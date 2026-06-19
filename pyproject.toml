@@ -1,0 +1,34 @@
+[project]
+name = "log-forge"
+version = "0.1.0"
+description = "Generate logs for your console and JSON events for downstream consumption."
+authors = [
+    { name = "Andrew Griffith" }
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+]
+
+[tool.poetry]
+# src layout: map the package from the src/ directory
+packages = [
+    { include = "log_forge", from = "src" },
+]
+
+# Non-Python files to include in the package
+include = [
+    "src/log_forge/py.typed",  # PEP 561 marker for typed packages
+]
+
+# Files to exclude from the package
+exclude = [
+    "tests/**/*",
+    "docs/**/*",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
