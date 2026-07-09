@@ -6,4 +6,11 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 
 | Name | Path | Purpose |
 |------|------|---------|
-| _(example)_ | `src/...` | _what it does in one line_ |
+| `configure` / `get_config` / `_ensure_sink` | `src/log_forge/config.py` | Process-wide config singleton; lazy `StdoutSink` default. |
+| id generators | `src/log_forge/ids.py` | `new_trace_id` / `new_span_id` / `new_log_id` (W3C-compatible). |
+| `Span` + event builders | `src/log_forge/model.py` | `Span` dataclass; `build_event` / `start_event` / `end_event` — the arch §6 JSON schema + precedence merge. |
+| context stack + baggage | `src/log_forge/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
+| `Sink` protocol | `src/log_forge/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
+| `StdoutSink` | `src/log_forge/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
+| `@trace` | `src/log_forge/decorator.py` | Sync span decorator: lifecycle, hierarchy, non-swallowing flush. |
+| `FakeSink` fixture | `tests/conftest.py` | Test double recording emitted batches (+ `fake_sink`/`lf` fixtures, config reset). |

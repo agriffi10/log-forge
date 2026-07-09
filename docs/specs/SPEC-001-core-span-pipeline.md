@@ -1,7 +1,7 @@
 # Spec: Core Span Pipeline
 
 **ID:** SPEC-001
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-09
 **Depends On:** None
 
