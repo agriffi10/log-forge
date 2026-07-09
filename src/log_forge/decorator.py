@@ -17,7 +17,7 @@ from time import monotonic
 from typing import Any, TypeVar, cast, overload
 
 from log_forge import context
-from log_forge.config import get_config
+from log_forge.config import _ensure_sink
 from log_forge.ids import new_span_id, new_trace_id
 from log_forge.model import Span, end_event, start_event
 
@@ -44,9 +44,10 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
 def _flush(span: Span) -> None:
     """Ship the finished span's buffered events to the configured sink.
 
-    SPEC-004 replaces this line with ``worker.submit(span.events)``.
+    Resolves the sink via ``_ensure_sink`` so a zero-config ``@trace`` falls back to
+    ``StdoutSink`` instead of crashing. SPEC-004 replaces this with ``worker.submit(...)``.
     """
-    get_config().sink.emit(span.events)  # type: ignore[union-attr]
+    _ensure_sink().emit(span.events)
 
 
 def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
