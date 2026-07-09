@@ -35,7 +35,7 @@ exclude = [
 # Development-only dependencies (not shipped to consumers).
 # Install with: poetry install --with dev
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.2"
+pytest = "^9.0"
 pytest-asyncio = "^0.23"        # for testing async @trace (guide Phase 8)
 pytest-cov = "^5.0"
 ruff = "^0.5"
