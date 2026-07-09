@@ -49,6 +49,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]             # src layout: make `import log_forge` work without an install
 asyncio_mode = "auto"            # async test functions run without an explicit marker
 addopts = "--strict-markers"
 
