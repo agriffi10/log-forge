@@ -57,12 +57,10 @@ def configure(
         _config.defaults = dict(defaults)
 
     if _config.sink is None:
-        # Local import defers the sinks dependency and avoids a top-level cycle (arch §7).
-        # StdoutSink arrives in guide Phase 5; until then callers must pass a sink.
-        try:
-            from log_forge.sinks.stdout import StdoutSink  # type: ignore[import-not-found]
-        except ImportError:
-            return
+        # Local import defers the sinks dependency and avoids a top-level cycle (arch §7):
+        # StdoutSink is the zero-dependency default when no sink was configured.
+        from log_forge.sinks.stdout import StdoutSink
+
         _config.sink = StdoutSink()
 
 
