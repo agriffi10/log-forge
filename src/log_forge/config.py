@@ -56,14 +56,24 @@ def configure(
     if defaults is not None:
         _config.defaults = dict(defaults)
 
-    if _config.sink is None:
-        # Local import defers the sinks dependency and avoids a top-level cycle (arch §7):
-        # StdoutSink is the zero-dependency default when no sink was configured.
-        from log_forge.sinks.stdout import StdoutSink
-
-        _config.sink = StdoutSink()
+    _ensure_sink()
 
 
 def get_config() -> Config:
     """Return the current global config singleton."""
     return _config
+
+
+def _ensure_sink() -> Sink:
+    """Return the active sink, applying the ``StdoutSink`` default if none was configured.
+
+    Centralizes the zero-dependency default (arch §8) so both ``configure()`` and the flush
+    path resolve a sink the same way — a decorated call never crashes just because the user
+    hasn't called ``configure()`` yet; it emits to stdout. The local import defers the
+    ``sinks`` dependency and avoids a top-level import cycle (arch §7).
+    """
+    if _config.sink is None:
+        from log_forge.sinks.stdout import StdoutSink
+
+        _config.sink = StdoutSink()
+    return _config.sink
