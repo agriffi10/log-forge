@@ -10,6 +10,23 @@ the matching tests light up on their own.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_config():
+    """Restore a fresh global ``Config`` before each test.
+
+    ``log_forge.config._config`` is a process-wide singleton mutated by ``configure()``;
+    without this, tests would leak identity/sink/defaults into one another and only pass by
+    ordering. No-ops until the module exists.
+    """
+    try:
+        from log_forge import config
+    except ImportError:
+        yield
+        return
+    config._config = config.Config()
+    yield
+
+
 class FakeSink:
     """A Sink that records emitted batches so tests can assert on the event dicts.
 
