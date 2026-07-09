@@ -7,7 +7,7 @@ content** — keep it to one screen.
 
 | Domain | Doc | Load when you are… | Internal index |
 |---|---|---|---|
-| Python (PEP 8 + PEP 257/484/526) | `python/python.md` | writing or refactoring any Python — layout, imports, naming, idioms, type hints | §1–§9 (Layout → Tooling) |
+| Python (3.13; PEP 8 + PEP 257/484/526 + Google Python Style Guide) | `python/python.md` | writing or refactoring any Python — style, naming, types, exceptions, docstrings, threading/`contextvars` | §1–§15 (Tooling → Modules & power features; §14 docstrings are the primary source of context, keep inline comments sparse) |
 
 ## How to use
 
