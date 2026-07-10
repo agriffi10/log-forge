@@ -1,13 +1,25 @@
 """log_forge — consistent, structured logs per decorated function call.
 
-Public façade (module-function shape). Later phases re-export ``shutdown`` here as it lands
-(see docs/implementation-guide.md module map). This phase exposes configuration, the
-``@trace`` decorator, the ``debug/info/warning/error/critical`` emitters, and ``set_baggage``.
+Public façade (module-function shape). Exposes configuration, the ``@trace`` decorator, the
+``debug/info/warning/error/critical`` emitters, ``set_baggage``, and ``shutdown`` (graceful
+drain of the background worker).
 """
 
 from log_forge.api import critical, debug, error, info, set_baggage, warning
 from log_forge.config import configure, get_config
 from log_forge.decorator import trace
+
+
+def shutdown() -> None:
+    """Flush buffered events and close the sink, blocking until drained. Idempotent.
+
+    Also registered via ``atexit``; call it explicitly before a fast process exit when you
+    want to be certain the tail of the queue reached the sink (SPEC-004 FR-005).
+    """
+    from log_forge.decorator import _shutdown_worker
+
+    _shutdown_worker()
+
 
 __all__ = [
     "configure",
@@ -19,4 +31,5 @@ __all__ = [
     "error",
     "critical",
     "set_baggage",
+    "shutdown",
 ]

@@ -8,7 +8,7 @@ to status only — no prose.
 | [SPEC-001](SPEC-001-core-span-pipeline.md) | Core Span Pipeline | Completed | None |
 | [SPEC-002](SPEC-002-logging-api-and-console-echo.md) | Logging API and Console Echo | Completed | SPEC-001 |
 | [SPEC-003](SPEC-003-async-trace.md) | Async `@trace` Support | Completed | SPEC-001, SPEC-002 |
-| [SPEC-004](SPEC-004-background-worker.md) | Background Flush Worker and Graceful Shutdown | Draft | SPEC-001 |
+| [SPEC-004](SPEC-004-background-worker.md) | Background Flush Worker and Graceful Shutdown | Completed | SPEC-001 |
 | [SPEC-005](SPEC-005-sqs-sink.md) | SQSSink and Optional `sqs` Extra | Draft | SPEC-004 |
 
 ## Arcs (build order)

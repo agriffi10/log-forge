@@ -26,8 +26,9 @@ implementation against the design in `architecture.md`.
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}`. SPEC-001 shipped `config`, `ids`, `model`,
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
-  `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware; the
-  setup-phase `core.py` + `modules/v1/` have been removed.
+  `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
+  SPEC-004 added `worker` (background flush) + `shutdown`; the setup-phase `core.py` +
+  `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -70,9 +71,9 @@ sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
 Index + status: `@docs/specs/INDEX.md`. Each spec file's header carries its own `Status`.
 **Current work:** the SPEC-001..005 arc is authored (`@docs/specs/INDEX.md`); build order
 SPEC-001 → 002 → 003 → 004 → 005. SPEC-001 (Core Span Pipeline), SPEC-002 (Logging API +
-console echo), and SPEC-003 (async `@trace`) are **Completed**; **next up is SPEC-004**
-(background flush worker + graceful shutdown). `docs/implementation-guide.md` remains the
-phase-level build reference behind the specs.
+console echo), SPEC-003 (async `@trace`), and SPEC-004 (background flush worker + graceful
+shutdown) are **Completed**; **next up is SPEC-005** (SQSSink + `sqs` extra).
+`docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
 

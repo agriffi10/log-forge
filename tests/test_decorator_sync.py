@@ -26,6 +26,7 @@ def test_single_span_records_start_end_ok(fake_sink) -> None:
         return 42
 
     assert contextvars.copy_context().run(work) == 42
+    log_forge.shutdown()  # drain the background worker before asserting (SPEC-004)
     events = fake_sink.events
     assert any(e["function"] == "work" for e in events)
     assert sum(1 for e in events if e.get("status") == "ok") == 1
@@ -43,6 +44,7 @@ def test_exception_is_recorded_then_reraised(fake_sink) -> None:
     with pytest.raises(ValueError, match="nope"):
         contextvars.copy_context().run(boom)
 
+    log_forge.shutdown()  # drain the background worker before asserting (SPEC-004)
     errors = [e for e in fake_sink.events if e.get("status") == "error"]
     assert errors, "an error end event must be recorded"
     assert errors[0]["error"]["type"] == "ValueError"
@@ -61,6 +63,7 @@ def test_bare_and_parameterized_forms_both_work(fake_sink) -> None:
 
     contextvars.copy_context().run(bare)
     contextvars.copy_context().run(param)
+    log_forge.shutdown()  # drain the background worker before asserting (SPEC-004)
     funcs = {e["function"] for e in fake_sink.events}
     assert "custom" in funcs  # name= override
     assert any(f.endswith("bare") for f in funcs)  # __qualname__ default
@@ -78,6 +81,7 @@ def test_nested_calls_share_trace_and_link_parent(fake_sink) -> None:
         child()
 
     contextvars.copy_context().run(parent)
+    log_forge.shutdown()  # drain the background worker before asserting (SPEC-004)
     events = fake_sink.events
     assert len({e["trace_id"] for e in events}) == 1, "nested calls share one trace"
 
@@ -97,6 +101,7 @@ def test_end_event_appended_before_flush(fake_sink) -> None:
         return 1
 
     contextvars.copy_context().run(w)
+    log_forge.shutdown()  # drain: the one span's two events flush together in one batch
     assert len(fake_sink.batches) == 1
     assert len(fake_sink.batches[0]) == 2
     assert fake_sink.batches[0][-1].get("status") == "ok"
