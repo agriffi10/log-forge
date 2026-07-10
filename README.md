@@ -81,6 +81,61 @@ with the child span pointing at its parent via `parent_span_id`:
 > **Note on ordering:** the child span (`tax.compute`) finishes first, so its events flush
 > before the parent's. Correlate by `trace_id` / `parent_span_id`, not by line order.
 
+## How it works
+
+![log-forge pipeline: a traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps 1–4 run on your thread; the worker and sink run on a background thread. Support modules — config, ids, model, context, console — assist every step.](docs/assets/pipeline.svg)
+
+A traced call travels through a small pipeline. The first four steps run on your own thread
+and are deliberately fast; the last two run on a background thread so your code never waits on
+the destination.
+
+1. **You call the code** — a `@trace` function, or one of the `debug`/`info`/… emitters.
+2. **A span opens** — a record of this one call. It inherits the current trace and parent (see
+   below), or starts a fresh trace if nothing is active.
+3. **Events gather on the span** — an automatic `span.start`, then any events you emit, held in
+   memory as one bundle rather than written line by line.
+4. **The span closes and hands off** — on return *or* exception, a `span.end` event is added
+   (with duration and status), and the whole bundle is handed to the background worker. This
+   hand-off is instant and never blocks; on an exception the original error is re-raised unchanged.
+5. **The worker batches** — the worker groups bundles and flushes them together (see below).
+6. **The sink ships them out** — `StdoutSink` by default, or `SQSSink` in production.
+
+Supporting this path are a handful of single-concept modules: `config` (the process-wide
+`service`/`version`/`env` and the sink), `ids` (trace/span/log ids), `model` (assembles the one
+JSON shape), `context` (holds the current span and baggage), and `console` (the optional
+instant `echo=` line).
+
+### Building the trace tree
+
+Nested calls form a tree through a stack of open spans kept in a `contextvars` context — the
+top of the stack is the "current" span. When a traced function starts, it reads the current
+span: if one exists, the new span copies its `trace_id` and records its `span_id` as
+`parent_span_id`; if the stack is empty, the new span starts a fresh trace with no parent. The
+new span is then pushed, so anything it calls sees *it* as the parent. On exit the span is
+popped by restoring the stack to its exact prior state (via a token, not a blind pop), which
+stays correct even when code branches into concurrent tasks. Because the stack lives in a
+context variable, every thread and asyncio task gets its own isolated copy — so `asyncio.gather`
+children share their parent's trace, and baggage set in one task never leaks into a sibling.
+
+### When the worker flushes
+
+The worker is one background thread with a bounded queue in front of it. `submit` drops a
+finished span's events into the queue and returns; the worker drains the queue into a small
+pending pile and flushes that pile to the sink on whichever of two triggers fires first:
+
+- **By count** — once ~10 span bundles have accumulated (note: that's 10 *spans*, and each span
+  carries at least its start/end pair, so a flush is usually well over 10 records). All pending
+  bundles are flattened into a single `sink.emit` call.
+- **By time** — once ~1 second has passed since the last flush, so an idle app never holds logs
+  indefinitely. (The loop advances its flush timestamp even when idle, so an empty queue sleeps
+  quietly instead of busy-spinning.)
+
+A failing `sink.emit` is retried a few times with growing backoff; past that the batch is
+abandoned with a counted warning and draining continues — a broken sink degrades logging but
+never crashes the worker or the app. If the bounded queue fills completely, new submissions are
+dropped (newest-first) and counted rather than blocking your code. On `shutdown()` the worker
+stops, sweeps anything still queued into one final batch, emits it, and closes the sink.
+
 ## Usage
 
 ### `configure(...)`

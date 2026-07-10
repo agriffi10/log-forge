@@ -1,0 +1,44 @@
+<svg width="680" viewBox="0 0 680 600" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>How log-forge processes a call</title>
+<desc>A traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps one to four run on your thread; the worker and sink run on a background thread. Support modules config, ids, model, context and console assist every step.</desc>
+<style>
+svg{--text:#1a1a1a;--text2:#6b6b6b;--line:#9ca3af;--nfill:#f5f5f4;--nstroke:#d6d3d1;--bfill:#dbeafe;--bstroke:#93c5fd;--afill:#fef3c7;--astroke:#fcd34d;--border:#d6d3d1}
+@media (prefers-color-scheme:dark){svg{--text:#e6e6e6;--text2:#a3a3a3;--line:#6b7280;--nfill:#262626;--nstroke:#404040;--bfill:#1e3a5f;--bstroke:#3b82f6;--afill:#422006;--astroke:#b45309;--border:#404040}}
+.t{fill:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:14px}
+.ts{fill:var(--text2);font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px}
+.th{fill:var(--text);font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:14px;font-weight:500}
+.box{fill:var(--nfill);stroke:var(--nstroke);stroke-width:.5}
+.blue{fill:var(--bfill);stroke:var(--bstroke);stroke-width:.5}
+.amber{fill:var(--afill);stroke:var(--astroke);stroke-width:.5}
+.arr{stroke:var(--line);stroke-width:1.5;fill:none}
+.ahead{stroke:var(--line);stroke-width:1.5;fill:none}
+.container{fill:none;stroke:var(--border);stroke-width:.5;stroke-dasharray:4 4}
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="ahead" d="M2 1L8 5L2 9" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+
+<line x1="175" y1="128" x2="175" y2="150" class="arr" marker-end="url(#arrow)"/>
+<line x1="175" y1="210" x2="175" y2="232" class="arr" marker-end="url(#arrow)"/>
+<line x1="175" y1="292" x2="175" y2="314" class="arr" marker-end="url(#arrow)"/>
+<line x1="175" y1="374" x2="175" y2="396" class="arr" marker-end="url(#arrow)"/>
+<line x1="175" y1="456" x2="175" y2="478" class="arr" marker-end="url(#arrow)"/>
+
+<rect x="50" y="70" width="250" height="58" rx="8" class="blue"/><text x="175" y="95" text-anchor="middle" class="th">You call the code</text><text x="175" y="114" text-anchor="middle" class="ts">a @trace function or an emitter</text>
+<rect x="50" y="152" width="250" height="58" rx="8" class="blue"/><text x="175" y="177" text-anchor="middle" class="th">A span opens</text><text x="175" y="196" text-anchor="middle" class="ts">inherits the trace and parent</text>
+<rect x="50" y="234" width="250" height="58" rx="8" class="blue"/><text x="175" y="259" text-anchor="middle" class="th">Events gather on the span</text><text x="175" y="278" text-anchor="middle" class="ts">start, your logs, then end</text>
+<rect x="50" y="316" width="250" height="58" rx="8" class="blue"/><text x="175" y="341" text-anchor="middle" class="th">Span closes and hands off</text><text x="175" y="360" text-anchor="middle" class="ts">non-blocking, never waits</text>
+<rect x="50" y="398" width="250" height="58" rx="8" class="amber"/><text x="175" y="423" text-anchor="middle" class="th">Worker batches the events</text><text x="175" y="442" text-anchor="middle" class="ts">grouped by count and time</text>
+<rect x="50" y="480" width="250" height="58" rx="8" class="amber"/><text x="175" y="505" text-anchor="middle" class="th">Sink ships them out</text><text x="175" y="524" text-anchor="middle" class="ts">stdout by default, or SQS</text>
+
+<rect x="360" y="70" width="280" height="468" rx="8" class="container"/>
+<text x="378" y="98" class="th">Support modules</text>
+<text x="378" y="116" class="ts">used at every step</text>
+
+<rect x="378" y="132" width="244" height="56" rx="4" class="box"/><text x="392" y="156" class="t">config.py</text><text x="392" y="174" class="ts">service, version, env, the sink</text>
+<rect x="378" y="200" width="244" height="56" rx="4" class="box"/><text x="392" y="224" class="t">ids.py</text><text x="392" y="242" class="ts">trace, span and log ids</text>
+<rect x="378" y="268" width="244" height="56" rx="4" class="box"/><text x="392" y="292" class="t">model.py</text><text x="392" y="310" class="ts">builds the one JSON record</text>
+<rect x="378" y="336" width="244" height="56" rx="4" class="box"/><text x="392" y="360" class="t">context.py</text><text x="392" y="378" class="ts">the current span and baggage</text>
+<rect x="378" y="404" width="244" height="56" rx="4" class="box"/><text x="392" y="428" class="t">console.py</text><text x="392" y="446" class="ts">instant human-readable line</text>
+
+<rect x="50" y="562" width="14" height="14" rx="3" class="blue"/><text x="72" y="573" class="ts">runs on your thread</text>
+<rect x="250" y="562" width="14" height="14" rx="3" class="amber"/><text x="272" y="573" class="ts">runs on the background worker thread</text>
+</svg>
