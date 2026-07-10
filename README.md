@@ -15,9 +15,10 @@ calls form a tree you can query later.
 - **Correct under threads and asyncio** — context propagates via `contextvars`.
 
 > **Status:** early implementation. **Shipped today:** the `@trace` decorator, `configure()`,
-> the zero-dependency `StdoutSink` (SPEC-001); and the `debug`/`info`/`warning`/`error`/`critical`
-> emitters, `echo=` console output, and `set_baggage` (SPEC-002). **Not yet shipped:** async
-> `@trace`, the background flush worker, `shutdown()`, and the SQS sink. See [Roadmap](#roadmap).
+> the zero-dependency `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
+> emitters, `echo=` console output, and `set_baggage` (SPEC-002); and async `@trace` over
+> `async def` (SPEC-003). **Not yet shipped:** the background flush worker, `shutdown()`, and the
+> SQS sink. See [Roadmap](#roadmap).
 
 ---
 
@@ -117,8 +118,25 @@ child span within it. On an exception, the decorator records `status="error"` pl
 exception type and formatted stack, then **re-raises the original exception unchanged** — it
 never swallows errors.
 
-> Async support (`@trace` over `async def`) is on the roadmap; today `@trace` targets
-> synchronous callables.
+**Async is supported.** Apply `@trace` to an `async def` and it traces the coroutine's actual
+run — the span opens when the coroutine starts and closes when the awaits complete, not when the
+coroutine object is created. `contextvars` keeps the trace correct across `await` points and
+concurrent tasks: children awaited under one parent (e.g. via `asyncio.gather`) share the
+parent's `trace_id` and link to its `span_id`, and baggage set in one task never leaks into a
+sibling. A cancelled coroutine is recorded as `status="error"` and the `CancelledError` re-raised.
+
+```python
+@lf.trace
+async def fetch(user_id: int) -> dict:
+    lf.info("fetching", user_id=user_id)
+    return await load(user_id)
+
+@lf.trace
+async def load(user_id: int) -> dict:
+    ...
+
+await fetch(4127)   # one trace_id; load's parent_span_id == fetch's span_id
+```
 
 ### Logging inside a span
 
@@ -204,10 +222,9 @@ design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](doc
 ## Roadmap
 
 Built in spec order (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)).
-SPEC-001 (core span pipeline) and SPEC-002 (logging API + console echo + baggage) are shipped;
-what's next:
+SPEC-001 (core span pipeline), SPEC-002 (logging API + console echo + baggage), and SPEC-003
+(async `@trace`) are shipped; what's next:
 
-- **SPEC-003** — async `@trace` support (span stack + baggage propagated across `async` tasks).
 - **SPEC-004** — background, non-blocking flush worker + graceful `shutdown()` / `atexit` drain.
 - **SPEC-005** — the `SQSSink` (behind the `sqs` extra) for the SQS → ELK path.
 - **Not yet planned:** **publishing to PyPI** (no release workflow exists today).

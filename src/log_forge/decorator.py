@@ -1,9 +1,15 @@
-"""The ``@trace`` decorator — synchronous (arch §4, guide Phase 6).
+"""The ``@trace`` decorator — synchronous and async (arch §4–5, guide Phases 6, 8).
 
 Opens a span on enter and closes it on exit (success *or* exception), maintaining the
 trace/parent hierarchy from the context stack, then flushes the finished span straight to
 the configured sink. The decorator is **non-swallowing**: it records the failure and
 re-raises the original exception unchanged (arch §4).
+
+At decoration time :func:`asyncio.iscoroutinefunction` selects a sync or async wrapper. The
+two are deliberate near-duplicates — the only difference is ``await fn(...)`` — because the
+sync/async split is a hard boundary; ``contextvars`` already propagates the span stack and
+baggage correctly across ``await`` points and concurrent tasks (arch §5), so the async span
+opens when the coroutine actually runs and closes when it finishes, with no new machinery.
 
 Flushing is synchronous here; the background worker (SPEC-004) later swaps only
 :func:`_flush` for a non-blocking handoff — the lifecycle below is untouched.
@@ -11,6 +17,7 @@ Flushing is synchronous here; the background worker (SPEC-004) later swaps only
 
 from __future__ import annotations
 
+import asyncio
 import functools
 from collections.abc import Callable
 from time import monotonic
@@ -77,6 +84,27 @@ def trace(
     """
 
     def decorate(fn: F) -> F:
+        if asyncio.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                span = _open_span(name or fn.__qualname__, defaults)
+                token = context.push_span(span)
+                try:
+                    result = await fn(*args, **kwargs)
+                    _close_span(span, "ok", None)
+                    return result
+                except BaseException as exc:
+                    # Non-swallowing (arch §4): record the error, then re-raise unchanged.
+                    # BaseException covers asyncio.CancelledError — a cancelled coroutine is
+                    # recorded as an error end event, never left with an unclosed span.
+                    _close_span(span, "error", exc)
+                    raise
+                finally:
+                    context.pop_span(token)
+
+            return cast(F, async_wrapper)
+
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             span = _open_span(name or fn.__qualname__, defaults)
