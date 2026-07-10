@@ -304,8 +304,11 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
   writer couples application availability to ELK availability.
 - log-forge's responsibility **ends at the sink.** A separate consumer drains SQS and
   owns indexing into ELK; that component is out of scope for this library (§13).
-- **Batching honors the sink's limits** — for SQS that means ≤ 10 messages and ≤ 256 KB
-  per batch; the worker's batch sizing is sink-aware.
+- **Batching honors the sink's limits, but the worker stays sink-agnostic** — the worker
+  flushes on fixed count/time thresholds and hands the sink whatever it accumulated; each
+  sink re-chunks that batch to its own transport constraints. For SQS that means splitting
+  into sends of ≤ 10 messages and ≤ 256 KB apiece. This keeps the worker dumb and lets each
+  sink own the limits only it knows about.
 
 ---
 
