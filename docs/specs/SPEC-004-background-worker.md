@@ -1,7 +1,7 @@
 # Spec: Background Flush Worker and Graceful Shutdown
 
 **ID:** SPEC-004
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-09
 **Depends On:** SPEC-001
 

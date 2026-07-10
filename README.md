@@ -13,12 +13,14 @@ calls form a tree you can query later.
 - **Structured, never free-form** — every event is the same named-field JSON shape.
 - **Safe by default** — never captures your arguments or return values (no accidental PII/secret leakage), and the decorator **never swallows exceptions**.
 - **Correct under threads and asyncio** — context propagates via `contextvars`.
+- **Non-blocking delivery** — finished spans are handed to a background worker; your code never
+  blocks on sink I/O, and a graceful drain at exit means buffered events aren't lost.
 
 > **Status:** early implementation. **Shipped today:** the `@trace` decorator, `configure()`,
 > the zero-dependency `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
-> emitters, `echo=` console output, and `set_baggage` (SPEC-002); and async `@trace` over
-> `async def` (SPEC-003). **Not yet shipped:** the background flush worker, `shutdown()`, and the
-> SQS sink. See [Roadmap](#roadmap).
+> emitters, `echo=` console output, and `set_baggage` (SPEC-002); async `@trace` over `async def`
+> (SPEC-003); and the non-blocking background flush worker with graceful `shutdown()` (SPEC-004).
+> **Not yet shipped:** the SQS sink. See [Roadmap](#roadmap).
 
 ---
 
@@ -179,6 +181,27 @@ Pass an instance to `configure(sink=...)`. The built-in `StdoutSink` writes one 
 event to a stream (default `sys.stdout`); construct it with `StdoutSink(stream=...)` to
 redirect.
 
+### Flushing and shutdown
+
+Delivery is off the hot path. When a span ends, its events are handed to a per-process
+background worker via a fast, non-blocking submit — your function returns without waiting on
+the sink. The worker batches events (by count and time), emits them on its own thread, retries
+a failing sink with backoff, and applies backpressure so a slow or down sink can never block or
+back-pressure the app: when its bounded queue is full it drops the newest submissions and counts
+them (`worker.dropped`) rather than stalling.
+
+Because delivery is asynchronous, drain before the process exits:
+
+```python
+import log_forge as lf
+
+lf.shutdown()   # flush buffered events and close the sink; blocks until drained
+```
+
+`shutdown()` is also registered via `atexit`, so a normal exit flushes automatically — call it
+explicitly when you need to be certain the tail reached the sink before a fast exit (e.g. at the
+end of a short script or an AWS Lambda handler). It is idempotent.
+
 ## Event schema
 
 Every event is the same shape (arch §6). Boundary events add a few fields:
@@ -216,16 +239,16 @@ every pull request and on push to `main`. A second workflow
 ([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
 
 The library uses a src layout (`src/log_forge/`) with a single concept per module: `config`,
-`ids`, `model`, `context`, `decorator`, `api`, `console`, and `sinks/{base,stdout}`. Deeper
-design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
+`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and `sinks/{base,stdout}`.
+Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
 Built in spec order (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)).
-SPEC-001 (core span pipeline), SPEC-002 (logging API + console echo + baggage), and SPEC-003
-(async `@trace`) are shipped; what's next:
+SPEC-001 (core span pipeline), SPEC-002 (logging API + console echo + baggage), SPEC-003
+(async `@trace`), and SPEC-004 (background flush worker + graceful `shutdown()`) are shipped;
+what's next:
 
-- **SPEC-004** — background, non-blocking flush worker + graceful `shutdown()` / `atexit` drain.
 - **SPEC-005** — the `SQSSink` (behind the `sqs` extra) for the SQS → ELK path.
 - **Not yet planned:** **publishing to PyPI** (no release workflow exists today).
 

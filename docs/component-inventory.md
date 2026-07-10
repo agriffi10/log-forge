@@ -15,4 +15,5 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `@trace` | `src/log_forge/decorator.py` | Span decorator (sync + async, dispatched by `iscoroutinefunction`): lifecycle, hierarchy, non-swallowing flush. |
 | level emitters + `set_baggage` | `src/log_forge/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
 | `ConsoleWriter` | `src/log_forge/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
+| `Worker` | `src/log_forge/worker.py` | Background flush: bounded queue + daemon thread, batch by count/time, retry+backoff, drop-newest backpressure, graceful `shutdown()`. |
 | `FakeSink` fixture | `tests/conftest.py` | Test double recording emitted batches (+ `fake_sink`/`lf` fixtures, config reset). |

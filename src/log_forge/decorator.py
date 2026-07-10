@@ -18,7 +18,9 @@ Flushing is synchronous here; the background worker (SPEC-004) later swaps only
 from __future__ import annotations
 
 import asyncio
+import atexit
 import functools
+import threading
 from collections.abc import Callable
 from time import monotonic
 from typing import Any, TypeVar, cast, overload
@@ -27,8 +29,14 @@ from log_forge import context
 from log_forge.config import _ensure_sink
 from log_forge.ids import new_span_id, new_trace_id
 from log_forge.model import Span, end_event, start_event
+from log_forge.worker import Worker
 
 __all__ = ["trace"]
+
+# One background worker per process (SPEC-004), created lazily from the configured sink on the
+# first flush. The double-checked lock makes concurrent first-flushes create exactly one.
+_worker: Worker | None = None
+_worker_lock = threading.Lock()
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -48,13 +56,34 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
     return span
 
 
-def _flush(span: Span) -> None:
-    """Ship the finished span's buffered events to the configured sink.
+def _get_worker() -> Worker:
+    """Return the process worker, creating it lazily from the configured sink (FR-006).
 
-    Resolves the sink via ``_ensure_sink`` so a zero-config ``@trace`` falls back to
-    ``StdoutSink`` instead of crashing. SPEC-004 replaces this with ``worker.submit(...)``.
+    Registers the graceful drain via ``atexit`` exactly once, on first creation, so a program
+    that logs and exits immediately still flushes its buffered events.
     """
-    _ensure_sink().emit(span.events)
+    global _worker
+    if _worker is None:
+        with _worker_lock:
+            if _worker is None:
+                atexit.register(_shutdown_worker)
+                _worker = Worker(_ensure_sink())
+    return _worker
+
+
+def _shutdown_worker() -> None:
+    """Drain + close the process worker if one was created (idempotent). Backs ``shutdown()``."""
+    if _worker is not None:
+        _worker.shutdown()
+
+
+def _flush(span: Span) -> None:
+    """Hand the finished span's events to the background worker — non-blocking (FR-001).
+
+    Resolves/creates the worker via :func:`_get_worker` (whose sink comes from ``_ensure_sink``,
+    so a zero-config ``@trace`` still falls back to ``StdoutSink`` rather than crashing).
+    """
+    _get_worker().submit(span.events)
 
 
 def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
