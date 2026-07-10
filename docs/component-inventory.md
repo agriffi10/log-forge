@@ -13,4 +13,6 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `Sink` protocol | `src/log_forge/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
 | `StdoutSink` | `src/log_forge/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
 | `@trace` | `src/log_forge/decorator.py` | Sync span decorator: lifecycle, hierarchy, non-swallowing flush. |
+| level emitters + `set_baggage` | `src/log_forge/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
+| `ConsoleWriter` | `src/log_forge/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
 | `FakeSink` fixture | `tests/conftest.py` | Test double recording emitted batches (+ `fake_sink`/`lf` fixtures, config reset). |
