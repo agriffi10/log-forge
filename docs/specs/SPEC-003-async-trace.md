@@ -1,7 +1,7 @@
 # Spec: Async `@trace` Support
 
 **ID:** SPEC-003
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-09
 **Depends On:** SPEC-001, SPEC-002
 
