@@ -25,8 +25,9 @@ implementation against the design in `architecture.md`.
 - `src/log_forge/` — the library (src layout; distribution `log-forge`, import `log_forge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}`. SPEC-001 shipped `config`, `ids`, `model`,
-  `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; the setup-phase
-  `core.py` + `modules/v1/` have been removed.
+  `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
+  `api` (emitters + `set_baggage`) and `console` (echo); the setup-phase `core.py` + `modules/v1/`
+  have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -68,9 +69,9 @@ sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
 
 Index + status: `@docs/specs/INDEX.md`. Each spec file's header carries its own `Status`.
 **Current work:** the SPEC-001..005 arc is authored (`@docs/specs/INDEX.md`); build order
-SPEC-001 → 002 → 003 → 004 → 005. SPEC-001 (Core Span Pipeline) is **Completed**; **next up is
-SPEC-002** (Logging API + console echo). `docs/implementation-guide.md` remains the phase-level
-build reference behind the specs.
+SPEC-001 → 002 → 003 → 004 → 005. SPEC-001 (Core Span Pipeline) and SPEC-002 (Logging API +
+console echo) are **Completed**; **next up is SPEC-003** (async `@trace`).
+`docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
 

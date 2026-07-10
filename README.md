@@ -14,10 +14,10 @@ calls form a tree you can query later.
 - **Safe by default** — never captures your arguments or return values (no accidental PII/secret leakage), and the decorator **never swallows exceptions**.
 - **Correct under threads and asyncio** — context propagates via `contextvars`.
 
-> **Status:** early implementation. **Shipped today (SPEC-001):** the `@trace` decorator,
-> `configure()`, and the zero-dependency `StdoutSink`. **Not yet shipped:** standalone log
-> emitters (`info`/`warning`/`error`/…), baggage, the background flush worker, `shutdown()`,
-> and the SQS sink. See [Roadmap](#roadmap).
+> **Status:** early implementation. **Shipped today:** the `@trace` decorator, `configure()`,
+> the zero-dependency `StdoutSink` (SPEC-001); and the `debug`/`info`/`warning`/`error`/`critical`
+> emitters, `echo=` console output, and `set_baggage` (SPEC-002). **Not yet shipped:** async
+> `@trace`, the background flush worker, `shutdown()`, and the SQS sink. See [Roadmap](#roadmap).
 
 ---
 
@@ -120,6 +120,32 @@ never swallows errors.
 > Async support (`@trace` over `async def`) is on the roadmap; today `@trace` targets
 > synchronous callables.
 
+### Logging inside a span
+
+Emit your own structured events from inside a decorated call with the level functions
+`debug` / `info` / `warning` / `error` / `critical`. Each appends one event to the current
+span, so the whole call's logs flush together and share its `trace_id` / `span_id`. Keyword
+arguments land in the event's `fields`; the function name is captured, but arguments and
+return values never are.
+
+```python
+@lf.trace
+def process_payment(user_id: int) -> str:
+    lf.set_baggage(request_id="req-123")     # rides every event emitted below, in this trace
+    lf.info("charging card", user_id=user_id)
+    lf.info("payment complete", echo=True)   # also printed to the console, immediately
+    return "ok"
+```
+
+- **`set_baggage(**kv)`** — attach trace-scoped context that is merged into the `fields` of
+  every subsequent event in the same execution flow. Precedence, lowest to highest: config
+  `defaults` → span `defaults` → baggage → per-call `fields`.
+- **`echo=True`** — *additionally* write a human-readable `LEVEL   message` line to the console
+  (`sys.stderr` by default), synchronously, without waiting for the async flush. The event
+  still rides the normal pipeline to the sink — echo never redirects.
+- **Orphan logs** — a level call made with no active span is not dropped: it emits a standalone
+  one-event span with a fresh `trace_id`, flushed straight to the sink.
+
 ### Custom sinks
 
 A sink is any object satisfying the `Sink` protocol — it receives already-built event dicts
@@ -172,14 +198,15 @@ every pull request and on push to `main`. A second workflow
 ([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
 
 The library uses a src layout (`src/log_forge/`) with a single concept per module: `config`,
-`ids`, `model`, `context`, `decorator`, and `sinks/{base,stdout}`. Deeper design docs live in
-[`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
+`ids`, `model`, `context`, `decorator`, `api`, `console`, and `sinks/{base,stdout}`. Deeper
+design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
-Built in spec order (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)):
+Built in spec order (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)).
+SPEC-001 (core span pipeline) and SPEC-002 (logging API + console echo + baggage) are shipped;
+what's next:
 
-- **SPEC-002** — standalone log emitters (`info`/`warning`/`error`/…), console echo, and baggage (`set_baggage`).
 - **SPEC-003** — async `@trace` support (span stack + baggage propagated across `async` tasks).
 - **SPEC-004** — background, non-blocking flush worker + graceful `shutdown()` / `atexit` drain.
 - **SPEC-005** — the `SQSSink` (behind the `sqs` extra) for the SQS → ELK path.

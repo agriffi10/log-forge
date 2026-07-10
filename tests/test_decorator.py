@@ -77,6 +77,10 @@ def test_baggage_flows_to_descendant_logs(lf, fake_sink) -> None:
 
     contextvars.copy_context().run(parent)
 
-    child_events = [e for e in fake_sink.events if e["function"] == "child"]
-    assert child_events
-    assert all(e["fields"].get("request_id") == "r-123" for e in child_events)
+    # Baggage rides user *log* events (SPEC-002 FR-003), not the decorator's span.start/end
+    # boundary events — SPEC-002 leaves those unchanged (SPEC-001, boundary baggage is empty).
+    child_logs = [
+        e for e in fake_sink.events if e["function"] == "child" and e["message"] == "child work"
+    ]
+    assert child_logs
+    assert all(e["fields"].get("request_id") == "r-123" for e in child_logs)
