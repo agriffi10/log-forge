@@ -100,6 +100,23 @@ async def test_async_nesting_links_parent(lf, fake_sink) -> None:
     assert all(e["parent_span_id"] == parent_span_id for e in load_events)
 
 
+async def test_parent_baggage_visible_to_awaited_child(lf, fake_sink) -> None:
+    # FR-003: baggage set in a parent async span is visible to child async spans it awaits.
+    @lf.trace(name="load")
+    async def load() -> None:
+        lf.info("loading")
+
+    @lf.trace(name="fetch")
+    async def fetch() -> None:
+        lf.set_baggage(request_id="req-async")
+        await load()
+
+    await fetch()
+
+    child_log = next(e for e in fake_sink.events if e["message"] == "loading")
+    assert child_log["fields"].get("request_id") == "req-async"
+
+
 async def test_concurrent_gather_children_share_trace_distinct_spans(lf, fake_sink) -> None:
     @lf.trace(name="child")
     async def child(i: int) -> int:
