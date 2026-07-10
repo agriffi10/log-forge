@@ -1,7 +1,7 @@
 # Spec: SQSSink and Optional `sqs` Extra
 
 **ID:** SPEC-005
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-09
 **Depends On:** SPEC-004
 

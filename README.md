@@ -16,11 +16,12 @@ calls form a tree you can query later.
 - **Non-blocking delivery** — finished spans are handed to a background worker; your code never
   blocks on sink I/O, and a graceful drain at exit means buffered events aren't lost.
 
-> **Status:** early implementation. **Shipped today:** the `@trace` decorator, `configure()`,
-> the zero-dependency `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
+> **Status:** the core arc (SPEC-001 → 005) is complete. Shipped: the `@trace` decorator,
+> `configure()`, and `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
 > emitters, `echo=` console output, and `set_baggage` (SPEC-002); async `@trace` over `async def`
-> (SPEC-003); and the non-blocking background flush worker with graceful `shutdown()` (SPEC-004).
-> **Not yet shipped:** the SQS sink. See [Roadmap](#roadmap).
+> (SPEC-003); the non-blocking background flush worker with graceful `shutdown()` (SPEC-004); and
+> the `SQSSink` behind the optional `sqs` extra (SPEC-005). Not yet done: publishing to PyPI (see
+> [Roadmap](#roadmap)).
 
 ---
 
@@ -166,10 +167,10 @@ def process_payment(user_id: int) -> str:
 - **Orphan logs** — a level call made with no active span is not dropped: it emits a standalone
   one-event span with a fresh `trace_id`, flushed straight to the sink.
 
-### Custom sinks
+### Sinks
 
-A sink is any object satisfying the `Sink` protocol — it receives already-built event dicts
-and knows nothing about spans:
+A sink is the swappable output transport — any object satisfying the `Sink` protocol. It
+receives already-built, batched event dicts and knows nothing about spans:
 
 ```python
 class Sink(Protocol):
@@ -177,9 +178,28 @@ class Sink(Protocol):
     def close(self) -> None: ...
 ```
 
-Pass an instance to `configure(sink=...)`. The built-in `StdoutSink` writes one JSON line per
-event to a stream (default `sys.stdout`); construct it with `StdoutSink(stream=...)` to
-redirect.
+Pass an instance to `configure(sink=...)`. Two sinks ship with the library:
+
+- **`StdoutSink`** (default, zero-dependency) — writes one JSON line per event to a stream
+  (default `sys.stdout`); construct it with `StdoutSink(stream=...)` to redirect.
+- **`SQSSink`** — the production path: ships events to an Amazon SQS queue that acts as a
+  durable buffer in front of your indexer (e.g. ELK), absorbing downstream spikes and outages.
+  It re-chunks each batch to SQS's hard limits (≤ 10 messages and ≤ 256 KB per request), retries
+  partial failures, and drops any single event too large to ever fit (with a warning). It lives
+  behind the optional `sqs` extra so the core stays dependency-free:
+
+  ```python
+  import log_forge
+  from log_forge.sinks.sqs import SQSSink
+
+  log_forge.configure(service="payments", sink=SQSSink(queue_url="https://sqs.../q"))
+  ```
+
+  Install with `pip install 'log-forge[sqs]'` (pulls `boto3`). AWS credentials and region are
+  resolved by `boto3`'s standard chain — log-forge adds no credential configuration of its own.
+  Consuming from SQS and indexing into ELK is a separate component, outside this library.
+
+You can also implement your own sink (file, HTTP, Kafka, …) — just satisfy the two methods.
 
 ### Flushing and shutdown
 
@@ -239,18 +259,20 @@ every pull request and on push to `main`. A second workflow
 ([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
 
 The library uses a src layout (`src/log_forge/`) with a single concept per module: `config`,
-`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and `sinks/{base,stdout}`.
+`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and `sinks/{base,stdout,sqs}`.
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
-Built in spec order (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)).
-SPEC-001 (core span pipeline), SPEC-002 (logging API + console echo + baggage), SPEC-003
-(async `@trace`), and SPEC-004 (background flush worker + graceful `shutdown()`) are shipped;
-what's next:
+The core arc (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)) is **complete**:
+core span pipeline, logging API + console echo + baggage, async `@trace`, the background flush
+worker with graceful `shutdown()`, and the `SQSSink`. What remains:
 
-- **SPEC-005** — the `SQSSink` (behind the `sqs` extra) for the SQS → ELK path.
-- **Not yet planned:** **publishing to PyPI** (no release workflow exists today).
+- **Publishing to PyPI** — not yet done; there is no release workflow today. Until then, install
+  from source (see [Installation](#installation)).
+- **Deferred by design** (IDs are already W3C-compatible, so these stay cheap to add later):
+  async is in; cross-process trace continuation, cross-process baggage, and tail sampling
+  (a `should_send` seam is reserved) are not built.
 
 **Out of scope** (by design): metrics or OTel-native traces · querying / dashboards / alerting
 (that's ELK downstream) · more than one configured sink per process · cross-process trace
