@@ -46,10 +46,13 @@ class Worker:
         self.flush_interval = flush_interval
         self.max_retries = max_retries
         self.dropped = 0  # submissions dropped because the queue was full (backpressure)
-        self.failed_batches = 0  # batches abandoned after exhausting retries
+        self.failed_batches = 0  # batches abandoned after exhausting retries (worker-thread only)
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
+        # Guards the `dropped` counter (incremented from any caller thread) and the shutdown
+        # once-only flag (shutdown may be called concurrently by atexit and user code).
+        self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="log-forge-worker", daemon=True
         )
@@ -65,7 +68,8 @@ class Worker:
         try:
             self._queue.put_nowait(events)
         except queue.Full:
-            self.dropped += 1
+            with self._lock:
+                self.dropped += 1
 
     def shutdown(self) -> None:
         """Stop the thread, drain + emit everything queued, then ``close()`` the sink.
@@ -73,9 +77,10 @@ class Worker:
         Idempotent: a second call is a no-op (FR-005). Registered via ``atexit`` by the
         decorator's lazy worker so a program that logs and exits immediately still flushes.
         """
-        if self._shutdown_done:
-            return
-        self._shutdown_done = True
+        with self._lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
         self._stop.set()
         try:
             self._queue.put_nowait(_SHUTDOWN)  # wake a blocked get() for a prompt stop
@@ -99,11 +104,13 @@ class Worker:
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
             now = time.monotonic()
-            if pending and (
-                len(pending) >= self.batch_size or now - last_flush >= self.flush_interval
-            ):
-                self._emit(pending)
-                pending = []
+            if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
+                if pending:
+                    self._emit(pending)
+                    pending = []
+                # Advance the window even when idle (pending empty). Otherwise last_flush never
+                # moves while the queue is empty, timeout collapses to 0.0, and get(timeout=0.0)
+                # busy-spins a core. Resetting it lets the next get() block a full interval.
                 last_flush = now
         self._final_drain(pending)
 

@@ -230,6 +230,32 @@ def test_dropped_counter_is_observable() -> None:
         w.shutdown()
 
 
+# -- regression: idle worker must block, not busy-spin ----------------------------------
+
+
+def test_idle_worker_does_not_busy_spin(monkeypatch) -> None:
+    import queue as queue_module
+
+    counts = {"get": 0}
+
+    class CountingQueue(queue_module.Queue):
+        def get(self, *args, **kwargs):
+            counts["get"] += 1
+            return super().get(*args, **kwargs)
+
+    monkeypatch.setattr(worker_mod.queue, "Queue", CountingQueue)
+
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=100, flush_interval=0.05)
+    try:
+        time.sleep(0.4)
+        # A correct worker blocks ~one get() per flush_interval while idle (~8 over 0.4s). A
+        # busy-spin (last_flush never advancing) would be tens of thousands to millions.
+        assert counts["get"] < 100, f"idle worker appears to busy-spin: {counts['get']} get() calls"
+    finally:
+        w.shutdown()
+
+
 # -- FR-005: graceful shutdown ----------------------------------------------------------
 
 

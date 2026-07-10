@@ -37,6 +37,7 @@ __all__ = ["trace"]
 # first flush. The double-checked lock makes concurrent first-flushes create exactly one.
 _worker: Worker | None = None
 _worker_lock = threading.Lock()
+_atexit_registered = False  # register the drain exactly once per process, not per worker
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -62,11 +63,13 @@ def _get_worker() -> Worker:
     Registers the graceful drain via ``atexit`` exactly once, on first creation, so a program
     that logs and exits immediately still flushes its buffered events.
     """
-    global _worker
+    global _worker, _atexit_registered
     if _worker is None:
         with _worker_lock:
             if _worker is None:
-                atexit.register(_shutdown_worker)
+                if not _atexit_registered:
+                    atexit.register(_shutdown_worker)
+                    _atexit_registered = True
                 _worker = Worker(_ensure_sink())
     return _worker
 

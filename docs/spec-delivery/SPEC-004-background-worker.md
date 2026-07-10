@@ -33,10 +33,17 @@ process worker between tests; the SPEC-001 `test_decorator_sync.py` tests now ca
 `log_forge.shutdown()` to drain before asserting (real end-to-end worker coverage). No public
 API from earlier specs changed.
 
+Concurrency hardening (from fresh-context review): the idle drain loop now advances its
+flush-window even when the queue is empty, so `get()` blocks a full interval instead of
+busy-spinning a core on a `0s` timeout; the `dropped` counter increments under a lock;
+`shutdown()`'s once-only flag is set under that lock; and `atexit` registers the drain exactly
+once per process rather than per worker creation.
+
 ## Verification
 
-Local gates green — ruff clean, `mypy --strict` clean (12 src files), `pytest` **61 passed / 0
-skipped**, and `test_worker.py` (13 tests) stable across repeated runs. New `test_worker.py`
-covers non-blocking submit, count/time batching, order/no-loss, retry survival + abandon-count,
-drop-newest backpressure with an observable counter, drain-and-close, idempotent shutdown, and
-the lazy single per-process worker. Fresh-context code review run before merge.
+Local gates green — ruff clean, `mypy --strict` clean (12 src files), `pytest` **62 passed / 0
+skipped**, and `test_worker.py` (14 tests) stable across repeated runs. `test_worker.py` covers
+non-blocking submit, count/time batching, order/no-loss, retry survival + abandon-count,
+drop-newest backpressure with an observable counter, an idle-not-busy-spin regression, drain-
+and-close, idempotent shutdown, and the lazy single per-process worker. Fresh-context code
+review run before merge; the one blocking finding (idle busy-spin) was fixed and re-verified.
