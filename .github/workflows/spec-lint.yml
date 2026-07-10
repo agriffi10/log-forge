@@ -13,6 +13,6 @@ jobs:
   spec-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run spec-lint
         run: sh scripts/spec-lint.sh docs/specs
