@@ -1,7 +1,7 @@
 # Spec: Stdlib Logging Bridge Sink
 
 **ID:** SPEC-007
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-07-10
 **Depends On:** SPEC-001
 
@@ -82,13 +82,19 @@ record's built-in attributes.
 
 #### Acceptance Criteria:
 
-- [ ] The event's `fields` values and identity keys (`trace_id`, `span_id`, `parent_span_id`,
-      `log_id`, `function`, `service`, `version`, `env`) are attached to the record as attributes
-      (e.g. via the `extra` mechanism) and are readable by a formatter.
+- [ ] Identity keys (`trace_id`, `span_id`, `parent_span_id`, `log_id`, `function`, `service`,
+      `version`, `env`) are attached to the record as flat attributes (all known non-reserved) and
+      are readable by a formatter.
+- [ ] Each `event["fields"]` entry is attached as a flat record attribute, **skipping** any key that
+      collides with a reserved `LogRecord` attribute or an identity key; **and** the complete
+      `event["fields"]` dict is always attached as `record.fields`, so a skipped collision is never
+      lost (flat + nested).
 - [ ] Attaching never overwrites reserved `LogRecord` attributes (`name`, `msg`, `args`, `levelname`,
-      `levelno`, `pathname`, `lineno`, `message`, `asctime`, etc.) — colliding keys are namespaced or
-      skipped, and attaching one never raises `KeyError`/`AttributeError`.
-- [ ] A JSON formatter reading these record attributes can reproduce the event's structured fields.
+      `levelno`, `pathname`, `lineno`, `message`, `asctime`, etc.) and never raises
+      `KeyError`/`AttributeError`.
+- [ ] A JSON formatter reading these record attributes (flat fields, or the nested `record.fields`)
+      can reproduce the event's structured fields — including a field whose key collides with a
+      reserved attribute (recoverable via `record.fields`).
 
 ### FR-004: Message passed verbatim (no %-formatting surprise)
 
