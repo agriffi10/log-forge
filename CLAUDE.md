@@ -39,7 +39,7 @@ implementation against the design in `architecture.md`.
 |---|---|
 | Language | Python **>= 3.13**, fully typed (PEP 561 `py.typed`) |
 | Packaging | Poetry (`poetry-core` build backend), src layout |
-| Runtime deps | **none**; optional `sqs` extra pulls `boto3>=1.34` |
+| Runtime deps | **none**; optional extras: `sqs` → `boto3>=1.34`, `sentry` → `sentry-sdk>=2.0` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
 | Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
 | Lint / types | `ruff` (line-length 100), `mypy --strict` over `src` |

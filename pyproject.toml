@@ -14,6 +14,7 @@ dependencies = [
 # Optional features. Install with: pip install log-forge[sqs]
 [project.optional-dependencies]
 sqs = ["boto3>=1.34"]
+sentry = ["sentry-sdk>=2.0"]
 
 [tool.poetry]
 # src layout: map the package from the src/ directory
