@@ -1,7 +1,7 @@
 # Spec: Composition and Adapter Sinks
 
 **ID:** SPEC-006
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-07-10
 **Depends On:** SPEC-001
 
@@ -96,6 +96,11 @@ an inner sink.
 - [ ] `FilteringSink(inner, min_level="WARNING")` forwards only events whose `level` is at or above
       the given level per standard severity ordering (`DEBUG < INFO < WARNING < ERROR < CRITICAL`);
       an event with an unknown/missing `level` is forwarded (fail-open) rather than dropped.
+- [ ] Level comparison is **case-insensitive** on both the configured `min_level` and each event's
+      `level` (e.g. `min_level="warning"` and an event `level` of `"Warning"` compare correctly) —
+      consistent with SPEC-007's `LoggingSink`.
+- [ ] An invalid `min_level` (not one of the five names, case-insensitive) raises `ValueError` at
+      construction — fail fast rather than silently forwarding every event.
 - [ ] When `predicate` and `min_level` are both given, an event must satisfy **both** to be forwarded.
 - [ ] When no event passes, `inner.emit` is **not** called (no empty-batch emit).
 - [ ] `close()` delegates to `inner.close()`; `isinstance(...)` is `True`.
@@ -129,8 +134,10 @@ underlying sink exactly once.
 - [ ] A nested composition such as
       `MultiSink(StdoutSink(), FilteringSink(TransformSink(SQSSink(...), redact), min_level="ERROR"))`
       constructs and emits without special-casing.
-- [ ] Calling `close()` on the outer sink results in each distinct underlying sink's `close()` being
-      called exactly once (no double-close of a shared leaf when it appears once in the tree).
+- [ ] Calling `close()` on the outer sink reaches every underlying sink: a leaf that appears once in
+      the tree is closed exactly once. A sink shared at multiple positions is closed once **per
+      position** (the simple `close()` protocol carries no cross-tree visited-set), so every sink's
+      `close()` is expected to be idempotent — as all shipped sinks are.
 - [ ] The wrappers hold no span/context types — they operate purely on the event-dict batch (arch §8).
 
 ---
