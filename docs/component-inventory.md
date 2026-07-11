@@ -21,6 +21,13 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `FileSink` / `RotatingFileSink` | `src/log_forge/sinks/file.py` | Append NDJSON to a file; rotating variant adds size/time triggers + numbered backup retention (rotate-before-exceed, no event lost). |
 | `SQLiteSink` | `src/log_forge/sinks/sqlite.py` | Batch-insert events (full JSON + projected columns) into an embedded SQLite DB; injectable connection, `create_table` opt-out, owned-vs-borrowed close. |
 | `StderrSink` / `NullSink` / `MemorySink` | `src/log_forge/sinks/util.py` | Utility sinks: NDJSON to stderr (twelve-factor); discard + `dropped` counter; in-process `.events` list with optional `maxlen` ring. |
+| `HTTPSink` (+ `merge_headers`) | `src/log_forge/sinks/http.py` | Dependency-free `urllib` POST core: ndjson/json_array, headers/auth, gzip, bounded 429/5xx retry (Retry-After); base for the platform sinks. |
+| Elasticsearch / Loki / Logstash / Syslog sinks | `src/log_forge/sinks/{elasticsearch,loki,logstash,syslog}.py` | Self-hosted platform sinks: `_bulk`, Loki push, Logstash HTTP/socket, RFC 5424 syslog. |
+| SaaS sinks (Datadog/Splunk/NewRelic/Honeycomb/Sentry) | `src/log_forge/sinks/{datadog,splunk,newrelic,honeycomb,sentry}.py` | SaaS logs intakes; `SentrySink` lazy-SDK (`sentry` extra) with HTTP-envelope fallback + level gating. |
+| AWS stream sinks (Kinesis/Firehose/SNS) | `src/log_forge/sinks/{kinesis,firehose,sns}.py` | boto3 (`aws` extra) durable-buffer sinks; count/byte chunking + partial-failure retry. |
+| Queue sinks (Kafka/Redis/RabbitMQ/NATS/PubSub/EventHubs) | `src/log_forge/sinks/{kafka,redis,rabbitmq,nats,pubsub,eventhubs}.py` | Lazy-import queue/stream sinks (one optional extra each); publish + bounded retry + close. |
+| DB sinks (Mongo/Postgres/ClickHouse) | `src/log_forge/sinks/{mongodb,postgres,clickhouse}.py` | Lazy-import DB sinks (one optional extra each); single-transaction batch insert, ownership-aware close. |
+| chunk + transport helpers | `src/log_forge/sinks/{_chunk,_time,_socket}.py` | `chunk_items`/`chunk_list`/`valid_identifier`; ISO→epoch time; TCP/UDP socket transport with reconnect retry. |
 | `@trace` | `src/log_forge/decorator.py` | Span decorator (sync + async, dispatched by `iscoroutinefunction`): lifecycle, hierarchy, non-swallowing flush. |
 | level emitters + `set_baggage` | `src/log_forge/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
 | `ConsoleWriter` | `src/log_forge/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
