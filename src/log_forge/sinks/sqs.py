@@ -6,7 +6,7 @@ of being lost or back-pressuring the app. A separate consumer indexes them into 
 scope here). Like every sink this receives *already-built* event dicts and knows nothing about
 spans.
 
-``boto3`` is an **optional** dependency (the ``sqs`` extra): it is imported lazily inside the
+``boto3`` is an **optional** dependency (the ``aws`` extra): it is imported lazily inside the
 sink, never at module top, so ``import log_forge.sinks.sqs`` — and the whole library — stays
 dependency-free unless an ``SQSSink`` is actually instantiated without an injected client.
 
@@ -33,7 +33,7 @@ class SQSSink:
 
     def __init__(self, queue_url: str, client: Any = None, *, max_retries: int = 3) -> None:
         if client is None:
-            import boto3  # type: ignore[import-not-found]  # optional 'sqs' extra
+            import boto3  # type: ignore[import-not-found]  # optional 'aws' extra
 
             client = boto3.client("sqs")
         self.queue_url = queue_url
