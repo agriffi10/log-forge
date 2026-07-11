@@ -2,7 +2,7 @@
 
 **ID:** SPEC-008
 **Status:** Draft
-**Last Updated:** 2026-07-10
+**Last Updated:** 2026-07-11
 **Depends On:** SPEC-001
 
 ## Overview
@@ -24,8 +24,9 @@ on already-built event dicts.
 - `FileSink(path, *, encoding="utf-8")` — append one `json.dumps` line per event; flush per emit.
 - `RotatingFileSink(path, *, max_bytes=0, backup_count=0, when=None, interval=1)` — rotate the active
   file on a size threshold and/or a time interval, keeping `backup_count` numbered backups.
-- `SQLiteSink(database, *, table="log_events", connection=None)` — ensure the target table exists,
-  then batch-insert each event (raw JSON plus a few extracted columns) in one transaction.
+- `SQLiteSink(database, *, table="log_events", connection=None, create_table=True)` — optionally
+  ensure the target table exists, then batch-insert each event (raw JSON plus a few extracted
+  columns) in one transaction.
 - `StderrSink(stream=None)` — the `StdoutSink` shape targeting `sys.stderr` by default.
 - `NullSink()` — discard every batch (optional `dropped` counter).
 - `MemorySink(maxlen=None)` — append events to an in-memory list exposed as `.events` (optional ring
@@ -88,9 +89,13 @@ Persist events as queryable rows in an embedded SQLite database.
 
 #### Acceptance Criteria:
 
-- [ ] `SQLiteSink(database)` ensures a table (default `log_events`) exists with at least columns
-      `log_id`, `trace_id`, `span_id`, `timestamp`, `level`, `function`, and `event` (the full event
-      as a JSON string); creation is idempotent (`CREATE TABLE IF NOT EXISTS`).
+- [ ] With `create_table=True` (the default), `SQLiteSink(database)` ensures a table (default
+      `log_events`) exists with at least columns `log_id`, `trace_id`, `span_id`, `timestamp`,
+      `level`, `function`, and `event` (the full event as a JSON string); creation is idempotent
+      (`CREATE TABLE IF NOT EXISTS`) so the sink owns its own schema out of the box.
+- [ ] With `create_table=False`, the sink runs no DDL and assumes the caller has provisioned the
+      table (e.g. via their own migrations); a missing or column-incompatible table surfaces as a
+      normal `sqlite3` error at insert time rather than being silently created.
 - [ ] `emit(batch)` inserts every event in the batch within a single transaction (executemany), and
       the extracted columns are populated from the corresponding event keys (missing keys → `NULL`).
 - [ ] A `connection` may be injected (e.g. `sqlite3.connect(":memory:")`) so tests run without touching
@@ -157,6 +162,7 @@ SQLiteSink {
   database: str
   table: str = "log_events"
   connection: sqlite3.Connection | None = None   # injected for tests
+  create_table: bool = True                      # False => caller owns the schema (no DDL)
 }
 # table columns: log_id, trace_id, span_id, timestamp, level, function, event (JSON text)
 
@@ -182,7 +188,8 @@ class RotatingFileSink:
 
 # sinks/sqlite.py
 class SQLiteSink:
-    def __init__(self, database: str, *, table: str = "log_events", connection=None) -> None: ...
+    def __init__(self, database: str, *, table: str = "log_events", connection=None,
+                 create_table: bool = True) -> None: ...
 
 # sinks/util.py
 class StderrSink:
