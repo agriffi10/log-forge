@@ -138,6 +138,15 @@ def test_attach_never_raises_on_reserved_field_keys() -> None:
     assert rec.fields == {"msg": "x", "args": "y", "name": "z", "levelno": 1}
 
 
+def test_field_named_fields_does_not_clobber_nested_payload() -> None:
+    logger, handler = make_logger("test.fields.selfcollision")
+    event = {"level": "INFO", "message": "m", "fields": {"fields": "CLOBBER", "user": "alice"}}
+    LoggingSink(logger).emit([event])
+    rec = handler.records[0]
+    assert rec.fields == {"fields": "CLOBBER", "user": "alice"}  # nested payload stays intact
+    assert rec.user == "alice"  # other fields still flat-attached
+
+
 def test_formatter_can_read_structured_data() -> None:
     logger, handler = make_logger("test.fields.formatter")
     LoggingSink(logger).emit([ev(message="hi", user="bob")])

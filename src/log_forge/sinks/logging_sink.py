@@ -98,5 +98,7 @@ class LoggingSink:
             # Nested payload is lossless even when a flat key collides and is skipped below.
             setattr(record, "fields", fields)
             for key, value in fields.items():
-                if key not in _RESERVED and key not in _IDENTITY:
+                # Skip reserved LogRecord attrs, identity keys, and "fields": the sink owns
+                # record.fields (the nested payload); a field named "fields" must not overwrite it.
+                if key not in _RESERVED and key not in _IDENTITY and key != "fields":
                     setattr(record, key, value)
