@@ -39,7 +39,7 @@ implementation against the design in `architecture.md`.
 |---|---|
 | Language | Python **>= 3.13**, fully typed (PEP 561 `py.typed`) |
 | Packaging | Poetry (`poetry-core` build backend), src layout |
-| Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), and queue/stream drivers: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs` |
+| Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), queue/stream: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs`, and database: `clickhouse`, `mongo`, `postgres` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
 | Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
 | Lint / types | `ruff` (line-length 100), `mypy --strict` over `src` |
