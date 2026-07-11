@@ -32,7 +32,7 @@ class TransformSink:
         self._fn = fn
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Apply ``fn`` to each event, forwarding the non-``None`` results as a new list (FR-004)."""
+        """Apply ``fn`` to each event, forwarding the non-``None`` results (FR-004)."""
         transformed: list[dict[str, object]] = []
         for event in batch:
             result = self._fn(event)

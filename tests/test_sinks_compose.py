@@ -116,6 +116,12 @@ def test_multi_close_closes_all_even_when_one_raises() -> None:
     assert multi.failed == 1
 
 
+def test_multi_logs_child_failure_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    MultiSink(BoomSink()).emit([ev()])
+    err = capsys.readouterr().err
+    assert "MultiSink" in err and "BoomSink" in err  # FR-002: failure logged to stderr
+
+
 def test_multi_empty_is_noop() -> None:
     multi = MultiSink()
     multi.emit([ev()])
@@ -132,9 +138,9 @@ def test_multi_is_sink_instance() -> None:
 
 def test_filter_predicate_keeps_truthy_preserving_order() -> None:
     inner = RecordingSink()
-    batch = [ev(INFO=1, keep=True), ev(INFO=2, keep=False), ev(INFO=3, keep=True)]
-    FilteringSink(inner, predicate=lambda e: bool(e["fields"]["keep"])).emit(batch)  # type: ignore[index]
-    assert [e["fields"]["INFO"] for e in inner.events] == [1, 3]
+    batch = [ev("INFO"), ev("DEBUG"), ev("WARNING")]
+    FilteringSink(inner, predicate=lambda e: e["level"] != "DEBUG").emit(batch)
+    assert [e["level"] for e in inner.events] == ["INFO", "WARNING"]
 
 
 def test_filter_min_level_forwards_at_or_above() -> None:
@@ -158,10 +164,12 @@ def test_filter_unknown_or_missing_level_fails_open() -> None:
 
 def test_filter_predicate_and_min_level_both_required() -> None:
     inner = RecordingSink()
-    batch = [ev("ERROR", keep=True), ev("ERROR", keep=False), ev("INFO", keep=True)]
-    FilteringSink(
-        inner, predicate=lambda e: bool(e["fields"]["keep"]), min_level="WARNING"  # type: ignore[index]
-    ).emit(batch)
+    batch = [
+        {"level": "ERROR", "keep": True},
+        {"level": "ERROR", "keep": False},
+        {"level": "INFO", "keep": True},
+    ]
+    FilteringSink(inner, predicate=lambda e: e["keep"] is True, min_level="WARNING").emit(batch)
     assert len(inner.events) == 1 and inner.events[0]["level"] == "ERROR"
 
 
@@ -195,7 +203,9 @@ def test_transform_applies_fn_as_new_list() -> None:
 
 def test_transform_none_drops_event() -> None:
     inner = RecordingSink()
-    TransformSink(inner, lambda e: None if e["level"] == "DEBUG" else e).emit([ev("DEBUG"), ev("INFO")])
+    TransformSink(inner, lambda e: None if e["level"] == "DEBUG" else e).emit(
+        [ev("DEBUG"), ev("INFO")]
+    )
     assert [e["level"] for e in inner.events] == ["INFO"]
 
 
