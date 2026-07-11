@@ -21,8 +21,9 @@ dependency-free.
     counted (`dropped_oversized`) warning; the rest of the batch still sends (FR-004).
   - **`close`** — no-op; the sink buffers nothing (FR-005).
 
-No changes to the worker, the batching contract, or any earlier module. The `sqs` extra
-(`boto3>=1.34`) was already declared in `pyproject.toml`.
+No changes to the worker, the batching contract, or any earlier module. The extra
+(`boto3>=1.34`) was already declared in `pyproject.toml` — originally named `sqs`, **renamed to
+`aws`** in SPEC-010 when `SNSSink`/`KinesisSink`/`FirehoseSink` joined `SQSSink` on boto3.
 
 ## What changed from earlier specs?
 

@@ -28,7 +28,7 @@ implementation against the design in `architecture.md`.
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
   `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
   SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
-  optional `sqs` extra). The full module map is now built; the setup-phase `core.py` +
+  optional `aws` extra — renamed from `sqs` in SPEC-010). The full module map is now built; the setup-phase `core.py` +
   `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
@@ -39,13 +39,13 @@ implementation against the design in `architecture.md`.
 |---|---|
 | Language | Python **>= 3.13**, fully typed (PEP 561 `py.typed`) |
 | Packaging | Poetry (`poetry-core` build backend), src layout |
-| Runtime deps | **none**; optional extras: `sqs` → `boto3>=1.34`, `sentry` → `sentry-sdk>=2.0` |
+| Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), and queue/stream drivers: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
 | Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
 | Lint / types | `ruff` (line-length 100), `mypy --strict` over `src` |
 
 **Don't add dependencies without noting them here first.** Keeping the core dependency-free is a
-deliberate constraint — new runtime deps belong behind an optional extra (as `sqs`/`boto3` is).
+deliberate constraint — new runtime deps belong behind an optional extra (as `aws`/`boto3` is).
 
 ## Code Conventions
 
