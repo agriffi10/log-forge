@@ -1,7 +1,7 @@
 # Spec: Local File and Embedded Sinks
 
 **ID:** SPEC-008
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-11
 **Depends On:** SPEC-001
 

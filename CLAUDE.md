@@ -72,8 +72,10 @@ sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
 Index + status: `@docs/specs/INDEX.md`. Each spec file's header carries its own `Status`.
 **Current work:** the SPEC-001..005 core arc is **fully Completed** (Core Span Pipeline →
 Logging API + console echo → async `@trace` → background flush worker + shutdown → SQSSink +
-`sqs` extra). No spec is in flight; the next initiative (e.g. PyPI publishing) needs a new spec.
-`docs/implementation-guide.md` remains the phase-level build reference behind the specs.
+`sqs` extra). The **sink-expansion** arc is under way: SPEC-006 (composition/adapter sinks),
+SPEC-007 (stdlib logging bridge), and SPEC-008 (local file + embedded sinks) are **Completed**;
+SPEC-009..011 (HTTP/platform, queue/stream, database sinks) remain **Draft**. No spec is in
+flight. `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
 
