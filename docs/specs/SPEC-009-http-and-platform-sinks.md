@@ -1,8 +1,8 @@
 # Spec: HTTP and Log-Platform Sinks
 
 **ID:** SPEC-009
-**Status:** Draft
-**Last Updated:** 2026-07-10
+**Status:** Completed
+**Last Updated:** 2026-07-11
 **Depends On:** SPEC-001, SPEC-005
 
 ## Overview

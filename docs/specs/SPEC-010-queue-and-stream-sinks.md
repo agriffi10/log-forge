@@ -1,8 +1,8 @@
 # Spec: Queue and Stream Buffer Sinks
 
 **ID:** SPEC-010
-**Status:** Draft
-**Last Updated:** 2026-07-10
+**Status:** Completed
+**Last Updated:** 2026-07-11
 **Depends On:** SPEC-005
 
 ## Overview
