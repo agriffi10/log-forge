@@ -8,12 +8,32 @@ single request (callers drop oversized items first, counting ``dropped_oversized
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from typing import TypeVar
 
-__all__ = ["chunk_items"]
+__all__ = ["chunk_items", "chunk_list", "valid_identifier"]
 
 _T = TypeVar("_T")
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def chunk_list(items: list[_T], size: int) -> Iterator[list[_T]]:
+    """Yield ``items`` in successive slices of at most ``size`` (a positive chunk size)."""
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def valid_identifier(name: str) -> str:
+    """Return ``name`` if it is a plain SQL identifier, else raise ``ValueError``.
+
+    Table names are config, not untrusted input, but they are interpolated into DDL/DML (SQL cannot
+    parameterize identifiers), so restrict them to ``[A-Za-z_][A-Za-z0-9_]*`` to foreclose injection.
+    """
+    if not _IDENTIFIER.match(name):
+        raise ValueError(f"invalid table name {name!r}; expected a plain SQL identifier")
+    return name
 
 
 def chunk_items(
