@@ -1,7 +1,7 @@
 # Spec: Composition and Adapter Sinks
 
 **ID:** SPEC-006
-**Status:** In Progress
+**Status:** Completed
 **Last Updated:** 2026-07-10
 **Depends On:** SPEC-001
 
