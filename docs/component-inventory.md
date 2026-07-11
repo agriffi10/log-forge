@@ -17,6 +17,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `MultiSink` | `src/log_forge/sinks/multi.py` | Fan one batch out to several sinks; per-child failure isolation (`failed`), close-all. |
 | `FilteringSink` | `src/log_forge/sinks/filtering.py` | Forward only events passing a predicate and/or `min_level`; fail-open on unknown level, no empty-batch emit. |
 | `TransformSink` | `src/log_forge/sinks/transform.py` | Per-event reshape/redact before forwarding; `None` drops; never mutates the caller's batch. |
+| `LoggingSink` | `src/log_forge/sinks/logging_sink.py` | Bridge events into stdlib `logging` — one `LogRecord`/event through a configurable logger; level-mapped, verbatim message, reserved-attr-safe fields (flat + nested). |
 | `@trace` | `src/log_forge/decorator.py` | Span decorator (sync + async, dispatched by `iscoroutinefunction`): lifecycle, hierarchy, non-swallowing flush. |
 | level emitters + `set_baggage` | `src/log_forge/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
 | `ConsoleWriter` | `src/log_forge/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
