@@ -17,17 +17,6 @@ calls form a tree you can query later.
 - **Non-blocking delivery** — finished spans are handed to a background worker; your code never
   blocks on sink I/O, and a graceful drain at exit means buffered events aren't lost.
 
-> **Status:** the core arc (SPEC-001 → 005) is complete. Shipped: the `@trace` decorator,
-> `configure()`, and `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
-> emitters, `echo=` console output, and `set_baggage` (SPEC-002); async `@trace` over `async def`
-> (SPEC-003); the non-blocking background flush worker with graceful `shutdown()` (SPEC-004); and
-> the `SQSSink` behind the optional `aws` extra (SPEC-005). The sink-expansion arc (SPEC-006 → 011)
-> is also complete: composition/adapter sinks, a stdlib `logging` bridge, local file + embedded
-> SQLite, HTTP and log-platform sinks (Elasticsearch, Loki, Logstash, Syslog, Datadog, Splunk, New
-> Relic, Honeycomb, Sentry), queue/stream sinks (Kafka, Redis, RabbitMQ, NATS, Pub/Sub, Event Hubs,
-> Kinesis, Firehose, SNS), and database sinks (MongoDB, Postgres, ClickHouse) — see [Sinks](#sinks).
-> Not yet done: publishing to PyPI (see [Roadmap](#roadmap)).
-
 ---
 
 ## Requirements
@@ -36,7 +25,7 @@ calls form a tree you can query later.
 
 ## Installation
 
-`log-forge` is not yet published to PyPI (see [Roadmap](#roadmap)). Install from source:
+`log-forge` is not yet published to PyPI. Install from source:
 
 ```bash
 # from a clone of this repo
@@ -502,24 +491,6 @@ The library uses a src layout (`src/log_forge/`) with a single concept per modul
 `ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
 `base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
-
-## Roadmap
-
-The core arc (SPEC-001 → 005) and the sink-expansion arc (SPEC-006 → 011; see
-[`docs/specs/INDEX.md`](docs/specs/INDEX.md)) are **complete**: the core span pipeline, logging API +
-console echo + baggage, async `@trace`, the background flush worker with graceful `shutdown()`, the
-`SQSSink`, and the full [sink catalog](#sinks) (composition/adapters, stdlib `logging`, file +
-SQLite, HTTP/platform, queue/stream, and database sinks). What remains:
-
-- **Publishing to PyPI** — not yet done; there is no release workflow today. Until then, install
-  from source (see [Installation](#installation)).
-- **Deferred by design** (IDs are already W3C-compatible, so these stay cheap to add later):
-  async is in; cross-process trace continuation, cross-process baggage, and tail sampling
-  (a `should_send` seam is reserved) are not built.
-
-**Out of scope** (by design): metrics or OTel-native traces · querying / dashboards / alerting
-(that's ELK downstream) · more than one configured sink per process · cross-process trace
-continuation.
 
 ## License
 
