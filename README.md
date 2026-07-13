@@ -1,14 +1,15 @@
 # log-forge
 
 Consistent, structured (JSON) logs for every decorated function call — correlated by shared
-trace/span IDs, ready to ship to a downstream sink (stdout today; SQS → ELK on the roadmap).
+trace/span IDs, ready to ship to any of 30-plus built-in sinks (stdout by default; SQS → ELK is
+the headline production path).
 
 `log-forge` owns the **logs** pillar of observability. You decorate a function with `@trace`;
 it emits one identically-shaped JSON record when the call starts and another when it ends
 (with duration and status), stitched together by W3C-compatible trace and span IDs so nested
 calls form a tree you can query later.
 
-- **Zero runtime dependencies** — the core pulls in nothing; `boto3` lives behind an optional `sqs` extra.
+- **Zero runtime dependencies** — the core pulls in nothing; every sink that needs a third-party client (boto3, kafka, redis, …) sits behind its own optional extra, lazily imported.
 - **Fully typed** — `mypy --strict`, ships a PEP 561 `py.typed` marker.
 - **Structured, never free-form** — every event is the same named-field JSON shape.
 - **Safe by default** — never captures your arguments or return values (no accidental PII/secret leakage), and the decorator **never swallows exceptions**.
@@ -20,8 +21,12 @@ calls form a tree you can query later.
 > `configure()`, and `StdoutSink` (SPEC-001); the `debug`/`info`/`warning`/`error`/`critical`
 > emitters, `echo=` console output, and `set_baggage` (SPEC-002); async `@trace` over `async def`
 > (SPEC-003); the non-blocking background flush worker with graceful `shutdown()` (SPEC-004); and
-> the `SQSSink` behind the optional `sqs` extra (SPEC-005). Not yet done: publishing to PyPI (see
-> [Roadmap](#roadmap)).
+> the `SQSSink` behind the optional `aws` extra (SPEC-005). The sink-expansion arc (SPEC-006 → 011)
+> is also complete: composition/adapter sinks, a stdlib `logging` bridge, local file + embedded
+> SQLite, HTTP and log-platform sinks (Elasticsearch, Loki, Logstash, Syslog, Datadog, Splunk, New
+> Relic, Honeycomb, Sentry), queue/stream sinks (Kafka, Redis, RabbitMQ, NATS, Pub/Sub, Event Hubs,
+> Kinesis, Firehose, SNS), and database sinks (MongoDB, Postgres, ClickHouse) — see [Sinks](#sinks).
+> Not yet done: publishing to PyPI (see [Roadmap](#roadmap)).
 
 ---
 
@@ -37,16 +42,37 @@ calls form a tree you can query later.
 # from a clone of this repo
 poetry install                 # or: pip install .
 
-# with the (planned) SQS sink extra
-poetry install -E sqs          # or: pip install '.[sqs]'
+# with an optional sink extra (e.g. the AWS sinks)
+poetry install -E aws          # or: pip install '.[aws]'
 ```
 
 Once published, the intended install will be:
 
 ```bash
 pip install log-forge          # core, zero dependencies
-pip install 'log-forge[sqs]'   # + boto3 for the SQS sink
+pip install 'log-forge[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
+
+### Optional extras
+
+The core is dependency-free. Each sink built on a third-party client lives behind its own extra
+(the client is imported lazily, only when you construct that sink). All other sinks — stdout,
+file, SQLite, the stdlib-`logging` bridge, and every HTTP/socket platform sink (Elasticsearch,
+Loki, Logstash, Syslog, Datadog, Splunk, New Relic, Honeycomb) — need **no** extra.
+
+| Extra | Installs | Enables |
+|---|---|---|
+| `aws` | `boto3` | `SQSSink`, `SNSSink`, `KinesisSink`, `FirehoseSink` |
+| `sentry` | `sentry-sdk` | `SentrySink` via the SDK (a raw-HTTP fallback works without it) |
+| `kafka` | `confluent-kafka` | `KafkaSink` |
+| `redis` | `redis` | `RedisStreamsSink`, `RedisListSink` |
+| `amqp` | `pika` | `RabbitMQSink` |
+| `nats` | `nats-py` | `NATSSink` |
+| `gcp-pubsub` | `google-cloud-pubsub` | `GooglePubSubSink` |
+| `azure-eventhubs` | `azure-eventhub` | `AzureEventHubsSink` |
+| `mongo` | `pymongo` | `MongoDBSink` |
+| `postgres` | `psycopg[binary]` | `PostgresSink` |
+| `clickhouse` | `clickhouse-connect` | `ClickHouseSink` |
 
 ## Quickstart
 
@@ -224,8 +250,8 @@ def process_payment(user_id: int) -> str:
 
 ### Sinks
 
-A sink is the swappable output transport — any object satisfying the `Sink` protocol. It
-receives already-built, batched event dicts and knows nothing about spans:
+A **sink** is the swappable output transport — any object satisfying the `Sink` protocol. It
+receives already-built, batched event dicts and knows nothing about spans or context:
 
 ```python
 class Sink(Protocol):
@@ -233,28 +259,187 @@ class Sink(Protocol):
     def close(self) -> None: ...
 ```
 
-Pass an instance to `configure(sink=...)`. Two sinks ship with the library:
+Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
+call falls back to `StdoutSink()`. Sinks are **not** re-exported at the top level — import each
+from its own module, e.g. `from log_forge.sinks.sqs import SQSSink`.
 
-- **`StdoutSink`** (default, zero-dependency) — writes one JSON line per event to a stream
-  (default `sys.stdout`); construct it with `StdoutSink(stream=...)` to redirect.
-- **`SQSSink`** — the production path: ships events to an Amazon SQS queue that acts as a
-  durable buffer in front of your indexer (e.g. ELK), absorbing downstream spikes and outages.
-  It re-chunks each batch to SQS's hard limits (≤ 10 messages and ≤ 256 KB per request), retries
-  partial failures, and drops any single event too large to ever fit (with a warning). It lives
-  behind the optional `sqs` extra so the core stays dependency-free:
+A few conventions hold across every sink below:
 
-  ```python
-  import log_forge
-  from log_forge.sinks.sqs import SQSSink
+- **Extras.** The core is dependency-free. A sink built on a third-party client sits behind the
+  optional extra named in its table (blank = zero-dependency, stdlib only); the client is imported
+  lazily, so `import log_forge.sinks.<x>` never fails for a missing dependency — only *constructing*
+  the sink without an injected client does. See [Optional extras](#optional-extras).
+- **Injection.** Sinks backed by an external resource accept an injected client/connection/stream
+  (`client=`, `connection=`, `producer=`, `stream=`, `opener=`) for testing or bespoke configuration.
+  The tables show the destination-defining arguments only; sinks that retry also take `max_retries`.
+- **Ownership.** A resource the sink opens itself is closed on `shutdown()`; an injected one is left
+  open for you to manage.
+- **Never crashes the app.** A failing sink is retried with backoff and then counted (`.failed`,
+  `.dropped_oversized`, …) rather than raised — a broken destination degrades logging, nothing more.
 
-  log_forge.configure(service="payments", sink=SQSSink(queue_url="https://sqs.../q"))
-  ```
+#### Built-in, zero-dependency
 
-  Install with `pip install 'log-forge[sqs]'` (pulls `boto3`). AWS credentials and region are
-  resolved by `boto3`'s standard chain — log-forge adds no credential configuration of its own.
-  Consuming from SQS and indexing into ELK is a separate component, outside this library.
+| Sink | Import from | Configure |
+|---|---|---|
+| `StdoutSink` | `log_forge.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
+| `StderrSink` | `log_forge.sinks.util` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
+| `NullSink` | `log_forge.sinks.util` | `NullSink()` — discard everything; `.dropped` counts events |
+| `MemorySink` | `log_forge.sinks.util` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
 
-You can also implement your own sink (file, HTTP, Kafka, …) — just satisfy the two methods.
+```python
+from log_forge.sinks.stdout import StdoutSink
+lf.configure(sink=StdoutSink())          # explicit; also the zero-config default
+```
+
+#### Composition & adapters (zero-dependency)
+
+`configure(sink=...)` takes a single sink, so compose these to filter, reshape, fan out, or bridge
+to a plain callable.
+
+| Sink | Import from | Configure |
+|---|---|---|
+| `MultiSink` | `log_forge.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed` |
+| `FilteringSink` | `log_forge.sinks.filtering` | `FilteringSink(inner, *, predicate=None, min_level=None)` — forward only events passing `predicate` and/or at/above `min_level` |
+| `TransformSink` | `log_forge.sinks.transform` | `TransformSink(inner, fn)` — map each event through `fn` before forwarding; return `None` to drop one |
+| `CallbackSink` | `log_forge.sinks.callback` | `CallbackSink(fn, *, on_close=None)` — hand each batch to any callable |
+
+```python
+from log_forge.sinks.multi import MultiSink
+from log_forge.sinks.filtering import FilteringSink
+from log_forge.sinks.stdout import StdoutSink
+from log_forge.sinks.sqs import SQSSink
+
+lf.configure(sink=MultiSink(
+    StdoutSink(),                                                    # echo everything locally
+    FilteringSink(SQSSink(queue_url="…"), min_level="WARNING"),      # only WARNING+ to SQS
+))
+```
+
+`min_level` is one of `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` (case-insensitive); an event whose
+level is unknown or missing fails open (is forwarded).
+
+#### Standard-library `logging` bridge (zero-dependency)
+
+| Sink | Import from | Configure |
+|---|---|---|
+| `LoggingSink` | `log_forge.sinks.logging_sink` | `LoggingSink(logger=None, *, default_level="INFO")` — emit each event as a `logging.LogRecord` |
+
+Hands every event to a `logging.Logger` (default `logging.getLogger("log_forge")`) so your existing
+handlers, formatters, and `logging.config` apply. Identity fields and the nested `fields` are
+attached to each record; the sink never configures or tears down logging itself.
+
+#### Local file & embedded (zero-dependency)
+
+| Sink | Import from | Configure |
+|---|---|---|
+| `FileSink` | `log_forge.sinks.file` | `FileSink(path, *, encoding="utf-8")` — append NDJSON to one file |
+| `RotatingFileSink` | `log_forge.sinks.file` | `RotatingFileSink(path, *, max_bytes=0, backup_count=0, when=None, interval=1)` — rotate by size and/or time, keeping `backup_count` numbered backups |
+| `SQLiteSink` | `log_forge.sinks.sqlite` | `SQLiteSink(database, *, table="log_events", create_table=True)` — batch-insert into an embedded SQLite DB |
+
+`RotatingFileSink`'s time trigger uses a `when` unit code — `"S"`/`"M"`/`"H"`/`"D"` — times `interval`
+(either trigger, or both, can be enabled). `SQLiteSink` stores each event as full JSON plus projected
+`log_id`/`trace_id`/`span_id`/`timestamp`/`level`/`function` columns; pass `create_table=False` when
+you provision the table yourself.
+
+```python
+from log_forge.sinks.file import RotatingFileSink
+lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup_count=5))
+```
+
+#### HTTP & self-hosted platforms (zero-dependency)
+
+All build on `HTTPSink` (stdlib `urllib`): they POST batches with bounded `429`/`5xx` retry
+(honoring `Retry-After`) and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
+to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`).
+
+| Sink | Import from | Configure |
+|---|---|---|
+| `HTTPSink` | `log_forge.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"` |
+| `ElasticsearchSink` | `log_forge.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
+| `OpenSearchSink` | `log_forge.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
+| `LokiSink` | `log_forge.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
+| `LogstashSink` | `log_forge.sinks.logstash` | `LogstashSink(url=…, **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket |
+| `SyslogSink` | `log_forge.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-forge")` — RFC 5424 over UDP/TCP |
+
+```python
+from log_forge.sinks.elasticsearch import ElasticsearchSink
+lf.configure(sink=ElasticsearchSink("https://es.internal:9200", index="app-logs",
+                                     auth=("elastic", "…")))
+```
+
+#### SaaS platforms
+
+Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers the `sentry-sdk`
+(the `sentry` extra) and falls back to raw HTTP envelopes when it isn't installed.
+
+| Sink | Import from | Extra | Configure |
+|---|---|---|---|
+| `DatadogSink` | `log_forge.sinks.datadog` | — | `DatadogSink(api_key, *, site="datadoghq.com", service=None, ddtags=None)` |
+| `SplunkHECSink` | `log_forge.sinks.splunk` | — | `SplunkHECSink(url, token, *, host=None, source="log-forge")` — HTTP Event Collector |
+| `NewRelicSink` | `log_forge.sinks.newrelic` | — | `NewRelicSink(api_key, *, region="US")` — `region` is `"US"` or `"EU"` |
+| `HoneycombSink` | `log_forge.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` |
+| `SentrySink` | `log_forge.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR")` — sends only `min_level`+ events |
+
+With the `sentry` extra installed, `SentrySink` captures via `sentry_sdk.capture_event` (initialize
+the SDK yourself with `sentry_sdk.init(...)`); without it, pass `dsn=` and events are POSTed as
+Sentry envelopes over HTTP.
+
+#### AWS — the durable-buffer path (`aws` extra)
+
+`pip install 'log-forge[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
+chain — log-forge adds none of its own. Each re-chunks every batch to the service's hard per-request
+limits, retries partial failures, and drops any single event too large to ever fit (counted on
+`.dropped_oversized`).
+
+| Sink | Import from | Configure |
+|---|---|---|
+| `SQSSink` | `log_forge.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages |
+| `SNSSink` | `log_forge.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3)` |
+| `KinesisSink` | `log_forge.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
+| `FirehoseSink` | `log_forge.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
+
+```python
+from log_forge.sinks.sqs import SQSSink
+lf.configure(service="payments",
+             sink=SQSSink(queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/logs"))
+```
+
+Consuming from the buffer and indexing into ELK is a separate component, outside this library.
+
+#### Queue & stream
+
+Each needs its own extra (lazy-imported). All publish + retry within a bound and close cleanly.
+
+| Sink | Import from | Extra | Configure |
+|---|---|---|---|
+| `KafkaSink` | `log_forge.sinks.kafka` | `kafka` | `KafkaSink(topic, *, bootstrap_servers="…", key_field="trace_id")` |
+| `RedisStreamsSink` | `log_forge.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None)` — `XADD` |
+| `RedisListSink` | `log_forge.sinks.redis` | `redis` | `RedisListSink(key, *, url=None)` — `RPUSH` |
+| `RabbitMQSink` | `log_forge.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
+| `NATSSink` | `log_forge.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None)` |
+| `GooglePubSubSink` | `log_forge.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
+| `AzureEventHubsSink` | `log_forge.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
+
+```python
+from log_forge.sinks.kafka import KafkaSink
+lf.configure(sink=KafkaSink("app-logs", bootstrap_servers="broker:9092"))
+```
+
+#### Databases
+
+Write-only inserts (querying is the downstream tool's job); each needs its own extra.
+
+| Sink | Import from | Extra | Configure |
+|---|---|---|---|
+| `MongoDBSink` | `log_forge.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…")` |
+| `PostgresSink` | `log_forge.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False)` — JSONB `event` column + extracted columns |
+| `ClickHouseSink` | `log_forge.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False)` — MergeTree, columnar insert |
+
+`PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set
+it `True` for an idempotent `CREATE TABLE IF NOT EXISTS` convenience.
+
+Prefer a destination not listed here? Implement the two-method `Sink` protocol yourself, or wrap any
+callable in `CallbackSink`.
 
 ### Flushing and shutdown
 
@@ -314,14 +499,17 @@ every pull request and on push to `main`. A second workflow
 ([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
 
 The library uses a src layout (`src/log_forge/`) with a single concept per module: `config`,
-`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and `sinks/{base,stdout,sqs}`.
+`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
+`base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
-The core arc (SPEC-001 → 005; see [`docs/specs/INDEX.md`](docs/specs/INDEX.md)) is **complete**:
-core span pipeline, logging API + console echo + baggage, async `@trace`, the background flush
-worker with graceful `shutdown()`, and the `SQSSink`. What remains:
+The core arc (SPEC-001 → 005) and the sink-expansion arc (SPEC-006 → 011; see
+[`docs/specs/INDEX.md`](docs/specs/INDEX.md)) are **complete**: the core span pipeline, logging API +
+console echo + baggage, async `@trace`, the background flush worker with graceful `shutdown()`, the
+`SQSSink`, and the full [sink catalog](#sinks) (composition/adapters, stdlib `logging`, file +
+SQLite, HTTP/platform, queue/stream, and database sinks). What remains:
 
 - **Publishing to PyPI** — not yet done; there is no release workflow today. Until then, install
   from source (see [Installation](#installation)).
