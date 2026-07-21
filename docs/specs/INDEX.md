@@ -16,6 +16,7 @@ to status only — no prose.
 | [SPEC-009](SPEC-009-http-and-platform-sinks.md) | HTTP and Log-Platform Sinks | Completed | SPEC-001, SPEC-005 |
 | [SPEC-010](SPEC-010-queue-and-stream-sinks.md) | Queue and Stream Buffer Sinks | Completed | SPEC-005 |
 | [SPEC-011](SPEC-011-database-sinks.md) | Database Sinks | Completed | SPEC-001, SPEC-005 |
+| [SPEC-012](SPEC-012-pypi-publishing-and-dynamic-versioning.md) | PyPI Publishing and Dynamic Versioning | Draft | None |
 
 ## Arcs (build order)
 
@@ -25,3 +26,5 @@ Group related specs and record the order to build them in. Delete this section i
 - **Sink expansion (pluggable destinations):** SPEC-006 → SPEC-007 → SPEC-008 → SPEC-009 → SPEC-010 → SPEC-011.
   SPEC-006..008 are independent zero-dependency specs (any order); SPEC-009..011 reuse the SPEC-005
   optional-extra + lazy-import + bounded-retry pattern for third-party transports.
+- **Release and distribution:** SPEC-012 — standalone; depends on no prior spec and touches only
+  packaging config and CI, not the library runtime.
