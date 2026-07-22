@@ -13,7 +13,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-__all__ = ["Span", "build_event", "start_event", "end_event"]
+__all__ = ["Span", "build_event", "start_event", "end_event", "backfill_baggage"]
 
 # Auto-generated span-boundary event messages. Tests assert on contract fields
 # (``status``, ``trace_id``), never on this text — rename freely.
@@ -104,3 +104,32 @@ def end_event(
             "stack": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         }
     return event
+
+
+def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
+    """Merge the span's final baggage into its buffered **boundary** events.
+
+    ``@trace`` buffers ``span.start`` before the body runs, so baggage the body sets on its first
+    line did not exist when that event was built — and :func:`build_event` snapshots ``fields``
+    into each event dict, so a later value has to be written back. Same structural reason as
+    :func:`~log_foundry.decorator._reparent_current_span`. The whole span flushes as one batch at
+    close, so this completes the events before any of them is emitted.
+
+    Boundary events only. An ``info`` emitted before ``set_baggage`` genuinely did not carry it,
+    and rewriting a record of a moment would be a lie; merging over mid-span events would also let
+    baggage override a per-call field, inverting :func:`build_event`'s precedence. Boundary events
+    describe the span as a whole and carry no per-call fields, so baggage correctly wins there over
+    ``cfg.defaults`` and ``span.defaults``.
+
+    The baggage is a parameter rather than read from ``context``: this module does not know where
+    the current span lives (arch §6).
+    """
+    if not baggage:
+        return
+    for event in span.events:
+        # Matched on the message constants, not a position — that ``span.start`` is index 0 is an
+        # implementation detail of when it happens to be appended.
+        if event.get("message") in (_START_MESSAGE, _END_MESSAGE):
+            fields = event.get("fields")
+            if isinstance(fields, dict):
+                event["fields"] = {**fields, **baggage}

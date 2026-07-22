@@ -39,7 +39,7 @@ from log_foundry.ids import (
     new_trace_id,
     parse_traceparent,
 )
-from log_foundry.model import Span, end_event, start_event
+from log_foundry.model import Span, backfill_baggage, end_event, start_event
 from log_foundry.worker import Worker
 
 __all__ = ["trace", "continue_trace"]
@@ -245,8 +245,16 @@ def _flush(span: Span) -> None:
 
 
 def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
-    """Append the end event (so the flushed queue is complete), then flush."""
+    """Append the end event, complete the boundary events' baggage, then flush.
+
+    Every path — sync, async, and the error path — closes through here, which is what makes one
+    backfill call enough to cover all three.
+    """
     span.events.append(end_event(span, status, exc))
+    # SPEC-015: the boundary events were built with the baggage known at their construction —
+    # empty for `span.start`, which is buffered before the body runs. Complete them from the
+    # baggage live *now*, while the batch is still ours.
+    backfill_baggage(span, context.get_baggage())
     _flush(span)
 
 
