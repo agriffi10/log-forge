@@ -80,6 +80,25 @@ def _shutdown_worker() -> None:
         _worker.shutdown()
 
 
+def _flush_worker(timeout: float | None = 5.0) -> bool:
+    """Drain the process worker without retiring it. Backs ``flush()`` (SPEC-013 FR-003).
+
+    Returns ``True`` when no worker exists: a process that never logged has nothing to drain,
+    and building one here — with the thread and ``atexit`` registration :func:`_get_worker`
+    brings — in order to flush nothing would be pure cost. So this deliberately does *not* call
+    :func:`_get_worker`.
+    """
+    worker = _worker
+    if worker is None:
+        return True
+    try:
+        return worker.flush(timeout)
+    except Exception:  # noqa: BLE001 — a flush is the call most likely to be made in a
+        # `finally`, so the library must never be the reason a caller's function fails. Any
+        # failure is reported by the return value instead (FR-003).
+        return False
+
+
 def _flush(span: Span) -> None:
     """Hand the finished span's events to the background worker — non-blocking (FR-001).
 

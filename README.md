@@ -170,6 +170,12 @@ never crashes the worker or the app. If the bounded queue fills completely, new 
 dropped (newest-first) and counted rather than blocking your code. On `shutdown()` the worker
 stops, sweeps anything still queued into one final batch, emits it, and closes the sink.
 
+Both triggers can be pre-empted: `flush()` puts a marker in the queue and the worker emits the
+pending pile the moment it reaches it, ignoring the count and time triggers. Because the queue
+is FIFO, everything submitted before the call is necessarily ahead of that marker — which is
+exactly why the guarantee is "events submitted before this call", and why concurrent
+submissions from other threads may or may not be included.
+
 ## Usage
 
 ### `configure(...)`
@@ -458,17 +464,70 @@ a failing sink with backoff, and applies backpressure so a slow or down sink can
 back-pressure the app: when its bounded queue is full it drops the newest submissions and counts
 them (`worker.dropped`) rather than stalling.
 
-Because delivery is asynchronous, drain before the process exits:
+Because delivery is asynchronous, drain before the process exits. There are two drains, and
+which one you want depends on whether the process is about to end:
 
 ```python
 import log_foundry as lf
 
-lf.shutdown()   # flush buffered events and close the sink; blocks until drained
+lf.flush()      # drain to the sink and keep going; returns True when everything landed
+lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained
 ```
 
+| | `flush()` | `shutdown()` |
+|---|---|---|
+| Drains buffered events | yes | yes |
+| Closes the sink | no | yes |
+| Worker survives | yes | **no** — it never comes back |
+| Repeatable | yes | idempotent, but only the first call does anything |
+| Use it | before returning from a handler, or at a checkpoint | once, as the process exits |
+
 `shutdown()` is also registered via `atexit`, so a normal exit flushes automatically — call it
-explicitly when you need to be certain the tail reached the sink before a fast exit (e.g. at the
-end of a short script or an AWS Lambda handler). It is idempotent.
+explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
+end of a short script. It is idempotent.
+
+`flush(timeout=5.0)` returns `True` when every event submitted before the call has been passed
+to the sink, and `False` if that did not happen within `timeout` (or the worker was already shut
+down). It never raises — a logging call must not be the reason your function fails. Passing
+`timeout=None` waits indefinitely, which is unsafe anywhere with an execution deadline.
+
+#### Serverless / short-lived processes
+
+In AWS Lambda (and anything else that freezes rather than exits) the rules are different, and
+getting them wrong is silent:
+
+- **Flush before the handler returns.** Lambda freezes the execution environment the instant
+  your handler returns, so the worker's interval-based flush stops mid-interval and whatever is
+  still queued is lost when the container is eventually reaped. `atexit` does not save you —
+  a frozen environment is killed without running exit handlers, so `flush()` is the *only*
+  guaranteed drain there.
+- **Put it in a `finally`.** A flush written as the last line of the handler body is precisely
+  the line that does not run when the handler raises, and the invocation whose logs are most
+  worth having is the one that failed.
+- **Never call `shutdown()` per invocation.** It is terminal: the worker does not come back, so
+  the first invocation on a warm container would log and every later one would silently log
+  nothing. That failure reads as "works locally, broken in production".
+
+```python
+import log_foundry as lf
+from log_foundry.sinks.sqs import SQSSink
+
+lf.configure(service="billing-api", env="prod", sink=SQSSink(queue_url=QUEUE_URL))
+
+@lf.trace
+def handler(event, context):
+    lf.info("received", records=len(event["Records"]))
+    try:
+        return do_work(event)
+    finally:
+        lf.flush()      # in `finally`: the failed invocation is the one worth logging.
+                        # NEVER shutdown() here — the worker does not come back, and every
+                        # later invocation on this warm container would log nothing.
+```
+
+Note that each invocation is its own trace: trace context does not cross a process boundary
+today, so N invocations produce N `trace_id`s. Correlate them with a shared
+[`set_baggage`](#logging-inside-a-span) field until cross-process continuation ships.
 
 ## Event schema
 
