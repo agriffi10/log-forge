@@ -5,9 +5,17 @@ Public façade (module-function shape). Exposes configuration, the ``@trace`` de
 drain of the background worker).
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from log_forge.api import critical, debug, error, info, set_baggage, warning
 from log_forge.config import configure, get_config
 from log_forge.decorator import trace
+
+try:
+    __version__ = _dist_version("log-forge")
+except PackageNotFoundError:  # running from a source tree that isn't installed
+    __version__ = "0.0.0"
 
 
 def shutdown() -> None:
@@ -32,4 +40,5 @@ __all__ = [
     "critical",
     "set_baggage",
     "shutdown",
+    "__version__",
 ]

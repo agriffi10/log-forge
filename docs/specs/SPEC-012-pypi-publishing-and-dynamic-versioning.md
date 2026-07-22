@@ -36,8 +36,10 @@ every merge before it is ever asked to ship to production.
   `pypa/gh-action-pypi-publish`, using GitHub Environments named `pypi` and `testpypi`.
 - Gating every publish behind the existing lint, type-check, and test suite by reusing the
   current `ci.yml` as a called workflow, so a red build can never publish.
-- Establishing an initial baseline tag (`v0.1.0`) so that development versions read sensibly
-  before the first real release.
+- Establishing an initial baseline tag (`v0.0.1`) so that development versions read sensibly
+  before the first real release. The baseline is pushed *before* `release.yml` exists, so it
+  never triggers a publish — which also means it is consumed by setup and cannot itself be the
+  debut release. The first production PyPI release is therefore `v0.1.0`.
 
 ### Out of Scope
 
@@ -72,8 +74,8 @@ table so no one edits a version by hand again.
       key.
 - [ ] `[build-system]` uses `build-backend = "poetry_dynamic_versioning.backend"` and lists
       `poetry-dynamic-versioning` in `requires`.
-- [ ] Building at a commit tagged `v0.1.0` produces distributions whose version metadata is
-      exactly `0.1.0`.
+- [ ] Building at a commit tagged `vX.Y.Z` produces distributions whose version metadata is
+      exactly `X.Y.Z`.
 - [ ] Building at an untagged commit that is N commits ahead of the latest tag produces a valid
       PEP 440 public development version (for example `0.1.1.devN`) that carries **no** local
       version segment (no `+<hash>` suffix), because PyPI and TestPyPI reject uploads whose
