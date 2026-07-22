@@ -1,8 +1,10 @@
 """log_foundry — consistent, structured logs per decorated function call.
 
 Public façade (module-function shape). Exposes configuration, the ``@trace`` decorator, the
-``debug/info/warning/error/critical`` emitters, ``set_baggage``, ``flush`` (drain and keep
-logging) and ``shutdown`` (drain, close the sink, and stop).
+``debug/info/warning/error/critical`` emitters, ``set_baggage``, the cross-process propagation
+pair (``continue_trace`` to adopt an inbound context; ``current_traceparent`` /
+``current_trace_context`` / ``current_baggage_header`` to publish this one), ``flush`` (drain and
+keep logging) and ``shutdown`` (drain, close the sink, and stop).
 """
 
 from importlib.metadata import PackageNotFoundError
@@ -10,7 +12,12 @@ from importlib.metadata import version as _dist_version
 
 from log_foundry.api import critical, debug, error, info, set_baggage, warning
 from log_foundry.config import configure, get_config
-from log_foundry.decorator import trace
+from log_foundry.context import (
+    current_baggage_header,
+    current_trace_context,
+    current_traceparent,
+)
+from log_foundry.decorator import continue_trace, trace
 
 try:
     # Distribution name ("log-foundry") differs from the import name ("log_foundry").
@@ -67,6 +74,10 @@ __all__ = [
     "error",
     "critical",
     "set_baggage",
+    "continue_trace",
+    "current_traceparent",
+    "current_trace_context",
+    "current_baggage_header",
     "flush",
     "shutdown",
     "__version__",

@@ -13,6 +13,10 @@ opens when the coroutine actually runs and closes when it finishes, with no new 
 
 Flushing is synchronous here; the background worker (SPEC-004) later swaps only
 :func:`_flush` for a non-blocking handoff — the lifecycle below is untouched.
+
+:func:`continue_trace` (SPEC-014) lives here rather than in ``api`` because it is the other half
+of :func:`_open_span`'s hierarchy rules: it decides which trace the *next* root span joins, and
+re-parents an already-open one. The ``traceparent`` codec it validates with stays in ``ids``.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import functools
+import sys
 import threading
 from collections.abc import Callable
 from time import monotonic
@@ -27,11 +32,20 @@ from typing import Any, TypeVar, cast, overload
 
 from log_foundry import context
 from log_foundry.config import _ensure_sink
-from log_foundry.ids import new_span_id, new_trace_id
+from log_foundry.ids import (
+    is_valid_span_id,
+    is_valid_trace_id,
+    new_span_id,
+    new_trace_id,
+    parse_traceparent,
+)
 from log_foundry.model import Span, end_event, start_event
 from log_foundry.worker import Worker
 
-__all__ = ["trace"]
+__all__ = ["trace", "continue_trace"]
+
+# Bound on how much of a rejected inbound value is echoed into a stderr warning.
+_MAX_REJECTED_ECHO = 64
 
 # One background worker per process (SPEC-004), created lazily from the configured sink on the
 # first flush. The double-checked lock makes concurrent first-flushes create exactly one.
@@ -43,18 +57,140 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
-    """Mint a span, inheriting the trace/parent from the current context (arch §3)."""
+    """Mint a span, inheriting the trace/parent from the current context (arch §3).
+
+    An inbound context adopted via :func:`continue_trace` is consulted **only** when no span is
+    open (SPEC-014 FR-001): a nested call still inherits from its in-process parent, because
+    moving it to the inbound span would sever it from the parent it actually ran inside.
+    """
     parent = context.current_span()
+    trace_id: str
+    parent_span_id: str | None
+    if parent is not None:
+        trace_id, parent_span_id = parent.trace_id, parent.span_id
+    else:
+        adopted = context.get_adopted_context()
+        trace_id, parent_span_id = adopted if adopted else (new_trace_id(), None)
     span = Span(
-        trace_id=parent.trace_id if parent else new_trace_id(),
+        trace_id=trace_id,
         span_id=new_span_id(),
-        parent_span_id=parent.span_id if parent else None,
+        parent_span_id=parent_span_id,
         name=name,
         start_ts=monotonic(),
         defaults=defaults or {},
     )
     span.events.append(start_event(span))
     return span
+
+
+def _warn_rejected(reason: str, value: object) -> None:
+    """Report a rejected inbound context on stderr, as ``worker`` and ``SQSSink`` do.
+
+    The offending value is echoed only as a **bounded ``repr``**. Unbounded is a log-injection
+    surface — the value is attacker-controllable, and `repr` additionally escapes newlines and
+    control characters so it cannot forge a second log line in an operator's console.
+    """
+    shown = repr(value)
+    if len(shown) > _MAX_REJECTED_ECHO:
+        shown = shown[:_MAX_REJECTED_ECHO] + "…"
+    sys.stderr.write(f"log-foundry: ignoring inbound trace context ({reason}): {shown}\n")
+
+
+def continue_trace(
+    traceparent: str | None = None,
+    *,
+    trace_id: str | None = None,
+    parent_span_id: str | None = None,
+    baggage: str | None = None,
+) -> bool:
+    """Adopt an inbound trace context so this process's spans join the caller's trace.
+
+    Accepts a W3C ``traceparent`` string or the ids directly. **If a span is already open and
+    it is a root** (``parent_span_id is None`` — the ``@trace``-decorated entry point calling
+    this on its first line), that span is re-parented in place and its buffered events are
+    rewritten to match. A span that is *not* a root is left alone; a call with no span open
+    re-parents nothing. In every case the context applies to the next root span opened here.
+
+    Call it on the **first line** of the entry point: a child span that already finished has
+    been handed to the worker and can no longer be rewritten.
+
+    ``baggage`` is a W3C ``baggage`` header merged into the current context. It succeeds or
+    fails independently of the trace context.
+
+    Returns ``True`` when a context was adopted, ``False`` when nothing valid was supplied and
+    a fresh trace is in use. Never raises.
+
+    Adopting a context grants **nothing** — it selects a correlation id and confers no
+    authority. The validation below is about output integrity (never emitting a malformed id
+    into the event stream), not authorization; this is not a trust boundary.
+    """
+    adopted: tuple[str, str | None] | None = None
+    if traceparent is not None:
+        if trace_id is not None or parent_span_id is not None:
+            # A programming error, not bad input: the caller supplied the same thing twice.
+            _warn_rejected("both traceparent and explicit ids given; traceparent wins", traceparent)
+        parsed = parse_traceparent(traceparent)
+        if parsed is None:
+            _warn_rejected("unparseable traceparent", traceparent)
+        else:
+            adopted = parsed
+    elif trace_id is not None:
+        if not is_valid_trace_id(trace_id):
+            _warn_rejected("invalid trace_id", trace_id)
+        elif parent_span_id is not None and not is_valid_span_id(parent_span_id):
+            # Drop just the parent and join as another root rather than reject the whole
+            # context: being in the right trace without a parent beats being in a fresh one.
+            _warn_rejected("invalid parent_span_id; joining as a root", parent_span_id)
+            adopted = (trace_id, None)
+        else:
+            # parent_span_id may legitimately be omitted — a consumer that knows the trace but
+            # not the specific parent span is better off in the right trace than a fresh one.
+            adopted = (trace_id, parent_span_id)
+    # Nothing supplied at all is a silent no-op, not a rejection: `event.get("traceparent")`
+    # legitimately yields None whenever the caller did not propagate one, and warning on that
+    # would write a line on every uninstrumented invocation.
+
+    if adopted is not None:
+        context.set_adopted_context(*adopted)
+        _reparent_current_span(*adopted)
+
+    if baggage is not None:
+        parsed_baggage = context.parse_baggage_header(baggage)
+        if parsed_baggage is None:
+            # Deliberately independent of the trace context above: losing correlating fields is
+            # bad, and losing the trace join because one field was malformed is worse.
+            _warn_rejected("unusable baggage header", baggage)
+        else:
+            context.set_baggage(**parsed_baggage)
+
+    return adopted is not None
+
+
+def _reparent_current_span(trace_id: str, parent_span_id: str | None) -> None:
+    """Move an already-open **root** span into the adopted trace, events included.
+
+    ``@trace`` opened the entry point's span before its body ran, so by the time
+    :func:`continue_trace` is called on the first line that span already exists *and* has its
+    ``span.start`` event buffered. :func:`~log_foundry.model.build_event` **snapshots** the ids
+    into each event dict, so re-parenting only the dataclass would leave the buffered start
+    event on the old trace — one span emitting its start on trace A and its end on trace B. A
+    split trace is worse than no continuation at all, because it looks like data rather than a
+    bug.
+    """
+    span = context.current_span()
+    if span is None or span.parent_span_id is not None:
+        # Not a root: it already belongs to an in-process trace, and moving it would sever it
+        # from its own parent. The adopted context still applies to the next root span.
+        return
+    span.trace_id = trace_id
+    span.parent_span_id = parent_span_id
+    for event in span.events:
+        event["trace_id"] = trace_id
+        # `span_id` is never overwritten — the adopting span keeps its own identity and takes
+        # the inbound span as its parent. Overwriting would give two processes the same span id
+        # and break parent/child reconstruction downstream.
+        if event.get("span_id") == span.span_id:
+            event["parent_span_id"] = parent_span_id
 
 
 def _get_worker() -> Worker:
