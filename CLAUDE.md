@@ -93,10 +93,8 @@ distribution) is Completed** — the package ships to PyPI as `log-foundry`. A f
 (AWS Lambda compatibility) is Completed** — floor lowered to Python 3.12 (CI matrix 3.12 + 3.13)
 and a repeatable `flush()` added. **SPEC-014 (cross-process trace continuation) is Completed** —
 `continue_trace()` adopts a W3C `traceparent` + `baggage`; `current_traceparent()` and friends
-publish it. **Latest release: `v0.2.0`** (the rename; `v0.1.0` was the first stable); SPEC-013
-and SPEC-014 are both unreleased and together want one **minor** bump (`v0.3.0` — everything is
-additive; the floor widened and no existing behaviour changed). No spec is in flight; the next
-initiative needs a new spec.
+publish it. **Latest release: `v0.3.0`** — SPEC-013 + SPEC-014, published to PyPI (`v0.2.0` was
+the rename, `v0.1.0` the first stable). No spec is in flight; the next initiative needs a new spec.
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
