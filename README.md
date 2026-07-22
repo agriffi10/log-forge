@@ -1,4 +1,4 @@
-# log-foundry
+# Log Foundry
 
 Consistent, structured (JSON) logs for every decorated function call — correlated by shared
 trace/span IDs, ready to ship to any of 30-plus built-in sinks (stdout by default; SQS → ELK is
