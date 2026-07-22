@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate: reuse the existing CI so a publish can never run on a red build.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # full history + tags so the version can be derived
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      # PyPI and TestPyPI reject any version carrying a local segment (+<hash>).
+      # Fail here rather than at upload time, where the error is far less obvious.
+      - name: Verify distributions are publishable
+        run: |
+          ls -l dist/
+          if ls dist/ | grep -q '+'; then
+            echo "::error::Built version carries a local segment (+); PyPI will reject it."
+            exit 1
+          fi
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 1
+          test "$(ls dist/*.whl | wc -l)" -eq 1
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    # Every merge to main ships a development pre-release to the TestPyPI sandbox.
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/log-forge
+    permissions:
+      id-token: write          # required for Trusted Publishing (OIDC)
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true   # tolerate a re-run that produces a duplicate dev version
