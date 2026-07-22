@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/log-forge
+      url: https://test.pypi.org/p/log-foundry
     permissions:
       id-token: write          # required for Trusted Publishing (OIDC)
     steps:
