@@ -16,7 +16,7 @@ to status only — no prose.
 | [SPEC-009](SPEC-009-http-and-platform-sinks.md) | HTTP and Log-Platform Sinks | Completed | SPEC-001, SPEC-005 |
 | [SPEC-010](SPEC-010-queue-and-stream-sinks.md) | Queue and Stream Buffer Sinks | Completed | SPEC-005 |
 | [SPEC-011](SPEC-011-database-sinks.md) | Database Sinks | Completed | SPEC-001, SPEC-005 |
-| [SPEC-012](SPEC-012-pypi-publishing-and-dynamic-versioning.md) | PyPI Publishing and Dynamic Versioning | Draft | None |
+| [SPEC-012](SPEC-012-pypi-publishing-and-dynamic-versioning.md) | PyPI Publishing and Dynamic Versioning | Completed | None |
 
 ## Arcs (build order)
 

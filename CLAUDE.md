@@ -39,7 +39,8 @@ implementation against the design in `architecture.md`.
 | Layer | Tech |
 |---|---|
 | Language | Python **>= 3.13**, fully typed (PEP 561 `py.typed`) |
-| Packaging | Poetry (`poetry-core` build backend), src layout |
+| Packaging | Poetry + `poetry-dynamic-versioning` backend, src layout; version derived from Git tags, **never hand-edited** |
+| Publishing | PyPI as **`log-foundry`** via `release.yml` — Trusted Publishing (OIDC), no stored token |
 | Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), queue/stream: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs`, and database: `clickhouse`, `mongo`, `postgres` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
 | Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
@@ -61,6 +62,7 @@ deliberate constraint — new runtime deps belong behind an optional extra (as `
 ## Common Commands
 
 ```bash
+poetry self add "poetry-dynamic-versioning[plugin]"   # one-time: resolve the tag-derived version locally
 poetry install --with dev          # set up
 poetry run pytest                  # test
 poetry run ruff check .            # lint
@@ -68,18 +70,26 @@ poetry run mypy                    # typecheck (src)
 sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
 ```
 
+**Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
+Merges to `main` publish a `X.Y.Z.devN` pre-release. Never add a `version` key to `pyproject.toml`.
+`poetry-dynamic-versioning` rewrites `pyproject.toml` in place whenever it resolves a version —
+`python -m build` **and** `poetry install` with the plugin active — and the round-trip reorders keys
+(it moves `[tool.poetry] version` out from under its comment). Harmless but noisy: `git checkout --
+pyproject.toml` after. Always `git diff pyproject.toml` before committing.
+
 ## Specs
 
 Index + status: `@docs/specs/INDEX.md`. Each spec file's header carries its own `Status`.
 **Current work:** the SPEC-001..005 core arc is **fully Completed** (Core Span Pipeline →
 Logging API + console echo → async `@trace` → background flush worker + shutdown → SQSSink +
-`sqs` extra). The **sink-expansion** arc (SPEC-006..011) is **fully Completed**: composition/adapter sinks →
+`aws` extra). The **sink-expansion** arc (SPEC-006..011) is **fully Completed**: composition/adapter sinks →
 stdlib logging bridge → local file + embedded → HTTP/platform (Elasticsearch, Loki, Logstash,
 Syslog, Datadog, Splunk, New Relic, Honeycomb, Sentry) → queue/stream (Kafka, Redis, RabbitMQ,
 NATS, Pub/Sub, Event Hubs, Kinesis, Firehose, SNS) → database (Mongo, Postgres, ClickHouse). Each
-third-party transport sits behind its own optional extra (lazy-imported). No spec is in flight; the
-next initiative (e.g. PyPI publishing) needs a new spec. `docs/implementation-guide.md` remains the
-phase-level build reference behind the specs.
+third-party transport sits behind its own optional extra (lazy-imported). **SPEC-012 (release and
+distribution) is Completed** — the package ships to PyPI as `log-foundry`, first stable release
+`v0.1.0`. No spec is in flight; the next initiative needs a new spec.
+`docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
 
@@ -97,6 +107,8 @@ phase-level build reference behind the specs.
   separate consumer indexes into ELK. `StdoutSink` is the zero-dep default. (arch §8, §9.1)
 - **Logs-only, send everything for now** — no metrics/OTel-native traces; sampling deferred but a
   `should_send` seam is reserved (tail-sampling-ready). (arch §10, §13)
+- **Version comes from Git tags, published to PyPI as `log-foundry`** — import name stays
+  `log_forge`; tags cut releases, merges to `main` publish `.devN` pre-releases. (SPEC-012)
 
 ## Out of Scope (don't build)
 

@@ -25,26 +25,32 @@ calls form a tree you can query later.
 
 ## Installation
 
-`log-forge` is not yet published to PyPI. Install from source:
-
-```bash
-# from a clone of this repo
-poetry install                 # or: pip install .
-
-# with an optional sink extra (e.g. the AWS sinks)
-poetry install -E aws          # or: pip install '.[aws]'
-```
-
-Once published, the intended install will be:
+Published on PyPI as **[`log-foundry`](https://pypi.org/project/log-foundry/)**:
 
 ```bash
 pip install log-foundry          # core, zero dependencies
 pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
 
-> **Note the name split.** The distribution is **`log-foundry`** on PyPI, but the import name
-> stays **`log_forge`** — `pip install log-foundry`, then `import log_forge`. PyPI rejects
-> `log-forge` as too similar to the unrelated, pre-existing `logforge` project.
+> **The install name and the import name differ.** You `pip install log-foundry`, then
+> `import log_forge`. PyPI rejects `log-forge` as too similar to the unrelated, pre-existing
+> [`logforge`](https://pypi.org/project/logforge/) project — its similarity check collapses
+> separators, so `log-forge` and `logforge` count as the same name. Only the distribution name
+> moved; no module or API was renamed.
+
+```python
+import log_forge
+
+print(log_forge.__version__)     # the installed version
+```
+
+To work on the library itself, install from a clone:
+
+```bash
+# the version is derived from Git tags, so clone with history (not --depth 1)
+poetry self add "poetry-dynamic-versioning[plugin]"   # one-time, resolves the version locally
+poetry install --with dev                             # or: pip install -e .
+```
 
 ### Optional extras
 
@@ -495,6 +501,36 @@ The library uses a src layout (`src/log_forge/`) with a single concept per modul
 `ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
 `base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
+
+## Releasing
+
+**The version is never hand-edited.** It is derived from Git tags at build time by
+`poetry-dynamic-versioning`, so `pyproject.toml` carries no literal version and the published
+number can't drift from what Git says.
+
+[`release.yml`](.github/workflows/release.yml) reuses the CI suite as a gate, then builds an
+sdist and a wheel:
+
+| Trigger | Version built | Published to PyPI as |
+|---|---|---|
+| merge to `main` | `0.1.1.devN` | dev pre-release |
+| push tag `v0.1.0` | `0.1.0` | stable release |
+
+Dev pre-releases keep the upload path exercised on every merge, so a real release is never the
+first time it runs. `pip install log-foundry` still resolves to the latest **stable** version —
+pip ignores pre-releases unless you pass `--pre`.
+
+Cutting a release is one tag:
+
+```bash
+git tag -a v0.2.0 -m "log-forge 0.2.0"
+git push origin v0.2.0
+```
+
+Uploads authenticate with PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+(OIDC) through the `pypi` GitHub Environment — there is no API token stored in the repository.
+A tagged build refuses to publish if the derived version doesn't match the tag, and the tagged
+job deliberately omits `skip-existing` so re-pushing an already-published version fails loudly.
 
 ## License
 

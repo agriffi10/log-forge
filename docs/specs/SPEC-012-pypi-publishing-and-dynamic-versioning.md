@@ -1,8 +1,8 @@
 # Spec: PyPI Publishing and Dynamic Versioning
 
 **ID:** SPEC-012
-**Status:** Draft
-**Last Updated:** 2026-07-21
+**Status:** Completed
+**Last Updated:** 2026-07-22
 **Depends On:** None
 
 ## Overview

@@ -4,12 +4,12 @@
 >
 > **Run the formatter/linter — don't hand-format.** Mechanics (§2, §3) are owned by `ruff`; this doc is for the choices a tool can't make (naming, interfaces, idioms) and for review. Style is *guidance*: the repo's configured tools win (line length **100**, quote style), and "a foolish consistency is the hobgoblin of little minds" — when a rule hurts readability in a specific case, deviate and flag it (§1).
 >
-> **The core stays dependency-free.** New runtime deps belong behind an optional extra (as `sqs`/`boto3` is); note them in `CLAUDE.md` first. This doc governs *language* style; the *design* rules (non-swallowing decorator, no arg/return auto-capture, structured-JSON-only) live in `CLAUDE.md` / `architecture.md` — when both apply, follow both.
+> **The core stays dependency-free.** New runtime deps belong behind an optional extra (as `aws`/`boto3` is); note them in `CLAUDE.md` first. This doc governs *language* style; the *design* rules (non-swallowing decorator, no arg/return auto-capture, structured-JSON-only) live in `CLAUDE.md` / `architecture.md` — when both apply, follow both.
 
 ## How to use this doc
 - Find the relevant section ID(s) in the Index below; read only those. Sections are cross-linked by ID (e.g. "see §7").
 - Defer to the repo's configured tools (line length, formatter, import order, typing strictness) over the defaults here; when a rule conflicts with existing code, follow the rule and **flag the conflict** unless the user says otherwise.
-- Repo defaults: format/lint with **`ruff`** (line-length 100), type-check with **`mypy --strict`** over `src`, test with **`pytest`** (`asyncio_mode=auto`, `--strict-markers`) + `pytest-asyncio`. Runtime = 3.13; core has **no runtime deps** (optional `sqs` extra pulls `boto3`).
+- Repo defaults: format/lint with **`ruff`** (line-length 100), type-check with **`mypy --strict`** over `src`, test with **`pytest`** (`asyncio_mode=auto`, `--strict-markers`) + `pytest-asyncio`. Runtime = 3.13; core has **no runtime deps** (optional `aws` extra pulls `boto3`).
 
 ## Index
 - **§1 Tooling & the "foolish consistency" rule** — formatter/linter/type-checker own the mechanics; when to deviate; don't churn diffs.
