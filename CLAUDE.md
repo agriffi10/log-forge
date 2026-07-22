@@ -99,6 +99,7 @@ a baggage filter; one backfill at span close now completes both. **Latest releas
 (SPEC-013 + SPEC-014; `v0.2.0` was the rename, `v0.1.0` the first stable). SPEC-015 is unreleased
 and wants a **minor** bump (`v0.4.0` — additive: a span that sets no baggage emits byte-identical
 output). No spec is in flight; the next initiative needs a new spec.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
