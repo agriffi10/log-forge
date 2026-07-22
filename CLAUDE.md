@@ -97,7 +97,10 @@ publish it. **SPEC-015 (baggage on boundary events) is Completed** — `span.sta
 built with `baggage={}` hardcoded, so the events carrying `duration_ms`/`status` were invisible to
 a baggage filter; one backfill at span close now completes both. **Latest release: `v0.4.0`**
 (SPEC-015; `v0.3.0` was SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
-Nothing is unreleased. No spec is in flight; the next initiative needs a new spec.
+Nothing is unreleased. **SPEC-016 (FIFO queue support for `SQSSink`) is Draft** — entries are built
+without a `MessageGroupId`, which a FIFO queue rejects per-entry as a sender fault, so the retry
+loop burns its budget and the batch is lost in silence; the group id will default to the event's
+`trace_id`. Not started — the build needs a validated plan first.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
