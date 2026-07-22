@@ -1,5 +1,7 @@
 [project]
-name = "log-forge"
+# Distribution name on PyPI. The import name stays `log_forge` (see src/); PyPI rejects
+# "log-forge" as too similar to the unrelated, pre-existing "logforge" project.
+name = "log-foundry"
 # The version is derived from Git tags at build time (poetry-dynamic-versioning).
 # Do not add a literal `version` key back here.
 dynamic = ["version"]
@@ -13,7 +15,7 @@ requires-python = ">=3.13"
 dependencies = [
 ]
 
-# Optional features. Install with: pip install log-forge[aws]
+# Optional features. Install with: pip install log-foundry[aws]
 [project.optional-dependencies]
 aws = ["boto3>=1.34"]              # SQSSink, SNSSink, KinesisSink, FirehoseSink
 sentry = ["sentry-sdk>=2.0"]

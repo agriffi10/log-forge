@@ -22,7 +22,8 @@ implementation against the design in `architecture.md`.
 
 ## Layout
 
-- `src/log_forge/` — the library (src layout; distribution `log-forge`, import `log_forge`).
+- `src/log_forge/` — the library (src layout; distribution `log-foundry` on PyPI, import `log_forge`
+  — PyPI rejects `log-forge` as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}`. SPEC-001 shipped `config`, `ids`, `model`,
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added

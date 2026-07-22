@@ -13,7 +13,8 @@ from log_forge.config import configure, get_config
 from log_forge.decorator import trace
 
 try:
-    __version__ = _dist_version("log-forge")
+    # Distribution name ("log-foundry") differs from the import name ("log_forge").
+    __version__ = _dist_version("log-foundry")
 except PackageNotFoundError:  # running from a source tree that isn't installed
     __version__ = "0.0.0"
 

@@ -9,7 +9,7 @@
 
 Today `log-forge` is built locally with Poetry and its version is a hand-edited
 `version = "0.1.0"` line in `pyproject.toml`; nothing is published anywhere and there is no
-release automation. This spec makes the package installable with `pip install log-forge` by
+release automation. This spec makes the package installable with `pip install log-foundry` by
 adding an automated release pipeline, and it removes the hand-edited version entirely so the
 version number is derived from Git tags instead. Every merge to `main` builds the package and
 publishes a development pre-release to the TestPyPI sandbox index, which continuously exercises
@@ -24,6 +24,11 @@ every merge before it is ever asked to ship to production.
 
 ### In Scope
 
+- Publishing under the distribution name **`log-foundry`**. PyPI rejects `log-forge` as too
+  similar to the unrelated, pre-existing `logforge` project — its similarity check collapses
+  separators, so `log-forge` and `logforge` are treated as the same name. The **import name
+  stays `log_forge`**: `pip install log-foundry`, then `import log_forge`. Only the
+  distribution name changes; no module, package directory, or public API is renamed.
 - Deriving the package version from Git tags with the `poetry-dynamic-versioning` build
   backend, replacing the static `version` field in `pyproject.toml`.
 - Exposing a runtime `log_forge.__version__` attribute sourced from the installed package
@@ -55,6 +60,9 @@ every merge before it is ever asked to ship to production.
   sdist is sufficient.
 - Changelog generation, GitHub Release note automation, and documentation-site publishing.
 - Any change to the library's runtime behavior, public API, or sinks.
+- Renaming the import package, the GitHub repository, or the `log-forge` brand used in prose,
+  runtime log prefixes (`log-forge: …`), and sink defaults (`app_name`, `_DDSOURCE`). Only the
+  PyPI distribution name moves to `log-foundry`.
 
 ---
 
@@ -94,7 +102,7 @@ sourced from the distribution metadata rather than a second hand-maintained cons
 
 - [ ] `import log_forge; log_forge.__version__` returns the installed distribution version as a
       string.
-- [ ] The value is read via `importlib.metadata.version("log-forge")`, so it always matches the
+- [ ] The value is read via `importlib.metadata.version("log-foundry")`, so it always matches the
       version the wheel was published under.
 - [ ] When the package is not installed (running directly from a source checkout), accessing
       `__version__` does not raise; it falls back to `"0.0.0"`.
@@ -211,7 +219,7 @@ No tags exist yet                     ->  0.0.0.dev<distance> (why FR reserves a
 
 ```toml
 [project]
-name = "log-forge"
+name = "log-foundry"
 # The version is derived from Git tags at build time (poetry-dynamic-versioning).
 # Do not add a literal `version` key back here.
 dynamic = ["version"]
@@ -245,7 +253,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
 try:
-    __version__ = _dist_version("log-forge")
+    __version__ = _dist_version("log-foundry")
 except PackageNotFoundError:  # running from a source tree that isn't installed
     __version__ = "0.0.0"
 
@@ -327,7 +335,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/log-forge
+      url: https://test.pypi.org/p/log-foundry
     permissions:
       id-token: write          # required for Trusted Publishing (OIDC)
     steps:
@@ -350,7 +358,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/log-forge
+      url: https://pypi.org/p/log-foundry
     permissions:
       id-token: write
     steps:
@@ -375,10 +383,10 @@ git push origin v0.2.0
 
 ## Configuration / Environment
 
-**Trusted publisher registration (one-time, per index).** Because `log-forge` does not yet
+**Trusted publisher registration (one-time, per index).** Because `log-foundry` does not yet
 exist on either index, use the "pending publisher" flow on both `pypi.org` and `test.pypi.org`
 (Your account → Publishing). Register, on each site, a GitHub Actions publisher with: PyPI
-project name `log-forge`; owner and repository matching this GitHub repository; workflow
+project name `log-foundry`; owner and repository matching this GitHub repository; workflow
 filename `release.yml`; and environment name `pypi` on PyPI and `testpypi` on TestPyPI. A
 pending publisher does not reserve the project name until the first successful publish, so run
 the first tagged release (and let the first `main` merge reach TestPyPI) soon after registering
@@ -436,7 +444,7 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
 - Register the pending trusted publisher on `test.pypi.org` and create the `testpypi`
   environment (FR-006).
 - Merge to `main` and confirm a development pre-release appears on TestPyPI and that
-  `pip install --index-url https://test.pypi.org/simple/ log-forge` installs it.
+  `pip install --index-url https://test.pypi.org/simple/ log-foundry` installs it.
 
 ### Phase 3: Production PyPI publishing on tags
 
@@ -444,7 +452,7 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
 - Register the pending trusted publisher on `pypi.org` and create the `pypi` environment, with
   an optional required-reviewer rule (FR-006).
 - Push `v0.1.0` (or the next chosen version) and confirm the release lands on production PyPI
-  and that `pip install log-forge` works from a clean environment.
+  and that `pip install log-foundry` works from a clean environment.
 
 ### Phase 4: Documentation and completion
 

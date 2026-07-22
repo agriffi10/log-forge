@@ -1,4 +1,7 @@
-"""SPEC-012 — runtime ``__version__`` sourced from installed distribution metadata (FR-002)."""
+"""SPEC-012 — runtime ``__version__`` sourced from installed distribution metadata (FR-002).
+
+The distribution is published as ``log-foundry``; the import name remains ``log_forge``.
+"""
 
 import importlib
 import importlib.metadata
@@ -25,7 +28,7 @@ def test_version_is_a_public_pep440_version() -> None:
 
 def test_version_matches_distribution_metadata() -> None:
     try:
-        expected = importlib.metadata.version("log-forge")
+        expected = importlib.metadata.version("log-foundry")
     except importlib.metadata.PackageNotFoundError:
         pytest.skip("log-forge is not installed in this environment")
     assert log_forge.__version__ == expected
@@ -39,7 +42,7 @@ def test_version_falls_back_when_not_installed(monkeypatch: pytest.MonkeyPatch) 
     """A source checkout with no installed distribution must not blow up on import."""
 
     def _raise(_name: str) -> str:
-        raise importlib.metadata.PackageNotFoundError("log-forge")
+        raise importlib.metadata.PackageNotFoundError("log-foundry")
 
     monkeypatch.setattr(importlib.metadata, "version", _raise)
     try:
