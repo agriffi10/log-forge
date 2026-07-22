@@ -21,10 +21,14 @@ jobs:
         with:
           fetch-depth: 0        # full history + tags so the version can be derived
 
+      # One version is enough here, unlike the CI matrix: the wheel is pure Python
+      # (`py3-none-any`) so the building interpreter does not appear in the artifact, and
+      # `requires-python` is read from pyproject.toml rather than from this runtime. Build on the
+      # floor and test on every supported version — that is the correct split (SPEC-013 FR-001).
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Build sdist and wheel
         run: |
