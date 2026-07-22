@@ -89,9 +89,11 @@ Syslog, Datadog, Splunk, New Relic, Honeycomb, Sentry) → queue/stream (Kafka, 
 NATS, Pub/Sub, Event Hubs, Kinesis, Firehose, SNS) → database (Mongo, Postgres, ClickHouse). Each
 third-party transport sits behind its own optional extra (lazy-imported). **SPEC-012 (release and
 distribution) is Completed** — the package ships to PyPI as `log-foundry`. A follow-up (no spec
-— a mechanical rename) renamed the import package `log_forge` → `log_foundry`. **Latest release:
-`v0.2.0`** (the rename; `v0.1.0` was the first stable). No spec is in flight; the next initiative
-needs a new spec.
+— a mechanical rename) renamed the import package `log_forge` → `log_foundry`. **SPEC-013
+(AWS Lambda compatibility) is Completed** — floor lowered to Python 3.12 (CI matrix 3.12 + 3.13)
+and a repeatable `flush()` added. **Latest release: `v0.2.0`** (the rename; `v0.1.0` was the
+first stable); SPEC-013 is unreleased and wants a **minor** bump (`v0.3.0` — additive `flush`,
+widened floor). **In flight: SPEC-014** (cross-process trace continuation).
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -112,6 +114,9 @@ needs a new spec.
   `should_send` seam is reserved (tail-sampling-ready). (arch §10, §13)
 - **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases,
   merges to `main` publish `.devN` pre-releases. (SPEC-012)
+- **Two drains, deliberately distinct** — `shutdown()` is terminal (stops the worker, closes the
+  sink); `flush()` drains on demand and leaves everything running. A frozen-not-exited process
+  (serverless) needs the second, and `atexit` never runs there. (SPEC-013)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

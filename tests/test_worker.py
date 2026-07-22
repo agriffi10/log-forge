@@ -299,3 +299,267 @@ def test_decorator_worker_is_lazy_and_single() -> None:
     finally:
         w1.shutdown()
         decorator._worker = None
+
+
+# -- SPEC-013 FR-002: flush() drains without retiring the worker ------------------------
+
+
+def test_flush_drains_and_leaves_the_worker_running() -> None:
+    sink = RecordingSink()
+    # Neither trigger can fire on its own: if these events arrive, flush() delivered them.
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        for i in range(5):
+            w.submit(_span(i))
+        assert sink.events == [], "still buffered before the flush"
+
+        assert w.flush(timeout=5.0) is True
+        assert [e["message"] for e in sink.events] == list(range(5))
+
+        # The whole point: unlike shutdown(), everything is still alive afterwards.
+        assert sink.closed == 0, "flush must not close the sink"
+        assert w._thread.is_alive(), "flush must not retire the worker thread"
+
+        w.submit(_span("after"))
+        assert w.flush(timeout=5.0) is True
+        assert sink.events[-1]["message"] == "after", "the worker still works after a flush"
+    finally:
+        w.shutdown()
+
+
+def test_flush_does_not_merely_wait_out_the_flush_interval() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        for i in range(20):
+            w.submit(_span(i))
+
+        start = time.monotonic()
+        assert w.flush(timeout=5.0) is True
+        elapsed = time.monotonic() - start
+
+        assert [e["message"] for e in sink.events] == list(range(20)), "ordering holds"
+        # A flush() implemented as a sleep, or one that let the batching triggers decide,
+        # could not have delivered these inside a 100s interval.
+        assert elapsed < 1.0, f"flush should return promptly, took {elapsed:.3f}s"
+    finally:
+        w.shutdown()
+
+
+def test_flush_marker_never_reaches_the_sink() -> None:
+    """The marker must be excluded from `pending`, not appended like a list of events."""
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        w.submit(_span("a"))
+        w.submit(_span("b"))
+        assert w.flush(timeout=5.0) is True
+
+        for batch in sink.batches:
+            for event in batch:
+                assert isinstance(event, dict), f"a non-event reached the sink: {event!r}"
+        assert [e["message"] for e in sink.events] == ["a", "b"], "exactly the submitted events"
+    finally:
+        w.shutdown()
+
+
+def test_shutdown_answers_a_marker_left_in_the_queue() -> None:
+    """`_final_drain` has its own copy of the exclusion guard, so it needs its own test."""
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0)
+    flushed: list[bool] = []
+
+    w.submit(_span("a"))  # pulled by the thread → emit blocks, holding the worker
+    assert sink.in_emit.wait(2.0), "worker should have entered emit"
+    w.submit(_span("b"))  # queues up behind the blocked worker
+
+    flusher = threading.Thread(target=lambda: flushed.append(w.flush(timeout=5.0)))
+    flusher.start()
+    stopper = threading.Thread(target=w.shutdown)
+    try:
+        assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
+        stopper.start()
+        # White-box on purpose: waiting for `_stop` guarantees the worker leaves the main loop
+        # when released and reaches `_final_drain`, rather than racing through `_run` instead.
+        assert _wait_until(w._stop.is_set), "shutdown should have signalled the stop"
+    finally:
+        sink.release.set()
+
+    stopper.join(5.0)
+    flusher.join(5.0)
+
+    assert flushed == [True], "a flush racing shutdown is answered by the final drain"
+    assert {e["message"] for e in sink.events} == {"a", "b"}, "and its events really did land"
+    for batch in sink.batches:
+        assert all(isinstance(e, dict) for e in batch), "no marker leaked into the final batch"
+
+
+def test_flush_is_repeatable_and_concurrent() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        w.submit(_span("first"))
+        assert w.flush(timeout=5.0) is True
+        w.submit(_span("second"))
+        assert w.flush(timeout=5.0) is True
+        assert [e["message"] for e in sink.events] == ["first", "second"]
+
+        # Each concurrent call gets its own marker and its own event.
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def _flush() -> None:
+            ok = w.flush(timeout=5.0)
+            with lock:
+                results.append(ok)
+
+        w.submit(_span("third"))
+        threads = [threading.Thread(target=_flush) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5.0)
+
+        assert results == [True] * 4, "every concurrent flush is answered"
+        assert sink.events[-1]["message"] == "third"
+    finally:
+        w.shutdown()
+
+
+def test_flush_does_not_consume_the_shutdown_flag() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    w.submit(_span("x"))
+    assert w.flush(timeout=5.0) is True
+    assert w.flush(timeout=5.0) is True
+
+    w.submit(_span("tail"))
+    w.shutdown()  # must still be a full, working shutdown
+
+    assert any(e["message"] == "tail" for e in sink.events), "shutdown still drains"
+    assert sink.closed == 1, "shutdown still closes the sink"
+
+
+# -- SPEC-013 FR-003: flush() cannot hang, and cannot resurrect a dead worker ------------
+
+
+def test_flush_after_shutdown_returns_false_promptly() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    w.shutdown()
+
+    start = time.monotonic()
+    assert w.flush(timeout=5.0) is False, "nothing will ever consume the marker now"
+    elapsed = time.monotonic() - start
+    # The bug this guards: waiting out `timeout` here turns a logging problem into an
+    # invocation that blows its execution deadline.
+    assert elapsed < 1.0, f"must not wait out the timeout, took {elapsed:.3f}s"
+
+
+def test_flush_honours_its_timeout_on_a_wedged_sink() -> None:
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, flush_interval=0.01)
+    try:
+        w.submit(_span("stuck"))
+        assert sink.in_emit.wait(2.0), "worker should be wedged inside emit"
+
+        start = time.monotonic()
+        result = w.flush(timeout=0.1)  # must not raise
+        elapsed = time.monotonic() - start
+
+        assert result is False, "a drain that could not complete reports False"
+        assert elapsed < 1.0, f"timeout not honoured, took {elapsed:.3f}s"
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+
+def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+    try:
+        w.submit(_span("doomed"))
+        # The drain completed — the events were passed to sink.emit, which is the guarantee.
+        # The sink's failure is reported through failed_batches, not by raising at the caller.
+        assert w.flush(timeout=5.0) is True
+        assert sink.events == [], "nothing was ever successfully emitted"
+        assert w.failed_batches >= 1, "the failure is counted, not swallowed silently"
+    finally:
+        w.shutdown()
+
+
+def test_flush_with_timeout_none_returns_true_on_a_healthy_worker() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        w.submit(_span("n"))
+        assert w.flush(timeout=None) is True
+        assert [e["message"] for e in sink.events] == ["n"]
+    finally:
+        w.shutdown()
+
+
+# -- SPEC-013 FR-003/FR-005: the public `lf.flush()` entry point -------------------------
+
+
+def test_module_flush_is_a_no_op_when_nothing_was_ever_logged() -> None:
+    import log_foundry
+    from log_foundry import decorator
+
+    decorator._worker = None
+    start = time.monotonic()
+    assert log_foundry.flush() is True, "no worker means nothing to drain"
+    assert time.monotonic() - start < 1.0
+    # Building a worker here would start a thread and register atexit purely to flush nothing.
+    assert decorator._worker is None, "flush must not create a worker"
+
+
+def test_module_flush_after_shutdown_returns_false_promptly() -> None:
+    import log_foundry
+    from log_foundry import decorator
+
+    log_foundry.configure(service="t", version="0", env="t", sink=RecordingSink())
+    decorator._get_worker()
+    log_foundry.shutdown()
+
+    start = time.monotonic()
+    assert log_foundry.flush(timeout=5.0) is False
+    assert time.monotonic() - start < 1.0, "must not block on a worker that is gone"
+
+
+def test_module_flush_delivers_a_traced_call_and_logging_continues() -> None:
+    """The Lambda pattern: drain before returning, then be invoked again on the same worker."""
+    import log_foundry
+    from log_foundry import decorator
+
+    sink = RecordingSink()
+    log_foundry.configure(service="t", version="0", env="t", sink=sink)
+    decorator._worker = None
+    # Neither batching trigger can fire in the life of this test.
+    decorator._worker = worker_mod.Worker(sink, batch_size=1000, flush_interval=100.0)
+
+    @log_foundry.trace
+    def handler() -> str:
+        log_foundry.info("invoked")
+        return "ok"
+
+    try:
+        handler()
+        assert log_foundry.flush(timeout=5.0) is True
+        first = [e["message"] for e in sink.events]
+        assert "invoked" in first, "the first invocation's events were drained"
+        assert sink.closed == 0, "the sink is still open"
+
+        handler()  # the failure mode this whole spec exists for: does the *second* one log?
+        assert log_foundry.flush(timeout=5.0) is True
+        assert [e["message"] for e in sink.events].count("invoked") == 2
+    finally:
+        decorator._worker.shutdown()
+        decorator._worker = None
+
+
+def test_flush_is_exported() -> None:
+    import log_foundry
+
+    assert "flush" in log_foundry.__all__
+    assert callable(log_foundry.flush)

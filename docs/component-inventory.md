@@ -32,4 +32,5 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | level emitters + `set_baggage` | `src/log_foundry/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
 | `ConsoleWriter` | `src/log_foundry/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
 | `Worker` | `src/log_foundry/worker.py` | Background flush: bounded queue + daemon thread, batch by count/time, retry+backoff, drop-newest backpressure, graceful `shutdown()`. |
+| `flush` | `src/log_foundry/__init__.py` (→ `Worker.flush`) | On-demand drain that does **not** retire the worker or close the sink: FIFO marker, bounded timeout, never raises, repeatable. The drain for frozen-not-exited processes (serverless). |
 | `FakeSink` fixture | `tests/conftest.py` | Test double recording emitted batches (+ `fake_sink`/`lf` fixtures, config reset). |

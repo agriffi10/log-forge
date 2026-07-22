@@ -8,6 +8,11 @@ bounded and overflow is dropped-newest with a counter (arch §9). Emit failures 
 with backoff; a graceful :meth:`shutdown` drains the queue, emits the tail, and closes the
 sink so buffered events survive process exit.
 
+Two drains, deliberately distinct (SPEC-013): :meth:`shutdown` is terminal — it stops the thread
+and closes the sink, and the worker never comes back — while :meth:`flush` drains on demand and
+leaves everything running. A process that is frozen rather than exited (a serverless handler
+between invocations) needs the second, because it will be asked to log again.
+
 This module owns *delivery mechanics only*; it receives already-built event dicts and knows
 nothing about spans or context (the same dumbness that makes sinks swappable).
 """
@@ -27,6 +32,25 @@ __all__ = ["Worker"]
 # Sentinel enqueued by shutdown() to wake a worker blocked in queue.get() so it stops promptly
 # instead of waiting out the flush_interval. It is never emitted.
 _SHUTDOWN = object()
+
+
+class _FlushMarker:
+    """A drain request travelling the queue in FIFO order (SPEC-013 FR-002).
+
+    The mechanism follows from the queue being FIFO: everything submitted *before* ``flush()``
+    was called is necessarily ahead of the marker, so by the time the worker dequeues it those
+    events are either already emitted or sitting in ``pending``. The worker emits ``pending``,
+    then sets ``event``. No lock, no inspection of queue internals, and no coordination with the
+    batching triggers.
+
+    Like ``_SHUTDOWN`` it is never emitted — but unlike ``_SHUTDOWN`` it carries state, so it is
+    a class rather than a bare sentinel object.
+    """
+
+    __slots__ = ("event",)
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
 
 
 class Worker:
@@ -71,6 +95,36 @@ class Worker:
             with self._lock:
                 self.dropped += 1
 
+    def flush(self, timeout: float | None = 5.0) -> bool:
+        """Drain everything submitted before this call through the sink, without stopping.
+
+        Returns ``True`` once the worker has emitted them, ``False`` on timeout or when the
+        worker has already been shut down. Unlike :meth:`shutdown` the thread keeps running, the
+        sink is **not** closed, and the once-only shutdown flag is untouched, so logging
+        continues normally afterwards (SPEC-013 FR-002).
+        """
+        with self._lock:
+            if self._shutdown_done:
+                # Nothing will ever consume a marker now, so report the failure immediately
+                # rather than make the caller wait out `timeout` for a drain that cannot happen.
+                # A caller with an execution deadline would pay that wait for nothing (FR-003).
+                return False
+        if not self._thread.is_alive():
+            return False
+        marker = _FlushMarker()
+        # One deadline shared by the put and the wait: a caller asked for a bound on the whole
+        # call, not on each half of it, so the two cannot add up to 2 * timeout.
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            # A *blocking* put, never put_nowait: on a full queue put_nowait would skip the
+            # flush and return as though it had succeeded, which is the one outcome a flush must
+            # never produce silently. A put that times out is reported as False.
+            self._queue.put(marker, timeout=timeout)
+        except queue.Full:
+            return False
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        return marker.event.wait(remaining)
+
     def shutdown(self) -> None:
         """Stop the thread, drain + emit everything queued, then ``close()`` the sink.
 
@@ -101,6 +155,22 @@ class Worker:
                 item = self._queue.get(timeout=timeout)
             except queue.Empty:
                 item = None
+            if isinstance(item, _FlushMarker):
+                # Drain on demand: emit immediately, ignoring both the batch_size and the
+                # flush_interval trigger — a caller who asked for a flush is not interested in
+                # the batching policy. Note this branch *returns to the top of the loop*: the
+                # marker must never fall through to the append below, where it would be treated
+                # as a list of events and handed to sink.emit, killing this thread.
+                try:
+                    if pending:
+                        self._emit(pending)
+                        pending = []
+                finally:
+                    # Signal even if the emit died, so a waiter is released rather than left to
+                    # wait out its timeout on a thread that is no longer running.
+                    last_flush = time.monotonic()
+                    item.event.set()
+                continue
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
             now = time.monotonic()
@@ -116,15 +186,24 @@ class Worker:
 
     def _final_drain(self, pending: list[list[dict[str, object]]]) -> None:
         """On stop, pull anything still queued and emit the tail as one final batch."""
+        markers: list[_FlushMarker] = []
         while True:
             try:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, _FlushMarker):
+                # This guard is a second copy of _run's and needs the same exclusion. Markers
+                # are answered *after* the final emit below, so a flush() that raced shutdown()
+                # still returns True — and truthfully: its events really did reach the sink.
+                markers.append(item)
+                continue
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
         if pending:
             self._emit(pending)
+        for marker in markers:
+            marker.event.set()
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
         """Flatten queued per-span event-lists into one batch and emit, retrying with backoff.

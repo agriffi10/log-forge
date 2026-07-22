@@ -384,6 +384,27 @@ def write_ledger(user_id: int):
 - Querying, dashboards, or alerting — that's ELK / downstream.
 - Log *routing* logic beyond a single configured sink per process.
 
+### Known constraints
+
+- **Trace context does not cross a process boundary.** A trace is per-process: `@trace` mints a
+  fresh `trace_id` whenever no span is open in the current context. Two processes cooperating on
+  one logical operation — an HTTP client and its server, nine Lambda invocations in one state
+  machine — therefore produce N unrelated traces, and `parent_span_id` is never set across them.
+  Correlate with a hand-set baggage field in the meantime.
+
+  The shape of the fix, so it needn't be rederived: a `continue_trace(trace_id, parent_span_id)`
+  entry point, plus the caller threading those two values through whatever payload already
+  crosses the boundary. The ID formats are already W3C-compatible (§3.1) to keep this cheap.
+  Closed by **SPEC-014 — Cross-Process Trace Continuation**.
+
+- **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
+  registered via `atexit`, which covers a process that *exits*. A Lambda execution environment
+  is frozen when the handler returns and killed later without running exit handlers, so there is
+  no point at which that drain is guaranteed to run. `flush()` (SPEC-013) is the only guaranteed
+  drain there, and is the first thing to check when tail events go missing in a serverless
+  deployment. `shutdown()` is the wrong tool per-invocation: it is terminal, so only the first
+  invocation on a warm container would log.
+
 ---
 
 ## 14. Alignment with observability concepts
