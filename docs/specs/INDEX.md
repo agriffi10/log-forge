@@ -18,6 +18,7 @@ to status only — no prose.
 | [SPEC-011](SPEC-011-database-sinks.md) | Database Sinks | Completed | SPEC-001, SPEC-005 |
 | [SPEC-012](SPEC-012-pypi-publishing-and-dynamic-versioning.md) | PyPI Publishing and Dynamic Versioning | Completed | None |
 | [SPEC-013](SPEC-013-aws-lambda-compatibility.md) | AWS Lambda Compatibility — Python 3.12 Support and a Repeatable `flush()` | Draft | SPEC-004, SPEC-012 |
+| [SPEC-014](SPEC-014-cross-process-trace-continuation.md) | Cross-Process Trace Continuation (W3C `traceparent` + baggage) | Draft | SPEC-001, SPEC-002, SPEC-013 |
 
 ## Arcs (build order)
 
@@ -34,5 +35,10 @@ Group related specs and record the order to build them in. Delete this section i
   without warning. Nothing can *install* it there (`requires-python >=3.13` excludes the 3.12
   runtime), and nothing can *flush* it there (`shutdown()` is terminal — the worker never comes back,
   so a handler that flushes the obvious way logs only its first invocation per warm container).
-  Adds a repeatable `flush()` and lowers the floor to 3.12. Driven by a real consumer; cross-process
-  trace stitching (`continue_trace`) is the recorded follow-up.
+  Adds a repeatable `flush()` and lowers the floor to 3.12. Driven by a real consumer.
+- **Cross-process correlation:** SPEC-014 — cashes in the `architecture.md` §12 deferral ("adopting
+  an inbound `trace_id` from a `traceparent` header, plus cross-process baggage"), which `ids.py`'s
+  W3C-compatible formats were chosen to make cheap. Ships both halves — `current_traceparent()` to
+  publish, `continue_trace()` to adopt — because a context nobody can read is a context nobody can
+  propagate. Build **after** SPEC-013: 013 is what makes the library usable in the multi-process
+  environment 014 exists to correlate.

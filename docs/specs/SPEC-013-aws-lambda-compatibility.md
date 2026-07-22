@@ -54,7 +54,7 @@ lowers the floor to 3.12 so the library can be installed where it is needed.
 - **A synchronous / worker-less mode.** Emitting inline on span close would remove the flush
   problem entirely, but it puts an SQS round-trip inside every decorated call — the exact
   back-pressure SPEC-004's worker exists to prevent.
-- **`continue_trace()` / adopting an inbound trace context.** A separate, genuinely distributed
+- **`continue_trace()` / adopting an inbound trace context — now SPEC-014.** A separate, genuinely distributed
   concern; a consumer wanting one trace across several Lambdas correlates on a baggage field until
   it lands. Recorded as the follow-up in FR-006, not built here.
 - **A Lambda extension, layer, or any AWS packaging artifact.** Consumers package the library
@@ -221,7 +221,9 @@ investigation.
 - [ ] The same entry records the shape of the fix, so it does not have to be rederived: a
       `continue_trace(trace_id, parent_span_id)` entry point plus the caller threading those two
       values through whatever payload already crosses the boundary.
-- [ ] It is registered as a **follow-up spec row**, not a code TODO.
+- [ ] The Known Constraints entry names **SPEC-014 — Cross-Process Trace Continuation** as the
+      follow-up that closes it, rather than leaving a code TODO. That spec is written and indexed,
+      so this criterion is satisfied by pointing at it, not by inventing a placeholder row.
 - [ ] The entry also records that `atexit` does not run when a serverless environment is reaped,
       so `flush()` is the only guaranteed drain there — this is why FR-002 exists and is the first
       thing someone debugging missing tail events needs to know.
