@@ -93,10 +93,12 @@ distribution) is Completed** — the package ships to PyPI as `log-foundry`. A f
 (AWS Lambda compatibility) is Completed** — floor lowered to Python 3.12 (CI matrix 3.12 + 3.13)
 and a repeatable `flush()` added. **SPEC-014 (cross-process trace continuation) is Completed** —
 `continue_trace()` adopts a W3C `traceparent` + `baggage`; `current_traceparent()` and friends
-publish it. **Latest release: `v0.2.0`** (the rename; `v0.1.0` was the first stable); SPEC-013
-and SPEC-014 are both unreleased and together want one **minor** bump (`v0.3.0` — everything is
-additive; the floor widened and no existing behaviour changed). No spec is in flight; the next
-initiative needs a new spec.
+publish it. **SPEC-015 (baggage on boundary events) is Completed** — `span.start`/`span.end` were
+built with `baggage={}` hardcoded, so the events carrying `duration_ms`/`status` were invisible to
+a baggage filter; one backfill at span close now completes both. **Latest release: `v0.3.0`**
+(SPEC-013 + SPEC-014; `v0.2.0` was the rename, `v0.1.0` the first stable). SPEC-015 is unreleased
+and wants a **minor** bump (`v0.4.0` — additive: a span that sets no baggage emits byte-identical
+output). No spec is in flight; the next initiative needs a new spec.
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -124,6 +126,10 @@ initiative needs a new spec.
   takes a W3C `traceparent`/baggage the *caller* moved; no client patching or middleware, which
   would need the deps the core refuses. Inbound context is untrusted and confers no authority.
   (SPEC-014, arch §12)
+- **Boundary events take the span's *final* baggage; mid-span events keep the moment's** — one
+  backfill at close completes `span.start`/`span.end` (which describe the whole span and carry the
+  outcome), while an `info` is left exactly as it was emitted. Backfilling everything would also
+  invert `build_event`'s precedence by letting baggage beat a per-call field. (SPEC-015)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
