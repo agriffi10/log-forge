@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import logging
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.logging_sink import LoggingSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.logging_sink import LoggingSink
 
 
 class ListHandler(logging.Handler):
@@ -56,8 +56,8 @@ def test_dispatches_one_record_per_event_in_order() -> None:
     assert [r.getMessage() for r in handler.records] == ["a", "b", "c"]
 
 
-def test_default_logger_is_log_forge() -> None:
-    assert LoggingSink()._logger is logging.getLogger("log_forge")
+def test_default_logger_is_log_foundry() -> None:
+    assert LoggingSink()._logger is logging.getLogger("log_foundry")
 
 
 def test_is_sink_instance() -> None:

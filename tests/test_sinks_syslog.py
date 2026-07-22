@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-import log_forge.sinks._socket as socket_mod
-from log_forge.sinks.base import Sink
-from log_forge.sinks.syslog import SyslogSink
+import log_foundry.sinks._socket as socket_mod
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.syslog import SyslogSink
 from test_sinks_logstash import FakeSocket
 
 

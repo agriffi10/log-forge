@@ -1,6 +1,6 @@
 # Python Best Practices — Agent Reference
 
-> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-forge** (runtime **Python ≥ 3.13**; a `src`-layout library, distribution `log-foundry` / import `log_forge`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
+> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-foundry** (runtime **Python ≥ 3.13**; a `src`-layout library, distribution `log-foundry` / import `log_foundry`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
 >
 > **Run the formatter/linter — don't hand-format.** Mechanics (§2, §3) are owned by `ruff`; this doc is for the choices a tool can't make (naming, interfaces, idioms) and for review. Style is *guidance*: the repo's configured tools win (line length **100**, quote style), and "a foolish consistency is the hobgoblin of little minds" — when a rule hurts readability in a specific case, deviate and flag it (§1).
 >
@@ -67,7 +67,7 @@ Standard typographic spacing; a few Python-specific traps.
 ## §4 Imports
 Import modules, not individual names (typing is the exception); keep them absolute and ordered.
 
-- ✅ `import x` for packages/modules; `from x import y` where `y` is a **module** (`from log_forge import context`), then reference `context.current_span()`. 🔴 No `import os, sys` on one line (`from pkg import a, b` is fine).
+- ✅ `import x` for packages/modules; `from x import y` where `y` is a **module** (`from log_foundry import context`), then reference `context.current_span()`. 🔴 No `import os, sys` on one line (`from pkg import a, b` is fine).
 - ✅ **Exception — typing:** import symbols directly from `typing` / `collections.abc` (`from collections.abc import Mapping, Sequence`; `from typing import Any, Protocol, cast, TYPE_CHECKING`) — multiple per line allowed.
 - ✅ `import y as z` only for standard abbreviations (`import numpy as np`) or to resolve a genuine collision / inconveniently long name.
 - ✅ Prefer **absolute imports** (full package path). Explicit relative (`from . import context`) is tolerable within the package; 🔴 never implicit relative imports. **Break import cycles with a local (function-body) import** — e.g. `config.configure()` imports `StdoutSink` locally, and `model`/`decorator` import `config` lazily where needed (see the module map's dependency arrows).
@@ -88,7 +88,7 @@ Names describe **intent**; casing follows the standard table; visibility governs
 ## §6 Public vs internal interfaces
 Make the public surface explicit; everything else carries no compatibility promise.
 
-- ✅ Declare the public API in **`__all__`** (the `log_forge` façade: `configure`, `trace`, the level functions, `set_baggage`, `shutdown`, …). Anything not in `__all__`, or prefixed with `_`, is internal and may change without notice.
+- ✅ Declare the public API in **`__all__`** (the `log_foundry` façade: `configure`, `trace`, the level functions, `set_baggage`, `shutdown`, …). Anything not in `__all__`, or prefixed with `_`, is internal and may change without notice.
 - ✅ Mark internal modules/functions with a **leading underscore** rather than relying on documentation alone (e.g. the module-level `_config` singleton, `_log`, `_open_span`).
 
 ## §7 Exceptions
@@ -134,7 +134,7 @@ Format explicitly; log lazily; write precise, greppable messages.
 
 - ✅ Format with **f-strings**, `%`, or `.format()` — pick per readability. A single `a + b` join is fine; 🔴 don't build strings with chained `+` (`'a: ' + name + '; ' + str(n)`).
 - 🔴 Don't accumulate a string with `+=` **in a loop** (risks quadratic time). ✅ Append substrings to a list and `''.join(items)` after the loop, or write to `io.StringIO`.
-- ✅ **Lazy logging** *when using the stdlib `logging` module* (e.g. an internal diagnostic logger): pass a **literal `%`-pattern** + args — `logger.info('dropped %s events', n)` — never a pre-rendered f-string. (This is distinct from log-forge's own structured events, which are always named JSON fields, never free-form text — `CLAUDE.md` / architecture §6.)
+- ✅ **Lazy logging** *when using the stdlib `logging` module* (e.g. an internal diagnostic logger): pass a **literal `%`-pattern** + args — `logger.info('dropped %s events', n)` — never a pre-rendered f-string. (This is distinct from log-foundry's own structured events, which are always named JSON fields, never free-form text — `CLAUDE.md` / architecture §6.)
 - ✅ **Error messages** (exceptions and console output): match the actual condition precisely, mark interpolated pieces clearly (`f'{p=}'`, `%r`), and stay greppable. 🔴 Don't assert a cause you didn't verify.
 - ✅ Be consistent with one quote character per file (`ruff format` normalizes to `"`); use `"""` for multi-line strings and all docstrings.
 
@@ -152,7 +152,7 @@ Use implicit falsiness and identity comparisons — with the standard traps in m
 Close what you open; avoid mutable global state; use the right concurrency primitive.
 
 - ✅ Manage files/sockets/clients and other closeables with a **`with` statement** (or `contextlib.closing()` for non-context-manager closeables); otherwise explicit `try/finally`. Don't rely on `__del__`/GC for cleanup — timing is unguaranteed; the worker's graceful drain + `sink.close()` runs from an explicit `atexit`/`shutdown()`, not a finalizer.
-- 🔴 **Avoid mutable global state.** log-forge's `_config` singleton is a deliberate, documented exception: declared at module level, internal (`_`), and read through `get_config()`. Don't add more mutable module state casually.
+- 🔴 **Avoid mutable global state.** log-foundry's `_config` singleton is a deliberate, documented exception: declared at module level, internal (`_`), and read through `get_config()`. Don't add more mutable module state casually.
 - ✅ **Module-level constants are encouraged** — `_MAX_RETRIES = 3` (internal) / `MAX_BYTES = 256 * 1024` (public on `SQSSink`), `CAPS_WITH_UNDER`.
 - ✅ Init reusable SDK clients (`boto3.client(...)`) once and reuse — not per call. Keep the `boto3` import **local to the SQS sink** so the core stays dependency-free.
 - ✅ **Context propagation uses `contextvars`, not thread-locals** — correct under threads *and* asyncio. Never mutate a `ContextVar`'s default mutable value; always `.set()` a new tuple/dict, and use the token/`reset(token)` pattern (architecture §5).

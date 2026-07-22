@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.kinesis import KinesisSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.kinesis import KinesisSink
 
 
 class FakeKinesis:
@@ -51,7 +51,7 @@ def test_one_record_per_event_with_partition_key() -> None:
 def test_partition_key_falls_back_when_field_absent() -> None:
     client = FakeKinesis()
     KinesisSink("stream", client=client).emit([{"a": 1}])
-    assert client.calls[0][0]["PartitionKey"] == "log-forge"
+    assert client.calls[0][0]["PartitionKey"] == "log-foundry"
 
 
 def test_chunks_by_record_count() -> None:

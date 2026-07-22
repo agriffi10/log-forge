@@ -10,7 +10,7 @@ import io
 
 import pytest
 
-console_mod = pytest.importorskip("log_forge.console")
+console_mod = pytest.importorskip("log_foundry.console")
 
 
 def test_console_writer_renders_level_and_message() -> None:
@@ -25,7 +25,7 @@ def test_console_writer_renders_level_and_message() -> None:
 
 def test_echo_true_writes_console_and_still_reaches_sink(lf, fake_sink, monkeypatch) -> None:
     stream = io.StringIO()
-    monkeypatch.setattr("log_forge.api._console", console_mod.ConsoleWriter(stream=stream))
+    monkeypatch.setattr("log_foundry.api._console", console_mod.ConsoleWriter(stream=stream))
 
     @lf.trace(name="work")
     def work() -> None:
@@ -42,7 +42,7 @@ def test_echo_true_writes_console_and_still_reaches_sink(lf, fake_sink, monkeypa
 
 def test_echo_false_writes_nothing_to_console(lf, fake_sink, monkeypatch) -> None:
     stream = io.StringIO()
-    monkeypatch.setattr("log_forge.api._console", console_mod.ConsoleWriter(stream=stream))
+    monkeypatch.setattr("log_foundry.api._console", console_mod.ConsoleWriter(stream=stream))
 
     @lf.trace(name="work")
     def work() -> None:
@@ -56,7 +56,7 @@ def test_echo_false_writes_nothing_to_console(lf, fake_sink, monkeypatch) -> Non
 
 def test_echo_on_orphan_log_still_writes_console(lf, fake_sink, monkeypatch) -> None:
     stream = io.StringIO()
-    monkeypatch.setattr("log_forge.api._console", console_mod.ConsoleWriter(stream=stream))
+    monkeypatch.setattr("log_foundry.api._console", console_mod.ConsoleWriter(stream=stream))
 
     lf.error("orphan echo", echo=True)
 

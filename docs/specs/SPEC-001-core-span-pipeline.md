@@ -7,7 +7,7 @@
 
 ## Overview
 
-log-forge turns each decorated function call into a **span**: a structured record of the
+log-foundry turns each decorated function call into a **span**: a structured record of the
 call's identity, timing, outcome, and any events emitted while it ran. This spec builds the
 minimum end-to-end slice that makes that real — configuration, W3C-compatible IDs, the JSON
 event schema, `contextvars`-based context propagation, a pluggable output sink with a
@@ -43,7 +43,7 @@ non-blocking background worker (SPEC-004) later swaps only *where* a finished sp
 - The user logging API (`debug`/`info`/`warning`/`error`/`critical`) and console `echo` —
   SPEC-002. This spec emits only span-boundary events, not user log calls.
 - The public `set_baggage` re-export on the façade — SPEC-002 (the underlying `context`
-  function is built here, but is not yet exposed on `log_forge`).
+  function is built here, but is not yet exposed on `log_foundry`).
 - Async `@trace` support — SPEC-003.
 - The background flush worker and `shutdown()` — SPEC-004. Flushing here is synchronous and
   inline by design.
@@ -183,8 +183,8 @@ Expose the smallest public surface needed to run the end-to-end demo.
 
 #### Acceptance Criteria:
 
-- [ ] `import log_forge` exposes `log_forge.configure` and `log_forge.trace`.
-- [ ] `log_forge.__all__` lists exactly the intended public names for this spec.
+- [ ] `import log_foundry` exposes `log_foundry.configure` and `log_foundry.trace`.
+- [ ] `log_foundry.__all__` lists exactly the intended public names for this spec.
 - [ ] Running the architecture §11 example (two nested `@trace` functions) with a `StdoutSink`
       prints JSON span-start/span-end lines exhibiting the shared-`trace_id` / linked-parent
       behavior from FR-006.
@@ -194,7 +194,7 @@ Expose the smallest public surface needed to run the end-to-end demo.
 ## Data Model
 
 ```
-# src/log_forge/config.py
+# src/log_foundry/config.py
 Config {
   service: str = "unknown"
   version: str = "0.0.0"
@@ -203,7 +203,7 @@ Config {
   defaults: dict[str, object] = {}
 }
 
-# src/log_forge/model.py
+# src/log_foundry/model.py
 Span {
   trace_id: str
   span_id: str
@@ -272,17 +272,17 @@ class StdoutSink:
 def trace(func=None, *, name=None, defaults=None): ...
 
 # Example (architecture §11)
-import log_forge
-from log_forge.sinks.stdout import StdoutSink
+import log_foundry
+from log_foundry.sinks.stdout import StdoutSink
 
-log_forge.configure(service="payments", version="2.14", env="prod", sink=StdoutSink())
+log_foundry.configure(service="payments", version="2.14", env="prod", sink=StdoutSink())
 
-@log_forge.trace
+@log_foundry.trace
 def process_payment(user_id: int) -> str:
     write_ledger(user_id)
     return "ok"
 
-@log_forge.trace
+@log_foundry.trace
 def write_ledger(user_id: int) -> None:
     ...
 
@@ -291,13 +291,13 @@ process_payment(4127)   # prints span-start/end JSON for both calls, one shared 
 
 ## Configuration / Environment
 
-No new environment variables. Runtime configuration is entirely via `log_forge.configure(...)`
+No new environment variables. Runtime configuration is entirely via `log_foundry.configure(...)`
 (FR-001). No new dependencies — the core stays dependency-free.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/
+src/log_foundry/
 ├── __init__.py        # public façade: configure, trace
 ├── config.py          # Config + configure/get_config          (exists — WIP folded in)
 ├── ids.py             # new_trace_id/new_span_id/new_log_id

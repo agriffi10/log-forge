@@ -12,8 +12,8 @@ import time
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.file import FileSink, RotatingFileSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.file import FileSink, RotatingFileSink
 
 
 def read_events(path: str) -> list[dict]:

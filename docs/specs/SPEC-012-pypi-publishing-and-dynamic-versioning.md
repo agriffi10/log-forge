@@ -7,7 +7,7 @@
 
 ## Overview
 
-Today `log-forge` is built locally with Poetry and its version is a hand-edited
+Today `log-foundry` is built locally with Poetry and its version is a hand-edited
 `version = "0.1.0"` line in `pyproject.toml`; nothing is published anywhere and there is no
 release automation. This spec makes the package installable with `pip install log-foundry` by
 adding an automated release pipeline, and it removes the hand-edited version entirely so the
@@ -36,9 +36,13 @@ at the cost of permanently consuming a version number per merge.
   separators, so `log-forge` and `logforge` are treated as the same name. The **import name
   stays `log_forge`**: `pip install log-foundry`, then `import log_forge`. Only the
   distribution name changes; no module, package directory, or public API is renamed.
+
+  > **Superseded:** a later change (post-SPEC-012, shipped in `0.2.0`) renamed the import
+  > package `log_forge` → `log_foundry` so the install and import names finally match. The
+  > paragraph above records the state SPEC-012 delivered.
 - Deriving the package version from Git tags with the `poetry-dynamic-versioning` build
   backend, replacing the static `version` field in `pyproject.toml`.
-- Exposing a runtime `log_forge.__version__` attribute sourced from the installed package
+- Exposing a runtime `log_foundry.__version__` attribute sourced from the installed package
   metadata, so the library reports the same version it was built and published under.
 - A new `.github/workflows/release.yml` workflow that builds a source distribution (sdist) and
   a wheel, then publishes them.
@@ -74,8 +78,8 @@ at the cost of permanently consuming a version number per merge.
   sdist is sufficient.
 - Changelog generation, GitHub Release note automation, and documentation-site publishing.
 - Any change to the library's runtime behavior, public API, or sinks.
-- Renaming the import package, the GitHub repository, or the `log-forge` brand used in prose,
-  runtime log prefixes (`log-forge: …`), and sink defaults (`app_name`, `_DDSOURCE`). Only the
+- Renaming the import package, the GitHub repository, or the `log-foundry` brand used in prose,
+  runtime log prefixes (`log-foundry: …`), and sink defaults (`app_name`, `_DDSOURCE`). Only the
   PyPI distribution name moves to `log-foundry`.
 
 ---
@@ -109,12 +113,12 @@ table so no one edits a version by hand again.
 
 #### Description:
 
-`log_forge` exposes its installed version at runtime so callers and bug reports can read it,
+`log_foundry` exposes its installed version at runtime so callers and bug reports can read it,
 sourced from the distribution metadata rather than a second hand-maintained constant.
 
 #### Acceptance Criteria:
 
-- [ ] `import log_forge; log_forge.__version__` returns the installed distribution version as a
+- [ ] `import log_foundry; log_foundry.__version__` returns the installed distribution version as a
       string.
 - [ ] The value is read via `importlib.metadata.version("log-foundry")`, so it always matches the
       version the wheel was published under.
@@ -249,7 +253,7 @@ dynamic = ["version"]
 # The real value is injected from Git tags during the build.
 version = "0.0.0"
 packages = [
-    { include = "log_forge", from = "src" },
+    { include = "log_foundry", from = "src" },
 ]
 # include / exclude unchanged
 
@@ -265,7 +269,7 @@ requires = ["poetry-core>=2.0.0,<3.0.0", "poetry-dynamic-versioning>=1.4.0,<2.0.
 build-backend = "poetry_dynamic_versioning.backend"
 ```
 
-### `src/log_forge/__init__.py` change
+### `src/log_foundry/__init__.py` change
 
 ```python
 from importlib.metadata import PackageNotFoundError
@@ -396,7 +400,7 @@ jobs:
 
 ```bash
 # main is green and carries the changes you want to ship.
-git tag -a v0.2.0 -m "log-forge 0.2.0"
+git tag -a v0.2.0 -m "log-foundry 0.2.0"
 git push origin v0.2.0
 # The tag push triggers release.yml -> build -> publish-release (version 0.2.0).
 ```
@@ -435,7 +439,7 @@ section of `CLAUDE.md`.
 ├── release.yml       # NEW: test gate -> build -> publish (dev on main, release on v* tags)
 └── spec-lint.yml     # unchanged
 pyproject.toml        # CHANGED: dynamic version, poetry-dynamic-versioning config + backend
-src/log_forge/
+src/log_foundry/
 └── __init__.py       # CHANGED: expose __version__ from importlib.metadata
 CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Common Commands
 ```
@@ -448,13 +452,13 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
   add the `[tool.poetry]` `version = "0.0.0"` placeholder, add the
   `[tool.poetry-dynamic-versioning]` block, and switch `[build-system]` to the
   `poetry_dynamic_versioning.backend` build backend (FR-001).
-- Add the `__version__` attribute to `src/log_forge/__init__.py` and list it in `__all__`
+- Add the `__version__` attribute to `src/log_foundry/__init__.py` and list it in `__all__`
   (FR-002).
 - Create the initial baseline tag `v0.1.0` on `main` so development versions read as
   `0.1.x.devN` rather than `0.0.0.devN`.
 - Verify locally: `python -m build`, then confirm the built wheel's version is `0.1.0` on the
   tag and a `0.1.1.devN` form (no `+hash`) one commit later. Confirm `pip install dist/*.whl`
-  then `python -c "import log_forge; print(log_forge.__version__)"` prints `0.1.0`.
+  then `python -c "import log_foundry; print(log_foundry.__version__)"` prints `0.1.0`.
 
 ### Phase 2: Reusable CI and dev pre-release publishing on main
 
@@ -471,7 +475,7 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
 - Add the `publish-release` job to `release.yml`, without `skip-existing` (FR-005, FR-006).
 - Push `v0.1.0` and confirm the stable release lands on PyPI, that `pip install log-foundry` in
   a clean environment installs `0.1.0` rather than a newer `.devN`, and that
-  `python -c "import log_forge; print(log_forge.__version__)"` reports `0.1.0`.
+  `python -c "import log_foundry; print(log_foundry.__version__)"` reports `0.1.0`.
 
 ### Phase 4: Documentation and completion
 

@@ -1,7 +1,7 @@
-"""Shared fixtures for the log-forge test suite.
+"""Shared fixtures for the log-foundry test suite.
 
 These tests are written *ahead* of the implementation (see docs/implementation-guide.md).
-Every test guards on the feature it needs — `pytest.importorskip("log_forge.<module>")`
+Every test guards on the feature it needs — `pytest.importorskip("log_foundry.<module>")`
 for whole modules, and an attribute check in the `lf` fixture for the public API — so the
 suite stays green and simply *skips* anything not built yet. As you complete each phase,
 the matching tests light up on their own.
@@ -14,12 +14,12 @@ import pytest
 def _reset_config():
     """Restore a fresh global ``Config`` before each test.
 
-    ``log_forge.config._config`` is a process-wide singleton mutated by ``configure()``;
+    ``log_foundry.config._config`` is a process-wide singleton mutated by ``configure()``;
     without this, tests would leak identity/sink/defaults into one another and only pass by
     ordering. No-ops until the module exists.
     """
     try:
-        from log_forge import config
+        from log_foundry import config
     except ImportError:
         yield
         return
@@ -37,7 +37,7 @@ def _reset_worker() -> None:
     module-global ``decorator._worker``. No-ops until the worker module exists.
     """
     try:
-        from log_forge import decorator
+        from log_foundry import decorator
     except ImportError:
         return
     worker = getattr(decorator, "_worker", None)
@@ -75,7 +75,7 @@ def fake_sink() -> FakeSink:
 
 @pytest.fixture
 def lf(fake_sink: FakeSink, monkeypatch):
-    """`log_forge` configured with a FakeSink, flushing synchronously.
+    """`log_foundry` configured with a FakeSink, flushing synchronously.
 
     SPEC-004 rewired the decorator to hand finished spans to a background worker, so
     `fake_sink.events` would no longer be populated by the time a pipeline test asserts.
@@ -84,17 +84,17 @@ def lf(fake_sink: FakeSink, monkeypatch):
     the worker's own batching/retry/backpressure/shutdown behavior is covered directly in
     `test_worker.py`.
     """
-    log_forge = pytest.importorskip("log_forge")
+    log_foundry = pytest.importorskip("log_foundry")
     for attr in ("configure", "trace", "info"):
-        if not hasattr(log_forge, attr):
-            pytest.skip(f"log_forge.{attr} not implemented yet")
-    log_forge.configure(service="test", version="0.0.0", env="test", sink=fake_sink)
+        if not hasattr(log_foundry, attr):
+            pytest.skip(f"log_foundry.{attr} not implemented yet")
+    log_foundry.configure(service="test", version="0.0.0", env="test", sink=fake_sink)
 
-    decorator = pytest.importorskip("log_forge.decorator")
-    from log_forge.config import _ensure_sink
+    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry.config import _ensure_sink
 
     def _sync_flush(span) -> None:
         _ensure_sink().emit(span.events)
 
     monkeypatch.setattr(decorator, "_flush", _sync_flush)
-    return log_forge
+    return log_foundry

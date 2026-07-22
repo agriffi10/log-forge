@@ -29,7 +29,7 @@ standalone single-event span with a fresh `trace_id` so nothing is silently drop
 - Public `set_baggage(**kv)` on the façade, re-exporting the SPEC-001 context function.
 - Orphan-log handling: a level call with no active span emits a standalone one-event span with
   a fresh `trace_id`, flushed directly to the configured sink.
-- Extending `log_forge.__all__` with the new public names.
+- Extending `log_foundry.__all__` with the new public names.
 
 ### Out of Scope
 
@@ -91,11 +91,11 @@ Expose baggage setting on the public façade, re-exporting the SPEC-001 `context
 
 #### Acceptance Criteria:
 
-- [ ] `log_forge.set_baggage(**kv)` merges the keys into the current trace's baggage (via the
+- [ ] `log_foundry.set_baggage(**kv)` merges the keys into the current trace's baggage (via the
       SPEC-001 context function; new dict, no in-place mutation).
 - [ ] Keys set via `set_baggage` appear in the `fields` of every subsequent event emitted at or
       below that point in the same execution flow (respecting FR-001 precedence).
-- [ ] `set_baggage` is listed in `log_forge.__all__`.
+- [ ] `set_baggage` is listed in `log_foundry.__all__`.
 
 ### FR-004: Orphan-log handling
 
@@ -139,11 +139,11 @@ def critical(message: str, *, echo: bool = False, **fields) -> None
 def set_baggage(**kv) -> None                       # re-exports context.set_baggage
 
 # Example
-@log_forge.trace
+@log_foundry.trace
 def process_payment(user_id: int) -> str:
-    log_forge.set_baggage(request_id="req-123")     # rides every log below
-    log_forge.info("charging card", user_id=user_id)
-    log_forge.info("payment complete", echo=True)   # also printed to console now
+    log_foundry.set_baggage(request_id="req-123")     # rides every log below
+    log_foundry.info("charging card", user_id=user_id)
+    log_foundry.info("payment complete", echo=True)   # also printed to console now
     return "ok"
 ```
 
@@ -156,7 +156,7 @@ Out of Scope).
 ## File & Folder Structure
 
 ```
-src/log_forge/
+src/log_foundry/
 ├── __init__.py        # façade: + debug/info/warning/error/critical, set_baggage
 ├── api.py             # level functions + _log helper + set_baggage re-export   (new)
 └── console.py         # ConsoleWriter                                           (new)

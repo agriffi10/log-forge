@@ -15,7 +15,7 @@ events that correlate by shared IDs and flush to a pluggable sink.
 - **`sinks.base` + `sinks.stdout`** — `Sink` Protocol + JSON-lines `StdoutSink`.
 - **`decorator`** — sync `@trace` (bare or parameterized); non-swallowing (records `error`,
   re-raises unchanged); direct flush.
-- **Façade** — `log_forge.configure` / `log_forge.trace`.
+- **Façade** — `log_foundry.configure` / `log_foundry.trace`.
 
 Deviations (all in-session, reversible): zero-config `@trace` falls back to `StdoutSink`
 rather than erroring (arch §8); `set_baggage` exists in `context` but is **not** yet on the

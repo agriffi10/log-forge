@@ -20,7 +20,7 @@ of blocking the decorated call on `sink.emit`.
 - **`decorator`** — `_flush(span)` now calls `_get_worker().submit(span.events)`; the worker is
   created lazily, one per process, from `_ensure_sink()`, and registers the drain via `atexit`
   on first creation (FR-006).
-- **Façade** — `log_forge.shutdown()` drains + closes; also `atexit`-registered.
+- **Façade** — `log_foundry.shutdown()` drains + closes; also `atexit`-registered.
 
 The span lifecycle from SPEC-001/003 is untouched — only *where a finished span goes* changed.
 
@@ -30,7 +30,7 @@ The span lifecycle from SPEC-001/003 is untouched — only *where a finished spa
 async, the shared test fixtures were updated: `conftest.lf` keeps flushing synchronous for the
 pipeline tests (the "synchronous-flush test mode" the fixture always anticipated) and resets the
 process worker between tests; the SPEC-001 `test_decorator_sync.py` tests now call
-`log_forge.shutdown()` to drain before asserting (real end-to-end worker coverage). No public
+`log_foundry.shutdown()` to drain before asserting (real end-to-end worker coverage). No public
 API from earlier specs changed.
 
 Concurrency hardening (from fresh-context review): the idle drain loop now advances its

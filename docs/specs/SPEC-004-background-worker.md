@@ -13,7 +13,7 @@ worker thread that batches events and emits them, so decorated functions return 
 application code never blocks on sink I/O. The worker batches by size and time, retries with
 backoff on emit failure, and applies a backpressure policy (drop-newest with a counted warning)
 when its queue is full so a slow or down sink can never back-pressure the app. A graceful
-`atexit` hook and an explicit `log_forge.shutdown()` drain the queue and `close()` the sink so
+`atexit` hook and an explicit `log_foundry.shutdown()` drain the queue and `close()` the sink so
 buffered events survive process exit. This phase changes only *where a finished span goes* —
 the span lifecycle from SPEC-001/003 is untouched, which is exactly why it was built
 synchronously first.
@@ -30,7 +30,7 @@ synchronously first.
 - Backpressure: when the queue is full, drop-newest and increment a counter (the app never
   blocks).
 - Graceful shutdown: drain remaining queue, emit final batches, then `sink.close()`, wired to
-  `atexit` and exposed as `log_forge.shutdown()`.
+  `atexit` and exposed as `log_foundry.shutdown()`.
 - Rewiring the decorator's `_flush(span)` to `worker.submit(span.events)`; the worker is
   created lazily (one per process) from the configured sink.
 
@@ -115,7 +115,7 @@ On explicit shutdown or interpreter exit, buffered events are flushed and the si
 
 - [ ] `Worker.shutdown()` signals the thread to stop, drains all remaining queued event-lists,
       emits them, then calls `sink.close()`.
-- [ ] `shutdown()` is registered via `atexit` and exposed as `log_forge.shutdown()`.
+- [ ] `shutdown()` is registered via `atexit` and exposed as `log_foundry.shutdown()`.
 - [ ] A program that logs and then exits immediately still flushes those events (the explicit
       drain runs even though the worker thread is a daemon).
 - [ ] `shutdown()` is idempotent — a second call after shutdown does not raise or double-close.
@@ -137,7 +137,7 @@ Exactly one worker is created per process, from the configured sink, on first us
 ## Data Model
 
 ```
-# src/log_forge/worker.py
+# src/log_foundry/worker.py
 Worker {
   sink: Sink
   queue: queue.Queue          # bounded by max_queue; holds per-span list[dict]
@@ -169,19 +169,19 @@ def shutdown() -> None                               # calls the process worker'
 
 # Example
 process_payment(4127)
-log_forge.shutdown()     # flush buffered events before exit
+log_foundry.shutdown()     # flush buffered events before exit
 ```
 
 ## Configuration / Environment
 
 No new environment variables or dependencies. Worker tunables (`batch_size`, `flush_interval`,
 `max_queue`) are constructor defaults for this spec; surfacing them through
-`log_forge.configure(...)` is not required here.
+`log_foundry.configure(...)` is not required here.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/
+src/log_foundry/
 ├── worker.py          # Worker: queue, daemon thread, batching, retry, shutdown   (new)
 ├── decorator.py       # _flush rewired to worker.submit; lazy _get_worker()
 └── __init__.py        # + shutdown
@@ -205,6 +205,6 @@ tests/
 - Add retry-with-backoff around `sink.emit` and the drop-newest+count backpressure path
   (FR-003, FR-004).
 - Add lazy `_get_worker()` and rewire the decorator's `_flush` to `worker.submit`; expose
-  `log_forge.shutdown()` (FR-006).
+  `log_foundry.shutdown()` (FR-006).
 - Test retry survival, `dropped` counting under a full queue, and end-to-end decorate→submit→
   drain.

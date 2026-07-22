@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.rabbitmq import RabbitMQSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.rabbitmq import RabbitMQSink
 
 
 class FakeChannel:
@@ -42,7 +42,7 @@ class FakeConnection:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.rabbitmq.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.rabbitmq.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:

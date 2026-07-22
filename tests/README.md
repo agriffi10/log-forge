@@ -7,10 +7,10 @@ you build.
 
 | File | Phase | Skips until |
 |------|-------|-------------|
-| `test_ids.py` | 2 | `log_forge.ids` exists |
-| `test_model.py` | 3 | `log_forge.model` exists + public API |
-| `test_context.py` | 4 | `log_forge.context` exists |
-| `test_decorator.py` | 6-7 | `log_forge.configure/trace/info` exist |
+| `test_ids.py` | 2 | `log_foundry.ids` exists |
+| `test_model.py` | 3 | `log_foundry.model` exists + public API |
+| `test_context.py` | 4 | `log_foundry.context` exists |
+| `test_decorator.py` | 6-7 | `log_foundry.configure/trace/info` exist |
 | `test_decorator_async.py` | 8 | same, plus `pytest-asyncio` installed |
 
 ## Running
@@ -19,7 +19,7 @@ you build.
 poetry install --with dev       # first time: gets pytest, pytest-asyncio, etc.
 poetry run pytest               # run everything
 poetry run pytest -v            # see which tests run vs. skip
-poetry run pytest --cov=log_forge
+poetry run pytest --cov=log_foundry
 ```
 
 Skipped tests are expected early on — `-v` shows `SKIPPED (… not implemented yet)`.
@@ -33,5 +33,5 @@ Skipped tests are expected early on — `-v` shows `SKIPPED (… not implemented
 - Tests assert on **contract fields** (`status`, `trace_id`, `parent_span_id`), not on the
   exact text of auto-generated span boundary messages — rename those freely.
 - **Once the async worker lands (Phase 9):** `fake_sink.events` won't be populated until
-  the worker drains. Add a synchronous-flush test mode or drain via `log_forge.shutdown()`
+  the worker drains. Add a synchronous-flush test mode or drain via `log_foundry.shutdown()`
   before asserting. See the note in `conftest.py`.

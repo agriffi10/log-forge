@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from test_sinks_http import FakeOpener, FakeResponse
 
 

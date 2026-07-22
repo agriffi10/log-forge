@@ -1,4 +1,4 @@
-# log-forge — Architecture
+# log-foundry — Architecture
 
 > A Python library for generating **consistent, structured logs** per function call,
 > correlating them with shared IDs, and shipping them to a configured output sink
@@ -12,7 +12,7 @@ code — sections describe the target design, not necessarily what's implemented
 
 ## 1. Purpose & scope
 
-log-forge owns the **logs** pillar of observability. It does **not** (yet) ship
+log-foundry owns the **logs** pillar of observability. It does **not** (yet) ship
 metrics or traces, but it deliberately uses tracing vocabulary and ID conventions so
 its output can be correlated with — or later promoted into — traces.
 
@@ -23,7 +23,7 @@ The unit of work is a **decorated function call**. Each call:
 3. records its own **end** on completion *or* exception,
 4. hands the whole buffered queue to a background worker that flushes it to the sink.
 
-Because the queue is buffered and flushed only at the *end* of the call, log-forge
+Because the queue is buffered and flushed only at the *end* of the call, log-foundry
 always knows the call's outcome (success/error, duration) before it sends — see
 [§10 Sampling](#10-sampling-deferred).
 
@@ -33,7 +33,7 @@ always knows the call's outcome (success/error, duration) before it sends — se
 
 We adopt standard observability terms (matches OpenTelemetry / ELK conventions):
 
-| Term | Meaning in log-forge |
+| Term | Meaning in log-foundry |
 |------|----------------------|
 | **trace** | One logical end-to-end flow. Shares a single `trace_id` across every nested decorated call. |
 | **span** | One decorated function call. Has its own `span_id`, a start, an end, a duration, and a status. |
@@ -93,19 +93,19 @@ trace_id = 7f3a9e...                         (one flow)
 ## 4. Lifecycle of a decorated call
 
 ```
-@logforge.trace
+@log_foundry.trace
 def process_payment(...):       # ── on enter ──────────────────────────────
                                 #  • resolve context: parent span? → inherit trace_id,
                                 #    set parent_span_id;  else → new trace_id, parent=null
                                 #  • mint span_id, record start_ts, capture function name,
                                 #    merge config defaults
                                 #  • push this span onto the context stack
-    logforge.info("charging")   #  • append a log event (trace_id + new log_id stamped)
+    log_foundry.info("charging")   #  • append a log event (trace_id + new log_id stamped)
     ...                         #
                                 # ── on exit (success OR exception) ─────────
                                 #  • record end_ts, duration, status (ok|error)
                                 #  • on error: capture exception type + traceback,
-                                #    then RE-RAISE (log-forge never swallows)
+                                #    then RE-RAISE (log-foundry never swallows)
                                 #  • pop the context stack
                                 #  • enqueue the finished span's queue to the worker
 ```
@@ -122,9 +122,9 @@ The decorator is **non-swallowing**: exceptions are recorded and re-raised uncha
   `contextvars` is correct under both threads and `async`/`await` (each task gets its
   own context), so users never pass the queue around manually.
 - The context holds a **stack** of active spans. Entering a decorated call pushes;
-  exiting pops. The top of the stack is the target for `logforge.info(...)` etc., and
+  exiting pops. The top of the stack is the target for `log_foundry.info(...)` etc., and
   the source of `parent_span_id` for the next nested call.
-- **Logging outside any span:** a top-level `logforge.info(...)` with no active span
+- **Logging outside any span:** a top-level `log_foundry.info(...)` with no active span
   emits a standalone single-event queue with a fresh `trace_id` (an "orphan" log) so
   records are never silently dropped. *(Open item — see §12.)*
 
@@ -136,9 +136,9 @@ between them: key/values set *at runtime* on the current trace that are then
 auto-stamped onto **every span and log event at or below** the point they were set.
 
 ```python
-@logforge.trace
+@log_foundry.trace
 def handle_request(req):
-    logforge.set_baggage(tenant=req.tenant, request_id=req.id)
+    log_foundry.set_baggage(tenant=req.tenant, request_id=req.id)
     process_payment(req.user_id)   # tenant + request_id appear on its logs too
 ```
 
@@ -189,7 +189,7 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
 
 While a span is active, user code has two complementary capabilities:
 
-1. **Add a log to the span** (the default) — `logforge.info("msg", user_id=4127)`
+1. **Add a log to the span** (the default) — `log_foundry.info("msg", user_id=4127)`
    appends a structured event to the current span's queue. It rides the async pipeline
    to the sink (→ ELK). This is the bread-and-butter path.
 
@@ -198,7 +198,7 @@ While a span is active, user code has two complementary capabilities:
    for the async flush. Triggered per-call via `echo=True`:
 
    ```python
-   logforge.info("payment complete", echo=True)
+   log_foundry.info("payment complete", echo=True)
    ```
 
 Console echo characteristics:
@@ -220,19 +220,19 @@ Console echo characteristics:
 
 Two layers:
 
-- **Global, once at startup** — `logforge.configure(...)`: `service`, `version`, `env`,
+- **Global, once at startup** — `log_foundry.configure(...)`: `service`, `version`, `env`,
   the `sink`, and a `defaults` dict merged into every event.
-- **Per-decorator overrides** — `@logforge.span(name=..., defaults={...})` to add or
+- **Per-decorator overrides** — `@log_foundry.span(name=..., defaults={...})` to add or
   override fields for one call tree.
 
 ```python
-import logforge
+import log_foundry
 
-logforge.configure(
+log_foundry.configure(
     service="payments",
     version="2.14",
     env="prod",
-    sink=logforge.sinks.SQSSink(queue_url="https://sqs..."),
+    sink=log_foundry.sinks.SQSSink(queue_url="https://sqs..."),
     defaults={"team": "checkout"},
 )
 ```
@@ -280,7 +280,7 @@ decorated call ends
 
 - The decorated function **returns immediately**; SQS latency and outages never block
   application code.
-- **Graceful shutdown:** an `atexit` (and explicit `logforge.shutdown()`) hook drains
+- **Graceful shutdown:** an `atexit` (and explicit `log_foundry.shutdown()`) hook drains
   the worker queue and `close()`s the sink so buffered events aren't lost on exit.
 - **Backpressure policy:** if the worker queue is full (sink is down / slow), default to
   **drop-newest with a counted warning** rather than blocking the app. *(Open item — the
@@ -288,7 +288,7 @@ decorated call ends
 
 ### 9.1 The sink is a durable buffer, not the final store
 
-A core design principle: **log-forge ships to a buffer, never directly to ELK.** The
+A core design principle: **log-foundry ships to a buffer, never directly to ELK.** The
 pipeline has two distinct stages of decoupling, each absorbing a different failure mode:
 
 ```
@@ -302,7 +302,7 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
   being lost or back-pressuring the app. This is exactly why a durable queue is the
   default headline sink rather than a direct `HTTPSink` to Elasticsearch — a direct
   writer couples application availability to ELK availability.
-- log-forge's responsibility **ends at the sink.** A separate consumer drains SQS and
+- log-foundry's responsibility **ends at the sink.** A separate consumer drains SQS and
   owns indexing into ELK; that component is out of scope for this library (§13).
 - **Batching honors the sink's limits, but the worker stays sink-agnostic** — the worker
   flushes on fixed count/time thresholds and hands the sink whatever it accumulated; each
@@ -333,28 +333,28 @@ plugs in here with no change to the rest of the pipeline. The hook should be
 ## 11. Public API sketch
 
 ```python
-import logforge
+import log_foundry
 
-logforge.configure(service="payments", version="2.14", env="prod",
-                   sink=logforge.sinks.SQSSink(queue_url="..."))
+log_foundry.configure(service="payments", version="2.14", env="prod",
+                   sink=log_foundry.sinks.SQSSink(queue_url="..."))
 
-@logforge.trace                      # root call: starts a new trace; captures "process_payment"
+@log_foundry.trace                      # root call: starts a new trace; captures "process_payment"
 def process_payment(user_id: int):
-    logforge.info("charging card", user_id=user_id)   # → span queue → sink
+    log_foundry.info("charging card", user_id=user_id)   # → span queue → sink
     write_ledger(user_id)            # nested span: same trace_id, parent=this span
-    logforge.info("payment complete", echo=True)      # → queue AND printed to console now
+    log_foundry.info("payment complete", echo=True)      # → queue AND printed to console now
     return "ok"
 
-@logforge.trace
+@log_foundry.trace
 def write_ledger(user_id: int):
-    logforge.debug("inserting row", user_id=user_id)
+    log_foundry.debug("inserting row", user_id=user_id)
 
-# Levels: logforge.debug / info / warning / error / critical
+# Levels: log_foundry.debug / info / warning / error / critical
 # Each appends to the current span's queue via contextvars; pass echo=True to also
 # print the message to the console immediately.
 ```
 
-> `@logforge.trace` decorates a function. The outermost decorated call starts a new
+> `@log_foundry.trace` decorates a function. The outermost decorated call starts a new
 > **trace**; every decorated call (outer or nested) is a **span** within it.
 
 ---
@@ -367,7 +367,7 @@ def write_ledger(user_id: int):
   and whether an `echo_level` auto-echo threshold ships in v1 (§6.1).
 
 ### Resolved
-- **Decorator name** → `@logforge.trace`.
+- **Decorator name** → `@log_foundry.trace`.
 - **Auto-capture** → function name only; no args/return capture.
 - **Cross-service trace continuation** (adopting an inbound `trace_id` from a
   `traceparent` request header, plus cross-process baggage — the full "Correlation ID
@@ -388,7 +388,7 @@ def write_ledger(user_id: int):
 
 ## 14. Alignment with observability concepts
 
-| Concept (design brief) | How log-forge addresses it |
+| Concept (design brief) | How log-foundry addresses it |
 |------------------------|----------------------------|
 | Structured vs unstructured | JSON with named fields, always (§6). |
 | Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3). |

@@ -8,8 +8,8 @@ import types
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.clickhouse import ClickHouseSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.clickhouse import ClickHouseSink
 
 
 class FakeClickHouse:
@@ -35,7 +35,7 @@ class FakeClickHouse:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.clickhouse.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.clickhouse.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:

@@ -73,7 +73,7 @@ def test_baggage_flows_to_descendant_logs(lf, fake_sink) -> None:
         child()
 
     if not hasattr(lf, "set_baggage"):
-        pytest.skip("log_forge.set_baggage not implemented yet")
+        pytest.skip("log_foundry.set_baggage not implemented yet")
 
     contextvars.copy_context().run(parent)
 

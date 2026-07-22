@@ -16,7 +16,7 @@ def _async_trace_supported() -> bool:
     coroutine function — so this probe (and the module skip below) lifts automatically when
     SPEC-003 is implemented, matching the "guard on the feature you need" suite convention.
     """
-    lf = pytest.importorskip("log_forge")
+    lf = pytest.importorskip("log_foundry")
     if not hasattr(lf, "trace"):
         return False
 

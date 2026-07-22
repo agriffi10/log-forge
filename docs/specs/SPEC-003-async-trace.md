@@ -111,12 +111,12 @@ No new types. Reuses SPEC-001 `Span` and the `LogEvent` schema unchanged.
 def trace(func=None, *, name=None, defaults=None): ...
 
 # Example
-@log_forge.trace
+@log_foundry.trace
 async def fetch(user_id: int) -> dict:
-    log_forge.info("fetching", user_id=user_id)
+    log_foundry.info("fetching", user_id=user_id)
     return await load(user_id)
 
-@log_forge.trace
+@log_foundry.trace
 async def load(user_id: int) -> dict:
     ...
 
@@ -131,7 +131,7 @@ No new configuration, environment variables, or dependencies. `pytest-asyncio`
 ## File & Folder Structure
 
 ```
-src/log_forge/
+src/log_foundry/
 └── decorator.py       # add the async wrapper branch to trace()
 tests/
 └── test_decorator_async.py   # async lifecycle, nesting, concurrent gather, baggage   (new)

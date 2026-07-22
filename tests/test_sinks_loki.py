@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.loki import LokiSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.loki import LokiSink
 from test_sinks_http import FakeOpener
 
 

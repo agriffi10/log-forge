@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-stdout_sink = pytest.importorskip("log_forge.sinks.stdout")
+stdout_sink = pytest.importorskip("log_foundry.sinks.stdout")
 
 
 class _RecordingStream(io.StringIO):

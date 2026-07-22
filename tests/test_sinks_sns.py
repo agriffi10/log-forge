@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.sns import SNSSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.sns import SNSSink
 
 
 class FakeSNS:

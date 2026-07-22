@@ -2,14 +2,14 @@
 
 ## What was completed?
 
-`log-forge` is published on PyPI as **[`log-foundry`](https://pypi.org/project/log-foundry/)**;
+`log-foundry` is published on PyPI as **[`log-foundry`](https://pypi.org/project/log-foundry/)**;
 first stable release **`v0.1.0`**. The version is no longer hand-edited — it is derived from Git
 tags at build time, so it cannot drift from what Git says.
 
 - **`pyproject.toml`** — `[project]` declares `dynamic = ["version"]`, `[tool.poetry]` keeps a
   `0.0.0` placeholder, build backend is `poetry_dynamic_versioning.backend`. `metadata = false`
   drops the `+<hash>` local segment, which PyPI refuses outright (FR-001).
-- **`log_forge.__version__`** — read from `importlib.metadata.version("log-foundry")`, falling
+- **`log_foundry.__version__`** — read from `importlib.metadata.version("log-foundry")`, falling
   back to `"0.0.0"` in an uninstalled checkout; exported in `__all__` (FR-002).
 - **`.github/workflows/release.yml`** (new) — `test` (reuses `ci.yml`) → `build` →
   `publish-dev` / `publish-release` (FR-003..FR-007).
@@ -24,9 +24,10 @@ tags at build time, so it cannot drift from what Git says.
 
 - **Distribution renamed `log-forge` → `log-foundry`.** PyPI's similarity check collapses
   separators, so `log-forge` collides with the unrelated, pre-existing `logforge`. Only the
-  distribution name moved — the import name is still `log_forge`, and no module or API was
+  distribution name moved — the import name was still `log_forge`, and no module or API was
   renamed. Anything doing `importlib.metadata` lookups must use `log-foundry`, or `__version__`
-  silently degrades to `"0.0.0"`.
+  silently degrades to `"0.0.0"`. *(Later superseded: a post-SPEC-012 change shipped in `0.2.0`
+  renamed the import package to `log_foundry`, so install and import names now match.)*
 - **TestPyPI dropped entirely.** It is a separate instance needing its own account and 2FA. Dev
   pre-releases on production PyPI preserve the property that mattered — a tagged release is
   never the first time the upload path runs. Cost: every merge permanently consumes a
@@ -62,5 +63,5 @@ local segment. The tag-match guard was tested against pass/mismatch/dev-version 
 Verified in production, not just locally: `publish-dev` shipped `0.0.2.dev1`/`0.0.2.dev2` on
 merges, `publish-release` shipped `0.1.0` on the tag, each skipping correctly on the other
 trigger. `pip install log-foundry` into a clean venv installs **`0.1.0`** (not a `.devN`),
-imports as `log_forge`, reports `__version__ == "0.1.0"`, and traces a call end to end.
+imports as `log_foundry`, reports `__version__ == "0.1.0"`, and traces a call end to end.
 Trusted Publishing (OIDC) authenticated on the first attempt with no stored credential.

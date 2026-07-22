@@ -134,7 +134,7 @@ Large batches and oversized documents are handled without crashing the worker.
 ## Data Model
 
 ```
-# One module per sink under src/log_forge/sinks/. Shared shape:
+# One module per sink under src/log_foundry/sinks/. Shared shape:
 <DBSink> {
   target: str                  # table or collection name
   client / connection: <lazily-imported or injected driver handle>
@@ -173,9 +173,9 @@ class PostgresSink:
                  chunk_size=1000, max_retries=3) -> None: ...
 
 # Usage
-import log_forge
-from log_forge.sinks.clickhouse import ClickHouseSink
-log_forge.configure(sink=ClickHouseSink("log_events", dsn="clickhouse://user:pw@host/db",
+import log_foundry
+from log_foundry.sinks.clickhouse import ClickHouseSink
+log_foundry.configure(sink=ClickHouseSink("log_events", dsn="clickhouse://user:pw@host/db",
                                         create_table=True))
 ```
 
@@ -185,12 +185,12 @@ log_forge.configure(sink=ClickHouseSink("log_events", dsn="clickhouse://user:pw@
   and CLAUDE.md's Tech Stack at implementation time): `clickhouse` (`clickhouse-connect`), `mongo`
   (`pymongo`), `postgres` (`psycopg[binary]`).
 - Connection details are passed as a DSN/URI or an injected client; credentials are resolved by the
-  driver (or the caller's own environment). log-forge adds no credential configuration of its own.
+  driver (or the caller's own environment). log-foundry adds no credential configuration of its own.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 ├── clickhouse.py   # ClickHouseSink (columnar batch insert)          (new)
 ├── mongodb.py      # MongoDBSink (insert_many, ordered=False)         (new)
 └── postgres.py     # PostgresSink (JSONB + extracted columns)         (new)

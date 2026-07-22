@@ -9,8 +9,8 @@ from __future__ import annotations
 import io
 import sys
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.util import MemorySink, NullSink, StderrSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.util import MemorySink, NullSink, StderrSink
 
 
 class FlushCounter(io.StringIO):

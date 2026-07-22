@@ -1,4 +1,4 @@
-# log-forge — Implementation Guide
+# log-foundry — Implementation Guide
 
 A step-by-step path from the empty package to a working library, built to match
 [`architecture.md`](architecture.md). Section references like *(arch §5)* point back to it.
@@ -8,10 +8,9 @@ slice* — it ends with something you can run and verify before moving on. The c
 are **skeletons and the tricky parts in full**; the straightforward method bodies are
 left for you. Each phase says *what* it accomplishes and *why* it exists.
 
-> **Naming note:** the installable package is `log_forge` (underscore). The architecture
-> doc writes `logforge` as friendly shorthand — same thing. This guide uses the real
-> `log_forge` import. If you'd rather type `logforge`, rename the distribution later;
-> don't let it block you now.
+> **Naming note:** you `pip install log-foundry` (hyphen) and `import log_foundry`
+> (underscore) — the usual distribution/import spelling split, same package. Both this guide
+> and the architecture doc use the real `log_foundry` import.
 
 ---
 
@@ -21,7 +20,7 @@ Build the package toward this layout. Each module owns one architecture concept,
 arrows show who imports whom (dependencies point *downward* — no cycles):
 
 ```
-src/log_forge/
+src/log_foundry/
 ├── __init__.py        Public façade: configure, trace, debug/info/…, set_baggage, shutdown
 ├── config.py          Global config (service/version/env/sink/defaults)        (arch §7)
 ├── ids.py             W3C-compatible id generation                             (arch §3.1)
@@ -53,25 +52,25 @@ superseded by `model.py`.
 every phase below makes a piece of it real.
 
 ```python
-import log_forge
-from log_forge.sinks.stdout import StdoutSink
+import log_foundry
+from log_foundry.sinks.stdout import StdoutSink
 
-log_forge.configure(service="payments", version="2.14", env="prod", sink=StdoutSink())
+log_foundry.configure(service="payments", version="2.14", env="prod", sink=StdoutSink())
 
-@log_forge.trace
+@log_foundry.trace
 def process_payment(user_id: int) -> str:
-    log_forge.set_baggage(request_id="req-123")     # rides every log below (arch §5.1)
-    log_forge.info("charging card", user_id=user_id)
+    log_foundry.set_baggage(request_id="req-123")     # rides every log below (arch §5.1)
+    log_foundry.info("charging card", user_id=user_id)
     write_ledger(user_id)
-    log_forge.info("payment complete", echo=True)   # also printed to console now
+    log_foundry.info("payment complete", echo=True)   # also printed to console now
     return "ok"
 
-@log_forge.trace
+@log_foundry.trace
 def write_ledger(user_id: int) -> None:
-    log_forge.debug("inserting row", user_id=user_id)
+    log_foundry.debug("inserting row", user_id=user_id)
 
 process_payment(4127)
-log_forge.shutdown()   # flush before exit
+log_foundry.shutdown()   # flush before exit
 ```
 
 **Why first:** locking the call-site shape keeps every internal decision honest. If a
@@ -213,7 +212,7 @@ it doesn't know where the "current" span lives. That's the next phase.
 **Goal:** track the active span and baggage per execution flow, with zero manual passing,
 working under both threads and `asyncio`.
 
-**Why:** `log_forge.info(...)` has to find "the span I'm inside" on its own. `contextvars`
+**Why:** `log_foundry.info(...)` has to find "the span I'm inside" on its own. `contextvars`
 is the one mechanism that does this correctly across threads *and* async tasks (each task
 inherits a copy). This is the linchpin of the whole ergonomic API.
 
@@ -223,9 +222,9 @@ import contextvars
 from .model import Span
 
 _span_stack: contextvars.ContextVar[tuple[Span, ...]] = \
-    contextvars.ContextVar("log_forge_span_stack", default=())
+    contextvars.ContextVar("log_foundry_span_stack", default=())
 _baggage: contextvars.ContextVar[dict] = \
-    contextvars.ContextVar("log_forge_baggage", default={})
+    contextvars.ContextVar("log_foundry_baggage", default={})
 
 def current_span() -> Span | None:
     stack = _span_stack.get()
@@ -512,7 +511,7 @@ def _flush(span):
     _get_worker().submit(span.events)   # was: get_config().sink.emit(...)
 ```
 
-Create the worker lazily from config (one per process) and expose `log_forge.shutdown()`
+Create the worker lazily from config (one per process) and expose `log_foundry.shutdown()`
 that calls `worker.shutdown()`.
 
 **Watch out:** the worker thread is a `daemon` so it can't hang interpreter exit, but daemon
@@ -562,7 +561,7 @@ aws = ["boto3>=1.34"]
 …installed with `pip install 'log-foundry[aws]'` / `poetry install --extras aws`. (This extra
 was named `sqs` when SPEC-005 shipped it; SPEC-010 renamed it to `aws` once SNS, Kinesis, and
 Firehose joined it. The distribution is `log-foundry` on PyPI — see SPEC-012 — while the import
-name remains `log_forge`.)
+name remains `log_foundry`.)
 
 **Watch out:** the worker batches by *count*, but SQS also caps by *bytes*. The sink must
 re-chunk on size, not assume the worker's batch already fits. One oversized event should be
@@ -611,9 +610,9 @@ class FakeSink:
 
 def test_nested_spans_share_trace_and_link_parent():
     sink = FakeSink()
-    log_forge.configure(service="t", sink=sink)
+    log_foundry.configure(service="t", sink=sink)
     # For deterministic tests, flush synchronously (skip the worker) or call
-    # log_forge.shutdown() to drain before asserting.
+    # log_foundry.shutdown() to drain before asserting.
     ...
     events = [e for batch in sink.batches for e in batch]
     trace_ids = {e["trace_id"] for e in events}

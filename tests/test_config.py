@@ -2,7 +2,7 @@
 
 import pytest
 
-config = pytest.importorskip("log_forge.config")
+config = pytest.importorskip("log_foundry.config")
 
 
 def test_configure_sets_identity_fields() -> None:

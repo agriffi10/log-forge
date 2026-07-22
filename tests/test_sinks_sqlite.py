@@ -11,8 +11,8 @@ import sqlite3
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.sqlite import SQLiteSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.sqlite import SQLiteSink
 
 _ALL_COLUMNS = ("log_id", "trace_id", "span_id", "timestamp", "level", "function", "event")
 

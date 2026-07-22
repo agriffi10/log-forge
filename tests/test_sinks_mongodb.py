@@ -7,8 +7,8 @@ import types
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.mongodb import MongoDBSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.mongodb import MongoDBSink
 
 
 class FakeBulkWriteError(Exception):
@@ -61,7 +61,7 @@ def make_sink(collection: FakeCollection, **kwargs) -> MongoDBSink:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.mongodb.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.mongodb.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:
