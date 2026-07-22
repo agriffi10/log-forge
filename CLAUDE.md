@@ -95,10 +95,9 @@ and a repeatable `flush()` added. **SPEC-014 (cross-process trace continuation) 
 `continue_trace()` adopts a W3C `traceparent` + `baggage`; `current_traceparent()` and friends
 publish it. **SPEC-015 (baggage on boundary events) is Completed** — `span.start`/`span.end` were
 built with `baggage={}` hardcoded, so the events carrying `duration_ms`/`status` were invisible to
-a baggage filter; one backfill at span close now completes both. **Latest release: `v0.3.0`**
-(SPEC-013 + SPEC-014; `v0.2.0` was the rename, `v0.1.0` the first stable). SPEC-015 is unreleased
-and wants a **minor** bump (`v0.4.0` — additive: a span that sets no baggage emits byte-identical
-output). No spec is in flight; the next initiative needs a new spec.
+a baggage filter; one backfill at span close now completes both. **Latest release: `v0.4.0`**
+(SPEC-015; `v0.3.0` was SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
+Nothing is unreleased. No spec is in flight; the next initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
