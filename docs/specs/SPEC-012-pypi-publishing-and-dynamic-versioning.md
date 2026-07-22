@@ -12,13 +12,20 @@ Today `log-forge` is built locally with Poetry and its version is a hand-edited
 release automation. This spec makes the package installable with `pip install log-foundry` by
 adding an automated release pipeline, and it removes the hand-edited version entirely so the
 version number is derived from Git tags instead. Every merge to `main` builds the package and
-publishes a development pre-release to the TestPyPI sandbox index, which continuously exercises
-the exact publish path without creating public releases. A real release to the production PyPI
-index happens only when a maintainer pushes an annotated version tag such as `v0.2.0`. All
-uploads authenticate with PyPI's Trusted Publishing (OpenID Connect), so there is no long-lived
-API token stored in the repository. The result is that cutting a release is a single `git tag`
-away, the version can never drift from what Git says, and the publish machinery is proven on
-every merge before it is ever asked to ship to production.
+publishes a **development pre-release** (`0.1.1.devN`) to production PyPI, which continuously
+exercises the exact publish path; `pip install log-foundry` still resolves to the latest stable
+release, because pip ignores pre-releases unless `--pre` is passed. A real release happens only
+when a maintainer pushes an annotated version tag such as `v0.2.0`. All uploads authenticate
+with PyPI's Trusted Publishing (OpenID Connect), so there is no long-lived API token stored in
+the repository. The result is that cutting a release is a single `git tag` away, the version can
+never drift from what Git says, and the publish machinery is proven on every merge before it is
+ever asked to ship a tagged release.
+
+**A single index.** An earlier draft of this spec rehearsed publishing against the TestPyPI
+sandbox. TestPyPI is a wholly separate instance requiring its own account and 2FA enrolment;
+that overhead was judged not worth it. Publishing dev pre-releases to production PyPI preserves
+the property that mattered — the upload path is never first exercised by a tagged release —
+at the cost of permanently consuming a version number per merge.
 
 ## Scope
 
@@ -35,10 +42,12 @@ every merge before it is ever asked to ship to production.
   metadata, so the library reports the same version it was built and published under.
 - A new `.github/workflows/release.yml` workflow that builds a source distribution (sdist) and
   a wheel, then publishes them.
-- Continuous publishing of a development pre-release to **TestPyPI** on every push to `main`.
-- Production publishing to **PyPI** on every pushed annotated tag matching `v*`.
+- Continuous publishing of a development pre-release (`X.Y.Z.devN`) to **production PyPI** on
+  every push to `main`, with `skip-existing: true` so re-runs are tolerated.
+- Tagged release publishing to **PyPI** on every pushed annotated tag matching `v*`, with
+  `skip-existing` **off** so re-tagging an already-published version fails loudly.
 - Authenticating both uploads with **Trusted Publishing (OIDC)** through
-  `pypa/gh-action-pypi-publish`, using GitHub Environments named `pypi` and `testpypi`.
+  `pypa/gh-action-pypi-publish`, using a single GitHub Environment named `pypi`.
 - Gating every publish behind the existing lint, type-check, and test suite by reusing the
   current `ci.yml` as a called workflow, so a red build can never publish.
 - Establishing an initial baseline tag (`v0.0.1`) so that development versions read sensibly
@@ -51,10 +60,15 @@ every merge before it is ever asked to ship to production.
 - Fully automated version bumping from commit messages (for example `python-semantic-release`
   with Conventional Commits). This spec keeps the version choice in the maintainer's hands via
   the tag; commit-driven bumping can be layered on later without changing the publish jobs.
-- Publishing a public release to production PyPI on ordinary merges to `main`. Routine merges
-  reach TestPyPI only; production releases are deliberate and tag-gated. This is a considered
-  reinterpretation of "publish on merges to main" and is called out here so it is not assumed
-  to include public releases.
+- Publishing a **stable** release on ordinary merges to `main`. Routine merges publish only
+  `X.Y.Z.devN` pre-releases, which pip will not install by default; a stable release is
+  deliberate and tag-gated. This is a considered reinterpretation of "publish on merges to
+  main" and is called out here so it is not assumed to include stable releases.
+- Using the **TestPyPI** sandbox at all. It is a separate instance needing its own account and
+  2FA enrolment; dev pre-releases on production PyPI serve the same rehearsal purpose. No
+  `testpypi` GitHub Environment and no `test.pypi.org` trusted publisher are required.
+- True PEP 440 **release candidates** (`0.1.0rc1`). Merges to `main` produce `.devN` builds,
+  which is the idiomatic every-commit form; an `rcN` would require its own deliberate tag.
 - Signing artifacts (for example Sigstore attestations), building compiled/binary wheels, or a
   multi-platform build matrix. The package is pure Python, so one universal wheel plus one
   sdist is sufficient.
@@ -86,8 +100,8 @@ table so no one edits a version by hand again.
       exactly `X.Y.Z`.
 - [ ] Building at an untagged commit that is N commits ahead of the latest tag produces a valid
       PEP 440 public development version (for example `0.1.1.devN`) that carries **no** local
-      version segment (no `+<hash>` suffix), because PyPI and TestPyPI reject uploads whose
-      version contains a local segment.
+      version segment (no `+<hash>` suffix), because PyPI rejects uploads whose version
+      contains a local segment.
 - [ ] The built sdist and wheel filenames and internal metadata all report the derived version
       consistently.
 
@@ -125,47 +139,51 @@ dynamic version can be resolved, and hands the artifacts to the publish jobs.
       `dist/`, and uploads them as a workflow artifact for the publish jobs to consume.
 - [ ] The build job runs only after the test gate (FR-007) succeeds.
 
-### FR-004: Continuous development publish to TestPyPI on merge to main
+### FR-004: Continuous development pre-release publish on merge to main
 
 #### Description:
 
-Every push to `main` publishes the built development pre-release to the TestPyPI sandbox index,
-so the publish pipeline is exercised end to end on each merge without producing a public
-release.
+Every push to `main` publishes the built development pre-release (`X.Y.Z.devN`) to production
+PyPI, so the publish pipeline is exercised end to end on each merge. Because pip does not
+install pre-releases unless `--pre` is passed, `pip install log-foundry` continues to resolve to
+the latest stable release.
 
 #### Acceptance Criteria:
 
 - [ ] On a push to `main` (and not on a tag), the workflow publishes the built artifacts to
-      `https://test.pypi.org/legacy/`.
-- [ ] The TestPyPI publish step sets `skip-existing: true`, so a re-run that produces an
+      production PyPI.
+- [ ] The published version is a `.devN` pre-release, never a stable `X.Y.Z`.
+- [ ] The dev publish step sets `skip-existing: true`, so a re-run that produces an
       already-uploaded development version is tolerated rather than failing the workflow.
-- [ ] The TestPyPI publish job runs in a GitHub Environment named `testpypi` and requests
+- [ ] The dev publish job runs in the GitHub Environment named `pypi` and requests
       `id-token: write`.
-- [ ] The production PyPI publish job does **not** run on a plain push to `main`.
+- [ ] The tagged-release publish job does **not** run on a plain push to `main`.
+- [ ] `pip install log-foundry` in a clean environment installs the latest **stable** release,
+      not the newest `.devN`.
 
-### FR-005: Production publish to PyPI on a version tag
+### FR-005: Tagged release publish to PyPI on a version tag
 
 #### Description:
 
-Pushing an annotated version tag builds and publishes a real release to the production PyPI
-index.
+Pushing an annotated version tag builds and publishes a stable release to PyPI.
 
 #### Acceptance Criteria:
 
-- [ ] On a push of a tag matching `v*`, the workflow publishes the built artifacts to production
-      PyPI.
+- [ ] On a push of a tag matching `v*`, the workflow publishes the built artifacts to PyPI.
 - [ ] The version published equals the tag with the leading `v` removed (tag `v0.2.0` publishes
       version `0.2.0`).
-- [ ] The PyPI publish job runs in a GitHub Environment named `pypi` and requests
+- [ ] The release publish job runs in the GitHub Environment named `pypi` and requests
       `id-token: write`.
-- [ ] The TestPyPI publish job does **not** run on a tag push.
+- [ ] The release publish step does **not** set `skip-existing`, so re-pushing a tag whose
+      version is already on PyPI fails the workflow instead of silently succeeding.
+- [ ] The dev pre-release publish job does **not** run on a tag push.
 
 ### FR-006: Trusted Publishing authentication with no stored secrets
 
 #### Description:
 
-Both uploads authenticate to their index using Trusted Publishing (OIDC); the repository stores
-no PyPI password or API token.
+Both uploads authenticate to PyPI using Trusted Publishing (OIDC); the repository stores no
+PyPI password or API token.
 
 #### Acceptance Criteria:
 
@@ -173,10 +191,11 @@ no PyPI password or API token.
       input.
 - [ ] Each publish job grants `id-token: write` (and nothing broader than `contents: read`
       besides it).
-- [ ] No PyPI or TestPyPI credential is present in repository or environment secrets.
-- [ ] A trusted publisher is registered on both `pypi.org` and `test.pypi.org` for this
-      repository, the `release.yml` workflow file, and the matching environment name (see
-      Configuration / Environment).
+- [ ] No PyPI credential is present in repository or environment secrets.
+- [ ] A trusted publisher is registered on `pypi.org` for this repository, the `release.yml`
+      workflow file, and the environment name `pypi` (see Configuration / Environment).
+- [ ] Both publish jobs use the same `pypi` environment, so one publisher registration covers
+      the dev pre-release and the tagged release.
 
 ### FR-007: Publish is gated on a green build
 
@@ -239,7 +258,7 @@ enable = true
 vcs = "git"
 style = "pep440"
 bump = true       # development builds sort after the last release (e.g. 0.1.1.devN)
-metadata = false  # drop the +<hash> local segment so PyPI/TestPyPI accept the upload
+metadata = false  # drop the +<hash> local segment so PyPI accepts the upload
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0", "poetry-dynamic-versioning>=1.4.0,<2.0.0"]
@@ -328,14 +347,15 @@ jobs:
           name: dist
           path: dist/
 
-  publish-testpypi:
-    # Every merge to main ships a development pre-release to the TestPyPI sandbox.
+  publish-dev:
+    # Every merge to main ships a 0.1.1.devN pre-release to PyPI. pip ignores pre-releases
+    # unless --pre is passed, so `pip install log-foundry` still gets the stable release.
     if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/log-foundry
+      name: pypi
+      url: https://pypi.org/p/log-foundry
     permissions:
       id-token: write          # required for Trusted Publishing (OIDC)
     steps:
@@ -345,14 +365,14 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to TestPyPI
+      - name: Publish dev pre-release to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          repository-url: https://test.pypi.org/legacy/
           skip-existing: true   # tolerate a re-run that produces a duplicate dev version
 
-  publish-pypi:
-    # A pushed version tag (vX.Y.Z) ships a real release to production PyPI.
+  publish-release:
+    # A pushed version tag (vX.Y.Z) ships a stable release to PyPI.
+    # Deliberately no skip-existing: re-tagging a published version must fail loudly.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
@@ -378,24 +398,25 @@ jobs:
 # main is green and carries the changes you want to ship.
 git tag -a v0.2.0 -m "log-forge 0.2.0"
 git push origin v0.2.0
-# The tag push triggers release.yml -> build -> publish-pypi (version 0.2.0).
+# The tag push triggers release.yml -> build -> publish-release (version 0.2.0).
 ```
 
 ## Configuration / Environment
 
-**Trusted publisher registration (one-time, per index).** Because `log-foundry` does not yet
-exist on either index, use the "pending publisher" flow on both `pypi.org` and `test.pypi.org`
-(Your account → Publishing). Register, on each site, a GitHub Actions publisher with: PyPI
-project name `log-foundry`; owner and repository matching this GitHub repository; workflow
-filename `release.yml`; and environment name `pypi` on PyPI and `testpypi` on TestPyPI. A
-pending publisher does not reserve the project name until the first successful publish, so run
-the first tagged release (and let the first `main` merge reach TestPyPI) soon after registering
-to claim the name.
+**Trusted publisher registration (one-time).** Because `log-foundry` does not yet exist on
+PyPI, use the "pending publisher" flow on `pypi.org` (Your account → Publishing). Register a
+GitHub Actions publisher with: PyPI project name `log-foundry`; owner and repository matching
+this GitHub repository; workflow filename `release.yml`; and environment name `pypi`. The
+environment field must be exactly `pypi` or left blank — blank is permissive and still matches,
+but any other value fails the OIDC exchange at upload time, which is the most common
+trusted-publishing failure. A pending publisher does not reserve the project name until the
+first successful publish, so let the first `main` merge run soon after registering to claim the
+name.
 
-**GitHub Environments.** Create two environments in the repository settings, `pypi` and
-`testpypi`, matching the names in `release.yml`. The `pypi` environment may optionally carry a
-required-reviewer protection rule so a human must approve before a production upload proceeds;
-`testpypi` needs no protection.
+**GitHub Environments.** Create one environment in the repository settings, `pypi`, matching
+the name in `release.yml`. It carries no protection rules: releases are fully automatic on a
+tag push, on the reasoning that pushing the tag is itself the deliberate act. Adding a
+required-reviewer rule later would insert a human approval before each upload.
 
 **Local contributor setup.** Because the version now comes from Git, contributors installing
 with Poetry need the plugin registered in their Poetry so local `poetry build` and
@@ -404,15 +425,14 @@ The CI build uses `python -m build`, which reads the backend directly and needs 
 plugin. Add this line, and a note that the version is tag-derived, to the "Common Commands"
 section of `CLAUDE.md`.
 
-**No secrets.** Do not add any `PYPI_*` or `TESTPYPI_*` secret; Trusted Publishing replaces
-them.
+**No secrets.** Do not add any `PYPI_*` secret; Trusted Publishing replaces them.
 
 ## File & Folder Structure
 
 ```
 .github/workflows/
 ├── ci.yml            # CHANGED: add `workflow_call:` trigger (steps unchanged)
-├── release.yml       # NEW: test gate -> build -> publish (TestPyPI on main, PyPI on tags)
+├── release.yml       # NEW: test gate -> build -> publish (dev on main, release on v* tags)
 └── spec-lint.yml     # unchanged
 pyproject.toml        # CHANGED: dynamic version, poetry-dynamic-versioning config + backend
 src/log_forge/
@@ -436,23 +456,22 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
   tag and a `0.1.1.devN` form (no `+hash`) one commit later. Confirm `pip install dist/*.whl`
   then `python -c "import log_forge; print(log_forge.__version__)"` prints `0.1.0`.
 
-### Phase 2: Reusable CI and TestPyPI publishing on main
+### Phase 2: Reusable CI and dev pre-release publishing on main
 
 - Add the `workflow_call` trigger to `ci.yml` (FR-007).
-- Add `.github/workflows/release.yml` with the `test` (reused CI), `build`, and
-  `publish-testpypi` jobs (FR-003, FR-004, FR-007).
-- Register the pending trusted publisher on `test.pypi.org` and create the `testpypi`
-  environment (FR-006).
-- Merge to `main` and confirm a development pre-release appears on TestPyPI and that
-  `pip install --index-url https://test.pypi.org/simple/ log-foundry` installs it.
+- Add `.github/workflows/release.yml` with the `test` (reused CI), `build`, and `publish-dev`
+  jobs (FR-003, FR-004, FR-007).
+- Register the pending trusted publisher on `pypi.org` and create the `pypi` environment
+  (FR-006).
+- Merge to `main` and confirm a `X.Y.Z.devN` pre-release appears on PyPI. This first publish is
+  also what converts the pending publisher into a real one and claims the project name.
 
-### Phase 3: Production PyPI publishing on tags
+### Phase 3: Tagged release publishing
 
-- Add the `publish-pypi` job to `release.yml` (FR-005, FR-006).
-- Register the pending trusted publisher on `pypi.org` and create the `pypi` environment, with
-  an optional required-reviewer rule (FR-006).
-- Push `v0.1.0` (or the next chosen version) and confirm the release lands on production PyPI
-  and that `pip install log-foundry` works from a clean environment.
+- Add the `publish-release` job to `release.yml`, without `skip-existing` (FR-005, FR-006).
+- Push `v0.1.0` and confirm the stable release lands on PyPI, that `pip install log-foundry` in
+  a clean environment installs `0.1.0` rather than a newer `.devN`, and that
+  `python -c "import log_forge; print(log_forge.__version__)"` reports `0.1.0`.
 
 ### Phase 4: Documentation and completion
 
