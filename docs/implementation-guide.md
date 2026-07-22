@@ -556,10 +556,13 @@ Add `boto3` as an **optional** dependency so stdout-only users stay dependency-f
 
 ```toml
 [project.optional-dependencies]
-sqs = ["boto3>=1.34"]
+aws = ["boto3>=1.34"]
 ```
 
-…installed with `pip install log-forge[sqs]` / `poetry install --extras sqs`.
+…installed with `pip install 'log-foundry[aws]'` / `poetry install --extras aws`. (This extra
+was named `sqs` when SPEC-005 shipped it; SPEC-010 renamed it to `aws` once SNS, Kinesis, and
+Firehose joined it. The distribution is `log-foundry` on PyPI — see SPEC-012 — while the import
+name remains `log_forge`.)
 
 **Watch out:** the worker batches by *count*, but SQS also caps by *bytes*. The sink must
 re-chunk on size, not assume the worker's batch already fits. One oversized event should be

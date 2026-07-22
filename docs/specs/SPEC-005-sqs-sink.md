@@ -5,6 +5,12 @@
 **Last Updated:** 2026-07-09
 **Depends On:** SPEC-004
 
+> **Superseded naming (this spec is a historical record).** The `sqs` extra described below was
+> renamed to **`aws`** by SPEC-010, once `SNSSink`, `KinesisSink`, and `FirehoseSink` joined it;
+> no `sqs` alias was kept. The distribution is published as **`log-foundry`** (SPEC-012), while
+> the import name remains `log_forge`. The current install is
+> `pip install 'log-foundry[aws]'`.
+
 ## Overview
 
 `StdoutSink` is the zero-dependency dev default; `SQSSink` is the headline production path
@@ -157,6 +163,8 @@ log_forge.configure(service="payments", sink=SQSSink(queue_url="https://sqs...")
 
 - Installed via the existing optional extra: `pip install log-forge[sqs]` /
   `poetry install --extras sqs` (`boto3>=1.34`, already declared in `pyproject.toml`).
+  *(As shipped. The extra is now `aws` and the distribution `log-foundry` — see the superseded-naming
+  note at the top of this spec.)*
 - AWS credentials/region are resolved by `boto3` through its standard chain — log-forge adds no
   new credential configuration.
 

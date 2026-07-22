@@ -46,9 +46,11 @@ tags at build time, so it cannot drift from what Git says.
 Nothing in the runtime, public API, or sinks. Packaging only: the static `version` key is gone
 (do not add it back), and `README.md` / `CLAUDE.md` record the install-vs-import split.
 
-**Gotcha:** `poetry-dynamic-versioning` rewrites `pyproject.toml` in place during a local
-`python -m build` and the round-trip can reorder keys. Check `git diff` after building locally;
-CI is unaffected (fresh checkout).
+**Gotcha:** `poetry-dynamic-versioning` rewrites `pyproject.toml` in place whenever it resolves a
+version — `python -m build` *and* `poetry install` with the plugin active — and the round-trip
+moves `[tool.poetry] version` out from under its comment. It bit three times during this build.
+`git diff pyproject.toml` before committing; `git checkout -- pyproject.toml` to undo. CI is
+unaffected (fresh checkout).
 
 ## Verification
 

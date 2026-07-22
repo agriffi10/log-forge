@@ -12,7 +12,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | context stack + baggage | `src/log_forge/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
 | `Sink` protocol | `src/log_forge/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
 | `StdoutSink` | `src/log_forge/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
-| `SQSSink` | `src/log_forge/sinks/sqs.py` | SQS sink (optional `sqs` extra): lazy boto3, count/byte chunking, Failed-list retry, oversized drop. |
+| `SQSSink` | `src/log_forge/sinks/sqs.py` | SQS sink (optional `aws` extra): lazy boto3, count/byte chunking, Failed-list retry, oversized drop. |
 | `CallbackSink` | `src/log_forge/sinks/callback.py` | Adapt any callable into a `Sink` (+ optional `on_close`); the escape hatch for unsupported destinations. |
 | `MultiSink` | `src/log_forge/sinks/multi.py` | Fan one batch out to several sinks; per-child failure isolation (`failed`), close-all. |
 | `FilteringSink` | `src/log_forge/sinks/filtering.py` | Forward only events passing a predicate and/or `min_level`; fail-open on unknown level, no empty-batch emit. |

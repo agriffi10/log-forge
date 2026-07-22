@@ -72,14 +72,17 @@ sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
 
 **Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
 Merges to `main` publish a `X.Y.Z.devN` pre-release. Never add a `version` key to `pyproject.toml`.
-A local `python -m build` rewrites `pyproject.toml` in place and can reorder keys — check `git diff` after.
+`poetry-dynamic-versioning` rewrites `pyproject.toml` in place whenever it resolves a version —
+`python -m build` **and** `poetry install` with the plugin active — and the round-trip reorders keys
+(it moves `[tool.poetry] version` out from under its comment). Harmless but noisy: `git checkout --
+pyproject.toml` after. Always `git diff pyproject.toml` before committing.
 
 ## Specs
 
 Index + status: `@docs/specs/INDEX.md`. Each spec file's header carries its own `Status`.
 **Current work:** the SPEC-001..005 core arc is **fully Completed** (Core Span Pipeline →
 Logging API + console echo → async `@trace` → background flush worker + shutdown → SQSSink +
-`sqs` extra). The **sink-expansion** arc (SPEC-006..011) is **fully Completed**: composition/adapter sinks →
+`aws` extra). The **sink-expansion** arc (SPEC-006..011) is **fully Completed**: composition/adapter sinks →
 stdlib logging bridge → local file + embedded → HTTP/platform (Elasticsearch, Loki, Logstash,
 Syslog, Datadog, Splunk, New Relic, Honeycomb, Sentry) → queue/stream (Kafka, Redis, RabbitMQ,
 NATS, Pub/Sub, Event Hubs, Kinesis, Firehose, SNS) → database (Mongo, Postgres, ClickHouse). Each
