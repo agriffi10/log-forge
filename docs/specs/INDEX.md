@@ -17,6 +17,7 @@ to status only — no prose.
 | [SPEC-010](SPEC-010-queue-and-stream-sinks.md) | Queue and Stream Buffer Sinks | Completed | SPEC-005 |
 | [SPEC-011](SPEC-011-database-sinks.md) | Database Sinks | Completed | SPEC-001, SPEC-005 |
 | [SPEC-012](SPEC-012-pypi-publishing-and-dynamic-versioning.md) | PyPI Publishing and Dynamic Versioning | Completed | None |
+| [SPEC-013](SPEC-013-aws-lambda-compatibility.md) | AWS Lambda Compatibility — Python 3.12 Support and a Repeatable `flush()` | Draft | SPEC-004, SPEC-012 |
 
 ## Arcs (build order)
 
@@ -28,3 +29,10 @@ Group related specs and record the order to build them in. Delete this section i
   optional-extra + lazy-import + bounded-retry pattern for third-party transports.
 - **Release and distribution:** SPEC-012 — standalone; depends on no prior spec and touches only
   packaging config and CI, not the library runtime.
+- **Serverless usability:** SPEC-013 — standalone. Two changes with one cause: the library assumes a
+  process that starts, runs and exits, and a Lambda gives it one that is frozen, thawed and killed
+  without warning. Nothing can *install* it there (`requires-python >=3.13` excludes the 3.12
+  runtime), and nothing can *flush* it there (`shutdown()` is terminal — the worker never comes back,
+  so a handler that flushes the obvious way logs only its first invocation per warm container).
+  Adds a repeatable `flush()` and lowers the floor to 3.12. Driven by a real consumer; cross-process
+  trace stitching (`continue_trace`) is the recorded follow-up.
