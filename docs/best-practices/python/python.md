@@ -1,6 +1,6 @@
 # Python Best Practices — Agent Reference
 
-> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-forge** (runtime **Python ≥ 3.13**; a `src`-layout library, distribution `log-forge` / import `log_forge`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
+> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-forge** (runtime **Python ≥ 3.13**; a `src`-layout library, distribution `log-foundry` / import `log_forge`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
 >
 > **Run the formatter/linter — don't hand-format.** Mechanics (§2, §3) are owned by `ruff`; this doc is for the choices a tool can't make (naming, interfaces, idioms) and for review. Style is *guidance*: the repo's configured tools win (line length **100**, quote style), and "a foolish consistency is the hobgoblin of little minds" — when a rule hurts readability in a specific case, deviate and flag it (§1).
 >
