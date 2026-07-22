@@ -87,7 +87,7 @@ description = "Python package for providing Mozilla's CA Bundle."
 optional = true
 python-versions = ">=3.7"
 groups = ["main"]
-markers = "python_version < \"3.15\" and (extra == \"clickhouse\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or python_version >= \"3.14\" and (extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")"
+markers = "(extra == \"clickhouse\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") and (python_version <= \"3.14\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")"
 files = [
     {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
     {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
@@ -100,7 +100,7 @@ description = "Foreign Function Interface for Python calling C code."
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
-markers = "extra == \"gcp-pubsub\" and platform_python_implementation != \"PyPy\""
+markers = "platform_python_implementation != \"PyPy\" and extra == \"gcp-pubsub\""
 files = [
     {file = "cffi-2.1.0-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:b65f590ef2a44640f9a05dbb548a429b4ade77913ce683ac8b1480777658a6c0"},
     {file = "cffi-2.1.0-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:164bff1657b2a74f0b6d54e11c9b375bc97b931f2ca9c43fcf875838da1570dd"},
@@ -318,7 +318,7 @@ description = "ClickHouse Database Core Driver for Python, Pandas, and Superset"
 optional = true
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
-markers = "python_version < \"3.15\" and extra == \"clickhouse\""
+markers = "extra == \"clickhouse\" and python_version <= \"3.14\""
 files = [
     {file = "clickhouse_connect-1.4.2-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:78239a374043ae2df0c0cbe0f95de872a770dc37d945f2a87efcff796a59dc4f"},
     {file = "clickhouse_connect-1.4.2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:491aaf816914315003cbe3bade550c89efc3f9782a7b5353efb0aef7cb921bdd"},
@@ -696,7 +696,10 @@ grpcio-status = [
     {version = ">=1.49.1,<2.0.0", optional = true, markers = "python_version >= \"3.11\" and extra == \"grpc\""},
     {version = ">=1.75.1,<2.0.0", optional = true, markers = "python_version >= \"3.14\" and extra == \"grpc\""},
 ]
-proto-plus = {version = ">=1.25.0,<2.0.0", markers = "python_version >= \"3.13\""}
+proto-plus = [
+    {version = ">=1.24.0,<2.0.0"},
+    {version = ">=1.25.0,<2.0.0", markers = "python_version >= \"3.13\""},
+]
 protobuf = ">=5.29.6,<8.0.0"
 requests = ">=2.33.0,<3.0.0"
 
@@ -758,7 +761,10 @@ grpcio = [
 grpcio-status = ">=1.51.3"
 opentelemetry-api = ">=1.27.0"
 opentelemetry-sdk = ">=1.27.0"
-proto-plus = {version = ">=1.25.0,<2.0.0", markers = "python_version >= \"3.13\""}
+proto-plus = [
+    {version = ">=1.22.3,<2.0.0", markers = "python_version < \"3.13\""},
+    {version = ">=1.25.0,<2.0.0", markers = "python_version >= \"3.13\""},
+]
 protobuf = ">=4.25.8,<8.0.0"
 
 [package.extras]
@@ -1039,7 +1045,7 @@ description = "LZ4 Bindings for Python"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "python_version < \"3.15\" and extra == \"clickhouse\""
+markers = "extra == \"clickhouse\" and python_version <= \"3.14\""
 files = [
     {file = "lz4-4.4.5-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:d221fa421b389ab2345640a508db57da36947a437dfe31aeddb8d5c7b646c22d"},
     {file = "lz4-4.4.5-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:7dc1e1e2dbd872f8fae529acd5e4839efd0b141eaa8ae7ce835a9fe80fbad89f"},
@@ -1376,6 +1382,7 @@ files = [
 
 [package.dependencies]
 psycopg-binary = {version = "3.3.4", optional = true, markers = "implementation_name != \"pypy\" and extra == \"binary\""}
+typing-extensions = {version = ">=4.6", markers = "python_version < \"3.13\""}
 tzdata = {version = "*", markers = "sys_platform == \"win32\""}
 
 [package.extras]
@@ -1393,7 +1400,7 @@ description = "PostgreSQL database adapter for Python -- C optimisation distribu
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
-markers = "extra == \"postgres\" and implementation_name != \"pypy\""
+markers = "implementation_name != \"pypy\" and extra == \"postgres\""
 files = [
     {file = "psycopg_binary-3.3.4-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:b7bfff1ca23732b488cbca3076fc11bc98d520ee122514fdb17a8e20d3338f5a"},
     {file = "psycopg_binary-3.3.4-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:32a6fbf8481e3a370d0d72b860d35948a693cb01281da217f7b2f307636e591a"},
@@ -1488,7 +1495,7 @@ description = "C parser in Python"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
-markers = "extra == \"gcp-pubsub\" and platform_python_implementation != \"PyPy\" and implementation_name != \"PyPy\""
+markers = "platform_python_implementation != \"PyPy\" and implementation_name != \"PyPy\" and extra == \"gcp-pubsub\""
 files = [
     {file = "pycparser-3.0-py3-none-any.whl", hash = "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"},
     {file = "pycparser-3.0.tar.gz", hash = "sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29"},
@@ -1640,6 +1647,7 @@ files = [
 
 [package.dependencies]
 pytest = ">=8.4,<10"
+typing-extensions = {version = ">=4.12", markers = "python_version < \"3.13\""}
 
 [package.extras]
 docs = ["sphinx (>=5.3)", "sphinx-rtd-theme (>=1)", "sphinx-tabs (>=3.5)"]
@@ -1861,7 +1869,7 @@ files = [
     {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
     {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
 ]
-markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")"}
 
 [[package]]
 name = "tzdata"
@@ -1870,7 +1878,7 @@ description = "Provider of IANA time zone data"
 optional = true
 python-versions = ">=2"
 groups = ["main"]
-markers = "(python_version < \"3.15\" or extra == \"postgres\") and sys_platform == \"win32\" and (extra == \"clickhouse\" or extra == \"postgres\")"
+markers = "sys_platform == \"win32\" and (extra == \"clickhouse\" or extra == \"postgres\") and (python_version <= \"3.14\" or extra == \"postgres\")"
 files = [
     {file = "tzdata-2026.3-py2.py3-none-any.whl", hash = "sha256:dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931"},
     {file = "tzdata-2026.3.tar.gz", hash = "sha256:4a1518b8993086a7982523e071643f3c0e5f213e75b21318e78bcabfff9d1415"},
@@ -1883,7 +1891,7 @@ description = "HTTP library with thread-safe connection pooling, file post, and 
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
-markers = "python_version < \"3.15\" and (extra == \"clickhouse\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or python_version >= \"3.14\" and (extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")"
+markers = "(extra == \"clickhouse\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") and (python_version <= \"3.14\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")"
 files = [
     {file = "urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897"},
     {file = "urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c"},
@@ -1902,7 +1910,7 @@ description = "Zstandard bindings for Python"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
-markers = "python_version < \"3.15\" and extra == \"clickhouse\""
+markers = "extra == \"clickhouse\" and python_version <= \"3.14\""
 files = [
     {file = "zstandard-0.25.0-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:e59fdc271772f6686e01e1b3b74537259800f57e24280be3f29c8a0deb1904dd"},
     {file = "zstandard-0.25.0-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:4d441506e9b372386a5271c64125f72d5df6d2a8e8a2a45a0ae09b03cb781ef7"},
@@ -2023,5 +2031,5 @@ sentry = ["sentry-sdk"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.13"
-content-hash = "9715806a62d59d6aa742e1bcdf997820549e4ae2ee5e4c92b9bd11ceaf28ac78"
+python-versions = ">=3.12"
+content-hash = "eb121ba39217c3d6ed89723d249ed314a4fb477948c5caec3fcecac7c4f958cd"

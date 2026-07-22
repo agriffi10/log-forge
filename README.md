@@ -21,7 +21,7 @@ calls form a tree you can query later.
 
 ## Requirements
 
-- **Python ≥ 3.13**
+- **Python ≥ 3.12** — the full gate (ruff, mypy, pytest) runs on 3.12 and 3.13 in CI.
 
 ## Installation
 
@@ -496,7 +496,7 @@ logs can later correlate with distributed traces cheaply.
 ## Development
 
 ```bash
-poetry install --with dev      # set up (Python 3.13)
+poetry install --with dev      # set up (Python 3.12+)
 poetry run pytest              # test
 poetry run ruff check .        # lint (line-length 100)
 poetry run mypy                # typecheck (strict, over src/)

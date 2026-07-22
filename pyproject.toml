@@ -12,11 +12,15 @@ authors = [
 ]
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.13"
+# 3.12 is the floor because that is the newest runtime a large class of deployed AWS Lambda
+# fleets is on, and nothing in the library needs 3.13 (SPEC-013 FR-001). CI runs the full gate
+# on 3.12 *and* 3.13 — the declaration follows the evidence.
+requires-python = ">=3.12"
 dependencies = [
 ]
 
 # Optional features. Install with: pip install log-foundry[aws]
+
 [project.optional-dependencies]
 aws = ["boto3>=1.34"]              # SQSSink, SNSSink, KinesisSink, FirehoseSink
 sentry = ["sentry-sdk>=2.0"]
@@ -84,8 +88,12 @@ addopts = "--strict-markers"
 [tool.ruff]
 src = ["src", "tests"]
 line-length = 100
+# Deliberately no `target-version`: ruff infers it from `requires-python`, so the two can never
+# drift. If one is ever added it must match the floor above.
 
 [tool.mypy]
 files = ["src"]
-python_version = "3.13"
+# Must be the *lowest* supported version, not the newest: mypy checks against this, so a 3.13-only
+# API would type-check clean on a 3.12 floor and fail as an AttributeError in a consumer's runtime.
+python_version = "3.12"
 strict = true
