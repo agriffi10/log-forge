@@ -46,8 +46,22 @@ jobs:
           test "$(ls dist/*.whl | wc -l)" -eq 1
           python -m twine check dist/*
 
+      # A release upload cannot be undone, so refuse to publish under a number that
+      # disagrees with the tag that asked for it (FR-005).
+      - name: Verify the built version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          built=$(basename dist/*.tar.gz .tar.gz)
+          built="${built#log_foundry-}"
+          echo "tag=$tag built=$built"
+          if [ "$tag" != "$built" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME implies version $tag, but the build produced $built."
+            exit 1
+          fi
+
       - name: Upload built distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -66,7 +80,7 @@ jobs:
       id-token: write          # required for Trusted Publishing (OIDC)
     steps:
       - name: Download built distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -75,3 +89,25 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true   # tolerate a re-run that produces a duplicate dev version
+
+  publish-release:
+    # A pushed version tag (vX.Y.Z) ships a stable release to PyPI.
+    # Deliberately NO skip-existing: re-pushing a tag whose version is already on PyPI must
+    # fail loudly rather than report a green, silently-did-nothing run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/log-foundry
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish release to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
