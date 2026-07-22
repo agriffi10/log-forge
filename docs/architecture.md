@@ -371,8 +371,11 @@ def write_ledger(user_id: int):
 - **Auto-capture** → function name only; no args/return capture.
 - **Cross-service trace continuation** (adopting an inbound `trace_id` from a
   `traceparent` request header, plus cross-process baggage — the full "Correlation ID
-  Journey") → deferred to a later version. ID formats are already W3C-compatible (§3.1)
-  to make this cheap.
+  Journey") → **shipped in SPEC-014**. `continue_trace()` adopts, `current_traceparent()` /
+  `current_trace_context()` / `current_baggage_header()` publish. The bet in §3.1 paid off: the
+  W3C-compatible ID formats meant this really was a header parse. Propagation stays manual —
+  the caller moves the header; no client patching or middleware (that would drag in the
+  dependencies the core deliberately does not have).
 - **"Follows-from" span relationships** for fire-and-forget / async work → deferred;
   the ID model already accommodates it (§3.2).
 
@@ -386,16 +389,18 @@ def write_ledger(user_id: int):
 
 ### Known constraints
 
-- **Trace context does not cross a process boundary.** A trace is per-process: `@trace` mints a
-  fresh `trace_id` whenever no span is open in the current context. Two processes cooperating on
-  one logical operation — an HTTP client and its server, nine Lambda invocations in one state
-  machine — therefore produce N unrelated traces, and `parent_span_id` is never set across them.
-  Correlate with a hand-set baggage field in the meantime.
+- **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
+  per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no
+  span is open, so *by default* N processes produce N unrelated traces; the difference is that
+  this is now fixable rather than inherent. `continue_trace(traceparent=...)` (or explicit
+  `trace_id` / `parent_span_id`) adopts an inbound context and re-parents the already-open root
+  span, and `current_traceparent()` / `current_baggage_header()` publish it on the way out.
 
-  The shape of the fix, so it needn't be rederived: a `continue_trace(trace_id, parent_span_id)`
-  entry point, plus the caller threading those two values through whatever payload already
-  crosses the boundary. The ID formats are already W3C-compatible (§3.1) to keep this cheap.
-  Closed by **SPEC-014 — Cross-Process Trace Continuation**.
+  What remains a constraint is that **propagation is manual**: the library reads and writes the
+  header, the caller moves it through whatever payload already crosses the boundary. There is no
+  HTTP client patching, framework middleware, or boto3 hook, and there will not be — that is
+  auto-instrumentation, a different product, and it needs the dependencies the core deliberately
+  does not have.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment
@@ -412,7 +417,7 @@ def write_ledger(user_id: int):
 | Concept (design brief) | How log-foundry addresses it |
 |------------------------|----------------------------|
 | Structured vs unstructured | JSON with named fields, always (§6). |
-| Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3). |
+| Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3), continued across processes via W3C `traceparent` + `baggage` (SPEC-014). |
 | Head vs tail sampling | Buffer-then-flush makes us tail-sampling-ready; seam reserved (§10). |
 | Cardinality explosion | High-cardinality fields allowed in logs; never auto-promoted to metric labels (§6). |
 | One event, three views | Logs-only today, but trace_id/span_id make traces derivable later (§13). |

@@ -91,9 +91,12 @@ third-party transport sits behind its own optional extra (lazy-imported). **SPEC
 distribution) is Completed** — the package ships to PyPI as `log-foundry`. A follow-up (no spec
 — a mechanical rename) renamed the import package `log_forge` → `log_foundry`. **SPEC-013
 (AWS Lambda compatibility) is Completed** — floor lowered to Python 3.12 (CI matrix 3.12 + 3.13)
-and a repeatable `flush()` added. **Latest release: `v0.2.0`** (the rename; `v0.1.0` was the
-first stable); SPEC-013 is unreleased and wants a **minor** bump (`v0.3.0` — additive `flush`,
-widened floor). **In flight: SPEC-014** (cross-process trace continuation).
+and a repeatable `flush()` added. **SPEC-014 (cross-process trace continuation) is Completed** —
+`continue_trace()` adopts a W3C `traceparent` + `baggage`; `current_traceparent()` and friends
+publish it. **Latest release: `v0.2.0`** (the rename; `v0.1.0` was the first stable); SPEC-013
+and SPEC-014 are both unreleased and together want one **minor** bump (`v0.3.0` — everything is
+additive; the floor widened and no existing behaviour changed). No spec is in flight; the next
+initiative needs a new spec.
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -117,6 +120,10 @@ widened floor). **In flight: SPEC-014** (cross-process trace continuation).
 - **Two drains, deliberately distinct** — `shutdown()` is terminal (stops the worker, closes the
   sink); `flush()` drains on demand and leaves everything running. A frozen-not-exited process
   (serverless) needs the second, and `atexit` never runs there. (SPEC-013)
+- **Cross-process traces are adopted explicitly, never auto-instrumented** — `continue_trace()`
+  takes a W3C `traceparent`/baggage the *caller* moved; no client patching or middleware, which
+  would need the deps the core refuses. Inbound context is untrusted and confers no authority.
+  (SPEC-014, arch §12)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
@@ -125,8 +132,9 @@ widened floor). **In flight: SPEC-014** (cross-process trace continuation).
 ## Out of Scope (don't build)
 
 Metrics or OTel-native traces · querying / dashboards / alerting (that's ELK/downstream) · log routing
-beyond one configured sink per process · cross-service trace continuation & cross-process baggage
-(deferred; IDs already W3C-compatible) · "follows-from" span relationships (deferred).
+beyond one configured sink per process · **auto**-instrumented propagation — no HTTP-client patching,
+middleware or boto3 hooks; the caller moves the header (cross-process continuation itself shipped in
+SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (deferred).
 
 ---
 

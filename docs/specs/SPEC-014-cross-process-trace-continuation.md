@@ -1,7 +1,7 @@
 # Spec: Cross-Process Trace Continuation (W3C `traceparent` + baggage propagation)
 
 **ID:** SPEC-014
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-22
 **Depends On:** SPEC-001 (span model, ids, context), SPEC-002 (baggage), SPEC-013 (the serverless consumer that motivates it)
 

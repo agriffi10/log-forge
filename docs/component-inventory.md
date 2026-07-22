@@ -33,4 +33,8 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `ConsoleWriter` | `src/log_foundry/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
 | `Worker` | `src/log_foundry/worker.py` | Background flush: bounded queue + daemon thread, batch by count/time, retry+backoff, drop-newest backpressure, graceful `shutdown()`. |
 | `flush` | `src/log_foundry/__init__.py` (→ `Worker.flush`) | On-demand drain that does **not** retire the worker or close the sink: FIFO marker, bounded timeout, never raises, repeatable. The drain for frozen-not-exited processes (serverless). |
+| `continue_trace` | `src/log_foundry/decorator.py` | Adopt an inbound trace context (W3C `traceparent` or explicit ids) + optional baggage header; re-parents an already-open **root** span and rewrites its buffered events. Total — never raises on hostile input. |
+| `current_traceparent` / `current_trace_context` | `src/log_foundry/context.py` | Producer side: the current span as a `traceparent` string, or as a `(trace_id, span_id)` pair for payload fields. `None` when no span is active. |
+| `current_baggage_header` (+ codec) | `src/log_foundry/context.py` | W3C `baggage` header serialize/parse, percent-encoded, 8192-byte cap; `str()` for non-string values. |
+| `traceparent` codec | `src/log_foundry/ids.py` | `parse_traceparent` / `format_traceparent` + `is_valid_trace_id` / `is_valid_span_id`: strict lowercase-hex, all-zero rejection, W3C higher-version forward compatibility. |
 | `FakeSink` fixture | `tests/conftest.py` | Test double recording emitted batches (+ `fake_sink`/`lf` fixtures, config reset). |

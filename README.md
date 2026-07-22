@@ -262,6 +262,75 @@ def process_payment(user_id: int) -> str:
 - **Orphan logs** — a level call made with no active span is not dropped: it emits a standalone
   one-event span with a fresh `trace_id`, flushed straight to the sink.
 
+### Continuing a trace across processes
+
+A trace stops at the process boundary: `@trace` mints a fresh `trace_id` whenever no span is
+open, so two processes cooperating on one logical operation produce two unrelated traces. Pass
+the context across and they join up. Nothing here is serverless-specific — the same two calls
+join an HTTP client to its server, or a Celery caller to its worker.
+
+**The producer publishes where it is:**
+
+```python
+@lf.trace
+def enqueue_check(location: str) -> None:
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps({
+            "location": location,
+            "traceparent": lf.current_traceparent(),      # "00-<trace_id>-<span_id>-01"
+            "baggage": lf.current_baggage_header(),       # "request_id=req-123,tenant=acme"
+        }),
+    )
+```
+
+**The consumer adopts it — one line, and make it the first line:**
+
+```python
+@lf.trace
+def handler(event, context):
+    lf.continue_trace(event.get("traceparent"), baggage=event.get("baggage"))
+    lf.info("inspecting")          # same trace_id as the producer; parent is its span
+    try:
+        return inspect(event)
+    finally:
+        lf.flush()
+```
+
+| Call | Does |
+|---|---|
+| `continue_trace(traceparent=None, *, trace_id=None, parent_span_id=None, baggage=None)` | Adopt an inbound context. `True` if adopted, `False` if nothing valid was supplied. Never raises. |
+| `current_traceparent()` | This span as a W3C `traceparent` string, or `None` if no span is active. |
+| `current_trace_context()` | `(trace_id, span_id)`, for when moving two fields beats moving a string. |
+| `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). |
+
+Details worth knowing:
+
+- **Call `continue_trace()` on the first line.** `@trace` opens the handler's span *before* the
+  body runs, so the call re-parents that span in place and rewrites the events it has already
+  buffered. A child span that already finished has been handed to the worker and can no longer
+  be moved.
+- **Only a root span is re-parented.** A nested span already belongs to an in-process trace, and
+  moving it would sever it from its own parent. The adopted context still applies to the next
+  root span opened in that context.
+- **Your `span_id` is never overwritten.** The adopting span keeps its own identity and takes the
+  inbound span as its `parent_span_id` — otherwise two processes would share a span id.
+- **`parent_span_id` may be omitted.** With only `trace_id` you join the trace as another root,
+  which beats being in a fresh trace when you know the trace but not the specific parent.
+- **Inbound context is untrusted and validated strictly** — 32/16 lowercase hex, all-zero ids
+  rejected, higher `traceparent` versions accepted per the W3C forward-compatibility rule.
+  Anything unusable is ignored with a single bounded warning on stderr and a fresh trace is
+  minted; a malformed id never reaches the event stream. Adopting a context grants **nothing**
+  — it selects a correlation id and confers no authority.
+- **Baggage fails independently of the trace.** A malformed `baggage` header is skipped with a
+  warning while the trace is still adopted: losing correlating fields is bad, losing the trace
+  join because one field was malformed is worse. Headers over 8192 bytes are rejected. Values
+  are percent-encoded, so `,` `=` and non-ASCII round-trip; non-string values are serialized
+  with `str()`, so a dict arrives as its repr.
+- **Sampling is not honoured.** `traceparent`'s flags byte is parsed and ignored, and outbound
+  is always `01`: this library records every span, so respecting another system's sampling
+  decision would mean dropping them.
+
 ### Sinks
 
 A **sink** is the swappable output transport — any object satisfying the `Sink` protocol. It
@@ -525,9 +594,9 @@ def handler(event, context):
                         # later invocation on this warm container would log nothing.
 ```
 
-Note that each invocation is its own trace: trace context does not cross a process boundary
-today, so N invocations produce N `trace_id`s. Correlate them with a shared
-[`set_baggage`](#logging-inside-a-span) field until cross-process continuation ships.
+By default each invocation is its own trace, so N invocations produce N `trace_id`s. To join
+them into one — a step function, a producer and its consumer — pass the context across with
+[`continue_trace()`](#continuing-a-trace-across-processes).
 
 ## Event schema
 
