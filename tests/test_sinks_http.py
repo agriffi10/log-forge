@@ -12,8 +12,8 @@ import urllib.error
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.http import HTTPSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.http import HTTPSink
 
 
 class FakeResponse:
@@ -59,7 +59,7 @@ class FakeOpener:
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps so retry tests run instantly."""
-    monkeypatch.setattr("log_forge.sinks.http.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("log_foundry.sinks.http.time.sleep", lambda _seconds: None)
 
 
 # --- FR-001: core POST ------------------------------------------------------------------

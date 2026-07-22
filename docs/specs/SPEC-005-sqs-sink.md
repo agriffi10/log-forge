@@ -8,7 +8,7 @@
 > **Superseded naming (this spec is a historical record).** The `sqs` extra described below was
 > renamed to **`aws`** by SPEC-010, once `SNSSink`, `KinesisSink`, and `FirehoseSink` joined it;
 > no `sqs` alias was kept. The distribution is published as **`log-foundry`** (SPEC-012), while
-> the import name remains `log_forge`. The current install is
+> the import name remains `log_foundry`. The current install is
 > `pip install 'log-foundry[aws]'`.
 
 ## Overview
@@ -64,7 +64,7 @@ change elsewhere in the pipeline.
 - [ ] `SQSSink(queue_url, client=None)` stores the queue URL and uses the injected `client`, or
       creates one via `boto3.client("sqs")` when `client is None`.
 - [ ] `import boto3` happens inside `SQSSink` (constructor/method), not at module top level, so
-      importing `log_forge.sinks.sqs` does not require `boto3` unless instantiated.
+      importing `log_foundry.sinks.sqs` does not require `boto3` unless instantiated.
 - [ ] `SQSSink` satisfies `emit(batch: list[dict]) -> None` and `close() -> None` and passes an
       `isinstance(sink, Sink)` runtime-checkable check.
 - [ ] A test can inject a fake SQS client and assert on the `send_message_batch` calls without
@@ -128,7 +128,7 @@ A single event too large to fit one message must not crash the whole batch.
 ## Data Model
 
 ```
-# src/log_forge/sinks/sqs.py
+# src/log_foundry/sinks/sqs.py
 SQSSink {
   MAX_BATCH = 10             # SQS SendMessageBatch hard limit (entries)
   MAX_BYTES = 256 * 1024     # 256 KB per batch
@@ -153,25 +153,25 @@ class SQSSink:
     def close(self) -> None: ...                     # no-op
 
 # Usage
-import log_forge
-from log_forge.sinks.sqs import SQSSink
+import log_foundry
+from log_foundry.sinks.sqs import SQSSink
 
-log_forge.configure(service="payments", sink=SQSSink(queue_url="https://sqs..."))
+log_foundry.configure(service="payments", sink=SQSSink(queue_url="https://sqs..."))
 ```
 
 ## Configuration / Environment
 
-- Installed via the existing optional extra: `pip install log-forge[sqs]` /
+- Installed via the existing optional extra: `pip install log-foundry[sqs]` /
   `poetry install --extras sqs` (`boto3>=1.34`, already declared in `pyproject.toml`).
   *(As shipped. The extra is now `aws` and the distribution `log-foundry` — see the superseded-naming
   note at the top of this spec.)*
-- AWS credentials/region are resolved by `boto3` through its standard chain — log-forge adds no
+- AWS credentials/region are resolved by `boto3` through its standard chain — log-foundry adds no
   new credential configuration.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/
+src/log_foundry/
 └── sinks/
     └── sqs.py         # SQSSink: chunking, send_message_batch, Failed handling   (new)
 tests/

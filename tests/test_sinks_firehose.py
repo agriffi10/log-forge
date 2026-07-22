@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.firehose import FirehoseSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.firehose import FirehoseSink
 
 
 class FakeFirehose:

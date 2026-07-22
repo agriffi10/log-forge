@@ -11,8 +11,8 @@ import pytest
 
 
 def test_span_stack_push_and_pop() -> None:
-    context = pytest.importorskip("log_forge.context")
-    model = pytest.importorskip("log_forge.model")
+    context = pytest.importorskip("log_foundry.context")
+    model = pytest.importorskip("log_foundry.model")
 
     def body() -> None:
         assert context.current_span() is None
@@ -27,7 +27,7 @@ def test_span_stack_push_and_pop() -> None:
 
 
 def test_baggage_merges_within_context() -> None:
-    context = pytest.importorskip("log_forge.context")
+    context = pytest.importorskip("log_foundry.context")
 
     def body() -> dict:
         context.set_baggage(tenant="acme")
@@ -38,7 +38,7 @@ def test_baggage_merges_within_context() -> None:
 
 
 def test_baggage_does_not_leak_across_contexts() -> None:
-    context = pytest.importorskip("log_forge.context")
+    context = pytest.importorskip("log_foundry.context")
 
     contextvars.copy_context().run(lambda: context.set_baggage(secret="leak"))
     # a fresh context sees nothing the previous one set

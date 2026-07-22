@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-ids = pytest.importorskip("log_forge.ids")
+ids = pytest.importorskip("log_foundry.ids")
 
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")  # 16-byte trace_id
 HEX_16 = re.compile(r"^[0-9a-f]{16}$")  # 8-byte span_id

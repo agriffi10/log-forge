@@ -7,7 +7,7 @@
 
 ## Overview
 
-Users want flexibility in *where* and *how* their logs are written without log-forge shipping a
+Users want flexibility in *where* and *how* their logs are written without log-foundry shipping a
 bespoke transport for every destination. This spec adds four **zero-dependency** sinks that either
 combine other sinks or adapt arbitrary user code: `CallbackSink` (ship anywhere via a plain
 function), `MultiSink` (fan a batch out to several sinks at once), `FilteringSink` (drop events by
@@ -22,7 +22,7 @@ destination and tee to several at once without writing a `Sink` subclass at all.
 ### In Scope
 
 - `CallbackSink(fn, *, on_close=None)` — `emit` delegates the batch to a user callable; the ultimate
-  escape hatch for "send my logs somewhere log-forge doesn't natively support."
+  escape hatch for "send my logs somewhere log-foundry doesn't natively support."
 - `MultiSink(*sinks)` — fan the same batch out to every child sink, isolating a failing child so its
   siblings still receive the batch; `close()` closes every child.
 - `FilteringSink(inner, *, predicate=None, min_level=None)` — forward to `inner` only the events that
@@ -145,26 +145,26 @@ underlying sink exactly once.
 ## Data Model
 
 ```
-# src/log_forge/sinks/callback.py
+# src/log_foundry/sinks/callback.py
 CallbackSink {
   fn: Callable[[list[dict]], None]
   on_close: Callable[[], None] | None = None
 }
 
-# src/log_forge/sinks/multi.py
+# src/log_foundry/sinks/multi.py
 MultiSink {
   sinks: tuple[Sink, ...]
   failed: int          # child emit/close failures (counted, logged, not propagated)
 }
 
-# src/log_forge/sinks/filtering.py
+# src/log_foundry/sinks/filtering.py
 FilteringSink {
   inner: Sink
   predicate: Callable[[dict], bool] | None
   min_level: str | None      # compared via a DEBUG<INFO<WARNING<ERROR<CRITICAL rank
 }
 
-# src/log_forge/sinks/transform.py
+# src/log_foundry/sinks/transform.py
 TransformSink {
   inner: Sink
   fn: Callable[[dict], dict | None]   # None => drop the event
@@ -198,12 +198,12 @@ class TransformSink:
     def __init__(self, inner: Sink, fn) -> None: ...
 
 # Usage — tee to stdout for dev + SQS for prod, redacting a field and only shipping errors upstream
-import log_forge
-from log_forge.sinks.stdout import StdoutSink
-from log_forge.sinks.sqs import SQSSink
-from log_forge.sinks.multi import MultiSink
-from log_forge.sinks.filtering import FilteringSink
-from log_forge.sinks.transform import TransformSink
+import log_foundry
+from log_foundry.sinks.stdout import StdoutSink
+from log_foundry.sinks.sqs import SQSSink
+from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.filtering import FilteringSink
+from log_foundry.sinks.transform import TransformSink
 
 def redact(event: dict) -> dict:
     event = dict(event)                       # shallow copy of the top level, AND
@@ -212,7 +212,7 @@ def redact(event: dict) -> dict:
     event["fields"] = fields
     return event
 
-log_forge.configure(sink=MultiSink(
+log_foundry.configure(sink=MultiSink(
     StdoutSink(),
     FilteringSink(TransformSink(SQSSink(queue_url="..."), redact), min_level="ERROR"),
 ))
@@ -226,7 +226,7 @@ dependency-free).
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 ├── callback.py     # CallbackSink                                   (new)
 ├── multi.py        # MultiSink (fan-out, per-child failure isolation) (new)
 ├── filtering.py    # FilteringSink (predicate / min_level)          (new)

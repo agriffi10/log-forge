@@ -8,7 +8,7 @@
 ## Overview
 
 Rather than reimplement rotating files, syslog, or the dozens of third-party log handlers that
-already exist, `LoggingSink` bridges log-forge into Python's standard `logging` framework: each
+already exist, `LoggingSink` bridges log-foundry into Python's standard `logging` framework: each
 built event dict is turned into a `logging.LogRecord` and dispatched through a configurable logger.
 That single adapter hands users the entire stdlib logging ecosystem — their existing handler/format
 configuration, `logging.config` setup, and any third-party handler (Sentry, Datadog, systemd) — for
@@ -21,7 +21,7 @@ knows nothing about spans or context.
 ### In Scope
 
 - `LoggingSink(logger=None, *, default_level="INFO")` implementing the SPEC-001 `Sink` protocol.
-- Dispatching one `LogRecord` per event to the target logger (default `logging.getLogger("log_forge")`).
+- Dispatching one `LogRecord` per event to the target logger (default `logging.getLogger("log_foundry")`).
 - Mapping the event's `level` string (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`) to stdlib numeric
   levels, falling back to `default_level` for unknown/missing levels.
 - Carrying the event's structured `fields` and identity keys (`trace_id`, `span_id`, `function`,
@@ -46,12 +46,12 @@ knows nothing about spans or context.
 
 #### Description:
 
-Every event becomes exactly one `LogRecord` handed to a logger, so log-forge output flows through the
+Every event becomes exactly one `LogRecord` handed to a logger, so log-foundry output flows through the
 user's existing logging pipeline.
 
 #### Acceptance Criteria:
 
-- [ ] `LoggingSink()` targets `logging.getLogger("log_forge")` by default; `LoggingSink(logger)`
+- [ ] `LoggingSink()` targets `logging.getLogger("log_foundry")` by default; `LoggingSink(logger)`
       targets the injected logger.
 - [ ] `emit(batch)` dispatches one record per event, in batch order, via the logger's handling path
       (e.g. `logger.handle(record)`), so attached handlers receive them.
@@ -125,9 +125,9 @@ format template.
 ## Data Model
 
 ```
-# src/log_forge/sinks/logging_sink.py
+# src/log_foundry/sinks/logging_sink.py
 LoggingSink {
-  logger: logging.Logger           # default logging.getLogger("log_forge")
+  logger: logging.Logger           # default logging.getLogger("log_foundry")
   default_level: int               # resolved from "INFO" (or the constructor arg)
 }
 
@@ -150,11 +150,11 @@ class LoggingSink:
     def close(self) -> None: ...                     # no-op
 
 # Usage — funnel span events through the app's existing logging config
-import logging, log_forge
-from log_forge.sinks.logging_sink import LoggingSink
+import logging, log_foundry
+from log_foundry.sinks.logging_sink import LoggingSink
 
 logging.basicConfig(level=logging.INFO)              # user's own logging setup / handlers
-log_forge.configure(sink=LoggingSink(logging.getLogger("app.telemetry")))
+log_foundry.configure(sink=LoggingSink(logging.getLogger("app.telemetry")))
 ```
 
 ## Configuration / Environment
@@ -164,7 +164,7 @@ None. Stdlib-only; no new config keys, env vars, or dependencies.
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 └── logging_sink.py     # LoggingSink (module named *_sink to avoid shadowing stdlib `logging`) (new)
 tests/
 └── test_sinks_logging.py   # dispatch, level mapping, reserved-attr safety, literal-% message (new)

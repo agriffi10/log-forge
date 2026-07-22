@@ -147,7 +147,7 @@ Collect events in memory for tests, notebooks, and introspection.
 ## Data Model
 
 ```
-# src/log_forge/sinks/file.py
+# src/log_foundry/sinks/file.py
 FileSink { path: str; encoding: str = "utf-8" }
 RotatingFileSink {
   path: str
@@ -157,7 +157,7 @@ RotatingFileSink {
   interval: int = 1
 }
 
-# src/log_forge/sinks/sqlite.py
+# src/log_foundry/sinks/sqlite.py
 SQLiteSink {
   database: str
   table: str = "log_events"
@@ -166,7 +166,7 @@ SQLiteSink {
 }
 # table columns: log_id, trace_id, span_id, timestamp, level, function, event (JSON text)
 
-# src/log_forge/sinks/util.py
+# src/log_foundry/sinks/util.py
 StderrSink { stream: TextIO = sys.stderr }
 NullSink   { dropped: int = 0 }
 MemorySink { events: list[dict]; maxlen: int | None = None }
@@ -199,9 +199,9 @@ class MemorySink:
     def __init__(self, maxlen: int | None = None) -> None: ...
 
 # Usage
-import log_forge
-from log_forge.sinks.file import RotatingFileSink
-log_forge.configure(sink=RotatingFileSink("logs/app.ndjson", max_bytes=50_000_000, backup_count=5))
+import log_foundry
+from log_foundry.sinks.file import RotatingFileSink
+log_foundry.configure(sink=RotatingFileSink("logs/app.ndjson", max_bytes=50_000_000, backup_count=5))
 ```
 
 ## Configuration / Environment
@@ -211,7 +211,7 @@ None. All sinks are standard-library only — no new config keys, env vars, or d
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 ├── file.py         # FileSink + RotatingFileSink                    (new)
 ├── sqlite.py       # SQLiteSink (schema-ensure + batch insert)      (new)
 └── util.py         # StderrSink, NullSink, MemorySink               (new)

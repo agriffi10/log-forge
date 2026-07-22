@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-worker_mod = pytest.importorskip("log_forge.worker")
+worker_mod = pytest.importorskip("log_foundry.worker")
 Worker = worker_mod.Worker
 
 
@@ -285,17 +285,17 @@ def test_shutdown_is_idempotent() -> None:
 
 
 def test_decorator_worker_is_lazy_and_single() -> None:
-    import log_forge
-    from log_forge import decorator
+    import log_foundry
+    from log_foundry import decorator
 
-    log_forge.configure(service="t", version="0", env="t", sink=RecordingSink())
+    log_foundry.configure(service="t", version="0", env="t", sink=RecordingSink())
     decorator._worker = None  # ensure a clean lazy creation for this assertion
 
     w1 = decorator._get_worker()
     w2 = decorator._get_worker()
     try:
         assert w1 is w2, "one worker per process, reused"
-        assert w1.sink is log_forge.get_config().sink, "worker built from the configured sink"
+        assert w1.sink is log_foundry.get_config().sink, "worker built from the configured sink"
     finally:
         w1.shutdown()
         decorator._worker = None

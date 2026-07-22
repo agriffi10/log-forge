@@ -226,7 +226,7 @@ Every sink here handles request failures uniformly and never crashes the worker.
 ## Data Model
 
 ```
-# src/log_forge/sinks/http.py — the shared base
+# src/log_foundry/sinks/http.py — the shared base
 HTTPSink {
   url: str
   method: str = "POST"
@@ -268,18 +268,18 @@ class ElasticsearchSink:   # OpenSearchSink mirrors it
 class LokiSink:
     def __init__(self, url, *, labels=("service", "env", "level"), **http_kwargs) -> None: ...
 class SyslogSink:
-    def __init__(self, host, port=514, *, transport="udp", facility="user", app_name="log-forge") -> None: ...
+    def __init__(self, host, port=514, *, transport="udp", facility="user", app_name="log-foundry") -> None: ...
 class DatadogSink:
     def __init__(self, api_key, *, site="datadoghq.com", service=None, ddtags=None) -> None: ...
 class SplunkHECSink:
-    def __init__(self, url, token, *, host=None, source="log-forge") -> None: ...
+    def __init__(self, url, token, *, host=None, source="log-foundry") -> None: ...
 class SentrySink:
     def __init__(self, dsn=None, *, min_level="ERROR") -> None: ...
 
 # Usage
-import log_forge
-from log_forge.sinks.datadog import DatadogSink
-log_forge.configure(sink=DatadogSink(api_key="...", service="payments", site="datadoghq.eu"))
+import log_foundry
+from log_foundry.sinks.datadog import DatadogSink
+log_foundry.configure(sink=DatadogSink(api_key="...", service="payments", site="datadoghq.eu"))
 ```
 
 ## Configuration / Environment
@@ -289,12 +289,12 @@ log_forge.configure(sink=DatadogSink(api_key="...", service="payments", site="da
   sink uses the HTTP envelope fallback. The new extra is added to `pyproject.toml` and noted in
   CLAUDE.md's Tech Stack at implementation time.
 - API keys / tokens / DSNs are passed as constructor arguments (callers may source them from their own
-  env); log-forge adds no credential-resolution logic of its own.
+  env); log-foundry adds no credential-resolution logic of its own.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 ├── http.py            # HTTPSink core (urllib, gzip, bounded retry)      (new)
 ├── elasticsearch.py   # ElasticsearchSink + OpenSearchSink (_bulk)       (new)
 ├── loki.py            # LokiSink (push API)                              (new)

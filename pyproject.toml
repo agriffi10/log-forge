@@ -1,6 +1,7 @@
 [project]
-# Distribution name on PyPI. The import name stays `log_forge` (see src/); PyPI rejects
-# "log-forge" as too similar to the unrelated, pre-existing "logforge" project.
+# Distribution name on PyPI; the import name matches it (`log_foundry`, see src/).
+# The project was originally "log-forge", which PyPI rejects as too similar to the unrelated,
+# pre-existing "logforge" project — its similarity check collapses separators.
 name = "log-foundry"
 # The version is derived from Git tags at build time (poetry-dynamic-versioning).
 # Do not add a literal `version` key back here.
@@ -37,12 +38,12 @@ version = "0.0.0"
 
 # src layout: map the package from the src/ directory
 packages = [
-    { include = "log_forge", from = "src" },
+    { include = "log_foundry", from = "src" },
 ]
 
 # Non-Python files to include in the package
 include = [
-    "src/log_forge/py.typed",  # PEP 561 marker for typed packages
+    "src/log_foundry/py.typed",  # PEP 561 marker for typed packages
 ]
 
 # Files to exclude from the package
@@ -76,7 +77,7 @@ build-backend = "poetry_dynamic_versioning.backend"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]             # src layout: make `import log_forge` work without an install
+pythonpath = ["src"]             # src layout: make `import log_foundry` work without an install
 asyncio_mode = "auto"            # async test functions run without an explicit marker
 addopts = "--strict-markers"
 

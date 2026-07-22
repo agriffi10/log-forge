@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.callback import CallbackSink
-from log_forge.sinks.filtering import FilteringSink
-from log_forge.sinks.multi import MultiSink
-from log_forge.sinks.transform import TransformSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.callback import CallbackSink
+from log_foundry.sinks.filtering import FilteringSink
+from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.transform import TransformSink
 
 
 class RecordingSink:

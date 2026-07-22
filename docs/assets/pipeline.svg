@@ -1,5 +1,5 @@
 <svg width="680" viewBox="0 0 680 600" role="img" xmlns="http://www.w3.org/2000/svg">
-<title>How log-forge processes a call</title>
+<title>How log-foundry processes a call</title>
 <desc>A traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps one to four run on your thread; the worker and sink run on a background thread. Support modules config, ids, model, context and console assist every step.</desc>
 <style>
 svg{--text:#1a1a1a;--text2:#6b6b6b;--line:#9ca3af;--nfill:#f5f5f4;--nstroke:#d6d3d1;--bfill:#dbeafe;--bstroke:#93c5fd;--afill:#fef3c7;--astroke:#fcd34d;--border:#d6d3d1}

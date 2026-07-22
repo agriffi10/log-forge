@@ -209,7 +209,7 @@ Chunking and failure handling are consistent across the family and reuse the SPE
 ## Data Model
 
 ```
-# One module per sink under src/log_forge/sinks/. Shared shape:
+# One module per sink under src/log_foundry/sinks/. Shared shape:
 <QueueSink> {
   target: str                  # topic / stream / queue / subject / topic_arn
   client: <lazily-imported or injected transport client>
@@ -254,9 +254,9 @@ class SNSSink:
     def __init__(self, topic_arn, *, client=None, max_retries=3) -> None: ...
 
 # Usage
-import log_forge
-from log_forge.sinks.kafka import KafkaSink
-log_forge.configure(sink=KafkaSink(topic="logs", bootstrap_servers="broker:9092"))
+import log_foundry
+from log_foundry.sinks.kafka import KafkaSink
+log_foundry.configure(sink=KafkaSink(topic="logs", bootstrap_servers="broker:9092"))
 ```
 
 ## Configuration / Environment
@@ -270,13 +270,13 @@ log_forge.configure(sink=KafkaSink(topic="logs", bootstrap_servers="broker:9092"
   pre-release, so the breaking rename is acceptable) and moves `SQSSink` onto `aws`; the ripple updates
   are `pyproject.toml`, CLAUDE.md's Tech Stack, and the SPEC-005 delivery doc's extra reference.
 - Credentials/endpoints are resolved by each client's standard mechanism (boto3 chain, Kafka
-  `bootstrap_servers`, Redis URL, AMQP URI, GCP ADC, Event Hubs connection string); log-forge adds no
+  `bootstrap_servers`, Redis URL, AMQP URI, GCP ADC, Event Hubs connection string); log-foundry adds no
   new credential configuration of its own.
 
 ## File & Folder Structure
 
 ```
-src/log_forge/sinks/
+src/log_foundry/sinks/
 ├── kafka.py        # KafkaSink                                   (new)
 ├── kinesis.py      # KinesisSink (put_records, 500/5MB chunks)   (new)
 ├── firehose.py     # FirehoseSink (put_record_batch, 500/4MB)    (new)

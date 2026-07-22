@@ -8,8 +8,8 @@ import types
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.postgres import PostgresSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.postgres import PostgresSink
 
 
 class FakeCursor:
@@ -57,7 +57,7 @@ class FakeConnection:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.postgres.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.postgres.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:

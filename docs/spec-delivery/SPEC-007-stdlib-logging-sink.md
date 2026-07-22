@@ -2,7 +2,7 @@
 
 ## What was completed?
 
-A zero-dependency `LoggingSink` that bridges log-forge into Python's standard `logging`: each event
+A zero-dependency `LoggingSink` that bridges log-foundry into Python's standard `logging`: each event
 dict becomes one `logging.LogRecord` dispatched through a configurable logger, handing users their
 whole existing `logging` setup (handlers, `logging.config`, third-party handlers) for free.
 
@@ -10,7 +10,7 @@ whole existing `logging` setup (handlers, `logging.config`, third-party handlers
   the SPEC-001 `Sink` protocol, `isinstance`-checkable. Module named `logging_sink` so it never
   shadows the stdlib `logging` module.
   - **Dispatch** — one `LogRecord` per event via `logger.handle(record)`, in batch order; default
-    target `logging.getLogger("log_forge")` (FR-001).
+    target `logging.getLogger("log_foundry")` (FR-001).
   - **Level mapping** — name → numeric, case-insensitive; unknown/missing → `default_level`;
     `levelno`/`levelname` reflect the mapping (FR-002).
   - **Verbatim message** — `msg=message`, `args=()`, so a literal `%`/`%s`/`%(name)s` never

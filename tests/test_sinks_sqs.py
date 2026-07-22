@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-sqs_mod = pytest.importorskip("log_forge.sinks.sqs")
+sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
 SQSSink = sqs_mod.SQSSink
 
 
@@ -61,7 +61,7 @@ def _events(n: int, pad: int = 0) -> list[dict]:
 
 
 def test_conforms_to_sink_protocol() -> None:
-    from log_forge.sinks.base import Sink
+    from log_foundry.sinks.base import Sink
 
     sink = SQSSink("https://sqs.example/q", client=FakeSQSClient())
     assert isinstance(sink, Sink)

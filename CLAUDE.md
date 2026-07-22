@@ -1,4 +1,4 @@
-# log-forge — Project Memory
+# log-foundry — Project Memory
 
 Loaded every session — keep it lean. Deep docs live in `docs/` and are pulled **on demand**:
 - `@docs/process.md` — how we work: spec lifecycle, session rhythm, completion ritual (read once)
@@ -22,8 +22,9 @@ implementation against the design in `architecture.md`.
 
 ## Layout
 
-- `src/log_forge/` — the library (src layout; distribution `log-foundry` on PyPI, import `log_forge`
-  — PyPI rejects `log-forge` as too similar to the unrelated pre-existing `logforge`).
+- `src/log_foundry/` — the library (src layout; distribution `log-foundry` on PyPI, import
+  `log_foundry` — install and import names match. The project was originally named `log-forge`,
+  which PyPI rejects as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}`. SPEC-001 shipped `config`, `ids`, `model`,
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
@@ -88,14 +89,15 @@ Syslog, Datadog, Splunk, New Relic, Honeycomb, Sentry) → queue/stream (Kafka, 
 NATS, Pub/Sub, Event Hubs, Kinesis, Firehose, SNS) → database (Mongo, Postgres, ClickHouse). Each
 third-party transport sits behind its own optional extra (lazy-imported). **SPEC-012 (release and
 distribution) is Completed** — the package ships to PyPI as `log-foundry`, first stable release
-`v0.1.0`. No spec is in flight; the next initiative needs a new spec.
+`v0.1.0`. A follow-up (no spec — a mechanical rename) renamed the import package `log_forge` →
+`log_foundry` ahead of `v0.2.0`. No spec is in flight; the next initiative needs a new spec.
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
 
 ## Key Decisions (settled — don't re-litigate; detail in architecture.md)
 
-- **Unit of work = a decorated call** (`@logforge.trace`); outermost call starts a trace, every call is
+- **Unit of work = a decorated call** (`@log_foundry.trace`); outermost call starts a trace, every call is
   a span within it. (arch §4)
 - **IDs are W3C Trace Context compatible** — `trace_id` 16B/32hex, `span_id` 8B/16hex, `log_id` UUID;
   makes future trace adoption cheap. (arch §3.1)
@@ -107,8 +109,12 @@ distribution) is Completed** — the package ships to PyPI as `log-foundry`, fir
   separate consumer indexes into ELK. `StdoutSink` is the zero-dep default. (arch §8, §9.1)
 - **Logs-only, send everything for now** — no metrics/OTel-native traces; sampling deferred but a
   `should_send` seam is reserved (tail-sampling-ready). (arch §10, §13)
-- **Version comes from Git tags, published to PyPI as `log-foundry`** — import name stays
-  `log_forge`; tags cut releases, merges to `main` publish `.devN` pre-releases. (SPEC-012)
+- **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases,
+  merges to `main` publish `.devN` pre-releases. (SPEC-012)
+- **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
+  `log_forge` for `0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
+  compatibility shim ships. Historical `log-forge` mentions survive only where they name the
+  PyPI-rejected original.
 
 ## Out of Scope (don't build)
 

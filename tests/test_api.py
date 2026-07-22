@@ -9,7 +9,7 @@ import contextvars
 
 import pytest
 
-api = pytest.importorskip("log_forge.api")
+api = pytest.importorskip("log_foundry.api")
 
 LEVELS = ["debug", "info", "warning", "error", "critical"]
 

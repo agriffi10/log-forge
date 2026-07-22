@@ -8,8 +8,8 @@ import types
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.redis import RedisListSink, RedisStreamsSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
 
 
 class FakePipeline:
@@ -48,7 +48,7 @@ class FakeRedis:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.redis.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.redis.time.sleep", lambda _s: None)
 
 
 def test_streams_is_a_sink() -> None:

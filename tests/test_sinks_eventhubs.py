@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.eventhubs import AzureEventHubsSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.eventhubs import AzureEventHubsSink
 
 
 class FakeBatch:
@@ -53,12 +53,12 @@ class FakeProducer:
 @pytest.fixture(autouse=True)
 def _identity_event_data(monkeypatch):
     """EventData(body) -> body, so the fake batch sees raw bytes (no azure dependency)."""
-    monkeypatch.setattr("log_forge.sinks.eventhubs._event_data_cls", lambda: (lambda body: body))
+    monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: (lambda body: body))
 
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_forge.sinks.eventhubs.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks.eventhubs.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:

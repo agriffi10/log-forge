@@ -1,10 +1,10 @@
-# log-forge
+# log-foundry
 
 Consistent, structured (JSON) logs for every decorated function call — correlated by shared
 trace/span IDs, ready to ship to any of 30-plus built-in sinks (stdout by default; SQS → ELK is
 the headline production path).
 
-`log-forge` owns the **logs** pillar of observability. You decorate a function with `@trace`;
+`log-foundry` owns the **logs** pillar of observability. You decorate a function with `@trace`;
 it emits one identically-shaped JSON record when the call starts and another when it ends
 (with duration and status), stitched together by W3C-compatible trace and span IDs so nested
 calls form a tree you can query later.
@@ -32,16 +32,25 @@ pip install log-foundry          # core, zero dependencies
 pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
 
-> **The install name and the import name differ.** You `pip install log-foundry`, then
-> `import log_forge`. PyPI rejects `log-forge` as too similar to the unrelated, pre-existing
+> **Renamed in 0.2.0: `log_forge` → `log_foundry`.** The import package now matches the
+> distribution name — `pip install log-foundry`, then `import log_foundry`. If you are on
+> `0.1.x`, update your imports; there is no compatibility shim. The project was originally
+> called *log-forge*, but PyPI rejects that name as too similar to the unrelated, pre-existing
 > [`logforge`](https://pypi.org/project/logforge/) project — its similarity check collapses
-> separators, so `log-forge` and `logforge` count as the same name. Only the distribution name
-> moved; no module or API was renamed.
+> separators, so `log-forge` and `logforge` count as the same name. Rather than keep a
+> distribution and an import name that disagreed, everything is now `log-foundry` /
+> `log_foundry`.
+>
+> Migrating from `0.1.x` is a find-and-replace on `log_forge` → `log_foundry`; no module moved
+> and no public API changed. A handful of *emitted* defaults carry the name and shift with it:
+> `LoggingSink`'s default logger (`logging.getLogger("log_foundry")`), `SyslogSink(app_name=…)`,
+> `SplunkHECSink(source=…)`, Datadog's `ddsource`, and Sentry's client tag. Override them
+> explicitly if a downstream query or dashboard pins the old string.
 
 ```python
-import log_forge
+import log_foundry
 
-print(log_forge.__version__)     # the installed version
+print(log_foundry.__version__)     # the installed version
 ```
 
 To work on the library itself, install from a clone:
@@ -76,7 +85,7 @@ Loki, Logstash, Syslog, Datadog, Splunk, New Relic, Honeycomb) — need **no** e
 ## Quickstart
 
 ```python
-import log_forge as lf
+import log_foundry as lf
 
 # Call once at startup. These values are stamped onto every event.
 lf.configure(service="billing-api", version="1.4.2", env="prod")
@@ -108,7 +117,7 @@ with the child span pointing at its parent via `parent_span_id`:
 
 ## How it works
 
-![log-forge pipeline: a traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps 1–4 run on your thread; the worker and sink run on a background thread. Support modules — config, ids, model, context, console — assist every step.](docs/assets/pipeline.svg)
+![log-foundry pipeline: a traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps 1–4 run on your thread; the worker and sink run on a background thread. Support modules — config, ids, model, context, console — assist every step.](docs/assets/pipeline.svg)
 
 A traced call travels through a small pipeline. The first four steps run on your own thread
 and are deliberately fast; the last two run on a background thread so your code never waits on
@@ -260,13 +269,13 @@ class Sink(Protocol):
 
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
 call falls back to `StdoutSink()`. Sinks are **not** re-exported at the top level — import each
-from its own module, e.g. `from log_forge.sinks.sqs import SQSSink`.
+from its own module, e.g. `from log_foundry.sinks.sqs import SQSSink`.
 
 A few conventions hold across every sink below:
 
 - **Extras.** The core is dependency-free. A sink built on a third-party client sits behind the
   optional extra named in its table (blank = zero-dependency, stdlib only); the client is imported
-  lazily, so `import log_forge.sinks.<x>` never fails for a missing dependency — only *constructing*
+  lazily, so `import log_foundry.sinks.<x>` never fails for a missing dependency — only *constructing*
   the sink without an injected client does. See [Optional extras](#optional-extras).
 - **Injection.** Sinks backed by an external resource accept an injected client/connection/stream
   (`client=`, `connection=`, `producer=`, `stream=`, `opener=`) for testing or bespoke configuration.
@@ -280,13 +289,13 @@ A few conventions hold across every sink below:
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `StdoutSink` | `log_forge.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
-| `StderrSink` | `log_forge.sinks.util` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
-| `NullSink` | `log_forge.sinks.util` | `NullSink()` — discard everything; `.dropped` counts events |
-| `MemorySink` | `log_forge.sinks.util` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
+| `StdoutSink` | `log_foundry.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
+| `StderrSink` | `log_foundry.sinks.util` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
+| `NullSink` | `log_foundry.sinks.util` | `NullSink()` — discard everything; `.dropped` counts events |
+| `MemorySink` | `log_foundry.sinks.util` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
 
 ```python
-from log_forge.sinks.stdout import StdoutSink
+from log_foundry.sinks.stdout import StdoutSink
 lf.configure(sink=StdoutSink())          # explicit; also the zero-config default
 ```
 
@@ -297,16 +306,16 @@ to a plain callable.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `MultiSink` | `log_forge.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed` |
-| `FilteringSink` | `log_forge.sinks.filtering` | `FilteringSink(inner, *, predicate=None, min_level=None)` — forward only events passing `predicate` and/or at/above `min_level` |
-| `TransformSink` | `log_forge.sinks.transform` | `TransformSink(inner, fn)` — map each event through `fn` before forwarding; return `None` to drop one |
-| `CallbackSink` | `log_forge.sinks.callback` | `CallbackSink(fn, *, on_close=None)` — hand each batch to any callable |
+| `MultiSink` | `log_foundry.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed` |
+| `FilteringSink` | `log_foundry.sinks.filtering` | `FilteringSink(inner, *, predicate=None, min_level=None)` — forward only events passing `predicate` and/or at/above `min_level` |
+| `TransformSink` | `log_foundry.sinks.transform` | `TransformSink(inner, fn)` — map each event through `fn` before forwarding; return `None` to drop one |
+| `CallbackSink` | `log_foundry.sinks.callback` | `CallbackSink(fn, *, on_close=None)` — hand each batch to any callable |
 
 ```python
-from log_forge.sinks.multi import MultiSink
-from log_forge.sinks.filtering import FilteringSink
-from log_forge.sinks.stdout import StdoutSink
-from log_forge.sinks.sqs import SQSSink
+from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.filtering import FilteringSink
+from log_foundry.sinks.stdout import StdoutSink
+from log_foundry.sinks.sqs import SQSSink
 
 lf.configure(sink=MultiSink(
     StdoutSink(),                                                    # echo everything locally
@@ -321,9 +330,9 @@ level is unknown or missing fails open (is forwarded).
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `LoggingSink` | `log_forge.sinks.logging_sink` | `LoggingSink(logger=None, *, default_level="INFO")` — emit each event as a `logging.LogRecord` |
+| `LoggingSink` | `log_foundry.sinks.logging_sink` | `LoggingSink(logger=None, *, default_level="INFO")` — emit each event as a `logging.LogRecord` |
 
-Hands every event to a `logging.Logger` (default `logging.getLogger("log_forge")`) so your existing
+Hands every event to a `logging.Logger` (default `logging.getLogger("log_foundry")`) so your existing
 handlers, formatters, and `logging.config` apply. Identity fields and the nested `fields` are
 attached to each record; the sink never configures or tears down logging itself.
 
@@ -331,9 +340,9 @@ attached to each record; the sink never configures or tears down logging itself.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `FileSink` | `log_forge.sinks.file` | `FileSink(path, *, encoding="utf-8")` — append NDJSON to one file |
-| `RotatingFileSink` | `log_forge.sinks.file` | `RotatingFileSink(path, *, max_bytes=0, backup_count=0, when=None, interval=1)` — rotate by size and/or time, keeping `backup_count` numbered backups |
-| `SQLiteSink` | `log_forge.sinks.sqlite` | `SQLiteSink(database, *, table="log_events", create_table=True)` — batch-insert into an embedded SQLite DB |
+| `FileSink` | `log_foundry.sinks.file` | `FileSink(path, *, encoding="utf-8")` — append NDJSON to one file |
+| `RotatingFileSink` | `log_foundry.sinks.file` | `RotatingFileSink(path, *, max_bytes=0, backup_count=0, when=None, interval=1)` — rotate by size and/or time, keeping `backup_count` numbered backups |
+| `SQLiteSink` | `log_foundry.sinks.sqlite` | `SQLiteSink(database, *, table="log_events", create_table=True)` — batch-insert into an embedded SQLite DB |
 
 `RotatingFileSink`'s time trigger uses a `when` unit code — `"S"`/`"M"`/`"H"`/`"D"` — times `interval`
 (either trigger, or both, can be enabled). `SQLiteSink` stores each event as full JSON plus projected
@@ -341,7 +350,7 @@ attached to each record; the sink never configures or tears down logging itself.
 you provision the table yourself.
 
 ```python
-from log_forge.sinks.file import RotatingFileSink
+from log_foundry.sinks.file import RotatingFileSink
 lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup_count=5))
 ```
 
@@ -353,15 +362,15 @@ to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`).
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `HTTPSink` | `log_forge.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"` |
-| `ElasticsearchSink` | `log_forge.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
-| `OpenSearchSink` | `log_forge.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
-| `LokiSink` | `log_forge.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
-| `LogstashSink` | `log_forge.sinks.logstash` | `LogstashSink(url=…, **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket |
-| `SyslogSink` | `log_forge.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-forge")` — RFC 5424 over UDP/TCP |
+| `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"` |
+| `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
+| `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
+| `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
+| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket |
+| `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry")` — RFC 5424 over UDP/TCP |
 
 ```python
-from log_forge.sinks.elasticsearch import ElasticsearchSink
+from log_foundry.sinks.elasticsearch import ElasticsearchSink
 lf.configure(sink=ElasticsearchSink("https://es.internal:9200", index="app-logs",
                                      auth=("elastic", "…")))
 ```
@@ -373,11 +382,11 @@ Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers 
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `DatadogSink` | `log_forge.sinks.datadog` | — | `DatadogSink(api_key, *, site="datadoghq.com", service=None, ddtags=None)` |
-| `SplunkHECSink` | `log_forge.sinks.splunk` | — | `SplunkHECSink(url, token, *, host=None, source="log-forge")` — HTTP Event Collector |
-| `NewRelicSink` | `log_forge.sinks.newrelic` | — | `NewRelicSink(api_key, *, region="US")` — `region` is `"US"` or `"EU"` |
-| `HoneycombSink` | `log_forge.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` |
-| `SentrySink` | `log_forge.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR")` — sends only `min_level`+ events |
+| `DatadogSink` | `log_foundry.sinks.datadog` | — | `DatadogSink(api_key, *, site="datadoghq.com", service=None, ddtags=None)` |
+| `SplunkHECSink` | `log_foundry.sinks.splunk` | — | `SplunkHECSink(url, token, *, host=None, source="log-foundry")` — HTTP Event Collector |
+| `NewRelicSink` | `log_foundry.sinks.newrelic` | — | `NewRelicSink(api_key, *, region="US")` — `region` is `"US"` or `"EU"` |
+| `HoneycombSink` | `log_foundry.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` |
+| `SentrySink` | `log_foundry.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR")` — sends only `min_level`+ events |
 
 With the `sentry` extra installed, `SentrySink` captures via `sentry_sdk.capture_event` (initialize
 the SDK yourself with `sentry_sdk.init(...)`); without it, pass `dsn=` and events are POSTed as
@@ -386,19 +395,19 @@ Sentry envelopes over HTTP.
 #### AWS — the durable-buffer path (`aws` extra)
 
 `pip install 'log-foundry[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
-chain — log-forge adds none of its own. Each re-chunks every batch to the service's hard per-request
+chain — log-foundry adds none of its own. Each re-chunks every batch to the service's hard per-request
 limits, retries partial failures, and drops any single event too large to ever fit (counted on
 `.dropped_oversized`).
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `SQSSink` | `log_forge.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages |
-| `SNSSink` | `log_forge.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3)` |
-| `KinesisSink` | `log_forge.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
-| `FirehoseSink` | `log_forge.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
+| `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages |
+| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3)` |
+| `KinesisSink` | `log_foundry.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
+| `FirehoseSink` | `log_foundry.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
 
 ```python
-from log_forge.sinks.sqs import SQSSink
+from log_foundry.sinks.sqs import SQSSink
 lf.configure(service="payments",
              sink=SQSSink(queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/logs"))
 ```
@@ -411,16 +420,16 @@ Each needs its own extra (lazy-imported). All publish + retry within a bound and
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `KafkaSink` | `log_forge.sinks.kafka` | `kafka` | `KafkaSink(topic, *, bootstrap_servers="…", key_field="trace_id")` |
-| `RedisStreamsSink` | `log_forge.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None)` — `XADD` |
-| `RedisListSink` | `log_forge.sinks.redis` | `redis` | `RedisListSink(key, *, url=None)` — `RPUSH` |
-| `RabbitMQSink` | `log_forge.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
-| `NATSSink` | `log_forge.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None)` |
-| `GooglePubSubSink` | `log_forge.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
-| `AzureEventHubsSink` | `log_forge.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
+| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, bootstrap_servers="…", key_field="trace_id")` |
+| `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None)` — `XADD` |
+| `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None)` — `RPUSH` |
+| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
+| `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None)` |
+| `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
+| `AzureEventHubsSink` | `log_foundry.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
 
 ```python
-from log_forge.sinks.kafka import KafkaSink
+from log_foundry.sinks.kafka import KafkaSink
 lf.configure(sink=KafkaSink("app-logs", bootstrap_servers="broker:9092"))
 ```
 
@@ -430,9 +439,9 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `MongoDBSink` | `log_forge.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…")` |
-| `PostgresSink` | `log_forge.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False)` — JSONB `event` column + extracted columns |
-| `ClickHouseSink` | `log_forge.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False)` — MergeTree, columnar insert |
+| `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…")` |
+| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False)` — JSONB `event` column + extracted columns |
+| `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False)` — MergeTree, columnar insert |
 
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set
 it `True` for an idempotent `CREATE TABLE IF NOT EXISTS` convenience.
@@ -452,7 +461,7 @@ them (`worker.dropped`) rather than stalling.
 Because delivery is asynchronous, drain before the process exits:
 
 ```python
-import log_forge as lf
+import log_foundry as lf
 
 lf.shutdown()   # flush buffered events and close the sink; blocks until drained
 ```
@@ -497,7 +506,7 @@ poetry run mypy                # typecheck (strict, over src/)
 every pull request and on push to `main`. A second workflow
 ([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
 
-The library uses a src layout (`src/log_forge/`) with a single concept per module: `config`,
+The library uses a src layout (`src/log_foundry/`) with a single concept per module: `config`,
 `ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
 `base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
@@ -513,8 +522,8 @@ sdist and a wheel:
 
 | Trigger | Version built | Published to PyPI as |
 |---|---|---|
-| merge to `main` | `0.1.1.devN` | dev pre-release |
-| push tag `v0.1.0` | `0.1.0` | stable release |
+| merge to `main` | `X.Y.Z.devN` | dev pre-release |
+| push tag `vX.Y.Z` | `X.Y.Z` | stable release |
 
 Dev pre-releases keep the upload path exercised on every merge, so a real release is never the
 first time it runs. `pip install log-foundry` still resolves to the latest **stable** version —
@@ -523,7 +532,7 @@ pip ignores pre-releases unless you pass `--pre`.
 Cutting a release is one tag:
 
 ```bash
-git tag -a v0.2.0 -m "log-forge 0.2.0"
+git tag -a v0.2.0 -m "log-foundry 0.2.0"
 git push origin v0.2.0
 ```
 

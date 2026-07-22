@@ -7,12 +7,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.datadog import DatadogSink
-from log_forge.sinks.honeycomb import HoneycombSink
-from log_forge.sinks.newrelic import NewRelicSink
-from log_forge.sinks.sentry import SentrySink
-from log_forge.sinks.splunk import SplunkHECSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.datadog import DatadogSink
+from log_foundry.sinks.honeycomb import HoneycombSink
+from log_foundry.sinks.newrelic import NewRelicSink
+from log_foundry.sinks.sentry import SentrySink
+from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
 
 
@@ -28,7 +28,7 @@ def test_datadog_intake_url_header_and_enrichment() -> None:
     assert call["url"] == "https://http-intake.logs.datadoghq.eu/api/v2/logs"
     assert call["headers"]["dd-api-key"] == "key123"
     entry = json.loads(call["body"])[0]
-    assert entry["ddsource"] == "log-forge"
+    assert entry["ddsource"] == "log-foundry"
     assert entry["service"] == "payments"
     assert entry["ddtags"] == "env:prod"
 
@@ -124,7 +124,7 @@ def test_sentry_sdk_path_with_level_gating() -> None:
 
 
 def test_sentry_http_envelope_fallback_when_sdk_absent(monkeypatch) -> None:
-    monkeypatch.setattr("log_forge.sinks.sentry._import_sdk", lambda: None)
+    monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
     opener = FakeOpener()
     sink = SentrySink(dsn="https://pubkey@o123.ingest.sentry.io/456", opener=opener)
     assert sink._sdk is None
@@ -141,6 +141,6 @@ def test_sentry_http_envelope_fallback_when_sdk_absent(monkeypatch) -> None:
 
 
 def test_sentry_without_sdk_or_dsn_raises(monkeypatch) -> None:
-    monkeypatch.setattr("log_forge.sinks.sentry._import_sdk", lambda: None)
+    monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
     with pytest.raises(ValueError):
         SentrySink()

@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from log_forge.sinks.base import Sink
-from log_forge.sinks.kafka import KafkaSink
+from log_foundry.sinks.base import Sink
+from log_foundry.sinks.kafka import KafkaSink
 
 
 class FakeProducer:

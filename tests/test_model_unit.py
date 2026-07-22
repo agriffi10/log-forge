@@ -1,6 +1,6 @@
 """SPEC-001 FR-003 — model unit coverage without the `lf` fixture.
 
-The pre-written `test_model.py` uses the shared `lf` fixture, which gates on `log_forge.info`
+The pre-written `test_model.py` uses the shared `lf` fixture, which gates on `log_foundry.info`
 (a SPEC-002 feature), so it stays skipped through SPEC-001. These tests exercise `model.py`
 directly against a `FakeSink`-configured process so the schema, precedence, and end-event
 fields are verified now.
@@ -10,8 +10,8 @@ import re
 
 import pytest
 
-config = pytest.importorskip("log_forge.config")
-model = pytest.importorskip("log_forge.model")
+config = pytest.importorskip("log_foundry.config")
+model = pytest.importorskip("log_foundry.model")
 
 BASE_FIELDS = (
     "timestamp", "level", "message", "trace_id", "span_id", "parent_span_id",
