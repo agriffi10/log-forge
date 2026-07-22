@@ -28,11 +28,13 @@ jobs:
 
       - name: Build sdist and wheel
         run: |
-          python -m pip install --upgrade build
+          python -m pip install --upgrade build twine
           python -m build
 
-      # PyPI and TestPyPI reject any version carrying a local segment (+<hash>).
-      # Fail here rather than at upload time, where the error is far less obvious.
+      # Every merge publishes, so a bad artifact turns main red at upload time.
+      # Catch the common rejections here instead, where the error is legible:
+      #   - a local version segment (+<hash>), which PyPI refuses outright
+      #   - malformed metadata or a README that fails to render on the project page
       - name: Verify distributions are publishable
         run: |
           ls -l dist/
@@ -42,6 +44,7 @@ jobs:
           fi
           test "$(ls dist/*.tar.gz | wc -l)" -eq 1
           test "$(ls dist/*.whl | wc -l)" -eq 1
+          python -m twine check dist/*
 
       - name: Upload built distributions
         uses: actions/upload-artifact@v4
@@ -49,14 +52,16 @@ jobs:
           name: dist
           path: dist/
 
-  publish-testpypi:
-    # Every merge to main ships a development pre-release to the TestPyPI sandbox.
+  publish-dev:
+    # Every merge to main ships an X.Y.Z.devN pre-release to PyPI. pip ignores pre-releases
+    # unless --pre is passed, so `pip install log-foundry` still resolves to the stable release.
+    # This keeps the upload path exercised, so a tagged release is never the first attempt.
     if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/log-foundry
+      name: pypi
+      url: https://pypi.org/p/log-foundry
     permissions:
       id-token: write          # required for Trusted Publishing (OIDC)
     steps:
@@ -66,8 +71,7 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to TestPyPI
+      - name: Publish dev pre-release to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          repository-url: https://test.pypi.org/legacy/
           skip-existing: true   # tolerate a re-run that produces a duplicate dev version
