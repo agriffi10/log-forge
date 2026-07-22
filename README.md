@@ -38,9 +38,13 @@ poetry install -E aws          # or: pip install '.[aws]'
 Once published, the intended install will be:
 
 ```bash
-pip install log-forge          # core, zero dependencies
-pip install 'log-forge[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
+pip install log-foundry          # core, zero dependencies
+pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
+
+> **Note the name split.** The distribution is **`log-foundry`** on PyPI, but the import name
+> stays **`log_forge`** — `pip install log-foundry`, then `import log_forge`. PyPI rejects
+> `log-forge` as too similar to the unrelated, pre-existing `logforge` project.
 
 ### Optional extras
 
@@ -375,7 +379,7 @@ Sentry envelopes over HTTP.
 
 #### AWS — the durable-buffer path (`aws` extra)
 
-`pip install 'log-forge[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
+`pip install 'log-foundry[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
 chain — log-forge adds none of its own. Each re-chunks every batch to the service's hard per-request
 limits, retries partial failures, and drops any single event too large to ever fit (counted on
 `.dropped_oversized`).
