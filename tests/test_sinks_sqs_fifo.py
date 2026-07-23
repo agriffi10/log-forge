@@ -280,3 +280,109 @@ def test_oversized_drop_is_judged_on_body_alone_for_both_queue_types() -> None:
     fifo.emit([big, _event()])
 
     assert std.dropped_oversized == fifo.dropped_oversized == 1
+
+
+# -- FR-006: sender-fault entries are not retried ---------------------------------------
+
+
+class FaultingClient:
+    """Fails chosen entry Ids every time, with a caller-chosen SenderFault flag and code."""
+
+    def __init__(self, *, sender_fault: bool, code: str = "MissingParameter") -> None:
+        self.sender_fault = sender_fault
+        self.code = code
+        self.calls: list[list[dict]] = []
+
+    def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+        self.calls.append([dict(e) for e in Entries])
+        return {
+            "Successful": [],
+            "Failed": [
+                {"Id": e["Id"], "SenderFault": self.sender_fault, "Code": self.code}
+                for e in Entries
+            ],
+        }
+
+
+class MixedFaultClient:
+    """Entry '0' is a permanent sender fault; the rest are retryable internal errors."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[dict]] = []
+
+    def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+        self.calls.append([dict(e) for e in Entries])
+        failed = []
+        for e in Entries:
+            fault = e["Id"] == "0"
+            failed.append(
+                {
+                    "Id": e["Id"],
+                    "SenderFault": fault,
+                    "Code": "InvalidParameterValue" if fault else "InternalError",
+                }
+            )
+        return {"Successful": [], "Failed": failed}
+
+
+def test_sender_fault_entries_are_not_resent() -> None:
+    client = FaultingClient(sender_fault=True)
+    sink = SQSSink(STD_URL, client=client, max_retries=3)
+    sink.emit([_event(log_id=f"log-{i}") for i in range(2)])
+
+    assert len(client.calls) == 1, "a deterministic rejection is never worth re-sending"
+    assert sink.failed == 2
+
+
+def test_non_sender_faults_are_still_retried_under_the_bound() -> None:
+    client = FaultingClient(sender_fault=False, code="InternalError")
+    sink = SQSSink(STD_URL, client=client, max_retries=3)
+    sink.emit([_event()])
+
+    assert len(client.calls) == 4, "1 attempt + 3 retries"
+    assert sink.failed == 1
+
+
+def test_mixed_response_retries_only_the_retryable_entries() -> None:
+    client = MixedFaultClient()
+    sink = SQSSink(STD_URL, client=client, max_retries=2)
+    sink.emit([_event(log_id=f"log-{i}") for i in range(3)])
+
+    assert [len(call) for call in client.calls] == [3, 2, 2], "entry '0' drops out after call 1"
+    assert all(e["Id"] != "0" for call in client.calls[1:] for e in call)
+    assert sink.failed == 3, "1 sender fault + 2 exhausted retryables"
+
+
+def test_abandoned_sender_faults_name_the_sqs_code(capsys) -> None:
+    client = FaultingClient(sender_fault=True, code="MissingParameter")
+    SQSSink(STD_URL, client=client).emit([_event()])
+
+    err = capsys.readouterr().err
+    assert "MissingParameter" in err, "the code is what makes the cause diagnosable"
+    assert "not retried" in err
+
+
+def test_a_missing_sender_fault_flag_degrades_to_retrying() -> None:
+    # An unfamiliar response shape must not silently drop messages.
+    class NoFlagClient:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+            self.calls.append([dict(e) for e in Entries])
+            return {"Successful": [], "Failed": [{"Id": e["Id"], "Code": "Weird"} for e in Entries]}
+
+    client = NoFlagClient()
+    SQSSink(STD_URL, client=client, max_retries=2).emit([_event()])
+    assert len(client.calls) == 3
+
+
+def test_fifo_misconfiguration_costs_one_call_per_chunk_not_four() -> None:
+    # The scenario FR-006 exists for: fifo=False forced onto a .fifo queue, so entries go out
+    # without a MessageGroupId and SQS rejects every one as a sender fault.
+    client = FaultingClient(sender_fault=True, code="MissingParameter")
+    sink = SQSSink(FIFO_URL, client=client, fifo=False, max_retries=3)
+    sink.emit([_event(log_id=f"log-{i}") for i in range(12)])
+
+    assert [len(call) for call in client.calls] == [10, 2], "one call per chunk, no retries"
+    assert sink.failed == 12

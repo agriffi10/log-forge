@@ -1,8 +1,8 @@
 # Spec: FIFO Queue Support for `SQSSink`
 
 **ID:** SPEC-016
-**Status:** Draft
-**Last Updated:** 2026-07-22
+**Status:** Completed
+**Last Updated:** 2026-07-23
 **Depends On:** SPEC-005 (`SQSSink`, chunking + `Failed`-list retry)
 
 ## Overview

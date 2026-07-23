@@ -194,6 +194,11 @@ class SQSSink:
         are counted (``failed``) and logged, not silently dropped (FR-003). The FIFO parameters
         are attached only when the queue is FIFO, so a standard queue's entries are exactly
         ``Id`` + ``MessageBody`` (SPEC-016 FR-004).
+
+        Entries SQS marks ``SenderFault`` are abandoned rather than retried (SPEC-016 FR-006):
+        a retry re-sends them byte-identical, so a fault in the request itself can only fail
+        the same way. Throttles and internal errors carry ``SenderFault: false`` and are still
+        retried under the bound.
         """
         entries: list[dict[str, str]] = []
         for i, item in enumerate(prepared):
@@ -208,8 +213,22 @@ class SQSSink:
             failed = response.get("Failed", [])
             if not failed:
                 return
-            failed_ids = {entry["Id"] for entry in failed}
-            entries = [entry for entry in entries if entry["Id"] in failed_ids]
+            # Abandon sender faults immediately and name the code: the retry would re-send the
+            # entry byte-identical, and the code is the only thing that makes a rejection
+            # diagnosable from the log line alone. A missing flag is treated as retryable, so
+            # an unfamiliar response shape degrades to the old behaviour rather than dropping.
+            sender_faults = [item for item in failed if item.get("SenderFault")]
+            if sender_faults:
+                self.failed += len(sender_faults)
+                sys.stderr.write(
+                    f"log-foundry: {len(sender_faults)} SQS message(s) rejected as invalid "
+                    f"(first code: {sender_faults[0].get('Code', 'unknown')}); not retried\n"
+                )
+
+            retryable_ids = {item["Id"] for item in failed if not item.get("SenderFault")}
+            if not retryable_ids:
+                return
+            entries = [entry for entry in entries if entry["Id"] in retryable_ids]
             if attempt >= self.max_retries:
                 self.failed += len(entries)
                 sys.stderr.write(
