@@ -95,13 +95,13 @@ and a repeatable `flush()` added. **SPEC-014 (cross-process trace continuation) 
 `continue_trace()` adopts a W3C `traceparent` + `baggage`; `current_traceparent()` and friends
 publish it. **SPEC-015 (baggage on boundary events) is Completed** — `span.start`/`span.end` were
 built with `baggage={}` hardcoded, so the events carrying `duration_ms`/`status` were invisible to
-a baggage filter; one backfill at span close now completes both. **Latest release: `v0.4.0`**
-(SPEC-015; `v0.3.0` was SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
+a baggage filter; one backfill at span close now completes both.
 **SPEC-016 (FIFO queue support for `SQSSink`) is Completed** — a `.fifo` URL now selects FIFO
 behaviour and every entry carries a `MessageGroupId` (the event's `trace_id` by default,
-configurable) plus a `log_id` dedup id; sender faults are no longer retried. SPEC-016 is
-**unreleased** and wants a **minor** bump (`v0.5.0` — additive, though sender faults now abandon
-after one attempt instead of four). No spec is in flight; the next initiative needs a new spec.
+configurable) plus a `log_id` dedup id; sender faults are no longer retried.
+**Latest release: `v0.5.0`** (SPEC-016; `v0.4.0` was SPEC-015, `v0.3.0` SPEC-013 + SPEC-014,
+`v0.2.0` the rename, `v0.1.0` the first stable). Nothing is unreleased. No spec is in flight; the
+next initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
