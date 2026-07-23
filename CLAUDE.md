@@ -97,10 +97,11 @@ publish it. **SPEC-015 (baggage on boundary events) is Completed** — `span.sta
 built with `baggage={}` hardcoded, so the events carrying `duration_ms`/`status` were invisible to
 a baggage filter; one backfill at span close now completes both. **Latest release: `v0.4.0`**
 (SPEC-015; `v0.3.0` was SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
-Nothing is unreleased. **SPEC-016 (FIFO queue support for `SQSSink`) is Draft** — entries are built
-without a `MessageGroupId`, which a FIFO queue rejects per-entry as a sender fault, so the retry
-loop burns its budget and the batch is lost in silence; the group id will default to the event's
-`trace_id`. Not started — the build needs a validated plan first.
+**SPEC-016 (FIFO queue support for `SQSSink`) is Completed** — a `.fifo` URL now selects FIFO
+behaviour and every entry carries a `MessageGroupId` (the event's `trace_id` by default,
+configurable) plus a `log_id` dedup id; sender faults are no longer retried. SPEC-016 is
+**unreleased** and wants a **minor** bump (`v0.5.0` — additive, though sender faults now abandon
+after one attempt instead of four). No spec is in flight; the next initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -133,6 +134,11 @@ loop burns its budget and the batch is lost in silence; the group id will defaul
   backfill at close completes `span.start`/`span.end` (which describe the whole span and carry the
   outcome), while an `info` is left exactly as it was emitted. Backfilling everything would also
   invert `build_event`'s precedence by letting baggage beat a per-call field. (SPEC-015)
+- **A FIFO message group is a trace, not the process** — `MessageGroupId` defaults to the event's
+  `trace_id`: SQS orders *within* a group, and a trace is the unit whose events must stay ordered,
+  while per-trace groups keep traces parallel instead of serializing everything behind one group.
+  Overridable with a constant or a callable. Ordering is best-effort across a retry boundary, and
+  sender faults are abandoned rather than re-sent byte-identical. (SPEC-016)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

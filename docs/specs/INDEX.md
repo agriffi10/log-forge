@@ -20,7 +20,7 @@ to status only — no prose.
 | [SPEC-013](SPEC-013-aws-lambda-compatibility.md) | AWS Lambda Compatibility — Python 3.12 Support and a Repeatable `flush()` | Completed | SPEC-004, SPEC-012 |
 | [SPEC-014](SPEC-014-cross-process-trace-continuation.md) | Cross-Process Trace Continuation (W3C `traceparent` + baggage) | Completed | SPEC-001, SPEC-002, SPEC-013 |
 | [SPEC-015](SPEC-015-baggage-on-boundary-events.md) | Baggage on Boundary Events | Completed | SPEC-002, SPEC-014 |
-| [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Draft | SPEC-005 |
+| [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Completed | SPEC-005 |
 
 ## Arcs (build order)
 
