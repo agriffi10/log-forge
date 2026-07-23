@@ -97,6 +97,11 @@ spanning several traces produces several groups in one request.
 - [ ] `message_group_id=lambda event: ...` is called once per event and its return value is used.
 - [ ] An event with no `trace_id` key, or one whose value is empty or whitespace, falls back to the
       module constant `DEFAULT_GROUP_ID` rather than sending an empty parameter.
+- [ ] A **callable** returning an empty or whitespace value falls back the same way — SQS rejects an
+      empty group id whatever produced it.
+- [ ] `message_group_id=""` (or all-whitespace) raises `ValueError` at construction. It is a
+      deterministic config error the caller can fix, so it fails fast rather than becoming a silent
+      substitution that surfaces as a mystery group in their queue.
 - [ ] A derived group id longer than SQS's 128-character maximum is truncated to 128 characters.
 - [ ] The retry-reordering limitation is recorded in the `SQSSink` docstring.
 
@@ -195,8 +200,19 @@ SQSSink {
 ```
 
 `_chunks` currently returns `list[list[str]]` — bodies only, with the source event discarded. A
-per-entry group id needs the event, so it becomes `list[list[tuple[str, dict[str, object]]]]`
-(body paired with the event it came from). This is internal; `emit`/`close` are unchanged.
+per-entry group id needs more, so it becomes `list[list[_Prepared]]`:
+
+```python
+class _Prepared(NamedTuple):
+    body: str
+    group_id: str | None      # None on a standard queue
+    dedup_id: str | None
+```
+
+The ids are resolved **once**, in `_chunks`, rather than again at send time. Deriving twice would
+be a latent bug, not just waste: the dedup fallback mints a fresh UUID, so the byte budget would be
+billed for one value while a different one went on the wire. This is internal; `emit`/`close` are
+unchanged.
 
 A FIFO entry:
 

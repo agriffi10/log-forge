@@ -14,15 +14,58 @@ The worker (SPEC-004) batches by count and time, but SQS has hard per-request li
 sink re-chunks every incoming batch on both dimensions: ≤ 10 messages **and** ≤ 256 KB per
 ``send_message_batch``. Partial failures (the response ``Failed`` list) are retried; a single
 event too large to ever fit is dropped with a warning rather than crashing the batch.
+
+Both queue types are supported (SPEC-016). A ``.fifo`` queue URL selects FIFO behaviour, where
+every entry additionally carries a ``MessageGroupId`` — SQS orders messages *within* a group, and
+the default group is the event's own ``trace_id``, which is exactly the unit whose events should
+stay ordered. Per-trace groups also keep traces independent, so the queue delivers them in
+parallel instead of serializing the whole process behind one group. Standard queues are
+untouched: their entries carry ``Id`` and ``MessageBody`` and nothing else.
+
+Ordering is best-effort across a retry boundary: if one entry fails while a same-group entry
+ahead of it succeeded, the retried entry lands *after* it. Holding a whole group back on one
+failure would trade log delivery for ordering the consumer can rebuild from ``timestamp``, so it
+is not done.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from typing import Any
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 __all__ = ["SQSSink"]
+
+DEFAULT_GROUP_ID = "log-foundry"
+"""Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
+
+MAX_ID_LEN = 128
+"""SQS maximum length for ``MessageGroupId`` and ``MessageDeduplicationId``."""
+
+GroupIdSource = str | Callable[[dict[str, object]], str] | None
+DedupIdSource = Callable[[dict[str, object]], str] | None
+
+
+class _Prepared(NamedTuple):
+    """One event serialized and costed, with its FIFO ids resolved (``None`` on a standard queue).
+
+    The ids are derived **once**, here, rather than again at send time: the deduplication
+    fallback mints a fresh UUID, so deriving twice would bill the byte budget for one value and
+    put a different one on the wire.
+    """
+
+    body: str
+    group_id: str | None
+    dedup_id: str | None
+
+
+def _bounded(raw: str, fallback: str) -> str:
+    """Normalize a derived id: blank falls back, over-long truncates to the SQS maximum."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return fallback
+    return cleaned[:MAX_ID_LEN]
 
 
 class SQSSink:
@@ -31,7 +74,20 @@ class SQSSink:
     MAX_BATCH = 10  # SQS SendMessageBatch hard limit: entries per request
     MAX_BYTES = 256 * 1024  # SQS limit: 256 KB per request
 
-    def __init__(self, queue_url: str, client: Any = None, *, max_retries: int = 3) -> None:
+    def __init__(
+        self,
+        queue_url: str,
+        client: Any = None,
+        *,
+        max_retries: int = 3,
+        fifo: bool | None = None,
+        message_group_id: GroupIdSource = None,
+        message_deduplication_id: DedupIdSource = None,
+    ) -> None:
+        if isinstance(message_group_id, str) and not message_group_id.strip():
+            raise ValueError(
+                "message_group_id must be a non-empty string; pass None to group by trace_id"
+            )
         if client is None:
             import boto3  # type: ignore[import-not-found]  # optional 'aws' extra
 
@@ -39,6 +95,11 @@ class SQSSink:
         self.queue_url = queue_url
         self.client = client
         self.max_retries = max_retries
+        # AWS requires every FIFO queue name to end in '.fifo', so the suffix is a contract
+        # rather than a guess — but an explicit flag still wins. Decided once, not per emit.
+        self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
+        self.message_group_id = message_group_id
+        self.message_deduplication_id = message_deduplication_id
         self.dropped_oversized = 0  # events too large to ever fit one message
         self.failed = 0  # entries still failing after the retry bound
 
@@ -52,15 +113,51 @@ class SQSSink:
 
     # -- internals ----------------------------------------------------------------------
 
-    def _chunks(self, batch: list[dict[str, object]]) -> list[list[str]]:
-        """Split ``batch`` into sends of ≤ ``MAX_BATCH`` bodies and ≤ ``MAX_BYTES`` each.
+    def _group_id(self, event: dict[str, object]) -> str:
+        """Resolve one event's ``MessageGroupId`` (SPEC-016 FR-002).
+
+        A constant is used as given; a callable is asked; otherwise the event's own
+        ``trace_id`` groups it. Every route is bounded by :func:`_bounded`, so a caller's
+        callable returning ``""`` cannot put an empty parameter on the wire.
+        """
+        source = self.message_group_id
+        if isinstance(source, str):
+            raw = source
+        elif source is not None:
+            raw = source(event)
+        else:
+            raw = str(event.get("trace_id", ""))
+        return _bounded(raw, DEFAULT_GROUP_ID)
+
+    def _dedup_id(self, event: dict[str, object]) -> str:
+        """Resolve one event's ``MessageDeduplicationId`` (SPEC-016 FR-003).
+
+        Defaults to the event's ``log_id`` — already a per-event UUID, so SQS's five-minute
+        deduplication window can never collapse two genuinely distinct records. The fallback
+        mints a fresh id for the same reason: a shared constant would make unrelated events
+        deduplicate each other.
+        """
+        source = self.message_deduplication_id
+        raw = source(event) if source is not None else str(event.get("log_id", ""))
+        if raw.strip():
+            return _bounded(raw, "")
+        from log_foundry.ids import new_log_id
+
+        return new_log_id()
+
+    def _chunks(self, batch: list[dict[str, object]]) -> list[list[_Prepared]]:
+        """Split ``batch`` into sends of ≤ ``MAX_BATCH`` entries and ≤ ``MAX_BYTES`` each.
 
         Each event is serialized once with ``json.dumps``. An event whose serialized size
         exceeds ``MAX_BYTES`` on its own can never fit a message, so it is dropped with a
-        counted warning (FR-004) instead of stalling the batch.
+        counted warning (FR-004) instead of stalling the batch — judged on the body alone, so
+        an event's droppability does not depend on which queue type it is bound for.
+
+        On a FIFO queue the resolved ids are costed alongside the body (SPEC-016 FR-005): they
+        travel in the same request, so leaving them out of the budget could overshoot 256 KB.
         """
-        chunks: list[list[str]] = []
-        current: list[str] = []
+        chunks: list[list[_Prepared]] = []
+        current: list[_Prepared] = []
         current_bytes = 0
         for event in batch:
             body = json.dumps(event)
@@ -72,25 +169,40 @@ class SQSSink:
                     f"{self.MAX_BYTES}-byte SQS message limit\n"
                 )
                 continue
+            group_id: str | None = None
+            dedup_id: str | None = None
+            if self.fifo:
+                group_id = self._group_id(event)
+                dedup_id = self._dedup_id(event)
+                size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if current and (
                 len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
             ):
                 chunks.append(current)
                 current = []
                 current_bytes = 0
-            current.append(body)
+            current.append(_Prepared(body, group_id, dedup_id))
             current_bytes += size
         if current:
             chunks.append(current)
         return chunks
 
-    def _send(self, bodies: list[str]) -> None:
+    def _send(self, prepared: list[_Prepared]) -> None:
         """Send one valid chunk, retrying only the ``Failed`` entries with a bounded count.
 
         Successfully-sent entries are never re-sent; entries still failing past ``max_retries``
-        are counted (``failed``) and logged, not silently dropped (FR-003).
+        are counted (``failed``) and logged, not silently dropped (FR-003). The FIFO parameters
+        are attached only when the queue is FIFO, so a standard queue's entries are exactly
+        ``Id`` + ``MessageBody`` (SPEC-016 FR-004).
         """
-        entries = [{"Id": str(i), "MessageBody": body} for i, body in enumerate(bodies)]
+        entries: list[dict[str, str]] = []
+        for i, item in enumerate(prepared):
+            entry = {"Id": str(i), "MessageBody": item.body}
+            if item.group_id is not None:
+                entry["MessageGroupId"] = item.group_id
+            if item.dedup_id is not None:
+                entry["MessageDeduplicationId"] = item.dedup_id
+            entries.append(entry)
         for attempt in range(self.max_retries + 1):
             response = self.client.send_message_batch(QueueUrl=self.queue_url, Entries=entries)
             failed = response.get("Failed", [])
