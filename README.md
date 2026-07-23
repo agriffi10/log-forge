@@ -476,7 +476,7 @@ limits, retries partial failures, and drops any single event too large to ever f
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages |
+| `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3, fifo=None, message_group_id=None, message_deduplication_id=None)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages. Standard **and** FIFO queues |
 | `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3)` |
 | `KinesisSink` | `log_foundry.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
 | `FirehoseSink` | `log_foundry.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
@@ -488,6 +488,51 @@ lf.configure(service="payments",
 ```
 
 Consuming from the buffer and indexing into ELK is a separate component, outside this library.
+
+`SQSSink` does not retry a message SQS rejects as a **sender fault** — the retry would re-send it
+byte-identical, so it can only fail the same way. Those are counted on `.failed` immediately and
+the SQS error code is named on stderr. Throttles and internal errors are still retried up to
+`max_retries`.
+
+##### FIFO queues
+
+A queue URL ending in `.fifo` switches `SQSSink` into FIFO mode automatically — AWS requires the
+suffix on every FIFO queue, so nothing needs configuring:
+
+```python
+SQSSink(queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/logs.fifo")
+```
+
+Each message then carries a **`MessageGroupId`**, which defaults to the event's own `trace_id`.
+SQS guarantees ordering *within* a group, and a trace is exactly the unit whose events should stay
+ordered — while separate traces land in separate groups, so the queue delivers them in parallel
+instead of serializing your whole process behind one group. (`KinesisSink` partitions on `trace_id`
+by default for the same reason.) The **`MessageDeduplicationId`** defaults to the event's `log_id`,
+already a per-event UUID, so SQS's five-minute deduplication window never collapses two distinct
+records.
+
+Override the group with a constant or a callable:
+
+```python
+# One group for the whole process — strict global ordering, capped at ~300 msg/s.
+SQSSink(queue_url=FIFO_URL, message_group_id="payments")
+
+# Group by anything on the event. Baggage lands in `fields`, so this groups by tenant
+# and falls back to per-trace when unset:
+SQSSink(queue_url=FIFO_URL,
+        message_group_id=lambda e: str(e["fields"].get("tenant_id") or e["trace_id"]))
+```
+
+Pass `fifo=True` or `fifo=False` to override the URL-based detection. Standard queues are entirely
+unaffected — their messages carry neither parameter.
+
+Two things worth knowing:
+
+- **Ordering is best-effort across a retry.** If one message fails and a same-group message ahead
+  of it succeeded, the retry lands after it. Holding a whole group back on a single failure would
+  trade log delivery for ordering you can rebuild from `timestamp`, so the sink doesn't.
+- **FIFO queues cap throughput** at 300 messages/second (3,000 with batching), or higher in
+  high-throughput mode. That's queue-side configuration, not something the library sets.
 
 #### Queue & stream
 
