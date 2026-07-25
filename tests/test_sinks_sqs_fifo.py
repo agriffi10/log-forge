@@ -270,8 +270,8 @@ def test_no_fifo_request_exceeds_the_byte_limit() -> None:
         assert billed <= SQSSink.MAX_BYTES
 
 
-def test_oversized_drop_is_judged_on_body_alone_for_both_queue_types() -> None:
-    # An event's droppability must not depend on which queue type it is bound for.
+def test_oversized_drop_is_judged_on_everything_that_travels() -> None:
+    # A body over the limit on its own is undeliverable on either queue type.
     big = _sized_event(SQSSink.MAX_BYTES + 1, "a" * 32, "log-1")
 
     std = SQSSink(STD_URL, client=RecordingClient())
@@ -280,6 +280,45 @@ def test_oversized_drop_is_judged_on_body_alone_for_both_queue_types() -> None:
     fifo.emit([big, _event()])
 
     assert std.dropped_oversized == fifo.dropped_oversized == 1
+
+
+def test_fifo_narrow_band_event_is_dropped_not_shipped_over_budget() -> None:
+    # A body at exactly the limit fits a standard message, but not once the FIFO ids that
+    # travel with it are added. Dropping it labels the loss; shipping it would earn a
+    # SenderFault, which FR-006 never retries — losing the event as an opaque failure.
+    event = _sized_event(SQSSink.MAX_BYTES, "a" * 32, "b" * 36)
+
+    std_client = RecordingClient()
+    std = SQSSink(STD_URL, client=std_client)
+    std.emit([event])
+    assert std.dropped_oversized == 0, "standard queue: the body alone fits"
+    assert len(std_client.calls) == 1
+
+    fifo_client = RecordingClient()
+    fifo = SQSSink(FIFO_URL, client=fifo_client)
+    fifo.emit([event])
+    assert fifo.dropped_oversized == 1, "FIFO: body + ids exceed the limit, so it is dropped"
+    assert fifo_client.calls == [], "nothing is sent"
+
+
+def test_no_fifo_request_exceeds_the_limit_with_a_narrow_band_event_mixed_in() -> None:
+    # The budget invariant must hold for a batch that mixes ordinary and near-limit events.
+    events = [
+        _event(log_id="small-1"),
+        _sized_event(SQSSink.MAX_BYTES, "a" * 32, "b" * 36),
+        _event(log_id="small-2"),
+    ]
+    client = RecordingClient()
+    SQSSink(FIFO_URL, client=client).emit(events)
+
+    for call in client.calls:
+        billed = sum(
+            len(e["MessageBody"].encode())
+            + len(e["MessageGroupId"].encode())
+            + len(e["MessageDeduplicationId"].encode())
+            for e in call
+        )
+        assert billed <= SQSSink.MAX_BYTES
 
 
 # -- FR-006: sender-fault entries are not retried ---------------------------------------

@@ -148,13 +148,16 @@ class SQSSink:
     def _chunks(self, batch: list[dict[str, object]]) -> list[list[_Prepared]]:
         """Split ``batch`` into sends of ≤ ``MAX_BATCH`` entries and ≤ ``MAX_BYTES`` each.
 
-        Each event is serialized once with ``json.dumps``. An event whose serialized size
-        exceeds ``MAX_BYTES`` on its own can never fit a message, so it is dropped with a
-        counted warning (FR-004) instead of stalling the batch — judged on the body alone, so
-        an event's droppability does not depend on which queue type it is bound for.
+        Each event is serialized once with ``json.dumps``, and on a FIFO queue its ids are
+        resolved once here too (SPEC-016 FR-005) — they travel in the same request, so both the
+        running budget and the single-entry check below cost them alongside the body.
 
-        On a FIFO queue the resolved ids are costed alongside the body (SPEC-016 FR-005): they
-        travel in the same request, so leaving them out of the budget could overshoot 256 KB.
+        An entry whose costed size exceeds ``MAX_BYTES`` can never fit a message, so it is
+        dropped with a counted warning (FR-004) instead of stalling the batch. The check is made
+        on everything that travels, not the body alone: a body just under the limit plus up to
+        256 bytes of FIFO ids would otherwise pass, then ship as a lone over-budget request that
+        SQS rejects as a sender fault — which FR-006 (rightly) never retries, losing the event
+        as an opaque failure instead of a labelled oversize drop.
         """
         chunks: list[list[_Prepared]] = []
         current: list[_Prepared] = []
@@ -162,6 +165,12 @@ class SQSSink:
         for event in batch:
             body = json.dumps(event)
             size = len(body.encode("utf-8"))
+            group_id: str | None = None
+            dedup_id: str | None = None
+            if self.fifo:
+                group_id = self._group_id(event)
+                dedup_id = self._dedup_id(event)
+                size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if size > self.MAX_BYTES:
                 self.dropped_oversized += 1
                 sys.stderr.write(
@@ -169,12 +178,6 @@ class SQSSink:
                     f"{self.MAX_BYTES}-byte SQS message limit\n"
                 )
                 continue
-            group_id: str | None = None
-            dedup_id: str | None = None
-            if self.fifo:
-                group_id = self._group_id(event)
-                dedup_id = self._dedup_id(event)
-                size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if current and (
                 len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
             ):
