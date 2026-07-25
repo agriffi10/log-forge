@@ -575,8 +575,10 @@ You don't build these now, but the code above is shaped so they drop in cleanly:
 
 - **Sampling (arch §10):** add `should_send(span_summary) -> bool` and call it in
   `_close_span` before `_flush`. Default `True` = "send everything" (the current decision).
-  Because the span is complete at that point, a future tail-sampling policy ("keep errors +
-  slow calls") has `status` and `duration_ms` available with no pipeline change.
+  Because the span is complete at that point, a **per-span** policy ("keep errors + slow
+  calls") has `status` and `duration_ms` available with no pipeline change. This is *not*
+  tail sampling: spans flush independently and the worker never groups by `trace_id`, so a
+  naive per-span policy emits broken traces (kept parent, dropped child). See arch §10.
 - **Follows-from relationships (arch §3.2):** `_open_span` could accept a `link=` for
   causal-but-non-blocking work; it would keep the parent's `trace_id` but record the link
   differently. The ID model already supports it.
