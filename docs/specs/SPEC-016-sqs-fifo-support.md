@@ -152,8 +152,13 @@ parameters per entry, which must not push a request over the limit.
       `MessageDeduplicationId` lengths alongside its body.
 - [ ] A batch of bodies that fits one standard-queue request but exceeds 256 KB once FIFO
       parameters are added is split into more than one `send_message_batch` call.
-- [ ] The oversized-single-event drop (SPEC-005 FR-004) still triggers on body size alone, so an
-      event's droppability does not depend on which queue type it is bound for.
+- [ ] The oversized-single-event drop (SPEC-005 FR-004) is judged on everything that travels in
+      the entry — body plus, on FIFO, the resolved ids. *(Revised post-delivery: this criterion
+      originally required the drop to trigger on body size alone "so droppability does not depend
+      on queue type", which contradicted this FR's own description in a narrow band. A body just
+      under 256 KB passed the body-alone check, then shipped as a lone request over the limit. SQS
+      rejects that as a sender fault, which FR-006 never retries — so the event was lost anyway,
+      as an opaque `failed` rather than a labelled `dropped_oversized`.)*
 
 ### FR-006: Sender-fault entries are not retried
 
