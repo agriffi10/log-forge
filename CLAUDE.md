@@ -119,8 +119,9 @@ next initiative needs a new spec.
   app never blocks on sink I/O; graceful drain on `atexit`/`shutdown()`. (arch §9)
 - **The sink is a durable buffer, not the final store** — ship to SQS (absorbs spikes/outages), a
   separate consumer indexes into ELK. `StdoutSink` is the zero-dep default. (arch §8, §9.1)
-- **Logs-only, send everything for now** — no metrics/OTel-native traces; sampling deferred but a
-  `should_send` seam is reserved (tail-sampling-ready). (arch §10, §13)
+- **Logs-only, send everything for now** — no metrics/OTel-native traces; sampling is deferred and
+  **unbuilt** — no `should_send` exists in code, and the per-span flush makes the pipeline
+  span-outcome-ready, *not* tail-sampling-ready. (arch §10, §13)
 - **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases,
   merges to `main` publish `.devN` pre-releases. (SPEC-012)
 - **Two drains, deliberately distinct** — `shutdown()` is terminal (stops the worker, closes the

@@ -316,17 +316,30 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
 
 *(Decision: send everything for now.)* Every span's queue is flushed unconditionally.
 
-But the architecture is deliberately **tail-sampling-ready**: because we buffer the
-whole queue and decide to send only at span end, we already know `status` and
-`duration_ms` at decision time. We reserve a single seam for this:
+Sampling is deferred **in prose only — nothing is reserved in code.** There is no
+`should_send` stub, `Protocol`, or config knob today. The shape a future hook would take:
 
 ```python
 def should_send(span_summary) -> bool: ...   # default: always True
 ```
 
-A future tail-sampling policy ("always keep errors + slow calls, sample the rest")
-plugs in here with no change to the rest of the pipeline. The hook should be
-**loadable from configuration**, so sampling policy can change without a code redeploy.
+Its natural call site is `_close_span`, immediately before `_flush`, where this span's
+`status` and `duration_ms` are already known. The hook should be **loadable from
+configuration**, so policy can change without a code redeploy.
+
+**Scope limit — that is span-outcome sampling, not tail sampling.** Tail sampling decides
+per *trace*, once the trace completes. This pipeline cannot do that today:
+
+- the buffer unit is a single span (`Span.events`), not a trace;
+- each span flushes at its own close, so children are already emitted before the root
+  learns its outcome;
+- the worker is deliberately type-erased (`Queue[object]`) and never groups by `trace_id`;
+- nothing signals trace completion — `pop_span` is a bare contextvar reset.
+
+Real tail sampling would need a trace-scoped buffer and a root-completion signal — a
+redesign of §9, not a hook. A per-span policy ("keep errors and slow calls") does plug in
+at the call site above, but applied naively it emits structurally broken traces (kept
+parent, dropped child), since siblings decide independently.
 
 ---
 
@@ -418,7 +431,7 @@ def write_ledger(user_id: int):
 |------------------------|----------------------------|
 | Structured vs unstructured | JSON with named fields, always (§6). |
 | Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3), continued across processes via W3C `traceparent` + `baggage` (SPEC-014). |
-| Head vs tail sampling | Buffer-then-flush makes us tail-sampling-ready; seam reserved (§10). |
+| Head vs tail sampling | Neither is built. Span-outcome sampling has a natural call site; true tail sampling needs a trace-scoped buffer we don't have (§10). |
 | Cardinality explosion | High-cardinality fields allowed in logs; never auto-promoted to metric labels (§6). |
 | One event, three views | Logs-only today, but trace_id/span_id make traces derivable later (§13). |
 | Symptom vs cause alerting | We stamp `duration_ms` / `status` / `error.type` — the fields alerts key off (§6). |
