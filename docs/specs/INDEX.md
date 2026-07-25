@@ -21,6 +21,7 @@ to status only — no prose.
 | [SPEC-014](SPEC-014-cross-process-trace-continuation.md) | Cross-Process Trace Continuation (W3C `traceparent` + baggage) | Completed | SPEC-001, SPEC-002, SPEC-013 |
 | [SPEC-015](SPEC-015-baggage-on-boundary-events.md) | Baggage on Boundary Events | Completed | SPEC-002, SPEC-014 |
 | [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Completed | SPEC-005 |
+| [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Draft | SPEC-001, SPEC-004, SPEC-006 |
 
 ## Arcs (build order)
 
@@ -44,3 +45,8 @@ Group related specs and record the order to build them in. Delete this section i
   publish, `continue_trace()` to adopt — because a context nobody can read is a context nobody can
   propagate. Build **after** SPEC-013: 013 is what makes the library usable in the multi-process
   environment 014 exists to correlate.
+- **Robustness:** SPEC-017 — standalone, and the first spec driven by an audit rather than a missing
+  feature. Every item is a case where the library breaks its own stated promise (logging never breaks
+  the app; a broken destination degrades logging and nothing more): an unserializable field raises
+  into the caller, an unbounded value gets a whole event discarded downstream, and an all-children-down
+  `MultiSink` reports success so the retry never runs. Buildable at any point; nothing depends on it.
