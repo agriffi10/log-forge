@@ -54,7 +54,9 @@ class LogstashSink:
         if self._http is not None:
             self._http.emit(batch)
         else:
-            assert self._socket is not None
+            # Narrowing for mypy, not a runtime check: __init__ guarantees exactly one of
+            # _http/_socket is set, and the branch above covers the other.
+            assert self._socket is not None  # noqa: S101
             frames = [(json.dumps(event) + "\n").encode("utf-8") for event in batch]
             self._socket.send_all(frames)
 

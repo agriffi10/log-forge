@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Any
 
-__all__ = ["RedisStreamsSink", "RedisListSink"]
+__all__ = ["RedisListSink", "RedisStreamsSink"]
 
 _BACKOFF_BASE = 0.1
 

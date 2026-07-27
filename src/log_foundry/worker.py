@@ -23,9 +23,10 @@ import queue
 import sys
 import threading
 import time
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
-from log_foundry.sinks.base import Sink
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import Sink
 
 __all__ = ["Health", "Worker"]
 
@@ -125,7 +126,7 @@ class Worker:
                     sys.stderr.write(
                         f"log-foundry: log queue full, dropped {total} submission(s) so far\n"
                     )
-                except Exception:  # noqa: BLE001 — submit() runs on the *caller's* thread, so an
+                except Exception:  # submit() runs on the *caller's* thread, so an
                     # unwritable stderr (closed fd, broken pipe, daemonized process) would raise
                     # straight into the app. A diagnostic about dropped logs must never itself be
                     # the reason a decorated function fails. The counter is already recorded.
@@ -267,7 +268,7 @@ class Worker:
             try:
                 self.sink.emit(batch)
                 return
-            except Exception:  # noqa: BLE001 — any sink failure must not kill the worker thread
+            except Exception:  # any sink failure must not kill the worker thread
                 if attempt >= self.max_retries:
                     # Under the lock so a concurrent health() sees a coherent snapshot rather
                     # than a half-updated pair. No deadlock: shutdown() releases before join().

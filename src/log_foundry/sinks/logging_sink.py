@@ -96,7 +96,7 @@ class LoggingSink:
         fields = event.get("fields")
         if isinstance(fields, dict):
             # Nested payload is lossless even when a flat key collides and is skipped below.
-            setattr(record, "fields", fields)
+            record.fields = fields
             for key, value in fields.items():
                 # Skip reserved LogRecord attrs, identity keys, and "fields": the sink owns
                 # record.fields (the nested payload); a field named "fields" must not overwrite it.

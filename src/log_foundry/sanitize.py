@@ -137,7 +137,7 @@ class _Coercer:
         """Coerce one node. Total — never raises, whatever the value does."""
         try:
             return self._dispatch(value, depth)
-        except Exception:  # noqa: BLE001 — a hostile __iter__/__str__/__eq__ must not reach the
+        except Exception:  # a hostile __iter__/__str__/__eq__ must not reach the
             return self._placeholder(value)  # caller's stack; this is the whole point (FR-001).
 
     def _dispatch(self, value: object, depth: int) -> object:
@@ -246,7 +246,7 @@ class _Coercer:
         """Name the type that could not be coerced, without disclosing the value."""
         try:
             name = type(value).__name__
-        except Exception:  # noqa: BLE001 — a pathological metaclass is still not our problem.
+        except Exception:  # a pathological metaclass is still not our problem.
             name = "?"
         return f"<unserializable: {name}>"
 
@@ -277,7 +277,7 @@ def sanitize_fields(
         # would replace every field value with ``<depth limit>`` and emit a uniformly empty event,
         # which is exactly what FR-006's validation exists to prevent.
         result = coercer.mapping(fields, -1)
-    except Exception:  # noqa: BLE001 — belt and braces: `_Coercer.value` is already total, but
+    except Exception:  # belt and braces: `_Coercer.value` is already total, but
         return {}, True  # a hostile top-level mapping must not reach the caller either.
     if not isinstance(result, dict):
         # ``fields`` was itself circular — impossible from ``build_event``, which always passes a

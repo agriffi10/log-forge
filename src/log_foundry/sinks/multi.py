@@ -17,8 +17,10 @@ has nothing to retry.
 from __future__ import annotations
 
 import sys
+from typing import TYPE_CHECKING
 
-from log_foundry.sinks.base import Sink
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import Sink
 
 __all__ = ["MultiSink"]
 

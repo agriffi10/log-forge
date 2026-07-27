@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from log_foundry.sanitize import sanitize_fields, truncate_str, truncate_tail
@@ -19,7 +19,7 @@ from log_foundry.sanitize import sanitize_fields, truncate_str, truncate_tail
 if TYPE_CHECKING:
     from log_foundry.config import Config
 
-__all__ = ["Span", "build_event", "start_event", "end_event", "backfill_baggage"]
+__all__ = ["Span", "backfill_baggage", "build_event", "end_event", "start_event"]
 
 # Auto-generated span-boundary event messages. Tests assert on contract fields
 # (``status``, ``trace_id``), never on this text — rename freely.
@@ -52,7 +52,7 @@ class Span:
 
 def _iso_now() -> str:
     """Return the current UTC time as ISO-8601 with millisecond precision and a 'Z'."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 1000:03d}Z"
 
 
@@ -121,7 +121,7 @@ def _exception_message(exc: BaseException) -> str:
     """
     try:
         return str(exc)
-    except Exception:  # noqa: BLE001 — see above; a hostile __str__ must not escape.
+    except Exception:  # see above; a hostile __str__ must not escape.
         return "<unprintable message>"
 
 
@@ -134,7 +134,7 @@ def _exception_stack(exc: BaseException) -> str:
     """
     try:
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    except Exception:  # noqa: BLE001 — same reasoning as _exception_message.
+    except Exception:  # same reasoning as _exception_message.
         return f"<unformattable traceback: {type(exc).__name__}>"
 
 

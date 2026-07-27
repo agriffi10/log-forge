@@ -62,7 +62,11 @@ exclude = [
 pytest = "^9.0"
 pytest-asyncio = "^1.4.0"        # for testing async @trace (guide Phase 8)
 pytest-cov = "^7.1.0"
-ruff = "^0.5"
+# Bounded to a minor, not left open. Ruff's DEFAULT rule set is not stable across minors —
+# 0.16.0 widened it from 59 rules to 413 — so an open constraint lets a release change what
+# CI enforces. `[tool.ruff.lint] select` below is the other half: the bound makes the change
+# deliberate, the select makes the set ours.
+ruff = ">=0.16,<0.17"
 mypy = "^1.10"
 
 
@@ -90,6 +94,65 @@ src = ["src", "tests"]
 line-length = 100
 # Deliberately no `target-version`: ruff infers it from `requires-python`, so the two can never
 # drift. If one is ever added it must match the floor above.
+
+[tool.ruff.lint]
+# THE RULE SET IS CHOSEN HERE, NOT INHERITED. Ruff's default set is not a stable contract:
+# 0.16.0 widened it from 59 rules to 413. Selecting explicitly means a ruff release can add
+# rules *inside* a family we asked for, but cannot decide which families CI enforces. The
+# `>=0.16,<0.17` bound on the dev dependency is the other half of that.
+select = [
+    "F",                    # pyflakes
+    "E4", "E7", "E9",       # pycodestyle errors. NOT E5: `line-length` above is advisory
+                            # today (it feeds `ruff format`, which this repo does not run) and
+                            # 52 lines in src+tests exceed it. Enforcing it is 52 reflows and
+                            # its own decision.
+    "W",
+    "I",                    # import sorting
+    "B",                    # bugbear
+    "UP",                   # pyupgrade — the floor is 3.12, keep the syntax current
+    "SIM", "C4", "PIE", "RET", "FURB", "PERF",
+    "RUF",
+    "S",                    # bandit
+    "BLE", "TRY",           # exception hygiene — the decorator's contract is about exceptions
+    "LOG", "G",
+    "DTZ",                  # naive datetimes: this library stamps every event's timestamp
+    "ASYNC",                # @trace is async-aware (SPEC-003)
+    "PYI", "YTT", "FLY", "INT", "TC", "FA", "PGH", "EXE", "ISC",
+]
+
+# Each entry is a decision with its reason, not a backlog.
+ignore = [
+    "BLE001",   # THE central one. `except Exception` in a sink is the architecture, not a
+                # slip: a broken destination must degrade logging and nothing more, and the
+                # decorator must never raise into the caller (arch §4). Eleven of these, all
+                # in sinks/ and worker.py, all load-bearing.
+    "TRY003",   # messages are written at the raise site; a class per message would add names
+                # nothing reads.
+    "TRY300",   # "return in else" reads worse than the early return this code uses.
+    "TRY400",   # this library IS the logger; it writes to stderr deliberately, and
+                # logger.exception is not available to it.
+    "S110",     # try/except/pass is the shape of "logging must never break the caller"
+                # (arch §4). Every occurrence carries a written reason.
+    "SIM105",   # same sites as S110: contextlib.suppress would hide the written reason
+                # behind an import.
+    "PERF203",  # try/except inside a loop is deliberate in the worker's drain: one bad batch
+                # must not abort the rest.
+    "S608",     # postgres.py and sqlite.py build INSERTs around a table name they validate
+                # themselves; the values are always parameterised.
+    "UP047",    # PEP 695 `def f[T](...)`. Valid on the 3.12 floor, but rewriting the public
+                # `@trace` decorator's generics is a change to the signature users read, and
+                # the TypeVar form is not deprecated. Its own PR if ever.
+    "RUF002", "RUF003",  # ambiguous-unicode in docstrings/comments: this codebase writes
+                # –, ×, → and — on purpose.
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Asserts are the test framework; the rest are fixtures that only look like secrets, naive
+# datetimes under test on purpose, and raises inside a `try` that IS the thing under test.
+"tests/**/*.py" = ["S101", "S106", "DTZ001", "TRY301"]
+# FileSink and RotatingFileSink hold a handle open ACROSS calls by design — that is what makes
+# them a sink rather than a per-event open(). A context manager would close it after one emit.
+"src/log_foundry/sinks/file.py" = ["SIM115"]
 
 [tool.mypy]
 files = ["src"]

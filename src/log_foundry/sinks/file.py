@@ -147,9 +147,7 @@ class RotatingFileSink:
             and self._size + incoming > self._max_bytes
         ):
             return True
-        if self._next_rollover is not None and time.time() >= self._next_rollover:
-            return True
-        return False
+        return self._next_rollover is not None and time.time() >= self._next_rollover
 
     def _rotate(self) -> None:
         """Close the active file, shift/prune numbered backups, and open a fresh active file."""

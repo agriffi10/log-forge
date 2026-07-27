@@ -17,13 +17,13 @@ import os
 import uuid
 
 __all__ = [
-    "new_trace_id",
-    "new_span_id",
-    "new_log_id",
-    "parse_traceparent",
     "format_traceparent",
-    "is_valid_trace_id",
     "is_valid_span_id",
+    "is_valid_trace_id",
+    "new_log_id",
+    "new_span_id",
+    "new_trace_id",
+    "parse_traceparent",
 ]
 
 _HEX = frozenset("0123456789abcdef")
@@ -91,7 +91,7 @@ def parse_traceparent(value: object) -> tuple[str, str] | None:
     version, trace_id, span_id, flags = parts[0], parts[1], parts[2], parts[3]
     if not _is_hex(version, 2) or version == _INVALID_VERSION:
         return None
-    if version == _VERSION:
+    if version == _VERSION:  # noqa: SIM102 - kept nested so the comment below stays attached
         # Version 00 is defined as exactly four fields; a trailing field is malformed, not a
         # forward-compatible extension.
         if len(parts) != 4 or not _is_hex(flags, 2):

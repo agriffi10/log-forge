@@ -20,12 +20,12 @@ from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
 
 __all__ = [
-    "debug",
-    "info",
-    "warning",
-    "error",
     "critical",
+    "debug",
+    "error",
+    "info",
     "set_baggage",
+    "warning",
 ]
 
 # One console writer per process (default stream sys.stderr). Configurable overrides are

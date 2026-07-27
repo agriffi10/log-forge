@@ -88,7 +88,7 @@ def _raised(exc_type, *args):
     """Raise and catch `exc_type(*args)` so the exception carries a real traceback."""
     try:
         raise exc_type(*args)
-    except BaseException as caught:  # noqa: BLE001 — the point is to capture it
+    except BaseException as caught:  # the point is to capture it
         return caught
 
 

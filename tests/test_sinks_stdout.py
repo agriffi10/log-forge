@@ -15,7 +15,7 @@ class _RecordingStream(io.StringIO):
         super().__init__()
         self.flushes = 0
 
-    def flush(self) -> None:  # noqa: D102
+    def flush(self) -> None:
         self.flushes += 1
         super().flush()
 

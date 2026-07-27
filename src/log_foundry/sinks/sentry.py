@@ -102,7 +102,9 @@ class SentrySink:
         }
 
     def _post_envelope(self, event: dict[str, object]) -> None:
-        assert self._http is not None
+        # Narrowing for mypy, not a runtime check: _http is set in __init__ whenever the
+        # transport path that reaches here is in use.
+        assert self._http is not None  # noqa: S101
         header = {"event_id": uuid.uuid4().hex, "dsn": self._dsn}
         item_header = {"type": "event"}
         body = (
