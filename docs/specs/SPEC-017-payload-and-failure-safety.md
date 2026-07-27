@@ -134,8 +134,11 @@ No single value may be unbounded. Four ceilings, all configurable (FR-006), appl
 - `max_value_bytes` (default `8192`) — any `str` value, measured in UTF-8 bytes.
 - `max_stack_bytes` (default `32768`) — `error.stack` only, which is legitimately long and is the
   field most worth keeping.
-- `max_keys` (default `256`) — per mapping; excess keys are dropped in iteration order.
-- `max_depth` (default `8`) — nesting levels; deeper structures are replaced.
+- `max_keys` (default `256`) — per mapping *and* per sequence; excess entries are dropped in
+  iteration order.
+- `max_depth` (default `8`) — nesting levels; deeper structures are replaced. The `fields` mapping
+  is the payload container rather than a level the caller chose, so its values sit at depth 0 and
+  the smallest legal setting still emits scalar fields instead of an empty event.
 
 Truncation of a `str` cuts on a UTF-8 character boundary (never splitting a multi-byte sequence) and
 marks the result with `…[truncated]`. **The marker is inside the budget, not added to it** — a
@@ -144,9 +147,11 @@ rely on the ceiling being one. `error.stack` is truncated by **keeping its tail*
 `traceback.format_exception` puts the exception type and the innermost frames last — the head of an
 over-long traceback is the least useful part of it. Every other value keeps its head.
 
-`message` is bounded by `max_value_bytes` like any other string. It is a base field, but unlike the
-other eleven it is caller-supplied free text, and exempting it would leave `info(huge_string)`
-unbounded — the exact hole this FR exists to close.
+`message` and `function` are bounded by `max_value_bytes` like any other string. They are base
+fields, but unlike the other ten both are caller-supplied: `message` directly, and `function` via
+`@trace(name=...)` or — on the orphan path, where a standalone span is named after the message
+itself — from that same string. Exempting either would leave `info(huge_string)` unbounded, which
+is the exact hole this FR exists to close.
 
 Any event to which a ceiling was applied carries top-level `truncated: true`, so a consumer can tell
 a complete payload from a clipped one, and an operator can find clipping without diffing sizes.
@@ -170,9 +175,9 @@ a complete payload from a clipped one, and an operator can find clipping without
       (absent, not `false`).
 - [ ] `truncated: true` is set by the four ceilings **only** — never by `<circular>` or
       `<unserializable: …>`, which are coercion outcomes rather than clipping.
-- [ ] The 11 library-generated base fields (`timestamp`, `trace_id`, `span_id`, … ) are never
-      truncated, and `truncated: true` never displaces one. `message` is caller-supplied and *is*
-      bounded (see above).
+- [ ] The 10 library-generated base fields (`timestamp`, `trace_id`, `span_id`, … ) are never
+      truncated, and `truncated: true` never displaces one. `message` and `function` are
+      caller-supplied and *are* bounded (see above).
 
 ### FR-003: The exception message is a queryable field
 

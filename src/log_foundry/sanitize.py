@@ -254,8 +254,9 @@ class _Coercer:
 def coerce(value: object, *, cfg: Config) -> object:
     """Return a JSON-serializable, size-bounded equivalent of ``value``. Never raises.
 
-    Use :func:`sanitize_fields` for a whole event mapping — it reports whether a ceiling fired,
-    which this cannot.
+    ``value`` is treated as a field value, i.e. depth 0 — the same level it would occupy inside
+    an event's ``fields``. Use :func:`sanitize_fields` for a whole event mapping; it reports
+    whether a ceiling fired, which this cannot.
     """
     return _Coercer(cfg).value(value, 0)
 
@@ -271,7 +272,11 @@ def sanitize_fields(
     """
     coercer = _Coercer(cfg)
     try:
-        result = coercer.mapping(fields, 0)
+        # ``-1`` so the *values* of the top-level mapping sit at depth 0: ``fields`` is the event's
+        # payload container, not a level of nesting the caller chose. Otherwise ``max_depth=1``
+        # would replace every field value with ``<depth limit>`` and emit a uniformly empty event,
+        # which is exactly what FR-006's validation exists to prevent.
+        result = coercer.mapping(fields, -1)
     except Exception:  # noqa: BLE001 — belt and braces: `_Coercer.value` is already total, but
         return {}, True  # a hostile top-level mapping must not reach the caller either.
     if not isinstance(result, dict):

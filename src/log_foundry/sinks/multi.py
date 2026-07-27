@@ -27,7 +27,11 @@ class MultiSink:
     """A :class:`~log_foundry.sinks.base.Sink` that forwards each batch to every child sink.
 
     Attributes:
-        failed: Count of child ``emit``/``close`` calls that raised and were isolated.
+        failed: Count of child ``emit``/``close`` **calls** that raised. Note this counts calls,
+            not batches: since total failure re-raises (SPEC-017 FR-004), the worker retries the
+            same batch, so one batch against an all-down fan-out of *n* children increments this
+            by *n* per attempt — ``n * (max_retries + 1)`` in total, with a stderr line each.
+            That is the visible cost of the loss no longer being silent.
     """
 
     def __init__(self, *sinks: Sink) -> None:

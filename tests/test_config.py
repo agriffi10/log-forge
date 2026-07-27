@@ -72,3 +72,41 @@ def test_a_rejected_call_leaves_the_config_untouched() -> None:
     with pytest.raises(ValueError):
         config.configure(service="after", max_keys=0)
     assert config.get_config().service == "before"
+
+
+def test_max_keys_configured_through_configure_takes_effect() -> None:
+    model = pytest.importorskip("log_foundry.model")
+    config.configure(max_keys=2)
+    span = model.Span(
+        trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
+    )
+    event = model.build_event(
+        span, "INFO", "m", fields={str(i): i for i in range(10)}, baggage={}
+    )
+    assert len(event["fields"]) == 2
+    assert event["truncated"] is True
+
+
+def test_max_depth_configured_through_configure_takes_effect() -> None:
+    model = pytest.importorskip("log_foundry.model")
+    config.configure(max_depth=2)
+    span = model.Span(
+        trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
+    )
+    event = model.build_event(
+        span, "INFO", "m", fields={"a": {"b": {"c": {"d": 1}}}}, baggage={}
+    )
+    assert "<depth limit>" in str(event["fields"])
+    assert event["truncated"] is True
+
+
+def test_max_depth_of_one_still_keeps_scalar_field_values() -> None:
+    """`fields` is the payload container, not a nesting level the caller chose — so the
+    smallest legal max_depth must still emit scalar values rather than an empty event."""
+    model = pytest.importorskip("log_foundry.model")
+    config.configure(max_depth=1)
+    span = model.Span(
+        trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
+    )
+    event = model.build_event(span, "INFO", "m", fields={"a": 1, "b": "two"}, baggage={})
+    assert event["fields"] == {"a": 1, "b": "two"}

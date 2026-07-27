@@ -70,8 +70,13 @@ def build_event(
     → per-call ``fields`` (arch §5.1). Later sources win on a key conflict.
 
     The merged mapping is coerced and size-bounded here (SPEC-017 FR-001/FR-002), which is what
-    makes every sink's bare ``json.dumps`` safe without any of them changing. ``message`` is
-    bounded too: it is a base field, but unlike the other eleven it is caller-supplied free text.
+    makes every sink's bare ``json.dumps`` safe without any of them changing.
+
+    ``message`` and ``function`` are bounded too. They are base fields, but unlike the other ten
+    both are caller-supplied text: ``message`` directly, and ``function`` via ``@trace(name=...)``
+    or — on the orphan path, where ``api`` names the standalone span after the message itself —
+    from the same unbounded string. Leaving either out would keep ``info(huge_string)`` unbounded,
+    which is the hole this ceiling exists to close.
     """
     from log_foundry.config import get_config
     from log_foundry.ids import new_log_id
@@ -80,6 +85,7 @@ def build_event(
     merged: dict[str, object] = {**cfg.defaults, **span.defaults, **baggage, **fields}
     safe, clipped = sanitize_fields(merged, cfg=cfg)
     bounded_message, message_clipped = truncate_str(message, cfg.max_value_bytes)
+    bounded_function, function_clipped = truncate_str(span.name, cfg.max_value_bytes)
     event: dict[str, object] = {
         "timestamp": _iso_now(),
         "level": level,
@@ -88,13 +94,13 @@ def build_event(
         "span_id": span.span_id,
         "parent_span_id": span.parent_span_id,
         "log_id": new_log_id(),
-        "function": span.name,
+        "function": bounded_function,
         "service": cfg.service,
         "version": cfg.version,
         "env": cfg.env,
     }
     # Before ``fields`` so it reads ahead of the payload blob in a rendered log line.
-    if clipped or message_clipped:
+    if clipped or message_clipped or function_clipped:
         event[_TRUNCATED] = True
     event["fields"] = safe
     return event

@@ -671,3 +671,31 @@ def test_overflow_warning_is_throttled(capsys) -> None:
     finally:
         sink.release.set()
         w.shutdown()
+
+
+def test_overflow_warning_never_raises_into_the_caller(monkeypatch) -> None:
+    """submit() runs on the *caller's* thread — an unwritable stderr must not reach the app.
+
+    Regression: the FR-005 warning was added unguarded, which reintroduced exactly the
+    raise-into-the-caller failure FR-001 exists to remove.
+    """
+    import io
+
+    class BrokenStderr(io.TextIOBase):
+        def write(self, s: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("b"))  # fills the queue
+
+        monkeypatch.setattr("sys.stderr", BrokenStderr())
+        w.submit(_span("c"))  # full -> first drop -> warns -> stderr raises internally
+
+        assert w.dropped == 1, "the drop is still counted even when the warning cannot be written"
+    finally:
+        sink.release.set()
+        w.shutdown()

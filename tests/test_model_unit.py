@@ -184,3 +184,15 @@ def test_library_generated_base_fields_are_never_truncated() -> None:
 def test_base_field_set_is_unchanged_apart_from_the_optional_marker() -> None:
     event = model.build_event(_span(), "INFO", "m", fields={}, baggage={})
     assert tuple(event) == BASE_FIELDS
+
+
+def test_function_is_bounded_like_message() -> None:
+    """`function` is caller-supplied too — via @trace(name=...) and, on the orphan path, from
+    the message itself — so leaving it out kept info(huge_string) unbounded."""
+    config.configure(max_value_bytes=32)
+    span = model.Span(
+        trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="f" * 500, start_ts=0.0
+    )
+    event = model.build_event(span, "INFO", "m", fields={}, baggage={})
+    assert len(event["function"].encode()) <= 32
+    assert event["truncated"] is True
