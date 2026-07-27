@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.loki import LokiSink
@@ -35,7 +35,7 @@ def test_push_payload_labels_and_ns_timestamp() -> None:
     stream = payload["streams"][0]
     assert stream["stream"] == {"service": "api", "env": "prod", "level": "INFO"}
     ns, line = stream["values"][0]
-    expected_ns = str(int(datetime(2026, 7, 11, tzinfo=timezone.utc).timestamp() * 1_000_000_000))
+    expected_ns = str(int(datetime(2026, 7, 11, tzinfo=UTC).timestamp() * 1_000_000_000))
     assert ns == expected_ns
     assert json.loads(line)["message"] == "hello"
 

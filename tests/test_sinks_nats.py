@@ -9,7 +9,7 @@ from log_foundry.sinks.nats import NATSSink
 
 
 class FakeJetStream:
-    def __init__(self, owner: "FakeNATS") -> None:
+    def __init__(self, owner: FakeNATS) -> None:
         self._owner = owner
 
     async def publish(self, subject, payload) -> None:

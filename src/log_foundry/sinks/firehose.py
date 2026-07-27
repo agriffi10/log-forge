@@ -77,7 +77,9 @@ class FirehoseSink:
             results = response.get("RequestResponses", [])
             records = [
                 record
-                for record, result in zip(records, results)
+                # strict=False states today's behaviour. A short `results` would silently
+                # truncate this retry list — see the note in kinesis.py.
+                for record, result in zip(records, results, strict=False)
                 if result.get("ErrorCode")
             ]
             if not records:

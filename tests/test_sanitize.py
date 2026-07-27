@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import enum
 import json
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from uuid import UUID
 
@@ -51,7 +51,7 @@ def _truncated(value: object, **overrides: int) -> bool:
         (1.5, 1.5),
         (True, True),
         (None, None),
-        (datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), "2026-01-01T12:30:00+00:00"),
+        (datetime(2026, 1, 1, 12, 30, tzinfo=UTC), "2026-01-01T12:30:00+00:00"),
         (date(2026, 1, 1), "2026-01-01"),
         (time(12, 30), "12:30:00"),
         (UUID("12345678-1234-5678-1234-567812345678"), "12345678-1234-5678-1234-567812345678"),
@@ -89,7 +89,7 @@ def test_every_coerced_event_is_json_serializable() -> None:
 
     fields, _ = sanitize_fields(
         {
-            "when": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "when": datetime(2026, 1, 1, tzinfo=UTC),
             "oid": UUID("12345678-1234-5678-1234-567812345678"),
             "amount": Decimal("1.10"),
             "raw": b"\xff\xfe",

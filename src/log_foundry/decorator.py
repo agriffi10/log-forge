@@ -42,7 +42,7 @@ from log_foundry.ids import (
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
 from log_foundry.worker import Health, Worker
 
-__all__ = ["trace", "continue_trace"]
+__all__ = ["continue_trace", "trace"]
 
 # Bound on how much of a rejected inbound value is echoed into a stderr warning.
 _MAX_REJECTED_ECHO = 64
@@ -70,7 +70,7 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
         trace_id, parent_span_id = parent.trace_id, parent.span_id
     else:
         adopted = context.get_adopted_context()
-        trace_id, parent_span_id = adopted if adopted else (new_trace_id(), None)
+        trace_id, parent_span_id = adopted or (new_trace_id(), None)
     span = Span(
         trace_id=trace_id,
         span_id=new_span_id(),
@@ -229,7 +229,7 @@ def _flush_worker(timeout: float | None = 5.0) -> bool:
         return True
     try:
         return worker.flush(timeout)
-    except Exception:  # noqa: BLE001 — a flush is the call most likely to be made in a
+    except Exception:  # a flush is the call most likely to be made in a
         # `finally`, so the library must never be the reason a caller's function fails. Any
         # failure is reported by the return value instead (FR-003).
         return False
@@ -311,7 +311,7 @@ def trace(
                 finally:
                     context.pop_span(token)
 
-            return cast(F, async_wrapper)
+            return cast("F", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -328,6 +328,6 @@ def trace(
             finally:
                 context.pop_span(token)
 
-        return cast(F, wrapper)
+        return cast("F", wrapper)
 
     return decorate(func) if func is not None else decorate

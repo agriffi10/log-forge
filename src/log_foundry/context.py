@@ -24,21 +24,24 @@ if TYPE_CHECKING:
     from log_foundry.model import Span
 
 __all__ = [
-    "current_span",
-    "push_span",
-    "pop_span",
-    "get_baggage",
-    "set_baggage",
-    "current_traceparent",
-    "current_trace_context",
     "current_baggage_header",
+    "current_span",
+    "current_trace_context",
+    "current_traceparent",
+    "get_baggage",
+    "pop_span",
+    "push_span",
+    "set_baggage",
 ]
 
 _span_stack: contextvars.ContextVar[tuple[Span, ...]] = contextvars.ContextVar(
     "log_foundry_span_stack", default=()
 )
 _baggage: contextvars.ContextVar[dict[str, object]] = contextvars.ContextVar(
-    "log_foundry_baggage", default={}
+    "log_foundry_baggage",
+    default={},  # noqa: B039 - the never-mutate rule in this module's docstring is what
+    # makes the shared default safe: `set_baggage` replaces the dict, `get_baggage` is not
+    # exported, and both internal readers treat it read-only.
 )
 # An inbound trace context adopted via ``continue_trace`` (SPEC-014), applied by ``_open_span``
 # to the next *root* span. A ContextVar for the same reason as the two above: it is then correct

@@ -85,7 +85,12 @@ class KinesisSink:
             results = response.get("Records", [])
             records = [
                 record
-                for record, result in zip(records, results)
+                # strict=False states today's behaviour rather than changing it. Note the
+                # latent case it preserves: if `results` came back shorter than `records`
+                # (or empty, via the `.get` default above), zip truncates, `records` empties
+                # and the batch reports success — the silent-loss shape SPEC-017 went after.
+                # Making that raise is a behaviour change, so it belongs in its own spec.
+                for record, result in zip(records, results, strict=False)
                 if result.get("ErrorCode")
             ]
             if not records:

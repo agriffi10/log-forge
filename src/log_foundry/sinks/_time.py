@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
-__all__ = ["epoch_seconds", "epoch_nanos"]
+__all__ = ["epoch_nanos", "epoch_seconds"]
 
 
 def epoch_seconds(timestamp: object) -> float:

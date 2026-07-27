@@ -13,7 +13,7 @@ from typing import TextIO
 
 from log_foundry.sinks.stdout import StdoutSink
 
-__all__ = ["StderrSink", "NullSink", "MemorySink"]
+__all__ = ["MemorySink", "NullSink", "StderrSink"]
 
 
 class StderrSink(StdoutSink):

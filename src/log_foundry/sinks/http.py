@@ -20,7 +20,10 @@ import time
 import urllib.error
 import urllib.request
 from base64 import b64encode
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = ["HTTPSink", "merge_headers"]
 
@@ -109,7 +112,10 @@ class HTTPSink:
         """
         headers, data = self._prepare(body, content_type, extra_headers)
         for attempt in range(self.max_retries + 1):
-            request = urllib.request.Request(
+            # Opening `self.url` is this class's entire purpose. The URL is the application's
+            # own configured endpoint, never inbound data — an app that can set it can already
+            # read its own files.
+            request = urllib.request.Request(  # noqa: S310
                 self.url, data=data, method=self.method, headers=headers
             )
             try:

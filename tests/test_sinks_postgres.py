@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from typing import Self
 
 import pytest
 
@@ -13,10 +14,10 @@ from log_foundry.sinks.postgres import PostgresSink
 
 
 class FakeCursor:
-    def __init__(self, owner: "FakeConnection") -> None:
+    def __init__(self, owner: FakeConnection) -> None:
         self._owner = owner
 
-    def __enter__(self) -> "FakeCursor":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> bool:

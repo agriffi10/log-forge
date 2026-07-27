@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,7 +14,6 @@ from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
-
 
 # --- FR-007: Datadog --------------------------------------------------------------------
 
@@ -60,7 +59,7 @@ def test_splunk_hec_envelope_auth_and_time() -> None:
     second, _ = decoder.raw_decode(body, index)
     assert first["event"]["message"] == "m"
     assert first["host"] == "h1"
-    assert first["time"] == datetime(2026, 7, 11, tzinfo=timezone.utc).timestamp()
+    assert first["time"] == datetime(2026, 7, 11, tzinfo=UTC).timestamp()
     assert second["event"]["message"] == "n"
 
 

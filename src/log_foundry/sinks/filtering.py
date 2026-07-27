@@ -8,9 +8,12 @@ time; this only reshapes an already-built batch on its way to a sink.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from log_foundry.sinks.base import Sink
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from log_foundry.sinks.base import Sink
 
 __all__ = ["FilteringSink"]
 

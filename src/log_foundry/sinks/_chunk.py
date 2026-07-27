@@ -9,8 +9,10 @@ single request (callers drop oversized items first, counting ``dropped_oversized
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 __all__ = ["chunk_items", "chunk_list", "valid_identifier"]
 
