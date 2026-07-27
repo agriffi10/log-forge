@@ -99,9 +99,14 @@ a baggage filter; one backfill at span close now completes both.
 **SPEC-016 (FIFO queue support for `SQSSink`) is Completed** — a `.fifo` URL now selects FIFO
 behaviour and every entry carries a `MessageGroupId` (the event's `trace_id` by default,
 configurable) plus a `log_id` dedup id; sender faults are no longer retried.
+**SPEC-017 (payload and failure safety) is Completed** — an unserializable field used to raise into
+the caller on the orphan path and destroy the whole batch inside a span; nothing bounded any value;
+and an all-children-down `MultiSink` reported success so the worker's retry never ran. Events are
+now coerced and size-bounded at assembly, `error` carries `message`/`module`, and `health()` exposes
+the worker's loss counters.
 **Latest release: `v0.5.0`** (SPEC-016; `v0.4.0` was SPEC-015, `v0.3.0` SPEC-013 + SPEC-014,
-`v0.2.0` the rename, `v0.1.0` the first stable). Nothing is unreleased. No spec is in flight; the
-next initiative needs a new spec.
+`v0.2.0` the rename, `v0.1.0` the first stable). **SPEC-017 is merged but unreleased** — it is the
+next tag. No spec is in flight; the next initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -140,6 +145,12 @@ next initiative needs a new spec.
   while per-trace groups keep traces parallel instead of serializing everything behind one group.
   Overridable with a constant or a callable. Ordering is best-effort across a retry boundary, and
   sender faults are abandoned rather than re-sent byte-identical. (SPEC-016)
+- **An event is safe by construction — coerced and bounded once at assembly, not per sink** —
+  `build_event` runs every value through `sanitize.py`, so all 40+ bare `json.dumps` calls in
+  `sinks/` are correct by consequence, it costs one pass per event rather than one per destination
+  (`MultiSink`), and the guarantee reaches the non-JSON sinks too. The unserializable fallback is a
+  type-name placeholder, never `repr()`, so the fix cannot widen the PII exposure arch §6 prevents.
+  Ceilings bound per *value*, not per event. (SPEC-017)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
