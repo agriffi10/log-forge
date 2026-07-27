@@ -92,3 +92,60 @@ def test_orphan_logs_get_distinct_traces(lf, fake_sink) -> None:
 
     traces = {e["trace_id"] for e in fake_sink.events}
     assert len(traces) == 2, "each orphan log starts its own trace"
+
+
+# -- SPEC-017 FR-001: the orphan path must not raise into the caller ----------------------
+
+
+def test_orphan_log_with_an_unserializable_field_does_not_raise(lf, fake_sink) -> None:
+    """The headline criterion: `api._log` emits synchronously on the caller's own thread when
+    no span is active, so a serialization failure there lands in the user's stack frame."""
+    from datetime import datetime
+
+    lf.info("m", when=datetime(2026, 1, 1))  # no active span — must return normally
+
+    event = fake_sink.events[-1]
+    assert event["fields"]["when"] == "2026-01-01T00:00:00"
+
+
+def test_orphan_log_coerces_the_documented_types(lf, fake_sink) -> None:
+    from decimal import Decimal
+    from uuid import UUID
+
+    lf.info(
+        "m",
+        oid=UUID("12345678-1234-5678-1234-567812345678"),
+        amount=Decimal("1.10"),
+        raw=b"\xff",
+        tags={"b", "a"},
+    )
+
+    fields = fake_sink.events[-1]["fields"]
+    assert fields["oid"] == "12345678-1234-5678-1234-567812345678"
+    assert fields["amount"] == "1.10"
+    assert isinstance(fields["raw"], str)
+    assert sorted(fields["tags"]) == ["a", "b"]
+
+
+def test_orphan_log_with_a_domain_object_keeps_its_other_fields(lf, fake_sink) -> None:
+    class MyClass:
+        pass
+
+    lf.info("m", bad=MyClass(), good="kept")
+
+    fields = fake_sink.events[-1]["fields"]
+    assert fields["bad"] == "<unserializable: MyClass>"
+    assert fields["good"] == "kept"
+
+
+def test_every_emitted_event_is_json_serializable(lf, fake_sink) -> None:
+    import json
+    from datetime import datetime
+
+    @lf.trace(name="work")
+    def work() -> None:
+        lf.info("inside", at=datetime(2026, 1, 1))
+
+    work()
+    for event in fake_sink.events:
+        json.dumps(event)  # must not raise for any event the pipeline produced
