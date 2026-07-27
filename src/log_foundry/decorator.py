@@ -40,7 +40,7 @@ from log_foundry.ids import (
     parse_traceparent,
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
-from log_foundry.worker import Worker
+from log_foundry.worker import Health, Worker
 
 __all__ = ["trace", "continue_trace"]
 
@@ -233,6 +233,19 @@ def _flush_worker(timeout: float | None = 5.0) -> bool:
         # `finally`, so the library must never be the reason a caller's function fails. Any
         # failure is reported by the return value instead (FR-003).
         return False
+
+
+def _worker_health() -> Health:
+    """Snapshot the process worker's counters, or zeros if none was ever created.
+
+    Backs :func:`log_foundry.health` (SPEC-017 FR-005). Like :func:`_flush_worker` this
+    deliberately does *not* call :func:`_get_worker`: starting a thread and registering an
+    ``atexit`` drain in order to report three zeros would be pure cost.
+    """
+    worker = _worker
+    if worker is None:
+        return Health(queued=0, dropped=0, failed_batches=0)
+    return worker.health()
 
 
 def _flush(span: Span) -> None:

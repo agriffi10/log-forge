@@ -23,15 +23,35 @@ import queue
 import sys
 import threading
 import time
-from typing import cast
+from typing import NamedTuple, cast
 
 from log_foundry.sinks.base import Sink
 
-__all__ = ["Worker"]
+__all__ = ["Health", "Worker"]
 
 # Sentinel enqueued by shutdown() to wake a worker blocked in queue.get() so it stops promptly
 # instead of waiting out the flush_interval. It is never emitted.
 _SHUTDOWN = object()
+
+# Queue overflow is a high-rate condition by nature: a line per dropped submission would be its
+# own outage. Warn on the first drop, then every this-many-th (SPEC-017 FR-005).
+_DROP_WARN_EVERY = 1000
+
+
+class Health(NamedTuple):
+    """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
+
+    Attributes:
+        queued: Submissions currently buffered. Approximate by nature — it is read without
+            stopping the world, and briefly counts the internal flush/shutdown markers
+            alongside real submissions.
+        dropped: Submissions discarded because the queue was full (backpressure).
+        failed_batches: Batches abandoned after the retry budget was spent.
+    """
+
+    queued: int
+    dropped: int
+    failed_batches: int
 
 
 class _FlushMarker:
@@ -87,13 +107,35 @@ class Worker:
 
         Enqueues via ``put_nowait`` and returns immediately without touching the sink. When the
         queue is full, drops this submission (drop-newest) and counts it in ``dropped`` rather
-        than blocking the caller (FR-001, FR-004).
+        than blocking the caller (FR-001, FR-004), warning on a throttle (SPEC-017 FR-005).
         """
         try:
             self._queue.put_nowait(events)
         except queue.Full:
             with self._lock:
                 self.dropped += 1
+                total = self.dropped  # read under the lock: every value is produced exactly once
+            # Written outside the lock deliberately. stderr can block on a slow reader, and
+            # ``_lock`` also guards flush()/shutdown()'s once-only flag — holding it across a
+            # blocking write would let a wedged console stall the drain path, not just other
+            # submitters. Lines may therefore interleave out of order under concurrency; the
+            # counts they carry are still exact.
+            if total == 1 or total % _DROP_WARN_EVERY == 0:
+                sys.stderr.write(
+                    f"log-foundry: log queue full, dropped {total} submission(s) so far\n"
+                )
+
+    def health(self) -> Health:
+        """Snapshot the delivery counters (SPEC-017 FR-005). Never raises.
+
+        Valid after :meth:`shutdown` — the counters are plain integers that outlive the thread,
+        and the final drain consumes the queue, so ``queued`` reads 0 rather than a stale marker.
+        """
+        with self._lock:
+            dropped, failed_batches = self.dropped, self.failed_batches
+        return Health(
+            queued=self._queue.qsize(), dropped=dropped, failed_batches=failed_batches
+        )
 
     def flush(self, timeout: float | None = 5.0) -> bool:
         """Drain everything submitted before this call through the sink, without stopping.
@@ -221,7 +263,10 @@ class Worker:
                 return
             except Exception:  # noqa: BLE001 — any sink failure must not kill the worker thread
                 if attempt >= self.max_retries:
-                    self.failed_batches += 1
+                    # Under the lock so a concurrent health() sees a coherent snapshot rather
+                    # than a half-updated pair. No deadlock: shutdown() releases before join().
+                    with self._lock:
+                        self.failed_batches += 1
                     sys.stderr.write(
                         f"log-foundry: abandoned a batch of {len(batch)} event(s) after "
                         f"{self.max_retries + 1} failed emit attempts\n"
