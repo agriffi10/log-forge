@@ -43,3 +43,26 @@ def test_field_precedence_explicit_fields_win(lf) -> None:
         fields={"k": "from_fields"}, baggage={"k": "from_baggage"},
     )
     assert event["fields"]["k"] == "from_fields"
+
+
+# -- SPEC-017 FR-001: pipeline-level serialization safety ---------------------------------
+
+
+def test_a_poisonous_field_does_not_break_the_batch(lf, fake_sink) -> None:
+    """One unserializable field used to take every co-batched event down with it."""
+    import json
+
+    class MyClass:
+        pass
+
+    @lf.trace(name="work")
+    def work() -> None:
+        lf.info("first", ok=1)
+        lf.info("second", bad=MyClass())
+        lf.info("third", ok=3)
+
+    work()
+
+    messages = [e["message"] for e in fake_sink.events]
+    assert "first" in messages and "second" in messages and "third" in messages
+    json.dumps(fake_sink.events)  # the whole batch serializes

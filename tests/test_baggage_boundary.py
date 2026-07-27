@@ -203,3 +203,39 @@ def test_every_event_in_the_span_carries_the_correlation_key(lf, fake_sink) -> N
     batch = fake_sink.batches[0]
     assert [e["message"] for e in batch] == ["span.start", "midpoint", "span.end"]
     assert all(e["fields"].get("request_id") == "r1" for e in batch)
+
+
+# -- SPEC-017 FR-001: baggage values are coerced by the same rules ------------------------
+
+
+def test_baggage_values_are_coerced_on_boundary_events(lf, fake_sink) -> None:
+    """`set_baggage` accepts arbitrary objects and `backfill_baggage` writes them into events
+    after `build_event` has run, so they bypass its pass and need their own."""
+    from datetime import datetime
+
+    @lf.trace(name="work")
+    def work() -> None:
+        lf.set_baggage(started=datetime(2026, 1, 1))
+
+    work()
+
+    end = _by_message(fake_sink, "span.end")
+    assert end["fields"]["started"] == "2026-01-01T00:00:00"
+
+
+def test_unserializable_baggage_does_not_break_the_span(lf, fake_sink) -> None:
+    import json
+
+    class MyClass:
+        pass
+
+    @lf.trace(name="work")
+    def work() -> None:
+        lf.set_baggage(obj=MyClass(), keep="kept")
+
+    work()
+
+    end = _by_message(fake_sink, "span.end")
+    assert end["fields"]["obj"] == "<unserializable: MyClass>"
+    assert end["fields"]["keep"] == "kept"
+    json.dumps(end)  # must not raise
