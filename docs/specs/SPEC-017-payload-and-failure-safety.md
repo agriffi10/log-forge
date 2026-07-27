@@ -2,7 +2,7 @@
 
 **ID:** SPEC-017
 **Status:** Draft
-**Last Updated:** 2026-07-24
+**Last Updated:** 2026-07-27
 **Depends On:** SPEC-001 (`build_event`, `model`), SPEC-004 (background worker), SPEC-006 (`MultiSink`)
 
 ## Overview
@@ -138,19 +138,27 @@ No single value may be unbounded. Four ceilings, all configurable (FR-006), appl
 - `max_depth` (default `8`) — nesting levels; deeper structures are replaced.
 
 Truncation of a `str` cuts on a UTF-8 character boundary (never splitting a multi-byte sequence) and
-appends the marker `…[truncated]`. `error.stack` is truncated by **keeping its tail**, because
+marks the result with `…[truncated]`. **The marker is inside the budget, not added to it** — a
+returned value never exceeds its ceiling, so a caller sizing against a hard downstream limit can
+rely on the ceiling being one. `error.stack` is truncated by **keeping its tail**, because
 `traceback.format_exception` puts the exception type and the innermost frames last — the head of an
 over-long traceback is the least useful part of it. Every other value keeps its head.
+
+`message` is bounded by `max_value_bytes` like any other string. It is a base field, but unlike the
+other eleven it is caller-supplied free text, and exempting it would leave `info(huge_string)`
+unbounded — the exact hole this FR exists to close.
 
 Any event to which a ceiling was applied carries top-level `truncated: true`, so a consumer can tell
 a complete payload from a clipped one, and an operator can find clipping without diffing sizes.
 
 #### Acceptance Criteria:
 
-- [ ] A field value of 20,000 ASCII characters is emitted at `max_value_bytes` UTF-8 bytes plus the
-      `…[truncated]` marker, and the event carries `truncated: true`.
+- [ ] A field value of 20,000 ASCII characters is emitted at no more than `max_value_bytes` UTF-8
+      bytes *including* the `…[truncated]` marker, and the event carries `truncated: true`.
 - [ ] A field value whose truncation point falls mid-character (a string of `"é"`) emits a value that
       decodes as valid UTF-8 and is no longer than `max_value_bytes` bytes.
+- [ ] A ceiling smaller than the marker itself (`max_stack_bytes=8`) yields the bare marker, not the
+      untruncated original.
 - [ ] A `RecursionError` traceback longer than `max_stack_bytes` produces an `error.stack` of at most
       `max_stack_bytes` bytes that **ends** with the original traceback's final line.
 - [ ] `error.stack` is permitted to exceed `max_value_bytes` — a 20,000-byte stack is not clipped to
@@ -160,8 +168,11 @@ a complete payload from a clipped one, and an operator can find clipping without
       `truncated: true`.
 - [ ] An event with every value inside all four ceilings does **not** carry a `truncated` key at all
       (absent, not `false`).
-- [ ] The 12 base fields (`timestamp`, `trace_id`, `span_id`, … ) are never truncated, and
-      `truncated: true` never displaces one.
+- [ ] `truncated: true` is set by the four ceilings **only** — never by `<circular>` or
+      `<unserializable: …>`, which are coercion outcomes rather than clipping.
+- [ ] The 11 library-generated base fields (`timestamp`, `trace_id`, `span_id`, … ) are never
+      truncated, and `truncated: true` never displaces one. `message` is caller-supplied and *is*
+      bounded (see above).
 
 ### FR-003: The exception message is a queryable field
 
@@ -301,7 +312,7 @@ class Health(NamedTuple):
 
 ```python
 # src/log_foundry/sanitize.py — new module, the whole surface
-def coerce(value: object, *, cfg: Config, _depth: int = 0) -> object:
+def coerce(value: object, *, cfg: Config) -> object:
     """Return a JSON-serializable, size-bounded equivalent of `value`. Never raises."""
 
 def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
@@ -311,7 +322,12 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
     """As above but keeping the tail — for error.stack."""
 
 def sanitize_fields(fields: Mapping[str, object], *, cfg: Config) -> tuple[dict[str, object], bool]:
-    """Coerce and bound a whole mapping. Returns (fields, any_truncation_occurred)."""
+    """Coerce and bound a whole mapping. Returns (fields, any_ceiling_was_applied)."""
+
+# The recursion lives on a private per-event `_Coercer` accumulator rather than in `coerce`
+# itself: `max_keys` and `max_depth` fire arbitrarily deep, and a recursive function returning a
+# bare value has nowhere to report that a ceiling fired. `coerce` is the single-value convenience
+# wrapper; `sanitize_fields` is what the event path calls.
 
 # src/log_foundry/__init__.py — one new public function
 def health() -> Health: ...
@@ -346,10 +362,13 @@ src/log_foundry/
 
 tests/
 ├── test_sanitize.py            # new — the coercion table, ceilings, circular refs
-├── test_model.py               # + error.message/module, truncated marker
-├── test_worker.py              # + health snapshot, throttled overflow warning
-├── test_sinks_composition.py   # + MultiSink total-failure re-raise
-└── test_config.py              # + ceiling defaults, validation
+├── test_config.py              # + ceiling defaults, validation
+├── test_model_unit.py          # + error.message/module, truncated marker (the unit home)
+├── test_model.py               # + pipeline-level json.dumps safety
+├── test_api.py                 # + the orphan-path criterion (FR-001's headline)
+├── test_baggage_boundary.py    # + set_baggage/backfill coercion
+├── test_sinks_compose.py       # + MultiSink total-failure re-raise
+└── test_worker.py              # + health snapshot, throttled overflow warning
 ```
 
 ## Implementation Phases
