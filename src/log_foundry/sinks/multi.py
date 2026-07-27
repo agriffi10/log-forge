@@ -6,6 +6,12 @@ whose ``emit`` (or ``close``) raises is isolated — the failure is counted on `
 logged to stderr, and its siblings still run — so one broken destination never fails the whole
 fan-out or the worker's retry. This mirrors the worker's own survive-a-sink-failure isolation
 boundary (arch §9; best-practices §7 sanctions the broad catch here).
+
+The one exception is **total** failure: if every child raised, ``emit`` re-raises rather than
+reporting success, so the worker's retry engages (SPEC-017 FR-004). Swallowing there meant a
+``MultiSink`` whose destinations were all down reported healthy on every batch and the loss was
+invisible. ``close()`` keeps the unconditional isolate-and-continue behaviour — a failed close
+has nothing to retry.
 """
 
 from __future__ import annotations
@@ -29,16 +35,35 @@ class MultiSink:
         self.failed = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Forward ``batch`` to every child in construction order, isolating failures (FR-002)."""
+        """Forward ``batch`` to every child in construction order, isolating failures (FR-002).
+
+        When **every** child failed, re-raise the first child's exception so the worker's bounded
+        retry sees the total loss (SPEC-017 FR-004). Partial success stays isolated: a retry there
+        would re-deliver the batch to the children that already took it, and duplicates are worse
+        than the one failure already counted on ``failed`` and written to stderr. Total failure
+        delivered nothing, so it has no duplicates to create and is the one case worth retrying.
+        """
+        first_error: Exception | None = None
+        delivered = 0
         for sink in self._sinks:
             try:
                 sink.emit(batch)
             except Exception as err:  # isolation boundary: one child must not fail the rest
                 self.failed += 1
+                if first_error is None:
+                    first_error = err
                 sys.stderr.write(
                     f"log-foundry: MultiSink child {type(sink).__name__}.emit "
                     f"failed and was skipped: {err!r}\n"
                 )
+            else:
+                delivered += 1
+        if delivered == 0 and first_error is not None:
+            # Raised outside any ``except`` block, so ``__context__`` is untouched and the
+            # exception propagates by identity with its original traceback. The ``is not None``
+            # is also what keeps an empty ``MultiSink`` a no-op rather than a raise — otherwise a
+            # misconfigured fan-out with no children would retry every batch to exhaustion.
+            raise first_error
 
     def close(self) -> None:
         """Close every child, isolating a failing child so the rest still close (FR-002)."""
