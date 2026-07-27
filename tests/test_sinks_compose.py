@@ -117,7 +117,10 @@ def test_multi_close_closes_all_even_when_one_raises() -> None:
 
 
 def test_multi_logs_child_failure_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
-    MultiSink(BoomSink()).emit([ev()])
+    # A lone failing child is now also a *total* failure, so this re-raises (SPEC-017 FR-004).
+    # The stderr line is still written first, which is what this test guards.
+    with pytest.raises(RuntimeError):
+        MultiSink(BoomSink()).emit([ev()])
     err = capsys.readouterr().err
     assert "MultiSink" in err and "BoomSink" in err  # FR-002: failure logged to stderr
 
@@ -266,3 +269,67 @@ def test_close_reaches_each_leaf_once() -> None:
     sink = MultiSink(a, FilteringSink(TransformSink(b, lambda e: e), min_level="ERROR"), c)
     sink.close()
     assert (a.closed, b.closed, c.closed) == (1, 1, 1)
+
+
+# -- SPEC-017 FR-004: total failure reaches the worker's retry ----------------------------
+
+
+def test_multi_raises_when_every_child_fails() -> None:
+    """Nothing was delivered, so a retry creates no duplicates — the one case worth retrying."""
+    multi = MultiSink(BoomSink(), BoomSink())
+    with pytest.raises(RuntimeError):
+        multi.emit([ev()])
+    assert multi.failed == 2
+
+
+def test_multi_raises_the_first_childs_exception_by_identity() -> None:
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+
+    class Raiser:
+        def __init__(self, err: Exception) -> None:
+            self.err = err
+            self.calls = 0
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            self.calls += 1
+            raise self.err
+
+        def close(self) -> None: ...
+
+    a, b = Raiser(first), Raiser(second)
+    multi = MultiSink(a, b)
+    with pytest.raises(RuntimeError) as caught:
+        multi.emit([ev()])
+
+    assert caught.value is first  # identity, not just type/message
+    assert b.calls == 1, "every child is attempted before the raise"
+
+
+def test_multi_still_isolates_when_one_child_succeeds() -> None:
+    """Partial success must not raise — retrying would duplicate into the healthy child."""
+    good = RecordingSink()
+    multi = MultiSink(BoomSink(), good)
+    multi.emit([ev()])  # must not raise
+    assert len(good.batches) == 1
+    assert multi.failed == 1
+
+
+def test_multi_empty_does_not_raise_on_emit() -> None:
+    """A fan-out with no children delivered nothing but has no failure to report — a raise here
+    would make a misconfigured empty MultiSink retry every batch to exhaustion."""
+    MultiSink().emit([ev()])  # must not raise
+
+
+def test_worker_records_a_failed_batch_when_every_child_is_down() -> None:
+    """End-to-end: the whole point of FR-004 — this used to leave failed_batches at 0."""
+    worker_mod = pytest.importorskip("log_foundry.worker")
+
+    worker = worker_mod.Worker(MultiSink(BoomSink()), batch_size=1, max_retries=1)
+    try:
+        worker.submit([ev()])
+        worker.flush(timeout=5.0)
+    finally:
+        worker.shutdown()
+
+    assert worker.failed_batches == 1
