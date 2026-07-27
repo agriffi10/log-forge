@@ -1,7 +1,7 @@
 # Spec: Payload and Failure Safety
 
 **ID:** SPEC-017
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-27
 **Depends On:** SPEC-001 (`build_event`, `model`), SPEC-004 (background worker), SPEC-006 (`MultiSink`)
 

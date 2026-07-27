@@ -9,6 +9,8 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `configure` / `get_config` / `_ensure_sink` | `src/log_foundry/config.py` | Process-wide config singleton; lazy `StdoutSink` default. |
 | id generators | `src/log_foundry/ids.py` | `new_trace_id` / `new_span_id` / `new_log_id` (W3C-compatible). |
 | `Span` + event builders | `src/log_foundry/model.py` | `Span` dataclass; `build_event` / `start_event` / `end_event` — the arch §6 JSON schema + precedence merge. |
+| value sanitizer | `src/log_foundry/sanitize.py` | `coerce` / `sanitize_fields` / `truncate_str` / `truncate_tail` — makes any value JSON-safe and size-bounded; total (never raises). |
+| `health()` + `Health` | `src/log_foundry/__init__.py`, `worker.py` | Public snapshot of the worker's `queued` / `dropped` / `failed_batches`; never creates a worker. |
 | context stack + baggage | `src/log_foundry/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
 | `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
 | `StdoutSink` | `src/log_foundry/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |

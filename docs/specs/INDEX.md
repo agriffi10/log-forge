@@ -21,7 +21,7 @@ to status only — no prose.
 | [SPEC-014](SPEC-014-cross-process-trace-continuation.md) | Cross-Process Trace Continuation (W3C `traceparent` + baggage) | Completed | SPEC-001, SPEC-002, SPEC-013 |
 | [SPEC-015](SPEC-015-baggage-on-boundary-events.md) | Baggage on Boundary Events | Completed | SPEC-002, SPEC-014 |
 | [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Completed | SPEC-005 |
-| [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Draft | SPEC-001, SPEC-004, SPEC-006 |
+| [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Completed | SPEC-001, SPEC-004, SPEC-006 |
 
 ## Arcs (build order)
 
