@@ -121,9 +121,15 @@ class Worker:
             # submitters. Lines may therefore interleave out of order under concurrency; the
             # counts they carry are still exact.
             if total == 1 or total % _DROP_WARN_EVERY == 0:
-                sys.stderr.write(
-                    f"log-foundry: log queue full, dropped {total} submission(s) so far\n"
-                )
+                try:
+                    sys.stderr.write(
+                        f"log-foundry: log queue full, dropped {total} submission(s) so far\n"
+                    )
+                except Exception:  # noqa: BLE001 — submit() runs on the *caller's* thread, so an
+                    # unwritable stderr (closed fd, broken pipe, daemonized process) would raise
+                    # straight into the app. A diagnostic about dropped logs must never itself be
+                    # the reason a decorated function fails. The counter is already recorded.
+                    pass
 
     def health(self) -> Health:
         """Snapshot the delivery counters (SPEC-017 FR-005). Never raises.
