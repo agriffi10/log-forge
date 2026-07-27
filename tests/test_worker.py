@@ -563,3 +563,111 @@ def test_flush_is_exported() -> None:
 
     assert "flush" in log_foundry.__all__
     assert callable(log_foundry.flush)
+
+
+# -- SPEC-017 FR-005: health snapshot + audible overflow ---------------------------------
+
+
+def test_health_reflects_live_counters() -> None:
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("b"))
+        w.submit(_span("c"))  # full -> dropped
+
+        h = w.health()
+        assert h.dropped >= 1
+        assert h.failed_batches == 0
+        assert isinstance(h.queued, int)
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+
+def test_health_counts_failed_batches() -> None:
+    class AlwaysFail(RecordingSink):
+        def emit(self, batch):
+            raise RuntimeError("down")
+
+    w = Worker(AlwaysFail(), batch_size=1, max_retries=1)
+    try:
+        w.submit(_span("a"))
+        w.flush(timeout=5.0)
+        assert w.health().failed_batches == 1
+    finally:
+        w.shutdown()
+
+
+def test_health_is_readable_after_shutdown() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1)
+    w.submit(_span("a"))
+    w.shutdown()
+
+    h = w.health()  # must not raise
+    assert h.queued == 0, "the final drain consumed the queue, markers included"
+    assert h.dropped == 0 and h.failed_batches == 0
+
+
+def test_module_health_returns_zeros_without_creating_a_worker() -> None:
+    """Asking after the health of a process that never logged must not start a thread."""
+    import threading
+
+    import log_foundry
+    from log_foundry import decorator
+
+    decorator._worker = None
+    before = threading.active_count()
+
+    h = log_foundry.health()
+
+    assert h == (0, 0, 0)
+    assert decorator._worker is None, "health() must not create a worker"
+    assert threading.active_count() == before, "health() must not start a thread"
+
+
+def test_health_is_exported() -> None:
+    import log_foundry
+
+    assert "health" in log_foundry.__all__
+    assert "Health" in log_foundry.__all__
+
+
+def test_first_overflow_drop_warns_once(capsys) -> None:
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("b"))
+        w.submit(_span("c"))  # first drop -> one line
+        w.submit(_span("d"))  # second drop -> silent (throttled)
+
+        err = capsys.readouterr().err
+        assert err.count("log queue full") == 1
+        assert "log-foundry:" in err
+        assert "dropped 1 submission(s)" in err
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+
+def test_overflow_warning_is_throttled(capsys) -> None:
+    """2,500 drops must produce exactly 3 lines (drops 1, 1000, 2000), not 2,500."""
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("filler"))  # occupies the single queue slot
+        for i in range(2500):
+            w.submit(_span(i))  # all dropped
+
+        err = capsys.readouterr().err
+        assert w.dropped == 2500
+        assert err.count("log queue full") == 3
+    finally:
+        sink.release.set()
+        w.shutdown()

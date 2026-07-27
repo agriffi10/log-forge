@@ -359,6 +359,9 @@ A few conventions hold across every sink below:
   open for you to manage.
 - **Never crashes the app.** A failing sink is retried with backoff and then counted (`.failed`,
   `.dropped_oversized`, …) rather than raised — a broken destination degrades logging, nothing more.
+  The one deliberate exception is a `MultiSink` whose children *all* failed: it re-raises so the
+  worker's retry engages, since nothing was delivered and there are no duplicates to risk. That
+  still doesn't reach your code — the worker is what catches it.
 
 #### Built-in, zero-dependency
 
@@ -576,7 +579,22 @@ background worker via a fast, non-blocking submit — your function returns with
 the sink. The worker batches events (by count and time), emits them on its own thread, retries
 a failing sink with backoff, and applies backpressure so a slow or down sink can never block or
 back-pressure the app: when its bounded queue is full it drops the newest submissions and counts
-them (`worker.dropped`) rather than stalling.
+them rather than stalling.
+
+Those losses are deliberate, so the library gives you a way to notice them. `log_foundry.health()`
+returns a snapshot of the worker's counters:
+
+```python
+h = log_foundry.health()
+if h.dropped or h.failed_batches:
+    ...  # logs were silently lost — worth an alert
+```
+
+`dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
+abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
+every thousandth after it, since overflow is a high-rate condition and a line per drop would be its
+own outage. A process that has never logged has no worker, and asking after its health does not
+create one.
 
 Because delivery is asynchronous, drain before the process exits. There are two drains, and
 which one you want depends on whether the process is about to end:

@@ -18,6 +18,7 @@ from log_foundry.context import (
     current_traceparent,
 )
 from log_foundry.decorator import continue_trace, trace
+from log_foundry.worker import Health
 
 try:
     # Distribution name ("log-foundry") differs from the import name ("log_foundry").
@@ -47,6 +48,27 @@ def flush(timeout: float | None = 5.0) -> bool:
     from log_foundry.decorator import _flush_worker
 
     return _flush_worker(timeout)
+
+
+def health() -> Health:
+    """Snapshot the background worker's delivery counters (SPEC-017 FR-005). Never raises.
+
+    Returns ``queued`` / ``dropped`` / ``failed_batches``. A non-zero ``dropped`` means the queue
+    filled and submissions were discarded to keep your code non-blocking; a non-zero
+    ``failed_batches`` means a sink stayed broken through the whole retry budget. Both are
+    losses the library absorbs on purpose, and this is how you notice them::
+
+        h = log_foundry.health()
+        if h.dropped or h.failed_batches:
+            ...  # raise an alert; logs were silently lost
+
+    A process that has never logged has no worker, and asking after its health does not create
+    one — the snapshot is simply zeroed. Valid after :func:`shutdown`, which leaves the final
+    counters readable.
+    """
+    from log_foundry.decorator import _worker_health
+
+    return _worker_health()
 
 
 def shutdown() -> None:
@@ -80,5 +102,7 @@ __all__ = [
     "current_baggage_header",
     "flush",
     "shutdown",
+    "health",
+    "Health",
     "__version__",
 ]
