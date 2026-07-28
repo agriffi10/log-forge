@@ -13,13 +13,22 @@ import json
 import sys
 from typing import Any
 
+from log_foundry.sinks._batch import adjudicate_positional
 from log_foundry.sinks._chunk import chunk_items
 
 __all__ = ["KinesisSink"]
 
 
 class KinesisSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Kinesis Data Stream."""
+    """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Kinesis Data Stream.
+
+    Three counters report what was not delivered: ``failed`` (the stream told us these failed, and
+    they still failed after ``max_retries``), ``dropped_oversized`` (too large for the per-record
+    limit to ever accept), and ``dropped_unadjudicated`` (a ``put_records`` response whose results
+    array did not describe the chunk that was sent, so no record in it could be paired to an
+    outcome). A non-zero ``dropped_unadjudicated`` means those records were abandoned without the
+    stream ever confirming them — treat it as loss, and as a sign the client is not AWS-shaped.
+    """
 
     MAX_RECORDS = 500  # put_records hard limit: records per request
     MAX_REQUEST_BYTES = 5 * 1024 * 1024  # 5 MB per put_records request
@@ -43,6 +52,7 @@ class KinesisSink:
         self.max_retries = max_retries
         self.failed = 0
         self.dropped_oversized = 0
+        self.dropped_unadjudicated = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunk to put_records limits and send each chunk, retrying failures (FR-003)."""
@@ -83,16 +93,16 @@ class KinesisSink:
             if not response.get("FailedRecordCount"):
                 return
             results = response.get("Records", [])
-            records = [
-                record
-                # strict=False states today's behaviour rather than changing it. Note the
-                # latent case it preserves: if `results` came back shorter than `records`
-                # (or empty, via the `.get` default above), zip truncates, `records` empties
-                # and the batch reports success — the silent-loss shape SPEC-017 went after.
-                # Making that raise is a behaviour change, so it belongs in its own spec.
-                for record, result in zip(records, results, strict=False)
-                if result.get("ErrorCode")
-            ]
+            verdict = adjudicate_positional(records, results)
+            if verdict.unadjudicated:
+                self.dropped_unadjudicated += verdict.unadjudicated
+                sys.stderr.write(
+                    f"log-foundry: KinesisSink could not adjudicate a put_records response "
+                    f"({len(records)} record(s) sent, {len(results)} result(s) returned); "
+                    f"{verdict.unadjudicated} record(s) abandoned\n"
+                )
+                return
+            records = verdict.retry
             if not records:
                 return
             if attempt >= self.max_retries:
