@@ -12,7 +12,7 @@ import json
 import sys
 from typing import Any
 
-from log_foundry.sinks._batch import adjudicate_positional
+from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 
 __all__ = ["FirehoseSink"]
@@ -85,7 +85,7 @@ class FirehoseSink:
             )
             if not response.get("FailedPutCount"):
                 return
-            results = response.get("RequestResponses", [])
+            results = usable_results(response.get("RequestResponses"))
             verdict = adjudicate_positional(records, results)
             if verdict.unadjudicated:
                 self.dropped_unadjudicated += verdict.unadjudicated

@@ -143,6 +143,25 @@ def test_absent_results_abandon_the_whole_chunk(capsys: pytest.CaptureFixture[st
     assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
 
 
+def test_an_unusable_results_field_abandons_and_counts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A Records field that isn't a list of mappings is counted like a mismatch, never raised."""
+
+    class UnusableKinesis(MalformedKinesis):
+        def put_records(self, *, StreamName: str, Records: list[dict]) -> dict:
+            super().put_records(StreamName=StreamName, Records=Records)
+            return {"FailedRecordCount": 1, "Records": None}  # present, but not a list
+
+    client = UnusableKinesis(None)
+    sink = KinesisSink("stream", client=client)
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_unadjudicated == 2
+    assert sink.failed == 0
+    assert len(client.calls) == 1
+    assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
+
+
 def test_no_failures_reported_never_consults_the_results_array(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-__all__ = ["Adjudication", "adjudicate_positional"]
+__all__ = ["Adjudication", "adjudicate_positional", "usable_results"]
 
 
 class Adjudication[T](NamedTuple):
@@ -32,6 +32,20 @@ class Adjudication[T](NamedTuple):
 
     retry: list[T]
     unadjudicated: int
+
+
+def usable_results(results: Any) -> list[dict[str, Any]]:
+    """Return ``results`` if it is a list of mappings, else an empty list.
+
+    The response comes off a client the sink does not control, so the field may be any shape at
+    all — ``None``, a scalar, a list of non-mappings. None of those carry per-record outcomes that
+    can be read, so each is treated as describing nothing, which routes it to the same counted,
+    audible abandonment as a length mismatch. Raising instead would put the malformed-client case
+    back on the path this module exists to take it off.
+    """
+    if isinstance(results, list) and all(isinstance(result, dict) for result in results):
+        return results
+    return []
 
 
 def adjudicate_positional[T](

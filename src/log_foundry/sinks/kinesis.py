@@ -13,7 +13,7 @@ import json
 import sys
 from typing import Any
 
-from log_foundry.sinks._batch import adjudicate_positional
+from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 
 __all__ = ["KinesisSink"]
@@ -92,7 +92,7 @@ class KinesisSink:
             response = self.client.put_records(StreamName=self.stream_name, Records=records)
             if not response.get("FailedRecordCount"):
                 return
-            results = response.get("Records", [])
+            results = usable_results(response.get("Records"))
             verdict = adjudicate_positional(records, results)
             if verdict.unadjudicated:
                 self.dropped_unadjudicated += verdict.unadjudicated

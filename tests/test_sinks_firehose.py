@@ -136,6 +136,25 @@ def test_absent_responses_abandon_the_whole_chunk(capsys: pytest.CaptureFixture[
     assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
 
 
+def test_an_unusable_responses_field_abandons_and_counts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A RequestResponses field that isn't a list of mappings is counted, never raised."""
+
+    class UnusableFirehose(MalformedFirehose):
+        def put_record_batch(self, *, DeliveryStreamName: str, Records: list[dict]) -> dict:
+            super().put_record_batch(DeliveryStreamName=DeliveryStreamName, Records=Records)
+            return {"FailedPutCount": 1, "RequestResponses": None}  # present, but not a list
+
+    client = UnusableFirehose(None)
+    sink = FirehoseSink("stream", client=client)
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_unadjudicated == 2
+    assert sink.failed == 0
+    assert len(client.calls) == 1
+    assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
+
+
 def test_no_failures_reported_never_consults_the_responses_array(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

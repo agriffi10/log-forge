@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from log_foundry.sinks._batch import adjudicate_positional
+from log_foundry.sinks._batch import adjudicate_positional, usable_results
 
 
 def test_equal_lengths_select_the_flagged_records() -> None:
@@ -59,3 +59,36 @@ def test_error_key_is_a_parameter() -> None:
     verdict = adjudicate_positional(records, results, error_key="status")
     assert verdict.retry == [{"Data": b"a"}]  # the ErrorCode entry is not consulted
     assert verdict.unadjudicated == 0
+
+
+# -- usable_results: the response field is whatever the client chose to return -------------
+
+
+def test_a_list_of_mappings_passes_through_unchanged() -> None:
+    results = [{"ErrorCode": "InternalFailure"}, {"SequenceNumber": "1"}]
+    assert usable_results(results) is results
+
+
+def test_an_empty_list_is_usable() -> None:
+    assert usable_results([]) == []
+
+
+def test_a_none_field_describes_nothing() -> None:
+    assert usable_results(None) == []
+
+
+def test_a_scalar_field_describes_nothing() -> None:
+    assert usable_results("InternalFailure") == []
+    assert usable_results(3) == []
+
+
+def test_a_list_of_non_mappings_describes_nothing() -> None:
+    assert usable_results(["InternalFailure", "ok"]) == []
+    assert usable_results([{"ErrorCode": "InternalFailure"}, None]) == []
+
+
+def test_an_unusable_field_routes_to_unadjudicated_not_an_exception() -> None:
+    records = [{"Data": b"a"}, {"Data": b"b"}]
+    verdict = adjudicate_positional(records, usable_results(None))
+    assert verdict.retry == []
+    assert verdict.unadjudicated == 2
