@@ -104,9 +104,12 @@ the caller on the orphan path and destroy the whole batch inside a span; nothing
 and an all-children-down `MultiSink` reported success so the worker's retry never ran. Events are
 now coerced and size-bounded at assembly, `error` carries `message`/`module`, and `health()` exposes
 the worker's loss counters.
-**Latest release: `v0.5.0`** (SPEC-016; `v0.4.0` was SPEC-015, `v0.3.0` SPEC-013 + SPEC-014,
-`v0.2.0` the rename, `v0.1.0` the first stable). **SPEC-017 is merged but unreleased** — it is the
-next tag. No spec is in flight; the next initiative needs a new spec.
+**Latest release: `v0.6.0`** (SPEC-017; `v0.5.0` was SPEC-016, `v0.4.0` SPEC-015, `v0.3.0`
+SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
+**SPEC-018 (batch response adjudication) is Draft and unbuilt** — `KinesisSink`/`FirehoseSink`
+adjudicate a batch response positionally without checking the arrays line up, so a short response
+truncates the retry list and the chunk reports success. Same silent-loss shape as SPEC-017, in the
+two sinks it did not reach.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 

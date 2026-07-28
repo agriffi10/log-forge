@@ -22,6 +22,7 @@ to status only — no prose.
 | [SPEC-015](SPEC-015-baggage-on-boundary-events.md) | Baggage on Boundary Events | Completed | SPEC-002, SPEC-014 |
 | [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Completed | SPEC-005 |
 | [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Completed | SPEC-001, SPEC-004, SPEC-006 |
+| [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Draft | SPEC-010, SPEC-017 |
 
 ## Arcs (build order)
 
@@ -50,3 +51,7 @@ Group related specs and record the order to build them in. Delete this section i
   the app; a broken destination degrades logging and nothing more): an unserializable field raises
   into the caller, an unbounded value gets a whole event discarded downstream, and an all-children-down
   `MultiSink` reports success so the retry never runs. Buildable at any point; nothing depends on it.
+  **SPEC-018** continues it into the two sinks 017 did not reach: `KinesisSink` and `FirehoseSink`
+  adjudicate a batch response by position without checking the arrays line up, so a short response
+  truncates the retry list and the chunk reports success. Same promise, same failure shape, found by
+  a linter rather than an audit. Standalone; nothing depends on it.
