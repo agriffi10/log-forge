@@ -106,10 +106,13 @@ now coerced and size-bounded at assembly, `error` carries `message`/`module`, an
 the worker's loss counters.
 **Latest release: `v0.6.0`** (SPEC-017; `v0.5.0` was SPEC-016, `v0.4.0` SPEC-015, `v0.3.0`
 SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
-**SPEC-018 (batch response adjudication) is Draft and unbuilt** — `KinesisSink`/`FirehoseSink`
-adjudicate a batch response positionally without checking the arrays line up, so a short response
-truncates the retry list and the chunk reports success. Same silent-loss shape as SPEC-017, in the
-two sinks it did not reach.
+**SPEC-018 (batch response adjudication) is Completed** — `KinesisSink`/`FirehoseSink` adjudicated a
+batch response positionally without checking the arrays line up, so a short response truncated the
+retry list and the chunk reported success: the same silent-loss shape as SPEC-017, in the two sinks
+it did not reach. The length check now lives in `sinks/_batch.py`, used by both, and an
+unadjudicable chunk is abandoned against a new `dropped_unadjudicated` counter.
+**SPEC-018 is merged but unreleased** — it is the next tag. No spec is in flight; the next
+initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -154,6 +157,14 @@ two sinks it did not reach.
   (`MultiSink`), and the guarantee reaches the non-JSON sinks too. The unserializable fallback is a
   type-name placeholder, never `repr()`, so the fix cannot widen the PII exposure arch §6 prevents.
   Ceilings bound per *value*, not per event. (SPEC-017)
+- **A positional response adjudicates all of a chunk or none of it** — an id-less per-record array
+  must prove it describes the records sent (same length, right shape) before entry *i* may be read
+  as record *i*; a mismatch is evidence of misalignment, so even the overlapping prefix is refused.
+  What it cannot adjudicate is **abandoned and counted** (`dropped_unadjudicated`), never retried —
+  the API reported a failure count, so some of the chunk landed and re-sending would duplicate
+  downstream forever, while an abandoned record is a loss counted here and now. Id-keyed responses
+  (`SQSSink`, `SNSSink`) select by `Id`, cannot mis-pair, and are deliberately not unified with
+  this. (SPEC-018)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
