@@ -136,6 +136,22 @@ def test_absent_responses_abandon_the_whole_chunk(capsys: pytest.CaptureFixture[
     assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
 
 
+def test_no_failures_reported_never_consults_the_responses_array(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fake client that reports zero failures stays silent however its responses array looks."""
+
+    class SilentFirehose(MalformedFirehose):
+        def put_record_batch(self, *, DeliveryStreamName: str, Records: list[dict]) -> dict:
+            super().put_record_batch(DeliveryStreamName=DeliveryStreamName, Records=Records)
+            return {"FailedPutCount": 0}  # no RequestResponses key at all
+
+    sink = FirehoseSink("stream", client=SilentFirehose(None))
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_unadjudicated == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_emit_does_not_raise_on_an_unadjudicated_chunk() -> None:
     FirehoseSink("stream", client=MalformedFirehose(None)).emit([{"a": 1}])  # no exception
 

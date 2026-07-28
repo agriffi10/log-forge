@@ -2,9 +2,9 @@
 
 Some batch APIs report per-record outcomes **positionally**: the response carries a parallel array
 with no identifiers, so entry *i* describes record *i*. That correlation holds only while the two
-arrays are the same length, and a disagreement is evidence they are not aligned — not an invitation
-to use the overlapping prefix. Pairing them anyway truncates silently, which reads downstream as
-"everything landed" for records the destination never confirmed.
+arrays are the same length, and a disagreement is evidence they are not aligned — not an
+invitation to use the overlapping prefix. Pairing them anyway truncates silently, which reads
+downstream as "everything landed" for records the destination never confirmed.
 
 This module makes the precondition explicit: either the response describes the whole chunk and the
 caller acts on it, or it does not and the caller abandons the chunk audibly. Id-keyed responses
@@ -23,13 +23,15 @@ class Adjudication[T](NamedTuple):
 
     ``retry`` is non-empty only when ``unadjudicated`` is ``0``: the response either describes the
     chunk or it does not. The two are never both non-zero.
+
+    Attributes:
+        retry: Records the response explicitly flagged as failed.
+        unadjudicated: Records whose outcome the response did not describe — ``0`` on a
+            well-formed response.
     """
 
     retry: list[T]
-    """Records the response explicitly flagged as failed."""
-
     unadjudicated: int
-    """Records whose outcome the response did not describe — ``0`` on a well-formed response."""
 
 
 def adjudicate_positional[T](
@@ -41,8 +43,8 @@ def adjudicate_positional[T](
     """Pair a positional batch response against the records it should describe.
 
     Returns the subset of ``records`` whose paired ``results`` entry carries a truthy ``error_key``.
-    If the arrays disagree in length — including a ``results`` the caller defaulted to empty because
-    the response omitted it — nothing is selected and the whole chunk is reported unadjudicated.
+    If the arrays disagree in length — including a ``results`` the caller defaulted to empty
+    because the response omitted it — nothing is selected and the chunk is reported unadjudicated.
     ``error_key`` is a parameter so a future positional response naming its error differently needs
     no fork of this rule.
     """

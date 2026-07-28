@@ -143,6 +143,22 @@ def test_absent_results_abandon_the_whole_chunk(capsys: pytest.CaptureFixture[st
     assert "2 record(s) sent, 0 result(s) returned" in capsys.readouterr().err
 
 
+def test_no_failures_reported_never_consults_the_results_array(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fake client that reports zero failures stays silent however its Records array looks."""
+
+    class SilentKinesis(MalformedKinesis):
+        def put_records(self, *, StreamName: str, Records: list[dict]) -> dict:
+            super().put_records(StreamName=StreamName, Records=Records)
+            return {"FailedRecordCount": 0}  # no Records key at all
+
+    sink = KinesisSink("stream", client=SilentKinesis(None))
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_unadjudicated == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_emit_does_not_raise_on_an_unadjudicated_chunk() -> None:
     KinesisSink("stream", client=MalformedKinesis(None)).emit([{"a": 1}])  # no exception
 
