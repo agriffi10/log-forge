@@ -1,7 +1,7 @@
 # Spec: Batch Response Adjudication
 
 **ID:** SPEC-018  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-07-28  
 **Depends On:** SPEC-010, SPEC-017
 
