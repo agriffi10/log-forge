@@ -358,7 +358,8 @@ A few conventions hold across every sink below:
 - **Ownership.** A resource the sink opens itself is closed on `shutdown()`; an injected one is left
   open for you to manage.
 - **Never crashes the app.** A failing sink is retried with backoff and then counted (`.failed`,
-  `.dropped_oversized`, …) rather than raised — a broken destination degrades logging, nothing more.
+  `.dropped_oversized`, `.dropped_unadjudicated`, …) rather than raised — a broken destination
+  degrades logging, nothing more.
   The one deliberate exception is a `MultiSink` whose children *all* failed: it re-raises so the
   worker's retry engages, since nothing was delivered and there are no duplicates to risk. That
   still doesn't reach your code — the worker is what catches it.
@@ -476,6 +477,14 @@ Sentry envelopes over HTTP.
 chain — log-foundry adds none of its own. Each re-chunks every batch to the service's hard per-request
 limits, retries partial failures, and drops any single event too large to ever fit (counted on
 `.dropped_oversized`).
+
+`KinesisSink` and `FirehoseSink` learn which records failed **positionally** — the response carries a
+parallel array with no ids — so they check that it describes as many records as were sent before
+acting on it. A response that doesn't is not used to adjudicate any record in the chunk: the chunk is
+abandoned rather than re-sent (some of it almost certainly landed), counted on
+`.dropped_unadjudicated`, and named on stderr. A non-zero value there is real loss, and normally
+means the client isn't AWS-shaped. `SQSSink` and `SNSSink` correlate by explicit `Id` instead, so
+they can't mis-pair and have no such counter.
 
 | Sink | Import from | Configure |
 |---|---|---|

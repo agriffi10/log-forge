@@ -12,13 +12,23 @@ import json
 import sys
 from typing import Any
 
+from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 
 __all__ = ["FirehoseSink"]
 
 
 class FirehoseSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Firehose delivery stream."""
+    """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Firehose delivery stream.
+
+    Three counters report what was not delivered: ``failed`` (the delivery stream told us these
+    failed, and they still failed after ``max_retries``), ``dropped_oversized`` (too large for the
+    per-record limit to ever accept), and ``dropped_unadjudicated`` (a ``put_record_batch`` response
+    whose ``RequestResponses`` did not describe the chunk that was sent, so no record in it could be
+    paired to an outcome). A non-zero ``dropped_unadjudicated`` means those records were abandoned
+    without the stream ever confirming them — treat it as loss, and as a sign the client is not
+    AWS-shaped.
+    """
 
     MAX_RECORDS = 500  # put_record_batch hard limit: records per request
     MAX_REQUEST_BYTES = 4 * 1024 * 1024  # 4 MB per put_record_batch request
@@ -34,6 +44,7 @@ class FirehoseSink:
         self.max_retries = max_retries
         self.failed = 0
         self.dropped_oversized = 0
+        self.dropped_unadjudicated = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunk to put_record_batch limits and send each chunk, retrying failures (FR-004)."""
@@ -74,14 +85,17 @@ class FirehoseSink:
             )
             if not response.get("FailedPutCount"):
                 return
-            results = response.get("RequestResponses", [])
-            records = [
-                record
-                # strict=False states today's behaviour. A short `results` would silently
-                # truncate this retry list — see the note in kinesis.py.
-                for record, result in zip(records, results, strict=False)
-                if result.get("ErrorCode")
-            ]
+            results = usable_results(response.get("RequestResponses"))
+            verdict = adjudicate_positional(records, results)
+            if verdict.unadjudicated:
+                self.dropped_unadjudicated += verdict.unadjudicated
+                sys.stderr.write(
+                    f"log-foundry: FirehoseSink could not adjudicate a put_record_batch response "
+                    f"({len(records)} record(s) sent, {len(results)} result(s) returned); "
+                    f"{verdict.unadjudicated} record(s) abandoned\n"
+                )
+                return
+            records = verdict.retry
             if not records:
                 return
             if attempt >= self.max_retries:
