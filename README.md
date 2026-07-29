@@ -595,9 +595,27 @@ returns a snapshot of the worker's counters:
 
 ```python
 h = log_foundry.health()
-if h.dropped or h.failed_batches:
+if h.dropped or h.failed_batches or h.stopped_reason:
     ...  # logs were silently lost — worth an alert
 ```
+
+The three tell you different things, and they want different responses:
+
+| Field | Means | What to do |
+|---|---|---|
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Tune `batch_size`/`flush_interval`, or scale the sink. |
+| `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
+| `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
+
+`stopped_reason` is a type name (e.g. `"SystemExit"`), never the exception's message — a sink's
+error text can carry event data. It reads `None` for a healthy worker, for a process that has never
+logged, and after a clean `shutdown()`, so a plain truthiness check is safe. Without it a dead
+thread showed up only indirectly, as `dropped` climbing once the queue filled — the wrong signal,
+pointing at the wrong fix.
+
+Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and gained a
+fourth field in `v0.7.0`, so unpacking it whole — `queued, dropped, failed = health()` — raises
+`ValueError` from that version on.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
