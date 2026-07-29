@@ -111,8 +111,12 @@ batch response positionally without checking the arrays line up, so a short resp
 retry list and the chunk reported success: the same silent-loss shape as SPEC-017, in the two sinks
 it did not reach. The length check now lives in `sinks/_batch.py`, used by both, and an
 unadjudicable chunk is abandoned against a new `dropped_unadjudicated` counter.
-**SPEC-018 is merged but unreleased** — it is the next tag. No spec is in flight; the next
-initiative needs a new spec.
+**SPEC-018 is merged but unreleased** — it is the next tag.
+**SPEC-019 (worker liveness and terminal-failure reporting) is Draft and unbuilt** — the drain
+thread has no terminal-failure path, so anything escaping its loop (`SystemExit` above all, which
+CPython's thread bootstrap discards silently) stops delivery with nothing recorded, while `health()`
+keeps reporting a healthy snapshot until the queue fills and `dropped` climbs — the wrong signal,
+since `dropped` already means backpressure.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
