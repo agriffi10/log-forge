@@ -53,13 +53,15 @@ def flush(timeout: float | None = 5.0) -> bool:
 def health() -> Health:
     """Snapshot the background worker's delivery counters (SPEC-017 FR-005). Never raises.
 
-    Returns ``queued`` / ``dropped`` / ``failed_batches``. A non-zero ``dropped`` means the queue
-    filled and submissions were discarded to keep your code non-blocking; a non-zero
-    ``failed_batches`` means a sink stayed broken through the whole retry budget. Both are
-    losses the library absorbs on purpose, and this is how you notice them::
+    Returns ``queued`` / ``dropped`` / ``failed_batches`` / ``stopped_reason``. A non-zero
+    ``dropped`` means the queue filled and submissions were discarded to keep your code
+    non-blocking; a non-zero ``failed_batches`` means a sink stayed broken through the whole
+    retry budget. Both are losses the library absorbs on purpose, and this is how you notice
+    them. A non-``None`` ``stopped_reason`` is worse than either: the background thread died
+    on that exception type, so nothing further will be delivered at all (SPEC-019)::
 
         h = log_foundry.health()
-        if h.dropped or h.failed_batches:
+        if h.dropped or h.failed_batches or h.stopped_reason:
             ...  # raise an alert; logs were silently lost
 
     A process that has never logged has no worker, and asking after its health does not create

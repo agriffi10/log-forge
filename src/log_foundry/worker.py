@@ -48,11 +48,19 @@ class Health(NamedTuple):
             alongside real submissions.
         dropped: Submissions discarded because the queue was full (backpressure).
         failed_batches: Batches abandoned after the retry budget was spent.
+        stopped_reason: The exception type name that terminated the drain thread, or ``None``
+            if it never died — which is also what a live worker and a process that never
+            logged report. Non-``None`` is categorically worse than the two counters above:
+            they measure loss the worker absorbed and kept running through, this one means
+            the worker is gone and nothing further will be delivered (SPEC-019 FR-003).
     """
 
     queued: int
     dropped: int
     failed_batches: int
+    # Defaulted so the zeroed snapshot in `decorator._worker_health` — and any third-party
+    # construction — keeps working unchanged.
+    stopped_reason: str | None = None
 
 
 class _FlushMarker:
@@ -92,6 +100,7 @@ class Worker:
         self.max_retries = max_retries
         self.dropped = 0  # submissions dropped because the queue was full (backpressure)
         self.failed_batches = 0  # batches abandoned after exhausting retries (worker-thread only)
+        self.stopped_reason: str | None = None  # set once if the drain loop dies (SPEC-019)
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
@@ -133,15 +142,21 @@ class Worker:
                     pass
 
     def health(self) -> Health:
-        """Snapshot the delivery counters (SPEC-017 FR-005). Never raises.
+        """Snapshot the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003). Never raises.
 
         Valid after :meth:`shutdown` — the counters are plain integers that outlive the thread,
         and the final drain consumes the queue, so ``queued`` reads 0 rather than a stale marker.
+        The same applies to ``stopped_reason``: a terminal failure stays readable afterwards,
+        since a caller finding a dead worker will usually call ``shutdown()`` next.
         """
         with self._lock:
             dropped, failed_batches = self.dropped, self.failed_batches
+            stopped_reason = self.stopped_reason
         return Health(
-            queued=self._queue.qsize(), dropped=dropped, failed_batches=failed_batches
+            queued=self._queue.qsize(),
+            dropped=dropped,
+            failed_batches=failed_batches,
+            stopped_reason=stopped_reason,
         )
 
     def flush(self, timeout: float | None = 5.0) -> bool:
@@ -195,8 +210,47 @@ class Worker:
     # -- worker thread ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Drain loop: accumulate event-lists and emit a batch on the count/time trigger."""
+        """Drain loop: accumulate event-lists and emit a batch on the count/time trigger.
+
+        Guarded end to end (SPEC-019 FR-001). ``_emit`` already absorbs an ``Exception`` from
+        the sink, so anything reaching this handler has ended the only thread that delivers —
+        and CPython's thread bootstrap discards a ``SystemExit`` without even a traceback, which
+        is why the catch is ``BaseException`` rather than ``Exception``. It records and exits;
+        looping onward past a ``KeyboardInterrupt`` would be a worse failure than the one this
+        prevents.
+        """
         pending: list[list[dict[str, object]]] = []
+        try:
+            self._drain(pending)
+        except BaseException as exc:  # deliberately broad — see the docstring
+            self._terminal_failure(exc, len(pending))
+
+    def _terminal_failure(self, exc: BaseException, undrained: int) -> None:
+        """Record the drain loop's terminal exit, then announce it (FR-001, FR-002).
+
+        Recording precedes announcing: stderr may be closed or wedged, and unlike the overflow
+        warning this line is written exactly once and cannot be re-emitted later, so the record
+        must not be able to ride on it. The exception's *type* is reported and its message is
+        not — a sink's exception text can carry event data, and arch §6 keeps caller data out of
+        places it was not asked for (the same rule behind ``sanitize``'s type-name placeholder).
+        """
+        name = type(exc).__name__
+        with self._lock:
+            self.stopped_reason = name
+        try:
+            sys.stderr.write(
+                f"log-foundry: worker thread stopped on {name}; {undrained} undrained "
+                f"event-list(s), nothing further will be delivered\n"
+            )
+        except Exception:  # best-effort: the record above is what an operator reads.
+            pass
+
+    def _drain(self, pending: list[list[dict[str, object]]]) -> None:
+        """The drain loop proper. ``pending`` is owned by :meth:`_run`, which reports its size.
+
+        It is mutated in place rather than rebound so the terminal handler sees what was still
+        in hand; a local ``pending = []`` here would leave that count reading zero.
+        """
         last_flush = time.monotonic()
         while not self._stop.is_set():
             timeout = max(0.0, self.flush_interval - (time.monotonic() - last_flush))
@@ -213,7 +267,7 @@ class Worker:
                 try:
                     if pending:
                         self._emit(pending)
-                        pending = []
+                        pending.clear()
                 finally:
                     # Signal even if the emit died, so a waiter is released rather than left to
                     # wait out its timeout on a thread that is no longer running.
@@ -226,7 +280,7 @@ class Worker:
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
                 if pending:
                     self._emit(pending)
-                    pending = []
+                    pending.clear()
                 # Advance the window even when idle (pending empty). Otherwise last_flush never
                 # moves while the queue is empty, timeout collapses to 0.0, and get(timeout=0.0)
                 # busy-spins a core. Resetting it lets the next get() block a full interval.
@@ -242,7 +296,7 @@ class Worker:
             except queue.Empty:
                 break
             if isinstance(item, _FlushMarker):
-                # This guard is a second copy of _run's and needs the same exclusion. Markers
+                # This guard is a second copy of _drain's and needs the same exclusion. Markers
                 # are answered *after* the final emit below, so a flush() that raced shutdown()
                 # still returns True — and truthfully: its events really did reach the sink.
                 markers.append(item)

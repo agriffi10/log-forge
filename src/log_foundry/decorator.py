@@ -240,7 +240,9 @@ def _worker_health() -> Health:
 
     Backs :func:`log_foundry.health` (SPEC-017 FR-005). Like :func:`_flush_worker` this
     deliberately does *not* call :func:`_get_worker`: starting a thread and registering an
-    ``atexit`` drain in order to report three zeros would be pure cost.
+    ``atexit`` drain in order to report an empty snapshot would be pure cost. That snapshot
+    reads ``stopped_reason=None`` — a worker that was never created has not died, which is why
+    SPEC-019 reports the terminal failure as a reason rather than an ``alive`` flag.
     """
     worker = _worker
     if worker is None:

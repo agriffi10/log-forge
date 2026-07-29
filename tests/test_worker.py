@@ -623,7 +623,10 @@ def test_module_health_returns_zeros_without_creating_a_worker() -> None:
 
     h = log_foundry.health()
 
-    assert h == (0, 0, 0)
+    # Compared field-wise, not as a whole tuple: SPEC-019 appended `stopped_reason`, and the
+    # advertised way to read a snapshot has always been by attribute.
+    assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
+    assert h.stopped_reason is None
     assert decorator._worker is None, "health() must not create a worker"
     assert threading.active_count() == before, "health() must not start a thread"
 
@@ -699,3 +702,139 @@ def test_overflow_warning_never_raises_into_the_caller(monkeypatch) -> None:
     finally:
         sink.release.set()
         w.shutdown()
+
+
+# -- SPEC-019: the drain thread's terminal-failure path ---------------------------------
+
+
+class TerminalSink(RecordingSink):
+    """A sink whose ``emit`` raises past ``_emit``'s ``except Exception`` and ends the thread."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def emit(self, batch: list[dict]) -> None:
+        raise self._exc
+
+
+def _dead(w) -> bool:
+    return w.health().stopped_reason is not None
+
+
+def test_system_exit_from_sink_is_recorded_and_announced(capsys) -> None:
+    """The motivating case: CPython's thread bootstrap discards SystemExit without a trace."""
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w)), "the terminal failure should be recorded"
+    assert w.health().stopped_reason == "SystemExit"
+    assert _wait_until(lambda: not w._thread.is_alive()), "the thread must not keep draining"
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert err.startswith("log-foundry: worker thread stopped on SystemExit")
+    assert "1 undrained event-list(s)" in err
+    assert "nothing further will be delivered" in err
+
+
+def test_keyboard_interrupt_from_sink_is_recorded() -> None:
+    w = Worker(TerminalSink(KeyboardInterrupt()), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w))
+    assert w.health().stopped_reason == "KeyboardInterrupt"
+
+
+def test_a_bare_base_exception_subclass_is_recorded_by_type_name() -> None:
+    class Detonation(BaseException):
+        pass
+
+    w = Worker(TerminalSink(Detonation("boom")), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w))
+    assert w.health().stopped_reason == "Detonation"
+
+
+def test_the_exception_message_is_never_reported(capsys) -> None:
+    """arch §6: a sink's exception text can carry event data, so only the type is reported."""
+    w = Worker(TerminalSink(SystemExit("secret-token-abc123")), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w))
+    assert w.health().stopped_reason == "SystemExit"
+    assert "secret-token-abc123" not in capsys.readouterr().err
+
+
+def test_an_ordinary_exception_does_not_set_stopped_reason() -> None:
+    """The non-terminal path is untouched: retried, counted, and the thread keeps running."""
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1, max_retries=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: w.health().failed_batches == 1)
+    h = w.health()
+    assert h.stopped_reason is None
+    assert w._thread.is_alive(), "an Exception is absorbed by _emit; the worker survives it"
+    w.submit(_span("b"))
+    assert _wait_until(lambda: sink.attempts >= 4), "still draining after the abandoned batch"
+    w.shutdown()
+
+
+def test_callers_are_unaffected_after_the_worker_dies() -> None:
+    """No path into the app raises once the thread is gone (architecture §4)."""
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w))
+    w.submit(_span("b"))  # queued, never drained — must not raise
+    assert w.flush(timeout=0.2) is False, "flush reports failure rather than burning its timeout"
+    w.shutdown()  # joins an already-dead thread and closes the sink
+    w.shutdown()  # still idempotent
+
+
+def test_stopped_reason_survives_shutdown() -> None:
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w))
+    w.shutdown()
+    assert w.health().stopped_reason == "SystemExit", "shutdown must not clear the diagnosis"
+
+
+def test_a_clean_run_reports_no_terminal_failure(capsys) -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1)
+    w.submit(_span("a"))
+    w.shutdown()
+    h = w.health()
+    assert h.stopped_reason is None
+    assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_process_that_never_logged_reports_no_terminal_failure() -> None:
+    """The trap that ruled out an ``alive`` flag: no worker exists, and none has died."""
+    import log_foundry
+
+    h = log_foundry.health()
+    assert h.stopped_reason is None
+    assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
+
+
+def test_existing_health_fields_keep_their_positions() -> None:
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1)
+    w.submit(_span("a"))
+    w.shutdown()
+    h = w.health()
+    assert (h[0], h[1], h[2]) == (h.queued, h.dropped, h.failed_batches)
+    assert len(h) == 4
+
+
+def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:
+    """The line is written once and cannot be re-emitted, so the record must not ride on it."""
+    import io
+
+    class BrokenStderr(io.TextIOBase):
+        def write(self, s: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("sys.stderr", BrokenStderr())
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+    assert _wait_until(lambda: _dead(w)), "recording precedes announcing"
+    assert w.health().stopped_reason == "SystemExit"
