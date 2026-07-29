@@ -23,6 +23,7 @@ to status only — no prose.
 | [SPEC-016](SPEC-016-sqs-fifo-support.md) | FIFO Queue Support for `SQSSink` | Completed | SPEC-005 |
 | [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Completed | SPEC-001, SPEC-004, SPEC-006 |
 | [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Completed | SPEC-010, SPEC-017 |
+| [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Draft | SPEC-004, SPEC-017 |
 
 ## Arcs (build order)
 
@@ -55,3 +56,7 @@ Group related specs and record the order to build them in. Delete this section i
   adjudicate a batch response by position without checking the arrays line up, so a short response
   truncates the retry list and the chunk reports success. Same promise, same failure shape, found by
   a linter rather than an audit. Standalone; nothing depends on it.
+  **SPEC-019** closes the arc one level up, at the thread all three run on: the drain loop has no
+  terminal-failure path, so an escape stops delivery with nothing recorded and `health()` — the
+  detector SPEC-017 added — keeps reporting a healthy snapshot. Same promise, same failure shape,
+  found by reading the code that SPEC-018's own review had just been pointed at. Standalone.
