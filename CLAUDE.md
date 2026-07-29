@@ -116,8 +116,12 @@ terminal-failure path, so anything escaping its loop (`SystemExit` above all, wh
 bootstrap discards silently) stopped delivery with nothing recorded, while `health()` kept reporting
 a healthy snapshot until the queue filled and `dropped` climbed — the wrong signal, since `dropped`
 already means backpressure. `_run` is now guarded and `Health` carries `stopped_reason`.
-**SPEC-018 + SPEC-019 ship together in `v0.7.0`** (as SPEC-013 + SPEC-014 did in `v0.3.0`). No spec
-is in flight; the next initiative needs a new spec.
+**SPEC-018 + SPEC-019 ship together in `v0.7.0`** (as SPEC-013 + SPEC-014 did in `v0.3.0`).
+**SPEC-020 (integer value bounds) is Draft and unbuilt** — `int` is the one type `sanitize` returns
+unbounded, and CPython 3.11+ refuses to render one past 4300 digits (`sys.get_int_max_str_digits`),
+so `json.dumps` raises: into the caller on the orphan path, and into a whole abandoned batch inside
+a span. Verified against `v0.7.0` — `log_foundry.info("m", n=10**5000)` raises. It is the last hole
+in SPEC-017's own guarantee.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 

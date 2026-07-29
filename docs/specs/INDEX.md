@@ -24,6 +24,7 @@ to status only — no prose.
 | [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Completed | SPEC-001, SPEC-004, SPEC-006 |
 | [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Completed | SPEC-010, SPEC-017 |
 | [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Completed | SPEC-004, SPEC-017 |
+| [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Draft | SPEC-017 |
 
 ## Arcs (build order)
 
@@ -60,3 +61,7 @@ Group related specs and record the order to build them in. Delete this section i
   terminal-failure path, so an escape stops delivery with nothing recorded and `health()` — the
   detector SPEC-017 added — keeps reporting a healthy snapshot. Same promise, same failure shape,
   found by reading the code that SPEC-018's own review had just been pointed at. Standalone.
+  **SPEC-020** closes the last hole in SPEC-017 itself: `int` is the one type left unbounded, and
+  CPython 3.11+ refuses to render one past 4300 digits, so `json.dumps` raises — into the caller on
+  the orphan path, and into a whole abandoned batch inside a span. The same promise again, this time
+  breached by the spec that made the promise. Standalone.
