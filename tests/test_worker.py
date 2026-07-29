@@ -757,7 +757,10 @@ def test_the_exception_message_is_never_reported(capsys) -> None:
     """arch §6: a sink's exception text can carry event data, so only the type is reported."""
     w = Worker(TerminalSink(SystemExit("secret-token-abc123")), batch_size=1)
     w.submit(_span("a"))
-    assert _wait_until(lambda: _dead(w))
+    # Waits on the thread *exiting*, not on the record: the record is stored before the stderr
+    # write, so polling it would let this assertion run against an stderr not yet written to and
+    # pass vacuously. The thread cannot exit until the write has been attempted.
+    assert _wait_until(lambda: not w._thread.is_alive())
     assert w.health().stopped_reason == "SystemExit"
     assert "secret-token-abc123" not in capsys.readouterr().err
 
@@ -785,6 +788,27 @@ def test_callers_are_unaffected_after_the_worker_dies() -> None:
     assert w.flush(timeout=0.2) is False, "flush reports failure rather than burning its timeout"
     w.shutdown()  # joins an already-dead thread and closes the sink
     w.shutdown()  # still idempotent
+
+
+def test_a_decorated_function_is_unaffected_after_the_worker_dies() -> None:
+    """The clause of FR-001 that reaches user code: @trace still returns normally (arch §4)."""
+    import log_foundry
+    from log_foundry import decorator
+
+    log_foundry.configure(service="t", sink=TerminalSink(SystemExit(1)))
+
+    @log_foundry.trace
+    def work() -> str:
+        return "ok"
+
+    assert work() == "ok"
+    log_foundry.flush(timeout=2.0)  # force the drain that kills the thread
+    w = decorator._worker
+    assert w is not None
+    assert _wait_until(lambda: not w._thread.is_alive())
+
+    assert work() == "ok", "a dead worker must not change what a decorated function returns"
+    assert log_foundry.health().stopped_reason == "SystemExit"
 
 
 def test_stopped_reason_survives_shutdown() -> None:
@@ -836,5 +860,7 @@ def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:
     monkeypatch.setattr("sys.stderr", BrokenStderr())
     w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
     w.submit(_span("a"))
-    assert _wait_until(lambda: _dead(w)), "recording precedes announcing"
-    assert w.health().stopped_reason == "SystemExit"
+    # Thread exit, not the record: polling the record could return before the write is attempted,
+    # leaving the failing write to land on the real stderr after monkeypatch teardown.
+    assert _wait_until(lambda: not w._thread.is_alive())
+    assert w.health().stopped_reason == "SystemExit", "recording precedes announcing"

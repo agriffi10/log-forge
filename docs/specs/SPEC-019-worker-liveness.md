@@ -165,7 +165,9 @@ class Health(NamedTuple):
     queued: int
     dropped: int
     failed_batches: int
-    stopped_reason: str | None   # new — exception type name, or None if the drain never died
+    # New — exception type name, or None if the drain never died. Defaulted so the zeroed
+    # snapshot in `decorator._worker_health` (and any third-party construction) keeps working.
+    stopped_reason: str | None = None
 
 
 # on Worker, beside `dropped` / `failed_batches`, guarded by the same `_lock`:
