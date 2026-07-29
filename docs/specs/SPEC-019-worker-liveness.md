@@ -1,7 +1,7 @@
 # Spec: Worker Liveness and Terminal-Failure Reporting
 
 **ID:** SPEC-019  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-07-29  
 **Depends On:** SPEC-004, SPEC-017
 

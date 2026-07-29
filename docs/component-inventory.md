@@ -34,7 +34,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `@trace` | `src/log_foundry/decorator.py` | Span decorator (sync + async, dispatched by `iscoroutinefunction`): lifecycle, hierarchy, non-swallowing flush. |
 | level emitters + `set_baggage` | `src/log_foundry/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
 | `ConsoleWriter` | `src/log_foundry/console.py` | Synchronous human-readable `LEVEL   message` console echo (default `sys.stderr`). |
-| `Worker` | `src/log_foundry/worker.py` | Background flush: bounded queue + daemon thread, batch by count/time, retry+backoff, drop-newest backpressure, graceful `shutdown()`. |
+| `Worker` | `src/log_foundry/worker.py` | Background flush: bounded queue + daemon thread, batch by count/time, retry+backoff, drop-newest backpressure, graceful `shutdown()`; a terminal failure of the drain loop is recorded on `Health.stopped_reason` rather than ending delivery silently. |
 | `flush` | `src/log_foundry/__init__.py` (→ `Worker.flush`) | On-demand drain that does **not** retire the worker or close the sink: FIFO marker, bounded timeout, never raises, repeatable. The drain for frozen-not-exited processes (serverless). |
 | `continue_trace` | `src/log_foundry/decorator.py` | Adopt an inbound trace context (W3C `traceparent` or explicit ids) + optional baggage header; re-parents an already-open **root** span and rewrites its buffered events. Total — never raises on hostile input. |
 | `current_traceparent` / `current_trace_context` | `src/log_foundry/context.py` | Producer side: the current span as a `traceparent` string, or as a `(trace_id, span_id)` pair for payload fields. `None` when no span is active. |
