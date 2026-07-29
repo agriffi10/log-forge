@@ -111,12 +111,13 @@ batch response positionally without checking the arrays line up, so a short resp
 retry list and the chunk reported success: the same silent-loss shape as SPEC-017, in the two sinks
 it did not reach. The length check now lives in `sinks/_batch.py`, used by both, and an
 unadjudicable chunk is abandoned against a new `dropped_unadjudicated` counter.
-**SPEC-018 is merged but unreleased** — it is the next tag.
-**SPEC-019 (worker liveness and terminal-failure reporting) is Draft and unbuilt** — the drain
-thread has no terminal-failure path, so anything escaping its loop (`SystemExit` above all, which
-CPython's thread bootstrap discards silently) stops delivery with nothing recorded, while `health()`
-keeps reporting a healthy snapshot until the queue fills and `dropped` climbs — the wrong signal,
-since `dropped` already means backpressure.
+**SPEC-019 (worker liveness and terminal-failure reporting) is Completed** — the drain thread had no
+terminal-failure path, so anything escaping its loop (`SystemExit` above all, which CPython's thread
+bootstrap discards silently) stopped delivery with nothing recorded, while `health()` kept reporting
+a healthy snapshot until the queue filled and `dropped` climbed — the wrong signal, since `dropped`
+already means backpressure. `_run` is now guarded and `Health` carries `stopped_reason`.
+**SPEC-018 + SPEC-019 ship together in `v0.7.0`** (as SPEC-013 + SPEC-014 did in `v0.3.0`). No spec
+is in flight; the next initiative needs a new spec.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -169,6 +170,13 @@ since `dropped` already means backpressure.
   downstream forever, while an abandoned record is a loss counted here and now. Id-keyed responses
   (`SQSSink`, `SNSSink`) select by `Id`, cannot mis-pair, and are deliberately not unified with
   this. (SPEC-018)
+- **A dead worker is reported, not restarted — and as a *reason*, not a liveness flag** — the drain
+  loop is guarded end to end and records the exception type that ended it (`Health.stopped_reason`),
+  because `dropped` climbing already means backpressure and must not double as "the thread is gone".
+  A reason string is `None` for a live worker, a never-created one, **and** a cleanly shut-down one,
+  so it extends the alert idiom by a term; an `alive` flag would read `False` on every process that
+  has not logged yet. No auto-restart: a thread that resurrects itself fights a process trying to
+  exit. Type name only, never the exception message (arch §6). (SPEC-019)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
