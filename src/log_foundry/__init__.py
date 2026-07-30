@@ -44,10 +44,10 @@ def flush(timeout: float | None = 5.0) -> bool:
     deadline — it converts "some logs were lost" into "the invocation timed out".
 
     Returns ``False`` if the drain did not complete within ``timeout``, if the worker has
-    already been shut down or has died, or if the drain carrying these events was abandoned
-    after exhausting its retries (SPEC-021 FR-001) — a ``True`` means they were delivered, not
-    merely that a drain took place. For the cumulative record across every batch the worker has
-    sent, read :func:`health`. Never raises.
+    already been shut down or has died, or if a batch was abandoned while this call was
+    outstanding (SPEC-021 FR-001) — a ``True`` means the events were delivered, not merely that
+    a drain took place. A batch lost *before* the call is outside this call's window and belongs
+    to :func:`health`, whose ``failed_batches`` is the cumulative record. Never raises.
     """
     from log_foundry.decorator import _flush_worker
 

@@ -1001,12 +1001,27 @@ def test_shutdown_still_returns_nothing_and_still_drains() -> None:
     assert sink.closed == 1, "and still closes the sink"
 
 
-def test_a_second_concurrent_flush_does_not_report_the_first_ones_loss_as_success() -> None:
-    """Both flushes cover the same events; the first emits and abandons them, the second finds
-    `pending` already cleared. Answering it from its own (empty) emit reported a delivery that
-    never happened — the same false success, one interleaving further out."""
-    sink = AlwaysFailSink()
-    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+class BlockingFailSink(RecordingSink):
+    """Blocks inside ``emit`` until released, then fails — so a test can queue markers behind an
+    emit that is *known* to be in flight, instead of racing the worker for the ordering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_emit = threading.Event()
+        self.release = threading.Event()
+
+    def emit(self, batch: list[dict]) -> None:
+        self.in_emit.set()
+        self.release.wait()
+        raise RuntimeError("sink down")
+
+
+def test_every_flush_outstanding_over_a_lost_batch_reports_the_loss() -> None:
+    """All four flushes cover the same events and are queued before the emit fails. Answering
+    each from its *own* emit told the three that found `pending` already cleared that all was
+    well — the same false success, one interleaving further out."""
+    sink = BlockingFailSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0, max_retries=0)
     results: list[bool] = []
     lock = threading.Lock()
 
@@ -1016,33 +1031,44 @@ def test_a_second_concurrent_flush_does_not_report_the_first_ones_loss_as_succes
             results.append(ok)
 
     try:
-        w.submit(_span("doomed"))  # submitted before *both* calls: both must answer for it
+        w.submit(_span("doomed"))
+        assert sink.in_emit.wait(2.0), "the emit must be in flight before the flushes are called"
         threads = [threading.Thread(target=_flush) for _ in range(4)]
         for t in threads:
             t.start()
+        # Every marker is queued while the doomed emit is still running, so no flush can be
+        # called after the abandonment and legitimately report success.
+        assert _wait_until(lambda: w._queue.qsize() >= 4), "all four markers queued"
+        sink.release.set()
         for t in threads:
             t.join(5.0)
 
         assert results == [False] * 4, f"every flush must report the loss, got {results}"
+        assert w.failed_batches == 1, "one batch, one abandonment — reported to all four"
         assert sink.events == []
     finally:
+        sink.release.set()
         w.shutdown()
 
 
-def test_a_flush_after_an_abandoned_batch_does_not_report_success() -> None:
-    """Sequential form of the same hole, and it needs no flush to open it: the batch_size
-    trigger abandons the batch, and the flush that follows has nothing left to drain."""
-    sink = AlwaysFailSink()
+def test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes() -> None:
+    """The other side of the same rule. A flush reports on what was lost while it was
+    outstanding; a batch abandoned before it was called is `health().failed_batches`' business.
+    Answering from a running "has anything ever failed" flag would make every later empty flush
+    report a failure it did not incur — and an empty drain is a successful one."""
+    sink = FlakySink(fail_times=1)
     w = Worker(sink, batch_size=1, flush_interval=100.0, max_retries=0)
     try:
-        w.submit(_span("doomed"))
+        w.submit(_span("lost"))
         assert _wait_until(lambda: w.failed_batches == 1), "the trigger should abandon it"
-        assert w.flush(timeout=5.0) is False, "nothing pending, but nothing delivered either"
 
-        # And the verdict is not permanent: a later drain that succeeds reports success.
-        w.submit(_span("fine"))
-        w.sink = RecordingSink()
+        assert w.flush(timeout=5.0) is True, "nothing pending, and nothing lost since"
+        assert w.failed_batches == 1, "the loss is still on the record where it belongs"
+
+        w.submit(_span("kept"))  # the sink has recovered by now
         assert w.flush(timeout=5.0) is True, "a healthy drain must not inherit the old failure"
+        assert [e["message"] for e in sink.events] == ["kept"]
+        assert w.flush(timeout=5.0) is True, "and it does not come back on the next empty flush"
     finally:
         w.shutdown()
 

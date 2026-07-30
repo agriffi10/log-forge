@@ -646,14 +646,19 @@ explicitly when you need to be certain the tail reached the sink before a fast e
 end of a short script. It is idempotent.
 
 `flush(timeout=5.0)` returns `True` when the events submitted before the call **reached the
-sink**, and `False` otherwise: on timeout, when the worker was already shut down or has died,
-and when the drain carrying them was abandoned after the sink refused every retry. A `True` is
-evidence of delivery, not merely that a drain took place — which matters most in the serverless
-case below, where the return value is all you get. It reports on the drain that carried *these*
-events; for the cumulative record across every batch the worker has sent, read `health()`
-above. It never raises — a logging call must not be the reason
-your function fails. Passing `timeout=None` waits indefinitely, which is unsafe anywhere with an
-execution deadline.
+sink**, and `False` otherwise: on timeout, when the worker was already shut down or has died, and
+when a batch was abandoned while the call was outstanding. A `True` is evidence of delivery, not
+merely that a drain took place — which matters most in the serverless case below, where the return
+value is all you get.
+
+It answers for its own window: the drain it forces, plus anything the worker abandoned while it
+waited its turn. A batch lost *before* you called it is deliberately outside that window — that
+loss is already counted in `health().failed_batches` and reported on stderr, and folding it in
+would make every later `flush()` in the process report a failure it did not incur. Use `flush()`
+for "did this invocation's logs get out", and `health()` for "has anything been lost at all".
+
+It never raises — a logging call must not be the reason your function fails. Passing
+`timeout=None` waits indefinitely, which is unsafe anywhere with an execution deadline.
 
 #### Serverless / short-lived processes
 
