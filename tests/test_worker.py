@@ -733,7 +733,7 @@ def test_system_exit_from_sink_is_recorded_and_announced(capsys) -> None:
     err = capsys.readouterr().err
     assert err.count("\n") == 1
     assert err.startswith("log-foundry: worker thread stopped on SystemExit")
-    assert "1 undrained event-list(s)" in err
+    assert "1 undrained event-list(s) held and 0 queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
 
 
@@ -1156,3 +1156,59 @@ def test_a_flush_answered_by_a_dying_final_drain_is_not_stranded() -> None:
     ok, elapsed = flushed[0]
     assert ok is False, "the batch died with the thread; that is not a delivery"
     assert elapsed < 5.0, f"released promptly, not at the timeout — took {elapsed:.3f}s"
+
+
+# -- SPEC-021 FR-002: the terminal-failure line accounts for everything undelivered ------
+
+
+class BlockingTerminalSink(RecordingSink):
+    """Blocks inside ``emit`` until released, then ends the thread — so the test can queue
+    work behind the dying worker deterministically rather than racing it."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+        self.in_emit = threading.Event()
+        self.release = threading.Event()
+
+    def emit(self, batch: list[dict]) -> None:
+        self.in_emit.set()
+        self.release.wait()
+        raise self._exc
+
+
+def test_the_line_reports_both_what_was_held_and_what_was_queued(capsys) -> None:
+    """Held alone under-reads the loss: nothing will drain the queue either."""
+    sink = BlockingTerminalSink(SystemExit("tok3n-not-in-the-line"))
+    w = Worker(sink, batch_size=1, flush_interval=100.0)
+    w.submit(_span("held"))  # pulled by the thread → emit blocks with this in `pending`
+    assert sink.in_emit.wait(2.0), "worker should have entered emit"
+    for i in range(3):
+        w.submit(_span(i))  # queued behind the blocked worker
+    assert _wait_until(lambda: w._queue.qsize() == 3)
+    sink.release.set()
+
+    assert _wait_until(lambda: not w._thread.is_alive())
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1, "still exactly one line"
+    assert err.startswith("log-foundry: worker thread stopped on SystemExit"), "type name only"
+    assert "1 undrained event-list(s) held and 3 queued item(s) undelivered" in err
+    assert "tok3n" not in err, "still never the exception's message"
+
+
+def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> None:
+    """`qsize()` is not guaranteed on every platform's queue; the diagnosis must not ride on it."""
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+
+    def _unavailable() -> int:
+        raise NotImplementedError("qsize is not supported here")
+
+    w._queue.qsize = _unavailable  # type: ignore[method-assign]
+    w.submit(_span("a"))
+
+    assert _wait_until(lambda: not w._thread.is_alive())
+    assert w.stopped_reason == "SystemExit", "the record is still set, and set first"
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "1 undrained event-list(s) held and ? queued item(s) undelivered" in err
+    assert "nothing further will be delivered" in err

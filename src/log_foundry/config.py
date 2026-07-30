@@ -24,6 +24,15 @@ class Config:
     The four ``max_*`` ceilings bound every event payload (SPEC-017 FR-002). Defaults are set so
     that the overwhelming majority of events are untouched; they exist to stop *one* pathological
     value getting a whole event rejected by a sink's hard limit.
+
+    ``max_value_bytes`` carries **two units**, deliberately (SPEC-020, recorded by SPEC-021): a
+    string is measured in UTF-8 bytes, an integer in the decimal length it renders as, sign
+    included. They coincide for ASCII digits, and one ceiling covering "how big may a single
+    value get" beat a second config key for a distinction almost no one configures. An integer is
+    also bounded by ``sys.get_int_max_str_digits()`` whenever that is lower, since a longer one
+    cannot be rendered at all.
+
+    They bound each *value*, not the event as a whole — see arch §13 Known Constraints.
     """
 
     service: str = "unknown"
@@ -31,7 +40,7 @@ class Config:
     env: str = "dev"
     sink: Sink | None = None
     defaults: dict[str, object] = field(default_factory=dict)
-    max_value_bytes: int = 8192  # per str value, UTF-8 bytes
+    max_value_bytes: int = 8192  # per value: UTF-8 bytes for a str, rendered digits for an int
     max_stack_bytes: int = 32768  # error.stack only — legitimately long, and worth keeping
     max_keys: int = 256  # per mapping / sequence
     max_depth: int = 8  # nesting levels

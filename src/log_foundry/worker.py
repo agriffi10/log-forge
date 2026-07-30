@@ -308,14 +308,30 @@ class Worker:
         must not be able to ride on it. The exception's *type* is reported and its message is
         not — a sink's exception text can carry event data, and arch §6 keeps caller data out of
         places it was not asked for (the same rule behind ``sanitize``'s type-name placeholder).
+
+        The count reports what was *in hand* and what was still *queued behind it* (SPEC-021
+        FR-002). Held alone under-reads the loss: nothing will drain the queue either, so an
+        operator reading "1 undrained event-list(s)" could conclude far less was lost than was.
+
+        The queued figure is "items", not "event-lists", and says so: like ``Health.queued`` it is
+        read without stopping the world, so it counts any internal flush/shutdown marker sitting
+        alongside real submissions, and a producer thread can add to the queue between the death
+        and the read. It is a floor on what was lost, which is the useful direction.
         """
         name = type(exc).__name__
         with self._lock:
             self.stopped_reason = name
         try:
+            # In its own guard, and after the record: ``qsize()`` is not guaranteed on every
+            # platform's queue, and a diagnostic must not be the reason the diagnosis is lost.
+            queued: object = self._queue.qsize()
+        except Exception:
+            queued = "?"
+        try:
             sys.stderr.write(
                 f"log-foundry: worker thread stopped on {name}; {undrained} undrained "
-                f"event-list(s), nothing further will be delivered\n"
+                f"event-list(s) held and {queued} queued item(s) undelivered, nothing further "
+                f"will be delivered\n"
             )
         except Exception:  # best-effort: the record above is what an operator reads.
             pass
