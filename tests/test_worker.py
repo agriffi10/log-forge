@@ -899,12 +899,15 @@ def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
 def test_a_failing_flush_returns_promptly_rather_than_at_the_timeout() -> None:
     """`False` must come from the answered marker, not from the caller waiting out `timeout`."""
     sink = AlwaysFailSink()
-    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+    # A real retry budget, so the bound below is load-bearing: three attempts plus backoff take
+    # a measurable but bounded time, and anything that strands the waiter blows a 30s timeout.
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=2)
     try:
         w.submit(_span("doomed"))
         start = time.monotonic()
         assert w.flush(timeout=30.0) is False
         elapsed = time.monotonic() - start
+        assert sink.attempts == 3, "the retry budget really was spent inside the flush"
         assert elapsed < 5.0, f"the waiter was stranded, took {elapsed:.3f}s"
     finally:
         w.shutdown()
@@ -988,8 +991,119 @@ def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
     assert sink.events == []
 
 
-def test_shutdown_still_returns_nothing() -> None:
+def test_shutdown_still_returns_nothing_and_still_drains() -> None:
     """FR-001 changes what `flush()` reports; `shutdown()` deliberately reports nothing."""
-    w = Worker(AlwaysFailSink(), batch_size=1000, flush_interval=100.0, max_retries=0)
-    w.submit(_span("doomed"))
-    assert w.shutdown() is None
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    w.submit(_span("tail"))
+    assert w.shutdown() is None, "shutdown must not grow a return value"
+    assert [e["message"] for e in sink.events] == ["tail"], "and it still drains"
+    assert sink.closed == 1, "and still closes the sink"
+
+
+def test_a_second_concurrent_flush_does_not_report_the_first_ones_loss_as_success() -> None:
+    """Both flushes cover the same events; the first emits and abandons them, the second finds
+    `pending` already cleared. Answering it from its own (empty) emit reported a delivery that
+    never happened — the same false success, one interleaving further out."""
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def _flush() -> None:
+        ok = w.flush(timeout=5.0)
+        with lock:
+            results.append(ok)
+
+    try:
+        w.submit(_span("doomed"))  # submitted before *both* calls: both must answer for it
+        threads = [threading.Thread(target=_flush) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5.0)
+
+        assert results == [False] * 4, f"every flush must report the loss, got {results}"
+        assert sink.events == []
+    finally:
+        w.shutdown()
+
+
+def test_a_flush_after_an_abandoned_batch_does_not_report_success() -> None:
+    """Sequential form of the same hole, and it needs no flush to open it: the batch_size
+    trigger abandons the batch, and the flush that follows has nothing left to drain."""
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0, max_retries=0)
+    try:
+        w.submit(_span("doomed"))
+        assert _wait_until(lambda: w.failed_batches == 1), "the trigger should abandon it"
+        assert w.flush(timeout=5.0) is False, "nothing pending, but nothing delivered either"
+
+        # And the verdict is not permanent: a later drain that succeeds reports success.
+        w.submit(_span("fine"))
+        w.sink = RecordingSink()
+        assert w.flush(timeout=5.0) is True, "a healthy drain must not inherit the old failure"
+    finally:
+        w.shutdown()
+
+
+def test_flush_reports_false_when_the_queue_is_too_full_for_the_marker() -> None:
+    """The fourth pre-existing `False` path, which had no test of its own."""
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0, max_queue=1)
+    try:
+        w.submit(_span("a"))  # pulled by the thread → emit blocks, holding the worker
+        assert sink.in_emit.wait(2.0), "worker should have entered emit"
+        w.submit(_span("b"))  # fills the queue (max_queue=1)
+
+        start = time.monotonic()
+        assert w.flush(timeout=0.1) is False, "the marker never got in, so nothing was drained"
+        assert time.monotonic() - start < 1.0, "and the put timeout bounds the wait"
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+
+def test_a_flush_answered_by_a_dying_final_drain_is_not_stranded() -> None:
+    """A BaseException from the final emit must release the waiter, not hold it to `timeout`."""
+
+    class BlockingTerminalSink(RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_emit = threading.Event()
+            self.release = threading.Event()
+
+        def emit(self, batch: list[dict]) -> None:
+            self.in_emit.set()
+            self.release.wait()
+            raise SystemExit(1)
+
+    sink = BlockingTerminalSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0)
+    flushed: list[tuple[bool, float]] = []
+
+    def _flush() -> None:
+        start = time.monotonic()
+        ok = w.flush(timeout=10.0)
+        flushed.append((ok, time.monotonic() - start))
+
+    w.submit(_span("a"))
+    assert sink.in_emit.wait(2.0), "worker should have entered emit"
+    w.submit(_span("b"))
+    flusher = threading.Thread(target=_flush)
+    flusher.start()
+    stopper = threading.Thread(target=w.shutdown)
+    try:
+        assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
+        stopper.start()
+        assert _wait_until(w._stop.is_set), "shutdown should have signalled the stop"
+    finally:
+        sink.release.set()
+
+    stopper.join(10.0)
+    flusher.join(10.0)
+
+    assert len(flushed) == 1, "the waiter was never released"
+    ok, elapsed = flushed[0]
+    assert ok is False, "the batch died with the thread; that is not a delivery"
+    assert elapsed < 5.0, f"released promptly, not at the timeout — took {elapsed:.3f}s"

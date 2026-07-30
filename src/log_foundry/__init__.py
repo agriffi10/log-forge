@@ -30,10 +30,11 @@ except PackageNotFoundError:  # running from a source tree that isn't installed
 def flush(timeout: float | None = 5.0) -> bool:
     """Drain buffered events through the sink without closing it.
 
-    Every event submitted before this call reached the sink when it returns ``True``. (Events
-    submitted concurrently by another thread may or may not be included — the caller cannot
-    have meant those.) Unlike :func:`shutdown` the background worker stays alive and the sink
-    stays open, so logging continues normally afterwards.
+    ``True`` means the events submitted before this call reached the sink; ``False`` means the
+    drain carrying them was abandoned, or never completed. (Events submitted concurrently by
+    another thread may or may not be included — the caller cannot have meant those.) Unlike
+    :func:`shutdown` the background worker stays alive and the sink stays open, so logging
+    continues normally afterwards.
 
     This is the drain for a process that is *frozen* rather than exited — an AWS Lambda
     handler must drain before it returns, but will be invoked again on the same warm
@@ -43,9 +44,10 @@ def flush(timeout: float | None = 5.0) -> bool:
     deadline — it converts "some logs were lost" into "the invocation timed out".
 
     Returns ``False`` if the drain did not complete within ``timeout``, if the worker has
-    already been shut down or has died, or if the drain ran and the batch it forced was
-    abandoned after exhausting its retries (SPEC-021 FR-001) — a ``True`` means the events
-    were delivered, not merely that a drain took place. Never raises.
+    already been shut down or has died, or if the drain carrying these events was abandoned
+    after exhausting its retries (SPEC-021 FR-001) — a ``True`` means they were delivered, not
+    merely that a drain took place. For the cumulative record across every batch the worker has
+    sent, read :func:`health`. Never raises.
     """
     from log_foundry.decorator import _flush_worker
 

@@ -78,15 +78,21 @@ class _FlushMarker:
     ``delivered`` carries the drain's *outcome* back to the waiter, not merely the fact that the
     marker was reached (SPEC-021 FR-001). It is written by the drain thread before ``event.set()``
     and read by the waiter after ``event.wait()`` returns, so the ``Event`` supplies the ordering
-    and no further lock is needed. It starts ``True`` because a drain with nothing pending is a
-    successful drain, not a failed one.
+    and no further lock is needed.
+
+    It starts ``False``, not ``True``: every path that answers a marker assigns the outcome
+    explicitly, so the default is only ever read when the drain thread died between releasing the
+    waiter and computing an answer. "I could not establish that this was delivered" is the honest
+    reading of that, and the empty-drain success it might otherwise stand in for is supplied by
+    ``Worker._emit_pending`` instead. (The spec's Data Model sketched the default as ``True``,
+    before the concurrent-flush case moved the empty-drain answer onto the worker.)
     """
 
     __slots__ = ("delivered", "event")
 
     def __init__(self) -> None:
         self.event = threading.Event()
-        self.delivered = True
+        self.delivered = False
 
 
 class Worker:
@@ -108,6 +114,9 @@ class Worker:
         self.dropped = 0  # submissions dropped because the queue was full (backpressure)
         self.failed_batches = 0  # batches abandoned after exhausting retries (worker-thread only)
         self.stopped_reason: str | None = None  # set once if the drain loop dies (SPEC-019)
+        # The outcome of the most recent emit, answering a flush() marker that finds nothing left
+        # to drain (SPEC-021 FR-001). Drain-thread-only: written and read there, never elsewhere.
+        self._last_delivered = True
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
@@ -171,11 +180,16 @@ class Worker:
 
         Returns ``True`` once the worker has *delivered* them — ``False`` on timeout, on a worker
         already shut down or dead, on a queue too full to accept the marker, and when the drain
-        ran but the batch it forced was abandoned after exhausting retries (SPEC-021 FR-001).
-        That last case used to return ``True``: the drain had run, so the marker was answered
-        regardless of what came of the emit. It is a false success exactly where ``flush()``
-        matters most — a serverless handler draining before the environment freezes has the
-        return value as its only evidence the tail of the queue survived.
+        carrying those events was abandoned after exhausting retries (SPEC-021 FR-001). That last
+        case used to return ``True``: the drain had run, so the marker was answered regardless of
+        what came of the emit. It is a false success exactly where ``flush()`` matters most — a
+        serverless handler draining before the environment freezes has the return value as its
+        only evidence the tail of the queue survived.
+
+        "The drain carrying those events" is the precise claim: the answer comes from the emit
+        that covered what was ahead of this marker, which may be one another flush() or a batching
+        trigger already forced. It is not a verdict on every batch the worker has ever sent —
+        ``health().failed_batches`` is the cumulative record.
 
         Unlike :meth:`shutdown` the thread keeps running, the sink is **not** closed, and the
         once-only shutdown flag is untouched, so logging continues normally afterwards
@@ -240,6 +254,31 @@ class Worker:
             self._drain(pending)
         except BaseException as exc:  # deliberately broad — see the docstring
             self._terminal_failure(exc, len(pending))
+            self._release_waiters()
+
+    def _release_waiters(self) -> None:
+        """Answer every ``flush()`` marker still queued, so no caller waits out its timeout.
+
+        A ``BaseException`` from the main loop skips ``_final_drain`` entirely, which is where
+        queued markers are normally answered — leaving a waiter to sit for its full ``timeout``
+        on a thread that is never coming back. FR-001 requires the waiter to be released on every
+        path, and this is the last one.
+
+        The markers are *read* out of the queue rather than consumed: the queued event-lists are
+        the evidence ``health().queued`` and the terminal line report, and answering a waiter must
+        not erase it. Each keeps its pessimistic ``delivered``, which is the truth here.
+
+        Residual race, stated rather than papered over: a ``flush()`` that passed its liveness
+        check microseconds before the thread died can still enqueue a marker after this sweep, and
+        that one waits out its timeout — and then returns ``False``, which is correct either way.
+        """
+        try:
+            with self._queue.mutex:  # a snapshot, so a marker cannot be missed mid-iteration
+                markers = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
+            for marker in markers:
+                marker.event.set()
+        except Exception:  # this runs *after* the record and the stderr line; neither may be lost
+            pass
 
     def _terminal_failure(self, exc: BaseException, undrained: int) -> None:
         """Record the drain loop's terminal exit, then announce it (FR-001, FR-002).
@@ -281,18 +320,12 @@ class Worker:
                 # marker must never fall through to the append below, where it would be treated
                 # as a list of events and handed to sink.emit, killing this thread.
                 try:
-                    if pending:
-                        # False *before* the call, not after: `_emit` absorbs an `Exception`, but
-                        # a `BaseException` from a sink escapes it and would leave the marker's
-                        # optimistic default standing — reporting a delivery to a waiter whose
-                        # events died with this thread (SPEC-021 FR-001).
-                        item.delivered = False
-                        item.delivered = self._emit(pending)
-                        pending.clear()
+                    item.delivered = self._emit_pending(pending)
                 finally:
                     # Signal even if the emit died, so a waiter is released rather than left to
                     # wait out its timeout on a thread that is no longer running. A failing flush
-                    # therefore returns False promptly rather than at the caller's timeout.
+                    # therefore returns False promptly rather than at the caller's timeout, and
+                    # an emit that died leaves the marker's pessimistic default standing.
                     last_flush = time.monotonic()
                     item.event.set()
                 continue
@@ -300,14 +333,36 @@ class Worker:
                 pending.append(cast("list[dict[str, object]]", item))
             now = time.monotonic()
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
-                if pending:
-                    self._emit(pending)
-                    pending.clear()
+                self._emit_pending(pending)
                 # Advance the window even when idle (pending empty). Otherwise last_flush never
                 # moves while the queue is empty, timeout collapses to 0.0, and get(timeout=0.0)
                 # busy-spins a core. Resetting it lets the next get() block a full interval.
                 last_flush = now
         self._final_drain(pending)
+
+    def _emit_pending(self, pending: list[list[dict[str, object]]]) -> bool:
+        """Emit ``pending`` if there is any, and return the outcome a marker should report.
+
+        The outcome is *recorded* (``_last_delivered``) rather than derived from this call alone,
+        because a marker that arrives with ``pending`` already empty is not thereby successful —
+        the events ahead of it in the FIFO were emitted by the most recent emit, so that emit's
+        outcome is its answer (SPEC-021 FR-001). Without this, two concurrent ``flush()`` calls
+        over the same events had the first emit-and-abandon them and the second, finding nothing
+        left to do, report ``True``: the same false success this spec exists to remove, one
+        interleaving further out. Found by the fresh-context review.
+
+        Called only from the drain thread, which is also the only reader, so ``_last_delivered``
+        needs no lock. It starts ``True``: a process that has never emitted has never lost
+        anything, so its first flush is a successful empty drain.
+        """
+        if pending:
+            # False *before* the call, not after: ``_emit`` absorbs an ``Exception``, but a
+            # ``BaseException`` from a sink escapes it and would otherwise leave the previous
+            # (possibly successful) outcome standing for a batch that died with this thread.
+            self._last_delivered = False
+            self._last_delivered = self._emit(pending)
+            pending.clear()
+        return self._last_delivered
 
     def _final_drain(self, pending: list[list[dict[str, object]]]) -> None:
         """On stop, pull anything still queued and emit the tail as one final batch."""
@@ -320,20 +375,21 @@ class Worker:
             if isinstance(item, _FlushMarker):
                 # This guard is a second copy of _drain's and needs the same exclusion. Markers
                 # are answered *after* the final emit below, so a flush() that raced shutdown()
-                # still returns True — and truthfully: its events really did reach the sink.
+                # is answered by the drain that carried its events — with that drain's outcome.
                 markers.append(item)
                 continue
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
-        delivered = True  # nothing to emit is a successful drain, as in the marker branch.
-        if pending:
-            delivered = False  # unproven until `_emit` returns — see the marker branch.
-            delivered = self._emit(pending)
-        for marker in markers:
-            # Same outcome rule as the marker branch: a flush() that raced shutdown() is answered
-            # by this final emit, and answered with what actually came of it (SPEC-021 FR-001).
-            marker.delivered = delivered
-            marker.event.set()
+        try:
+            delivered = self._emit_pending(pending)
+            for marker in markers:
+                marker.delivered = delivered
+        finally:
+            # In a ``finally`` so a ``BaseException`` from the final emit cannot strand a waiter
+            # for its whole timeout — the markers are released carrying their pessimistic
+            # default, which is the truth about a batch that died with this thread.
+            for marker in markers:
+                marker.event.set()
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> bool:
         """Flatten queued per-span event-lists into one batch and emit, retrying with backoff.
@@ -342,10 +398,11 @@ class Worker:
         abandoned with a counted warning and draining continues, so a broken sink never crashes
         the worker thread or the app (FR-002, FR-003).
 
-        Returns whether the batch reached the sink — ``False`` only on the abandon path, which is
-        the same event that increments ``failed_batches``. A caller-facing ``flush()`` reads it
-        (SPEC-021 FR-001); the batching triggers ignore it, since a batch that failed its whole
-        retry budget is gone and there is nothing further for the loop to do about it.
+        Returns whether the batch reached the sink. ``False`` means the abandon path below — the
+        same event that increments ``failed_batches`` — or, for a negative ``max_retries``, a loop
+        that makes no attempt at all. :meth:`_emit_pending` records it for a caller-facing
+        ``flush()`` (SPEC-021 FR-001); the batching triggers do nothing further with it, since a
+        batch that failed its whole retry budget is gone.
         """
         batch = [event for events in event_lists for event in events]
         if not batch:
