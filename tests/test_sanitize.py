@@ -520,8 +520,26 @@ def test_a_negative_key_is_bounded_with_its_sign_too() -> None:
     # `integer()`, so at a ceiling shorter than the placeholder the placeholder is itself clipped
     # to the truncation marker. That is SPEC-017 behaviour and not what this test is about.
     cfg = Config(max_value_bytes=30)
-    fields, truncated = sanitize_fields({"d": {-(10**29): "big", 10**29: "ok", -1: "small"}}, cfg=cfg)
+    payload = {"d": {-(10**29): "big", 10**29: "ok", -1: "small"}}
+    fields, truncated = sanitize_fields(payload, cfg=cfg)
     assert fields["d"]["-1"] == "small", "an ordinary negative key still renders as its digits"
     assert fields["d"][str(10**29)] == "ok", "30 digits unsigned still fits the same ceiling"
     assert "<int: ~30 digits>" in fields["d"], "31 rendered bytes does not, and is named"
     assert truncated is True
+
+
+def test_the_sign_test_cannot_be_diverted_by_an_int_subclass() -> None:
+    """`value < 0` would dispatch to user code; one hostile key would take its siblings."""
+
+    class Hostile(int):
+        def __lt__(self, other: object) -> bool:
+            raise RuntimeError("boom")
+
+    fields, _ = sanitize_fields({"d": {Hostile(-5): "v", "ok": 1}}, cfg=Config())
+    assert fields["d"] == {"-5": "v", "ok": 1}, "the sibling key must survive the hostile one"
+
+    class Liar(int):
+        def __lt__(self, other: object) -> bool:
+            return False  # claims to be non-negative, to buy a byte past the ceiling
+
+    assert isinstance(coerce(Liar(-(10**9)), cfg=Config(max_value_bytes=10)), str)

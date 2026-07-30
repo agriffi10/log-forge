@@ -733,7 +733,7 @@ def test_system_exit_from_sink_is_recorded_and_announced(capsys) -> None:
     err = capsys.readouterr().err
     assert err.count("\n") == 1
     assert err.startswith("log-foundry: worker thread stopped on SystemExit")
-    assert "1 undrained event-list(s) held and 0 still queued" in err
+    assert "1 undrained event-list(s) held and 0 queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
 
 
@@ -1179,7 +1179,7 @@ class BlockingTerminalSink(RecordingSink):
 
 def test_the_line_reports_both_what_was_held_and_what_was_queued(capsys) -> None:
     """Held alone under-reads the loss: nothing will drain the queue either."""
-    sink = BlockingTerminalSink(SystemExit(1))
+    sink = BlockingTerminalSink(SystemExit("tok3n-not-in-the-line"))
     w = Worker(sink, batch_size=1, flush_interval=100.0)
     w.submit(_span("held"))  # pulled by the thread → emit blocks with this in `pending`
     assert sink.in_emit.wait(2.0), "worker should have entered emit"
@@ -1192,8 +1192,8 @@ def test_the_line_reports_both_what_was_held_and_what_was_queued(capsys) -> None
     err = capsys.readouterr().err
     assert err.count("\n") == 1, "still exactly one line"
     assert err.startswith("log-foundry: worker thread stopped on SystemExit"), "type name only"
-    assert "1 undrained event-list(s) held and 3 still queued" in err
-    assert "SystemExit(1)" not in err, "still never the exception's message"
+    assert "1 undrained event-list(s) held and 3 queued item(s) undelivered" in err
+    assert "tok3n" not in err, "still never the exception's message"
 
 
 def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> None:
@@ -1210,5 +1210,5 @@ def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> 
     assert w.stopped_reason == "SystemExit", "the record is still set, and set first"
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    assert "1 undrained event-list(s) held and ? still queued" in err
+    assert "1 undrained event-list(s) held and ? queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err

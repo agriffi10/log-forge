@@ -286,6 +286,8 @@ class _Coercer:
         O(1), total, and ignores the sign — so the minus sign is added back explicitly, since the
         ceiling measures what the value *renders* as and ``-10**9`` renders as eleven bytes
         (SPEC-021 FR-003). The placeholder still names the digit count: a sign is not a digit.
+        The sign is read through an *unbound* ``int.__lt__``, which an ``int`` subclass cannot
+        divert; ``bit_length()`` stays the one trusted call, as below.
 
         An over-long integer is *replaced*, not clipped. Dropping digits would silently change the
         value, and a wrong number is worse than a visibly elided one — so this reuses the
@@ -298,7 +300,12 @@ class _Coercer:
         ``type()`` check to catch only a value engineered to lie about itself.
         """
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
-        rendered = digits + 1 if value < 0 else digits
+        # ``int.__lt__`` unbound, never ``value < 0``: on an ``int`` *subclass* the operator
+        # dispatches to user code, which can raise — and a raise here is caught up in
+        # :meth:`value`, replacing the whole enclosing mapping and taking every sibling key with
+        # it, which is precisely what :meth:`key` was written to prevent. The unbound call reads
+        # the underlying integer and cannot be overridden.
+        rendered = digits + 1 if int.__lt__(value, 0) else digits
         if rendered <= _int_digit_ceiling(self._cfg.max_value_bytes):
             return value
         self.truncated = True
