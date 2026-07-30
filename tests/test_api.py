@@ -149,3 +149,75 @@ def test_every_emitted_event_is_json_serializable(lf, fake_sink) -> None:
     work()
     for event in fake_sink.events:
         json.dumps(event)  # must not raise for any event the pipeline produced
+
+
+# -- SPEC-020 FR-004: an over-long int must not raise into the caller either --------------
+
+# Past CPython's default int->str conversion limit, where json.dumps refuses to render.
+_HUGE = 10**5000
+
+
+def test_orphan_log_with_an_over_long_int_does_not_raise(lf, fake_sink) -> None:
+    """The same failure SPEC-017 fixed for unserializable objects, reached through a number.
+
+    Before SPEC-020 this raised ValueError in the caller's own stack frame: the orphan path
+    emits synchronously, and json.dumps refuses an int past sys.get_int_max_str_digits().
+    """
+    import json
+
+    lf.info("m", n=_HUGE, ok=7)  # no active span — must return normally
+
+    event = fake_sink.batches[-1][-1]
+    json.dumps(event)  # the guarantee: every sink can serialize what it is handed
+    assert event["fields"]["ok"] == 7, "the sound fields survive alongside the elided one"
+    assert event["fields"]["n"].startswith("<int: ~")
+    assert event["truncated"] is True
+
+
+def test_an_over_long_int_inside_a_span_does_not_destroy_its_batch(lf, fake_sink) -> None:
+    """Inside a span the value reached the sink, json.dumps raised, and the retry loop abandoned
+    the whole flattened batch — taking co-batched events from unrelated spans with it.
+
+    Driven through a real ``Worker`` rather than the fixture's inline flush, so the co-batching
+    and the abandon path are the real ones: ``batch_size=2`` against a long interval makes the
+    second submission flush both spans as exactly one batch, and the sink serializes as any real
+    sink does. Before SPEC-020 that ``json.dumps`` raised and ``failed_batches`` went to 1.
+    """
+    import json
+
+    from log_foundry.worker import Worker
+
+    @lf.trace(name="poisoned")
+    def poisoned() -> None:
+        lf.info("big", n=_HUGE)
+
+    @lf.trace(name="innocent")
+    def innocent() -> None:
+        lf.info("small", n=1)
+
+    contextvars.copy_context().run(poisoned)
+    contextvars.copy_context().run(innocent)
+    poisoned_events, innocent_events = fake_sink.batches[0], fake_sink.batches[1]
+
+    class JsonSink:
+        def __init__(self) -> None:
+            self.batches: list[list[dict]] = []
+
+        def emit(self, batch: list[dict]) -> None:
+            json.dumps(batch)
+            self.batches.append(list(batch))
+
+        def close(self) -> None:
+            pass
+
+    sink = JsonSink()
+    worker = Worker(sink, batch_size=2, flush_interval=60.0)
+    worker.submit(poisoned_events)
+    worker.submit(innocent_events)
+    worker.shutdown()
+
+    assert len(sink.batches) == 1, "both spans must land in one flattened batch"
+    messages = [event["message"] for event in sink.batches[0]]
+    assert "big" in messages
+    assert "small" in messages, "the unrelated span survives intact"
+    assert worker.health().failed_batches == 0, "the batch was delivered, not abandoned"

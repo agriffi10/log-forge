@@ -707,9 +707,27 @@ Every event is the same shape (arch §6). Boundary events add a few fields:
 | `duration_ms` | span.end | wall time from a monotonic delta |
 | `status` | span.end | `"ok"` or `"error"` |
 | `error` | on failure | `{"type": ..., "stack": ...}` |
+| `truncated` | when a ceiling fired | `true`; absent otherwise, never `false` |
 
 IDs are [W3C Trace Context](https://www.w3.org/TR/trace-context/)-compatible by design, so the
 logs can later correlate with distributed traces cheaply.
+
+### Field values are coerced and bounded
+
+Every value you pass is made JSON-safe and given a size ceiling once, when the event is assembled
+— so no sink can be handed a payload JSON refuses, and no single field can grow without limit.
+Strings are clipped to `max_value_bytes` (8192 by default), mappings and sequences to `max_keys`
+entries and `max_depth` levels. `datetime`, `UUID`, `Decimal`, `bytes` and friends render as
+strings; anything with no JSON form becomes `<unserializable: TypeName>` — the type name only,
+never a `repr`, so coercion can never leak a value the library was careful not to capture.
+
+Integers are the one case worth knowing about. They are passed through unchanged — an ID or an
+amount stays a number, at full precision — but an integer too long to *render* is replaced by
+`<int: ~N digits>`. CPython refuses to convert an integer past `sys.get_int_max_str_digits()`
+decimal digits (**4300** by default) and raises, and `json.dumps` inherits that refusal, so with
+the default configuration the interpreter's limit — not `max_value_bytes` — is what binds. You are
+unlikely to meet it deliberately; `int.from_bytes(blob, "big")` over a couple of kilobytes gets
+there. Any ceiling firing sets `truncated: true` on the event.
 
 ## Development
 

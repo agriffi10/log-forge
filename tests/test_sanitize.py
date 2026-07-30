@@ -331,3 +331,140 @@ def test_sanitize_fields_returns_a_new_mapping() -> None:
     out, _ = sanitize_fields(original, cfg=CFG)
     assert out == original
     assert out is not original
+
+
+# -- SPEC-020: integer bounds -----------------------------------------------------------
+
+# Past CPython's default `sys.get_int_max_str_digits()` (4300), where `str()` itself raises.
+_HUGE = 10**5000
+
+
+def test_an_ordinary_int_is_unchanged_and_still_an_int() -> None:
+    cfg = Config()
+    for n in (0, 1, -1, 4200, -4200, 2**62, -(2**62)):
+        out = coerce(n, cfg=cfg)
+        assert out == n
+        assert type(out) is int, "the common case must not become a string or lose precision"
+
+
+def test_an_over_long_int_is_replaced_by_a_placeholder() -> None:
+    out = coerce(_HUGE, cfg=Config())
+    assert isinstance(out, str)
+    assert out.startswith("<int: ~")
+    assert out.endswith(" digits>")
+
+
+def test_negatives_are_bounded_identically_to_positives() -> None:
+    cfg = Config()
+    assert coerce(-_HUGE, cfg=cfg) == coerce(_HUGE, cfg=cfg), "the sign must not shift the bound"
+
+
+def test_bool_is_untouched() -> None:
+    cfg = Config()
+    assert coerce(True, cfg=cfg) is True, "bool is an int subclass but must stay a bool"
+    assert coerce(False, cfg=cfg) is False
+
+
+def test_a_float_is_untouched() -> None:
+    assert coerce(1.5e308, cfg=Config()) == 1.5e308  # IEEE-754 bounds it already
+
+
+def test_the_replacement_sets_the_truncated_flag() -> None:
+    fields, truncated = sanitize_fields({"n": _HUGE}, cfg=Config())
+    assert truncated is True
+    assert isinstance(fields["n"], str)
+
+    _, untruncated = sanitize_fields({"n": 4200}, cfg=Config())
+    assert untruncated is False
+
+
+def test_an_over_long_int_is_bounded_wherever_it_is_nested() -> None:
+    cfg = Config()
+    fields, _ = sanitize_fields(
+        {
+            "mapping": {"k": _HUGE},
+            "list": [_HUGE],
+            "tuple": (_HUGE,),
+            "set": {_HUGE},
+            "deep": {"a": {"b": [{"c": _HUGE}]}},
+        },
+        cfg=cfg,
+    )
+    assert isinstance(fields["mapping"]["k"], str)
+    assert isinstance(fields["list"][0], str)
+    assert isinstance(fields["tuple"][0], str)
+    assert isinstance(next(iter(fields["set"])), str)
+    assert isinstance(fields["deep"]["a"]["b"][0]["c"], str)
+
+
+def test_an_int_valued_enum_member_is_bounded() -> None:
+    class Big(enum.Enum):
+        HUGE = _HUGE
+
+    class BigInt(enum.IntEnum):
+        SMALL = 3
+
+    out = coerce(Big.HUGE, cfg=Config())
+    assert isinstance(out, str)
+    assert out.startswith("<int: ~")
+    assert coerce(BigInt.SMALL, cfg=Config()) == 3, "an in-range IntEnum still degrades to its value"
+
+
+def test_an_int_subclass_is_bounded() -> None:
+    class Weight(int):
+        pass
+
+    out = coerce(Weight(_HUGE), cfg=Config())
+    assert isinstance(out, str)
+    assert coerce(Weight(7), cfg=Config()) == 7
+
+
+def test_coercion_is_total_at_absurd_magnitudes() -> None:
+    cfg = Config()
+    for n in (10**100000, -(10**100000), 2**1000000):
+        assert isinstance(coerce(n, cfg=cfg), str)  # no ValueError escapes
+
+
+def test_the_result_is_always_json_serializable() -> None:
+    """The guarantee SPEC-017 stated and this closes: json.dumps never refuses an event."""
+    fields, _ = sanitize_fields({"n": _HUGE, "ok": 1, "deep": [{"x": 2**100000}]}, cfg=Config())
+    json.dumps(fields)  # would raise ValueError on an unbounded int
+
+
+def test_the_ceiling_never_admits_an_int_str_would_refuse() -> None:
+    """FR-002: where the bit_length arithmetic is inexact it must err toward replacing."""
+    import sys
+
+    limit = sys.get_int_max_str_digits()
+    cfg = Config()
+    admitted = 0
+    # Both ends of each digit band: 10**(d-1) is the smallest d-digit number, 10**d - 1 the
+    # largest — the dangerous end, where an under-estimating bound would let one slip through.
+    for digits in range(limit - 3, limit + 4):
+        for n in (10 ** (digits - 1), 10**digits - 1):
+            out = coerce(n, cfg=cfg)
+            if type(out) is int:
+                str(out)  # must not raise — that is the whole contract
+                admitted += 1
+    assert admitted, "the walk must admit some values, or it proves nothing about over-replacing"
+
+
+def test_a_configured_ceiling_below_the_interpreter_limit_wins() -> None:
+    cfg = Config(max_value_bytes=10)
+    assert isinstance(coerce(10**20, cfg=cfg), str), "20 digits exceeds a 10-byte ceiling"
+    assert coerce(123, cfg=cfg) == 123
+
+
+def test_an_over_long_int_key_does_not_destroy_its_mapping() -> None:
+    """A bare ``str(key)`` raised here, and the failure took every sibling key with it."""
+    fields, truncated = sanitize_fields({"d": {"ok": 1, _HUGE: 2}}, cfg=Config())
+    assert fields["d"]["ok"] == 1, "the sibling key must survive the hostile one"
+    assert any(k.startswith("<int: ~") for k in fields["d"]), "the elided key is named, not dropped"
+    assert truncated is True
+    json.dumps(fields)
+
+
+def test_an_ordinary_int_key_still_renders_as_its_digits() -> None:
+    fields, _ = sanitize_fields({"d": {7: "seven", True: "yes"}}, cfg=Config())
+    assert fields["d"]["7"] == "seven"
+    assert fields["d"]["True"] == "yes", "a bool key is its name, not 1"
