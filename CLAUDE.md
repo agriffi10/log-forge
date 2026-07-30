@@ -121,8 +121,13 @@ already means backpressure. `_run` is now guarded and `Health` carries `stopped_
 unbounded, and CPython 3.11+ refuses to render one past 4300 digits (`sys.get_int_max_str_digits`),
 so `json.dumps` raised: into the caller on the orphan path, and into a whole abandoned batch inside
 a span. An over-long integer is now replaced by `<int: ~N digits>`, mapping keys included. It closed
-the last hole in SPEC-017's own guarantee. **Merged but unreleased** — a bug fix against `v0.7.0`,
-so the next tag is a patch. No spec is in flight.
+the last hole in SPEC-017's own guarantee. Shipped in **`v0.7.1`**.
+**SPEC-021 (open-item cleanup) is Draft and unbuilt** — the 017..020 arc left 17 delivery-doc notes
+and `architecture.md` §12 has carried 3 open items since before the first line of code; a reader
+cannot tell live defects from settled decisions. Two SPEC-017 notes are now false (019 and 020 fixed
+them). The real wart: `flush()` returns `True` when the drain it forced was abandoned — a false
+success in the serverless path it was built for. Everything else is fixed, settled, or recorded as a
+constraint.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
