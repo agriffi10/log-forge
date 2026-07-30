@@ -747,6 +747,12 @@ the default configuration the interpreter's limit — not `max_value_bytes` — 
 unlikely to meet it deliberately; `int.from_bytes(blob, "big")` over a couple of kilobytes gets
 there. Any ceiling firing sets `truncated: true` on the event.
 
+`max_value_bytes` therefore carries two units: **UTF-8 bytes** for a string, **rendered decimal
+length** (sign included) for an integer. They coincide for ASCII digits, and one ceiling for "how
+big may a single value get" was preferred to a second config key. Note that all four ceilings
+bound each *value* — an event of many bounded values can still be large; see
+[Known constraints](docs/architecture.md#known-constraints).
+
 ## Development
 
 ```bash

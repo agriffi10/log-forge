@@ -468,3 +468,60 @@ def test_an_ordinary_int_key_still_renders_as_its_digits() -> None:
     fields, _ = sanitize_fields({"d": {7: "seven", True: "yes"}}, cfg=Config())
     assert fields["d"]["7"] == "seven"
     assert fields["d"]["True"] == "yes", "a bool key is its name, not 1"
+
+
+# -- SPEC-021 FR-003: the ceiling counts the minus sign ----------------------------------
+
+
+def test_a_negative_int_is_measured_with_its_sign() -> None:
+    """`Config(max_value_bytes=10)` used to admit -10**9, which renders as eleven bytes."""
+    cfg = Config(max_value_bytes=10)
+    assert coerce(10**9, cfg=cfg) == 10**9, "ten digits fits a ten-byte ceiling"
+    out = coerce(-(10**9), cfg=cfg)
+    assert isinstance(out, str), "eleven rendered bytes does not"
+    assert out.startswith("<int: ~10 digits>"), "the sign is not a digit, and is not counted as one"
+
+
+def test_the_sign_only_matters_at_the_boundary() -> None:
+    """One rendered byte, not a halved ceiling: a negative one digit shorter still fits."""
+    cfg = Config(max_value_bytes=10)
+    assert coerce(-(10**8), cfg=cfg) == -(10**8), "nine digits plus a sign is ten bytes"
+    for n in (-1, -4200, -(2**62)):
+        out = coerce(n, cfg=Config())
+        assert out == n
+        assert type(out) is int, "the common path must not shift at all"
+
+
+def test_a_negative_ints_replacement_still_renders_and_serializes() -> None:
+    cfg = Config(max_value_bytes=10)
+    fields, truncated = sanitize_fields({"n": -(10**9)}, cfg=cfg)
+    assert truncated is True
+    json.dumps(fields)
+
+
+def test_the_ceiling_never_admits_a_negative_int_str_would_refuse() -> None:
+    """SPEC-020 FR-002 still holds on the side the sign now shifts."""
+    import sys
+
+    limit = sys.get_int_max_str_digits()
+    cfg = Config()
+    admitted = 0
+    for digits in range(limit - 3, limit + 4):
+        for n in (-(10 ** (digits - 1)), -(10**digits - 1)):
+            out = coerce(n, cfg=cfg)
+            if type(out) is int:
+                str(out)  # must not raise
+                admitted += 1
+    assert admitted, "the walk must admit some values, or it proves nothing about over-replacing"
+
+
+def test_a_negative_key_is_bounded_with_its_sign_too() -> None:
+    # A 30-byte ceiling, not the 10-byte one above: a mapping key goes through `text()` after
+    # `integer()`, so at a ceiling shorter than the placeholder the placeholder is itself clipped
+    # to the truncation marker. That is SPEC-017 behaviour and not what this test is about.
+    cfg = Config(max_value_bytes=30)
+    fields, truncated = sanitize_fields({"d": {-(10**29): "big", 10**29: "ok", -1: "small"}}, cfg=cfg)
+    assert fields["d"]["-1"] == "small", "an ordinary negative key still renders as its digits"
+    assert fields["d"][str(10**29)] == "ok", "30 digits unsigned still fits the same ceiling"
+    assert "<int: ~30 digits>" in fields["d"], "31 rendered bytes does not, and is named"
+    assert truncated is True

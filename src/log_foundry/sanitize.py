@@ -74,6 +74,11 @@ def _int_digit_ceiling(max_value_bytes: int) -> int:
     raises ``ValueError``, which ``json.dumps`` inherits. A configured ceiling above that cannot be
     honoured — rendering such an integer is the very thing that raises — so the interpreter's limit
     wins whenever it is lower. A limit of ``0`` means the interpreter imposes none.
+
+    The caller measures a negative value's rendered length, sign included, against this; the
+    interpreter's own limit counts digits only. A negative integer sitting exactly on the
+    interpreter bound is therefore replaced rather than rendered — one value at the far edge, in
+    the direction this module always errs (SPEC-021 FR-003).
     """
     limit = sys.get_int_max_str_digits()
     return max_value_bytes if limit <= 0 else min(max_value_bytes, limit)
@@ -278,7 +283,9 @@ class _Coercer:
         The size test is ``bit_length()``, never ``len(str(value))``: converting an over-long
         integer to a string raises the very ``ValueError`` this bound exists to prevent, so the
         obvious check would move the crash rather than remove it (FR-002). ``bit_length()`` is
-        O(1), total, and ignores the sign, so ``n`` and ``-n`` are bounded identically.
+        O(1), total, and ignores the sign — so the minus sign is added back explicitly, since the
+        ceiling measures what the value *renders* as and ``-10**9`` renders as eleven bytes
+        (SPEC-021 FR-003). The placeholder still names the digit count: a sign is not a digit.
 
         An over-long integer is *replaced*, not clipped. Dropping digits would silently change the
         value, and a wrong number is worse than a visibly elided one — so this reuses the
@@ -291,7 +298,8 @@ class _Coercer:
         ``type()`` check to catch only a value engineered to lie about itself.
         """
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
-        if digits <= _int_digit_ceiling(self._cfg.max_value_bytes):
+        rendered = digits + 1 if value < 0 else digits
+        if rendered <= _int_digit_ceiling(self._cfg.max_value_bytes):
             return value
         self.truncated = True
         return f"<int: ~{digits} digits>"
