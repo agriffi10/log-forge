@@ -38,7 +38,6 @@ postgres = ["psycopg[binary]>=3.1"]
 [tool.poetry]
 # Poetry still requires this field to exist; it is only a placeholder.
 # The real value is injected from Git tags during the build.
-version = "0.0.0"
 
 # src layout: map the package from the src/ directory
 packages = [
@@ -58,6 +57,8 @@ exclude = [
 
 # Development-only dependencies (not shipped to consumers).
 # Install with: poetry install --with dev
+version = "0.0.0"
+
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0"
 pytest-asyncio = "^1.4.0"        # for testing async @trace (guide Phase 8)

@@ -193,6 +193,17 @@ constraint.
   so it extends the alert idiom by a term; an `alive` flag would read `False` on every process that
   has not logged yet. No auto-restart: a thread that resurrects itself fights a process trying to
   exit. Type name only, never the exception message (arch §6). (SPEC-019)
+- **`flush()` reports delivery, and answers from the drain that carried the events** — the marker
+  brings the emit's *outcome* back, so `True` means the sink took them, not merely that a drain
+  ran. A marker that finds nothing pending inherits the outcome of the emit that carried what was
+  ahead of it in the FIFO — otherwise a second concurrent flush reports success for events the
+  first one just abandoned. It is not a verdict on every batch ever sent; `health().failed_batches`
+  is the cumulative record. (SPEC-021)
+- **An open item is closed by being fixed, settled, or recorded as a constraint — never deleted** —
+  a note that is merely removed takes its reasoning with it, and a reader cannot tell a live defect
+  from a decision that reads like one. Superseded notes are struck through in place and marked with
+  the spec that closed them; `architecture.md` §12 carries no open items and §13 states the
+  constraints. (SPEC-021)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

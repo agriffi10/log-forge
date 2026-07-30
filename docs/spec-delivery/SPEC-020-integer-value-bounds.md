@@ -43,18 +43,34 @@ missing `truncated` row. Slightly wider than the spec's letter.
 
 ## Notes for the next spec
 
+*Reconciled by SPEC-021 — one of these was a defect it fixed; the rest are settled or constraints.*
+
 - **The bound trusts `bit_length()`.** An `int` subclass overriding it to understate its magnitude
   defeats the check, and nothing raises, so the totality guard never engages. Documented in
   `integer()` as the trust boundary it is; narrowing it would cost the common path a `type()` check
   to catch only a value engineered to lie about itself.
-- **The sign is not counted against the byte budget.** `Config(max_value_bytes=10)` admits `-10**9`,
-  which renders as 11 bytes. Only reachable at absurdly small configured ceilings.
+  → **Settled** (SPEC-021, named in its Out of Scope). Worth noting that the *sign* test added by
+  SPEC-021 is deliberately **not** inside that boundary: it uses an unbound `int.__lt__`, because a
+  `<` on a subclass dispatches to user code that can raise, and a raise there would replace the
+  whole enclosing mapping. `bit_length()` remains the one trusted call.
+- ~~**The sign is not counted against the byte budget.** `Config(max_value_bytes=10)` admits
+  `-10**9`, which renders as 11 bytes. Only reachable at absurdly small configured ceilings.~~
+  → **Fixed by SPEC-021 (FR-003).** The ceiling measures rendered length, sign included. It also
+  closed a case this note did not notice: at a small ceiling an over-long negative *key* was
+  admitted by `integer()` and then clipped by `text()`, so the key rendered as a truncated number
+  rather than being named as elided.
 - **Over-replacement is bounded and tiny** — the largest admitted value is `2**14284 - 1`, itself a
   full 4300-digit number, so the rule only clips the top ~18% of the final digit band.
+  → **Settled** (SPEC-021). Quantifies the `log10(2)` over-estimate as acceptable; not an action.
+  SPEC-021 adds one value to it: a negative integer sitting exactly on the interpreter's own limit,
+  since that limit counts digits and this ceiling counts rendered length.
 - **`max_value_bytes` now means two things** — UTF-8 bytes for a string, decimal digits for an
   integer. They coincide for ASCII digits, but a future ceiling change should keep that in mind.
+  → **Documented by SPEC-021 (FR-004)**, in `Config` and the README, rather than renamed or split
+  — a new or renamed config key would be a breaking change for a cosmetic gain.
 - **The ceilings still bound per *value*, not per event.** Unchanged from SPEC-017 and still out of
   scope.
+  → **Constraint** (SPEC-021), now stated in `architecture.md` §13. See SPEC-017's note.
 
 ## Verification
 
