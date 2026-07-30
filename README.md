@@ -645,9 +645,19 @@ lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained
 explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
 end of a short script. It is idempotent.
 
-`flush(timeout=5.0)` returns `True` when every event submitted before the call has been passed
-to the sink, and `False` if that did not happen within `timeout` (or the worker was already shut
-down). It never raises — a logging call must not be the reason your function fails. Passing
+`flush(timeout=5.0)` returns `True` when **nothing was lost while the call was outstanding** — the
+drain it forces reached the sink, and so did anything else the worker emitted while it waited its
+turn. It returns `False` on timeout, when the worker was already shut down or has died, and when
+any batch was abandoned inside that window. A `True` is evidence of delivery, not merely that a
+drain took place.
+
+The window starts when you call it. A batch abandoned *before* that is deliberately not its
+business: the loss is already counted in `health().failed_batches` and reported on stderr, and
+folding it in would make every later `flush()` in the process report a failure it did not incur.
+So `flush()` answers "did the logs I am waiting on get out", and `health()` answers "has anything
+been lost at all" — **check both**, as the handler below does.
+
+It never raises — a logging call must not be the reason your function fails. Passing
 `timeout=None` waits indefinitely, which is unsafe anywhere with an execution deadline.
 
 #### Serverless / short-lived processes
@@ -679,9 +689,17 @@ def handler(event, context):
     try:
         return do_work(event)
     finally:
-        lf.flush()      # in `finally`: the failed invocation is the one worth logging.
-                        # NEVER shutdown() here — the worker does not come back, and every
-                        # later invocation on this warm container would log nothing.
+        # In `finally`: the failed invocation is the one worth logging. NEVER shutdown() here —
+        # the worker does not come back, and every later invocation on this warm container
+        # would log nothing.
+        drained = lf.flush()
+        h = lf.health()
+        if not drained or h.failed_batches or h.dropped or h.stopped_reason:
+            # `drained` covers this invocation's tail; the counters cover anything the worker
+            # lost earlier — a batch its own interval trigger already gave up on, for instance.
+            # Emitting this through your platform's own logger keeps it outside the pipeline
+            # that just failed.
+            print(f"log-foundry: undelivered logs ({drained=}, {h=})")
 ```
 
 By default each invocation is its own trace, so N invocations produce N `trace_id`s. To join
