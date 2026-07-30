@@ -479,9 +479,10 @@ def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
     try:
         w.submit(_span("doomed"))
-        # The drain completed — the events were passed to sink.emit, which is the guarantee.
-        # The sink's failure is reported through failed_batches, not by raising at the caller.
-        assert w.flush(timeout=5.0) is True
+        # The drain ran and the failure is reported through the return value and
+        # failed_batches, not by raising at the caller (SPEC-021 FR-001 changed the first of
+        # those from True; see test_flush_reports_false_when_the_batch_is_abandoned).
+        assert w.flush(timeout=5.0) is False
         assert sink.events == [], "nothing was ever successfully emitted"
         assert w.failed_batches >= 1, "the failure is counted, not swallowed silently"
     finally:
@@ -864,3 +865,131 @@ def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:
     # leaving the failing write to land on the real stderr after monkeypatch teardown.
     assert _wait_until(lambda: not w._thread.is_alive())
     assert w.health().stopped_reason == "SystemExit", "recording precedes announcing"
+
+
+# -- SPEC-021 FR-001: flush() reports whether the drain it forced was delivered ----------
+
+
+def test_flush_reports_true_when_the_events_reach_the_sink() -> None:
+    """The `True` contract, stated against sink receipt rather than against the drain running."""
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        w.submit(_span("landed"))
+        assert w.flush(timeout=5.0) is True
+        assert [e["message"] for e in sink.events] == ["landed"], "True means these landed"
+        assert w.failed_batches == 0
+    finally:
+        w.shutdown()
+
+
+def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
+    """The false success SPEC-021 removes: the drain ran, the events died with the retries."""
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+    try:
+        w.submit(_span("doomed"))
+        assert w.flush(timeout=5.0) is False, "a drain that delivered nothing is not a success"
+        assert w.failed_batches == 1, "and the failure it reports is the abandoned batch"
+        assert sink.events == []
+    finally:
+        w.shutdown()
+
+
+def test_a_failing_flush_returns_promptly_rather_than_at_the_timeout() -> None:
+    """`False` must come from the answered marker, not from the caller waiting out `timeout`."""
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
+    try:
+        w.submit(_span("doomed"))
+        start = time.monotonic()
+        assert w.flush(timeout=30.0) is False
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"the waiter was stranded, took {elapsed:.3f}s"
+    finally:
+        w.shutdown()
+
+
+def test_flush_reports_true_when_there_was_nothing_pending() -> None:
+    """An empty drain is a successful one — a quiet process must not read as a failing one."""
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1000, flush_interval=100.0)
+    try:
+        assert w.flush(timeout=5.0) is True, "nothing to deliver is not a delivery failure"
+        assert sink.events == []
+        # And again after a successful flush has already drained everything.
+        w.submit(_span("a"))
+        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0) is True, "the second flush has nothing left to do"
+    finally:
+        w.shutdown()
+
+
+def test_flush_reports_true_when_the_sink_recovers_mid_retry() -> None:
+    """Retries are part of the delivery, not a failure of it: the events did reach the sink."""
+    sink = FlakySink(fail_times=2)
+    w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=3)
+    try:
+        w.submit(_span("eventually"))
+        assert w.flush(timeout=5.0) is True
+        assert [e["message"] for e in sink.events] == ["eventually"]
+        assert sink.attempts == 3, "two failures then the delivery"
+        assert w.failed_batches == 0, "a recovered batch is not an abandoned one"
+    finally:
+        w.shutdown()
+
+
+def test_flush_reports_false_on_a_dead_worker() -> None:
+    """Unchanged by this spec, and now the *same* answer as a drain that delivered nothing."""
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    try:
+        w.submit(_span("a"))
+        assert _wait_until(lambda: not w._thread.is_alive())
+        assert w.flush(timeout=5.0) is False
+    finally:
+        w.shutdown()
+
+
+def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
+    """The `_final_drain` copy of the rule: answered from the tail emit, with its outcome.
+
+    The mirror of ``test_shutdown_answers_a_marker_left_in_the_queue``, which pins the `True`
+    side of the same path.
+    """
+
+    class BlockingThenFailingSink(BlockingSink):
+        def emit(self, batch: list[dict]) -> None:
+            self.in_emit.set()
+            self.release.wait()
+            raise RuntimeError("sink is down")
+
+    sink = BlockingThenFailingSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0, max_retries=0)
+    flushed: list[bool] = []
+
+    w.submit(_span("a"))  # pulled by the thread → emit blocks, holding the worker
+    assert sink.in_emit.wait(2.0), "worker should have entered emit"
+    w.submit(_span("b"))  # queues up behind the blocked worker
+
+    flusher = threading.Thread(target=lambda: flushed.append(w.flush(timeout=5.0)))
+    flusher.start()
+    stopper = threading.Thread(target=w.shutdown)
+    try:
+        assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
+        stopper.start()
+        assert _wait_until(w._stop.is_set), "shutdown should have signalled the stop"
+    finally:
+        sink.release.set()
+
+    stopper.join(5.0)
+    flusher.join(5.0)
+
+    assert flushed == [False], "the final drain's emit failed, so the flush it answered failed"
+    assert sink.events == []
+
+
+def test_shutdown_still_returns_nothing() -> None:
+    """FR-001 changes what `flush()` reports; `shutdown()` deliberately reports nothing."""
+    w = Worker(AlwaysFailSink(), batch_size=1000, flush_interval=100.0, max_retries=0)
+    w.submit(_span("doomed"))
+    assert w.shutdown() is None

@@ -645,10 +645,13 @@ lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained
 explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
 end of a short script. It is idempotent.
 
-`flush(timeout=5.0)` returns `True` when every event submitted before the call has been passed
-to the sink, and `False` if that did not happen within `timeout` (or the worker was already shut
-down). It never raises — a logging call must not be the reason your function fails. Passing
-`timeout=None` waits indefinitely, which is unsafe anywhere with an execution deadline.
+`flush(timeout=5.0)` returns `True` when every event submitted before the call **reached the
+sink**, and `False` otherwise: on timeout, when the worker was already shut down or has died,
+and when the drain ran but the sink refused the batch through every retry. A `True` is evidence
+of delivery, not merely that a drain took place — which matters most in the serverless case
+below, where the return value is all you get. It never raises — a logging call must not be the
+reason your function fails. Passing `timeout=None` waits indefinitely, which is unsafe anywhere
+with an execution deadline.
 
 #### Serverless / short-lived processes
 
