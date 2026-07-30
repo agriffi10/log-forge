@@ -437,14 +437,34 @@ def test_the_ceiling_never_admits_an_int_str_would_refuse() -> None:
 
     limit = sys.get_int_max_str_digits()
     cfg = Config()
-    # Walk the boundary from just inside to just outside the interpreter's own limit.
+    admitted = 0
+    # Both ends of each digit band: 10**(d-1) is the smallest d-digit number, 10**d - 1 the
+    # largest — the dangerous end, where an under-estimating bound would let one slip through.
     for digits in range(limit - 3, limit + 4):
-        out = coerce(10 ** (digits - 1), cfg=cfg)
-        if type(out) is int:
-            str(out)  # must not raise — that is the whole contract
+        for n in (10 ** (digits - 1), 10**digits - 1):
+            out = coerce(n, cfg=cfg)
+            if type(out) is int:
+                str(out)  # must not raise — that is the whole contract
+                admitted += 1
+    assert admitted, "the walk must admit some values, or it proves nothing about over-replacing"
 
 
 def test_a_configured_ceiling_below_the_interpreter_limit_wins() -> None:
     cfg = Config(max_value_bytes=10)
     assert isinstance(coerce(10**20, cfg=cfg), str), "20 digits exceeds a 10-byte ceiling"
     assert coerce(123, cfg=cfg) == 123
+
+
+def test_an_over_long_int_key_does_not_destroy_its_mapping() -> None:
+    """A bare ``str(key)`` raised here, and the failure took every sibling key with it."""
+    fields, truncated = sanitize_fields({"d": {"ok": 1, _HUGE: 2}}, cfg=Config())
+    assert fields["d"]["ok"] == 1, "the sibling key must survive the hostile one"
+    assert any(k.startswith("<int: ~") for k in fields["d"]), "the elided key is named, not dropped"
+    assert truncated is True
+    json.dumps(fields)
+
+
+def test_an_ordinary_int_key_still_renders_as_its_digits() -> None:
+    fields, _ = sanitize_fields({"d": {7: "seven", True: "yes"}}, cfg=Config())
+    assert fields["d"]["7"] == "seven"
+    assert fields["d"]["True"] == "yes", "a bool key is its name, not 1"

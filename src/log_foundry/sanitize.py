@@ -257,9 +257,20 @@ class _Coercer:
             self._parents.pop()
 
     def key(self, key: object) -> str:
-        """Coerce a mapping key to a bounded ``str`` — JSON object keys are always strings."""
-        text = key if isinstance(key, str) else str(key)
-        return self.text(text)
+        """Coerce a mapping key to a bounded ``str`` — JSON object keys are always strings.
+
+        An integer key goes through :meth:`integer` first. A bare ``str()`` here would raise on an
+        over-long one — the very ``ValueError`` this module exists to keep away from a sink — and
+        the failure would be caught up in :meth:`value`, replacing the *whole mapping* with a
+        placeholder. One hostile key would take every sibling key with it, unmarked. ``bool`` is
+        excluded because ``True`` must render as the key ``"True"``, not ``"1"``.
+        """
+        if isinstance(key, str):
+            return self.text(key)
+        if isinstance(key, int) and not isinstance(key, bool):
+            rendered = self.integer(key)
+            return self.text(rendered if isinstance(rendered, str) else str(rendered))
+        return self.text(str(key))
 
     def integer(self, value: int) -> object:
         """Return ``value`` unchanged, or a placeholder when it is too long to render (FR-001).
@@ -272,6 +283,12 @@ class _Coercer:
         An over-long integer is *replaced*, not clipped. Dropping digits would silently change the
         value, and a wrong number is worse than a visibly elided one — so this reuses the
         type-naming shape of :meth:`_placeholder` rather than inventing a second elision style.
+
+        The bound trusts ``bit_length()``. An ``int`` subclass that overrides it to understate its
+        own magnitude defeats this, and nothing here can tell — the call does not raise, so the
+        totality guard in :meth:`value` never engages either. That is the same trust every coercion
+        rule extends to a subclass's dunders, and narrowing it would cost the common path a
+        ``type()`` check to catch only a value engineered to lie about itself.
         """
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
         if digits <= _int_digit_ceiling(self._cfg.max_value_bytes):
