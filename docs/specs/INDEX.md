@@ -25,6 +25,7 @@ to status only — no prose.
 | [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Completed | SPEC-010, SPEC-017 |
 | [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Completed | SPEC-004, SPEC-017 |
 | [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
+| [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Draft | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 
 ## Arcs (build order)
 
@@ -65,3 +66,7 @@ Group related specs and record the order to build them in. Delete this section i
   CPython 3.11+ refuses to render one past 4300 digits, so `json.dumps` raises — into the caller on
   the orphan path, and into a whole abandoned batch inside a span. The same promise again, this time
   breached by the spec that made the promise. Standalone.
+  **SPEC-021** closes the arc's paperwork as well as its last wart: four specs of "Notes for the
+  next spec" plus `architecture.md` §12 left 20 items a reader cannot triage, two of them now false.
+  Every item ends fixed, settled, or recorded as a constraint — and `flush()` stops returning `True`
+  for a drain that was abandoned. Standalone; nothing depends on it.
