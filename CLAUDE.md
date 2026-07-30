@@ -122,12 +122,13 @@ unbounded, and CPython 3.11+ refuses to render one past 4300 digits (`sys.get_in
 so `json.dumps` raised: into the caller on the orphan path, and into a whole abandoned batch inside
 a span. An over-long integer is now replaced by `<int: ~N digits>`, mapping keys included. It closed
 the last hole in SPEC-017's own guarantee. Shipped in **`v0.7.1`**.
-**SPEC-021 (open-item cleanup) is Draft and unbuilt** — the 017..020 arc left 17 delivery-doc notes
-and `architecture.md` §12 has carried 3 open items since before the first line of code; a reader
-cannot tell live defects from settled decisions. Two SPEC-017 notes are now false (019 and 020 fixed
-them). The real wart: `flush()` returns `True` when the drain it forced was abandoned — a false
-success in the serverless path it was built for. Everything else is fixed, settled, or recorded as a
-constraint.
+**SPEC-021 (open-item cleanup) is Completed** — the 017..020 arc left 18 delivery-doc notes and
+`architecture.md` §12 had carried 3 open items since before the first line of code, two of them
+false by then. Every one is now fixed, settled, or recorded as a constraint, and §12 carries no
+open items. The real wart is gone: `flush()` returned `True` when the drain it forced was
+abandoned — a false success in the serverless path it was built for. It now reports whether
+anything was lost while the call was outstanding. Also: the terminal-failure line counts the queue,
+and the integer ceiling counts the minus sign.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
