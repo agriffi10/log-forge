@@ -24,7 +24,7 @@ to status only — no prose.
 | [SPEC-017](SPEC-017-payload-and-failure-safety.md) | Payload and Failure Safety | Completed | SPEC-001, SPEC-004, SPEC-006 |
 | [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Completed | SPEC-010, SPEC-017 |
 | [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Completed | SPEC-004, SPEC-017 |
-| [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Draft | SPEC-017 |
+| [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
 
 ## Arcs (build order)
 
