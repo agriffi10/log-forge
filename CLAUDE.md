@@ -117,11 +117,12 @@ bootstrap discards silently) stopped delivery with nothing recorded, while `heal
 a healthy snapshot until the queue filled and `dropped` climbed — the wrong signal, since `dropped`
 already means backpressure. `_run` is now guarded and `Health` carries `stopped_reason`.
 **SPEC-018 + SPEC-019 ship together in `v0.7.0`** (as SPEC-013 + SPEC-014 did in `v0.3.0`).
-**SPEC-020 (integer value bounds) is Draft and unbuilt** — `int` is the one type `sanitize` returns
+**SPEC-020 (integer value bounds) is Completed** — `int` was the one type `sanitize` returned
 unbounded, and CPython 3.11+ refuses to render one past 4300 digits (`sys.get_int_max_str_digits`),
-so `json.dumps` raises: into the caller on the orphan path, and into a whole abandoned batch inside
-a span. Verified against `v0.7.0` — `log_foundry.info("m", n=10**5000)` raises. It is the last hole
-in SPEC-017's own guarantee.
+so `json.dumps` raised: into the caller on the orphan path, and into a whole abandoned batch inside
+a span. An over-long integer is now replaced by `<int: ~N digits>`, mapping keys included. It closed
+the last hole in SPEC-017's own guarantee. **Merged but unreleased** — a bug fix against `v0.7.0`,
+so the next tag is a patch. No spec is in flight.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -166,6 +167,12 @@ in SPEC-017's own guarantee.
   (`MultiSink`), and the guarantee reaches the non-JSON sinks too. The unserializable fallback is a
   type-name placeholder, never `repr()`, so the fix cannot widen the PII exposure arch §6 prevents.
   Ceilings bound per *value*, not per event. (SPEC-017)
+- **A value too large to *render* is replaced, never clipped** — `int` is the one type with no
+  natural ceiling, and CPython refuses to render one past `sys.get_int_max_str_digits()`, so an
+  over-long integer becomes `<int: ~N digits>`. Truncating digits would silently change the number,
+  and a wrong number is worse than a visibly elided one. Detection is `bit_length()`, never
+  `len(str(v))` — the obvious check raises the very error being prevented — with the ratio rounded
+  so it errs toward replacing. (SPEC-020)
 - **A positional response adjudicates all of a chunk or none of it** — an id-less per-record array
   must prove it describes the records sent (same length, right shape) before entry *i* may be read
   as record *i*; a mismatch is evidence of misalignment, so even the overlapping prefix is refused.
