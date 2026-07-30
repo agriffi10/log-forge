@@ -55,6 +55,12 @@ _DEPTH_LIMIT = "<depth limit>"
 _LOG10_2_NUM = 30103
 _LOG10_2_DEN = 100000
 
+# ``int.__lt__`` bound once, for the sign test in :meth:`_Coercer.integer` (SPEC-021 FR-003). The
+# unbound slot cannot be diverted by an ``int`` subclass the way ``value < 0`` can, but reaching
+# it through ``int.__lt__`` costs a global plus an attribute lookup on a per-value hot path;
+# binding it here recovers about a third of that, the same idiom as the constants above.
+_INT_LT = int.__lt__
+
 # Exact-type membership, deliberately not ``isinstance``. ``IntEnum``/``StrEnum`` members *are*
 # ``int``/``str`` instances, so an isinstance check would pass the enum member itself through and
 # hand a sink an ``Enum`` where a plain value was promised. Exact typing lets them fall to the
@@ -300,12 +306,12 @@ class _Coercer:
         ``type()`` check to catch only a value engineered to lie about itself.
         """
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
-        # ``int.__lt__`` unbound, never ``value < 0``: on an ``int`` *subclass* the operator
-        # dispatches to user code, which can raise — and a raise here is caught up in
+        # ``_INT_LT`` (unbound ``int.__lt__``), never ``value < 0``: on an ``int`` *subclass* the
+        # operator dispatches to user code, which can raise — and a raise here is caught up in
         # :meth:`value`, replacing the whole enclosing mapping and taking every sibling key with
         # it, which is precisely what :meth:`key` was written to prevent. The unbound call reads
         # the underlying integer and cannot be overridden.
-        rendered = digits + 1 if int.__lt__(value, 0) else digits
+        rendered = digits + 1 if _INT_LT(value, 0) else digits
         if rendered <= _int_digit_ceiling(self._cfg.max_value_bytes):
             return value
         self.truncated = True
