@@ -1051,6 +1051,29 @@ def test_every_flush_outstanding_over_a_lost_batch_reports_the_loss() -> None:
         w.shutdown()
 
 
+def test_a_flush_called_after_the_abandonment_reports_success() -> None:
+    """The boundary of the rule above, pinned rather than avoided.
+
+    A flush *outstanding* when a batch is abandoned reports the loss; one called afterwards has
+    an empty window and reports success. Two concurrent flushes therefore need not agree — which
+    is not a race in the mechanism but the same trade as
+    `test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes`, seen from the other
+    side. `health().failed_batches` is what reports the loss to a caller who asked too late.
+    """
+    sink = BlockingFailSink()
+    w = Worker(sink, batch_size=1, flush_interval=100.0, max_retries=0)
+    try:
+        w.submit(_span("doomed"))
+        assert sink.in_emit.wait(2.0)
+        sink.release.set()
+        assert _wait_until(lambda: w.failed_batches == 1), "the abandonment must complete first"
+
+        assert w.flush(timeout=5.0) is True, "nothing pending, and nothing lost since the call"
+        assert w.health().failed_batches == 1, "the loss is reported by health(), not by flush()"
+    finally:
+        w.shutdown()
+
+
 def test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes() -> None:
     """The other side of the same rule. A flush reports on what was lost while it was
     outstanding; a batch abandoned before it was called is `health().failed_batches`' business.

@@ -84,11 +84,18 @@ class _FlushMarker:
     this marker was created, on the *caller's* thread — against the same counter when the marker is
     answered. Equal means nothing was abandoned while this flush was outstanding, which covers both
     the batch the marker forces and any batch another flush or a batching trigger emitted in the
-    meantime. Two flushes over the same doomed events therefore both report the loss, where a
-    per-marker "did *my* emit succeed" answer told the second one, whose emit found nothing left to
-    do, that all was well. A batch abandoned *before* the call is deliberately not in scope: that
-    loss is already recorded in ``failed_batches`` and on stderr, and folding it in here would make
-    every later empty flush report a failure it did not incur.
+    meantime. So every flush *outstanding* when a batch is abandoned reports it, including the ones
+    whose own emit found nothing left to do because another marker's emit had just cleared and lost
+    it — that case was the original false success.
+
+    Two limits, both deliberate. A batch abandoned *before* the call is not in scope: that loss is
+    already in ``failed_batches`` and on stderr, and folding it in would make every later empty
+    flush report a failure it did not incur. It follows that two *concurrent* flushes need not
+    agree — one stamped before the abandonment and one after are the outstanding case and the
+    already-lost case respectively, and the race between them decides which is which. Reporting a
+    past loss and not letting a past loss stick are the same property read in opposite directions;
+    FR-001's "an empty drain is a successful one" chooses. ``health().failed_batches`` is what
+    reports a loss regardless of when anyone asked.
 
     ``delivered`` starts ``False``: every path that answers a marker assigns it explicitly, so the
     default is read only when the drain thread died without computing an answer, where "I could not
@@ -367,8 +374,7 @@ class Worker:
         marker's stamp answers "was anything lost while this flush was in flight" — which is the
         question ``flush()`` asks, and a stronger one than "did *my* emit succeed". A marker whose
         own emit found nothing pending still reports the loss if another flush's emit, or a
-        batching trigger's, abandoned a batch in the meantime: the two flushes cover the same
-        events, so they must give the same answer.
+        batching trigger's, abandoned a batch while it waited its turn.
 
         Deliberately *not* a running "has anything ever failed" flag. That would make every empty
         flush after a single bad batch report a failure it did not incur, contradicting the rule
