@@ -374,12 +374,27 @@ def write_ledger(user_id: int):
 
 ## 12. Open items
 
-- **Orphan logs** — confirm "emit standalone with fresh trace_id" (§5) vs warn-and-drop.
-- **Backpressure** — make drop-vs-block configurable (§9); pick safe default.
-- **Console echo defaults** — confirm destination (stdout vs stderr), default line format,
-  and whether an `echo_level` auto-echo threshold ships in v1 (§6.1).
+**None.** This list predates the first line of code; the three questions it carried are settled
+below, and SPEC-021 reconciled it so that nothing here reads as open unless it is. An item leaves
+this section by being *resolved* (with the spec that settled it) or by moving to §13 as a stated
+constraint — never by being deleted quietly.
 
 ### Resolved
+
+- **Orphan logs** (emit standalone with a fresh `trace_id` vs warn-and-drop) → **emit standalone**,
+  shipped in **SPEC-002**. A level call with no active span builds a complete event with a fresh
+  `trace_id` and emits it synchronously on the caller's thread. Dropping it would make the emitters
+  silently conditional on decorator placement, which is the opposite of what a logging call should
+  promise. That synchronous path is also why `sanitize` must be total (SPEC-017).
+- **Console echo defaults** (destination, line format, an `echo_level` threshold) → **shipped in
+  SPEC-002**: `console.py` echoes to **stdout**, opt-in per call, no automatic `echo_level`
+  threshold. Auto-echo was declined rather than deferred — it would double every event's cost by
+  default for a development convenience.
+- **Backpressure** (make drop-vs-block configurable) → **not built; a constraint, not a wart.**
+  Overflow is drop-newest with a counter and a throttled stderr warning (§9, SPEC-017 FR-005), and
+  blocking would put sink latency back on the caller's thread — the one thing arch §9 exists to
+  prevent. Making it configurable is a *feature* with its own design surface, deliberately out of
+  scope in SPEC-021. Stated in §13.
 - **Decorator name** → `@log_foundry.trace`.
 - **Auto-capture** → function name only; no args/return capture.
 - **Cross-service trace continuation** (adopting an inbound `trace_id` from a
@@ -414,6 +429,32 @@ def write_ledger(user_id: int):
   HTTP client patching, framework middleware, or boto3 hook, and there will not be — that is
   auto-instrumentation, a different product, and it needs the dependencies the core deliberately
   does not have.
+
+- **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
+  `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event
+  can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB. Acceptable because
+  it is *visible* — a sink with a hard limit drops the event and counts `dropped_oversized`, so
+  the loss is signalled where it happens rather than passed downstream silently. A per-event byte
+  ceiling was deferred by SPEC-017, again by SPEC-020, and deliberately again by SPEC-021: it is a
+  feature with real design surface (what happens on breach, which fields are sacrificed first) and
+  belongs in its own spec. Lower `max_value_bytes` / `max_keys` if your destination's limit is
+  tight. Note `max_value_bytes` carries two units — UTF-8 bytes for a string, rendered decimal
+  length for an integer (SPEC-020, SPEC-021).
+
+- **Backpressure is drop-newest, and is not configurable.** When the worker's bounded queue is
+  full a submission is discarded rather than blocking the caller (§9): `health().dropped` counts
+  it and stderr warns on the first drop and every thousandth (SPEC-017 FR-005). Blocking instead
+  would push sink latency back onto the decorated function, which is the failure §9 exists to
+  prevent, so the default is not merely a default — it is the behaviour the design commits to.
+  A configurable drop-vs-block policy remains unbuilt (see §12).
+
+- **A `BaseException` from a sink ends the worker — recorded, not silent.** `MultiSink.emit` and
+  `Worker._emit` both catch `Exception` on purpose; widening either to `BaseException` would
+  swallow a `KeyboardInterrupt` raised inside a child sink and carry on to the next one, which is
+  worse than the failure it would prevent. Since SPEC-019 the escape is caught by the drain
+  thread's terminal guard, which records the exception *type* in `health().stopped_reason` and
+  writes one stderr line stating what was held and what was still queued (SPEC-021 FR-002). The
+  worker is not restarted: a thread that resurrects itself fights a process trying to exit.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment

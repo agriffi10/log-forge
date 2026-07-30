@@ -46,15 +46,24 @@ exactly as the spec's API contract states.
 
 ## Notes for the next spec
 
+*Reconciled by SPEC-021 — each note is marked settled or recorded as a constraint. None was a
+defect; this spec's notes were the cleanest of the four.*
+
 - **The two correlation styles are still not unified**, deliberately. The AWS APIs differ and the
   id-keyed one is already safe; a third positional sink should reuse `_batch`, and a third
   id-keyed one should not.
+  → **Settled** (SPEC-021). Already recorded in `CLAUDE.md` Key Decisions, and named in
+  SPEC-021's Out of Scope so it is not reopened by a later reader mistaking it for a to-do.
 - **An absent failure count is still read as zero failures.** Out of scope by ruling, not
   omission: `put_records`/`put_record_batch` always return the count, and treating its absence as
   a failure would make every reasonable fake client in a consumer's test suite start warning.
+  → **Settled** (SPEC-021). A ruling, restated here as one: the AWS APIs always return the count,
+  so its absence describes a fake client rather than a delivery failure.
 - **`dropped_unadjudicated` is a client-shape signal as much as a loss signal.** A non-zero value
   against real AWS should not happen; it usually means the client is a fake, a proxy, or a
   compatibility layer that isn't AWS-shaped.
+  → **Settled** (SPEC-021). Operator guidance, not an open item; it lives in the counter's own
+  documentation in the README and both class docstrings.
 
 ## Verification
 

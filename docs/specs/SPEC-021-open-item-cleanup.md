@@ -1,7 +1,7 @@
 # Spec: Open-Item Cleanup
 
 **ID:** SPEC-021  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-07-30  
 **Depends On:** SPEC-013, SPEC-017, SPEC-019, SPEC-020
 

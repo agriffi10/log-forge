@@ -46,18 +46,30 @@ described the snapshot it returns.
 
 ## Notes for the next spec
 
+*Reconciled by SPEC-021 — two of these were the defects it was written to fix.*
+
 - **`stopped_reason` is a one-shot terminal fact, not a counter.** It records the *first* thing to
   kill the thread, and there is no second — nothing runs afterwards to overwrite it.
-- **The stderr line reports only what the thread was holding.** Event-lists still in the bounded
+  → **Settled** (SPEC-021). A property of the design, documented on the field itself.
+- ~~**The stderr line reports only what the thread was holding.** Event-lists still in the bounded
   queue are equally undelivered and are not in that number; `health().queued` still shows them.
-  Spec-compliant, but an operator reading "1 undrained event-list(s)" may under-read the loss.
+  Spec-compliant, but an operator reading "1 undrained event-list(s)" may under-read the loss.~~
+  → **Fixed by SPEC-021 (FR-002).** The line reports what was held *and* what was still queued.
+  The queued figure is labelled "items" because it counts internal markers alongside real
+  submissions, and it is a floor: a producer can add to the queue between the death and the read.
 - **The field's default commits future `Health` fields to being defaulted too**, since a
   non-defaulted field cannot follow a defaulted one in a `NamedTuple`.
-- **`flush()` returns `True` for a marker whose emit died** — the `finally` sets the waiter's event
-  so it isn't stranded. Pre-existing (SPEC-013), documented in place, and untouched here, but it
-  means `flush() is True` does not prove delivery.
-- **Non-`str` scalars in `sanitize.py` are still unbounded** — named in this spec's Out of Scope as
-  payload-safety territory. Still unclaimed by any spec.
+  → **Settled** (SPEC-021). A live constraint on future work, not an outstanding question. It has
+  already held once: SPEC-021 added no `Health` field.
+- ~~**`flush()` returns `True` for a marker whose emit died** — the `finally` sets the waiter's
+  event so it isn't stranded. Pre-existing (SPEC-013), documented in place, and untouched here,
+  but it means `flush() is True` does not prove delivery.~~
+  → **Fixed by SPEC-021 (FR-001).** The marker carries the drain's outcome back, so `True` means
+  delivered. This note is why SPEC-021 exists: it was the one genuine defect in the four specs'
+  worth of notes, and a false success in the serverless path `flush()` was built for.
+- ~~**Non-`str` scalars in `sanitize.py` are still unbounded** — named in this spec's Out of Scope
+  as payload-safety territory. Still unclaimed by any spec.~~
+  → **Fixed by SPEC-020**, which claimed it. See the same note on SPEC-017's delivery doc.
 
 ## Verification
 

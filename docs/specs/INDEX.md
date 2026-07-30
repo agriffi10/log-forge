@@ -25,7 +25,7 @@ to status only — no prose.
 | [SPEC-018](SPEC-018-batch-response-adjudication.md) | Batch Response Adjudication | Completed | SPEC-010, SPEC-017 |
 | [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Completed | SPEC-004, SPEC-017 |
 | [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
-| [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Draft | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
+| [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 
 ## Arcs (build order)
 
