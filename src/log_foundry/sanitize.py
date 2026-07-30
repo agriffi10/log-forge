@@ -27,6 +27,7 @@ dropped without disclosing it.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -47,6 +48,13 @@ _MARKER_BYTES = len(TRUNCATION_MARKER.encode("utf-8"))
 _CIRCULAR = "<circular>"
 _DEPTH_LIMIT = "<depth limit>"
 
+# ``log10(2)`` as an integer ratio, rounded *up*: ``|n| < 2**b``, so ``n`` has at most
+# ``b * _LOG10_2_NUM // _LOG10_2_DEN + 1`` decimal digits. Rounding the ratio up makes that an
+# over-estimate, which is the safe direction — it can replace an integer marginally short of the
+# ceiling, but never admit one past it (SPEC-020 FR-002).
+_LOG10_2_NUM = 30103
+_LOG10_2_DEN = 100000
+
 # Exact-type membership, deliberately not ``isinstance``. ``IntEnum``/``StrEnum`` members *are*
 # ``int``/``str`` instances, so an isinstance check would pass the enum member itself through and
 # hand a sink an ``Enum`` where a plain value was promised. Exact typing lets them fall to the
@@ -57,6 +65,18 @@ _PLAIN_SCALARS: frozenset[type] = frozenset({int, float, bool})
 # ``str``/``bytes``/``bytearray`` are Sequences, and so — less obviously — is ``memoryview``.
 # Without this guard ``memoryview(b"x")`` would render as ``[120]`` instead of ``"x"``.
 _TEXTLIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
+
+
+def _int_digit_ceiling(max_value_bytes: int) -> int:
+    """The largest decimal length an integer may have and still be rendered (SPEC-020 FR-001).
+
+    CPython 3.11+ refuses to convert an integer past ``sys.get_int_max_str_digits()`` digits and
+    raises ``ValueError``, which ``json.dumps`` inherits. A configured ceiling above that cannot be
+    honoured — rendering such an integer is the very thing that raises — so the interpreter's limit
+    wins whenever it is lower. A limit of ``0`` means the interpreter imposes none.
+    """
+    limit = sys.get_int_max_str_digits()
+    return max_value_bytes if limit <= 0 else min(max_value_bytes, limit)
 
 
 def _measured(value: str) -> bytes:
@@ -152,7 +172,9 @@ class _Coercer:
         kind = type(value)
         if kind is str:
             return self.text(value)  # type: ignore[arg-type]
-        if kind in _PLAIN_SCALARS:
+        if kind is int:  # before _PLAIN_SCALARS: `int` is the one scalar with no natural ceiling.
+            return self.integer(value)  # type: ignore[arg-type]
+        if kind in _PLAIN_SCALARS:  # float (IEEE-754-bounded) and bool
             return value
         if kind is dict:
             return self.mapping(value, depth)  # type: ignore[arg-type]
@@ -161,6 +183,8 @@ class _Coercer:
 
         if isinstance(value, Enum):
             member = value.value
+            if type(member) is int:  # an IntEnum member is as unbounded as a bare int.
+                return self.integer(member)
             if type(member) in _PLAIN_SCALARS or member is None:
                 return member
             if isinstance(member, str):
@@ -170,7 +194,9 @@ class _Coercer:
             return self.text(str(value))
         if isinstance(value, bool):  # bool before int: it is an int subclass.
             return value
-        if isinstance(value, (int, float)):  # int/float *subclasses* land here.
+        if isinstance(value, int):  # int *subclasses* — bounded like the exact type above.
+            return self.integer(value)
+        if isinstance(value, float):  # float *subclasses*.
             return value
         if isinstance(value, (datetime, date, time)):
             return self.text(value.isoformat())
@@ -234,6 +260,24 @@ class _Coercer:
         """Coerce a mapping key to a bounded ``str`` — JSON object keys are always strings."""
         text = key if isinstance(key, str) else str(key)
         return self.text(text)
+
+    def integer(self, value: int) -> object:
+        """Return ``value`` unchanged, or a placeholder when it is too long to render (FR-001).
+
+        The size test is ``bit_length()``, never ``len(str(value))``: converting an over-long
+        integer to a string raises the very ``ValueError`` this bound exists to prevent, so the
+        obvious check would move the crash rather than remove it (FR-002). ``bit_length()`` is
+        O(1), total, and ignores the sign, so ``n`` and ``-n`` are bounded identically.
+
+        An over-long integer is *replaced*, not clipped. Dropping digits would silently change the
+        value, and a wrong number is worse than a visibly elided one — so this reuses the
+        type-naming shape of :meth:`_placeholder` rather than inventing a second elision style.
+        """
+        digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
+        if digits <= _int_digit_ceiling(self._cfg.max_value_bytes):
+            return value
+        self.truncated = True
+        return f"<int: ~{digits} digits>"
 
     def text(self, value: str) -> str:
         """Apply ``max_value_bytes``, recording whether it fired."""
