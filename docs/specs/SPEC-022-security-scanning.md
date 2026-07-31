@@ -35,8 +35,18 @@ than deferred.
 
 ### In Scope
 
-- A new `.github/workflows/codeql.yml` running CodeQL **advanced setup** over both languages GitHub
-  detects for this repository: `python` and `actions`.
+- CodeQL code scanning over both languages GitHub detects for this repository, `python` and
+  `actions`, via **default setup** — a repository setting, not a workflow file.
+
+  > **Amended 2026-07-31.** This spec was authored calling for *advanced* setup
+  > (`.github/workflows/codeql.yml`). Default setup was enabled by hand before the build began,
+  > and the two are mutually exclusive in one direction: default setup "overrides existing CodeQL
+  > setups by disabling any existing CodeQL workflows, and blocking any CodeQL analysis API
+  > uploads." A `codeql.yml` added now would run and silently fail to upload its results. Default
+  > setup already delivers what FR-001 and FR-002 asked for — both languages, weekly — so the
+  > workflow file is dropped rather than the coverage. What is given up is configuration in
+  > version control, an explicit matrix, and a controllable cron minute; what is gained is one
+  > less file to maintain and no `uses:` pins to keep current.
 - A new `.github/dependabot.yml` enabling scheduled **version** updates for two ecosystems: `pip`
   (Poetry) and `github-actions`.
 - A new `.github/workflows/dependency-review.yml` running `actions/dependency-review-action` on
@@ -44,7 +54,7 @@ than deferred.
 - A new `.github/workflows/zizmor.yml` running `zizmorcore/zizmor-action`, uploading SARIF to
   GitHub code scanning.
 - **Pinning every `uses:` reference in the repository to a full commit SHA**, with a trailing
-  `# vX.Y.Z` comment, across `ci.yml`, `release.yml`, `spec-lint.yml`, and the three new workflows.
+  `# vX.Y.Z` comment, across `ci.yml`, `release.yml`, `spec-lint.yml`, and the two new workflows.
   This is not optional decoration: since zizmor v1.20.0 the default `unpinned-uses` policy is
   blanket hash-pinning for *all* actions, so a tag-pinned `actions/checkout@v5` is a High-severity
   finding. The alternative — a `zizmor.yml` restoring the pre-1.20 `"actions/*": ref-pin` behavior —
@@ -89,40 +99,39 @@ than deferred.
 
 #### Description:
 
-A CodeQL workflow analyzes `src/` for the vulnerability classes `ruff`'s single-file `S` rules
-cannot see — anything requiring dataflow across function or module boundaries.
+CodeQL analyzes `src/` for the vulnerability classes `ruff`'s single-file `S` rules cannot see —
+anything requiring dataflow across function or module boundaries.
 
 #### Acceptance Criteria:
 
-- [ ] `.github/workflows/codeql.yml` exists and triggers on `pull_request`, on `push` to `main`,
-      and on a weekly `schedule`.
-- [ ] The workflow analyzes the `python` language.
-- [ ] The job declares exactly `security-events: write`, `contents: read`, and `actions: read` —
-      no broader permission.
-- [ ] The `schedule` cron is at a non-zero minute offset, so the run is not queued into GitHub's
-      on-the-hour congestion.
-- [ ] A CodeQL analysis completes successfully on the pull request that introduces the workflow,
-      and the repository's code-scanning setup reports a state other than `not-configured`.
-- [ ] The weekly schedule exists specifically so newly published queries reach unchanged code;
-      this is recorded as a comment in the workflow.
+- [ ] `GET /repos/{owner}/{repo}/code-scanning/default-setup` reports `state: "configured"`.
+- [ ] Its `languages` array includes `python`.
+- [ ] Its `schedule` is `weekly`. The scheduled run is the point: CodeQL's query packs improve
+      over time, so unchanged code can acquire a finding without any commit.
+- [ ] A completed analysis for `/language:python` is visible at
+      `GET /repos/{owner}/{repo}/code-scanning/analyses`.
+- [ ] No `.github/workflows/codeql.yml` exists. Advanced setup would be disabled by default setup
+      and would upload nothing; an inert workflow that appears to be scanning is worse than none.
 
 ### FR-002: CodeQL also scans the workflows themselves
 
 #### Description:
 
 GitHub detects `actions` as a scannable language for this repository. CodeQL's Actions queries
-catch workflow-level issues that its Python queries do not, and this repository's workflows hold
+catch workflow-level issues its Python queries do not, and this repository's workflows hold
 publish credentials.
 
 #### Acceptance Criteria:
 
-- [ ] The CodeQL workflow's language matrix includes `actions` alongside `python`.
-- [ ] Both languages are analyzed on every trigger, and a failure in one leg does not hide the
-      other's result (`fail-fast: false`), matching `ci.yml`'s existing convention.
-- [ ] The query suite is `security-extended`, not `default` and not `security-and-quality`. The
-      workflow records why: `security-extended` raises recall at some cost in precision, which a
-      codebase this size can absorb, while `security-and-quality` would add maintainability queries
-      that duplicate `ruff`.
+- [ ] The default-setup `languages` array includes `actions` alongside `python`.
+- [ ] A completed analysis for `/language:actions` is visible at the analyses endpoint.
+- [ ] `query_suite` is `extended`, not `default`. Extended raises recall at some cost in
+      precision, which a codebase this size absorbs easily. (Default setup exposes `default` and
+      `extended`; the `security-and-quality` suite is not offered here, which is no loss — its
+      maintainability queries duplicate `ruff`, which already gates CI.)
+- [ ] Changing the query suite re-runs the analysis; the change is confirmed by re-reading the
+      endpoint after that run completes, not from the `PATCH` response, which returns a `run_id`
+      while the old value is still in place.
 
 ### FR-003: Dependabot keeps the Python toolchain current
 
@@ -166,8 +175,9 @@ With every action SHA-pinned per FR-007, something must move those pins forward.
 - [ ] Every version comment is written as **exactly** `# vX.Y.Z` with the version last in the
       comment and no trailing prose. Dependabot skips the comment rewrite when the comment carries
       additional text, which would silently leave a stale version annotation next to a fresh SHA.
-- [ ] The entry covers all workflow files in `.github/workflows/`, including the three added by
-      this spec.
+- [ ] The entry covers all workflow files in `.github/workflows/`, including the two added by
+      this spec. CodeQL needs no entry — default setup runs no workflow of ours and so has no
+      `uses:` pin to maintain, which is one of the reasons it was kept (see Scope).
 
 ### FR-005: A pull request cannot introduce a vulnerable dependency
 
@@ -260,7 +270,7 @@ issue.
 
 #### Description:
 
-Three new workflows are added to a repository whose release path depends on tightly scoped tokens.
+Two new workflows are added to a repository whose release path depends on tightly scoped tokens.
 Each must request the minimum it needs, so that adding security scanning does not itself widen the
 attack surface it exists to reduce.
 
@@ -305,50 +315,27 @@ Every `uses:` below is shown **unpinned for readability**. FR-007 requires that 
 commit SHA with a `# vX.Y.Z` comment when written to disk; the SHAs are resolved at implementation
 time, deliberately not recorded here, and verified against the tag they claim.
 
-### `.github/workflows/codeql.yml` (new)
+### CodeQL default setup (a repository setting, not a file)
 
-```yaml
-name: CodeQL
+There is no workflow to write. The configuration lives behind
+`/repos/{owner}/{repo}/code-scanning/default-setup`, and this is the target state:
 
-on:
-  pull_request:
-  push:
-    branches: [main]
-  schedule:
-    # Weekly, at an odd minute to avoid the on-the-hour scheduling queue. The point of a scheduled
-    # run is that CodeQL's query packs improve over time: unchanged code can acquire a finding.
-    - cron: "27 5 * * 1"
+```jsonc
+{
+  "state": "configured",
+  "languages": ["actions", "python"],  // both languages GitHub detects here
+  "query_suite": "extended",           // FR-002; `default` is the out-of-box value
+  "schedule": "weekly",                // newly published queries reach unchanged code
+  "threat_model": "remote",
+  "runner_type": "standard"
+}
+```
 
-permissions:
-  contents: read
-
-jobs:
-  analyze:
-    name: analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write   # upload the SARIF results
-      contents: read
-      actions: read
-    strategy:
-      fail-fast: false         # report both legs, as ci.yml does
-      matrix:
-        language: ["python", "actions"]
-    steps:
-      - uses: actions/checkout@<sha>   # vX.Y.Z
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@<sha>   # vX.Y.Z
-        with:
-          language: ${{ matrix.language }}
-          # security-extended, not default: more recall at some cost in precision, which a
-          # codebase this size absorbs easily. NOT security-and-quality — its maintainability
-          # queries duplicate ruff, which already gates CI.
-          queries: security-extended
-
-      # No build step: Python and Actions are both no-build languages for CodeQL.
-      - name: Analyze
-        uses: github/codeql-action/analyze@<sha>   # vX.Y.Z
+```bash
+# Raise the query suite. Returns a run_id and re-runs the analysis; the endpoint keeps
+# reporting the OLD suite until that run finishes, so verify by re-reading, not from the response.
+gh api -X PATCH repos/agriffi10/log-forge/code-scanning/default-setup -f query_suite=extended
+gh api repos/agriffi10/log-forge/code-scanning/default-setup --jq '.query_suite'
 ```
 
 ### `.github/dependabot.yml` (new)
@@ -457,15 +444,22 @@ updates, secret scanning, and secret scanning push protection.
 FR-008. No new secret, environment, or variable is introduced — every tool here is free on a public
 repository and authenticates with the automatic `GITHUB_TOKEN`.
 
-**Out of band.** Two free secret-scanning sub-settings — validity checks and non-provider patterns —
-are currently disabled. The REST API accepts a `PATCH` for them and returns 200 without applying the
-change, so they need the repository's Advanced Security settings page. They are unrelated to the
-files in this spec and are not a functional requirement of it.
+**Unavailable, not merely unconfigured.** Two secret-scanning sub-settings — validity checks and
+non-provider patterns (renamed "generic patterns" in the UI) — read `disabled` and cannot be
+enabled here. They require an **organization-owned** repository with **GitHub Secret Protection**,
+a Team/Enterprise product; a personal account cannot enable or purchase them, public repo or not.
+`PATCH /repos/{owner}/{repo}` returns 200 and silently changes nothing because
+`secret_scanning_validity_checks` is not in that endpoint's request schema at all — it exists only
+on the org and enterprise code-security-configuration endpoints — and GitHub ignores unrecognized
+body properties. The docs page saying otherwise is stale. Recorded here as a constraint so it is
+not rediscovered as a bug. What *is* free on a public repository, and already on: secret scanning
+alerts and push protection.
 
-**CodeQL default setup must stay off.** Advanced setup (a workflow file) and default setup (a
-repository setting) are mutually exclusive; enabling default setup later would disable
-`codeql.yml`. Advanced setup is chosen here so the configuration is reviewable in a pull request
-and matches `ci.yml`'s branch and matrix conventions.
+**CodeQL default setup stays on, and advanced setup must not be added.** The two are mutually
+exclusive in one direction — default setup disables any CodeQL workflow and blocks CodeQL analysis
+API uploads, while adding a workflow does *not* turn default setup off. Reverting to advanced setup
+would mean explicitly disabling default setup first, then adding `codeql.yml`. See the amendment
+note in Scope for why this spec no longer does that.
 
 ## File & Folder Structure
 
@@ -476,9 +470,9 @@ and matches `ci.yml`'s branch and matrix conventions.
     ├── ci.yml                        # CHANGED: SHA-pin uses: (steps otherwise unchanged)
     ├── release.yml                   # CHANGED: SHA-pin uses:, incl. gh-action-pypi-publish
     ├── spec-lint.yml                 # CHANGED: SHA-pin uses:
-    ├── codeql.yml                    # NEW: python + actions, security-extended
     ├── dependency-review.yml         # NEW: PR-time vulnerable-dependency gate
     └── zizmor.yml                    # NEW: workflow static analysis -> SARIF
+                                      # (no codeql.yml — default setup is a repo setting, FR-001)
 SECURITY.md                           # NEW: private disclosure policy
 CLAUDE.md                             # CHANGED: one Key Decisions line + pointer
 docs/specs/INDEX.md                   # CHANGED: one row
@@ -502,12 +496,16 @@ docs/spec-delivery/
 
 ### Phase 2: CodeQL
 
-- Add `.github/workflows/codeql.yml` with the `python` + `actions` matrix, `security-extended`,
-  the weekly schedule, and minimal permissions (FR-001, FR-002, FR-009).
-- Confirm both analyses complete on the PR and that code scanning reports a configured state.
-- Triage whatever the first `security-extended` run produces. A finding is either a real defect
-  worth its own spec, or a false positive to be dismissed with a written reason — not left
-  sitting unread. Record the disposition in the delivery doc.
+- **Mostly already done, and it changes no files.** Default setup was enabled by hand on
+  2026-07-31 and both analyses have completed; the query suite was raised to `extended` the same
+  day. This phase is verification plus triage, not construction.
+- Confirm the endpoint reports `state: configured`, `languages: ["actions", "python"]`,
+  `query_suite: extended`, `schedule: weekly`, and that a completed analysis exists for each
+  language (FR-001, FR-002).
+- Confirm no `codeql.yml` was added, which would upload nothing.
+- Triage whatever the first `extended` run produces. A finding is either a real defect worth its
+  own spec, or a false positive to be dismissed with a written reason — not left sitting unread.
+  Record the disposition in the delivery doc.
 
 ### Phase 3: Dependency review and Dependabot
 
