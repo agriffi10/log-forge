@@ -22,11 +22,11 @@ dependencies = [
 # Optional features. Install with: pip install log-foundry[aws]
 
 [project.optional-dependencies]
-aws = ["boto3>=1.34"]              # SQSSink, SNSSink, KinesisSink, FirehoseSink
-sentry = ["sentry-sdk>=2.0"]
+aws = ["boto3>=1.43.61"]              # SQSSink, SNSSink, KinesisSink, FirehoseSink
+sentry = ["sentry-sdk>=2.66.1"]
 kafka = ["confluent-kafka>=2.0"]
 redis = ["redis>=5.0"]
-amqp = ["pika>=1.3"]
+amqp = ["pika>=1.4.2"]
 nats = ["nats-py>=2.6"]
 gcp-pubsub = ["google-cloud-pubsub>=2.18"]
 azure-eventhubs = ["azure-eventhub>=5.11"]
