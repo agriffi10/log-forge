@@ -762,14 +762,51 @@ poetry run ruff check .        # lint (line-length 100)
 poetry run mypy                # typecheck (strict, over src/)
 ```
 
-**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs ruff → mypy → pytest on
-every pull request and on push to `main`. A second workflow
-([`spec-lint.yml`](.github/workflows/spec-lint.yml)) lints the design specs under `docs/specs/`.
-
 The library uses a src layout (`src/log_foundry/`) with a single concept per module: `config`,
 `ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
 `base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
+
+### Continuous integration
+
+Every pull request and every push to `main` runs the same set of checks:
+
+| Check | Does | Fails the build |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | yes |
+| [`spec-lint.yml`](.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | yes |
+| [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | yes |
+| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | no — reports to code scanning |
+| CodeQL | `python` + `actions`, `extended` query suite; also weekly | no — reports to code scanning |
+
+CodeQL runs as GitHub's **default setup** — a repository setting, not a workflow file, which is
+why there is no `codeql.yml` here (adding one would disable the default setup and silently stop
+the uploads). The two scanners that don't fail a build report findings to code scanning
+deliberately: the alert count is the verdict there, not the green check mark.
+
+[`dependabot.yml`](.github/dependabot.yml) opens scheduled version updates for `pip` and
+`github-actions` on top of the security updates GitHub raises against advisories. Both ecosystems
+use a cooldown so a freshly published release isn't adopted within hours of appearing, and `pip`
+uses `increase-if-necessary` so an update never narrows a floor this library publishes to its
+consumers.
+
+## Security
+
+Please report a vulnerability through GitHub's **private** reporting rather than a public issue:
+[**open a draft advisory**](https://github.com/agriffi10/log-forge/security/advisories/new).
+[`SECURITY.md`](SECURITY.md) covers what to include and what to expect — an acknowledgement
+within 7 days, an assessment within 30. Fixes land on the latest released minor; there are no
+long-term support branches.
+
+Three properties of the supply chain are worth stating, since a logging library sits inside
+everything it instruments:
+
+- **Zero runtime dependencies in the core.** A default `pip install log-foundry` pulls in no
+  third-party code at all; every sink needing a client sits behind an extra you opt into.
+- **Every action is pinned to a commit SHA**, Dependabot maintains the pins, and every workflow
+  declares least-privilege `permissions` instead of inheriting the repository default.
+- **Releases publish over OIDC**, so no PyPI token is stored in the repository — see
+  [Releasing](#releasing).
 
 ## Releasing
 
@@ -792,14 +829,19 @@ pip ignores pre-releases unless you pass `--pre`.
 Cutting a release is one tag:
 
 ```bash
-git tag -a v0.2.0 -m "log-foundry 0.2.0"
-git push origin v0.2.0
+git tag -a v0.9.0 -m "log-foundry 0.9.0"
+git push origin v0.9.0
 ```
 
 Uploads authenticate with PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
 (OIDC) through the `pypi` GitHub Environment — there is no API token stored in the repository.
 A tagged build refuses to publish if the derived version doesn't match the tag, and the tagged
 job deliberately omits `skip-existing` so re-pushing an already-published version fails loudly.
+
+Every action on this path is pinned to a commit SHA, `pypa/gh-action-pypi-publish` included —
+deliberately off the rolling `release/v1` branch PyPA recommends, because this is the job holding
+`id-token: write` against PyPI and a mutable reference there reaches every consumer's
+`pip install`. Dependabot moves the pins, so they stay maintained rather than frozen.
 
 ## License
 
