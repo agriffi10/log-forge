@@ -6,6 +6,11 @@ on:
     branches: [main]
   workflow_call:   # allow release.yml to run this same gate before publishing
 
+# Least privilege, stated rather than inherited from the repository default. This gate only
+# reads the tree; release.yml, which calls it, requests id-token separately for its own jobs.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

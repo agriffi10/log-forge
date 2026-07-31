@@ -1,0 +1,35 @@
+name: Zizmor
+
+# Static analysis of the workflows themselves — template injection, excessive permissions,
+# unpinned actions, artifact poisoning. The reason this repository wants it: release.yml holds
+# `id-token: write` against PyPI Trusted Publishing, so a defect in a workflow file is a defect
+# upstream of every consumer's `pip install` (SPEC-022 FR-006).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: audit
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload the SARIF results to code scanning
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Pinned by SHA because this action publishes no moving major tag — only specific
+      # versions (v0.5.7, v0.6.0, v0.6.1). A `@v0` reference does not exist and must not be
+      # invented. Dependabot's github-actions ecosystem moves this pin like any other.
+      #
+      # `advanced-security` defaults to true, which emits SARIF to code scanning and exits
+      # zero rather than failing the job. That is deliberate, and it matches how CodeQL
+      # reports here: Advanced Security owns triage. To make a finding blocking, use a
+      # repository ruleset — not a job failure.
+      - name: Audit the workflows
+        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
