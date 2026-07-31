@@ -1,7 +1,7 @@
 # Spec: Security Scanning in CI
 
 **ID:** SPEC-022
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-07-31
 **Depends On:** SPEC-012
 
