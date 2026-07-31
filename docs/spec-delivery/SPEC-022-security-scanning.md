@@ -63,7 +63,16 @@ Local per PR: `ruff` clean, `mypy --strict` clean, 568 tests pass, `spec-lint` c
 [#75](https://github.com/agriffi10/log-forge/pull/75) and
 [#78](https://github.com/agriffi10/log-forge/pull/78) — ten checks on the last of these, up from
 three before this spec. `main` green and the Release job's PyPI upload confirmed after the pinning
-change. FR-003's post-merge criteria are confirmed for `github-actions` (Dependabot rewrote both
-the SHA and its version comment across all four `checkout` occurrences); the first `pip` PR had not
-yet appeared at completion, so the `poetry.lock`-in-the-same-PR criterion and the extras/dev-group
-fallback (`allow: dependency-type: all`) remain to be observed on the first weekly run.
+change.
+
+FR-003 and FR-004 were verified against Dependabot's real output rather than assumed. It rewrote
+both the SHA and its `# vX.Y.Z` comment across all four `checkout` occurrences
+([#76](https://github.com/agriffi10/log-forge/pull/76),
+[#77](https://github.com/agriffi10/log-forge/pull/77)); the first `pip` PRs changed `poetry.lock`
+and `pyproject.toml` **in the same PR** — the split that hard-fails CI's `poetry install`;
+grouping held, with three minor/patch updates bundled into
+[#79](https://github.com/agriffi10/log-forge/pull/79) and mypy's major arriving alone in
+[#80](https://github.com/agriffi10/log-forge/pull/80); optional-extra dependencies (`boto3`,
+`botocore`) produced updates without the `allow: dependency-type: all` fallback FR-003 held in
+reserve, so it was not needed; and `ruff` was left untouched, confirming the `ignore` protects the
+`>=0.16,<0.17` bound.
