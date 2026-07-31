@@ -1,0 +1,36 @@
+name: Dependency Review
+
+# Catches a vulnerable dependency at the point it is INTRODUCED, by diffing the dependency graph
+# between the base and head of a pull request. Dependabot's security updates cover the other
+# direction — an advisory published against something already merged. This is the only scan added
+# by SPEC-022 that fails a build; CodeQL and zizmor report to code scanning instead.
+#
+# Requires the dependency graph, which is enabled for this repository.
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write     # only so comment-summary-in-pr can post
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Review dependencies introduced by this PR
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Set explicitly rather than left at the default (`low`). The core library has zero
+          # runtime dependencies, so everything this sees is dev tooling or an optional extra;
+          # `moderate` keeps the gate meaningful instead of noisy (SPEC-022 FR-005).
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
+          # Deliberately NO deny-licenses. The `postgres` extra pulls psycopg, which is LGPL-3.0,
+          # so any GPL-family denial list would fail on a dependency this project ships on
+          # purpose. Choosing a license policy that accounts for that is its own decision, not a
+          # rider on this one (SPEC-022, Out of Scope).

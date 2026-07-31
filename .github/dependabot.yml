@@ -1,0 +1,46 @@
+# Scheduled VERSION updates. Dependabot *security* updates are enabled separately as a repository
+# setting and already run; they react to a published advisory. These two ecosystems keep things
+# current between advisories (SPEC-022 FR-003, FR-004).
+version: 2
+updates:
+  # Poetry is served by the `pip` ecosystem — there is no `poetry` value. Dependabot writes
+  # pyproject.toml and poetry.lock in the same pull request, which matters here: a constraint
+  # change landing without a regenerated lockfile hard-fails CI's `poetry install`.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine minor/patch drift instead of one per package. Majors stay
+      # ungrouped so each arrives alone and gets read on its own merits.
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # The `>=0.16,<0.17` bound in pyproject.toml is a decision, not an oversight: ruff's
+      # DEFAULT rule set is not stable across minors (0.16.0 widened it from 59 rules to 413),
+      # so an unbounded constraint would let a ruff release change what CI enforces.
+      #
+      # Left alone, Dependabot would REWRITE that range rather than respect it. It picks the
+      # `increase` strategy here because it classifies this project as an application, not a
+      # library — `[tool.poetry]` carries no `name` key (the name lives in `[project]`), which
+      # is what that check reads. Patch updates inside 0.16.x are welcome; crossing the bound
+      # stays a human decision made against the reasoning in pyproject.toml.
+      - dependency-name: "ruff"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+
+  # Every action is SHA-pinned (SPEC-022 FR-007), so something has to move the pins. Dependabot
+  # updates the SHA and rewrites the trailing `# vX.Y.Z` comment with it — which is why those
+  # comments must stay in exactly that form, version last and no trailing prose. It skips the
+  # comment rewrite otherwise, leaving a stale version annotation beside a fresh SHA.
+  #
+  # This is the ecosystem that matters most here: release.yml holds `id-token: write` against
+  # PyPI Trusted Publishing, so its actions sit directly upstream of every `pip install`.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
