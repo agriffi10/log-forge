@@ -68,7 +68,7 @@ pytest-cov = "^7.1.0"
 # CI enforces. `[tool.ruff.lint] select` below is the other half: the bound makes the change
 # deliberate, the select makes the set ours.
 ruff = ">=0.16,<0.17"
-mypy = "^1.10"
+mypy = "^2.3"
 
 
 [tool.poetry-dynamic-versioning]
