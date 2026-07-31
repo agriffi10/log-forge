@@ -76,3 +76,14 @@ grouping held, with three minor/patch updates bundled into
 `botocore`) produced updates without the `allow: dependency-type: all` fallback FR-003 held in
 reserve, so it was not needed; and `ruff` was left untouched, confirming the `ignore` protects the
 `>=0.16,<0.17` bound.
+
+**One correction after completion.** That same first `pip` PR exposed a gap in what shipped: the
+`ignore` protected `ruff` from Dependabot's `increase` strategy, but nothing protected anything
+else, and the strategy applies to `[project.optional-dependencies]` too. The PR rewrote
+`boto3>=1.34` to `boto3>=1.43.61` (and `sentry-sdk`, `pika` likewise) — a narrowing of the
+library's published contract, forcing consumers of those extras onto near-current versions when
+the existing floor already admitted them. The spec had identified the misclassification and
+treated it as a `ruff` problem; it is a project-wide one. Fixed by setting
+`versioning-strategy: increase-if-necessary` on the `pip` ecosystem, which leaves a requirement
+alone whenever it already admits the new version. The lockfile still moves, so CI keeps exercising
+current releases.
