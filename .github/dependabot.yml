@@ -11,6 +11,21 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # THIS PROJECT IS A LIBRARY, AND THE DEFAULT GETS THAT WRONG. Dependabot picks its strategy
+    # by guessing app-vs-library, and it reads `[tool.poetry].name` to decide — a key this
+    # project does not have, because the name lives in `[project]` under PEP 621. So it guesses
+    # "application" and applies `increase`, which rewrites a requirement even when the existing
+    # one already allows the new release.
+    #
+    # For `[project.optional-dependencies]` that is a change to the published contract, not
+    # maintenance: it rewrote `boto3>=1.34` to `boto3>=1.43.61`, forcing every consumer of the
+    # `aws` extra onto a near-current boto3 for no functional reason. `>=1.34` already permitted
+    # it. Eleven extras have the same shape.
+    #
+    # `increase-if-necessary` leaves a requirement alone whenever it already admits the new
+    # version, and only widens when it genuinely does not — so poetry.lock still moves and CI
+    # still exercises current releases, while the floors consumers must satisfy stay put.
+    versioning-strategy: increase-if-necessary
     # Wait before adopting a freshly published release. This is the defence against the shape
     # this whole spec is about: a compromised version published and pulled in within hours.
     # It costs nothing in responsiveness to a real CVE — cooldown applies to VERSION updates
