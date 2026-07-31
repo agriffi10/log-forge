@@ -104,8 +104,9 @@ the caller on the orphan path and destroy the whole batch inside a span; nothing
 and an all-children-down `MultiSink` reported success so the worker's retry never ran. Events are
 now coerced and size-bounded at assembly, `error` carries `message`/`module`, and `health()` exposes
 the worker's loss counters.
-**Latest release: `v0.6.0`** (SPEC-017; `v0.5.0` was SPEC-016, `v0.4.0` SPEC-015, `v0.3.0`
-SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
+**Latest release: `v0.9.0`** (SPEC-022 + the extras-floor raise; `v0.8.0` was SPEC-021, `v0.7.1`
+SPEC-020, `v0.7.0` SPEC-018 + SPEC-019, `v0.6.0` SPEC-017, `v0.5.0` SPEC-016, `v0.4.0` SPEC-015,
+`v0.3.0` SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
 **SPEC-018 (batch response adjudication) is Completed** — `KinesisSink`/`FirehoseSink` adjudicated a
 batch response positionally without checking the arrays line up, so a short response truncated the
 retry list and the chunk reported success: the same silent-loss shape as SPEC-017, in the two sinks
@@ -229,6 +230,12 @@ with GitHub Secret Protection, and `PATCH /repos` returns 200 while ignoring the
   count is the verdict, never the check mark — and a green audit is not evidence a *setting* is
   present (zizmor's `dependabot-cooldown` stops at the first passing entry). State the setting.
   (SPEC-022)
+- **An extra's floor is a published contract — moved deliberately, never by a bot** — Dependabot's
+  first `pip` PR raised `boto3`/`sentry-sdk`/`pika` past floors that already admitted the new
+  release. Those raises were **kept** (staying near-current on boto3 is worth the narrowing) but
+  `versioning-strategy: increase-if-necessary` stays, so the floors now move only when a human
+  decides they should. A floor raise is a contract change: it cuts a release **minor**, not patch.
+  (`v0.9.0`)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
