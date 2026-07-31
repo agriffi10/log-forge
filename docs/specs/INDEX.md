@@ -26,6 +26,7 @@ to status only — no prose.
 | [SPEC-019](SPEC-019-worker-liveness.md) | Worker Liveness and Terminal-Failure Reporting | Completed | SPEC-004, SPEC-017 |
 | [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
 | [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
+| [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Draft | SPEC-012 |
 
 ## Arcs (build order)
 
@@ -70,3 +71,7 @@ Group related specs and record the order to build them in. Delete this section i
   next spec" plus `architecture.md` §12 left 20 items a reader cannot triage, two of them now false.
   Every item ends fixed, settled, or recorded as a constraint — and `flush()` stops returning `True`
   for a drain that was abandoned. Standalone; nothing depends on it.
+- **Supply-chain and code security:** SPEC-022 — depends on SPEC-012 only because that spec built the
+  publish path this one protects: `release.yml` exchanges an OIDC token for the right to ship
+  `log-foundry` to PyPI, and every action it calls is pinned to a mutable tag. Touches only `.github/`
+  and `SECURITY.md`, never `src/`. Buildable at any point; nothing depends on it.
