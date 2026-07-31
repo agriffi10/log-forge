@@ -130,6 +130,16 @@ abandoned — a false success in the serverless path it was built for. It now re
 anything was lost while the call was outstanding. Also: the terminal-failure line counts the queue,
 and the integer ceiling counts the minus sign.
 
+**SPEC-022 (security scanning in CI) is Completed** — the first spec that touches no `src/` file.
+Nothing in CI looked for a vulnerability beyond `ruff`'s single-file `S` rules, while `release.yml`
+held `id-token: write` against PyPI and called every action by a mutable tag. Now: CodeQL
+(`python` + `actions`, `extended`, weekly, **default setup** — a repo setting, so do **not** add a
+`codeql.yml`, which default setup would disable and silently stop uploading), `dependency-review`
+on PRs, `dependabot.yml` version updates with cooldowns, `zizmor` over the workflows, `SECURITY.md`
+with private reporting, and every action SHA-pinned. Free throughout because the repo is public —
+though validity checks and generic secret patterns are **not** free: they need an org-owned repo
+with GitHub Secret Protection, and `PATCH /repos` returns 200 while ignoring them.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -205,6 +215,20 @@ and the integer ceiling counts the minus sign.
   from a decision that reads like one. Superseded notes are struck through in place and marked with
   the spec that closed them; `architecture.md` §12 carries no open items and §13 states the
   constraints. (SPEC-021)
+- **Every action is pinned to a commit SHA, and the pins are maintained, not frozen** — a mutable
+  tag on a workflow holding `id-token: write` against PyPI is a silent path from a third-party
+  repository to every consumer's `pip install`, so `pypa/gh-action-pypi-publish` is pinned away
+  from the `release/v1` branch PyPA itself recommends: a lagging pin fails loudly at release time,
+  a compromised action fails forever. Dependabot's `github-actions` ecosystem moves the pins, which
+  is what makes pinning affordable — the version comment must stay exactly `# vX.Y.Z` or it silently
+  stops rewriting it. Pin to the tip of the major in use; a major bump is its own reviewable PR.
+  (SPEC-022)
+- **A scanner that exits zero has not said "clean"** — zizmor in SARIF mode and CodeQL both report
+  to code scanning and pass the job regardless of findings, deliberately: Advanced Security owns
+  triage, and blocking belongs in a ruleset. Only `dependency-review` fails a build. So the alert
+  count is the verdict, never the check mark — and a green audit is not evidence a *setting* is
+  present (zizmor's `dependabot-cooldown` stops at the first passing entry). State the setting.
+  (SPEC-022)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
