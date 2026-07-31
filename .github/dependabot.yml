@@ -11,6 +11,15 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # Wait before adopting a freshly published release. This is the defence against the shape
+    # this whole spec is about: a compromised version published and pulled in within hours.
+    # It costs nothing in responsiveness to a real CVE — cooldown applies to VERSION updates
+    # only, never to security updates, which keep arriving immediately.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30    # a major is a review anyway; let it settle first
+      semver-minor-days: 14
+      semver-patch-days: 7
     groups:
       # One PR for the routine minor/patch drift instead of one per package. Majors stay
       # ungrouped so each arrives alone and gets read on its own merits.
@@ -44,3 +53,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # Stated explicitly rather than relied upon. Two reasons it is not a copy of the pip block:
+    # the github-actions ecosystem supports `default-days` only — the semver-*-days keys are
+    # ignored here — and zizmor's dependabot-cooldown audit returns after the FIRST entry that
+    # satisfies its minimum, so a green audit would NOT have proven this second entry was
+    # covered. A clean scan is not evidence; the setting is.
+    cooldown:
+      default-days: 7

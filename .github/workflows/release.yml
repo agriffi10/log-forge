@@ -20,6 +20,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0        # full history + tags so the version can be derived
+          # The build reads git history; it never writes. Publishing authenticates to PyPI with
+          # OIDC, not this token, so nothing downstream needs the credential left on disk.
+          persist-credentials: false
 
       # One version is enough here, unlike the CI matrix: the wheel is pure Python
       # (`py3-none-any`) so the building interpreter does not appear in the artifact, and
