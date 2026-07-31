@@ -9,10 +9,15 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   spec-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false   # nothing here runs git; don't leave a token on disk
       - name: Run spec-lint
         run: sh scripts/spec-lint.sh docs/specs
