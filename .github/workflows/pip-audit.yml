@@ -1,0 +1,77 @@
+name: pip-audit
+
+# Re-examine dependencies nobody is currently touching (SPEC-023 FR-004).
+#
+# The gap this fills: dependency-review.yml reads a pull request's dependency DIFF, so it fails a PR
+# that *introduces* something vulnerable. An advisory published against an already-pinned dependency
+# produces no diff, so nothing there ever sees it. Dependabot raises an alert, but an alert is a
+# notification on a dashboard — this turns it into a red build.
+#
+# Deliberately NOT on pull_request: dependency-review already covers the PR diff, reading the same
+# lockfile. The unique value here is the scheduled re-examination.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"    # Mondays, offset off the hour to avoid the scheduling stampede
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # this job only reads files; don't leave a token on disk
+
+      # The floor, not the newest: 3.12 is what `release.yml` builds on and the oldest runtime a
+      # consumer may be using, so it resolves the widest set of dependency versions.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      # `--all-extras` is the whole point: runtime dependencies are empty by design, so an audit
+      # without the extras audits nothing. `dev` comes along too — this is a supply-chain scan of
+      # what builds and tests this library, not only of what a consumer installs, and a compromised
+      # test dependency runs in CI with the same access as everything else here.
+      #
+      # `--no-root` is load-bearing, not tidiness. Poetry installs the project itself in EDITABLE
+      # mode, and pip-audit under `--strict` refuses an editable distribution ("distribution marked
+      # as editable") exactly as it refuses one it cannot find on PyPI — so with the root installed,
+      # `--strict` can never pass. Auditing log-foundry against the advisory database would be
+      # circular anyway: this job exists to audit what the library DEPENDS on.
+      - name: Install every extra plus the audit tooling
+        run: poetry install --with security --all-extras --no-root
+
+      # Suppressions are per-advisory and live in a tracked file with their reasons beside them
+      # (FR-005). Built into argv here rather than pasted into this workflow so that adding one is
+      # a one-line diff to a file whose entire purpose is to be read.
+      - name: Audit the resolved environment
+        run: |
+          args=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            id="${line%%#*}"
+            id="$(echo "$id" | tr -d '[:space:]')"
+            [ -n "$id" ] && args+=(--ignore-vuln "$id")
+          done < .github/pip-audit-ignores.txt
+          if [ ${#args[@]} -gt 0 ]; then
+            echo "suppressed advisories: ${args[*]}"
+          else
+            echo "no suppressed advisories"
+          fi
+          # pip-audit exits non-zero when it reports an advisory — that exit code IS the gate.
+          # `--strict` additionally fails on a package it could not audit, because a silently
+          # skipped package is an unaudited one, and a green run that skipped something has not
+          # said "clean".
+          poetry run pip-audit --strict --progress-spinner=off "${args[@]}"

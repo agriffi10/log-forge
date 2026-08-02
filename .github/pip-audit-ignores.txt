@@ -1,0 +1,18 @@
+# Advisories deliberately NOT failing the pip-audit job (SPEC-023 FR-005).
+#
+# One advisory id per line, reason beside it — the same convention as the `ignore` block in
+# pyproject.toml: each entry is a decision with its reasoning, not a backlog. Blank lines and
+# `#` comments are skipped; everything before a `#` on a line is the id.
+#
+# Suppress an advisory only when one of these is true, and say which:
+#   - there is no fixed release yet, and the exposure is understood; or
+#   - it does not apply to how this library uses the package (say why).
+#
+# NEVER suppress by severity threshold or by package — those hide advisories nobody has read.
+# An entry here is a standing claim; delete it when the advisory is fixed or the reason expires.
+#
+# Format:
+#   GHSA-xxxx-xxxx-xxxx  # <package> — no fix released as of YYYY-MM-DD; <why the exposure is ok>
+#
+# This file ships EMPTY on purpose. The mechanism exists before it is needed, so the first real
+# advisory is triaged against a convention rather than one invented under time pressure.
