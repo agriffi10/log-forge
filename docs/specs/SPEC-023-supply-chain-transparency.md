@@ -331,7 +331,10 @@ it runs, which may be later than these:
 - `pip-audit` — CLI run inside the Poetry environment, not via `pypa/gh-action-pip-audit`, matching
   how `release.yml` already runs `build` and `twine` directly. One fewer pin to maintain.
 - `ossf/scorecard-action` v2.4.4
-- `github/codeql-action/upload-sarif` — already pinned in `zizmor.yml`; reuse that exact pin.
+- `github/codeql-action/upload-sarif` v4.37.4 — **corrected during Phase 4.** This section claimed
+  the pin already existed in `zizmor.yml` and could be reused; it does not. `zizmor-action` uploads
+  its own SARIF, so no `codeql-action` reference existed anywhere in the repository and
+  `scorecard.yml` introduces the first one.
 
 **No new repository settings.** Everything here is a file in the repository, unlike SPEC-022's
 CodeQL default setup. Nothing in this spec can be silently disabled by a UI toggle.
