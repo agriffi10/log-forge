@@ -168,8 +168,14 @@ applied to `publish-dev`).
       `contents: write`.
 - [ ] Release creation runs only after the PyPI publish succeeds — a GitHub Release must not exist
       for a version that failed to ship.
-- [ ] Re-running a release for an existing tag does not fail the workflow on "release already
-      exists"; the asset is replaced.
+- [ ] ~~Re-running a release for an existing tag does not fail the workflow on "release already
+      exists"; the asset is replaced.~~ **Superseded — this criterion is not achievable and was
+      wrong to ask for.** This repository has immutable releases enabled: a published release's
+      assets are frozen, and `gh release upload` against one returns `HTTP 422: Cannot upload
+      assets to an immutable release`. That is what made `v0.10.0` ship without its SBOM. Two
+      consequences: the asset must be attached while the release is still a **draft**
+      (create-as-draft → upload → publish), and a re-run *must* fail loudly rather than pretend to
+      replace an asset it cannot touch.
 - [ ] Every workflow run, tagged or not, uploads the SBOM as a workflow artifact.
 
 ### FR-004: A scheduled audit re-examines the full dependency surface

@@ -178,21 +178,34 @@ jobs:
         run: mv sbom.cdx.json "log-foundry-${GITHUB_REF_NAME#v}.cdx.json"
 
       # `gh` rather than a third-party action: one fewer pin upstream of a job that can write to
-      # this repository. Idempotent on re-run — a re-pushed tag replaces the asset (`--clobber`)
-      # instead of failing on "release already exists".
-      - name: Create or update the GitHub Release
+      # this repository.
+      #
+      # THE ORDER IS THE WHOLE POINT. This repository has immutable releases enabled, so a release's
+      # assets are frozen the moment it is published — `gh release upload` against a published
+      # release returns `HTTP 422: Cannot upload assets to an immutable release`, which is exactly
+      # how v0.10.0 shipped without its SBOM. A draft is not yet immutable, so the sequence must be
+      # create-as-draft → upload → publish, never create → upload.
+      #
+      # Deliberately NOT idempotent, because immutability means it cannot be: an existing published
+      # release can never be amended, so a re-run that quietly "succeeded" would be lying. It fails
+      # loudly instead and says what a human has to do.
+      - name: Create the GitHub Release with its SBOM attached
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           asset="log-foundry-${GITHUB_REF_NAME#v}.cdx.json"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists; updating its asset"
-          else
-            # --generate-notes builds the changelog server-side from the commits since the
-            # previous tag, so this job needs no checkout and no history.
-            gh release create "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes \
-              --repo "$GITHUB_REPOSITORY"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $GITHUB_REF_NAME already exists. Immutable releases cannot be" \
+                 "amended — delete it and re-run this workflow to attach the SBOM."
+            exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+          # --generate-notes builds the changelog server-side from the commits since the previous
+          # tag, so this job needs no checkout and no history.
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --repo "$GITHUB_REPOSITORY"
+          gh release upload "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+          echo "published $GITHUB_REF_NAME with $asset attached"
