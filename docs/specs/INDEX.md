@@ -27,6 +27,7 @@ to status only — no prose.
 | [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
 | [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 | [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Completed | SPEC-012 |
+| [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Draft | SPEC-012, SPEC-022 |
 
 ## Arcs (build order)
 
@@ -75,3 +76,11 @@ Group related specs and record the order to build them in. Delete this section i
   publish path this one protects: `release.yml` exchanges an OIDC token for the right to ship
   `log-foundry` to PyPI, and every action it calls is pinned to a mutable tag. Touches only `.github/`
   and `SECURITY.md`, never `src/`. Buildable at any point; nothing depends on it.
+  **SPEC-023** turns that arc outward. SPEC-022's scanners all look *inward* — CodeQL at this
+  source, zizmor at these workflows, `dependency-review` at what a PR *introduces* — so nothing
+  describes what already shipped, and nothing re-examines the eleven extras after the merge that
+  pinned them. A CVE published against a dependency nobody is currently touching produces no diff
+  for `dependency-review` to fail. Adds a CycloneDX SBOM per release, a scheduled `pip-audit` over
+  the full extras surface, and OpenSSF Scorecard as standing measurement of what SPEC-022 built.
+  Depends on SPEC-012 for the same reason 022 does — it extends the publish path — and on SPEC-022
+  for the pinning and least-privilege conventions it inherits. Touches no `src/` file.
