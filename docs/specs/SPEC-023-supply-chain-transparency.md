@@ -231,10 +231,12 @@ branch rule) shows up without anyone re-reading the workflows.
 - [ ] `publish_results` is enabled.
 - [ ] The job does not fail the build on a low score — consistent with the settled decision that a
       scanner's exit code is not its verdict; only `dependency-review` and `pip-audit` gate.
-- [ ] Checks that Scorecard cannot evaluate without a stored personal access token (notably
-      `Branch-Protection`) are documented as deliberately inconclusive. No PAT is created: a stored
-      long-lived credential is the exact class of thing SPEC-022's OIDC-and-SHA-pins design avoids,
-      and one score line is not worth reintroducing it.
+- [ ] No PAT is created, and what that actually costs is recorded from the first run rather than
+      assumed. **Corrected after Phase 4 shipped:** this criterion was written expecting
+      `Branch-Protection` to be *inconclusive* without a stored token. It is not — the job token
+      read the ruleset and scored it 6/10 with real detail. A PAT would raise the ceiling on a few
+      checks; a stored long-lived credential remains the exact class of thing SPEC-022's
+      OIDC-and-SHA-pins design removed, and no score line justifies reintroducing it.
 
 ### FR-007: The audit tooling is locked and maintained, not fetched ad hoc
 

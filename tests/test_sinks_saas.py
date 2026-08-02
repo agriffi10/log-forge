@@ -35,7 +35,10 @@ def test_datadog_intake_url_header_and_enrichment() -> None:
 def test_datadog_default_site() -> None:
     opener = FakeOpener()
     DatadogSink("k", opener=opener).emit([{"a": 1}])
-    assert "datadoghq.com" in opener.calls[0]["url"]
+    # Assert the whole URL, not a substring of it. `"datadoghq.com" in url` passes for
+    # `https://evil.example/?x=datadoghq.com` too, which is why CodeQL flags the substring form
+    # (py/incomplete-url-substring-sanitization) — and the exact string is what this test means.
+    assert opener.calls[0]["url"] == "https://http-intake.logs.datadoghq.com/api/v2/logs"
 
 
 # --- FR-008: Splunk HEC -----------------------------------------------------------------
