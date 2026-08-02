@@ -1,7 +1,7 @@
 # Spec: Supply-Chain Transparency and Dependency Auditing
 
 **ID:** SPEC-023
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-08-02
 **Depends On:** SPEC-012, SPEC-022
 
