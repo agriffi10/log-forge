@@ -46,13 +46,13 @@ jobs:
           # transparency; a score nobody outside can see measures nothing for a consumer deciding
           # whether to depend on this library.
           publish_results: true
-          # NO `repo_token`. Some checks — Branch-Protection above all — need a classic PAT with
-          # admin scope to read the ruleset, and will score as inconclusive without one. That is a
-          # deliberate trade: a stored long-lived credential is exactly the class of secret the
-          # SPEC-022 design removed from this repository (OIDC for PyPI, SHA pins for actions), and
-          # one score line does not justify putting one back. `main` IS protected by a ruleset —
-          # 1 approving review, code-owner review, last-push approval, squash-only, linear history
-          # — the scanner simply cannot see it with the job token.
+          # NO `repo_token`, and the first run showed why that costs less than assumed: the job
+          # token DOES read this repository's ruleset. Branch-Protection scored 6/10 with real
+          # detail ("required approving review count is 1", "no status checks found"), not the
+          # inconclusive result a PAT is usually said to be needed for. A PAT would raise the
+          # ceiling on a few checks, but a stored long-lived credential is exactly the class of
+          # secret the SPEC-022 design removed here (OIDC for PyPI, SHA pins for actions), and no
+          # score line justifies putting one back.
 
       # Reported to code scanning, and deliberately NOT gating. Same settled reasoning as CodeQL and
       # zizmor here: Advanced Security owns triage, and blocking belongs in a repository ruleset.
