@@ -116,7 +116,9 @@ the caller on the orphan path and destroy the whole batch inside a span; nothing
 and an all-children-down `MultiSink` reported success so the worker's retry never ran. Events are
 now coerced and size-bounded at assembly, `error` carries `message`/`module`, and `health()` exposes
 the worker's loss counters.
-**Latest release: `v0.9.0`** (SPEC-022 + the extras-floor raise; `v0.8.0` was SPEC-021, `v0.7.1`
+**Latest release: `v0.10.1`** (SPEC-023 — and the first release carrying an SBOM; `v0.10.0` shipped
+without one and its GitHub Release is unrepairable, see the delivery doc. `v0.9.0` was
+SPEC-022 + the extras-floor raise; `v0.8.0` was SPEC-021, `v0.7.1`
 SPEC-020, `v0.7.0` SPEC-018 + SPEC-019, `v0.6.0` SPEC-017, `v0.5.0` SPEC-016, `v0.4.0` SPEC-015,
 `v0.3.0` SPEC-013 + SPEC-014, `v0.2.0` the rename, `v0.1.0` the first stable).
 **SPEC-018 (batch response adjudication) is Completed** — `KinesisSink`/`FirehoseSink` adjudicated a
@@ -152,6 +154,15 @@ on PRs, `dependabot.yml` version updates with cooldowns, `zizmor` over the workf
 with private reporting, and every action SHA-pinned. Free throughout because the repo is public —
 though validity checks and generic secret patterns are **not** free: they need an org-owned repo
 with GitHub Secret Protection, and `PATCH /repos` returns 200 while ignoring them.
+
+**SPEC-023 (supply-chain transparency and dependency auditing) is Completed** — SPEC-022's scanners
+all look *inward*, so nothing described what had shipped and nothing re-examined the eleven extras
+after the merge that pinned them. Adds a CycloneDX SBOM per release (`scripts/make-sbom.py`,
+published as a GitHub Release asset — the repo had nine tags and zero Releases), a weekly gating
+`pip-audit` across all extras, OpenSSF Scorecard, and an optional `security` Poetry group. Touches
+no `src/` file. Three of its own acceptance criteria were amended by evidence: FR-001's generator
+could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
+FR-006 overstated what a missing PAT costs.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -248,6 +259,26 @@ with GitHub Secret Protection, and `PATCH /repos` returns 200 while ignoring the
   `versioning-strategy: increase-if-necessary` stays, so the floors now move only when a human
   decides they should. A floor raise is a contract change: it cuts a release **minor**, not patch.
   (`v0.9.0`)
+- **An SBOM describes the published artifact, and is generated from it** — `make-sbom.py` installs
+  the built wheel with every extra into a throwaway venv and describes *that*, because runtime
+  dependencies are empty by design and the extras are the whole dependency surface. The generator
+  runs from a *second* venv or it lists itself and its ~30 dependencies as the library's (measured:
+  98 components vs 43). `cyclonedx-py`'s `poetry` mode cannot read this project at all — it wants
+  `[tool.poetry].name`, and PEP 621 puts the name in `[project]`, the same misreading
+  `dependabot.yml` documents. An empty SBOM, one versioned `0.0.0`, or one carrying build tooling
+  fails the job: an inaccurate SBOM is worse than none, because it looks authoritative. (SPEC-023)
+- **Release assets are attached to a draft, never to a published release** — this repository has
+  immutable releases enabled, so assets freeze at publish: create-as-draft → upload → publish. And
+  deleting an immutable release does **not** free its tag name, so a botched release is repaired
+  only by a new version tag, never by recreating the old one. Both were learned by shipping
+  `v0.10.0` without its SBOM and then making it unrepairable. The job is deliberately *not*
+  idempotent — a re-run that claimed to replace an asset it cannot touch would be lying. (SPEC-023)
+- **`pip-audit` gates, and audits the extras or it audits nothing** — `dependency-review` only sees
+  a PR's dependency *diff*, so an advisory against an already-pinned dependency is invisible to it;
+  the weekly re-examination is the point. `--no-root` is load-bearing (Poetry installs the project
+  editable, and `--strict` refuses an editable distribution), and `--strict` is on because a
+  silently skipped package is an unaudited one. Suppressions are per-advisory with written reasons
+  in `.github/pip-audit-ignores.txt`, never by severity or package. (SPEC-023)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

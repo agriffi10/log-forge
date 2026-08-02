@@ -27,7 +27,7 @@ to status only — no prose.
 | [SPEC-020](SPEC-020-integer-value-bounds.md) | Integer Value Bounds | Completed | SPEC-017 |
 | [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 | [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Completed | SPEC-012 |
-| [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Draft | SPEC-012, SPEC-022 |
+| [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Completed | SPEC-012, SPEC-022 |
 
 ## Arcs (build order)
 
