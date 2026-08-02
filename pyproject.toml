@@ -70,6 +70,25 @@ pytest-cov = "^7.1.0"
 ruff = ">=0.16,<0.17"
 mypy = "^2.3"
 
+# Supply-chain tooling (SPEC-023 FR-007). `optional = true` keeps it OUT of the
+# `poetry install --with dev` that every CI matrix leg runs — neither tool is needed to lint,
+# typecheck or test, and both drag in dependency trees of their own. The two security workflows
+# ask for it explicitly with `--with security`.
+#
+# In the lockfile rather than fetched ad hoc so the versions are pinned and Dependabot's existing
+# `pip` ecosystem maintains them under its cooldown, like every other dependency here.
+[tool.poetry.group.security]
+optional = true
+
+#
+# Both carry a `python = "<4.0"` marker for the same reason `clickhouse-connect` carries one:
+# `requires-python = ">=3.12"` has no upper bound, so Poetry solves against a range that runs past
+# 4.0, and a dependency capped at `<4.0` makes resolution fail outright. The marker scopes the tool
+# instead of narrowing the library's own declared range.
+[tool.poetry.group.security.dependencies]
+cyclonedx-bom = { version = "^7.3", python = "<4.0" }   # the `cyclonedx-py` CLI (SBOM generation)
+pip-audit = { version = "^2.10", python = "<4.0" }      # OSV/PyPI advisory audit of the env
+
 
 [tool.poetry-dynamic-versioning]
 enable = true
