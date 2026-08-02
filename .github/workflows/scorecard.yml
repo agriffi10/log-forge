@@ -1,0 +1,67 @@
+name: Scorecard
+
+# Standing measurement of the supply-chain posture SPEC-022 built (SPEC-023 FR-006).
+#
+# Those controls — SHA-pinned actions, least-privilege permissions, branch rules, a security policy
+# — are currently asserted by the specs that added them. Nothing re-checks them. Scorecard turns
+# them into a continuously measured score, so a regression (a pin reverted to a tag, a permission
+# widened, a rule lapsed) surfaces without anyone re-reading five workflows.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1"    # Mondays, offset off the hour and away from pip-audit's slot
+  push:
+    branches: [main]
+  # Scorecard's documented trigger for re-scoring when branch protection changes. Without it the
+  # Branch-Protection score only refreshes on the weekly run.
+  branch_protection_rule:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analysis:
+    name: analyze
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload the SARIF results to code scanning
+      contents: read
+      # NOT the PyPI publishing token. This OIDC token is audienced to the OpenSSF Scorecard API
+      # and is what `publish_results` uses to attest that this score came from this repository.
+      # release.yml's `id-token: write` exchanges for the right to upload to PyPI; a reader
+      # comparing the two files will otherwise read them as the same grant. They are not.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # this job only reads the tree; don't leave a token on disk
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish to the OpenSSF public API. The repository is public and this spec is about
+          # transparency; a score nobody outside can see measures nothing for a consumer deciding
+          # whether to depend on this library.
+          publish_results: true
+          # NO `repo_token`. Some checks — Branch-Protection above all — need a classic PAT with
+          # admin scope to read the ruleset, and will score as inconclusive without one. That is a
+          # deliberate trade: a stored long-lived credential is exactly the class of secret the
+          # SPEC-022 design removed from this repository (OIDC for PyPI, SHA pins for actions), and
+          # one score line does not justify putting one back. `main` IS protected by a ruleset —
+          # 1 approving review, code-owner review, last-push approval, squash-only, linear history
+          # — the scanner simply cannot see it with the job token.
+
+      # Reported to code scanning, and deliberately NOT gating. Same settled reasoning as CodeQL and
+      # zizmor here: Advanced Security owns triage, and blocking belongs in a repository ruleset.
+      # Only dependency-review and pip-audit fail a build. The alert count is the verdict, never
+      # the check mark.
+      #
+      # This upload coexists with CodeQL default setup: default setup only rejects uploads in the
+      # CodeQL category, and zizmor already proves third-party SARIF is accepted on this repository.
+      - name: Upload results to code scanning
+        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          sarif_file: results.sarif

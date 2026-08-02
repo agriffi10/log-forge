@@ -807,6 +807,15 @@ everything it instruments:
   declares least-privilege `permissions` instead of inheriting the repository default.
 - **Releases publish over OIDC**, so no PyPI token is stored in the repository — see
   [Releasing](#releasing).
+- **Every release ships a CycloneDX SBOM** as a release asset
+  ([latest release](https://github.com/agriffi10/log-forge/releases/latest),
+  `log-foundry-X.Y.Z.cdx.json`), describing the published wheel with every extra installed.
+  [`SECURITY.md`](SECURITY.md#software-bill-of-materials) has the detail.
+
+Scanning runs continuously rather than at release time: CodeQL over the source and the workflows,
+zizmor over the workflows, `dependency-review` on every pull request, a weekly `pip-audit` across
+all eleven extras, and OpenSSF Scorecard. Findings go to code scanning; `dependency-review` and
+`pip-audit` are the two that fail a build.
 
 ## Releasing
 

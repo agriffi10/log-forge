@@ -69,6 +69,25 @@ This project is a logging library, so the security properties that matter most a
 - The security of the destination you ship logs to. Access control on your SQS queue,
   Elasticsearch cluster, or database is yours to configure.
 
+## Software Bill of Materials
+
+Every tagged release carries a **CycloneDX** SBOM as a release asset, named for its version:
+
+```
+https://github.com/agriffi10/log-forge/releases/latest
+→ log-foundry-X.Y.Z.cdx.json
+```
+
+It describes the published wheel installed with **every optional extra**, so it is the widest
+dependency closure this library can produce — a consumer who installs only `[aws]` gets a strict
+subset of it. The core itself has no runtime dependencies, so an SBOM without the extras would
+describe nothing.
+
+The document is generated from the built artifact rather than from a checkout, its version is
+checked against the distribution it describes, and it is schema-validated before upload. It is not
+signed: build provenance attestation is not yet implemented, so treat the SBOM as maintainer-
+published metadata rather than as a verifiable attestation.
+
 ## Reporting security issues in dependencies
 
 This library has **zero required runtime dependencies**. Everything else is behind an optional
