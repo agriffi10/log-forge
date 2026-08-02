@@ -178,6 +178,11 @@ ignore = [
 # trip this rule.
 "src/log_foundry/sinks/postgres.py" = ["S608"]
 "src/log_foundry/sinks/sqlite.py" = ["S608"]
+# make-sbom.py exists to drive two virtualenvs it creates itself, so subprocess is the whole job.
+# Every argv element is either a literal, a path under a `tempfile.TemporaryDirectory` this script
+# just made, or a value read from the repository's own pyproject.toml / poetry.lock. There is no
+# caller-supplied input and no shell — `subprocess.run` is given a list, never a string.
+"scripts/make-sbom.py" = ["S603"]
 
 [tool.mypy]
 files = ["src"]

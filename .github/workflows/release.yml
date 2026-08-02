@@ -67,11 +67,39 @@ jobs:
             exit 1
           fi
 
+      # Runs on EVERY release-workflow run, not only on a tag. Same reasoning as publish-dev
+      # below: a step first exercised at release time is a step first debugged at release time.
+      # The script installs the built wheel with every extra into a throwaway virtualenv and
+      # describes that, so the SBOM is the closure a consumer actually gets — and it asserts the
+      # result rather than trusting it (empty, 0.0.0, or leaked build tooling all exit non-zero).
+      - name: Generate CycloneDX SBOM
+        run: python scripts/make-sbom.py --output "sbom.cdx.json"
+
+      # FR-002: the SBOM must not name a version that was never published. The build already
+      # checks the tag against the sdist; this checks the SBOM against the same sdist, so all
+      # three agree or the release stops here.
+      - name: Verify the SBOM version matches the build
+        run: |
+          built=$(basename dist/*.tar.gz .tar.gz)
+          built="${built#log_foundry-}"
+          sbom=$(python -c "import json;print(json.load(open('sbom.cdx.json'))['metadata']['component']['version'])")
+          echo "built=$built sbom=$sbom"
+          if [ "$sbom" != "$built" ]; then
+            echo "::error::SBOM version $sbom disagrees with the built distribution $built."
+            exit 1
+          fi
+
       - name: Upload built distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
 
   publish-dev:
     # Every merge to main ships an X.Y.Z.devN pre-release to PyPI. pip ignores pre-releases
@@ -124,3 +152,47 @@ jobs:
       # SHA-pinned for the same reason as publish-dev above.
       - name: Publish release to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  github-release:
+    # Publish the SBOM where a consumer can actually fetch it (SPEC-023 FR-003). Until this job
+    # existed the repository had tags but no GitHub Releases at all, so there was nothing for a
+    # release asset to attach to.
+    #
+    # `needs: publish-release` is the ordering that matters: a GitHub Release must never exist for
+    # a version that failed to reach PyPI. This job is the ONLY one here holding `contents: write`,
+    # and it deliberately does not request `id-token` — it authenticates to the GitHub API with the
+    # job token and never touches PyPI. The publish jobs above keep the inverse.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create the release and upload its asset; nothing else
+    steps:
+      - name: Download SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom
+
+      # Tag-qualified so a downloaded file identifies itself without its surrounding page.
+      - name: Name the asset for its version
+        run: mv sbom.cdx.json "log-foundry-${GITHUB_REF_NAME#v}.cdx.json"
+
+      # `gh` rather than a third-party action: one fewer pin upstream of a job that can write to
+      # this repository. Idempotent on re-run — a re-pushed tag replaces the asset (`--clobber`)
+      # instead of failing on "release already exists".
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="log-foundry-${GITHUB_REF_NAME#v}.cdx.json"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; updating its asset"
+          else
+            # --generate-notes builds the changelog server-side from the commits since the
+            # previous tag, so this job needs no checkout and no history.
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
