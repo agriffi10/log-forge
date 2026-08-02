@@ -138,8 +138,6 @@ ignore = [
                 # behind an import.
     "PERF203",  # try/except inside a loop is deliberate in the worker's drain: one bad batch
                 # must not abort the rest.
-    "S608",     # postgres.py and sqlite.py build INSERTs around a table name they validate
-                # themselves; the values are always parameterised.
     "UP047",    # PEP 695 `def f[T](...)`. Valid on the 3.12 floor, but rewriting the public
                 # `@trace` decorator's generics is a change to the signature users read, and
                 # the TypeVar form is not deprecated. Its own PR if ever.
@@ -154,6 +152,13 @@ ignore = [
 # FileSink and RotatingFileSink hold a handle open ACROSS calls by design — that is what makes
 # them a sink rather than a per-event open(). A context manager would close it after one emit.
 "src/log_foundry/sinks/file.py" = ["SIM115"]
+# These two build an INSERT around a table name because SQL cannot parameterize an identifier.
+# The name is run through `valid_identifier` at construction, so it is a plain SQL identifier by
+# the time it reaches the f-string, and every VALUE is parameterised. Scoped to these two files
+# rather than ignored repository-wide: a future sink that builds SQL less carefully should still
+# trip this rule.
+"src/log_foundry/sinks/postgres.py" = ["S608"]
+"src/log_foundry/sinks/sqlite.py" = ["S608"]
 
 [tool.mypy]
 files = ["src"]

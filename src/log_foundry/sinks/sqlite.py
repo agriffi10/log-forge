@@ -13,18 +13,15 @@ ClickHouse, …) are out of scope here (the latter is SPEC-011).
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
+
+from log_foundry.sinks._chunk import valid_identifier
 
 __all__ = ["SQLiteSink"]
 
 # Columns projected out of each event for cheap SQL filtering. ``event`` (full JSON) is stored
 # alongside these and is the source of truth; these are convenience projections (NULL if absent).
 _COLUMNS = ("log_id", "trace_id", "span_id", "timestamp", "level", "function")
-
-# A table name is a config value, not untrusted input, but it is interpolated into DDL/DML (SQLite
-# cannot parameterize identifiers), so restrict it to a plain SQL identifier to foreclose injection.
-_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SQLiteSink:
@@ -49,9 +46,7 @@ class SQLiteSink:
         connection: sqlite3.Connection | None = None,
         create_table: bool = True,
     ) -> None:
-        if not _IDENTIFIER.match(table):
-            raise ValueError(f"invalid table name {table!r}; expected a plain SQL identifier")
-        self._table = table
+        self._table = valid_identifier(table)
         self._owns_connection = connection is None
         # check_same_thread=False: the background worker (a different thread than the one that ran
         # configure()) is the sole writer, so SQLite's same-thread guard would only get in the way

@@ -46,6 +46,10 @@ def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[
 class HTTPSink:
     """A :class:`~log_foundry.sinks.base.Sink` that POSTs each batch to an HTTP endpoint.
 
+    Credentials passed as ``auth`` are sent on every request to ``url`` as given. Nothing here
+    requires ``https://`` — over a plaintext endpoint a bearer token, and a basic-auth pair (which
+    is base64, not encryption), travel in the clear. Use ``https://`` for anything off the host.
+
     Attributes:
         failed: Requests abandoned past the retry bound.
         dropped_oversized: Events dropped for exceeding a destination's hard size limit (used by
@@ -154,7 +158,14 @@ class HTTPSink:
         return headers, data
 
     def _apply_auth(self, headers: dict[str, str]) -> None:
-        """Apply bearer-token (str) or basic-auth (user, pass) credentials, if not already set."""
+        """Apply bearer-token (str) or basic-auth (user, pass) credentials, if not already set.
+
+        The scheme of ``url`` is NOT checked here: an ``http://`` endpoint sends these credentials
+        in cleartext, and basic auth is base64, not encryption. That is deliberate — a plaintext
+        endpoint is a legitimate configuration (a sidecar collector on loopback, an in-cluster
+        aggregator), and this library does not get to overrule the application's own deployment.
+        The caller owns the choice; see the class docstring.
+        """
         if self._auth is None or "Authorization" in headers:
             return
         if isinstance(self._auth, str):
