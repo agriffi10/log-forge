@@ -78,13 +78,35 @@ file under `src/`.
 
 ## Functional Requirements
 
-### FR-001: An SBOM is generated from the locked dependency graph
+### FR-001: An SBOM is generated covering every optional extra
 
 #### Description:
 
-Generate a CycloneDX SBOM from `pyproject.toml` + `poetry.lock` during the release workflow's
-`build` job, covering all optional extras. Runtime dependencies are empty by design, so an SBOM
-generated without `--all-extras` describes nothing — the extras *are* the dependency surface.
+Generate a CycloneDX SBOM during the release workflow's `build` job, covering all optional extras.
+Runtime dependencies are empty by design, so an SBOM that omits the extras describes nothing — the
+extras *are* the dependency surface.
+
+**Amended during Phase 1 — the mechanism changed, the requirement did not.** This FR was authored
+around `cyclonedx-py poetry`, reading `pyproject.toml` + `poetry.lock`. That subcommand cannot read
+this project: it takes the root component from `[tool.poetry].name`, which does not exist here
+because the name lives in `[project]` under PEP 621, and it crashes with `KeyError: 'name'`
+(`cyclonedx_py/_internal/utils/poetry.py:68`, v7.3.1 — the current release). Supplying that key
+clears the crash but yields **zero components**, because the parser then reads
+`[tool.poetry.dependencies]` while all eleven extras live in `[project.optional-dependencies]`.
+`--pyproject` on the `environment` subcommand routes through the same parser and fails identically.
+This is the same root cause `dependabot.yml` already documents for the app-vs-library
+misclassification.
+
+The mechanism is therefore **`cyclonedx-py environment`**, which reads installed distributions and
+is layout-agnostic (verified: 98 components with every extra installed), against a virtualenv
+resolved with `--all-extras` and **without** the `dev` and `security` groups. `environment` mode
+emits no `metadata.component`, so FR-002's root component is written by a post-processing step
+rather than by the tool. The generating tool must not appear in its own SBOM, so it runs from an
+environment separate from the one it describes.
+
+Rejected alternatives: adding `[tool.poetry].name` (does not produce components, and flips the
+Dependabot classification `dependabot.yml` deliberately reasons about); injecting that key into
+`pyproject.toml` inside CI (the same manoeuvre, hidden in a workflow).
 
 #### Acceptance Criteria:
 
@@ -95,8 +117,10 @@ generated without `--all-extras` describes nothing — the extras *are* the depe
       `boto3`, `confluent-kafka`, `psycopg`, `pymongo` and `sentry-sdk` are present by name.
 - [ ] The job fails if the document contains zero components, rather than uploading an empty SBOM.
 - [ ] The document validates against the CycloneDX schema for the spec version it declares.
-- [ ] Development dependencies (`pytest`, `ruff`, `mypy`, and the new `security` group) are **not**
-      components of the SBOM: it describes what a consumer installs, not what built it.
+- [ ] Development dependencies (`pytest`, `ruff`, `mypy`, and the `security` group itself) are
+      **not** components of the SBOM: it describes what a consumer installs, not what built it.
+      Confirmed in Phase 1 to require a dedicated virtualenv — installing extras and tooling
+      together leaks `pytest`, `ruff`, `mypy` and `cyclonedx-bom` into the component list.
 
 ### FR-002: The SBOM states the version that was actually published
 
@@ -106,8 +130,11 @@ The version in `pyproject.toml` is the literal placeholder `0.0.0`; the real val
 Git tags at build time by `poetry-dynamic-versioning`. An SBOM generated against the un-rewritten
 file would name a version that was never published, which is worse than no SBOM — it is a
 confidently wrong one. `cyclonedx-py` has no flag to override the root component's version, so the
-version must be resolved into `pyproject.toml` before the SBOM is generated (the plugin's own
-`poetry dynamic-versioning` command does this; the implementation plan confirms the mechanism).
+version must be resolved before the SBOM is written. `poetry dynamic-versioning` does this in place
+— verified in Phase 1: it sets `[project] version` and clears `dynamic`, producing e.g.
+`0.9.1.dev2`. Since FR-001's `environment` mode emits no root component at all, the version reaches
+the SBOM through the post-processing step that writes `metadata.component`, sourced from the built
+sdist filename — the same value `release.yml` already parses for its tag-agreement check.
 
 #### Acceptance Criteria:
 
@@ -299,8 +326,8 @@ No library API changes. This spec adds no public symbol, and `src/` is untouched
 **Tooling versions at authoring time** — the implementation pins the SHA for the tag current when
 it runs, which may be later than these:
 
-- `cyclonedx-bom` 7.3.1 (provides the `cyclonedx-py` CLI; `poetry` subcommand, `--all-extras`,
-  `--mc-type library`)
+- `cyclonedx-bom` `^7.3` (provides the `cyclonedx-py` CLI; **`environment` subcommand** — see the
+  FR-001 amendment for why not `poetry`)
 - `pip-audit` — CLI run inside the Poetry environment, not via `pypa/gh-action-pip-audit`, matching
   how `release.yml` already runs `build` and `twine` directly. One fewer pin to maintain.
 - `ossf/scorecard-action` v2.4.4

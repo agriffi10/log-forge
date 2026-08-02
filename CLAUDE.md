@@ -45,6 +45,7 @@ implementation against the design in `architecture.md`.
 | Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), queue/stream: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs`, and database: `clickhouse`, `mongo`, `postgres` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
 | Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
+| Supply chain | optional `security` group: `cyclonedx-bom` (SBOM), `pip-audit` (advisories) — SPEC-023 |
 | Lint / types | `ruff` (line-length 100), `mypy --strict` over `src` |
 
 **Don't add dependencies without noting them here first.** Keeping the core dependency-free is a
@@ -69,7 +70,18 @@ poetry run pytest                  # test
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
 sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
+
+# Supply-chain tooling (SPEC-023). The `security` group is optional — `--with dev` never installs it.
+poetry install --with security --all-extras    # audit tooling + every optional extra
+poetry run pip-audit                           # advisories in the resolved environment
+poetry run cyclonedx-py environment "$(poetry env info --path)" -o sbom.cdx.json
 ```
+
+**After installing extras locally, recreate the venv before trusting `mypy`.** With the optional
+deps present the `type: ignore[import-not-found]` comments in `sinks/` become "unused" and
+`mypy --strict` fails — CI never installs extras, so its no-extras environment is the contract.
+Uninstalling is not enough: `azure/` and `google/` leave namespace directories behind that mypy
+still reads as installed. `poetry env remove --all && poetry install --with dev` is the fix.
 
 **Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
 Merges to `main` publish a `X.Y.Z.devN` pre-release. Never add a `version` key to `pyproject.toml`.
