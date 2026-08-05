@@ -28,6 +28,14 @@ to status only — no prose.
 | [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 | [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Completed | SPEC-012 |
 | [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Completed | SPEC-012, SPEC-022 |
+| [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Draft | SPEC-014, SPEC-015 |
+| [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Draft | SPEC-004, SPEC-017 |
+| [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
+| [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
+| [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
+| [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Draft | SPEC-017, SPEC-019 |
+| [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Draft | SPEC-013, SPEC-019 |
+| [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-008, SPEC-009, SPEC-020 |
 
 ## Arcs (build order)
 
@@ -84,3 +92,30 @@ Group related specs and record the order to build them in. Delete this section i
   the full extras surface, and OpenSSF Scorecard as standing measurement of what SPEC-022 built.
   Depends on SPEC-012 for the same reason 022 does — it extends the publish path — and on SPEC-022
   for the pinning and least-privilege conventions it inherits. Touches no `src/` file.
+- **Audit remediation (SPEC-024..031):** the output of the 2026-08-05 full-codebase audit, whose
+  findings were validated in a second fresh context before being written up. The suite was green
+  throughout (568 tests, `ruff`, `mypy --strict`), so every item here is behaviour no gate catches.
+  Build order is by blast radius, not by number:
+  **SPEC-024** first and alone — baggage and the adopted trace context are never taken back out of
+  `contextvars`, so a request's data appears on the next request's events and a handler keeps
+  joining a trace whose process has exited. It is the only finding that puts *wrong data* in the
+  log stream rather than losing it, and the fix is small and self-contained.
+  **SPEC-025** next — three surviving instances of the SPEC-017 shape, where the exception a caller
+  receives is one the library invented: an unguarded `_close_span` fails a function that already
+  returned (and emits a contradictory second `span.end`), the orphan path propagates a sink's
+  failure, and `shutdown()` raises out of `atexit` while leaving the sink open forever.
+  **SPEC-029** before SPEC-026 — both introduce `_diag.py`, and 029 owns it. Twelve sink sites
+  print `repr(exception)` against the arch §6 rule that `_terminal_failure` cites for not doing it,
+  and `_emit`'s one unguarded stderr write kills the drain thread on a broken stream.
+  **SPEC-026** then — the largest. Every remote transport absorbs its own failures and returns
+  normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract are all inert
+  against a down destination, while the counters that *do* record the loss have no accessor. It is
+  SPEC-017 FR-004's rule generalized to the whole sink family.
+  **SPEC-027** and **SPEC-028** may go in either order after 026, and both touch every sink: 027
+  bounds a server-supplied `Retry-After` (a measured 22 s `shutdown()` hang, and 24 h is reachable)
+  and makes every sink wait interruptible; 028 states the concurrency contract the orphan path has
+  been violating since SPEC-002 and locks the sinks that hold mutable transport state.
+  **SPEC-030** after 026 (it appends to the same `Health`) — two documented user errors that produce
+  total silent loss with no signal: logging after `shutdown()`, and a late `configure(sink=...)`.
+  **SPEC-031** last, and independent of all of them — the residue too small to spec individually,
+  handled per SPEC-021's rule that an open item is fixed, settled, or recorded as a constraint.

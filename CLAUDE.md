@@ -164,6 +164,12 @@ no `src/` file. Three of its own acceptance criteria were amended by evidence: F
 could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
 FR-006 overstated what a missing PAT costs.
 
+**SPEC-024..031 are Draft** — the 2026-08-05 full-codebase audit arc, validated in a second fresh
+context and unbuilt. Nothing here is caught by CI (the suite was green throughout). Build order and
+the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; start with **SPEC-024**
+(baggage and the adopted trace context are never cleared, so one request's data lands on the next
+request's events — the only findings that put *wrong* data in the log stream rather than losing it).
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
