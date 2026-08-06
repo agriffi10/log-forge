@@ -8,9 +8,9 @@ request, ≤ 256 KB total). ``boto3`` is the optional ``aws`` extra, imported la
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any
 
+from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
 
 __all__ = ["SNSSink"]
@@ -53,10 +53,7 @@ class SNSSink:
             body = json.dumps(event)
             if len(body.encode("utf-8")) > self.MAX_BYTES:
                 self.dropped_oversized += 1
-                sys.stderr.write(
-                    f"log-foundry: SNSSink dropped an event exceeding the "
-                    f"{self.MAX_BYTES}-byte message limit\n"
-                )
+                _diag.lost("event", 1, f"SNSSink, exceeds the {self.MAX_BYTES}-byte message limit")
                 continue
             bodies.append(body)
         return bodies
@@ -75,8 +72,9 @@ class SNSSink:
             entries = [entry for entry in entries if entry["Id"] in failed_ids]
             if attempt >= self.max_retries:
                 self.failed += len(entries)
-                sys.stderr.write(
-                    f"log-foundry: {len(entries)} SNS message(s) still failing after "
-                    f"{self.max_retries + 1} attempts; abandoned\n"
+                _diag.lost(
+                    "message",
+                    len(entries),
+                    f"SNSSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
                 return

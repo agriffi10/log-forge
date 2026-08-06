@@ -44,12 +44,13 @@ def test_publishes_one_message_per_event() -> None:
     ]
 
 
-def test_close_flushes_futures_and_counts_errors() -> None:
+def test_close_flushes_futures_and_counts_errors(capsys) -> None:
     client = FakePublisher(errors=[None, RuntimeError("publish failed")])
     sink = GooglePubSubSink("projects/p/topics/t", client=client)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.failed == 0  # not resolved until close
     sink.close()
     assert sink.failed == 1
+    assert "lost 1 event(s)" in capsys.readouterr().err
     sink.close()  # idempotent; futures already cleared
     assert sink.failed == 1

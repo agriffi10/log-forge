@@ -76,12 +76,13 @@ def test_list_rpush_pipelined() -> None:
     ]
 
 
-def test_connection_error_retried_then_counted() -> None:
+def test_connection_error_retried_then_counted(capsys) -> None:
     client = FakeRedis(fail=True)
     sink = RedisStreamsSink("s", client=client, max_retries=2)
     sink.emit([{"a": 1}, {"a": 2}])
     assert len(client.pipelines) == 3  # initial + 2 retries
     assert sink.failed == 2  # whole batch abandoned
+    assert "lost 2 event(s)" in capsys.readouterr().err
 
 
 def test_injected_client_is_not_closed() -> None:

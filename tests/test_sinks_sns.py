@@ -50,11 +50,12 @@ def test_chunks_by_ten_entries() -> None:
     assert [len(call) for call in client.calls] == [10, 10, 5]
 
 
-def test_oversized_message_is_dropped() -> None:
+def test_oversized_message_is_dropped(capsys) -> None:
     client = FakeSNS()
     sink = SNSSink("arn", client=client)
     sink.emit([{"pad": "x" * (256 * 1024 + 50)}, {"ok": 1}])
     assert sink.dropped_oversized == 1
+    assert "lost 1 event(s)" in capsys.readouterr().err
     assert len(client.calls[0]) == 1
 
 
@@ -66,9 +67,10 @@ def test_failed_entries_retried_then_succeed() -> None:
     assert sink.failed == 0
 
 
-def test_persistent_failures_counted() -> None:
+def test_persistent_failures_counted(capsys) -> None:
     client = FakeSNS(always_fail={"0"})
     sink = SNSSink("arn", client=client, max_retries=2)
     sink.emit([{"a": 1}])
     assert len(client.calls) == 3
     assert sink.failed == 1
+    assert "lost 1 message(s)" in capsys.readouterr().err

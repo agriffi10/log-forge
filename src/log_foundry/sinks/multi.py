@@ -16,8 +16,9 @@ has nothing to retry.
 
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING
+
+from log_foundry import _diag
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
@@ -58,9 +59,8 @@ class MultiSink:
                 self.failed += 1
                 if first_error is None:
                     first_error = err
-                sys.stderr.write(
-                    f"log-foundry: MultiSink child {type(sink).__name__}.emit "
-                    f"failed and was skipped: {err!r}\n"
+                _diag.absorbed(
+                    f"emitting to MultiSink child {type(sink).__name__}", err, "child skipped"
                 )
             else:
                 delivered += 1
@@ -78,7 +78,6 @@ class MultiSink:
                 sink.close()
             except Exception as err:  # close-all: an earlier failure must not skip the rest
                 self.failed += 1
-                sys.stderr.write(
-                    f"log-foundry: MultiSink child {type(sink).__name__}.close "
-                    f"failed and was skipped: {err!r}\n"
+                _diag.absorbed(
+                    f"closing MultiSink child {type(sink).__name__}", err, "child skipped"
                 )

@@ -9,9 +9,10 @@ and counted; ``close()`` closes the channel and connection.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["RabbitMQSink"]
 
@@ -83,9 +84,10 @@ class RabbitMQSink:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += 1
-                sys.stderr.write(
-                    f"log-foundry: RabbitMQSink abandoned a message after "
-                    f"{self._max_retries + 1} attempts ({err!r})\n"
+                _diag.lost(
+                    "message",
+                    1,
+                    f"RabbitMQSink, {self._max_retries + 1} attempts, {type(err).__name__}",
                 )
                 return
 

@@ -45,15 +45,29 @@ def test_is_a_sink() -> None:
 def test_row_projection_and_column_names() -> None:
     client = FakeClickHouse()
     event = {
-        "timestamp": "t", "level": "ERROR", "trace_id": "tr", "span_id": "sp", "function": "fn",
-        "service": "svc", "duration_ms": 12.5, "status": "error", "extra": 1,
+        "timestamp": "t",
+        "level": "ERROR",
+        "trace_id": "tr",
+        "span_id": "sp",
+        "function": "fn",
+        "service": "svc",
+        "duration_ms": 12.5,
+        "status": "error",
+        "extra": 1,
     }
     ClickHouseSink("log_events", client=client).emit([event])
     table, data, columns = client.inserts[0]
     assert table == "log_events"
     assert columns == [
-        "timestamp", "level", "trace_id", "span_id", "function", "service",
-        "duration_ms", "status", "event",
+        "timestamp",
+        "level",
+        "trace_id",
+        "span_id",
+        "function",
+        "service",
+        "duration_ms",
+        "status",
+        "event",
     ]
     row = data[0]
     assert row[:8] == ["t", "ERROR", "tr", "sp", "fn", "svc", 12.5, "error"]
@@ -88,12 +102,13 @@ def test_create_table_runs_mergetree_ddl() -> None:
     assert "MergeTree" in client.commands[0]
 
 
-def test_insert_failure_retried_then_counted() -> None:
+def test_insert_failure_retried_then_counted(capsys) -> None:
     client = FakeClickHouse(fail_times=-1)
     sink = ClickHouseSink("log_events", client=client, max_retries=1)
     sink.emit([{"a": 1}, {"a": 2}])
     assert len(client.inserts) == 2  # initial + 1 retry
     assert sink.failed == 2
+    assert "lost 2 row(s)" in capsys.readouterr().err, "the line carries the count"
 
 
 def test_invalid_table_name_raises() -> None:

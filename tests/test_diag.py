@@ -392,3 +392,53 @@ def test_diag_imports_nothing_from_its_own_package() -> None:
         elif isinstance(node, ast.ImportFrom):
             assert not (node.module or "").startswith("log_foundry")
             assert node.level == 0, "a relative import is an intra-package import"
+
+
+# -- FR-002, enforced across the package ----------------------------------------------------
+
+_SRC = Path(_diag.__file__).parent
+
+
+def _diag_calls(tree: ast.AST) -> list[ast.Call]:
+    """Every ``_diag.<writer>(...)`` call in a module."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_diag"
+    ]
+
+
+@pytest.mark.parametrize("path", sorted(_SRC.rglob("*.py")), ids=lambda p: p.name)
+def test_no_diagnostic_interpolates_a_repr(path: Path) -> None:
+    """No ``_diag`` call site may re-introduce the twelve sinks' ``{err!r}`` (SPEC-029 FR-002).
+
+    A ``repr`` prints attribute values, so a psycopg error carries the failing statement and its
+    bound parameters, and a client object carries its credentials. Checked at the call sites rather
+    than by grepping for ``!r`` outright, because a ``raise ValueError(f"invalid table name
+    {name!r}")`` is correct — that echoes the caller's own bad argument back to the caller, which
+    is the opposite direction.
+
+    ``str(exc)`` is not mechanically detectable here (nothing in the AST says which name holds an
+    exception); the per-sink tests carry that one, `test_an_abandoned_insert_never_reprints_the_event`
+    above all.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for call in _diag_calls(tree):
+        for node in ast.walk(call):
+            if isinstance(node, ast.FormattedValue):
+                assert node.conversion != ord("r"), f"{path.name}: !r in a diagnostic"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                assert node.func.id != "repr", f"{path.name}: repr() in a diagnostic"
+            if isinstance(node, ast.Attribute):
+                assert node.attr != "args", f"{path.name}: exception args in a diagnostic"
+
+
+def test_the_enforcement_actually_sees_the_call_sites() -> None:
+    """Guards the guard: a walker that matched nothing would pass every file vacuously."""
+    calls = sum(
+        len(_diag_calls(ast.parse(p.read_text(encoding="utf-8")))) for p in _SRC.rglob("*.py")
+    )
+    assert calls >= 30, f"expected the converted call sites to be found, saw {calls}"

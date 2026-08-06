@@ -10,8 +10,8 @@ without discarding the successfully-indexed items. OpenSearch speaks the same bu
 from __future__ import annotations
 
 import json
-import sys
 
+from log_foundry import _diag
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
@@ -25,11 +25,20 @@ class ElasticsearchSink(HTTPSink):
             which counts whole requests abandoned past the retry bound).
     """
 
-    def __init__(self, url: str, *, index: str, auth: str | tuple[str, str] | None = None,
-                 **http_kwargs: object) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        index: str,
+        auth: str | tuple[str, str] | None = None,
+        **http_kwargs: object,
+    ) -> None:
         self._index = index
         super().__init__(
-            url.rstrip("/") + "/_bulk", auth=auth, body_format="ndjson", **http_kwargs  # type: ignore[arg-type]
+            url.rstrip("/") + "/_bulk",
+            auth=auth,
+            body_format="ndjson",
+            **http_kwargs,  # type: ignore[arg-type]
         )
         self.item_errors = 0
 
@@ -61,7 +70,7 @@ class ElasticsearchSink(HTTPSink):
                 errors += 1
         if errors:
             self.item_errors += errors
-            sys.stderr.write(f"log-foundry: ElasticsearchSink saw {errors} failed bulk item(s)\n")
+            _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
 
 
 class OpenSearchSink(ElasticsearchSink):

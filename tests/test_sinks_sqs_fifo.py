@@ -93,7 +93,9 @@ def test_three_traces_yield_three_groups_in_one_request() -> None:
     SQSSink(FIFO_URL, client=client).emit(events)
 
     assert len(client.calls) == 1
-    pairs = {(e["MessageGroupId"], json.loads(e["MessageBody"])["trace_id"]) for e in client.entries}
+    pairs = {
+        (e["MessageGroupId"], json.loads(e["MessageBody"])["trace_id"]) for e in client.entries
+    }
     # Each group id is paired with the body it was derived from — no cross-wiring.
     assert pairs == {("a" * 32, "a" * 32), ("b" * 32, "b" * 32), ("c" * 32, "c" * 32)}
 
@@ -397,6 +399,7 @@ def test_abandoned_sender_faults_name_the_sqs_code(capsys) -> None:
     SQSSink(STD_URL, client=client).emit([_event()])
 
     err = capsys.readouterr().err
+    assert "lost 1 message(s)" in err, "the line carries the count"
     assert "MissingParameter" in err, "the code is what makes the cause diagnosable"
     assert "not retried" in err
 

@@ -9,8 +9,9 @@ are counted and logged.
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["GooglePubSubSink"]
 
@@ -41,5 +42,5 @@ class GooglePubSubSink:
                 future.result()
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 self.failed += 1
-                sys.stderr.write(f"log-foundry: GooglePubSubSink publish failed: {err!r}\n")
+                _diag.lost("event", 1, f"GooglePubSubSink publish, {type(err).__name__}")
         self._futures.clear()

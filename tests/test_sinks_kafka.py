@@ -63,11 +63,14 @@ def test_close_flushes() -> None:
     assert producer.flushes == 1
 
 
-def test_delivery_errors_are_counted() -> None:
+def test_delivery_errors_are_counted(capsys) -> None:
     producer = FakeProducer(deliver_error="broker down")
     sink = KafkaSink("logs", producer=producer)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.failed == 2
+    err = capsys.readouterr().err
+    assert err.count("lost 1 message(s)") == 2, "one line per failed delivery"
+    assert "broker down" not in err, "the driver's text is never written"
 
 
 def test_requires_bootstrap_servers_without_producer() -> None:

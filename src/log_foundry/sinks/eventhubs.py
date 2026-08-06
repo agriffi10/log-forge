@@ -10,9 +10,10 @@ send errors are retried within a bound. ``close()`` closes the producer.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["AzureEventHubsSink"]
 
@@ -62,10 +63,7 @@ class AzureEventHubsSink:
             current = self.producer.create_batch()
             if not _try_add(current, data):
                 self.dropped_oversized += 1
-                sys.stderr.write(
-                    "log-foundry: AzureEventHubsSink dropped an event too large for an "
-                    "empty 1 MB batch\n"
-                )
+                _diag.lost("event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch")
         self._send(current)
 
     def close(self) -> None:
@@ -87,9 +85,11 @@ class AzureEventHubsSink:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += len(event_batch)
-                sys.stderr.write(
-                    f"log-foundry: AzureEventHubsSink abandoned a batch of {len(event_batch)} "
-                    f"event(s) after {self.max_retries + 1} attempts ({err!r})\n"
+                _diag.lost(
+                    "event",
+                    len(event_batch),
+                    f"AzureEventHubsSink, one batch, {self.max_retries + 1} attempts, "
+                    f"{type(err).__name__}",
                 )
                 return
 

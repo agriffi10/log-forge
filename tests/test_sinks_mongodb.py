@@ -83,27 +83,30 @@ def test_does_not_mutate_caller_events() -> None:
     assert events == [{"a": 1}]  # a copy is inserted, so no _id leaks back onto the caller's dict
 
 
-def test_bulk_write_error_counts_rejects_without_retry() -> None:
+def test_bulk_write_error_counts_rejects_without_retry(capsys) -> None:
     collection = FakeCollection(error=FakeBulkWriteError(2), error_times=1)
     sink = make_sink(collection)
     sink.emit([{"a": 1}, {"a": 2}, {"a": 3}])
     assert sink.failed == 2
+    assert "lost 2 document(s)" in capsys.readouterr().err
     assert len(collection.inserted) == 1  # unordered insert not retried
 
 
-def test_connection_error_retried_then_counted() -> None:
+def test_connection_error_retried_then_counted(capsys) -> None:
     collection = FakeCollection(error=RuntimeError("no primary"), error_times=-1)
     sink = make_sink(collection, max_retries=2)
     sink.emit([{"a": 1}, {"a": 2}])
     assert len(collection.inserted) == 3  # initial + 2 retries
     assert sink.failed == 2
+    assert "lost 2 document(s)" in capsys.readouterr().err
 
 
-def test_oversized_document_is_dropped() -> None:
+def test_oversized_document_is_dropped(capsys) -> None:
     collection = FakeCollection()
     sink = make_sink(collection)
     sink.emit([{"pad": "x" * (16 * 1024 * 1024 + 100)}, {"ok": 1}])
     assert sink.dropped_oversized == 1
+    assert "lost 1 document(s)" in capsys.readouterr().err
     assert collection.inserted[0][0] == [{"ok": 1}]
 
 

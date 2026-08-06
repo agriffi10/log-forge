@@ -72,12 +72,13 @@ def test_reconnects_after_channel_error() -> None:
     assert len(conn.channels[1].published) == 1
 
 
-def test_persistent_failure_is_counted() -> None:
+def test_persistent_failure_is_counted(capsys) -> None:
     conn = FakeConnection(fail_channels=99)  # every reconnect also fails
     sink = RabbitMQSink(exchange="logs", routing_key="rk", connection=conn, max_retries=2)
     sink.emit([{"a": 1}])
     assert len(conn.channels) == 3  # initial + 2 retries, each a fresh channel
     assert sink.failed == 1
+    assert "lost 1 message(s)" in capsys.readouterr().err
 
 
 def test_close_closes_channel_and_connection() -> None:

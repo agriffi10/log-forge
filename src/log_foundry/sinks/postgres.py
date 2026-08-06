@@ -10,10 +10,10 @@ convenience is off by default — the user owns their schema and indexes.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
 
+from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 
 __all__ = ["PostgresSink"]
@@ -71,9 +71,14 @@ class PostgresSink:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += len(batch)
-                sys.stderr.write(
-                    f"log-foundry: PostgresSink abandoned {len(batch)} event(s) after "
-                    f"{self.max_retries + 1} attempts ({err!r})\n"
+                # The type, never the repr. ``_row`` binds the whole ``json.dumps(event)`` as a
+                # statement parameter, and a psycopg error repr routinely reprints the failing
+                # statement *and* its parameters — so the old line reprinted the event, PII
+                # included, into a stream nobody was asked to secure (SPEC-029 FR-002, arch §6).
+                _diag.lost(
+                    "event",
+                    len(batch),
+                    f"PostgresSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
                 return
 

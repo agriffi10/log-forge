@@ -116,7 +116,9 @@ def test_full_coverage_no_loss_no_duplication() -> None:
     events = _events(23)
     SQSSink("q", client=client).emit(events)
 
-    sent = [json.loads(b) for call in client.calls for entry in call for b in [entry["MessageBody"]]]
+    sent = [
+        json.loads(b) for call in client.calls for entry in call for b in [entry["MessageBody"]]
+    ]
     assert sent == events, "every event sent exactly once, in order"
 
 
@@ -143,7 +145,7 @@ def test_partial_failure_retries_only_failed_entries() -> None:
     assert sink.failed == 0
 
 
-def test_persistent_failure_is_counted_not_raised() -> None:
+def test_persistent_failure_is_counted_not_raised(capsys) -> None:
     client = FakeSQSClient()
     client.always_fail_ids = {"0"}
     sink = SQSSink("q", client=client, max_retries=2)
@@ -151,6 +153,7 @@ def test_persistent_failure_is_counted_not_raised() -> None:
 
     assert sink.failed >= 1
     assert len(client.calls) == 3, "initial + max_retries attempts for the failing entry"
+    assert f"lost {sink.failed} message(s)" in capsys.readouterr().err
     # the successfully-sent entries were not discarded
     assert {json.loads(b)["i"] for b in client.sent_bodies} == {1, 2}
 
@@ -158,14 +161,20 @@ def test_persistent_failure_is_counted_not_raised() -> None:
 # -- FR-004: oversized-event handling ---------------------------------------------------
 
 
-def test_oversized_event_dropped_rest_sent() -> None:
+def test_oversized_event_dropped_rest_sent(capsys) -> None:
     client = FakeSQSClient()
     sink = SQSSink("q", client=client)
     batch = [{"i": 0}, {"i": 1, "big": "x" * (SQSSink.MAX_BYTES + 10)}, {"i": 2}]
     sink.emit(batch)
 
     assert sink.dropped_oversized == 1
-    sent = {json.loads(b)["i"] for call in client.calls for entry in call for b in [entry["MessageBody"]]}
+    assert "lost 1 event(s)" in capsys.readouterr().err
+    sent = {
+        json.loads(b)["i"]
+        for call in client.calls
+        for entry in call
+        for b in [entry["MessageBody"]]
+    }
     assert sent == {0, 2}, "the oversized event is dropped; the rest are still sent"
 
 

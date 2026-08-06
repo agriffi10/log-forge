@@ -61,12 +61,13 @@ def test_jetstream_path_publishes_via_jetstream() -> None:
     assert client.published == []
 
 
-def test_publish_errors_counted() -> None:
+def test_publish_errors_counted(capsys) -> None:
     client = FakeNATS(fail=True)
     sink = NATSSink("logs", client=client)
     sink.emit([{"a": 1}, {"a": 2}])
     sink.close()
     assert sink.failed == 2
+    assert capsys.readouterr().err.count("lost 1 event(s)") == 2
 
 
 def test_close_drains_the_connection() -> None:

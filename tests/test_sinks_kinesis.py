@@ -67,11 +67,12 @@ def test_chunks_by_record_count() -> None:
     assert [len(call) for call in client.calls] == [500, 500, 1]
 
 
-def test_oversized_record_is_dropped() -> None:
+def test_oversized_record_is_dropped(capsys) -> None:
     client = FakeKinesis()
     sink = KinesisSink("stream", client=client)
     sink.emit([{"pad": "x" * (1024 * 1024 + 50)}, {"ok": 1}])
     assert sink.dropped_oversized == 1
+    assert "lost 1 event(s)" in capsys.readouterr().err
     assert len(client.calls[0]) == 1  # only the in-limit record was sent
 
 
@@ -84,13 +85,14 @@ def test_failed_records_are_retried_then_succeed() -> None:
     assert sink.failed == 0
 
 
-def test_persistent_failures_are_counted() -> None:
+def test_persistent_failures_are_counted(capsys) -> None:
     body = json.dumps({"trace_id": "t1", "a": 1}).encode("utf-8")
     client = FakeKinesis(always_fail={body})
     sink = KinesisSink("stream", client=client, max_retries=2)
     sink.emit([{"trace_id": "t1", "a": 1}])
     assert len(client.calls) == 3  # initial + 2 retries
     assert sink.failed == 1
+    assert "lost 1 record(s)" in capsys.readouterr().err
 
 
 # -- SPEC-018: responses that don't describe the chunk ------------------------------------
@@ -120,9 +122,10 @@ def test_short_response_abandons_the_whole_chunk(capsys: pytest.CaptureFixture[s
     assert len(client.calls) == 1  # the retry loop stopped; nothing was re-sent
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    assert err.startswith("log-foundry: KinesisSink")
+    assert err.startswith("log-foundry: lost 3 record(s)"), "the count leads the line"
+    assert "KinesisSink" in err
     assert "3 record(s) sent, 1 result(s) returned" in err
-    assert "3 record(s) abandoned" in err
+    assert "abandoned, not retried" in err
 
 
 def test_long_response_abandons_the_whole_chunk(capsys: pytest.CaptureFixture[str]) -> None:

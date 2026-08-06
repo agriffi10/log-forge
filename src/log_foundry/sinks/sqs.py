@@ -31,9 +31,10 @@ is not done.
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable
 from typing import Any, NamedTuple
+
+from log_foundry import _diag
 
 __all__ = ["SQSSink"]
 
@@ -173,9 +174,10 @@ class SQSSink:
                 size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if size > self.MAX_BYTES:
                 self.dropped_oversized += 1
-                sys.stderr.write(
-                    f"log-foundry: dropped an event of {size} bytes exceeding the "
-                    f"{self.MAX_BYTES}-byte SQS message limit\n"
+                _diag.lost(
+                    "event",
+                    1,
+                    f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
                 )
                 continue
             if current and (
@@ -223,9 +225,14 @@ class SQSSink:
             sender_faults = [item for item in failed if item.get("SenderFault")]
             if sender_faults:
                 self.failed += len(sender_faults)
-                sys.stderr.write(
-                    f"log-foundry: {len(sender_faults)} SQS message(s) rejected as invalid "
-                    f"(first code: {sender_faults[0].get('Code', 'unknown')}); not retried\n"
+                # The AWS error code is library-controlled in the sense that matters — it is an
+                # enumerated API constant, not the event — and ``_diag`` bounds and escapes it
+                # regardless, so a surprising response shape cannot forge a line (SPEC-029).
+                _diag.lost(
+                    "message",
+                    len(sender_faults),
+                    f"SQSSink, rejected as invalid (first code: "
+                    f"{sender_faults[0].get('Code', 'unknown')}); not retried",
                 )
 
             retryable_ids = {item["Id"] for item in failed if not item.get("SenderFault")}
@@ -234,8 +241,9 @@ class SQSSink:
             entries = [entry for entry in entries if entry["Id"] in retryable_ids]
             if attempt >= self.max_retries:
                 self.failed += len(entries)
-                sys.stderr.write(
-                    f"log-foundry: {len(entries)} SQS message(s) still failing after "
-                    f"{self.max_retries + 1} attempts; abandoned\n"
+                _diag.lost(
+                    "message",
+                    len(entries),
+                    f"SQSSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
                 return

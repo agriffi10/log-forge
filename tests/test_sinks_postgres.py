@@ -69,8 +69,15 @@ def test_batch_insert_projects_columns_and_commits() -> None:
     conn = FakeConnection()
     PostgresSink("logs", connection=conn).emit(
         [
-            {"timestamp": "t", "level": "INFO", "trace_id": "tr", "span_id": "sp",
-             "function": "fn", "service": "svc", "extra": 1}
+            {
+                "timestamp": "t",
+                "level": "INFO",
+                "trace_id": "tr",
+                "span_id": "sp",
+                "function": "fn",
+                "service": "svc",
+                "extra": 1,
+            }
         ]
     )
     sql, rows = conn.executemany_calls[0]
@@ -140,3 +147,53 @@ def test_owned_connection_is_closed(monkeypatch) -> None:
     sink = PostgresSink("logs", dsn="postgresql://x")
     sink.close()
     assert conn.closed is True
+
+
+# -- SPEC-029 FR-002: the diagnostic must not reprint the event ------------------------------
+
+
+class LeakyDriverError(Exception):
+    """A psycopg-shaped error: its ``repr`` reprints the statement *and* its bound parameters.
+
+    Not an exaggeration of the real thing — psycopg's ``DiagnosticsMixin`` errors routinely carry
+    the failing query, and ``_row`` binds the whole ``json.dumps(event)`` as a parameter. Under the
+    old line the diagnostic for a failed insert reprinted the event, PII included.
+    """
+
+    def __init__(self, statement: str, params: object) -> None:
+        super().__init__(f"insert failed: {statement} with params {params!r}")
+        self.statement = statement
+        self.params = params
+
+    def __repr__(self) -> str:
+        return f"LeakyDriverError({self.args[0]!r})"
+
+
+class LeakyCursor(FakeCursor):
+    def executemany(self, sql, rows) -> None:
+        self._owner.executemany_calls.append((sql, [tuple(r) for r in rows]))
+        raise LeakyDriverError(sql, list(rows))
+
+
+class LeakyConnection(FakeConnection):
+    def cursor(self) -> LeakyCursor:
+        return LeakyCursor(self)
+
+
+def test_an_abandoned_insert_never_reprints_the_event(capsys) -> None:
+    """The leak the type-name rule prevents, stated as the test that would have caught it."""
+    conn = LeakyConnection()
+    sink = PostgresSink("logs", connection=conn, max_retries=0)
+
+    sink.emit([{"message": "hi", "fields": {"email": "user@example.com", "card": "4111111111111"}}])
+
+    err = capsys.readouterr().err
+    assert "user@example.com" not in err, "the event must not reach stderr through a driver repr"
+    assert "4111111111111" not in err
+    assert "INSERT INTO" not in err, "nor the statement the event was bound to"
+    assert "insert failed:" not in err, "nor the exception's own message"
+
+    assert "LeakyDriverError" in err, "the type is what an operator gets, and is enough"
+    assert "lost 1 event(s)" in err, "and the count it cost"
+    assert sink.failed == 1
+    assert err.count("\n") == 1
