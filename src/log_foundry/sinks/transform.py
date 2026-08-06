@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from log_foundry.sinks.base import read_losses
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from log_foundry.sinks.base import Sink
+    from log_foundry.sinks.base import Sink, SinkLosses
 
 __all__ = ["TransformSink"]
 
@@ -43,6 +45,20 @@ class TransformSink:
                 transformed.append(result)
         if transformed:
             self._inner.emit(transformed)
+
+    def losses(self) -> SinkLosses | None:
+        """Report the inner sink's losses (SPEC-026 FR-002). Never raises.
+
+        A wrapper that reported nothing would hide the destination it wraps: ``health().sink``
+        would read ``None`` for a ``TransformSink`` in front of a sink that counts perfectly well.
+        Events this sink itself declines to forward are not loss — they are the configuration
+        working, the same reason ``NullSink`` reports nothing.
+
+        ``None`` passes through unchanged rather than becoming ``SinkLosses(0, 0)``: FR-003
+        distinguishes "the sink reports nothing" from "the sink reports no loss", and a wrapper
+        that flattened the two would claim a clean bill of health on a sink that never gave one.
+        """
+        return read_losses(self._inner)
 
     def close(self) -> None:
         """Close the inner sink (FR-004)."""

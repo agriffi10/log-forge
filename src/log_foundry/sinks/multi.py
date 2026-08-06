@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkLosses, read_losses
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
@@ -72,6 +73,32 @@ class MultiSink:
             # is also what keeps an empty ``MultiSink`` a no-op rather than a raise — otherwise a
             # misconfigured fan-out with no children would retry every batch to exhaustion.
             raise first_error
+
+    def losses(self) -> SinkLosses | None:
+        """Sum the children's losses so a fan-out reports the whole tree (SPEC-026 FR-002).
+
+        Never raises: a child without ``losses()`` contributes zero, and a child whose accessor
+        raises or returns the wrong shape is skipped rather than allowed to take the aggregate —
+        and ``health()`` with it — down. Nesting is handled for free, since a child ``MultiSink``
+        is just another sink with a ``losses()``.
+
+        ``MultiSink.failed`` is deliberately absent from the total. It counts child *calls* that
+        raised, not events, so adding it to a per-event figure would produce a number with no
+        unit. The children already report their own loss in events.
+
+        ``None`` when *no* child reported anything — including an empty fan-out. FR-003 separates
+        "reports nothing" from "reports no loss", and a tree of silent children has not given a
+        clean bill of health; summing them to zero would claim one on their behalf. One reporting
+        child is enough to make the total meaningful, since the silent ones contribute zero.
+        """
+        children = [read_losses(sink) for sink in self._sinks]
+        reported = [child for child in children if child is not None]
+        if not reported:
+            return None
+        return SinkLosses(
+            dropped=sum(child.dropped for child in reported),
+            failed=sum(child.failed for child in reported),
+        )
 
     def close(self) -> None:
         """Close every child, isolating a failing child so the rest still close (FR-002)."""

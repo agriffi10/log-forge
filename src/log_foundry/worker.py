@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 from log_foundry import _diag
 
 if TYPE_CHECKING:
-    from log_foundry.sinks.base import Sink
+    from log_foundry.sinks.base import Sink, SinkLosses
 
 __all__ = ["Health", "Worker"]
 
@@ -54,6 +54,11 @@ class Health(NamedTuple):
             logged report. Non-``None`` is categorically worse than the two counters above:
             they measure loss the worker absorbed and kept running through, this one means
             the worker is gone and nothing further will be delivered (SPEC-019 FR-003).
+        sink: The configured sink's own loss counters, or ``None`` when there is no worker or
+            the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the two
+            integers above because they mean different things: ``dropped`` here is backpressure
+            at the queue, ``dropped`` on the sink is an event the destination could never
+            accept, and one number would make the remedies indistinguishable.
     """
 
     queued: int
@@ -62,6 +67,9 @@ class Health(NamedTuple):
     # Defaulted so the zeroed snapshot in `decorator._worker_health` — and any third-party
     # construction — keeps working unchanged.
     stopped_reason: str | None = None
+    # Appended for the same reason `stopped_reason` was: attribute and index access to every
+    # field that came before stay exactly as they were.
+    sink: SinkLosses | None = None
 
 
 class _FlushMarker:
@@ -179,7 +187,19 @@ class Worker:
             dropped=dropped,
             failed_batches=failed_batches,
             stopped_reason=stopped_reason,
+            sink=self._sink_losses(),
         )
+
+    def _sink_losses(self) -> SinkLosses | None:
+        """Read the configured sink's optional ``losses()``; ``None`` when it has none (FR-003).
+
+        The probe and its guarantees live in ``sinks.base.read_losses`` — imported here rather
+        than at module scope, keeping ``worker`` free of a runtime dependency on ``sinks`` the
+        same way ``config`` does (the ``Sink`` Protocol itself is ``TYPE_CHECKING``-only).
+        """
+        from log_foundry.sinks.base import read_losses
+
+        return read_losses(self.sink)
 
     def flush(self, timeout: float | None = 5.0) -> bool:
         """Drain everything submitted before this call through the sink, without stopping.
