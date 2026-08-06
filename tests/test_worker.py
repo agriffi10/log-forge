@@ -6,11 +6,16 @@ observe an auto-flush *before* shutdown (count/time triggers), it polls with a b
 `_wait_until` rather than a fixed sleep.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
+log_foundry_mod = pytest.importorskip("log_foundry")
 worker_mod = pytest.importorskip("log_foundry.worker")
 Worker = worker_mod.Worker
 
@@ -1212,3 +1217,190 @@ def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> 
     assert err.count("\n") == 1
     assert "1 undrained event-list(s) held and ? queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
+
+
+# -- SPEC-025 FR-004: shutdown() is total, and a failed close is announced ----------------
+
+
+class _CloseFailsSink:
+    """Emits fine, fails to close — a socket already reset, a client mid-teardown.
+
+    ``emit`` is deliberately slow and ``close`` records how much had been emitted by the time it
+    ran: asserting on ``batches`` *after* ``shutdown()`` returns cannot tell "close after drain"
+    from "close before drain", since both end with everything emitted.
+    """
+
+    def __init__(self, exc: BaseException | None = None, emit_delay: float = 0.0) -> None:
+        self.exc = exc or OSError("cannot close")
+        self.emit_delay = emit_delay
+        self.batches: list[list[dict]] = []
+        self.close_calls = 0
+        self.emitted_at_close = -1
+
+    def emit(self, batch: list[dict]) -> None:
+        time.sleep(self.emit_delay)
+        self.batches.append(list(batch))
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.emitted_at_close = sum(len(b) for b in self.batches)
+        raise self.exc
+
+
+def test_shutdown_returns_normally_when_the_sink_cannot_close(capsys) -> None:
+    sink = _CloseFailsSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    worker.shutdown()  # must not raise
+
+    err = capsys.readouterr().err
+    assert "absorbed a failure while closing the sink (OSError)" in err
+    assert "it may still hold its resources" in err, "the consequence is the point of the line"
+    assert "cannot close" not in err, "the message is never written (arch §6)"
+    assert err.count("\n") == 1, "one line, as SPEC-019's own stderr tests assert"
+
+
+def test_shutdown_drains_and_emits_before_attempting_the_close() -> None:
+    """The close runs after the join, so a failure there loses cleanup, not events.
+
+    Closing a sink while its drain thread is still running would mean `emit()` on a closed sink,
+    so this asserts what had been emitted *at close time*, not after `shutdown()` returned.
+    """
+    sink = _CloseFailsSink(emit_delay=0.05)
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    worker.submit(_span("b"))
+
+    worker.shutdown()
+
+    assert [e["message"] for batch in sink.batches for e in batch] == ["a", "b"]
+    assert sink.emitted_at_close == 2, "the drain had completed before the close was attempted"
+    assert sink.close_calls == 1
+
+
+def test_a_second_shutdown_is_still_a_no_op_and_still_does_not_raise() -> None:
+    """The once-only flag stays ahead of the close: a second close() on a sink that partially
+    released its resources is worse than leaving it unclosed."""
+    sink = _CloseFailsSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    worker.shutdown()
+    worker.shutdown()  # must not raise, and must not retry the close
+
+    assert sink.close_calls == 1
+
+
+def test_health_stays_readable_after_a_failed_close() -> None:
+    sink = _CloseFailsSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    worker.shutdown()
+
+    health = worker.health()
+    assert health.queued == 0
+    assert health.dropped == 0
+    assert health.failed_batches == 0, "the events were delivered; only the close failed"
+    assert health.stopped_reason is None, "a failed close is not a dead thread (SPEC-019)"
+
+
+def test_a_keyboardinterrupt_from_close_still_propagates() -> None:
+    """FR-004 draws the same line as FR-001 and FR-003: Exception, never BaseException.
+
+    The second call also pins where the once-only flag sits. It is set *before* the close, so
+    even an escape leaves `shutdown()` spent: moved after the close, this path would retry and
+    call `close()` twice on a sink that may already have released some of its resources.
+    """
+    sink = _CloseFailsSink(KeyboardInterrupt())
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.shutdown()
+
+    try:
+        worker.shutdown()  # spent, not retryable — and still silent
+    except KeyboardInterrupt:
+        # Caught rather than allowed to propagate: an escaping KeyboardInterrupt aborts the
+        # whole pytest session instead of failing this test, which reads in CI as an
+        # interrupted run rather than a regression.
+        pytest.fail("shutdown() retried a close that had already failed")
+    assert sink.close_calls == 1
+
+
+def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
+    """FR-004's criterion names `log_foundry.shutdown()`, whose delegate is deliberately
+    unguarded — it relies entirely on `Worker.shutdown()` being total."""
+    log_foundry = pytest.importorskip("log_foundry")
+    decorator = pytest.importorskip("log_foundry.decorator")
+    sink = _CloseFailsSink()
+    log_foundry.configure(service="t", sink=sink)
+
+    @log_foundry.trace(name="work")
+    def work() -> int:
+        return 42
+
+    work()
+    log_foundry.shutdown()  # must not raise
+    log_foundry.shutdown()  # idempotent, still silent
+
+    assert sink.close_calls == 1
+    assert [e["message"] for batch in sink.batches for e in batch] == ["span.start", "span.end"]
+    monkeypatch.setattr(decorator, "_worker", None)
+
+
+_ATEXIT_PROGRAM = """
+import sys
+import log_foundry as lf
+
+class CloseFailsSink:
+    def emit(self, batch): pass
+    def close(self): raise OSError("cannot close")
+
+lf.configure(service="t", env="t", sink=CloseFailsSink())
+
+@lf.trace(name="work")
+def work(): return 1
+
+work()
+sys.exit({code})
+"""
+
+
+@pytest.mark.parametrize("code", [0, 3])
+def test_an_atexit_shutdown_prints_no_traceback_at_interpreter_shutdown(code, tmp_path) -> None:
+    """FR-004: the failure must not surface as "Exception ignored in atexit callback".
+
+    A real subprocess, because that is the only way to reach the interpreter-shutdown path —
+    ``atexit`` handlers do not run inside pytest, and CPython's handling of an exception escaping
+    one is exactly what this criterion is about.
+
+    The exit-status half of the criterion was **already true** before the guard: CPython absorbs
+    a non-``SystemExit`` exception from an ``atexit`` callback and carries on, so the status was
+    never at risk (measured against the unguarded code at exit 0, exit 3 and an uncaught
+    exception). It is asserted anyway to keep that fact pinned. What the guard actually changes
+    is the block below it — the traceback, and with it the exception's *message*, which can carry
+    a value from the event that provoked the failure (arch §6).
+    """
+    src = pathlib.Path(log_foundry_mod.__file__).resolve().parent.parent
+    script = tmp_path / "prog.py"
+    script.write_text(_ATEXIT_PROGRAM.format(code=code))
+
+    # Suppressed here rather than by widening the tests-wide ignores: argv is this interpreter
+    # plus a script this test just wrote into pytest's own tmp_path. No shell, no caller-supplied
+    # input — the same reasoning `scripts/make-sbom.py` carries in pyproject.
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(src)},
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == code, "the process keeps its own exit status"
+    assert "Exception ignored in atexit callback" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "cannot close" not in result.stderr, "the message is never written (arch §6)"
+    assert "absorbed a failure while closing the sink (OSError)" in result.stderr

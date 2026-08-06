@@ -19,6 +19,12 @@ Two rules, both load-bearing:
   as everywhere else in this library: a ``KeyboardInterrupt`` landing mid-write is the operator's
   intent, not a stream fault to swallow.
 
+**This module must import nothing from its own package.** ``decorator``, ``api`` and ``worker``
+all reach it with ``from log_foundry import _diag`` at module scope, which executes while the
+package is still partially initialised and resolves only because ``_diag`` is a leaf — it needs
+``sys`` and nothing else. Give it an intra-package import and every module that is imported
+*first* in a fresh interpreter starts failing.
+
 SPEC-029 takes ownership of this module and moves the ``repr(exception)`` sink sites onto it.
 """
 

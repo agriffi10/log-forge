@@ -25,6 +25,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from log_foundry import _diag
+
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
 
@@ -244,6 +246,17 @@ class Worker:
 
         Idempotent: a second call is a no-op (FR-005). Registered via ``atexit`` by the
         decorator's lazy worker so a program that logs and exits immediately still flushes.
+
+        **Total** (SPEC-025 FR-004). The close was unguarded, so a sink whose ``close()`` failed
+        raised out of ``shutdown()`` — and out of the ``atexit`` handler, where CPython printed
+        "Exception ignored in atexit callback" with a full traceback carrying the exception's
+        message, which arch §6 keeps out of anything the library says about itself.
+
+        The once-only flag deliberately stays *ahead* of the close rather than moving after it.
+        Re-running a drain is not safe, and a second ``shutdown()`` retrying a close that already
+        failed would call ``close()`` twice on a sink that may have partially released its
+        resources. Idempotence is preserved; what changes is that the failure is announced rather
+        than swallowed by the flag.
         """
         with self._lock:
             if self._shutdown_done:
@@ -255,7 +268,12 @@ class Worker:
         except queue.Full:
             pass
         self._thread.join()
-        self.sink.close()
+        try:
+            self.sink.close()
+        except Exception as exc:
+            # After the join, so everything queued has already been drained and emitted: what is
+            # lost here is the sink's own cleanup, not events.
+            _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
     # -- worker thread ------------------------------------------------------------------
 
