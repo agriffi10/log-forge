@@ -1,9 +1,4 @@
-"""DatadogSink — ship to Datadog's logs intake (arch §8, SPEC-009).
-
-An :class:`~log_foundry.sinks.http.HTTPSink` specialization: POSTs the batch as a JSON array to the
-region-specific logs intake with a ``DD-API-KEY`` header, enriching each entry with ``ddsource``,
-``service``, and ``ddtags`` from configuration / the event.
-"""
+"""DatadogSink — ship to Datadog's logs intake (arch §8, SPEC-009)."""
 
 from __future__ import annotations
 
@@ -17,7 +12,11 @@ _DDSOURCE = "log-foundry"
 
 
 class DatadogSink(HTTPSink):
-    """POST events to Datadog's logs intake (FR-007)."""
+    """POSTs events to Datadog's logs intake (FR-007).
+
+    The batch goes as a JSON array to the region-specific intake with a ``DD-API-KEY`` header,
+    each entry enriched with ``ddsource``, ``service`` and ``ddtags``.
+    """
 
     def __init__(
         self,
@@ -28,6 +27,21 @@ class DatadogSink(HTTPSink):
         ddtags: str | None = None,
         **http_kwargs: object,
     ) -> None:
+        """Points the sink at a Datadog site's logs intake.
+
+        Args:
+          api_key: The key sent as ``DD-API-KEY``.
+          site: The Datadog site, which selects the intake host.
+          service: Overrides the event's own ``service``, or ``None`` to keep it.
+          ddtags: Tags applied to every entry, or ``None`` for none.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self._service = service
         self._ddtags = ddtags
         headers = merge_headers({"DD-API-KEY": api_key}, http_kwargs)
@@ -37,13 +51,34 @@ class DatadogSink(HTTPSink):
         )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """POST each event (enriched) as one JSON array (FR-007)."""
+        """POSTs each enriched event as one JSON array (FR-007).
+
+        Args:
+          batch: The events to ship. An empty batch is a no-op.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: If the request was abandoned past the retry bound.
+        """
         if not batch:
             return
         body = json.dumps([self._entry(event) for event in batch]).encode("utf-8")
         self._send(body, content_type="application/json")
 
     def _entry(self, event: dict[str, object]) -> dict[str, object]:
+        """Copies an event and applies the configured Datadog enrichment.
+
+        Args:
+          event: The event to enrich, which is not mutated.
+
+        Returns:
+          The enriched entry.
+
+        Raises:
+          None.
+        """
         entry = dict(event)
         entry["ddsource"] = _DDSOURCE
         if self._service is not None:

@@ -1,8 +1,4 @@
-"""HoneycombSink — ship to Honeycomb's batch events API (arch §8, SPEC-009).
-
-An :class:`~log_foundry.sinks.http.HTTPSink` specialization: POSTs to ``/1/batch/<dataset>`` with an
-``X-Honeycomb-Team`` header, using Honeycomb's ``[{"data": <event>}, ...]`` batch shape.
-"""
+"""HoneycombSink — ship to Honeycomb's batch events API (arch §8, SPEC-009)."""
 
 from __future__ import annotations
 
@@ -14,7 +10,11 @@ __all__ = ["HoneycombSink"]
 
 
 class HoneycombSink(HTTPSink):
-    """POST events to Honeycomb's batch API for a dataset (FR-010)."""
+    """POSTs events to Honeycomb's batch API for a dataset (FR-010).
+
+    The request goes to ``/1/batch/<dataset>`` with an ``X-Honeycomb-Team`` header, in
+    Honeycomb's ``[{"data": <event>}, ...]`` batch shape.
+    """
 
     def __init__(
         self,
@@ -24,6 +24,20 @@ class HoneycombSink(HTTPSink):
         url: str = "https://api.honeycomb.io",
         **http_kwargs: object,
     ) -> None:
+        """Points the sink at a dataset's batch endpoint.
+
+        Args:
+          api_key: The key sent as ``X-Honeycomb-Team``.
+          dataset: The target dataset, which forms part of the path.
+          url: The API base URL.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",
@@ -31,7 +45,17 @@ class HoneycombSink(HTTPSink):
         )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """POST the batch as Honeycomb's ``[{"data": event}, ...]`` shape (FR-010)."""
+        """POSTs the batch in Honeycomb's ``[{"data": event}, ...]`` shape (FR-010).
+
+        Args:
+          batch: The events to ship. An empty batch is a no-op.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: If the request was abandoned past the retry bound.
+        """
         if not batch:
             return
         body = json.dumps([{"data": event} for event in batch]).encode("utf-8")
