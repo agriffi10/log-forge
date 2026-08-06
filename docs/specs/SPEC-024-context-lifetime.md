@@ -1,7 +1,7 @@
 # Spec: Context Lifetime — Scoping Baggage and Adopted Trace Context
 
 **ID:** SPEC-024  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-05  
 **Depends On:** SPEC-014, SPEC-015
 

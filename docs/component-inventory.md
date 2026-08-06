@@ -12,6 +12,8 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | value sanitizer | `src/log_foundry/sanitize.py` | `coerce` / `sanitize_fields` / `truncate_str` / `truncate_tail` — makes any value JSON-safe and size-bounded, integers included (SPEC-020); total (never raises). |
 | `health()` + `Health` | `src/log_foundry/__init__.py`, `worker.py` | Public snapshot of the worker's `queued` / `dropped` / `failed_batches`; never creates a worker. |
 | context stack + baggage | `src/log_foundry/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
+| root-span context scope | `src/log_foundry/context.py` | `push_baggage_scope` / `pop_baggage_scope` — bracket a root span so baggage is restored and the adopted context cleared on exit; total, tolerates a foreign-context token (SPEC-024). |
+| `reset_context` | `src/log_foundry/context.py` | Public clear of baggage + adopted context, for callers who open no span (the orphan path) or adopt before dispatching into a child context. Never raises. |
 | `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
 | `StdoutSink` | `src/log_foundry/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
 | `SQSSink` | `src/log_foundry/sinks/sqs.py` | SQS sink (optional `aws` extra): lazy boto3, count/byte chunking, Failed-list retry, oversized drop. FIFO queues supported — `MessageGroupId` defaults to the event's `trace_id`, configurable; sender faults are not retried. |
