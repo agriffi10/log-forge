@@ -30,7 +30,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import threading
 
-__all__ = ["clamp_server_delay", "wait"]
+__all__ = ["MAX_WAIT", "clamp_server_delay", "wait"]
+
+MAX_WAIT = 86_400.0
+"""Hard ceiling on any single wait, in seconds — a day.
+
+Not a policy, a totality guard. ``time.sleep`` and ``Event.wait`` both raise ``OverflowError``
+past the platform's ``time_t``, so ``wait(1e18)`` — reachable from a large ``max_retry_after``, or
+from ``0.1 * 2**63`` on an absurd ``max_retries`` — would raise on the drain thread, which is the
+one thing this module exists to prevent. Nothing legitimate waits longer than this, and a caller
+who genuinely wants to is better served by not logging.
+"""
 
 
 def wait(delay: float, stop: threading.Event | None = None) -> None:
@@ -45,11 +55,16 @@ def wait(delay: float, stop: threading.Event | None = None) -> None:
     rather than ``time.sleep`` in both cases: with no event there is nothing to wait on, so the
     ``None`` path falls back to ``time.sleep``.
 
+    A finite delay larger than :data:`MAX_WAIT` is capped rather than passed through: both
+    ``time.sleep`` and ``Event.wait`` raise ``OverflowError`` past the platform's ``time_t``, and
+    "total" has to mean total.
+
     It does **not** abort an in-flight network call — only the pause between attempts. Cancelling
     a socket mid-write is not something this library attempts.
     """
     if not (delay > 0) or math.isinf(delay):
         return
+    delay = min(delay, MAX_WAIT)
     if stop is None:
         time.sleep(delay)
         return
@@ -76,5 +91,13 @@ def clamp_server_delay(value: float | None, ceiling: float) -> float | None:
     to lower it below the default.
     """
     if value is None or not (value > 0) or math.isinf(value):
+        return None
+    if not (ceiling > 0):
+        # An unusable ceiling is a misconfiguration, not an instruction to stop waiting. Left
+        # unchecked, ``min(value, 0)`` returns ``0.0`` — which is *not* ``None``, so the caller
+        # reads it as an honoured delay and retries with no backoff at all, and ``min(value,
+        # nan)`` returns ``value``, so the ceiling silently vanishes and the header is honoured
+        # in full. Both defeat this function in the direction it exists to prevent. Falling back
+        # to the sink's own backoff is the same answer a missing header gets.
         return None
     return min(value, ceiling)

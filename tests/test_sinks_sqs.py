@@ -13,7 +13,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
+    # ``wait`` is bound into each sink at import, and its Event branch never reaches
+    # ``time.sleep`` — patching either centrally would leave this fixture inert.
+    monkeypatch.setattr("log_foundry.sinks.sqs.wait", lambda _delay, _stop=None: None)
 
 sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
 SQSSink = sqs_mod.SQSSink

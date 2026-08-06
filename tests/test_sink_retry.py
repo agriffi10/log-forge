@@ -247,10 +247,81 @@ def test_shutdown_is_not_held_by_a_sink_mid_backoff() -> None:
 # --- FR-002 (Phase 2): every retrying sink waits through the shared helper ------------------
 
 
-RETRYING_SINKS = (
-    "_socket", "clickhouse", "eventhubs", "http", "mongodb", "postgres", "rabbitmq", "redis",
-    "sqs",
-)
+def _modules_with_a_retry_loop() -> list[str]:
+    """Every sinks module containing a ``for attempt in range(...)`` re-send loop.
+
+    Derived, not listed: a hand-written roster is exactly how ``KinesisSink``, ``FirehoseSink``
+    and ``SNSSink`` shipped with a re-send loop, no wait and no stop signal while two tests
+    claimed to cover "every retrying sink". A new sink with a retry loop joins this set the day
+    it is written.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    import log_foundry
+
+    found: list[str] = []
+    for path in sorted((_pathlib.Path(log_foundry.__file__).parent / "sinks").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "attempt"
+            ):
+                found.append(path.stem)
+                break
+    return found
+
+
+def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
+    """A re-send loop with no wait is the SQSSink defect, in a sink nobody listed."""
+    import ast
+    import pathlib as _pathlib
+
+    import log_foundry
+
+    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
+    missing: list[str] = []
+    for name in _modules_with_a_retry_loop():
+        source = (root / f"{name}.py").read_text()
+        missing.extend(
+            f"{name}.py:{node.lineno}"
+            for node in ast.walk(ast.parse(source))
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "attempt"
+                and not any(
+                    isinstance(inner, ast.Call)
+                    and (
+                        (isinstance(inner.func, ast.Name) and inner.func.id == "wait")
+                        # ``HTTPSink`` reaches ``wait`` through its own helper, which is where
+                        # the ``Retry-After`` clamp lives; the helper is checked by its own tests.
+                        or (
+                            isinstance(inner.func, ast.Attribute)
+                            and inner.func.attr == "_sleep_backoff"
+                        )
+                    )
+                    for inner in ast.walk(node)
+                )
+            )
+        )
+    assert missing == [], f"retry loops with no interruptible wait: {missing}"
+
+
+def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:
+    import pathlib as _pathlib
+
+    import log_foundry
+
+    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
+    missing = [
+        name
+        for name in _modules_with_a_retry_loop()
+        if "self.stop_signal" not in (root / f"{name}.py").read_text()
+    ]
+    assert missing == [], f"no stop_signal: {missing}"
 
 
 def test_no_sink_calls_time_sleep_directly() -> None:
@@ -269,8 +340,12 @@ def test_no_sink_calls_time_sleep_directly() -> None:
             f"{path.name}:{node.lineno}"
             for node in ast.walk(ast.parse(path.read_text()))
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "sleep"
+            and (
+                # ``time.sleep(...)`` and ``from time import sleep; sleep(...)`` alike — the
+                # second form would otherwise slip past a lint that only matches attributes.
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "sleep")
+                or (isinstance(node.func, ast.Name) and node.func.id == "sleep")
+            )
         )
     assert offenders == [], f"uninterruptible sleeps: {offenders}"
 
@@ -279,18 +354,24 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
     """A constructed instance of every sink with a retry loop, with fake transports."""
     from log_foundry.sinks.clickhouse import ClickHouseSink
     from log_foundry.sinks.eventhubs import AzureEventHubsSink
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
     from log_foundry.sinks.mongodb import MongoDBSink
     from log_foundry.sinks.postgres import PostgresSink
     from log_foundry.sinks.rabbitmq import RabbitMQSink
     from log_foundry.sinks.redis import RedisStreamsSink
+    from log_foundry.sinks.sns import SNSSink
     from log_foundry.sinks.sqs import SQSSink
     from log_foundry.sinks.syslog import SyslogSink
     from test_sinks_clickhouse import FakeClickHouse
     from test_sinks_eventhubs import FakeProducer
+    from test_sinks_firehose import FakeFirehose
+    from test_sinks_kinesis import FakeKinesis
     from test_sinks_mongodb import FakeCollection, FakeMongoClient
     from test_sinks_postgres import FakeConnection as FakePG
     from test_sinks_rabbitmq import FakeConnection as FakeAMQP
     from test_sinks_redis import FakeRedis
+    from test_sinks_sns import FakeSNS
     from test_sinks_sqs import FakeSQSClient
     from test_sinks_syslog import FakeSocket
 
@@ -307,6 +388,9 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
         RabbitMQSink(exchange="e", routing_key="r", connection=FakeAMQP()),
         AzureEventHubsSink(producer=FakeProducer()),
         SQSSink("https://q/x", client=FakeSQSClient()),
+        KinesisSink("s", client=FakeKinesis()),
+        FirehoseSink("s", client=FakeFirehose()),
+        SNSSink("arn", client=FakeSNS()),
     ]
 
 
@@ -627,3 +711,110 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
     log_foundry.shutdown(timeout=None)  # None is still available on request
 
     assert seen == [DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SHUTDOWN_TIMEOUT, None]
+
+
+# --- review follow-ups ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ceiling", [0.0, -1.0, math.nan])
+def test_an_unusable_ceiling_falls_back_rather_than_defeating_the_clamp(ceiling: float) -> None:
+    """A zero ceiling returned 0.0 (a hot retry loop); a NaN one made ``min`` return the value."""
+    assert clamp_server_delay(86400.0, ceiling) is None
+
+
+def test_a_zero_max_retry_after_does_not_produce_a_hot_retry_loop(monkeypatch) -> None:
+    """The obvious way to lower the ceiling for a tight deadline must not remove the backoff."""
+    slept: list[float] = []
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", slept.append)
+
+    sink = HTTPSink(
+        "http://x",
+        max_retries=2,
+        max_retry_after=0.0,
+        opener=FakeOpener([FakeResponse(429, b"", {"Retry-After": "60"})]),
+    )
+    with pytest.raises(Exception):  # noqa: B017
+        sink.emit([{"a": 1}])
+
+    assert slept == [0.1, 0.2], "fell back to exponential backoff, not to no backoff"
+
+
+def test_a_huge_finite_delay_does_not_raise_on_the_drain_thread(monkeypatch) -> None:
+    """``time.sleep(1e18)`` raises OverflowError; "total" has to mean total."""
+    from log_foundry.sinks._retry import MAX_WAIT
+
+    slept: list[float] = []
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", slept.append)
+    wait(1e18, None)
+    assert slept == [MAX_WAIT]
+
+    stop = threading.Event()
+    stop.set()
+    wait(1e18, stop)  # the Event branch overflows too
+
+
+def test_a_later_shutdown_closes_a_sink_an_expired_one_left_open() -> None:
+    """One expiry used to mean the sink was never closed for the life of the process."""
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+
+    worker.shutdown(timeout=0.2)
+    assert sink.closed == 0, "not while the thread is still inside emit"
+
+    sink.release.set()
+    worker._thread.join(5.0)
+    worker.shutdown(timeout=1.0)
+    assert sink.closed == 1, "the close was deferred, not abandoned"
+
+    worker.shutdown(timeout=1.0)
+    assert sink.closed == 1, "and still idempotent"
+
+
+def test_a_deferred_close_does_not_re_drain() -> None:
+    """The once-only flag still holds: a second call closes, it does not emit again."""
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+    worker.shutdown(timeout=0.2)
+    sink.release.set()
+    worker._thread.join(5.0)
+
+    calls_before = sink.entered.is_set()
+    worker.submit([{"b": 2}])  # nothing consumes this now
+    worker.shutdown(timeout=1.0)
+
+    assert calls_before and sink.closed == 1
+
+
+def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+    worker.submit([{"b": 2}])
+    worker.submit([{"c": 3}])
+    try:
+        worker.shutdown(timeout=0.2)
+        err = capsys.readouterr().err
+    finally:
+        sink.release.set()
+
+    assert "lost 1 drain(s)" not in err, "nothing counted a 'drain'; the events are the loss"
+    assert "event(s)" in err
+    assert "shutdown timed out after 0.2s" in err
+
+
+def test_the_timeout_in_the_line_is_not_taken_on_the_callers_word(capsys) -> None:
+    """``timeout`` is caller data, so its ``__str__`` is not the library's to trust (arch §6)."""
+    from log_foundry.worker import _bounded_seconds
+
+    class Hostile:
+        def __str__(self) -> str:
+            return "0\nlog-foundry: forged line"
+
+    assert _bounded_seconds(Hostile()) == "?"  # type: ignore[arg-type]
+    assert _bounded_seconds(None) == "no timeout"
+    assert _bounded_seconds(0.25) == "0.25s"

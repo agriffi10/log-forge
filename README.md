@@ -754,7 +754,9 @@ either waits indefinitely, which is unsafe in any environment with an execution 
 
 **What a broken destination can cost you.** There is one drain thread, so a sink's backoff pauses
 *all* log delivery, and it spans `shutdown()`. At the defaults (`max_retries=3`) that is 0.7 s of
-backoff per batch for most sinks, and up to 90 s for an HTTP sink whose destination is sending
+backoff per batch for most sinks (per *message* for the socket-backed ones — ~70 s for a
+100-message batch against a dead syslog host), and up to 90 s for an HTTP sink whose destination
+is sending
 `Retry-After` — clamped to `max_retry_after=30.0` per wait, which you can lower. Every wait is cut
 short by a shutdown, and `shutdown()`'s own timeout bounds the total either way. Each sink's class
 docstring states its own worst case.

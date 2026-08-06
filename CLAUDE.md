@@ -185,7 +185,7 @@ it alone lacked, and `shutdown()` takes a timeout.
 **SPEC-028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
 validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
 throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
-Arcs; **SPEC-027** is next.
+Arcs; **SPEC-028** is next.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing

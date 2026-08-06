@@ -99,6 +99,9 @@ class HTTPSink:
         # skipped the loop entirely, so the request was abandoned with no attempt made and no
         # counter moved — reachable only by misconfiguration, but reachable.
         self.max_retries = max(max_retries, 0)
+        # Not floored or rejected here: ``clamp_server_delay`` refuses an unusable ceiling and
+        # falls back to exponential backoff, which keeps the validation in one place (SPEC-027
+        # FR-001). Stored as given so a caller can read back what they passed.
         self.max_retry_after = max_retry_after
         # Set by the worker when this sink is the configured one (SPEC-027 FR-002); ``None``
         # standalone, which backs off uninterruptibly exactly as before.

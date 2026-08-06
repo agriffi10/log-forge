@@ -13,14 +13,19 @@ from `atexit`.
   day, and a negative value made `time.sleep` raise — absorbed inside a span, but reaching the
   caller on the orphan path. `clamp_server_delay` now bounds it to `max_retry_after` (default 30 s,
   a constructor argument) and rejects anything non-positive or non-finite in favour of the sink's
-  own backoff.
+  own backoff — the *ceiling* included, since `min(value, 0)` returns `0.0` (a hot retry loop for
+  anyone lowering the ceiling to meet a deadline) and `min(value, nan)` returns `value` (the
+  ceiling silently vanishing, which is the failure FR-001 exists for).
 - **Every wait is interruptible** (FR-002). `sinks/_retry.py`'s `wait(delay, stop)` waits on the
   worker's shutdown `Event` rather than sleeping. The worker pushes that event onto the sink,
   probed with `hasattr` — the optional-protocol shape SPEC-026 used for `losses()` — so `sinks`
   still never imports `worker`, and a sink used standalone backs off exactly as before.
-- **`SQSSink` backs off** (FR-003). It was alone among the retrying sinks in re-sending
-  immediately, while its own docstring named throttling as the retryable case — precisely the
-  failure an instant retry makes worse.
+- **Four sinks back off** (FR-003). The spec said `SQSSink` was "alone among the sinks" in
+  re-sending immediately; review found `KinesisSink`, `FirehoseSink` and `SNSSink` holding the
+  same shape, and `ProvisionedThroughputExceededException` makes Kinesis the one where an instant
+  re-send is most harmful. The spec's premise is amended in place, per SPEC-023's precedent. The
+  roster is now derived from the AST rather than hand-written — a listed roster is exactly how
+  three sinks came to be missed by two tests whose names claimed to cover every one.
 - **`shutdown()` cannot block forever** (FR-004). It takes a `timeout` (default 30 s; `None` still
   waits indefinitely). On expiry it returns having stopped what it could and records
   `stopped_reason="ShutdownTimeout"`.
@@ -38,8 +43,12 @@ A test constructing one of every retrying sink is what found it.
 rate-limiting destination saying "wait zero seconds" is far more likely truncated than meant.
 (2) An expired shutdown does **not** close the sink, which the spec asked for and is worth
 restating: the drain thread may still be inside `emit`, so closing the transport under it turns a
-slow shutdown into a corrupt one. (3) `stopped_reason` is not overwritten if one is already set — a
-thread that died on `SystemExit` is worse news than the timeout that followed it.
+slow shutdown into a corrupt one. The close is *deferred*, not abandoned — a later `shutdown()`
+finds the thread finished and closes then, because one expiry otherwise meant the sink was never
+closed for the life of the process. (3) `stopped_reason` is not overwritten if one is already set —
+a thread that died on `SystemExit` is worse news than the timeout that followed it. (4) `wait()`
+caps any single delay at `MAX_WAIT` (a day): `time.sleep` and `Event.wait` both raise
+`OverflowError` past the platform's `time_t`, and "total" has to mean total.
 
 ## What changed from earlier specs?
 
@@ -49,14 +58,15 @@ thread that died on `SystemExit` is worse news than the timeout that followed it
   vocabulary rather than adding a field, which is what a reason string was chosen for: an expired
   shutdown and a dead thread mean the same thing to a reader.
 - **`HTTPSink` gained `max_retry_after`**, inherited by every platform subclass.
-- **Sink test fixtures patch `log_foundry.sinks._retry.time.sleep`**, not each sink's own `time`.
-  Nine test modules moved.
+- **Sink test fixtures patch each sink module's own bound `wait`**, not `time.sleep`. `wait` is
+  bound at import and its `Event` branch never reaches `time.sleep`, so patching either centrally
+  leaves the fixture inert — a trap the first attempt fell into. Twelve test modules moved.
 - **`sinks/_retry.py` imports nothing from its own package**, joining `_diag` and `sanitize` as a
   leaf helper.
 
 ## Verification
 
-Local: 925 tests pass (48 new), `ruff` and `mypy --strict` clean over 50 source files, `spec-lint`
+Local: 936 tests pass (59 new), `ruff` and `mypy --strict` clean over 50 source files, `spec-lint`
 clean. CI green on 3.12 and 3.13.
 
 Every change was mutation-tested individually: removing the clamp, the sign/NaN check, the
@@ -66,6 +76,13 @@ each fail at least one test. Two survivors were fixed rather than accepted — a
 that scanned module source (and so passed against a sink whose `__init__` no longer set it) became
 a check on constructed instances, and an `atexit` test asserting only a signature default became
 one that asserts the value is actually forwarded.
+
+Review then found three things mutation testing could not: `KinesisSink`, `FirehoseSink` and
+`SNSSink` missing entirely (the roster was a hand-written list, so the two tests named "every
+retrying sink" agreed with it rather than with the code); the unvalidated ceiling; and a
+`wait(1e18)` that raises `OverflowError` on the thread this module exists to protect. The roster is
+now derived from the AST, and a second lint fails any `for attempt in range(...)` loop that does
+not reach `wait`.
 
 One testing decision is worth recording. The interruptibility tests join a worker thread with a
 timeout rather than asserting on elapsed time: against an *uninterruptible* wait the latter blocks

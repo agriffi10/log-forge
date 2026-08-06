@@ -21,7 +21,13 @@ from log_foundry.worker import Health, Worker
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
+    for module in (
+        "_socket", "clickhouse", "eventhubs", "firehose", "http", "kinesis", "mongodb",
+        "postgres", "rabbitmq", "redis", "sns", "sqs",
+    ):
+        monkeypatch.setattr(
+            f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None
+        )
 
 
 class QuietSink:

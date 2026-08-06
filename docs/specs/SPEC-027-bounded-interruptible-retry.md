@@ -21,8 +21,13 @@ makes `time.sleep` raise `ValueError`, which inside a span is absorbed by `_emit
 path reaches the caller.
 
 The third problem is the mirror image: `SQSSink._send` (`sqs.py:214-241`) retries in a tight loop
-with no sleep at all, alone among the sinks — while its own docstring names throttling as the
-retryable case, which is precisely the failure an immediate retry makes worse.
+with no sleep at all — while its own docstring names throttling as the retryable case, which is
+precisely the failure an immediate retry makes worse.
+
+**Amended by evidence during the build:** "alone among the sinks" was false. `KinesisSink`,
+`FirehoseSink` and `SNSSink` each hold the same shape — a `for attempt in range(...)` re-send loop
+with no wait — and `ProvisionedThroughputExceededException` makes Kinesis the sink where an
+immediate re-send is *most* harmful. FR-003 applies to all four.
 
 And every sink's sleep is a bare `time.sleep`, which cannot be interrupted. The worker's own backoff
 already knows better: it uses `self._stop.wait(...)` (`worker.py:469`) so a shutdown cuts it short.

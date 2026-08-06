@@ -58,7 +58,9 @@ class FakeConnection:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
+    # ``wait`` is bound into each sink at import, and its Event branch never reaches
+    # ``time.sleep`` — patching either centrally would leave this fixture inert.
+    monkeypatch.setattr("log_foundry.sinks.postgres.wait", lambda _delay, _stop=None: None)
 
 
 def test_is_a_sink() -> None:

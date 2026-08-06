@@ -49,6 +49,19 @@ timeout can still hold the thread even after FR-002 removed the common cause.
 _DROP_WARN_EVERY = 1000
 
 
+def _bounded_seconds(timeout: float | None) -> str:
+    """Render a shutdown timeout for a diagnostic without trusting its ``__str__``.
+
+    ``timeout`` is the caller's, so it is a value the library does not control — the rule
+    ``_diag.errno_of`` follows for an ``errno``. A non-number renders as ``"?"`` rather than
+    whatever its ``__repr__`` chose to say (SPEC-029 FR-002).
+    """
+    try:
+        return f"{float(timeout):g}s" if timeout is not None else "no timeout"
+    except Exception:
+        return "?"
+
+
 class Health(NamedTuple):
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
@@ -154,6 +167,7 @@ class Worker:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
+        self._sink_closed = False  # a shutdown that expired still owes the close (SPEC-027)
         # Guards the `dropped` counter (incremented from any caller thread) and the shutdown
         # once-only flag (shutdown may be called concurrently by atexit and user code).
         self._lock = threading.Lock()
@@ -298,6 +312,11 @@ class Worker:
         corrupt one. The cost is a leaked resource in a process that is exiting anyway, which is
         the cheaper of the two.
 
+        That close is *deferred*, not abandoned: the once-only flag still short-circuits a second
+        drain, but a later call finds the thread finished and closes the sink then. Without that,
+        one expiry meant the sink was never closed for the life of the process — a caller who
+        waited and tried again had no way to complete what they started.
+
         Idempotent: a second call is a no-op (FR-005). Registered via ``atexit`` by the
         decorator's lazy worker so a program that logs and exits immediately still flushes.
 
@@ -314,6 +333,12 @@ class Worker:
         """
         with self._lock:
             if self._shutdown_done:
+                # A previous call already drained. If it expired before it could close the sink,
+                # the close is still owed — and is safe now only if the thread has since ended.
+                if self._sink_closed or self._thread.is_alive():
+                    return
+                self._sink_closed = True
+                self._close_sink()
                 return
             self._shutdown_done = True
         self._stop.set()
@@ -323,24 +348,41 @@ class Worker:
             pass
         self._thread.join(timeout)
         if self._thread.is_alive():
+            queued = self._queued_or_unknown()
             # Recorded before the line, as SPEC-019's terminal failure is: stderr may be wedged,
             # and this is written exactly once.
             with self._lock:
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
+            # The count is what is still queued, not "one drain": ``lost`` reports a unit whose
+            # counter moved, and the events behind the wedged thread are what an operator lost.
+            # A floor, like ``_terminal_failure``'s — the thread may yet deliver some of them.
             _diag.lost(
-                "drain",
-                1,
-                f"shutdown timed out after {timeout}s; the sink is left open because the "
-                f"worker thread is still using it",
+                "event",
+                queued,
+                f"shutdown timed out after {_bounded_seconds(timeout)}; the sink is left open "
+                f"because the worker thread is still using it",
             )
             return
+        with self._lock:
+            self._sink_closed = True
+        self._close_sink()
+
+    def _close_sink(self) -> None:
+        """Close the sink, absorbing a failure. Called once, after the thread has ended."""
         try:
             self.sink.close()
         except Exception as exc:
             # After the join, so everything queued has already been drained and emitted: what is
             # lost here is the sink's own cleanup, not events.
             _diag.absorbed("closing the sink", exc, "it may still hold its resources")
+
+    def _queued_or_unknown(self) -> int:
+        """``qsize()``, or ``0`` where the platform does not implement it. Never raises."""
+        try:
+            return self._queue.qsize()
+        except Exception:
+            return 0
 
     # -- worker thread ------------------------------------------------------------------
 
