@@ -219,3 +219,110 @@ async def test_cancellation_records_error_end_event(lf, fake_sink) -> None:
     end_events = [e for e in fake_sink.events if e.get("status") == "error"]
     assert end_events, "a cancelled coroutine records an error end event, not an unclosed span"
     assert any(e.get("error", {}).get("type") == "CancelledError" for e in end_events)
+
+
+# -- SPEC-025 FR-001/FR-002 on the async wrapper ------------------------------------------
+
+
+async def test_async_success_survives_a_broken_close(lf, monkeypatch, capsys) -> None:
+    decorator = pytest.importorskip("log_foundry.decorator")
+    calls: list[str] = []
+
+    def _raise(span, status, exc):
+        calls.append(status)
+        raise RuntimeError("closing blew up")
+
+    monkeypatch.setattr(decorator, "_close_span", _raise)
+
+    @lf.trace(name="work")
+    async def work() -> int:
+        await asyncio.sleep(0)
+        return 42
+
+    assert await work() == 42
+    assert calls == ["ok"], "closed exactly once"
+    assert "absorbed a failure while closing a span (RuntimeError)" in capsys.readouterr().err
+
+
+async def test_async_failure_propagates_its_own_exception(lf, monkeypatch) -> None:
+    decorator = pytest.importorskip("log_foundry.decorator")
+    monkeypatch.setattr(
+        decorator, "_close_span", lambda *a: (_ for _ in ()).throw(RuntimeError("closing"))
+    )
+
+    @lf.trace(name="boom")
+    async def boom() -> None:
+        raise ValueError("mine")
+
+    with pytest.raises(ValueError, match="mine") as caught:
+        await boom()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+async def test_cancellation_still_propagates_through_a_broken_close(lf, monkeypatch) -> None:
+    """FR-001: CancelledError is a BaseException and must not be absorbed by the guard."""
+    decorator = pytest.importorskip("log_foundry.decorator")
+    monkeypatch.setattr(
+        decorator, "_close_span", lambda *a: (_ for _ in ()).throw(RuntimeError("closing"))
+    )
+    started = asyncio.Event()
+
+    @lf.trace(name="acancel")
+    async def acancel() -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(acancel())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_async_keyboardinterrupt_from_the_close_reaches_the_caller(lf, monkeypatch) -> None:
+    decorator = pytest.importorskip("log_foundry.decorator")
+    monkeypatch.setattr(
+        decorator, "_close_span", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt)
+    )
+
+    @lf.trace(name="work")
+    async def work() -> int:
+        return 42
+
+    with pytest.raises(KeyboardInterrupt):
+        await work()
+
+
+async def test_async_call_still_runs_when_the_span_cannot_be_opened(lf, monkeypatch) -> None:
+    decorator = pytest.importorskip("log_foundry.decorator")
+    monkeypatch.setattr(
+        decorator, "_open_span", lambda name, defaults: (_ for _ in ()).throw(OSError("nope"))
+    )
+
+    @lf.trace(name="work")
+    async def work() -> int:
+        await asyncio.sleep(0)
+        return 42
+
+    assert await work() == 42
+
+
+async def test_async_emits_exactly_one_end_event_on_each_path(lf, fake_sink) -> None:
+    @lf.trace(name="ok_call")
+    async def ok_call() -> int:
+        return 1
+
+    @lf.trace(name="bad_call")
+    async def bad_call() -> None:
+        raise ValueError("no")
+
+    await ok_call()
+    with pytest.raises(ValueError):
+        await bad_call()
+
+    ends = [e for e in fake_sink.events if e["message"] == "span.end"]
+    by_fn = {e["function"]: e for e in ends}
+    assert len(ends) == 2
+    assert by_fn["ok_call"]["status"] == "ok"
+    assert by_fn["bad_call"]["status"] == "error"

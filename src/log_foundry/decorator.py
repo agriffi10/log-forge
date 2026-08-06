@@ -28,9 +28,9 @@ import sys
 import threading
 from collections.abc import Callable
 from time import monotonic
-from typing import Any, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
-from log_foundry import context
+from log_foundry import _diag, context
 from log_foundry.config import _ensure_sink
 from log_foundry.ids import (
     is_valid_span_id,
@@ -41,6 +41,9 @@ from log_foundry.ids import (
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
 from log_foundry.worker import Health, Worker
+
+if TYPE_CHECKING:
+    import contextvars
 
 __all__ = ["continue_trace", "trace"]
 
@@ -272,6 +275,75 @@ def _flush(span: Span) -> None:
     _get_worker().submit(span.events)
 
 
+_Scope = tuple[
+    Span | None,
+    "contextvars.Token[tuple[Span, ...]] | None",
+    "contextvars.Token[dict[str, object]] | None",
+]
+
+
+def _begin(name: str, defaults: dict[str, object] | None) -> _Scope:
+    """Open a span and make it current, or give up on tracing this call. Never raises.
+
+    Everything here runs **before** the caller's function body, so a failure would mean the
+    library prevented the application from doing its work at all — the worst reading of arch §4,
+    and worse than the close-path faults (SPEC-025 FR-001) because nothing has run yet. Any
+    fault gives back ``(None, None, None)``: the call proceeds untraced, its own result or
+    exception is the caller's, and :func:`_end` skips whatever was never set up. Partial setup
+    is kept rather than unwound — a span that exists but was never pushed still closes and
+    flushes, which is more than discarding it would preserve.
+
+    ``is_root`` is read before :func:`_open_span`, which is what makes the new span current
+    (SPEC-024).
+    """
+    span: Span | None = None
+    token: contextvars.Token[tuple[Span, ...]] | None = None
+    scope: contextvars.Token[dict[str, object]] | None = None
+    try:
+        is_root = context.current_span() is None
+        span = _open_span(name, defaults)
+        token = context.push_span(span)
+        if is_root:
+            scope = context.push_baggage_scope()
+    except Exception as exc:
+        _diag.absorbed("opening a span", exc, "this call runs untraced")
+    return span, token, scope
+
+
+def _end(
+    span: Span | None,
+    token: contextvars.Token[tuple[Span, ...]] | None,
+    scope: contextvars.Token[dict[str, object]] | None,
+    status: str,
+    error: BaseException | None,
+) -> None:
+    """Close the span and release the context. Never raises on a library fault.
+
+    Called from the wrappers' ``finally`` **once** per span, with the outcome the body actually
+    had (SPEC-025 FR-002) — the previous shape closed once in the ``try`` and again in the
+    ``except``, so a close that failed on the success path emitted a second, contradicting
+    ``span.end`` for a call that had returned normally.
+
+    The catch is ``Exception``, never ``BaseException``: a ``KeyboardInterrupt`` or
+    ``SystemExit`` arriving here is the operator's or the runtime's intent and must still reach
+    the caller. That is the same line SPEC-019 drew in the opposite direction for the worker
+    thread, where the *absence* of a handler was the defect.
+
+    Order is fixed and load-bearing: close first, so SPEC-015's backfill reads the baggage that
+    was live inside the span; then pop the stack; then release the baggage scope (SPEC-024).
+    Both releases are total in their own right, so neither needs a guard here.
+    """
+    if span is not None:
+        try:
+            _close_span(span, status, error)
+        except Exception as exc:
+            _diag.absorbed("closing a span", exc, "the span's events were lost")
+    if token is not None:
+        context.pop_span(token)
+    if scope is not None:
+        context.pop_baggage_scope(scope)
+
+
 def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
     """Append the end event, complete the boundary events' baggage, then flush.
 
@@ -311,47 +383,35 @@ def trace(
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                # Before _open_span, which is what makes the new span current (SPEC-024).
-                is_root = context.current_span() is None
-                span = _open_span(name or fn.__qualname__, defaults)
-                token = context.push_span(span)
-                scope = context.push_baggage_scope() if is_root else None
+                span, token, scope = _begin(name or fn.__qualname__, defaults)
+                status, error = "ok", None
                 try:
                     result = await fn(*args, **kwargs)
-                    _close_span(span, "ok", None)
-                    return result
                 except BaseException as exc:
-                    # Non-swallowing (arch §4): record the error, then re-raise unchanged.
+                    # Non-swallowing (arch §4): record the outcome, then re-raise unchanged.
                     # BaseException covers asyncio.CancelledError — a cancelled coroutine is
                     # recorded as an error end event, never left with an unclosed span.
-                    _close_span(span, "error", exc)
+                    status, error = "error", exc
                     raise
                 finally:
-                    context.pop_span(token)
-                    if scope is not None:
-                        context.pop_baggage_scope(scope)
+                    _end(span, token, scope, status, error)
+                return result
 
             return cast("F", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Before _open_span, which is what makes the new span current (SPEC-024).
-            is_root = context.current_span() is None
-            span = _open_span(name or fn.__qualname__, defaults)
-            token = context.push_span(span)
-            scope = context.push_baggage_scope() if is_root else None
+            span, token, scope = _begin(name or fn.__qualname__, defaults)
+            status, error = "ok", None
             try:
                 result = fn(*args, **kwargs)
-                _close_span(span, "ok", None)
-                return result
             except BaseException as exc:
-                # Non-swallowing (arch §4): record the error, then re-raise unchanged.
-                _close_span(span, "error", exc)
+                # Non-swallowing (arch §4): record the outcome, then re-raise unchanged.
+                status, error = "error", exc
                 raise
             finally:
-                context.pop_span(token)
-                if scope is not None:
-                    context.pop_baggage_scope(scope)
+                _end(span, token, scope, status, error)
+            return result
 
         return cast("F", wrapper)
 
