@@ -3,8 +3,9 @@
 Public façade (module-function shape). Exposes configuration, the ``@trace`` decorator, the
 ``debug/info/warning/error/critical`` emitters, ``set_baggage``, the cross-process propagation
 pair (``continue_trace`` to adopt an inbound context; ``current_traceparent`` /
-``current_trace_context`` / ``current_baggage_header`` to publish this one), ``flush`` (drain and
-keep logging) and ``shutdown`` (drain, close the sink, and stop).
+``current_trace_context`` / ``current_baggage_header`` to publish this one), ``reset_context``
+(clear both for a caller who opens no span), ``flush`` (drain and keep logging) and ``shutdown``
+(drain, close the sink, and stop).
 """
 
 from importlib.metadata import PackageNotFoundError
@@ -16,6 +17,7 @@ from log_foundry.context import (
     current_baggage_header,
     current_trace_context,
     current_traceparent,
+    reset_context,
 )
 from log_foundry.decorator import continue_trace, trace
 from log_foundry.worker import Health
@@ -107,6 +109,7 @@ __all__ = [
     "get_config",
     "health",
     "info",
+    "reset_context",
     "set_baggage",
     "shutdown",
     "trace",

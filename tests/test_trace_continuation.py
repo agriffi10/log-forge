@@ -3,6 +3,11 @@
 These use the `lf` fixture (synchronous flush into `fake_sink`) so a span's emitted batch can be
 asserted on directly — which is the only way to catch the FR-003 split-trace failure, where the
 dataclass is re-parented but the already-buffered `span.start` event is not.
+
+This module used to carry an autouse fixture that reset `context._adopted` and `context._baggage`
+by hand around every test, because pytest runs them all in one context and an adoption in one
+would silently decide the trace in the next. SPEC-024 removed the need for it: a root span now
+releases both on the way out, so no test here leaves either set (verified per test, not assumed).
 """
 
 import asyncio
@@ -19,20 +24,6 @@ INBOUND_SPAN = "00f067aa0ba902b7"
 TRACEPARENT = f"00-{INBOUND_TRACE}-{INBOUND_SPAN}-01"
 
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
-
-
-@pytest.fixture(autouse=True)
-def _reset_propagation_context():
-    """Clear the adopted context and baggage around each test.
-
-    Both are ContextVars living in the module, and pytest runs every test in the same context —
-    without this an adoption in one test would silently decide the trace in the next.
-    """
-    context_mod._adopted.set(None)
-    context_mod._baggage.set({})
-    yield
-    context_mod._adopted.set(None)
-    context_mod._baggage.set({})
 
 
 def _span_batch(fake_sink, name: str) -> list[dict]:
@@ -352,7 +343,9 @@ def test_baggage_round_trips_through_the_header(lf) -> None:
         return lf.current_baggage_header()
 
     header = producer()
-    context_mod._baggage.set({})  # a fresh process, conceptually
+    # No hand reset for "a fresh process" any more: `producer` was a root span, so SPEC-024
+    # already restored the baggage it set on the way out.
+    assert context_mod.get_baggage() == {}
 
     @lf.trace
     def consumer() -> dict:
@@ -615,3 +608,25 @@ async def test_an_adoption_outside_a_task_boundary_is_not_cleared(lf, fake_sink)
         "the adoption survives a task boundary — the constraint this test exists to record"
     )
     assert context_mod.get_adopted_context() == (INBOUND_TRACE, INBOUND_SPAN)
+
+
+def test_reset_context_makes_the_next_root_span_a_fresh_trace(lf, fake_sink) -> None:
+    """FR-003, and the documented remedy for the task-boundary constraint above."""
+
+    @lf.trace(name="handler")
+    def handler() -> None:
+        lf.info("working")
+
+    async def dispatch() -> None:
+        handler()
+
+    lf.continue_trace(TRACEPARENT)
+    asyncio.run(dispatch())  # a task boundary: the span's own clear lands in the context copy
+    lf.reset_context()  # the remedy, called in the context that made the adoption
+    asyncio.run(dispatch())
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] != INBOUND_TRACE for e in second)
+    assert HEX32.match(second[0]["trace_id"])
+    assert all(e["parent_span_id"] is None for e in second)

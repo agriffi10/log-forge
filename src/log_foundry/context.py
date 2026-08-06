@@ -33,6 +33,7 @@ __all__ = [
     "pop_span",
     "push_baggage_scope",
     "push_span",
+    "reset_context",
     "set_baggage",
 ]
 
@@ -131,6 +132,38 @@ def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
         # land on empty rather than poisoning baggage with whatever was passed.
         old = getattr(token, "old_value", None)
         _baggage.set(old if isinstance(old, dict) else {})
+
+
+def reset_context() -> None:
+    """Clear baggage and any adopted trace context outright (SPEC-024 FR-003).
+
+    For the caller who uses the emitters **without** ``@trace``: the orphan path opens no span,
+    so there is no root-span exit to hang the release on, and both values would otherwise live
+    as long as the context does. A ``@trace`` user does not need this —
+    :func:`pop_baggage_scope` already runs at every root span's exit.
+
+    It is also the remedy for the one case that scope cannot reach: an adoption made outside a
+    span whose root span then runs in a child context, where the clear lands in the copy. Call
+    this in the context that made the adoption.
+
+    One function rather than two because the two values have the same lifetime and the same
+    failure mode, and a caller who wants one almost always wants the other.
+
+    Unlike the scope release this **clears** rather than restores — a process-level baggage
+    default set before any span is erased too, which is the point of an explicit reset. Safe
+    with nothing ever set, with no span open, and inside an open span. Never raises, like every
+    other entry point on this path (arch §4).
+
+    Prefer calling it **outside** a span. Inside one it does the obvious thing to the events
+    that follow, but SPEC-015 backfills ``span.start`` and ``span.end`` from the baggage live at
+    *close*, so a mid-span reset also empties the two boundary events — which describe the whole
+    span and carry ``duration_ms``/``status`` — of baggage that was live for most of it. That
+    span's exit then restores the baggage from before the span, as it always does.
+    """
+    # Cleared in the same order as `pop_baggage_scope`, for the reason given there: a stale
+    # trace id is wrong data, a stale baggage field is only stale.
+    _adopted.set(None)
+    _baggage.set({})
 
 
 # -- adopted inbound context (SPEC-014) --------------------------------------------------

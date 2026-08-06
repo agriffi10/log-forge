@@ -221,3 +221,54 @@ def test_an_over_long_int_inside_a_span_does_not_destroy_its_batch(lf, fake_sink
     assert "big" in messages
     assert "small" in messages, "the unrelated span survives intact"
     assert worker.health().failed_batches == 0, "the batch was delivered, not abandoned"
+
+
+# -- SPEC-024 FR-003: the orphan path is what `reset_context` exists for -----------------
+
+
+def test_reset_context_clears_baggage_for_a_later_orphan_log(lf, fake_sink) -> None:
+    """The case with no root span to hang the release on — the emitters used without @trace."""
+
+    def body() -> None:
+        lf.set_baggage(user_id="alice")
+        lf.info("serving alice")
+        lf.reset_context()
+        lf.info("serving bob")
+
+    contextvars.copy_context().run(body)
+
+    alice, bob = fake_sink.events
+    assert alice["fields"]["user_id"] == "alice"
+    assert "user_id" not in bob["fields"]
+
+
+def test_reset_context_inside_a_real_root_span_also_empties_the_boundary_events(
+    lf, fake_sink
+) -> None:
+    """FR-003's "safe inside an open span", end to end — including the part that surprises.
+
+    SPEC-015 backfills the boundary events from the baggage live at *close*, so a reset mid-span
+    leaves `span.start` and `span.end` — the events carrying `duration_ms` and `status` — with
+    none of it, even though it was live for most of the span. That follows from SPEC-015's
+    "boundary events take the span's final baggage" decision rather than contradicting it, but
+    it is why the docs say to call this outside a span.
+    """
+
+    @lf.trace(name="work")
+    def work() -> None:
+        lf.set_baggage(user_id="alice")
+        lf.info("before")
+        lf.reset_context()
+        lf.info("after")
+
+    def body() -> None:
+        work()
+
+    contextvars.copy_context().run(body)
+
+    by_message = {e["message"]: e for e in fake_sink.events}
+    assert by_message["before"]["fields"]["user_id"] == "alice"
+    assert "user_id" not in by_message["after"]["fields"]
+    boundary = [e for e in fake_sink.events if e["message"].startswith("span.")]
+    assert len(boundary) == 2
+    assert all("user_id" not in e["fields"] for e in boundary)
