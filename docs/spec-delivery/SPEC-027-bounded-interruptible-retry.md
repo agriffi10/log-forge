@@ -66,7 +66,7 @@ caps any single delay at `MAX_WAIT` (a day): `time.sleep` and `Event.wait` both 
 
 ## Verification
 
-Local: 936 tests pass (59 new), `ruff` and `mypy --strict` clean over 50 source files, `spec-lint`
+Local: 941 tests pass (64 new), `ruff` and `mypy --strict` clean over 50 source files, `spec-lint`
 clean. CI green on 3.12 and 3.13.
 
 Every change was mutation-tested individually: removing the clamp, the sign/NaN check, the
@@ -77,7 +77,16 @@ that scanned module source (and so passed against a sink whose `__init__` no lon
 a check on constructed instances, and an `atexit` test asserting only a signature default became
 one that asserts the value is actually forwarded.
 
-Review then found three things mutation testing could not: `KinesisSink`, `FirehoseSink` and
+A second review found the defect this commit's own design invited: both exits from `shutdown()`
+closed the sink, and the success path did so *unconditionally*, so two concurrent calls — the
+documented `atexit`-plus-user-code case — could close twice, which is precisely what the once-only
+flag exists to prevent. One lock-guarded decision (`_close_if_owed`) now owns it, and the close
+runs outside the lock so a wedged console cannot stall a lock `submit()` also takes. It also
+corrected the expired-shutdown count from "event(s)" to "item(s)": the queue holds one entry per
+submitted span plus internal markers, so the old label was plausibly wrong where the label before
+it ("1 drain") was obviously wrong.
+
+Review found three things mutation testing could not: `KinesisSink`, `FirehoseSink` and
 `SNSSink` missing entirely (the roster was a hand-written list, so the two tests named "every
 retrying sink" agreed with it rather than with the code); the unvalidated ceiling; and a
 `wait(1e18)` that raises `OverflowError` on the thread this module exists to protect. The roster is

@@ -326,21 +326,21 @@ class Worker:
         message, which arch §6 keeps out of anything the library says about itself.
 
         The once-only flag deliberately stays *ahead* of the close rather than moving after it.
+        (The close it guards is now owned by :meth:`_close_if_owed`, which is what makes the
+        deferred case safe without weakening this.)
         Re-running a drain is not safe, and a second ``shutdown()`` retrying a close that already
         failed would call ``close()`` twice on a sink that may have partially released its
         resources. Idempotence is preserved; what changes is that the failure is announced rather
         than swallowed by the flag.
         """
         with self._lock:
-            if self._shutdown_done:
-                # A previous call already drained. If it expired before it could close the sink,
-                # the close is still owed — and is safe now only if the thread has since ended.
-                if self._sink_closed or self._thread.is_alive():
-                    return
-                self._sink_closed = True
-                self._close_sink()
-                return
+            first = not self._shutdown_done
             self._shutdown_done = True
+        if not first:
+            # A previous call already drained; nothing here re-runs it. But if that call expired
+            # before it could close the sink, the close is still owed.
+            self._close_if_owed()
+            return
         self._stop.set()
         try:
             self._queue.put_nowait(_SHUTDOWN)  # wake a blocked get() for a prompt stop
@@ -354,17 +354,38 @@ class Worker:
             with self._lock:
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
-            # The count is what is still queued, not "one drain": ``lost`` reports a unit whose
-            # counter moved, and the events behind the wedged thread are what an operator lost.
-            # A floor, like ``_terminal_failure``'s — the thread may yet deliver some of them.
+            # "item", not "event", and for ``_terminal_failure``'s reason: the queue holds
+            # event-*lists* plus any internal marker, so this counts submissions and sentinels,
+            # not events. It is also a floor rather than a total — what the wedged thread still
+            # holds in hand is not in the queue, and it may yet deliver some of it.
             _diag.lost(
-                "event",
+                "item",
                 queued,
                 f"shutdown timed out after {_bounded_seconds(timeout)}; the sink is left open "
                 f"because the worker thread is still using it",
             )
             return
+        self._close_if_owed()
+
+    def _close_if_owed(self) -> None:
+        """Close the sink exactly once, and only once the drain thread has ended.
+
+        Both exits from :meth:`shutdown` come through here, so the decision is made in one place
+        under one lock. Two concurrent ``shutdown()`` calls are the case that needs it — the
+        docstring above names a double ``close()`` on a partially-released sink as the thing this
+        design avoids, and ``atexit`` plus user code calling it at once is documented as normal.
+        A success path that closed unconditionally could race a deferred call that had just
+        observed the thread end.
+
+        ``is_alive()`` is the safety condition, not a heuristic: it reads ``False`` only after
+        ``_run`` has returned, so the sink is provably out of use.
+
+        The close itself runs **outside** the lock, because it can reach ``_diag`` and a wedged
+        console must not stall a lock ``submit()`` also takes.
+        """
         with self._lock:
+            if self._sink_closed or self._thread.is_alive():
+                return
             self._sink_closed = True
         self._close_sink()
 
@@ -378,7 +399,11 @@ class Worker:
             _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
     def _queued_or_unknown(self) -> int:
-        """``qsize()``, or ``0`` where the platform does not implement it. Never raises."""
+        """Queued **items**, or ``0`` where the platform does not implement ``qsize``.
+
+        Items, not events: the queue holds one entry per submitted span plus any flush/shutdown
+        marker. Never raises — a diagnostic must not be the reason the diagnosis is lost.
+        """
         try:
             return self._queue.qsize()
         except Exception:

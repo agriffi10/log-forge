@@ -28,11 +28,10 @@ _BACKOFF_BASE = 0.1  # seconds; delay before retry attempt n is _BACKOFF_BASE * 
 class FirehoseSink:
     """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Firehose delivery stream.
 
-
     **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
     0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
 
-    Three counters report what was not delivered: ``failed` (the delivery stream told us these
+    Three counters report what was not delivered: ``failed`` (the delivery stream told us these
     failed, and they still failed after ``max_retries``), ``dropped_oversized`` (too large for the
     per-record limit to ever accept), and ``dropped_unadjudicated`` (a ``put_record_batch`` response
     whose ``RequestResponses`` did not describe the chunk that was sent, so no record in it could be

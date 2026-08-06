@@ -6,6 +6,7 @@ Every test here is in-process. Timing assertions use generous bounds and assert 
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -748,9 +749,21 @@ def test_a_huge_finite_delay_does_not_raise_on_the_drain_thread(monkeypatch) -> 
     wait(1e18, None)
     assert slept == [MAX_WAIT]
 
-    stop = threading.Event()
-    stop.set()
-    wait(1e18, stop)  # the Event branch overflows too
+    # The Event branch overflows too, and must be exercised *unset* — a set flag returns
+    # without ever looking at the timeout, so setting it first tests nothing.
+    errors: list[str] = []
+
+    def waiting() -> None:
+        try:
+            wait(1e18, threading.Event())
+        except BaseException as err:
+            errors.append(type(err).__name__)
+
+    thread = threading.Thread(target=waiting, daemon=True)
+    thread.start()
+    thread.join(0.3)
+    assert errors == [], "Event.wait overflows past the platform's time_t too"
+    assert thread.is_alive(), "and is still waiting out the capped delay, not returning early"
 
 
 def test_a_later_shutdown_closes_a_sink_an_expired_one_left_open() -> None:
@@ -790,20 +803,24 @@ def test_a_deferred_close_does_not_re_drain() -> None:
 
 
 def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
+    """"item(s)", not "event(s)": the queue holds one entry per span, plus internal markers."""
     sink = _WedgedSink()
     worker = Worker(sink, batch_size=1)
-    worker.submit([{"a": 1}])
+    worker.submit([{"a": 1}, {"a": 2}])  # one item, two events
     assert sink.entered.wait(2.0)
-    worker.submit([{"b": 2}])
-    worker.submit([{"c": 3}])
+    worker.submit([{"b": 1}])
+    worker.submit([{"c": 1}])
     try:
         worker.shutdown(timeout=0.2)
         err = capsys.readouterr().err
     finally:
         sink.release.set()
 
-    assert "lost 1 drain(s)" not in err, "nothing counted a 'drain'; the events are the loss"
-    assert "event(s)" in err
+    assert "lost 1 drain(s)" not in err, "nothing counted a 'drain'"
+    # 2 submissions still queued + the _SHUTDOWN sentinel. Asserted exactly, because a count
+    # nobody checks is how "lost 1 drain(s)" survived the first round of tests.
+    assert "lost 3 item(s)" in err
+    assert "event(s)" not in err, "the queue counts spans, not the events inside them"
     assert "shutdown timed out after 0.2s" in err
 
 
@@ -818,3 +835,111 @@ def test_the_timeout_in_the_line_is_not_taken_on_the_callers_word(capsys) -> Non
     assert _bounded_seconds(Hostile()) == "?"  # type: ignore[arg-type]
     assert _bounded_seconds(None) == "no timeout"
     assert _bounded_seconds(0.25) == "0.25s"
+
+
+def _delays_for(sink, batch, monkeypatch) -> list[float]:
+    """Record the delays a sink waits between attempts, without waiting them."""
+    module = type(sink).__module__
+    slept: list[float] = []
+    monkeypatch.setattr(f"{module}.wait", lambda delay, _stop=None: slept.append(delay))
+    try:
+        sink.emit(batch)
+    except Exception:  # SPEC-026's raise; this test is about the waits
+        pass
+    return slept
+
+
+def test_the_three_aws_stream_sinks_back_off_between_attempts(monkeypatch) -> None:
+    """The AST lint proves a ``wait`` call exists; only this proves it is in the right place."""
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.sns import SNSSink
+    from test_sinks_firehose import FakeFirehose
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_sns import FakeSNS
+
+    kinesis_body = json.dumps({"trace_id": "t", "a": 1}).encode("utf-8")
+    firehose_body = json.dumps({"a": 1}).encode("utf-8")
+    cases = (
+        (KinesisSink("s", client=FakeKinesis(always_fail={kinesis_body}), max_retries=3),
+         [{"trace_id": "t", "a": 1}]),
+        (FirehoseSink("s", client=FakeFirehose(always_fail={firehose_body}), max_retries=3),
+         [{"a": 1}]),
+        (SNSSink("arn", client=FakeSNS(always_fail={"0"}), max_retries=3), [{"a": 1}]),
+    )
+    for sink, batch in cases:
+        assert _delays_for(sink, batch, monkeypatch) == [0.1, 0.2, 0.4], (
+            f"{type(sink).__name__}: one wait before each retry, none before giving up"
+        )
+
+
+def test_the_three_aws_stream_sinks_do_not_wait_before_abandoning(monkeypatch) -> None:
+    """FR-003: a wait before giving up is pure delay on the drain thread."""
+    from log_foundry.sinks.kinesis import KinesisSink
+    from test_sinks_kinesis import FakeKinesis
+
+    body = json.dumps({"trace_id": "t", "a": 1}).encode("utf-8")
+    sink = KinesisSink("s", client=FakeKinesis(always_fail={body}), max_retries=0)
+    assert _delays_for(sink, [{"trace_id": "t", "a": 1}], monkeypatch) == []
+
+
+def test_a_first_attempt_that_succeeds_never_waits_on_any_of_them(monkeypatch) -> None:
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.sns import SNSSink
+    from test_sinks_firehose import FakeFirehose
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_sns import FakeSNS
+
+    for sink in (
+        KinesisSink("s", client=FakeKinesis()),
+        FirehoseSink("s", client=FakeFirehose()),
+        SNSSink("arn", client=FakeSNS()),
+    ):
+        assert _delays_for(sink, [{"a": 1}], monkeypatch) == [], type(sink).__name__
+
+
+def test_an_unadjudicable_chunk_is_abandoned_with_no_wait(monkeypatch) -> None:
+    """SPEC-018 never re-sends it, so there is nothing to wait for."""
+    from log_foundry.sinks.kinesis import KinesisSink
+    from test_sinks_kinesis import MalformedKinesis
+
+    sink = KinesisSink("s", client=MalformedKinesis(None), max_retries=3)
+    assert _delays_for(sink, [{"a": 1}], monkeypatch) == []
+
+
+def test_concurrent_shutdowns_close_the_sink_exactly_once() -> None:
+    """atexit and user code both call it; a double close on a released sink is what we avoid.
+
+    A guard on the invariant rather than a reproduction of the race — the window between the
+    join returning and the flag being read is microseconds wide. The structural fix is that both
+    exits from ``shutdown`` go through one lock-guarded decision; this pins the observable.
+    """
+    from conftest import FakeSink
+
+    class CountingSink(FakeSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    sink = CountingSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+
+    ready = threading.Barrier(4)
+
+    def shut() -> None:
+        ready.wait(5.0)
+        worker.shutdown(timeout=5.0)
+
+    threads = [threading.Thread(target=shut, daemon=True) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    ready.wait(5.0)
+    for thread in threads:
+        thread.join(10.0)
+
+    assert sink.closed == 1
