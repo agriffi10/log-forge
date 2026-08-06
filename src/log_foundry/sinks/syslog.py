@@ -1,10 +1,4 @@
-"""SyslogSink — RFC 5424 syslog frames over UDP or TCP (arch §8, SPEC-009).
-
-Formats each event as an RFC 5424 message (``<PRI>1 TIMESTAMP HOST APP PROCID MSGID SD MSG``) with
-``PRI`` derived from a configurable facility and a severity mapped from the event ``level``. UDP
-sends one datagram per event; TCP uses octet-counted framing (RFC 6587). Dependency-free (stdlib
-``socket``, via :class:`~log_foundry.sinks._socket.SocketTransport`).
-"""
+"""SyslogSink — RFC 5424 syslog frames over UDP or TCP (arch §8, SPEC-009)."""
 
 from __future__ import annotations
 
@@ -22,11 +16,9 @@ if TYPE_CHECKING:
 
 __all__ = ["SyslogSink"]
 
-# RFC 5424 numeric severities; log-foundry levels mapped onto them (unknown level -> notice/5).
 _SEVERITY = {"DEBUG": 7, "INFO": 6, "NOTICE": 5, "WARNING": 4, "ERROR": 3, "CRITICAL": 2}
 _DEFAULT_SEVERITY = 5
 
-# A subset of RFC 5424 facility keywords -> numeric code.
 _FACILITY = {
     "kern": 0, "user": 1, "mail": 2, "daemon": 3, "auth": 4, "syslog": 5, "lpr": 6, "news": 7,
     "uucp": 8, "cron": 9, "authpriv": 10, "ftp": 11,
@@ -36,7 +28,12 @@ _FACILITY = {
 
 
 class SyslogSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that emits RFC 5424 frames over UDP/TCP (FR-006)."""
+    """A :class:`~log_foundry.sinks.base.Sink` emitting RFC 5424 frames over UDP or TCP (FR-006).
+
+    Each event becomes an RFC 5424 message whose ``PRI`` is derived from a configurable facility
+    and a severity mapped from the event's level. UDP sends one datagram per event, TCP uses
+    octet-counted framing (RFC 6587), and the whole sink is dependency-free.
+    """
 
     def __init__(
         self,
@@ -49,6 +46,23 @@ class SyslogSink:
         timeout: float = 5.0,
         max_retries: int = 3,
     ) -> None:
+        """Configures the destination, framing and message identity.
+
+        Args:
+          host: The syslog host.
+          port: The syslog port.
+          transport: ``"udp"`` or ``"tcp"``, which also selects the framing.
+          facility: An RFC 5424 facility keyword.
+          app_name: The ``APP-NAME`` field of every message.
+          timeout: Seconds allowed for a TCP connection.
+          max_retries: Reconnect retries per message.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: If the facility is not one of the supported keywords.
+        """
         if facility not in _FACILITY:
             raise ValueError(f"invalid facility {facility!r}; expected one of {sorted(_FACILITY)}")
         self._facility = _FACILITY[facility]
@@ -62,49 +76,116 @@ class SyslogSink:
         self._stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Frame each event as RFC 5424 and send it over the socket (FR-006)."""
+        """Frames each event as RFC 5424 and sends it over the socket (FR-006).
+
+        Args:
+          batch: The events to ship. An empty batch is a no-op.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: If no frame reached the socket.
+        """
         if not batch:
             return
         self._socket.send_all([self._frame(event) for event in batch])
 
     def close(self) -> None:
-        """Close the underlying socket (FR-006)."""
+        """Closes the underlying socket (FR-006).
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self._socket.close()
 
     @property
     def stop_signal(self) -> threading.Event | None:
         """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
 
-        The worker sets this on the *configured* sink (SPEC-027 FR-002), and a wrapper is not
+        The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
         where the waiting happens. Without the forward the attribute is set on an object that
         never waits, and the backoff one level down stays uninterruptible — which is the whole
         defect, moved rather than fixed.
+
+        Args:
+          None.
+
+        Returns:
+          The stop signal, or ``None`` if none was offered.
+
+        Raises:
+          None.
         """
         return self._stop_signal
 
     @stop_signal.setter
     def stop_signal(self, signal: threading.Event | None) -> None:
+        """Forwards the stop signal to the socket transport.
+
+        Args:
+          signal: The worker's shutdown event, or ``None``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self._stop_signal = signal
         self._socket.stop_signal = signal
 
     @property
     def failed(self) -> int:
-        """Messages abandoned past the retry bound."""
+        """Messages abandoned past the retry bound.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
         return self._socket.failed
 
     def losses(self) -> SinkLosses:
-        """Delegate to the socket transport (SPEC-026 FR-002). Never raises.
+        """Delegates to the socket transport (SPEC-026 FR-002).
 
-        The transport raises on total failure, and ``emit`` hands it the whole batch in one
+        The transport raises on total failure and :meth:`emit` hands it the whole batch in one
         call, so a dead syslog destination now reaches ``health().failed_batches`` — the reading
-        SPEC-026 was written from, where ``flush()`` returned ``True`` and every frame was lost.
+        SPEC-026 was written from, where ``flush()`` returned True and every frame was lost.
+
+        Args:
+          None.
+
+        Returns:
+          The transport's counters.
+
+        Raises:
+          None.
         """
         return self._socket.losses()
 
-    # -- internals ----------------------------------------------------------------------
-
     def _frame(self, event: dict[str, object]) -> bytes:
-        """Build one RFC 5424 message; TCP gets octet-counted framing (RFC 6587)."""
+        """Builds one RFC 5424 message, octet-counted when the transport is TCP.
+
+        Args:
+          event: The event to frame.
+
+        Returns:
+          The exact bytes to put on the wire.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+        """
         level = event.get("level")
         severity = _SEVERITY.get(level.upper(), _DEFAULT_SEVERITY) if isinstance(level, str) else (
             _DEFAULT_SEVERITY
@@ -116,5 +197,5 @@ class SyslogSink:
         frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {self._procid} - - {msg}"
         data = frame.encode("utf-8")
         if self._transport == "tcp":
-            return f"{len(data)} ".encode("ascii") + data  # RFC 6587 octet counting
+            return f"{len(data)} ".encode("ascii") + data
         return data
