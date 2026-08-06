@@ -1118,3 +1118,31 @@ def test_the_sink_protocol_documents_both_rules() -> None:
     assert "delivered nothing" in doc, "the raise-on-total-failure rule"
     assert "Do not raise on partial failure" in doc
     assert "no-op and never raises" in doc, "the empty-batch rule"
+
+
+def test_pubsub_names_which_counter_moved(capsys) -> None:
+    """``rejected`` and ``failed`` mean different things; the line is where an operator sees which."""
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+
+    class RefusingClient:
+        def publish(self, topic, data):
+            raise RuntimeError("no credentials")
+
+    class UnconfirmedClient:
+        def publish(self, topic, data):
+            return self
+
+        def result(self):
+            raise TimeoutError("never acked")
+
+    with pytest.raises(SinkDeliveryError):
+        GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}])
+    refused = capsys.readouterr().err
+    assert "refused the publish" in refused
+
+    sink = GooglePubSubSink("t", client=UnconfirmedClient())
+    sink.emit([{"a": 1}])
+    sink.close()
+    unconfirmed = capsys.readouterr().err
+    assert "publish unconfirmed" in unconfirmed
+    assert "refused" not in unconfirmed, "the two paths must not read alike"

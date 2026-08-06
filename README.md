@@ -406,8 +406,12 @@ A few conventions hold across every sink below:
   delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
   A sink that delivered **none** of it raises instead, so the worker's bounded retry engages and
-  `health().failed_batches` records the loss — there is nothing downstream to duplicate. Either
-  way the exception never reaches your code: the worker is what catches it.
+  `health().failed_batches` records the loss — there is nothing downstream to duplicate. Three
+  cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
+  event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
+  landed), and an SQS sender fault (a byte-identical re-send can only fail again). Either way the
+  exception never reaches your code — inside a span the worker catches it, and on the orphan path
+  (`log_foundry.info(...)` outside any span, which emits synchronously) the emitter does.
 
 #### Built-in, zero-dependency
 
@@ -430,7 +434,7 @@ to a plain callable.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `MultiSink` | `log_foundry.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed` |
+| `MultiSink` | `log_foundry.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed`, unless *every* child failed, which re-raises |
 | `FilteringSink` | `log_foundry.sinks.filtering` | `FilteringSink(inner, *, predicate=None, min_level=None)` — forward only events passing `predicate` and/or at/above `min_level` |
 | `TransformSink` | `log_foundry.sinks.transform` | `TransformSink(inner, fn)` — map each event through `fn` before forwarding; return `None` to drop one |
 | `CallbackSink` | `log_foundry.sinks.callback` | `CallbackSink(fn, *, on_close=None)` — hand each batch to any callable |
