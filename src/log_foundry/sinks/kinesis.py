@@ -10,18 +10,27 @@ unless a sink is built without an injected client. Each incoming batch is re-chu
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KinesisSink"]
 
+_BACKOFF_BASE = 0.1  # seconds; delay before retry attempt n is _BACKOFF_BASE * 2**n
+
 
 class KinesisSink:
     """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Kinesis Data Stream.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
 
     Three counters report what was not delivered: ``failed`` (the stream told us these failed, and
     they still failed after ``max_retries``), ``dropped_oversized`` (too large for the per-record
@@ -53,6 +62,8 @@ class KinesisSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
         # from ``_send`` having sent nothing, and reported success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
         self.dropped_unadjudicated = 0
@@ -158,6 +169,11 @@ class KinesisSink:
             records = verdict.retry
             if not records:
                 return sent
+            if attempt < self.max_retries:
+                # Before the next attempt, never before abandoning (SPEC-027 FR-003). This loop
+                # re-sends the entries the destination flagged, and the canonical reason it
+                # flags them is throttling — which an immediate re-send makes worse.
+                wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
                 self.failed += len(records)
                 _diag.lost(

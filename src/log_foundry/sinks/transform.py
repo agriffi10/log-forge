@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from log_foundry import _diag
 from log_foundry.sinks.base import read_losses
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -34,6 +36,7 @@ class TransformSink:
         fn: Callable[[dict[str, object]], dict[str, object] | None],
     ) -> None:
         self._inner = inner
+        self._stop_signal: threading.Event | None = None
         self._fn = fn
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -45,6 +48,29 @@ class TransformSink:
                 transformed.append(result)
         if transformed:
             self._inner.emit(transformed)
+
+    @property
+    def stop_signal(self) -> threading.Event | None:
+        """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
+
+        The worker sets this on the *configured* sink (SPEC-027 FR-002), and a wrapper is not
+        where the waiting happens. Without the forward the attribute is set on an object that
+        never waits, and the backoff one level down stays uninterruptible — which is the whole
+        defect, moved rather than fixed.
+        """
+        return self._stop_signal
+
+    @stop_signal.setter
+    def stop_signal(self, signal: threading.Event | None) -> None:
+        self._stop_signal = signal
+        try:
+            self._inner.stop_signal = signal  # type: ignore[attr-defined]
+        except Exception as err:
+            _diag.absorbed(
+                "handing the inner sink its stop signal",
+                err,
+                f"{type(self._inner).__name__} stays uninterruptible",
+            )
 
     def losses(self) -> SinkLosses | None:
         """Report the inner sink's losses (SPEC-026 FR-002). Never raises.

@@ -31,7 +31,7 @@ to status only — no prose.
 | [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Completed | SPEC-014, SPEC-015 |
 | [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Completed | SPEC-004, SPEC-017 |
 | [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Completed | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
-| [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
+| [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Completed | SPEC-004, SPEC-009, SPEC-013 |
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
 | [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Completed | SPEC-017, SPEC-019 |
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Draft | SPEC-013, SPEC-019 |
@@ -114,10 +114,11 @@ Group related specs and record the order to build them in. Delete this section i
   returned normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract were
   all inert against a down destination, while the counters that *did* record the loss had no
   accessor. SPEC-017 FR-004's rule, generalized to the whole sink family.
-  **SPEC-027** and **SPEC-028** may go in either order after 026, and both touch every sink: 027
-  bounds a server-supplied `Retry-After` (a measured 22 s `shutdown()` hang, and 24 h is reachable)
-  and makes every sink wait interruptible; 028 states the concurrency contract the orphan path has
-  been violating since SPEC-002 and locks the sinks that hold mutable transport state.
+  **SPEC-027** (**shipped**) and **SPEC-028** may go in either order after 026, and both touch
+  every sink: 027 bounded a server-supplied `Retry-After` (a measured 22 s `shutdown()` hang, and
+  24 h was reachable) and made every sink wait interruptible; 028 states the concurrency contract
+  the orphan path has been violating since SPEC-002 and locks the sinks that hold mutable
+  transport state.
   **SPEC-030** after 026 (it appends to the same `Health`) — two documented user errors that produce
   total silent loss with no signal: logging after `shutdown()`, and a late `configure(sink=...)`.
   **SPEC-031** last, and independent of all of them — the residue too small to spec individually,

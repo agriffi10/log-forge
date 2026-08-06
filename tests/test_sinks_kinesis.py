@@ -13,6 +13,16 @@ from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.kinesis import KinesisSink
 
 
+@pytest.fixture(autouse=True)
+def _no_backoff(monkeypatch):
+    """Neutralize the retry backoff SPEC-027 FR-003 added, so retry tests run instantly.
+
+    ``wait`` is bound into each sink at import, and its Event branch never reaches ``time.sleep``
+    — patching either centrally would leave this fixture inert.
+    """
+    monkeypatch.setattr("log_foundry.sinks.kinesis.wait", lambda _delay, _stop=None: None)
+
+
 class FakeKinesis:
     """Records put_records calls; fails records whose Data is in ``fail_once``/``always_fail``."""
 

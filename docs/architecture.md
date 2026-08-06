@@ -339,6 +339,14 @@ decorated call ends
   configurable is **not built** and is a constraint rather than a wart — blocking would put sink
   latency back on the caller's thread, which is the one thing this section exists to prevent
   (§12, §13).
+- **A sink's backoff pauses the single drain thread** (SPEC-027). There is one drain thread by
+  design, so a sink sleeping between attempts is not making a local decision — it is a global
+  pause on log delivery, and it spans `shutdown()`, which joins that thread from `atexit`. Every
+  sink therefore waits on the worker's stop event rather than `time.sleep`, so a shutdown cuts an
+  in-progress backoff short; a server-supplied `Retry-After` is clamped (it is advice from a
+  destination, not an instruction the application must obey); and `shutdown()` itself takes a
+  timeout, because a sink blocked *in* a network call can still hold the thread. Each retrying
+  sink's docstring states its worst-case total delay.
 - **"Retries with backoff on failure" means: on a failure the sink reports.** The worker can
   only retry what reaches it as an exception, so the guarantee is conditional on §8's
   raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no

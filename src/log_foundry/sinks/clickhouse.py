@@ -9,11 +9,14 @@ idempotent ``MergeTree`` ``create_table`` convenience is off by default. Write-o
 from __future__ import annotations
 
 import json
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["ClickHouseSink"]
@@ -41,7 +44,11 @@ _COLUMN_TYPES = {
 
 
 class ClickHouseSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a ClickHouse table."""
+    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a ClickHouse table.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(
         self,
@@ -58,6 +65,8 @@ class ClickHouseSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
         # from ``_insert`` having attempted nothing, and reported success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False
         self._owns_client = client is None
@@ -110,7 +119,7 @@ class ClickHouseSink:
                 return 1
             except Exception as err:  # isolation boundary: never crash the worker (FR-006)
                 if attempt < self.max_retries:
-                    time.sleep(_BACKOFF_BASE * (2**attempt))
+                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += len(rows)
                 _diag.lost(

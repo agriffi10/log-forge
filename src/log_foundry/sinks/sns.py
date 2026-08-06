@@ -8,17 +8,27 @@ request, ≤ 256 KB total). ``boto3`` is the optional ``aws`` extra, imported la
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SNSSink"]
 
+_BACKOFF_BASE = 0.1  # seconds; delay before retry attempt n is _BACKOFF_BASE * 2**n
+
 
 class SNSSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that publishes events to an SNS topic."""
+    """A :class:`~log_foundry.sinks.base.Sink` that publishes events to an SNS topic.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     MAX_BATCH = 10  # publish_batch hard limit: entries per request
     MAX_BYTES = 256 * 1024  # 256 KB per request
@@ -33,6 +43,8 @@ class SNSSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
         # from ``_send`` having published nothing, and reported success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
 
@@ -92,6 +104,11 @@ class SNSSink:
                 return sent
             failed_ids = {entry["Id"] for entry in failed}
             entries = [entry for entry in entries if entry["Id"] in failed_ids]
+            if attempt < self.max_retries:
+                # Before the next attempt, never before abandoning (SPEC-027 FR-003). This loop
+                # re-sends the entries the destination flagged, and the canonical reason it
+                # flags them is throttling — which an immediate re-send makes worse.
+                wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
                 self.failed += len(entries)
                 _diag.lost(

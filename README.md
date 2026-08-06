@@ -744,8 +744,22 @@ which one you want depends on whether the process is about to end:
 import log_foundry as lf
 
 lf.flush()      # drain to the sink and keep going; returns True when everything landed
-lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained
+lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained (30s cap)
 ```
+
+Both are bounded, because both can be called somewhere with a deadline. `flush(timeout=5.0)`
+returns `False` if the drain did not complete; `shutdown(timeout=30.0)` returns having stopped
+what it could, and reports `health().stopped_reason == "ShutdownTimeout"`. Passing `None` to
+either waits indefinitely, which is unsafe in any environment with an execution deadline.
+
+**What a broken destination can cost you.** There is one drain thread, so a sink's backoff pauses
+*all* log delivery, and it spans `shutdown()`. At the defaults (`max_retries=3`) that is 0.7 s of
+backoff per batch for most sinks (per *message* for the socket-backed ones — ~70 s for a
+100-message batch against a dead syslog host), and up to 90 s for an HTTP sink whose destination
+is sending
+`Retry-After` — clamped to `max_retry_after=30.0` per wait, which you can lower. Every wait is cut
+short by a shutdown, and `shutdown()`'s own timeout bounds the total either way. Each sink's class
+docstring states its own worst case.
 
 | | `flush()` | `shutdown()` |
 |---|---|---|

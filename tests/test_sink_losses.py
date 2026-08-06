@@ -18,6 +18,18 @@ from log_foundry.sinks.multi import MultiSink
 from log_foundry.worker import Health, Worker
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
+    for module in (
+        "_socket", "clickhouse", "eventhubs", "firehose", "http", "kinesis", "mongodb",
+        "postgres", "rabbitmq", "redis", "sns", "sqs",
+    ):
+        monkeypatch.setattr(
+            f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None
+        )
+
+
 class QuietSink:
     """A sink that takes everything and reports nothing — the pre-SPEC-026 interface."""
 

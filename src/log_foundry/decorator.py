@@ -39,7 +39,7 @@ from log_foundry.ids import (
     parse_traceparent,
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
-from log_foundry.worker import Health, Worker
+from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health, Worker
 
 if TYPE_CHECKING:
     import contextvars
@@ -209,10 +209,15 @@ def _get_worker() -> Worker:
     return _worker
 
 
-def _shutdown_worker() -> None:
-    """Drain + close the process worker if one was created (idempotent). Backs ``shutdown()``."""
+def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
+    """Drain + close the process worker if one was created (idempotent). Backs ``shutdown()``.
+
+    The ``atexit`` registration binds this function, so the exit path gets the bounded form and
+    its default (SPEC-027 FR-004) — an unbounded join in an ``atexit`` handler is a process that
+    will not exit.
+    """
     if _worker is not None:
-        _worker.shutdown()
+        _worker.shutdown(timeout)
 
 
 def _flush_worker(timeout: float | None = 5.0) -> bool:

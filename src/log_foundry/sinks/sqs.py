@@ -32,12 +32,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
+if TYPE_CHECKING:
+    import threading
+
 __all__ = ["SQSSink"]
+
+_BACKOFF_BASE = 0.1  # seconds; delay before retry attempt n is _BACKOFF_BASE * 2**n
 
 DEFAULT_GROUP_ID = "log-foundry"
 """Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
@@ -71,7 +77,11 @@ def _bounded(raw: str, fallback: str) -> str:
 
 
 class SQSSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an SQS queue."""
+    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an SQS queue.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     MAX_BATCH = 10  # SQS SendMessageBatch hard limit: entries per request
     MAX_BYTES = 256 * 1024  # SQS limit: 256 KB per request
@@ -99,6 +109,8 @@ class SQSSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
         # from ``_send`` having sent nothing, and reported success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         # AWS requires every FIFO queue name to end in '.fifo', so the suffix is a contract
         # rather than a guess — but an explicit flag still wins. Decided once, not per emit.
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
@@ -248,6 +260,12 @@ class SQSSink:
         a retry re-sends them byte-identical, so a fault in the request itself can only fail
         the same way. Throttles and internal errors carry ``SenderFault: false`` and are still
         retried under the bound.
+
+        Attempts are separated by exponential backoff (SPEC-027 FR-003). This sink was alone
+        among the retrying sinks in re-sending immediately, while its own docstring named
+        throttling as the retryable case — which is exactly the failure an instant retry makes
+        worse. The wait is interruptible, so a shutdown does not sit through it, and a first
+        attempt that fully succeeds never reaches it.
         """
         entries: list[dict[str, str]] = []
         for i, item in enumerate(prepared):
@@ -296,6 +314,10 @@ class SQSSink:
                 # report a total failure the worker would answer with that re-send.
                 return accepted, False
             entries = [entry for entry in entries if entry["Id"] in retryable_ids]
+            if attempt < self.max_retries:
+                # Before the next attempt, never before abandoning: the sender-fault exit above
+                # has already returned, so nothing waits to give up.
+                wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
                 self.failed += len(entries)
                 _diag.lost(
