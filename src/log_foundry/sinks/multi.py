@@ -59,8 +59,10 @@ class MultiSink:
                 self.failed += 1
                 if first_error is None:
                     first_error = err
+                # The class name goes in the *detail*, not in ``where``: only the detail is
+                # bounded, and a child's ``__name__`` is a runtime value (SPEC-029 FR-002).
                 _diag.absorbed(
-                    f"emitting to MultiSink child {type(sink).__name__}", err, "child skipped"
+                    "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"
                 )
             else:
                 delivered += 1
@@ -78,6 +80,4 @@ class MultiSink:
                 sink.close()
             except Exception as err:  # close-all: an earlier failure must not skip the rest
                 self.failed += 1
-                _diag.absorbed(
-                    f"closing MultiSink child {type(sink).__name__}", err, "child skipped"
-                )
+                _diag.absorbed("closing a MultiSink child", err, f"{type(sink).__name__} skipped")

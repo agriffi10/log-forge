@@ -36,7 +36,9 @@ class NATSSink:
         if client is None:
             import nats  # type: ignore[import-not-found]  # optional 'nats' extra
 
-            client = self._loop.run_until_complete(nats.connect(servers or "nats://localhost:4222"))
+            client = self._loop.run_until_complete(
+                nats.connect(servers or "nats://localhost:4222")
+            )
         self._client = client
 
     def emit(self, batch: list[dict[str, object]]) -> None:

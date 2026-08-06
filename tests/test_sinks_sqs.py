@@ -116,9 +116,7 @@ def test_full_coverage_no_loss_no_duplication() -> None:
     events = _events(23)
     SQSSink("q", client=client).emit(events)
 
-    sent = [
-        json.loads(b) for call in client.calls for entry in call for b in [entry["MessageBody"]]
-    ]
+    sent = [json.loads(b) for call in client.calls for entry in call for b in [entry["MessageBody"]]]
     assert sent == events, "every event sent exactly once, in order"
 
 
@@ -169,12 +167,7 @@ def test_oversized_event_dropped_rest_sent(capsys) -> None:
 
     assert sink.dropped_oversized == 1
     assert "lost 1 event(s)" in capsys.readouterr().err
-    sent = {
-        json.loads(b)["i"]
-        for call in client.calls
-        for entry in call
-        for b in [entry["MessageBody"]]
-    }
+    sent = {json.loads(b)["i"] for call in client.calls for entry in call for b in [entry["MessageBody"]]}
     assert sent == {0, 2}, "the oversized event is dropped; the rest are still sent"
 
 

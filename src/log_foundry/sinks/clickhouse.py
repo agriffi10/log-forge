@@ -21,14 +21,7 @@ _BACKOFF_BASE = 0.1
 
 # Extracted columns (typed in the MergeTree schema); ``event`` (full JSON String) is stored too.
 _COLUMNS = (
-    "timestamp",
-    "level",
-    "trace_id",
-    "span_id",
-    "function",
-    "service",
-    "duration_ms",
-    "status",
+    "timestamp", "level", "trace_id", "span_id", "function", "service", "duration_ms", "status"
 )
 _COLUMN_NAMES = [*_COLUMNS, "event"]
 

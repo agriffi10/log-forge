@@ -82,12 +82,18 @@ def _code(err: object) -> str:
     """Render a ``KafkaError``'s numeric code as ``" code=N"``, or ``""`` if it has none.
 
     ``code()`` is a method on confluent-kafka's ``KafkaError``, returns one of librdkafka's
-    integer constants, and carries no caller data. Total, and deliberately narrow: only an ``int``
-    is written, so a stub or a future version returning something else contributes nothing rather
-    than smuggling text past the type-name rule.
+    integer constants, and carries no caller data. Deliberately narrow: only an ``int`` is written,
+    so a stub or a future version returning something else contributes nothing rather than
+    smuggling text past the type-name rule.
+
+    Total, and the ``int()`` is inside the guard for the same reason ``_diag.errno_of`` puts it
+    there: ``isinstance(code, int)`` admits a *subclass*, whose ``__int__`` is Python that can
+    raise — and this runs in a delivery callback, so an escaping exception would surface from
+    ``emit`` and cost the whole batch. A diagnostic can never be the failure (SPEC-029 FR-003).
     """
     try:
-        code = err.code()  # type: ignore[attr-defined]
+        code = getattr(err, "code", None)
+        value = code() if callable(code) else None
+        return f" code={int(value)}" if isinstance(value, int) else ""
     except Exception:
         return ""
-    return f" code={int(code)}" if isinstance(code, int) else ""

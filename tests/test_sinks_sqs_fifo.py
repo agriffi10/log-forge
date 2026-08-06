@@ -93,9 +93,7 @@ def test_three_traces_yield_three_groups_in_one_request() -> None:
     SQSSink(FIFO_URL, client=client).emit(events)
 
     assert len(client.calls) == 1
-    pairs = {
-        (e["MessageGroupId"], json.loads(e["MessageBody"])["trace_id"]) for e in client.entries
-    }
+    pairs = {(e["MessageGroupId"], json.loads(e["MessageBody"])["trace_id"]) for e in client.entries}
     # Each group id is paired with the body it was derived from — no cross-wiring.
     assert pairs == {("a" * 32, "a" * 32), ("b" * 32, "b" * 32), ("c" * 32, "c" * 32)}
 

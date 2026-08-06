@@ -25,20 +25,11 @@ class ElasticsearchSink(HTTPSink):
             which counts whole requests abandoned past the retry bound).
     """
 
-    def __init__(
-        self,
-        url: str,
-        *,
-        index: str,
-        auth: str | tuple[str, str] | None = None,
-        **http_kwargs: object,
-    ) -> None:
+    def __init__(self, url: str, *, index: str, auth: str | tuple[str, str] | None = None,
+                 **http_kwargs: object) -> None:
         self._index = index
         super().__init__(
-            url.rstrip("/") + "/_bulk",
-            auth=auth,
-            body_format="ndjson",
-            **http_kwargs,  # type: ignore[arg-type]
+            url.rstrip("/") + "/_bulk", auth=auth, body_format="ndjson", **http_kwargs  # type: ignore[arg-type]
         )
         self.item_errors = 0
 

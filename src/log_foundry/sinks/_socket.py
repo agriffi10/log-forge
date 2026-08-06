@@ -82,10 +82,10 @@ class SocketTransport:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += 1
-                # Guarded now (SPEC-029 FR-003): this runs on the worker thread, where the bare
-                # write below could end delivery for good. ``errno`` because an ``OSError`` type
-                # name alone does not tell "connection refused" from "host unknown", and the code
-                # is an integer from the OS — not caller data (FR-002).
+                # Guarded now (SPEC-029 FR-003): this runs on the worker thread, and the bare
+                # ``sys.stderr.write`` this replaced could end delivery for good. ``errno``
+                # because an ``OSError`` type name alone does not tell "connection refused" from
+                # "host unknown", and the code is an integer from the OS — not caller data.
                 _diag.lost(
                     "message",
                     1,
@@ -97,9 +97,9 @@ class SocketTransport:
     def _socket(self) -> socket.socket:
         if self._sock is None:
             self._sock = (
-                _make_udp()
-                if self._transport == "udp"
-                else _make_tcp(self._host, self._port, self._timeout)
+                _make_udp() if self._transport == "udp" else _make_tcp(
+                    self._host, self._port, self._timeout
+                )
             )
         return self._sock
 
