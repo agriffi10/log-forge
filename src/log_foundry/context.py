@@ -5,9 +5,30 @@ inherits its own copy — so ``log_foundry.info(...)`` can find "the span I'm in
 manual passing. This module holds a *stack* of active spans (the top is the current span and
 the parent of the next nested call) plus trace-scoped baggage.
 
+**The three variables and how long each lives** (SPEC-024 — before it, the last two lived as
+long as the context did, so one request's data reached the next request's events):
+
+``_span_stack``
+    One entry per active decorated call. Pushed on enter, popped in the ``finally`` on exit.
+
+``_baggage``
+    Restored to its pre-span value when the **root** span closes — the span opened when no
+    other was active. Nested spans do not reset, so baggage set three calls deep stays visible
+    to its parent and to later siblings in the same trace: that is what "trace-scoped" means.
+    Baggage set before any span is a process-level default and is restored *to*, not erased.
+
+``_adopted``
+    Cleared when the root span closes, and consumed by that one span — an inbound context is a
+    one-shot handoff to the trace it names, not a standing setting. Restoring it instead would
+    leave a warm container joining the first caller's trace forever.
+
+The last two are released together by :func:`pop_baggage_scope`; the span stack is released by
+:func:`pop_span`. A caller who opens no span clears both with :func:`reset_context`.
+
 Two footguns, both avoided below:
   * Never mutate a ContextVar's default mutable value — the ``()`` / ``{}`` defaults are shared
-    across all contexts. Always ``.set()`` a new tuple/dict.
+    across all contexts. Always ``.set()`` a new tuple/dict. The same applies to any value a
+    *parent* context can still see: emptying a baggage dict in place reaches back into it.
   * Use the token/``reset`` pattern, not a manual pop — ``reset(token)`` restores the exact
     prior state even when tasks branch.
 """
@@ -75,12 +96,25 @@ def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
 
 
 def get_baggage() -> dict[str, object]:
-    """Return the current trace's baggage (do not mutate the returned dict in place)."""
+    """Return the current trace's baggage (do not mutate the returned dict in place).
+
+    The trace's own keys are discarded when the enclosing **root** span closes, restoring the
+    baggage in effect before it — so a later trace sees only a process-level default set before
+    any span opened. With no span open at all nothing releases them and they accumulate for the
+    life of the context; :func:`reset_context` is the release on that path.
+    """
     return _baggage.get()
 
 
 def set_baggage(**kv: object) -> None:
-    """Merge key/values into the current trace's baggage (replaces with a new dict)."""
+    """Merge key/values into the current trace's baggage (replaces with a new dict).
+
+    The keys live until the enclosing **root** span closes, then the baggage in effect before
+    that span is restored — so they ride every event at or below this point in the trace and
+    none of the next trace's. Called with no span open they become a process-level default that
+    later traces inherit and restore to; :func:`reset_context` is what erases those, and
+    ``configure(defaults=...)`` is the better tool for setting them in the first place.
+    """
     _baggage.set({**_baggage.get(), **kv})
 
 
