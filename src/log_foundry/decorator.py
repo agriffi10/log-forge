@@ -298,8 +298,11 @@ def trace(
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                # Before _open_span, which is what makes the new span current (SPEC-024).
+                is_root = context.current_span() is None
                 span = _open_span(name or fn.__qualname__, defaults)
                 token = context.push_span(span)
+                scope = context.push_baggage_scope() if is_root else None
                 try:
                     result = await fn(*args, **kwargs)
                     _close_span(span, "ok", None)
@@ -312,13 +315,18 @@ def trace(
                     raise
                 finally:
                     context.pop_span(token)
+                    if scope is not None:
+                        context.pop_baggage_scope(scope)
 
             return cast("F", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Before _open_span, which is what makes the new span current (SPEC-024).
+            is_root = context.current_span() is None
             span = _open_span(name or fn.__qualname__, defaults)
             token = context.push_span(span)
+            scope = context.push_baggage_scope() if is_root else None
             try:
                 result = fn(*args, **kwargs)
                 _close_span(span, "ok", None)
@@ -329,6 +337,8 @@ def trace(
                 raise
             finally:
                 context.pop_span(token)
+                if scope is not None:
+                    context.pop_baggage_scope(scope)
 
         return cast("F", wrapper)
 

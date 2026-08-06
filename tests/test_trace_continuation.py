@@ -459,3 +459,98 @@ def test_new_names_are_exported(lf) -> None:
     ):
         assert name in lf.__all__
         assert callable(getattr(lf, name))
+
+
+# -- SPEC-024 FR-002: the adopted context does not outlive its trace ----------------------
+
+SECOND_TRACE = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+SECOND_SPAN = "a1b2c3d4e5f6a1b2"
+SECOND_TRACEPARENT = f"00-{SECOND_TRACE}-{SECOND_SPAN}-01"
+
+
+def _handler_batches(fake_sink) -> list[list[dict]]:
+    """Every emitted batch for a span named ``handler``, in order."""
+    return [b for b in fake_sink.batches if b and b[0].get("function") == "handler"]
+
+
+def test_an_adopted_context_does_not_survive_into_the_next_root_span(lf, fake_sink) -> None:
+    """The contract example: adopted *outside* the span, on a warm container."""
+
+    @lf.trace(name="handler")
+    def handler() -> None:
+        lf.info("working")
+
+    lf.continue_trace(TRACEPARENT)  # invocation 1 supplied a header
+    handler()
+    handler()  # invocation 2 supplied none
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] != INBOUND_TRACE for e in second), (
+        "invocation 2 must not still be joining invocation 1's caller's trace"
+    )
+    assert HEX32.match(second[0]["trace_id"])
+    assert all(e["parent_span_id"] is None for e in second)
+
+
+def test_an_adopted_context_adopted_inside_the_span_also_does_not_survive(lf, fake_sink) -> None:
+    """The documented placement — first line of the decorated entry point."""
+    headers = [TRACEPARENT, None]
+
+    @lf.trace(name="handler")
+    def handler(header) -> None:
+        lf.continue_trace(header)
+        lf.info("working")
+
+    for header in headers:
+        handler(header)
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] != INBOUND_TRACE for e in second)
+    assert all(e["parent_span_id"] is None for e in second)
+
+
+def test_sequential_invocations_land_in_their_own_adopted_traces(lf, fake_sink) -> None:
+    @lf.trace(name="handler")
+    def handler(header: str) -> None:
+        lf.continue_trace(header)
+        lf.info("working")
+
+    handler(TRACEPARENT)
+    handler(SECOND_TRACEPARENT)
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] == SECOND_TRACE for e in second)
+    assert second[0]["parent_span_id"] == SECOND_SPAN
+
+
+def test_an_invalid_continue_trace_does_not_clear_a_context_adopted_in_the_same_trace(
+    lf, fake_sink, capsys
+) -> None:
+    @lf.trace(name="handler")
+    def handler() -> None:
+        assert lf.continue_trace(TRACEPARENT) is True
+        assert lf.continue_trace(None) is False
+        assert lf.continue_trace("garbage") is False
+        assert context_mod.get_adopted_context() == (INBOUND_TRACE, INBOUND_SPAN)
+        lf.info("working")
+
+    handler()
+
+    (batch,) = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in batch)
+
+
+def test_baggage_adopted_from_a_header_does_not_leak_into_the_next_invocation(lf, fake_sink) -> None:
+    @lf.trace(name="handler")
+    def handler(header) -> None:
+        lf.continue_trace(header, baggage="tenant=acme" if header else None)
+        lf.info("working")
+
+    handler(TRACEPARENT)
+    handler(None)
+
+    _, second = _handler_batches(fake_sink)
+    assert all("tenant" not in e["fields"] for e in second)

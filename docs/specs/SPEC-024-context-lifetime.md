@@ -91,9 +91,18 @@ path, and the async wrapper identically — the same three paths `_close_span` a
 
 #### Description:
 
-`context._adopted` is restored on the same token discipline and at the same point as baggage. A
-handler that adopted a context on one invocation must not still be joining that trace on the next
-invocation that adopted nothing.
+`context._adopted` is released at the same point as baggage — the root span's exit — but it is
+**cleared**, not restored. A handler that adopted a context on one invocation must not still be
+joining that trace on the next invocation that adopted nothing.
+
+The asymmetry with FR-001 is deliberate, and restoring would defeat the requirement. The documented
+call site is the first line of the decorated entry point, but adopting *before* the span opens is
+equally legitimate (a framework middleware that dispatches, and the caller-side example in this
+spec's API contract). A token restore puts back whatever was current at root-span **entry**, so an
+adoption made before the span survives it — leaving invocation 2 joined to invocation 1's trace,
+exactly the defect this spec exists to close. Baggage set outside a span is a process-level default
+and is restored to (Out of Scope); an adopted context is a one-shot handoff to the trace it names,
+consumed by it. A caller who opens no span clears it with FR-003's `reset_context()`.
 
 Within a single trace the adopted context keeps its current meaning exactly: it is consulted only
 when no span is open (`decorator.py:72-73`), so a nested call still inherits from its in-process
@@ -160,29 +169,24 @@ reader is most likely to get wrong.
 ```python
 # src/log_foundry/context.py — new token accessors, mirroring push_span/pop_span
 
-def push_baggage_scope() -> tuple[
-    contextvars.Token[dict[str, object]],
-    contextvars.Token[tuple[str, str | None] | None],
-]:
-    """Capture the current baggage + adopted-context tokens, for restoration at root-span exit."""
+def push_baggage_scope() -> contextvars.Token[dict[str, object]]:
+    """Capture the current baggage token, for restoration at root-span exit."""
 
 
-def pop_baggage_scope(
-    tokens: tuple[
-        contextvars.Token[dict[str, object]],
-        contextvars.Token[tuple[str, str | None] | None],
-    ],
-) -> None:
-    """Restore both variables to their pre-scope values. Total — never raises."""
+def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
+    """Restore baggage to its pre-scope value; clear the adopted context. Never raises."""
 
 
 def reset_context() -> None:
     """Clear baggage and any adopted context outright. Public, re-exported from `log_foundry`."""
 ```
 
+Only baggage needs a token: FR-002's adopted context is cleared rather than restored, so there is
+nothing to capture for it.
+
 `pop_baggage_scope` must tolerate a token created in a different context — `contextvars.Token`
 raises `ValueError` when reset from a context other than the one that made it, which is reachable if
-a caller pushes work onto another thread mid-span. It catches and falls back to setting the values
+a caller pushes work onto another thread mid-span. It catches and falls back to setting the value
 directly, because a decorated function must not fail on the way out (architecture §4).
 
 ---
@@ -202,7 +206,7 @@ def wrapper(*args, **kwargs):
     finally:
         context.pop_span(token)
         if scope is not None:
-            context.pop_baggage_scope(scope)
+            context.pop_baggage_scope(scope)   # restores baggage, clears the adopted context
 
 
 # Caller side — the case this spec fixes:

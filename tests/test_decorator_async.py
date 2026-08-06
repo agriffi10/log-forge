@@ -157,6 +157,51 @@ async def test_sibling_baggage_isolation(lf, fake_sink) -> None:
     assert "key0" not in done[1]["fields"], "sibling baggage must not leak in"
 
 
+async def test_baggage_does_not_leak_into_a_later_async_root_span(lf, fake_sink) -> None:
+    """SPEC-024 FR-001 on the async wrapper — the same reset, the same `finally`.
+
+    Both awaits run in one task, so they share a context: the sequential-reuse case, not the
+    concurrent one that `test_sibling_baggage_isolation` above already covers.
+    """
+
+    @lf.trace(name="alice")
+    async def alice() -> None:
+        lf.set_baggage(user_id="alice")
+        await asyncio.sleep(0)
+        lf.info("serving")
+
+    @lf.trace(name="bob")
+    async def bob() -> None:
+        await asyncio.sleep(0)
+        lf.info("serving")
+
+    await alice()
+    await bob()
+
+    bob_events = [e for e in fake_sink.events if e["function"] == "bob"]
+    assert bob_events
+    assert all("user_id" not in e["fields"] for e in bob_events)
+
+
+async def test_async_baggage_is_restored_when_the_root_span_raises(lf, fake_sink) -> None:
+    @lf.trace(name="boom")
+    async def boom() -> None:
+        lf.set_baggage(user_id="alice")
+        raise ValueError("nope")
+
+    @lf.trace(name="after")
+    async def after() -> None:
+        lf.info("clean")
+
+    with pytest.raises(ValueError, match="nope"):
+        await boom()
+    await after()
+
+    after_events = [e for e in fake_sink.events if e["function"] == "after"]
+    assert after_events
+    assert all("user_id" not in e["fields"] for e in after_events)
+
+
 async def test_cancellation_records_error_end_event(lf, fake_sink) -> None:
     started = asyncio.Event()
 
