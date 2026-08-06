@@ -54,7 +54,9 @@ class SocketTransport:
         self._port = port
         self._transport = transport
         self._timeout = timeout
-        self._max_retries = max_retries
+        # Floored for the reason ``Worker._emit`` floors its own (SPEC-021): a negative value
+        # made no attempt at all and abandoned the message without moving ``failed``.
+        self._max_retries = max(max_retries, 0)
         self._sock: socket.socket | None = None
         self.failed = 0
 

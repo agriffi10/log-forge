@@ -78,7 +78,10 @@ class HTTPSink:
         self.body_format = body_format
         self.timeout = timeout
         self.gzip = gzip
-        self.max_retries = max_retries
+        # Floored, as ``Worker._emit`` floors its own (SPEC-021): a negative value otherwise
+        # skipped the loop entirely, so the request was abandoned with no attempt made and no
+        # counter moved — reachable only by misconfiguration, but reachable.
+        self.max_retries = max(max_retries, 0)
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0

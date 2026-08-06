@@ -141,7 +141,12 @@ def test_health_sink_defaults_to_none_for_third_party_construction() -> None:
 
 
 def test_a_total_failure_reaches_failed_batches_and_flush() -> None:
-    """The two assertions SPEC-026 was written from: both read healthy before the fix."""
+    """Characterization, not a regression guard — ``DeadSink`` raises either way.
+
+    The guard for the actual defect is ``test_a_dead_syslog_destination_now_reports_loss``
+    below, against a shipped sink that used to absorb. This one pins the worker-side half of
+    the contract: what a raising sink is supposed to produce.
+    """
     worker = Worker(DeadSink(), batch_size=1, max_retries=0)
     try:
         worker.submit(_span("a"))
@@ -404,3 +409,144 @@ def test_logstash_losses_follow_the_active_backend(monkeypatch) -> None:
     with pytest.raises(SinkDeliveryError):
         sock.emit([{"a": 1}])
     assert sock.losses() == SinkLosses(dropped=0, failed=1)
+
+
+# --- FR-002: the accessor is safe to call while emit is running ---------------------------
+
+
+def test_losses_is_safe_to_call_concurrently_with_emit() -> None:
+    """FR-002: ``health()`` is a poll, so it lands mid-emit routinely."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    class SlowSink(QuietSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = 0
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            started.set()
+            release.wait(2.0)
+            self.failed += len(batch)
+            super().emit(batch)
+
+        def losses(self) -> SinkLosses:
+            return SinkLosses(dropped=0, failed=self.failed)
+
+    sink = SlowSink()
+    worker = Worker(sink, batch_size=1)
+    try:
+        worker.submit(_span("a"))
+        assert started.wait(2.0), "the emit is in flight"
+        assert worker.health().sink == SinkLosses(dropped=0, failed=0)
+        release.set()
+    finally:
+        worker.shutdown()
+    assert worker.health().sink == SinkLosses(dropped=0, failed=1)
+
+
+# --- review follow-ups: wrappers, the SDK path, an all-rejected bulk ----------------------
+
+
+def test_filtering_and_transform_report_the_inner_sinks_losses() -> None:
+    """A wrapper that reported nothing would hide the destination it wraps (FR-003)."""
+    from log_foundry.sinks.filtering import FilteringSink
+    from log_foundry.sinks.transform import TransformSink
+
+    inner = CountingSink(dropped=2, failed=3)
+    assert FilteringSink(inner, min_level="ERROR").losses() == SinkLosses(dropped=2, failed=3)
+    assert TransformSink(inner, lambda e: e).losses() == SinkLosses(dropped=2, failed=3)
+
+
+def test_a_wrapper_over_a_silent_sink_reports_zero_not_none() -> None:
+    from log_foundry.sinks.filtering import FilteringSink
+
+    assert FilteringSink(QuietSink()).losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_sentry_sdk_errors_are_isolated_per_event() -> None:
+    """A ``capture_event`` that raises mid-batch would duplicate what Sentry already took."""
+    from log_foundry.sinks.sentry import SentrySink
+
+    class FlakySDK:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capture_event(self, event: dict) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transport down")
+
+    sdk = FlakySDK()
+    sink = SentrySink(sdk=sdk)
+
+    sink.emit([{"level": "ERROR"}, {"level": "ERROR"}])  # the second lands: must not raise
+
+    assert (sdk.calls, sink.sent, sink.sdk_errors) == (2, 1, 1)
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+def test_sentry_sdk_raises_when_every_capture_failed() -> None:
+    from log_foundry.sinks.sentry import SentrySink
+
+    class DeadSDK:
+        def capture_event(self, event: dict) -> None:
+            raise RuntimeError("transport down")
+
+    with pytest.raises(SinkDeliveryError):
+        SentrySink(sdk=DeadSDK()).emit([{"level": "ERROR"}, {"level": "ERROR"}])
+
+
+def _bulk(*errors: bool) -> bytes:
+    import json as _json
+
+    items = [{"index": {"error": "nope"} if bad else {}} for bad in errors]
+    return _json.dumps({"errors": any(errors), "items": items}).encode("utf-8")
+
+
+def test_elasticsearch_raises_when_the_bulk_response_rejected_every_item() -> None:
+    """A 200 that indexed nothing is a total failure like any other (FR-001)."""
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    sink = ElasticsearchSink(
+        "http://x", index="i", opener=FakeOpener([FakeResponse(200, _bulk(True, True))])
+    )
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.item_errors == 2
+
+
+def test_elasticsearch_partial_rejection_still_does_not_raise() -> None:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    sink = ElasticsearchSink(
+        "http://x", index="i", opener=FakeOpener([FakeResponse(200, _bulk(True, False))])
+    )
+    sink.emit([{"a": 1}, {"b": 2}])  # one landed: retrying would duplicate it
+    assert sink.item_errors == 1
+
+
+def test_an_unreadable_bulk_body_is_not_read_as_a_total_failure() -> None:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    sink = ElasticsearchSink(
+        "http://x", index="i", opener=FakeOpener([FakeResponse(200, b"not json")])
+    )
+    sink.emit([{"a": 1}])  # the request succeeded; an unparseable body is no evidence against it
+    assert sink.item_errors == 0
+
+
+def test_a_negative_max_retries_still_makes_one_attempt() -> None:
+    """``Worker._emit`` floors its own for exactly this shape (SPEC-021)."""
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    opener = FakeOpener([FakeResponse(500, b"")])
+    sink = HTTPSink("http://x", max_retries=-1, opener=opener)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert len(opener.calls) == 1, "abandoned with no attempt made is a silent loss"
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)

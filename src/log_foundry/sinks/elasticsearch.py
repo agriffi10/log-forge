@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 
 from log_foundry import _diag
-from log_foundry.sinks.base import SinkLosses
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
@@ -45,7 +45,17 @@ class ElasticsearchSink(HTTPSink):
         body = ("\n".join(lines) + "\n").encode("utf-8")  # bulk must be newline-terminated
         # An abandoned request raises out of ``_send`` now (SPEC-026 FR-001) — nothing was
         # indexed, so there is no response to parse and nothing downstream to duplicate.
-        self._parse_bulk_response(self._send(body, content_type="application/x-ndjson"))
+        payload = self._send(body, content_type="application/x-ndjson")
+        rejected = self._parse_bulk_response(payload)
+        if rejected >= len(batch):
+            # A 200 whose every item carries an error indexed nothing, so it is a total failure
+            # like any other and must reach the worker (FR-001). A retry cannot duplicate — and
+            # where the cause is permanent (a mapping conflict), the worker abandons the batch
+            # after its bound and records it, which beats a silent success. A response
+            # rejecting *some* items stays partial and is reported through ``losses()``.
+            raise SinkDeliveryError(
+                f"{type(self).__name__} indexed none of {len(batch)} event(s)"
+            )
 
     def losses(self) -> SinkLosses:
         """Abandoned requests plus server-rejected bulk items (SPEC-026 FR-002). Never raises.
@@ -56,14 +66,19 @@ class ElasticsearchSink(HTTPSink):
         """
         return SinkLosses(dropped=self.dropped_oversized, failed=self.failed + self.item_errors)
 
-    def _parse_bulk_response(self, payload: bytes) -> None:
-        """Count items the bulk response flagged as errors; a partial failure keeps the rest."""
+    def _parse_bulk_response(self, payload: bytes) -> int:
+        """Count items the bulk response flagged as errors; a partial failure keeps the rest.
+
+        Returns how many items were rejected, so ``emit`` can tell a partial failure from one
+        that indexed nothing. An unparseable or errors-free response returns ``0``: the request
+        succeeded, and a body this sink cannot read is not evidence against that.
+        """
         try:
             data = json.loads(payload)
         except (ValueError, TypeError):
-            return
+            return 0
         if not isinstance(data, dict) or not data.get("errors"):
-            return
+            return 0
         errors = 0
         for item in data.get("items", []):
             result: object = next(iter(item.values()), {}) if isinstance(item, dict) else {}
@@ -72,6 +87,7 @@ class ElasticsearchSink(HTTPSink):
         if errors:
             self.item_errors += errors
             _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
+        return errors
 
 
 class OpenSearchSink(ElasticsearchSink):
