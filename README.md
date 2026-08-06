@@ -148,8 +148,10 @@ span: if one exists, the new span copies its `trace_id` and records its `span_id
 new span is then pushed, so anything it calls sees *it* as the parent. On exit the span is
 popped by restoring the stack to its exact prior state (via a token, not a blind pop), which
 stays correct even when code branches into concurrent tasks. Because the stack lives in a
-context variable, every thread and asyncio task gets its own isolated copy — so `asyncio.gather`
-children share their parent's trace, and baggage set in one task never leaks into a sibling.
+context variable, every asyncio task gets its own isolated copy — so `asyncio.gather` children
+share their parent's trace, and baggage set in one task never leaks into a sibling. A new thread
+gets a fresh context rather than a copy, so nothing follows it there unless the caller copies one
+(as `asyncio.to_thread` does).
 
 ### When the worker flushes
 
@@ -256,11 +258,13 @@ def process_payment(user_id: int) -> str:
 - **`set_baggage(**kv)`** — attach trace-scoped context that is merged into the `fields` of
   every subsequent event in the same execution flow. Precedence, lowest to highest: config
   `defaults` → span `defaults` → baggage → per-call `fields`. **Trace-scoped means it ends
-  with the trace:** when the outermost `@trace` call returns, the baggage in effect before it
-  is restored, so one request's keys never reach the next request's events. Nested calls do
-  not reset — baggage set three calls deep stays visible to its parent and to the siblings
-  after it. Set with no span open it becomes a process-level default that later traces
-  inherit and restore to (`configure(defaults=...)` is the better tool for that).
+  with the trace:** when the outermost `@trace` call returns *or raises*, the baggage in effect
+  before it is restored, so one request's keys do not reach the next request's events. Nested
+  calls do not reset — baggage set three calls deep stays visible to its parent and to the
+  siblings after it. Set with no span open it becomes a process-level default that later traces
+  inherit and restore to (`configure(defaults=...)` is the better tool for that) — and a process
+  that logs *without* `@trace` has no root span to release anything, so it needs
+  [`reset_context()`](#clearing-context-in-a-long-lived-process).
 - **`echo=True`** — *additionally* write a human-readable `LEVEL   message` line to the console
   (`sys.stderr` by default), synchronously, without waiting for the async flush. The event
   still rides the normal pipeline to the sink — echo never redirects.
@@ -345,9 +349,9 @@ Details worth knowing:
 
 #### Clearing context in a long-lived process
 
-`@trace` releases both baggage and the adopted context when the outermost decorated call
-returns, so **most callers never need `reset_context()`**. It exists for the two cases that
-have no root span to hang that release on:
+`@trace` releases both baggage and the adopted context when the outermost decorated call returns
+or raises, so **most callers never need `reset_context()`**. It exists for the two cases where no
+root-span exit releases them in *your* context:
 
 ```python
 lf.reset_context()      # clears baggage *and* any adopted trace context
@@ -356,7 +360,9 @@ lf.reset_context()      # clears baggage *and* any adopted trace context
 - **You use the emitters without `@trace`.** An orphan log opens no span, so nothing releases
   what `set_baggage()` or `continue_trace()` set. In a process that reuses one thread across
   requests — the main thread, a pooled worker, a warm Lambda container — that state reaches the
-  next request. Call `reset_context()` when a unit of work ends.
+  next request. Call `reset_context()` when a unit of work ends. (An orphan log never joins an
+  adopted trace either: it mints its own `trace_id`, and the adoption simply waits to claim the
+  next root span, whenever one happens to run.)
 - **You adopt outside the span and dispatch into a task.** The release runs in whichever
   context the root span's `finally` runs in, so `continue_trace()` here followed by
   `asyncio.run(main())` clears the adoption in the task's copy of the context while this one
@@ -365,9 +371,10 @@ lf.reset_context()      # clears baggage *and* any adopted trace context
   needs nothing.
 
 It clears rather than restores: a process-level baggage default set before any span is erased
-too. Prefer calling it **outside** a span — inside one it also empties the `span.start` /
-`span.end` events of baggage, because those are stamped with the span's *final* baggage at
-close. It never raises.
+too — permanently when you call it outside a span. Prefer that. Called *inside* a span it also
+empties the `span.start` / `span.end` events of baggage, because those are stamped with the
+span's *final* baggage at close, and that span's exit then restores the pre-span baggage anyway,
+undoing the erasure. It never raises.
 
 ### Sinks
 

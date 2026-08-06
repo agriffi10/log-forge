@@ -126,7 +126,9 @@ The decorator is **non-swallowing**: exceptions are recorded and re-raised uncha
   the source of `parent_span_id` for the next nested call.
 - **Logging outside any span:** a top-level `log_foundry.info(...)` with no active span
   emits a standalone single-event queue with a fresh `trace_id` (an "orphan" log) so
-  records are never silently dropped. *(Open item — see §12.)*
+  records are never silently dropped. It mints that `trace_id` unconditionally, so an orphan
+  log never joins a context adopted via `continue_trace` — the adoption waits for the next
+  root span. A caller on this path releases both values with `reset_context()` (SPEC-024).
 
 ### 5.1 Baggage — trace-scoped dynamic context
 
@@ -143,7 +145,10 @@ def handle_request(req):
 ```
 
 - Baggage lives in the same `contextvars` context as the span stack, so it propagates
-  across nested calls, threads, and `async` tasks automatically.
+  across nested calls and `async` tasks automatically. **A new thread does not inherit it** —
+  a thread starts with a fresh context, and only an explicit `copy_context()` (as
+  `asyncio.to_thread` does) carries anything into it. That context then persists for the life
+  of the thread, which is the mechanism behind the leak the next bullet closes.
 - **The scope ends at the root span** (SPEC-024). "At or below the point they were set" is
   where baggage *starts*; where it stops is the close of the **root** span — the one opened
   when no other was active — at which point the baggage in effect before that span is
@@ -162,8 +167,9 @@ def handle_request(req):
 - It is merged into each event's `fields` (see §6) at emit time. Precedence, lowest to
   highest: global `defaults` → per-decorator `defaults` → baggage → explicit per-call
   fields.
-- Baggage is **not** propagated across process boundaries in v1 (that travels with the
-  cross-service trace-continuation work deferred in §12).
+- Baggage crosses a process boundary **only when the caller carries it** (SPEC-014, §13):
+  `current_baggage_header()` publishes it in W3C `baggage` format, `continue_trace(baggage=...)`
+  adopts it. Nothing is auto-instrumented.
 
 ---
 
@@ -444,6 +450,16 @@ constraint — never by being deleted quietly.
   HTTP client patching, framework middleware, or boto3 hook, and there will not be — that is
   auto-instrumentation, a different product, and it needs the dependencies the core deliberately
   does not have.
+
+- **A context released at a root span is released in *that span's* context.** Baggage and the
+  adopted trace context are taken back out when the root span closes (SPEC-024), but the write
+  lands in whichever `contextvars` context the span's `finally` runs in. Adopt *outside* a span
+  and then dispatch it into a child context — any `asyncio.Task`, including the one
+  `asyncio.run` creates — and the clear lands in the copy while the parent keeps the adoption.
+  `contextvars` offers no way to write to a parent context, so this cannot be fixed in the
+  library; it is closed by documentation and a test that pins it. The documented placement —
+  `continue_trace()` on the entry point's first line, inside the span — is unaffected, and
+  `reset_context()` is the remedy for a caller who adopts before dispatching.
 
 - **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event

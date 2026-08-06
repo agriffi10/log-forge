@@ -22,8 +22,8 @@ long as the context did, so one request's data reached the next request's events
     one-shot handoff to the trace it names, not a standing setting. Restoring it instead would
     leave a warm container joining the first caller's trace forever.
 
-Both are released together by :func:`pop_baggage_scope`, and a caller who opens no span clears
-them with :func:`reset_context`.
+The last two are released together by :func:`pop_baggage_scope`; the span stack is released by
+:func:`pop_span`. A caller who opens no span clears both with :func:`reset_context`.
 
 Two footguns, both avoided below:
   * Never mutate a ContextVar's default mutable value — the ``()`` / ``{}`` defaults are shared
@@ -98,8 +98,10 @@ def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
 def get_baggage() -> dict[str, object]:
     """Return the current trace's baggage (do not mutate the returned dict in place).
 
-    Discarded when the enclosing **root** span closes, so this returns only what the current
-    trace can see: its own keys, plus any process-level default set before any span opened.
+    The trace's own keys are discarded when the enclosing **root** span closes, restoring the
+    baggage in effect before it — so a later trace sees only a process-level default set before
+    any span opened. With no span open at all nothing releases them and they accumulate for the
+    life of the context; :func:`reset_context` is the release on that path.
     """
     return _baggage.get()
 
