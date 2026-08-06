@@ -145,10 +145,30 @@ class Worker:
         # Guards the `dropped` counter (incremented from any caller thread) and the shutdown
         # once-only flag (shutdown may be called concurrently by atexit and user code).
         self._lock = threading.Lock()
+        self._offer_stop_signal()
         self._thread = threading.Thread(
             target=self._run, name="log-foundry-worker", daemon=True
         )
         self._thread.start()
+
+    def _offer_stop_signal(self) -> None:
+        """Give the sink this worker's shutdown event, if it advertises somewhere to put it.
+
+        The dependency stays one-way (SPEC-027 FR-002): ``sinks`` must not import ``worker``, so
+        the worker pushes rather than the sink pulling. Probed with ``hasattr``, the same
+        optional-protocol shape SPEC-026 uses for ``losses()`` — a sink without the attribute
+        simply never gets one and backs off uninterruptibly, exactly as before this spec.
+
+        Total: a sink whose ``stop_signal`` is a read-only property, or whose ``__setattr__``
+        objects, loses interruptibility rather than preventing the worker from starting.
+        """
+        try:
+            if hasattr(self.sink, "stop_signal"):
+                self.sink.stop_signal = self._stop
+        except Exception as exc:
+            _diag.absorbed(
+                "handing the sink its stop signal", exc, "its backoff stays uninterruptible"
+            )
 
     def submit(self, events: list[dict[str, object]]) -> None:
         """Hand a finished span's events to the worker. Non-blocking.

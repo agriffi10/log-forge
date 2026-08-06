@@ -1,7 +1,7 @@
 """SPEC-009 — HTTPSink core: body format, headers/auth, gzip, bounded retry (fake opener).
 
 Every test injects a fake ``urlopen``-shaped opener, so nothing touches the network. Retry tests
-patch ``time.sleep`` to a no-op so bounded backoff does not actually sleep.
+patch ``_retry``'s ``time.sleep`` to a no-op so bounded backoff does not actually sleep.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class FakeOpener:
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks.http.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _seconds: None)
 
 
 # --- FR-001: core POST ------------------------------------------------------------------

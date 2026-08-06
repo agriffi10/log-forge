@@ -12,9 +12,13 @@ substitute a fake socket without any network access.
 from __future__ import annotations
 
 import socket
-import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
@@ -59,6 +63,8 @@ class SocketTransport:
         self._max_retries = max(max_retries, 0)
         self._sock: socket.socket | None = None
         self.failed = 0
+        # Set by the worker through the owning sink (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
 
     def send_all(self, messages: list[bytes]) -> None:
         """Send each pre-framed message, reconnecting on error (FR-005, FR-006).
@@ -102,7 +108,7 @@ class SocketTransport:
             except OSError as err:
                 self._reset()  # force a fresh connection on the next attempt
                 if attempt < self._max_retries:
-                    time.sleep(_BACKOFF_BASE * (2**attempt))
+                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += 1
                 # Guarded now (SPEC-029 FR-003): this runs on the worker thread, and the bare

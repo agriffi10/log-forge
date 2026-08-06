@@ -15,21 +15,31 @@ from __future__ import annotations
 
 import gzip as _gzip
 import json
-import time
 import urllib.error
 import urllib.request
 from base64 import b64encode
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Callable
 
 __all__ = ["HTTPSink", "merge_headers"]
 
 _BACKOFF_BASE = 0.1  # seconds; delay for retry attempt n is _BACKOFF_BASE * 2**n
+
+DEFAULT_MAX_RETRY_AFTER = 30.0
+"""Ceiling on a server-supplied ``Retry-After``, in seconds (SPEC-027 FR-001).
+
+Thirty rather than something smaller because a rate-limited platform asking for half a minute is
+making a reasonable request, and rather than something larger because the *total* is what a caller
+with an execution deadline pays: with the default ``max_retries=3`` the worst case is three waits,
+90 s, which stays inside a typical serverless timeout while leaving room for the request itself.
+"""
 
 
 def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[str, str]:
@@ -69,6 +79,7 @@ class HTTPSink:
         timeout: float = 5.0,
         gzip: bool = False,
         max_retries: int = 3,
+        max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
         opener: Callable[..., Any] | None = None,
     ) -> None:
         self.url = url
@@ -82,6 +93,10 @@ class HTTPSink:
         # skipped the loop entirely, so the request was abandoned with no attempt made and no
         # counter moved — reachable only by misconfiguration, but reachable.
         self.max_retries = max(max_retries, 0)
+        self.max_retry_after = max_retry_after
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002); ``None``
+        # standalone, which backs off uninterruptibly exactly as before.
+        self.stop_signal: threading.Event | None = None
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0
@@ -219,9 +234,18 @@ class HTTPSink:
         return int(status), payload, _parse_retry_after(getattr(response, "headers", None))
 
     def _sleep_backoff(self, attempt: int, retry_after: float | None) -> None:
-        """Sleep before the next attempt: ``Retry-After`` if the server gave one, else backoff."""
-        delay = retry_after if retry_after is not None else _BACKOFF_BASE * (2**attempt)
-        time.sleep(delay)
+        """Wait before the next attempt: ``Retry-After`` if usable, else exponential backoff.
+
+        The server's value is clamped and sign-checked first (SPEC-027 FR-001) — it is advice
+        from the destination, not an instruction the application must obey. Unbounded, a measured
+        ``Retry-After: 8`` held ``shutdown()`` for 22 s and a header of ``86400`` would have held
+        it for a day; a negative one made ``time.sleep`` raise, which the orphan path handed to
+        the caller. Anything rejected falls back to this sink's own backoff, which is what the
+        destination would have got had it sent no header at all.
+        """
+        server = clamp_server_delay(retry_after, self.max_retry_after)
+        delay = server if server is not None else _BACKOFF_BASE * (2**attempt)
+        wait(delay, self.stop_signal)
 
     def _abandon(self, reason: str) -> NoReturn:
         """Count, log, then raise for a request abandoned past the retry bound (FR-012).
