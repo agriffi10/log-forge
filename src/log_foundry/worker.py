@@ -20,7 +20,6 @@ nothing about spans or context (the same dumbness that makes sinks swappable).
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import time
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -162,15 +161,7 @@ class Worker:
             # submitters. Lines may therefore interleave out of order under concurrency; the
             # counts they carry are still exact.
             if total == 1 or total % _DROP_WARN_EVERY == 0:
-                try:
-                    sys.stderr.write(
-                        f"log-foundry: log queue full, dropped {total} submission(s) so far\n"
-                    )
-                except Exception:  # submit() runs on the *caller's* thread, so an
-                    # unwritable stderr (closed fd, broken pipe, daemonized process) would raise
-                    # straight into the app. A diagnostic about dropped logs must never itself be
-                    # the reason a decorated function fails. The counter is already recorded.
-                    pass
+                _diag.lost("submission", total, "log queue full; count is cumulative")
 
     def health(self) -> Health:
         """Snapshot the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003). Never raises.
@@ -323,36 +314,36 @@ class Worker:
 
         Recording precedes announcing: stderr may be closed or wedged, and unlike the overflow
         warning this line is written exactly once and cannot be re-emitted later, so the record
-        must not be able to ride on it. The exception's *type* is reported and its message is
-        not — a sink's exception text can carry event data, and arch §6 keeps caller data out of
-        places it was not asked for (the same rule behind ``sanitize``'s type-name placeholder).
+        must not be able to ride on it. The exception's *type* is reported and its message is not
+        — the rule ``_diag`` now applies to every line the library writes (SPEC-029), and the
+        reason this site had it first.
 
-        The count reports what was *in hand* and what was still *queued behind it* (SPEC-021
-        FR-002). Held alone under-reads the loss: nothing will drain the queue either, so an
-        operator reading "1 undrained event-list(s)" could conclude far less was lost than was.
+        The announcement is an :func:`~log_foundry._diag.absorbed`, not a fourth kind of line: the
+        thread's death *is* an exception this method caught and did not propagate, and what it
+        cost belongs in the detail. The count reports what was *in hand* and what was still
+        *queued behind it* (SPEC-021 FR-002). Held alone under-reads the loss: nothing will drain
+        the queue either, so an operator reading "1 undrained event-list(s)" could conclude far
+        less was lost than was.
 
         The queued figure is "items", not "event-lists", and says so: like ``Health.queued`` it is
         read without stopping the world, so it counts any internal flush/shutdown marker sitting
         alongside real submissions, and a producer thread can add to the queue between the death
         and the read. It is a floor on what was lost, which is the useful direction.
         """
-        name = type(exc).__name__
         with self._lock:
-            self.stopped_reason = name
+            self.stopped_reason = type(exc).__name__
         try:
             # In its own guard, and after the record: ``qsize()`` is not guaranteed on every
             # platform's queue, and a diagnostic must not be the reason the diagnosis is lost.
             queued: object = self._queue.qsize()
         except Exception:
             queued = "?"
-        try:
-            sys.stderr.write(
-                f"log-foundry: worker thread stopped on {name}; {undrained} undrained "
-                f"event-list(s) held and {queued} queued item(s) undelivered, nothing further "
-                f"will be delivered\n"
-            )
-        except Exception:  # best-effort: the record above is what an operator reads.
-            pass
+        _diag.absorbed(
+            "draining the log queue",
+            exc,
+            f"worker thread stopped; {undrained} undrained event-list(s) held and {queued} "
+            f"queued item(s) undelivered, nothing further will be delivered",
+        )
 
     def _drain(self, pending: list[list[dict[str, object]]]) -> None:
         """The drain loop proper. ``pending`` is owned by :meth:`_run`, which reports its size.
@@ -477,9 +468,12 @@ class Worker:
                     # than a half-updated pair. No deadlock: shutdown() releases before join().
                     with self._lock:
                         self.failed_batches += 1
-                    sys.stderr.write(
-                        f"log-foundry: abandoned a batch of {len(batch)} event(s) after "
-                        f"{retries + 1} failed emit attempts\n"
+                    # Through ``_diag`` so the write is guarded: unguarded, a broken stderr raised
+                    # out of here, through ``_drain``, into ``_run``'s handler, and the drain
+                    # thread died for good — a diagnostic about one lost batch costing every batch
+                    # after it (SPEC-029 FR-003).
+                    _diag.lost(
+                        "event", len(batch), f"batch abandoned after {retries + 1} emit attempts"
                     )
                     return
                 # Backoff between attempts; _stop.wait returns at once during shutdown, so a

@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import atexit
 import functools
-import sys
 import threading
 from collections.abc import Callable
 from time import monotonic
@@ -46,9 +45,6 @@ if TYPE_CHECKING:
     import contextvars
 
 __all__ = ["continue_trace", "trace"]
-
-# Bound on how much of a rejected inbound value is echoed into a stderr warning.
-_MAX_REJECTED_ECHO = 64
 
 # One background worker per process (SPEC-004), created lazily from the configured sink on the
 # first flush. The double-checked lock makes concurrent first-flushes create exactly one.
@@ -84,19 +80,6 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
     )
     span.events.append(start_event(span))
     return span
-
-
-def _warn_rejected(reason: str, value: object) -> None:
-    """Report a rejected inbound context on stderr, as ``worker`` and ``SQSSink`` do.
-
-    The offending value is echoed only as a **bounded ``repr``**. Unbounded is a log-injection
-    surface — the value is attacker-controllable, and `repr` additionally escapes newlines and
-    control characters so it cannot forge a second log line in an operator's console.
-    """
-    shown = repr(value)
-    if len(shown) > _MAX_REJECTED_ECHO:
-        shown = shown[:_MAX_REJECTED_ECHO] + "…"
-    sys.stderr.write(f"log-foundry: ignoring inbound trace context ({reason}): {shown}\n")
 
 
 def continue_trace(
@@ -144,19 +127,19 @@ def continue_trace(
     if traceparent is not None:
         if trace_id is not None or parent_span_id is not None:
             # A programming error, not bad input: the caller supplied the same thing twice.
-            _warn_rejected("both traceparent and explicit ids given; traceparent wins", traceparent)
+            _diag.rejected("both traceparent and explicit ids given; traceparent wins", traceparent)
         parsed = parse_traceparent(traceparent)
         if parsed is None:
-            _warn_rejected("unparseable traceparent", traceparent)
+            _diag.rejected("unparseable traceparent", traceparent)
         else:
             adopted = parsed
     elif trace_id is not None:
         if not is_valid_trace_id(trace_id):
-            _warn_rejected("invalid trace_id", trace_id)
+            _diag.rejected("invalid trace_id", trace_id)
         elif parent_span_id is not None and not is_valid_span_id(parent_span_id):
             # Drop just the parent and join as another root rather than reject the whole
             # context: being in the right trace without a parent beats being in a fresh one.
-            _warn_rejected("invalid parent_span_id; joining as a root", parent_span_id)
+            _diag.rejected("invalid parent_span_id; joining as a root", parent_span_id)
             adopted = (trace_id, None)
         else:
             # parent_span_id may legitimately be omitted — a consumer that knows the trace but
@@ -175,7 +158,7 @@ def continue_trace(
         if parsed_baggage is None:
             # Deliberately independent of the trace context above: losing correlating fields is
             # bad, and losing the trace join because one field was malformed is worse.
-            _warn_rejected("unusable baggage header", baggage)
+            _diag.rejected("unusable baggage header", baggage)
         else:
             context.set_baggage(**parsed_baggage)
 
