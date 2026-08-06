@@ -30,8 +30,10 @@ implementation against the design in `architecture.md`.
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
   `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
   SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
-  optional `aws` extra — renamed from `sqs` in SPEC-010). The full module map is now built; the setup-phase `core.py` +
-  `modules/v1/` have been removed.
+  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus two leaf helpers no module map
+  anticipated, both of which must import nothing from the package: `sanitize` (SPEC-017) and
+  `_diag` (SPEC-025, owned by SPEC-029). The full module map is now built; the setup-phase
+  `core.py` + `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -164,11 +166,16 @@ no `src/` file. Three of its own acceptance criteria were amended by evidence: F
 could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
 FR-006 overstated what a missing PAT costs.
 
-**SPEC-026..031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc, validated in a
-second fresh context and unbuilt. Nothing here is caught by CI (the suite was green throughout).
-Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-029**
-is next (it owns `_diag.py`, which SPEC-025 shipped, and moves the twelve `repr(exception)` sink
-sites onto it), then SPEC-026.
+**SPEC-026..028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
+validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
+throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
+Arcs; **SPEC-026** is next (the largest — it needs `_diag`'s writers, which SPEC-029 shipped).
+
+**SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
+printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
+it (a psycopg repr reprints the statement *and* the bound event), and two were unguarded on the
+worker thread, where announcing one lost batch ended delivery for good. Every line now goes through
+`_diag`, and a test forbids any other module writing to stderr.
 
 **SPEC-025 (the library must not fail the caller) is Completed** — three surviving instances of the
 SPEC-017 shape, where the exception the caller received was one the library invented: an unguarded
@@ -320,6 +327,19 @@ where it starts.
   retried (the once-only flag stays ahead of it, because a second `close()` on a partially
   released sink is worse than an unclosed one). Only the type is written, never the message
   (arch §6). `_diag` must import nothing from its own package. (SPEC-025)
+- **One module writes every diagnostic, so the rules are applied once rather than remembered
+  twenty-eight times** — which is exactly how twelve sites came to print `repr(exception)` while
+  the other eight printed a type name, and how two came to be unguarded. `_diag` owns
+  `absorbed`/`lost`/`rejected`: an exception is named by `type(exc).__name__`, and where that is
+  not diagnosable (an `OSError` is not "refused" vs "host unknown") the caller passes a detail
+  built from values the *library* controls — an `errno`, an HTTP status, an attempt count — never
+  from the exception's text. Any detail is escaped **then** bounded, so the bound governs what is
+  written, and `isprintable()` is the escape test rather than a C0 table: `splitlines()` breaks on
+  three separators such a table misses, so a newline count would call a forged line safe. The one
+  bounded `repr` is `rejected`, whose input is an inbound *header* rather than an exception — and
+  it is escaped afterwards anyway, because `repr` escaping newlines is a property of the built-ins,
+  not of `repr`. A test forbids any other module writing to stderr; it is a lint on the idiom
+  (`stderr.write`, `print(file=…)`, `traceback.print_*`), not a sandbox. (SPEC-029, arch §6)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
