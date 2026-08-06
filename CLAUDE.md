@@ -166,10 +166,18 @@ no `src/` file. Three of its own acceptance criteria were amended by evidence: F
 could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
 FR-006 overstated what a missing PAT costs.
 
-**SPEC-026..028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
+**SPEC-026 (sink loss visibility) is Completed** — four specs built a loss-reporting apparatus
+(`failed_batches`, `dropped_unadjudicated`, `stopped_reason`, `flush()`'s verdict) that fired against
+no shipped remote transport: each sink counted its own failures on a private attribute with no
+accessor and returned normally, so with a dead syslog socket `flush()` read `True` and `health()`
+read all zeros while every message was lost. Total failure now raises across the whole sink family,
+absorbed loss is readable through `Health.sink`, and `sinks/base.py` states the contract a
+third-party sink must satisfy.
+
+**SPEC-027, 028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
 validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
 throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
-Arcs; **SPEC-026** is next (the largest — it needs `_diag`'s writers, which SPEC-029 shipped).
+Arcs; **SPEC-027** is next.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
@@ -340,6 +348,21 @@ where it starts.
   it is escaped afterwards anyway, because `repr` escaping newlines is a property of the built-ins,
   not of `repr`. A test forbids any other module writing to stderr; it is a lint on the idiom
   (`stderr.write`, `print(file=…)`, `traceback.print_*`), not a sandbox. (SPEC-029, arch §6)
+- **A sink that delivered nothing raises; one that delivered something reports** — the worker's
+  retry, `failed_batches` and `flush()`'s verdict all run on an exception, so a sink that absorbs a
+  total failure is a sink the worker *believes*: retry never engages, counters stay at zero, and
+  `flush()` returns `True` while everything is lost. Raising is safe exactly when nothing landed,
+  because there is nothing downstream to duplicate — which is also why partial failure must **not**
+  raise (the worker retries whole batches). Absorbed loss goes to an optional `losses()`, aggregated
+  into `Health.sink` and kept *nested*: `dropped` at the queue is backpressure, `dropped` at the sink
+  is an event the destination could never accept, and one number would hide which fix applies.
+  `losses()` is probed by name rather than declared on the Protocol, so a pre-SPEC-026 sink still
+  satisfies `Sink`. Three cases stay silent by prior decision — an unadjudicable response (SPEC-018:
+  cannot prove nothing landed, so a retry may duplicate), an SQS sender fault (SPEC-016: provably
+  rejected, a byte-identical re-send can only fail again), and an oversized event (nothing to retry).
+  The first is suppressed batch-wide and the second only when nothing *recoverable* was also lost:
+  "unknown" and "rejected" are not the same claim. `losses().failed` is an upper bound on loss, not
+  a count of it. (SPEC-026, arch §8, §9)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

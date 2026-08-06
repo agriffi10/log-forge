@@ -1,8 +1,8 @@
 # Spec: Sink Loss Visibility
 
 **ID:** SPEC-026  
-**Status:** Draft  
-**Last Updated:** 2026-08-05  
+**Status:** Completed  
+**Last Updated:** 2026-08-06  
 **Depends On:** SPEC-017, SPEC-018, SPEC-019, SPEC-021
 
 ## Overview
