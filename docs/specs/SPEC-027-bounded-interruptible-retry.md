@@ -1,8 +1,8 @@
 # Spec: Bounded, Interruptible Retry
 
 **ID:** SPEC-027  
-**Status:** Draft  
-**Last Updated:** 2026-08-05  
+**Status:** Completed  
+**Last Updated:** 2026-08-06  
 **Depends On:** SPEC-004, SPEC-009, SPEC-013
 
 ## Overview

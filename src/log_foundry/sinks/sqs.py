@@ -77,7 +77,11 @@ def _bounded(raw: str, fallback: str) -> str:
 
 
 class SQSSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an SQS queue."""
+    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an SQS queue.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     MAX_BATCH = 10  # SQS SendMessageBatch hard limit: entries per request
     MAX_BYTES = 256 * 1024  # SQS limit: 256 KB per request

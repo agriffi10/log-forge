@@ -39,6 +39,11 @@ def _make_udp() -> socket.socket:
 class SocketTransport:
     """Send pre-framed messages over a TCP or UDP socket, reconnecting on error within a bound.
 
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` *per
+    message* — 0.7 s per message at the default 3, so a 100-message batch against a dead
+    destination is ~70 s of backoff on the single drain thread. The wait is interruptible, so
+    ``shutdown()`` cuts it short.
+
     Attributes:
         failed: Messages abandoned past the reconnect-retry bound.
     """

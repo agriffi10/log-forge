@@ -44,7 +44,11 @@ _COLUMN_TYPES = {
 
 
 class ClickHouseSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a ClickHouse table."""
+    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a ClickHouse table.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(
         self,

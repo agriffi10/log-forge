@@ -62,6 +62,12 @@ class HTTPSink:
     requires ``https://`` — over a plaintext endpoint a bearer token, and a basic-auth pair (which
     is base64, not encryption), travel in the clear. Use ``https://`` for anything off the host.
 
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits, each at most
+    ``max_retry_after`` when the server sends a ``Retry-After`` and ``0.1 * 2**n`` otherwise —
+    so 90 s at the defaults (3 × 30 s), plus the request timeouts themselves. That delay pauses
+    the single drain thread, so it is a pause on *all* log delivery, not just this sink's.
+    ``shutdown()``'s own timeout bounds the total (SPEC-027 FR-004).
+
     Attributes:
         failed: Requests abandoned past the retry bound.
         dropped_oversized: Events dropped for exceeding a destination's hard size limit (used by

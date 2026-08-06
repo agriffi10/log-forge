@@ -26,7 +26,11 @@ _BACKOFF_BASE = 0.1
 
 
 class _RedisSink:
-    """Shared pipelining, bounded retry, and ownership-aware close for the Redis sinks."""
+    """Shared pipelining, bounded retry, and ownership-aware close for the Redis sinks.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per batch —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(self, *, client: Any, url: str | None, max_retries: int) -> None:
         self._owns_client = client is None

@@ -25,7 +25,11 @@ _BACKOFF_BASE = 0.1
 
 
 class AzureEventHubsSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an Azure Event Hub."""
+    """A :class:`~log_foundry.sinks.base.Sink` that sends events to an Azure Event Hub.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per EventDataBatch —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(
         self,

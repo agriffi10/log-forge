@@ -174,7 +174,15 @@ read all zeros while every message was lost. Total failure now raises across the
 absorbed loss is readable through `Health.sink`, and `sinks/base.py` states the contract a
 third-party sink must satisfy.
 
-**SPEC-027, 028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
+**SPEC-027 (bounded, interruptible retry) is Completed** — every retrying sink slept the one
+thread that delivers anything, so a sink's backoff was a global pause on log delivery held across
+`shutdown()`, which joins that thread from `atexit`. `HTTPSink` passed a server-supplied
+`Retry-After` straight to `time.sleep`: a measured `Retry-After: 8` blocked `shutdown()` for 22 s,
+`86400` would have stalled logging for a day, and a negative value made `time.sleep` raise. Every
+wait now goes through `sinks/_retry.py` and is cut short by a shutdown, `SQSSink` gained the backoff
+it alone lacked, and `shutdown()` takes a timeout.
+
+**SPEC-028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
 validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
 throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
 Arcs; **SPEC-027** is next.
@@ -363,6 +371,20 @@ where it starts.
   The first is suppressed batch-wide and the second only when nothing *recoverable* was also lost:
   "unknown" and "rejected" are not the same claim. `losses().failed` is an upper bound on loss, not
   a count of it. (SPEC-026, arch §8, §9)
+- **A sink's wait is bounded, interruptible, and never taken on a destination's word** — one
+  drain thread means a sink's backoff pauses *all* delivery, and it spans `shutdown()`, so
+  `time.sleep` is the wrong primitive: every sink waits on the worker's stop event, pushed onto it
+  by the worker (`hasattr` probe, as with `losses()`) so `sinks` still never imports `worker`. A
+  wrapper sink forwards it to whatever actually holds the retry loop — set on a wrapper the
+  signal reaches nothing, which moves the defect rather than fixing it. `Retry-After` is advice,
+  not an instruction: clamped to `max_retry_after`, and rejected outright when non-positive or
+  non-finite (the test is `not (value > 0)`, because `value <= 0` reads `False` for `NaN`). Zero is
+  rejected too — a rate-limiting destination saying "wait zero seconds" is far more likely
+  truncated than meant. `shutdown()` is bounded because a sink blocked *in* a call still holds the
+  thread, and an expired one leaves the sink **open**: the drain thread may still be inside
+  `emit`, and a leaked resource in an exiting process beats a corrupt write. It reports through
+  `stopped_reason` (`"ShutdownTimeout"`) rather than a new field, extending SPEC-019's vocabulary
+  as that spec intended. (SPEC-027, arch §9)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

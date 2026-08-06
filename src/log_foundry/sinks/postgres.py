@@ -29,7 +29,11 @@ _COLUMNS = ("timestamp", "level", "trace_id", "span_id", "function", "service")
 
 
 class PostgresSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a Postgres table."""
+    """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a Postgres table.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per batch —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(
         self,

@@ -28,6 +28,10 @@ _MAX_DOC_BYTES = 16 * 1024 * 1024  # MongoDB's hard 16 MB per-document limit
 class MongoDBSink:
     """A :class:`~log_foundry.sinks.base.Sink` that inserts events into a MongoDB collection.
 
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per batch —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+
     Attributes:
         failed: Documents the server rejected (bulk write errors) or a whole batch abandoned past
             the retry bound.

@@ -35,7 +35,11 @@ class _PersistentProperties:
 
 
 class RabbitMQSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that publishes persistent messages to RabbitMQ."""
+    """A :class:`~log_foundry.sinks.base.Sink` that publishes persistent messages to RabbitMQ.
+
+    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per message —
+    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    """
 
     def __init__(
         self,
