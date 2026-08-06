@@ -8,6 +8,8 @@ observe an auto-flush *before* shutdown (count/time triggers), it polls with a b
 
 import os
 import pathlib
+import subprocess
+import sys
 import threading
 import time
 
@@ -1221,18 +1223,27 @@ def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> 
 
 
 class _CloseFailsSink:
-    """Emits fine, fails to close — a socket already reset, a client mid-teardown."""
+    """Emits fine, fails to close — a socket already reset, a client mid-teardown.
 
-    def __init__(self, exc: BaseException | None = None) -> None:
+    ``emit`` is deliberately slow and ``close`` records how much had been emitted by the time it
+    ran: asserting on ``batches`` *after* ``shutdown()`` returns cannot tell "close after drain"
+    from "close before drain", since both end with everything emitted.
+    """
+
+    def __init__(self, exc: BaseException | None = None, emit_delay: float = 0.0) -> None:
         self.exc = exc or OSError("cannot close")
+        self.emit_delay = emit_delay
         self.batches: list[list[dict]] = []
         self.close_calls = 0
+        self.emitted_at_close = -1
 
     def emit(self, batch: list[dict]) -> None:
+        time.sleep(self.emit_delay)
         self.batches.append(list(batch))
 
     def close(self) -> None:
         self.close_calls += 1
+        self.emitted_at_close = sum(len(b) for b in self.batches)
         raise self.exc
 
 
@@ -1245,12 +1256,18 @@ def test_shutdown_returns_normally_when_the_sink_cannot_close(capsys) -> None:
 
     err = capsys.readouterr().err
     assert "absorbed a failure while closing the sink (OSError)" in err
+    assert "it may still hold its resources" in err, "the consequence is the point of the line"
     assert "cannot close" not in err, "the message is never written (arch §6)"
+    assert err.count("\n") == 1, "one line, as SPEC-019's own stderr tests assert"
 
 
 def test_shutdown_drains_and_emits_before_attempting_the_close() -> None:
-    """The close is after the join, so what a failure loses is cleanup, not events."""
-    sink = _CloseFailsSink()
+    """The close runs after the join, so a failure there loses cleanup, not events.
+
+    Closing a sink while its drain thread is still running would mean `emit()` on a closed sink,
+    so this asserts what had been emitted *at close time*, not after `shutdown()` returned.
+    """
+    sink = _CloseFailsSink(emit_delay=0.05)
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     worker.submit(_span("a"))
     worker.submit(_span("b"))
@@ -1258,6 +1275,7 @@ def test_shutdown_drains_and_emits_before_attempting_the_close() -> None:
     worker.shutdown()
 
     assert [e["message"] for batch in sink.batches for e in batch] == ["a", "b"]
+    assert sink.emitted_at_close == 2, "the drain had completed before the close was attempted"
     assert sink.close_calls == 1
 
 
@@ -1288,13 +1306,48 @@ def test_health_stays_readable_after_a_failed_close() -> None:
 
 
 def test_a_keyboardinterrupt_from_close_still_propagates() -> None:
-    """FR-004 draws the same line as FR-001 and FR-003: Exception, never BaseException."""
+    """FR-004 draws the same line as FR-001 and FR-003: Exception, never BaseException.
+
+    The second call also pins where the once-only flag sits. It is set *before* the close, so
+    even an escape leaves `shutdown()` spent: moved after the close, this path would retry and
+    call `close()` twice on a sink that may already have released some of its resources.
+    """
     sink = _CloseFailsSink(KeyboardInterrupt())
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     worker.submit(_span("a"))
 
     with pytest.raises(KeyboardInterrupt):
         worker.shutdown()
+
+    try:
+        worker.shutdown()  # spent, not retryable — and still silent
+    except KeyboardInterrupt:
+        # Caught rather than allowed to propagate: an escaping KeyboardInterrupt aborts the
+        # whole pytest session instead of failing this test, which reads in CI as an
+        # interrupted run rather than a regression.
+        pytest.fail("shutdown() retried a close that had already failed")
+    assert sink.close_calls == 1
+
+
+def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
+    """FR-004's criterion names `log_foundry.shutdown()`, whose delegate is deliberately
+    unguarded — it relies entirely on `Worker.shutdown()` being total."""
+    log_foundry = pytest.importorskip("log_foundry")
+    decorator = pytest.importorskip("log_foundry.decorator")
+    sink = _CloseFailsSink()
+    log_foundry.configure(service="t", sink=sink)
+
+    @log_foundry.trace(name="work")
+    def work() -> int:
+        return 42
+
+    work()
+    log_foundry.shutdown()  # must not raise
+    log_foundry.shutdown()  # idempotent, still silent
+
+    assert sink.close_calls == 1
+    assert [e["message"] for batch in sink.batches for e in batch] == ["span.start", "span.end"]
+    monkeypatch.setattr(decorator, "_worker", None)
 
 
 _ATEXIT_PROGRAM = """
@@ -1316,16 +1369,20 @@ sys.exit({code})
 
 
 @pytest.mark.parametrize("code", [0, 3])
-def test_an_atexit_shutdown_does_not_disturb_the_process_exit_status(code, tmp_path) -> None:
+def test_an_atexit_shutdown_prints_no_traceback_at_interpreter_shutdown(code, tmp_path) -> None:
     """FR-004: the failure must not surface as "Exception ignored in atexit callback".
 
     A real subprocess, because that is the only way to reach the interpreter-shutdown path —
     ``atexit`` handlers do not run inside pytest, and CPython's handling of an exception escaping
     one is exactly what this criterion is about.
-    """
-    import subprocess
-    import sys as _sys
 
+    The exit-status half of the criterion was **already true** before the guard: CPython absorbs
+    a non-``SystemExit`` exception from an ``atexit`` callback and carries on, so the status was
+    never at risk (measured against the unguarded code at exit 0, exit 3 and an uncaught
+    exception). It is asserted anyway to keep that fact pinned. What the guard actually changes
+    is the block below it — the traceback, and with it the exception's *message*, which can carry
+    a value from the event that provoked the failure (arch §6).
+    """
     src = pathlib.Path(log_foundry_mod.__file__).resolve().parent.parent
     script = tmp_path / "prog.py"
     script.write_text(_ATEXIT_PROGRAM.format(code=code))
@@ -1334,7 +1391,7 @@ def test_an_atexit_shutdown_does_not_disturb_the_process_exit_status(code, tmp_p
     # plus a script this test just wrote into pytest's own tmp_path. No shell, no caller-supplied
     # input — the same reasoning `scripts/make-sbom.py` carries in pyproject.
     result = subprocess.run(  # noqa: S603
-        [_sys.executable, str(script)],
+        [sys.executable, str(script)],
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": str(src)},
