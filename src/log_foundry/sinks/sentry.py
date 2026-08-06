@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlparse
 
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["SentrySink"]
@@ -60,16 +61,35 @@ class SentrySink:
             self._http = HTTPSink(ingest_url, opener=opener, max_retries=max_retries)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Capture each qualifying event via the SDK or the HTTP fallback (FR-011)."""
+        """Capture each qualifying event via the SDK or the HTTP fallback (FR-011).
+
+        One envelope per event, so an abandoned request is a *per-event* outcome: it is caught,
+        counted, and only re-raised when the whole batch got through to nothing (SPEC-026
+        FR-001). Letting the first failure propagate would hand the worker a batch whose earlier
+        events Sentry had already accepted, and the retry would duplicate them.
+
+        An event below ``min_level`` is skipped, not lost, so a batch of nothing but skipped
+        events is a successful emit — there was never anything to deliver.
+        """
+        attempted = delivered = 0
         for event in batch:
             if not self._qualifies(event):
                 self.skipped += 1
                 continue
+            attempted += 1
             if self._sdk is not None:
                 self._sdk.capture_event(self._sentry_event(event))
             else:
-                self._post_envelope(event)
+                try:
+                    self._post_envelope(event)
+                except SinkDeliveryError:
+                    continue  # already counted and logged by HTTPSink._abandon
             self.sent += 1
+            delivered += 1
+        if attempted and not delivered:
+            raise SinkDeliveryError(
+                f"SentrySink delivered none of {attempted} qualifying event(s)"
+            )
 
     def close(self) -> None:
         """Release the HTTP fallback resource, if any; idempotent (FR-012)."""
@@ -80,6 +100,16 @@ class SentrySink:
     def failed(self) -> int:
         """Requests abandoned past the retry bound (HTTP fallback only)."""
         return self._http.failed if self._http is not None else 0
+
+    def losses(self) -> SinkLosses:
+        """Envelopes abandoned past the retry bound (SPEC-026 FR-002). Never raises.
+
+        ``skipped`` is deliberately **not** ``dropped``: an event below ``min_level`` was never
+        meant for Sentry, and reporting a configured filter as loss would make the alert idiom
+        fire on every INFO log. The SDK path reports nothing — ``capture_event`` is fire-and-
+        forget and the SDK owns its own delivery.
+        """
+        return SinkLosses(dropped=0, failed=self.failed)
 
     # -- internals ----------------------------------------------------------------------
 

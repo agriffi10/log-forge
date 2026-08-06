@@ -11,8 +11,12 @@ from __future__ import annotations
 import json
 import os
 import socket
+from typing import TYPE_CHECKING
 
 from log_foundry.sinks._socket import SocketTransport
+
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["SyslogSink"]
 
@@ -68,6 +72,15 @@ class SyslogSink:
     def failed(self) -> int:
         """Messages abandoned past the retry bound."""
         return self._socket.failed
+
+    def losses(self) -> SinkLosses:
+        """Delegate to the socket transport (SPEC-026 FR-002). Never raises.
+
+        The transport raises on total failure, and ``emit`` hands it the whole batch in one
+        call, so a dead syslog destination now reaches ``health().failed_batches`` — the reading
+        SPEC-026 was written from, where ``flush()`` returned ``True`` and every frame was lost.
+        """
+        return self._socket.losses()
 
     # -- internals ----------------------------------------------------------------------
 

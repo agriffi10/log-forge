@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
@@ -42,9 +43,18 @@ class ElasticsearchSink(HTTPSink):
             lines.append(json.dumps({"index": {"_index": self._index}}))
             lines.append(json.dumps(event))
         body = ("\n".join(lines) + "\n").encode("utf-8")  # bulk must be newline-terminated
-        payload = self._send(body, content_type="application/x-ndjson")
-        if payload is not None:
-            self._parse_bulk_response(payload)
+        # An abandoned request raises out of ``_send`` now (SPEC-026 FR-001) — nothing was
+        # indexed, so there is no response to parse and nothing downstream to duplicate.
+        self._parse_bulk_response(self._send(body, content_type="application/x-ndjson"))
+
+    def losses(self) -> SinkLosses:
+        """Abandoned requests plus server-rejected bulk items (SPEC-026 FR-002). Never raises.
+
+        The two are summed into ``failed`` because both are events the server did not confirm;
+        they are kept apart on the instance (``failed`` / ``item_errors``) for anyone who needs
+        to tell "the request never landed" from "the request landed and these items bounced".
+        """
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed + self.item_errors)
 
     def _parse_bulk_response(self, payload: bytes) -> None:
         """Count items the bulk response flagged as errors; a partial failure keeps the rest."""

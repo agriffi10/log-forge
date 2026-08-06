@@ -15,6 +15,7 @@ import socket
 import time
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
 
@@ -58,9 +59,28 @@ class SocketTransport:
         self.failed = 0
 
     def send_all(self, messages: list[bytes]) -> None:
-        """Send each pre-framed message, reconnecting on error (FR-005, FR-006)."""
+        """Send each pre-framed message, reconnecting on error (FR-005, FR-006).
+
+        Raises :class:`~log_foundry.sinks.base.SinkDeliveryError` when **none** of the messages
+        reached the socket, so the sinks built on this transport propagate a dead destination to
+        the worker instead of reporting success (SPEC-026 FR-001). A partial send does not raise:
+        the worker's retry would re-send the messages that already landed.
+
+        An empty call is a no-op, not a total failure — ``delivered == 0`` there means there was
+        nothing to deliver.
+        """
+        delivered = 0
         for message in messages:
-            self._send_one(message)
+            if self._send_one(message):
+                delivered += 1
+        if messages and delivered == 0:
+            raise SinkDeliveryError(
+                f"SocketTransport delivered none of {len(messages)} message(s)"
+            )
+
+    def losses(self) -> SinkLosses:
+        """Messages abandoned past the reconnect-retry bound (SPEC-026 FR-002). Never raises."""
+        return SinkLosses(dropped=0, failed=self.failed)
 
     def close(self) -> None:
         """Close the held socket, if any; idempotent (FR-005, FR-012)."""
@@ -68,14 +88,15 @@ class SocketTransport:
 
     # -- internals ----------------------------------------------------------------------
 
-    def _send_one(self, message: bytes) -> None:
+    def _send_one(self, message: bytes) -> bool:
+        """Send one message within the retry bound; ``False`` once it is abandoned."""
         for attempt in range(self._max_retries + 1):
             try:
                 if self._transport == "udp":
                     self._socket().sendto(message, (self._host, self._port))
                 else:
                     self._socket().sendall(message)
-                return
+                return True
             except OSError as err:
                 self._reset()  # force a fresh connection on the next attempt
                 if attempt < self._max_retries:
@@ -92,7 +113,8 @@ class SocketTransport:
                     f"SocketTransport, {self._max_retries + 1} attempt(s), "
                     f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                 )
-                return
+                return False
+        return False  # unreachable: the loop returns on every path (mypy needs the exit)
 
     def _socket(self) -> socket.socket:
         if self._sock is None:

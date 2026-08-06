@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 from log_foundry.sinks._socket import SocketTransport
+from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["LogstashSink"]
@@ -73,3 +74,15 @@ class LogstashSink:
         return self._http.failed if self._http is not None else (
             self._socket.failed if self._socket is not None else 0
         )
+
+    def losses(self) -> SinkLosses:
+        """Delegate to whichever backend is held (SPEC-026 FR-002). Never raises.
+
+        Both backends raise on total failure of their own accord, so ``emit`` needs no rule of
+        its own — it forwards the whole batch to exactly one of them.
+        """
+        if self._http is not None:
+            return self._http.losses()
+        if self._socket is not None:
+            return self._socket.losses()
+        return SinkLosses(dropped=0, failed=0)  # unreachable: __init__ sets exactly one

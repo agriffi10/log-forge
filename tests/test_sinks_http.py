@@ -12,7 +12,7 @@ import urllib.error
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.http import HTTPSink
 
 
@@ -147,7 +147,8 @@ def test_retries_on_429_then_succeeds() -> None:
 def test_persistent_5xx_is_abandoned_and_counted(capsys) -> None:
     opener = FakeOpener([FakeResponse(500, b"err")])
     sink = HTTPSink("http://x", max_retries=2, opener=opener)
-    sink.emit([{"a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])  # nothing landed, so the worker must see it (SPEC-026 FR-001)
     assert len(opener.calls) == 3  # initial + 2 retries
     assert sink.failed == 1
     err = capsys.readouterr().err
@@ -158,7 +159,8 @@ def test_persistent_5xx_is_abandoned_and_counted(capsys) -> None:
 def test_connection_error_is_retried_then_abandoned(capsys) -> None:
     opener = FakeOpener([urllib.error.URLError("boom")])
     sink = HTTPSink("http://x", max_retries=1, opener=opener)
-    sink.emit([{"a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
     assert len(opener.calls) == 2  # initial + 1 retry
     assert sink.failed == 1
     err = capsys.readouterr().err

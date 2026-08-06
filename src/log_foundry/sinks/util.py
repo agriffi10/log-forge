@@ -32,6 +32,10 @@ class NullSink:
 
     Useful to disable output without unwiring the pipeline, or to benchmark everything up to the
     sink. ``dropped`` counts how many events were discarded, so a benchmark can assert throughput.
+
+    Deliberately exposes no ``losses()`` (SPEC-026 FR-002): discarding is what this sink is *for*,
+    and reporting it as loss would make ``health()``'s alert idiom fire on every batch for anyone
+    who chose this sink to turn logging off. The counter stays readable on the instance.
     """
 
     def __init__(self) -> None:

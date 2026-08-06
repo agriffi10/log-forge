@@ -856,7 +856,11 @@ def test_existing_health_fields_keep_their_positions() -> None:
     w.shutdown()
     h = w.health()
     assert (h[0], h[1], h[2]) == (h.queued, h.dropped, h.failed_batches)
-    assert len(h) == 4
+    assert h[3] is h.stopped_reason
+    # SPEC-026 appended ``sink`` exactly as SPEC-019 appended ``stopped_reason``: every field
+    # that came before keeps its index, so positional reads written against either shape hold.
+    assert len(h) == 5
+    assert h[4] is h.sink
 
 
 def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:

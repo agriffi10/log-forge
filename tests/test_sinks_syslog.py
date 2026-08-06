@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.syslog import SyslogSink
 from test_sinks_logstash import FakeSocket
 
@@ -94,7 +94,8 @@ def test_an_abandoned_message_reports_the_errno_not_the_message(monkeypatch, cap
     """An ``OSError`` type name alone cannot tell "refused" from "host unknown"; the code can."""
     sink = _refusing_sink(monkeypatch)
 
-    sink.emit([{"level": "INFO", "message": "x"}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"level": "INFO", "message": "x"}])  # nothing landed (SPEC-026 FR-001)
 
     err = capsys.readouterr().err
     assert "Connection refused" not in err, "the exception's message is never written (arch §6)"
@@ -117,7 +118,10 @@ def test_a_broken_stderr_does_not_reach_the_caller(monkeypatch) -> None:
     stream = RaisingStderr()
     monkeypatch.setattr(sys, "stderr", stream)
 
-    sink.emit([{"level": "INFO", "message": "x"}])  # must not raise
+    # The *delivery* failure propagates (SPEC-026 FR-001); the stderr fault must not — a
+    # ``RuntimeError`` here would mean the diagnostic became the failure.
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"level": "INFO", "message": "x"}])
 
     assert stream.calls == 1, "it tried, and the guard absorbed the fault"
     assert sink._socket.failed == 1, "the counter moved before the announcement"

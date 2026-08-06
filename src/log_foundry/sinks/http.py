@@ -19,9 +19,10 @@ import time
 import urllib.error
 import urllib.request
 from base64 import b64encode
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -89,6 +90,15 @@ class HTTPSink:
         body, content_type = self._encode(batch)
         self._send(body, content_type=content_type)
 
+    def losses(self) -> SinkLosses:
+        """Oversized drops and abandoned requests (SPEC-026 FR-002). Never raises.
+
+        ``failed`` counts abandoned *requests*, not events — this class has no per-event outcome
+        to report, and an abandoned request took its whole body with it. Subclasses that do learn
+        per-record outcomes (``ElasticsearchSink``) add them.
+        """
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
     def close(self) -> None:
         """No-op — ``urllib`` opens a fresh connection per request; idempotent (FR-012)."""
 
@@ -109,11 +119,20 @@ class HTTPSink:
         *,
         content_type: str,
         extra_headers: dict[str, str] | None = None,
-    ) -> bytes | None:
-        """POST ``body`` with bounded retry; return the response bytes, or ``None`` if abandoned.
+    ) -> bytes:
+        """POST ``body`` with bounded retry; return the response bytes.
 
         Subclasses that must inspect the response (e.g. Elasticsearch ``_bulk`` ``items``) use the
-        returned bytes; a ``None`` return means the request was retried to exhaustion and counted.
+        returned bytes. A request retried to exhaustion is counted and then **raises**
+        :class:`~log_foundry.sinks.base.SinkDeliveryError` (SPEC-026 FR-001) — it used to return
+        ``None``, which every caller here spelled as "nothing to parse" and the worker read as a
+        successful emit. One request carries the whole batch, so an abandoned one delivered
+        nothing and is exactly the total failure the worker's retry exists for.
+
+        Raising from here rather than from each ``emit`` is deliberate: every platform subclass
+        (Datadog, Splunk, New Relic, Honeycomb, Loki, Logstash-HTTP) builds its own body and calls
+        this, so the rule reaches them without a line of their own. The one caller that must not
+        propagate is ``SentrySink``, which sends one envelope *per event* and therefore catches it.
         """
         headers, data = self._prepare(body, content_type, extra_headers)
         for attempt in range(self.max_retries + 1):
@@ -134,15 +153,14 @@ class HTTPSink:
                 self._abandon(
                     f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
                 )
-                return None
             if 200 <= status < 300:
                 return payload
             if (status == 429 or 500 <= status < 600) and attempt < self.max_retries:
                 self._sleep_backoff(attempt, retry_after)
                 continue
             self._abandon(f"HTTP {status}")
-            return None
-        return None
+        # Unreachable: every path through the loop returns or raises. mypy needs the exit.
+        raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
 
     def _prepare(
         self,
@@ -202,16 +220,22 @@ class HTTPSink:
         delay = retry_after if retry_after is not None else _BACKOFF_BASE * (2**attempt)
         time.sleep(delay)
 
-    def _abandon(self, reason: str) -> None:
-        """Count and log a request abandoned past the retry bound (FR-012).
+    def _abandon(self, reason: str) -> NoReturn:
+        """Count, log, then raise for a request abandoned past the retry bound (FR-012).
 
         ``reason`` carries only library-controlled values — an HTTP status, an exception type, an
-        ``errno`` — never a server-supplied body or an exception's text (SPEC-029 FR-002).
+        ``errno`` — never a server-supplied body or an exception's text (SPEC-029 FR-002). It is
+        also the message of the raised error, for the same reason.
+
+        The counter moves *before* the raise: ``failed`` is this sink's own record of what it
+        could not put on the wire, and it must not depend on who catches what. It therefore
+        counts every worker retry attempt too, so it is an upper bound on loss rather than a
+        count of it — see :class:`~log_foundry.sinks.base.SinkLosses`.
         """
         self.failed += 1
-        _diag.lost(
-            "request", 1, f"{type(self).__name__}, {self.max_retries + 1} attempt(s), {reason}"
-        )
+        detail = f"{type(self).__name__}, {self.max_retries + 1} attempt(s), {reason}"
+        _diag.lost("request", 1, detail)
+        raise SinkDeliveryError(detail)
 
 
 def _parse_retry_after(headers: Any) -> float | None:
