@@ -1,8 +1,8 @@
 # Spec: Diagnostic Output Safety
 
 **ID:** SPEC-029  
-**Status:** Draft  
-**Last Updated:** 2026-08-05  
+**Status:** In Progress  
+**Last Updated:** 2026-08-06  
 **Depends On:** SPEC-017, SPEC-019
 
 ## Overview

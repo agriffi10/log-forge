@@ -33,7 +33,7 @@ to status only — no prose.
 | [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
 | [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
-| [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Draft | SPEC-017, SPEC-019 |
+| [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | In Progress | SPEC-017, SPEC-019 |
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Draft | SPEC-013, SPEC-019 |
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-008, SPEC-009, SPEC-020 |
 
