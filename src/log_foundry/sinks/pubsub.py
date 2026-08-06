@@ -1,10 +1,4 @@
-"""GooglePubSubSink — publish events to a Google Cloud Pub/Sub topic (arch §8, §9.1, SPEC-010).
-
-A durable-buffer sink on ``google-cloud-pubsub`` (the optional ``gcp-pubsub`` extra, imported
-lazily). ``publish()`` returns a future that resolves asynchronously; the sink accumulates the
-batch's futures and resolves them on ``close()`` so buffered messages are flushed and publish errors
-are counted and logged.
-"""
+"""GooglePubSubSink — publish events to a Google Cloud Pub/Sub topic (arch §8, SPEC-010)."""
 
 from __future__ import annotations
 
@@ -18,11 +12,28 @@ __all__ = ["GooglePubSubSink"]
 
 
 class GooglePubSubSink:
-    """A :class:`~log_foundry.sinks.base.Sink` that publishes events to a Pub/Sub topic."""
+    """A :class:`~log_foundry.sinks.base.Sink` that publishes events to a Pub/Sub topic.
+
+    This is a durable-buffer sink on ``google-cloud-pubsub``, the optional ``gcp-pubsub`` extra,
+    imported lazily. ``publish()`` returns a future that resolves asynchronously, so the sink
+    accumulates the batch's futures and resolves them on :meth:`close`.
+    """
 
     def __init__(self, topic: str, *, client: Any = None) -> None:
+        """Binds the sink to a topic.
+
+        Args:
+          topic: The topic to publish to.
+          client: A publisher client to borrow, or ``None`` to build one.
+
+        Returns:
+          None.
+
+        Raises:
+          ImportError: If the ``gcp-pubsub`` extra is not installed.
+        """
         if client is None:
-            from google.cloud import pubsub_v1  # type: ignore[import-not-found]  # 'gcp-pubsub'
+            from google.cloud import pubsub_v1  # type: ignore[import-not-found]
 
             client = pubsub_v1.PublisherClient()
         self.topic = topic
@@ -32,31 +43,45 @@ class GooglePubSubSink:
         self._futures: list[Any] = []
 
     def losses(self) -> SinkLosses:
-        """Refused publishes and futures that resolved to an error (SPEC-026 FR-002).
+        """Reports refused publishes and futures that resolved to an error (FR-002).
 
-        ``failed`` only moves when the futures are resolved, which happens in :meth:`close` —
-        so a long-lived process reads zero here until it shuts down. That is a property of the
-        client's asynchronous publish, not of this accessor. Never raises.
+        Args:
+          None.
+
+        Returns:
+          The counters. ``failed`` only moves when the futures are resolved, which happens in
+          :meth:`close`, so a long-lived process reads zero there until it shuts down — a
+          property of the client's asynchronous publish, not of this accessor.
+
+        Raises:
+          None.
         """
         return SinkLosses(dropped=self.rejected, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publish one message per event, retaining each future for flush on close (FR-008).
+        """Publishes one message per event, retaining each future for flush on close (FR-008).
 
-        ``publish()`` is a local hand-off returning a future, so a refusal here is the only
-        failure this call can observe; it is isolated per event and raises only when *every*
-        event was refused (SPEC-026 FR-001). Letting the first refusal propagate would hand the
-        worker a batch whose earlier events are already in flight, and the retry would duplicate
-        them.
+        ``publish()`` is a local hand-off returning a future, so a refusal is the only failure
+        this call can observe. It is isolated per event, because letting the first refusal
+        propagate would hand the worker a batch whose earlier events are already in flight, and
+        the retry would duplicate them. The stderr line names which counter moved, since
+        "refused" and "unconfirmed" mean different things.
+
+        Args:
+          batch: The events to publish.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When every event was refused (SPEC-026 FR-001).
         """
         published = 0
         for event in batch:
             try:
                 future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
-            except Exception as err:  # isolation boundary: one event must not fail the batch
+            except Exception as err:
                 self.rejected += 1
-                # "refused" vs "unconfirmed" below: the two counters mean different things and
-                # the line is the only place an operator sees which one moved.
                 _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
                 continue
             self._futures.append(future)
@@ -67,11 +92,24 @@ class GooglePubSubSink:
             )
 
     def close(self) -> None:
-        """Resolve all pending publish futures, counting/logging errors; idempotent (FR-008)."""
+        """Resolves all pending publish futures, counting and logging errors (FR-008).
+
+        Idempotent.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. This is an isolation boundary: an unresolved future must never crash the worker
+            (FR-011).
+        """
         for future in self._futures:
             try:
                 future.result()
-            except Exception as err:  # isolation boundary: never crash the worker (FR-011)
+            except Exception as err:
                 self.failed += 1
                 _diag.lost(
                     "event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}"

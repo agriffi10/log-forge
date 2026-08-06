@@ -1,11 +1,4 @@
-"""KafkaSink — produce events to a Kafka topic (arch §8, §9.1, SPEC-010).
-
-A durable-buffer sink built on ``confluent-kafka`` (the optional ``kafka`` extra, imported lazily).
-``produce()`` enqueues locally into the producer's internal batch and returns without blocking; the
-delivery result arrives asynchronously on a callback serviced by ``poll()``/``flush()``. ``close()``
-flushes so buffered messages are sent before exit. Delivery errors are counted and logged, never
-raised out of ``emit``.
-"""
+"""KafkaSink — produce events to a Kafka topic (arch §8, §9.1, SPEC-010)."""
 
 from __future__ import annotations
 
@@ -21,10 +14,15 @@ __all__ = ["KafkaSink"]
 class KafkaSink:
     """A :class:`~log_foundry.sinks.base.Sink` that produces events to a Kafka topic.
 
+    This is a durable-buffer sink built on ``confluent-kafka``, the optional ``kafka`` extra,
+    imported lazily. ``produce()`` enqueues locally into the producer's internal batch and
+    returns without blocking, while the delivery result arrives asynchronously on a callback
+    serviced by ``poll()`` and ``flush()``.
+
     Attributes:
-        failed: Messages whose delivery callback reported an error.
-        rejected: Messages ``produce()`` itself refused — a full local queue, a serialization
-            fault — which never reached the producer's batch at all.
+      failed: Messages whose delivery callback reported an error.
+      rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
+        — which never reached the producer's batch at all.
     """
 
     def __init__(
@@ -35,12 +33,27 @@ class KafkaSink:
         bootstrap_servers: str | None = None,
         key_field: str = "trace_id",
     ) -> None:
+        """Binds the sink to a topic and a producer.
+
+        Args:
+          topic: The topic to produce to.
+          producer: A ``confluent-kafka``-shaped producer, or ``None`` to build one.
+          bootstrap_servers: The broker list, required when no producer is injected.
+          key_field: The event key used as the message key, or empty for no key.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: If no producer is injected and no broker list was given.
+          ImportError: If the ``kafka`` extra is not installed.
+        """
         if producer is None:
             if bootstrap_servers is None:
                 raise ValueError(
                     "KafkaSink requires bootstrap_servers when no producer is injected"
                 )
-            from confluent_kafka import Producer  # type: ignore[import-not-found]  # 'kafka' extra
+            from confluent_kafka import Producer  # type: ignore[import-not-found]
 
             producer = Producer({"bootstrap.servers": bootstrap_servers})
         self.topic = topic
@@ -50,27 +63,43 @@ class KafkaSink:
         self.rejected = 0
 
     def losses(self) -> SinkLosses:
-        """Refused and undelivered messages (SPEC-026 FR-002). Never raises.
+        """Reports refused and undelivered messages (SPEC-026 FR-002).
 
-        ``rejected`` is ``dropped``: ``produce()`` refused it, so nothing ever left the process.
-        ``failed`` is the delivery callback's verdict on a message the producer *did* accept.
+        A callback failure never makes :meth:`emit` raise, and the reason is ownership rather
+        than timing — ``poll(0)`` runs inside ``emit``, so a callback for a message produced
+        earlier in the same batch can and does fire before it returns. Once the producer has
+        accepted a message it owns delivery, including its own retries, and re-producing it from
+        here would duplicate whatever the producer eventually lands.
 
-        A callback failure never makes ``emit`` raise, and the reason is ownership rather than
-        timing — ``poll(0)`` runs inside ``emit``, so a callback for a message produced earlier
-        in the same batch can and does fire before it returns. Once the producer has accepted a
-        message it owns delivery, including its own retries; re-producing it from here would
-        duplicate whatever the producer eventually lands. So the raise decision reads only what
-        ``produce()`` refused.
+        Args:
+          None.
+
+        Returns:
+          The counters. Refusals are reported as ``dropped``, since nothing ever left the
+          process, while ``failed`` is the delivery callback's verdict on a message the producer
+          did accept.
+
+        Raises:
+          None.
         """
         return SinkLosses(dropped=self.rejected, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Produce one message per event; serve delivery callbacks without blocking (FR-002).
+        """Produces one message per event and serves delivery callbacks without blocking.
 
         ``produce()`` is a local hand-off, so what it refuses is the only failure this call can
-        observe. When it refused *every* message the batch reached nothing, which is the total
-        failure the worker's retry exists for (SPEC-026 FR-001); a partial refusal is counted and
-        left alone, since the messages that were accepted are already on their way.
+        observe (FR-002). A partial refusal is counted and left alone, since the messages that
+        were accepted are already on their way.
+
+        Args:
+          batch: The events to produce.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When every message was refused, so the batch reached nothing —
+            the total failure the worker's retry exists for (SPEC-026 FR-001).
         """
         accepted = 0
         for event in batch:
@@ -78,34 +107,64 @@ class KafkaSink:
             key = self._key(event)
             try:
                 self.producer.produce(self.topic, value=body, key=key, callback=self._on_delivery)
-            except Exception as err:  # BufferError on a full local queue, and anything the
-                self.rejected += 1    # driver raises for an unproducible message
+            except Exception as err:
+                self.rejected += 1
                 _diag.lost("message", 1, f"KafkaSink produce, {type(err).__name__}")
                 continue
             accepted += 1
-            self.producer.poll(0)  # serve queued delivery callbacks, non-blocking
+            self.producer.poll(0)
         if batch and not accepted:
             raise SinkDeliveryError(f"KafkaSink produced none of {len(batch)} message(s)")
 
     def close(self) -> None:
-        """Flush the producer so buffered messages are delivered before exit (FR-002)."""
+        """Flushes the producer so buffered messages are delivered before exit (FR-002).
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the producer raises on flush.
+        """
         self.producer.flush()
 
-    # -- internals ----------------------------------------------------------------------
-
     def _key(self, event: dict[str, object]) -> bytes | None:
+        """Derives one message's partition key from the configured field.
+
+        Args:
+          event: The event being produced.
+
+        Returns:
+          The encoded key, or ``None`` when there is no key field or no value.
+
+        Raises:
+          None.
+        """
         if not self.key_field:
             return None
         value = event.get(self.key_field)
         return str(value).encode("utf-8") if value is not None else None
 
     def _on_delivery(self, err: object, msg: object) -> None:
-        """confluent-kafka delivery callback: count and log failures (FR-002).
+        """Counts and logs a delivery failure, as ``confluent-kafka``'s callback (FR-002).
 
-        ``err`` is a ``KafkaError``, not an exception, so it goes to :func:`~_diag.lost` rather
-        than :func:`~_diag.absorbed`. Its ``str`` is a human message that can quote the record, so
-        only the type and the numeric ``code()`` are written — the code is librdkafka's own
-        enumeration and is what makes a delivery failure diagnosable (SPEC-029 FR-002).
+        The error is a ``KafkaError`` rather than an exception, so it goes to
+        :func:`~log_foundry._diag.lost` rather than ``absorbed``. Its ``str`` is a human message
+        that can quote the record, so only the type and the numeric code are written — the code
+        is librdkafka's own enumeration and is what makes a delivery failure diagnosable
+        (SPEC-029 FR-002).
+
+        Args:
+          err: The delivery error, or ``None`` on success.
+          msg: The message the callback describes, unused.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
         """
         if err is not None:
             self.failed += 1
@@ -113,17 +172,23 @@ class KafkaSink:
 
 
 def _code(err: object) -> str:
-    """Render a ``KafkaError``'s numeric code as ``" code=N"``, or ``""`` if it has none.
+    """Renders a ``KafkaError``'s numeric code for a diagnostic.
 
-    ``code()`` is a method on confluent-kafka's ``KafkaError``, returns one of librdkafka's
-    integer constants, and carries no caller data. Deliberately narrow: only an ``int`` is written,
-    so a stub or a future version returning something else contributes nothing rather than
-    smuggling text past the type-name rule.
+    ``code()`` returns one of librdkafka's integer constants and carries no caller data. This is
+    deliberately narrow: only an ``int`` is written, so a stub or a future version returning
+    something else contributes nothing rather than smuggling text past the type-name rule. The
+    ``int()`` sits inside the guard for the reason ``_diag.errno_of`` puts it there —
+    ``isinstance(code, int)`` admits a subclass whose ``__int__`` is Python that can raise.
 
-    Total, and the ``int()`` is inside the guard for the same reason ``_diag.errno_of`` puts it
-    there: ``isinstance(code, int)`` admits a *subclass*, whose ``__int__`` is Python that can
-    raise — and this runs in a delivery callback, so an escaping exception would surface from
-    ``emit`` and cost the whole batch. A diagnostic can never be the failure (SPEC-029 FR-003).
+    Args:
+      err: The delivery error.
+
+    Returns:
+      The rendered code, or an empty string when there is none.
+
+    Raises:
+      None. This runs in a delivery callback, so an escaping exception would surface from
+        ``emit`` and cost the whole batch; a diagnostic can never be the failure (FR-003).
     """
     try:
         code = getattr(err, "code", None)
