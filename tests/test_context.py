@@ -203,16 +203,35 @@ def test_reset_context_inside_a_span_clears_for_the_remainder_then_the_scope_res
     contextvars.copy_context().run(body)
 
 
-def test_reset_context_never_mutates_the_shared_contextvar_default() -> None:
-    """The module's never-mutate rule: `reset_context` must `.set()` a new dict, not clear one."""
+def test_reset_context_replaces_the_baggage_dict_rather_than_emptying_it() -> None:
+    """The module's never-mutate rule, pinned where it actually bites.
+
+    A `reset_context` written as ``_baggage.get().clear()`` looks equivalent and passes every
+    other test here. It is not: the dict a child context reads is the *same object* its parent
+    holds, so emptying it in place reaches back and wipes the parent's baggage. Only `.set()` of
+    a new dict is confined to the context that calls it.
+    """
     context = pytest.importorskip("log_foundry.context")
 
     def body() -> None:
-        context.reset_context()
-        context.set_baggage(leaked="x")
+        context.set_baggage(tenant="acme")
+        contextvars.copy_context().run(context.reset_context)  # a child resets
+        assert context.get_baggage() == {"tenant": "acme"}, "the parent keeps its own baggage"
 
     contextvars.copy_context().run(body)
-    assert contextvars.copy_context().run(context.get_baggage) == {}
+
+
+def test_reset_context_does_not_hand_back_the_shared_contextvar_default() -> None:
+    """The other half: with nothing ever set, `.clear()` would be a no-op on the shared default."""
+    context = pytest.importorskip("log_foundry.context")
+    shared_default = contextvars.Context().run(context.get_baggage)
+
+    def body() -> None:
+        context.reset_context()
+        assert context.get_baggage() is not shared_default
+
+    contextvars.copy_context().run(body)
+    assert shared_default == {}, "the shared default must never have been mutated"
 
 
 def test_reset_context_is_exported_from_the_package() -> None:

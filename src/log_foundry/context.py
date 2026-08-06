@@ -151,12 +151,19 @@ def reset_context() -> None:
 
     Unlike the scope release this **clears** rather than restores — a process-level baggage
     default set before any span is erased too, which is the point of an explicit reset. Safe
-    with nothing ever set, with no span open, and inside an open span (where it clears for the
-    remainder and that span's exit then restores the baggage from before the span). Never
-    raises, like every other entry point on this path (arch §4).
+    with nothing ever set, with no span open, and inside an open span. Never raises, like every
+    other entry point on this path (arch §4).
+
+    Prefer calling it **outside** a span. Inside one it does the obvious thing to the events
+    that follow, but SPEC-015 backfills ``span.start`` and ``span.end`` from the baggage live at
+    *close*, so a mid-span reset also empties the two boundary events — which describe the whole
+    span and carry ``duration_ms``/``status`` — of baggage that was live for most of it. That
+    span's exit then restores the baggage from before the span, as it always does.
     """
-    _baggage.set({})
+    # Cleared in the same order as `pop_baggage_scope`, for the reason given there: a stale
+    # trace id is wrong data, a stale baggage field is only stale.
     _adopted.set(None)
+    _baggage.set({})
 
 
 # -- adopted inbound context (SPEC-014) --------------------------------------------------

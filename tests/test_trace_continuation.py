@@ -343,7 +343,9 @@ def test_baggage_round_trips_through_the_header(lf) -> None:
         return lf.current_baggage_header()
 
     header = producer()
-    context_mod._baggage.set({})  # a fresh process, conceptually
+    # No hand reset for "a fresh process" any more: `producer` was a root span, so SPEC-024
+    # already restored the baggage it set on the way out.
+    assert context_mod.get_baggage() == {}
 
     @lf.trace
     def consumer() -> dict:
