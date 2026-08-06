@@ -635,7 +635,7 @@ def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
     assert transport.losses() == SinkLosses(dropped=0, failed=1), "abandoned without a counter"
 
 
-def _es(payload: bytes):
+def _es(payload: bytes) -> object:
     from log_foundry.sinks.elasticsearch import ElasticsearchSink
     from test_sinks_http import FakeOpener, FakeResponse
 
@@ -655,6 +655,12 @@ def test_a_bulk_body_whose_items_cannot_be_read_is_not_read_as_success() -> None
         ),
         _json.dumps({"errors": True, "items": []}).encode("utf-8"),
         _json.dumps({"errors": True}).encode("utf-8"),
+        # Heterogeneous: one readable rejection beside one unreadable entry. Without the shape
+        # check this reads as a *partial* failure (item_errors=1, no raise) — the whole point of
+        # routing it through ``usable_results`` rather than a bare ``isinstance(list)``.
+        _json.dumps({"errors": True, "items": [{"index": {"error": "x"}}, "junk"]}).encode(
+            "utf-8"
+        ),
     ]
     for payload in unreadable:
         sink = _es(payload)

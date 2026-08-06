@@ -120,6 +120,8 @@ class ElasticsearchSink(HTTPSink):
                 f"not retried",
             )
             return False
+        # Unconditional only because the gate above already returned on ``not errors``; a
+        # loosened gate would start writing "lost 0 bulk item(s)" here.
         self.item_errors += errors
         _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
         return errors == sent
