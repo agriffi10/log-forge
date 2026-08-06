@@ -30,7 +30,7 @@ to status only — no prose.
 | [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Completed | SPEC-012, SPEC-022 |
 | [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Completed | SPEC-014, SPEC-015 |
 | [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Completed | SPEC-004, SPEC-017 |
-| [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
+| [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Completed | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
 | [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
 | [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Completed | SPEC-017, SPEC-019 |
@@ -110,10 +110,10 @@ Group related specs and record the order to build them in. Delete this section i
   `_terminal_failure` cites for not doing it, and two unguarded stderr writes (`_emit` and
   `SocketTransport`) killed the drain thread on a broken stream. All 28 sites are converted and a
   test forbids any other module writing to stderr.
-  **SPEC-026** then — the largest. Every remote transport absorbs its own failures and returns
-  normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract are all inert
-  against a down destination, while the counters that *do* record the loss have no accessor. It is
-  SPEC-017 FR-004's rule generalized to the whole sink family.
+  **SPEC-026** after SPEC-029 (**shipped**) — the largest. Every remote transport absorbed its own failures and
+  returned normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract were
+  all inert against a down destination, while the counters that *did* record the loss had no
+  accessor. SPEC-017 FR-004's rule, generalized to the whole sink family.
   **SPEC-027** and **SPEC-028** may go in either order after 026, and both touch every sink: 027
   bounds a server-supplied `Retry-After` (a measured 22 s `shutdown()` hang, and 24 h is reachable)
   and makes every sink wait interruptible; 028 states the concurrency contract the orphan path has

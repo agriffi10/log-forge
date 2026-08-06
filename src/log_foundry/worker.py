@@ -56,9 +56,9 @@ class Health(NamedTuple):
             the worker is gone and nothing further will be delivered (SPEC-019 FR-003).
         sink: The configured sink's own loss counters, or ``None`` when there is no worker or
             the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the two
-            integers above because they mean different things: ``dropped`` here is backpressure
-            at the queue, ``dropped`` on the sink is an event the destination could never
-            accept, and one number would make the remedies indistinguishable.
+            integers above because they count different things: ``dropped`` here is backpressure
+            at *this* queue, ``dropped`` on the sink is an event that never reached the wire,
+            and one number would make the remedies indistinguishable.
     """
 
     queued: int

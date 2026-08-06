@@ -1098,3 +1098,51 @@ def test_a_duplicate_id_in_the_failed_array_cannot_understate_what_landed() -> N
     sink = SQSSink("https://q/x", client=DuplicateIdClient(), max_retries=0)
     sink.emit([{"log_id": "a"}, {"log_id": "b"}])  # entry '1' landed: must not raise
     assert sink.failed == 1
+
+
+# --- FR-004: the contract is reachable from where a caller reads it -------------------------
+
+
+def test_the_public_facade_exports_what_health_returns() -> None:
+    """``health().sink`` is a ``SinkLosses``; a caller should not have to reach into ``sinks``."""
+    import log_foundry
+
+    assert log_foundry.SinkLosses is SinkLosses
+    assert log_foundry.SinkDeliveryError is SinkDeliveryError
+    assert {"SinkLosses", "SinkDeliveryError"} <= set(log_foundry.__all__)
+
+
+def test_the_sink_protocol_documents_both_rules() -> None:
+    """A third-party sink that absorbs silently reintroduces the whole defect (FR-004)."""
+    doc = Sink.emit.__doc__ or ""
+    assert "delivered nothing" in doc, "the raise-on-total-failure rule"
+    assert "Do not raise on partial failure" in doc
+    assert "no-op and never raises" in doc, "the empty-batch rule"
+
+
+def test_pubsub_names_which_counter_moved(capsys) -> None:
+    """``rejected`` and ``failed`` mean different things; the line is where an operator sees which."""
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+
+    class RefusingClient:
+        def publish(self, topic, data):
+            raise RuntimeError("no credentials")
+
+    class UnconfirmedClient:
+        def publish(self, topic, data):
+            return self
+
+        def result(self):
+            raise TimeoutError("never acked")
+
+    with pytest.raises(SinkDeliveryError):
+        GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}])
+    refused = capsys.readouterr().err
+    assert "refused the publish" in refused
+
+    sink = GooglePubSubSink("t", client=UnconfirmedClient())
+    sink.emit([{"a": 1}])
+    sink.close()
+    unconfirmed = capsys.readouterr().err
+    assert "publish unconfirmed" in unconfirmed
+    assert "refused" not in unconfirmed, "the two paths must not read alike"

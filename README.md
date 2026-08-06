@@ -402,12 +402,16 @@ A few conventions hold across every sink below:
   The tables show the destination-defining arguments only; sinks that retry also take `max_retries`.
 - **Ownership.** A resource the sink opens itself is closed on `shutdown()`; an injected one is left
   open for you to manage.
-- **Never crashes the app.** A failing sink is retried with backoff and then counted (`.failed`,
-  `.dropped_oversized`, `.dropped_unadjudicated`, …) rather than raised — a broken destination
-  degrades logging, nothing more.
-  The one deliberate exception is a `MultiSink` whose children *all* failed: it re-raises so the
-  worker's retry engages, since nothing was delivered and there are no duplicates to risk. That
-  still doesn't reach your code — the worker is what catches it.
+- **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
+  delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
+  `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
+  A sink that delivered **none** of it raises instead, so the worker's bounded retry engages and
+  `health().failed_batches` records the loss — there is nothing downstream to duplicate. Three
+  cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
+  event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
+  landed), and an SQS sender fault (a byte-identical re-send can only fail again). Either way the
+  exception never reaches your code — inside a span the worker catches it, and on the orphan path
+  (`log_foundry.info(...)` outside any span, which emits synchronously) the emitter does.
 
 #### Built-in, zero-dependency
 
@@ -430,7 +434,7 @@ to a plain callable.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `MultiSink` | `log_foundry.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed` |
+| `MultiSink` | `log_foundry.sinks.multi` | `MultiSink(*sinks)` — forward each batch to every child; a failing child is isolated and counted on `.failed`, unless *every* child failed, which re-raises |
 | `FilteringSink` | `log_foundry.sinks.filtering` | `FilteringSink(inner, *, predicate=None, min_level=None)` — forward only events passing `predicate` and/or at/above `min_level` |
 | `TransformSink` | `log_foundry.sinks.transform` | `TransformSink(inner, fn)` — map each event through `fn` before forwarding; return `None` to drop one |
 | `CallbackSink` | `log_foundry.sinks.callback` | `CallbackSink(fn, *, on_close=None)` — hand each batch to any callable |
@@ -623,8 +627,56 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set
 it `True` for an idempotent `CREATE TABLE IF NOT EXISTS` convenience.
 
-Prefer a destination not listed here? Implement the two-method `Sink` protocol yourself, or wrap any
-callable in `CallbackSink`.
+Prefer a destination not listed here? Implement the `Sink` protocol yourself, or wrap any callable
+in `CallbackSink`.
+
+#### Writing your own sink
+
+`Sink` is two required methods, `emit(batch)` and `close()`, plus two rules about *how* `emit`
+fails. They are not stylistic — the library's whole loss-reporting apparatus is built on them:
+
+- **Raise when you delivered none of the batch**, after your own retries are spent. That is the
+  signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
+  a retry cannot duplicate anything: nothing landed downstream. Raise `SinkDeliveryError` (from
+  `log_foundry.sinks.base`) or any exception of your own — the contract is that *something*
+  propagates.
+- **Do not raise when you delivered some of it.** The worker retries whole batches, so raising on a
+  partial success re-delivers the records that already arrived, and duplicates downstream are worse
+  than a counted loss.
+
+A sink that absorbs a total failure and returns normally is a sink the worker believes: the retry
+never engages, `failed_batches` stays at zero, and `flush()` returns `True` while every event is
+lost.
+
+Optionally add `losses()` to report what you absorbed. It must never raise and must be safe to call
+while `emit` is running (`health()` is a poll):
+
+```python
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+class MySink:
+    def __init__(self) -> None:
+        self._dropped = self._failed = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        delivered = 0
+        for chunk in self._chunks(batch):
+            if self._send(chunk):          # your own bounded retry
+                delivered += len(chunk)
+            else:
+                self._failed += len(chunk)
+        if batch and not delivered:
+            raise SinkDeliveryError(f"MySink delivered none of {len(batch)} event(s)")
+
+    def losses(self) -> SinkLosses:
+        return SinkLosses(dropped=self._dropped, failed=self._failed)
+
+    def close(self) -> None: ...
+```
+
+`losses()` is optional and probed by name, so a sink written before it existed keeps working and
+simply contributes nothing to `health().sink`. `emit([])` must be a no-op: an empty batch has not
+failed to deliver.
 
 ### Flushing and shutdown
 
@@ -640,17 +692,33 @@ returns a snapshot of the worker's counters:
 
 ```python
 h = log_foundry.health()
-if h.dropped or h.failed_batches or h.stopped_reason:
+if h.dropped or h.failed_batches or h.stopped_reason or (h.sink and (h.sink.dropped or h.sink.failed)):
     ...  # logs were silently lost — worth an alert
 ```
 
-The three tell you different things, and they want different responses:
+They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
 | `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Tune `batch_size`/`flush_interval`, or scale the sink. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
+| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
+| `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
+
+`h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
+the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
+different things: the worker's is backpressure at *its* queue, the sink's is an event that never
+reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
+itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
+fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused outright, which may
+be backpressure one layer further out than the worker's, or may be a misconfiguration. The stderr
+line carries the exception type that distinguishes them.
+
+`sink.failed` is an **upper bound** on loss, not a count of it. A sink that raises on total failure
+counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a
+transient outage leaves it non-zero with nothing actually lost. `failed_batches` is the record of a
+batch given up on for good.
 
 `stopped_reason` is a type name (e.g. `"SystemExit"`), never the exception's message — a sink's
 error text can carry event data. It reads `None` for a healthy worker, for a process that has never
@@ -658,9 +726,10 @@ logged, and after a clean `shutdown()`, so a plain truthiness check is safe. Wit
 thread showed up only indirectly, as `dropped` climbing once the queue filled — the wrong signal,
 pointing at the wrong fix.
 
-Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and gained a
-fourth field in `v0.7.0`, so unpacking it whole — `queued, dropped, failed = health()` — raises
-`ValueError` from that version on.
+Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
+fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) not yet in a tagged
+release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
+field keeps its position when a new one is appended, so attribute and index access stay stable.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and

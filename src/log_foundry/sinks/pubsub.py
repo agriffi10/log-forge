@@ -55,7 +55,9 @@ class GooglePubSubSink:
                 future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
             except Exception as err:  # isolation boundary: one event must not fail the batch
                 self.rejected += 1
-                _diag.lost("event", 1, f"GooglePubSubSink publish, {type(err).__name__}")
+                # "refused" vs "unconfirmed" below: the two counters mean different things and
+                # the line is the only place an operator sees which one moved.
+                _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
                 continue
             self._futures.append(future)
             published += 1
@@ -71,5 +73,7 @@ class GooglePubSubSink:
                 future.result()
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 self.failed += 1
-                _diag.lost("event", 1, f"GooglePubSubSink publish, {type(err).__name__}")
+                _diag.lost(
+                    "event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}"
+                )
         self._futures.clear()

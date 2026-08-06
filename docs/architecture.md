@@ -276,7 +276,30 @@ A sink is a small interface so the transport is swappable:
 class Sink(Protocol):
     def emit(self, batch: list[dict]) -> None: ...   # ship a batch of events
     def close(self) -> None: ...                      # flush + release resources
+    # optional (SPEC-026):
+    # def losses(self) -> SinkLosses | None: ...      # cumulative loss this sink absorbed
 ```
+
+**A sink carries two reporting obligations** (SPEC-026), because the worker's retry and
+`health()` are built on them:
+
+- **Total failure raises.** A sink that delivered *none* of a batch must let something
+  propagate out of `emit`, after its own retries are spent. That is the only case where the
+  worker's retry cannot create duplicates — nothing landed downstream to duplicate.
+- **Partial failure does not.** A batch where some records landed must be counted, not raised:
+  the worker retries whole batches, so raising would re-deliver what already arrived.
+
+A sink that absorbs a total failure and returns normally is a sink the worker *believes* — the
+retry never engages, `failed_batches` stays at zero and `flush()` returns `True` while every
+event is lost. `losses()` is optional (`Sink` is structural, so a pre-SPEC-026 sink must keep
+satisfying it) and is read through `sinks.base.read_losses`, which treats absent, non-callable,
+raising and wrong-shaped alike as "reports nothing".
+
+Three cases where nothing landed and the sink still must not raise, each settled by an earlier
+spec: an **unadjudicable** batch response (SPEC-018 — the sink cannot prove nothing landed, so a
+retry risks duplicating), an **SQS sender fault** (SPEC-016 FR-006 — provably rejected, and a
+byte-identical re-send can only fail the same way), and an **oversized** event (it can never fit,
+so there is nothing to retry). All three are reported through `losses()` instead.
 
 Planned implementations:
 
@@ -312,8 +335,22 @@ decorated call ends
 - **Graceful shutdown:** an `atexit` (and explicit `log_foundry.shutdown()`) hook drains
   the worker queue and `close()`s the sink so buffered events aren't lost on exit.
 - **Backpressure policy:** if the worker queue is full (sink is down / slow), default to
-  **drop-newest with a counted warning** rather than blocking the app. *(Open item — the
-  drop-vs-block tradeoff should be configurable; see §12.)*
+  **drop-newest with a counted warning** rather than blocking the app. Making drop-vs-block
+  configurable is **not built** and is a constraint rather than a wart — blocking would put sink
+  latency back on the caller's thread, which is the one thing this section exists to prevent
+  (§12, §13).
+- **"Retries with backoff on failure" means: on a failure the sink reports.** The worker can
+  only retry what reaches it as an exception, so the guarantee is conditional on §8's
+  raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no
+  `failed_batches`, and a `flush()` that returns `True` — the library's loss reporting is the
+  sink's contract as much as the worker's code (SPEC-026).
+- **Loss the sink absorbs on purpose is reported, not retried** — a partially-failed batch, an
+  oversized record, an unadjudicable response. `health().sink` carries the configured sink's
+  `losses()` snapshot so the documented alert idiom covers it; it is nested rather than folded
+  into the worker's own counters because `dropped` at the queue and `dropped` at the sink count
+  different things. The sink's is what never reached the wire — usually an event that can never
+  fit, but for the sinks whose client owns a local buffer (`KafkaSink`, `GooglePubSubSink`) also
+  what that buffer refused, which is backpressure one layer further out.
 
 ### 9.1 The sink is a durable buffer, not the final store
 

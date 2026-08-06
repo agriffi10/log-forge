@@ -20,6 +20,7 @@ from log_foundry.context import (
     reset_context,
 )
 from log_foundry.decorator import continue_trace, trace
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.worker import Health
 
 try:
@@ -59,16 +60,28 @@ def flush(timeout: float | None = 5.0) -> bool:
 def health() -> Health:
     """Snapshot the background worker's delivery counters (SPEC-017 FR-005). Never raises.
 
-    Returns ``queued`` / ``dropped`` / ``failed_batches`` / ``stopped_reason``. A non-zero
-    ``dropped`` means the queue filled and submissions were discarded to keep your code
+    Returns ``queued`` / ``dropped`` / ``failed_batches`` / ``stopped_reason`` / ``sink``. A
+    non-zero ``dropped`` means the queue filled and submissions were discarded to keep your code
     non-blocking; a non-zero ``failed_batches`` means a sink stayed broken through the whole
     retry budget. Both are losses the library absorbs on purpose, and this is how you notice
     them. A non-``None`` ``stopped_reason`` is worse than either: the background thread died
     on that exception type, so nothing further will be delivered at all (SPEC-019)::
 
         h = log_foundry.health()
-        if h.dropped or h.failed_batches or h.stopped_reason:
+        if h.dropped or h.failed_batches or h.stopped_reason or (
+            h.sink and (h.sink.dropped or h.sink.failed)
+        ):
             ...  # raise an alert; logs were silently lost
+
+    ``sink`` is the configured sink's own :class:`~log_foundry.sinks.base.SinkLosses` — loss the
+    *sink* absorbed rather than the worker, which the worker's counters cannot see (SPEC-026).
+    It is ``None`` when no worker exists and when the sink reports nothing, since ``losses()`` is
+    optional. Its ``dropped`` is not the worker's: the worker's is backpressure at the queue, the
+    sink's is an event that never reached the wire — usually one too large to ever fit, and for the
+    sinks whose client owns a local buffer (Kafka, Pub/Sub) also what that buffer refused. The
+    stderr line names which. Its ``failed`` is an upper bound on loss, not a count of it: a sink
+    that raises on total failure counts the attempt *and* hands the batch back, and the worker's
+    retry may then deliver it.
 
     A process that has never logged has no worker, and asking after its health does not create
     one — the snapshot is simply zeroed. Valid after :func:`shutdown`, which leaves the final
@@ -96,6 +109,8 @@ def shutdown() -> None:
 
 __all__ = [
     "Health",
+    "SinkDeliveryError",
+    "SinkLosses",
     "__version__",
     "configure",
     "continue_trace",

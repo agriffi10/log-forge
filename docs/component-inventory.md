@@ -16,7 +16,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `reset_context` | `src/log_foundry/context.py` | Public clear of baggage + adopted context, for callers who open no span (the orphan path) or adopt before dispatching into a child context. Never raises. |
 | diagnostic channel | `src/log_foundry/_diag.py` | `absorbed` / `lost` / `rejected` + `errno_of` — **every** stderr line the library writes about itself. Exception **type** only (arch §6), detail escaped then bounded, each write total in itself. A test forbids any other module writing to stderr. Must import nothing from its own package (SPEC-025, SPEC-029). |
 | `_begin` / `_end` | `src/log_foundry/decorator.py` | The `@trace` span lifecycle, guarded end to end — degraded setup rather than a failed call, one close per span, total teardown (SPEC-025). |
-| `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
+| `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement (plus the loss contract below). |
 | `StdoutSink` | `src/log_foundry/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
 | `SQSSink` | `src/log_foundry/sinks/sqs.py` | SQS sink (optional `aws` extra): lazy boto3, count/byte chunking, Failed-list retry, oversized drop. FIFO queues supported — `MessageGroupId` defaults to the event's `trace_id`, configurable; sender faults are not retried. |
 | `CallbackSink` | `src/log_foundry/sinks/callback.py` | Adapt any callable into a `Sink` (+ optional `on_close`); the escape hatch for unsupported destinations. |
@@ -34,6 +34,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | Queue sinks (Kafka/Redis/RabbitMQ/NATS/PubSub/EventHubs) | `src/log_foundry/sinks/{kafka,redis,rabbitmq,nats,pubsub,eventhubs}.py` | Lazy-import queue/stream sinks (one optional extra each); publish + bounded retry + close. |
 | DB sinks (Mongo/Postgres/ClickHouse) | `src/log_foundry/sinks/{mongodb,postgres,clickhouse}.py` | Lazy-import DB sinks (one optional extra each); single-transaction batch insert, ownership-aware close. |
 | chunk + transport helpers | `src/log_foundry/sinks/{_chunk,_time,_socket}.py` | `chunk_items`/`chunk_list`/`valid_identifier`; ISO→epoch time; TCP/UDP socket transport with reconnect retry. |
+| sink loss contract | `src/log_foundry/sinks/base.py` | `SinkLosses` + `SinkDeliveryError` + `read_losses(sink)`: the raise-on-total-failure / never-raise-on-partial rules a sink must honour, plus the total probe for the optional `losses()` accessor (absent, non-callable, raising and wrong-shaped all read as "reports nothing"). |
 | positional batch adjudicator | `src/log_foundry/sinks/_batch.py` | `usable_results` + `adjudicate_positional` — pair an id-less per-record response against the records it should describe, refusing to adjudicate any of them unless it describes all of them. Total (never raises). |
 | `@trace` | `src/log_foundry/decorator.py` | Span decorator (sync + async, dispatched by `iscoroutinefunction`): lifecycle, hierarchy, non-swallowing flush. |
 | level emitters + `set_baggage` | `src/log_foundry/api.py` | `debug/info/warning/error/critical` (append to span, orphan-safe) + `set_baggage` re-export. |
