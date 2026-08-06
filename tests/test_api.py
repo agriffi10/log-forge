@@ -6,6 +6,8 @@ emitted events without a decorated call (orphan path), it asserts on the sink di
 """
 
 import contextvars
+import io
+import sys
 
 import pytest
 
@@ -272,3 +274,201 @@ def test_reset_context_inside_a_real_root_span_also_empties_the_boundary_events(
     boundary = [e for e in fake_sink.events if e["message"].startswith("span.")]
     assert len(boundary) == 2
     assert all("user_id" not in e["fields"] for e in boundary)
+
+
+# -- SPEC-025 FR-003: the orphan path cannot raise into the caller -------------------------
+#
+# The orphan branch is the only place a level call reaches the sink on the caller's own
+# thread, with no worker between them to absorb a failure.
+
+
+class _BrokenSink:
+    """A sink that fails the way a real one does — at emit time, not construction."""
+
+    def __init__(self, exc: BaseException | None = None) -> None:
+        self.exc = exc or ConnectionError("sink is down")
+
+    def emit(self, batch: list[dict]) -> None:
+        raise self.exc
+
+    def close(self) -> None:
+        pass
+
+
+class _BrokenStream:
+    """A stream that is closed, redirected, or gone — the shape `ConsoleWriter` cannot survive."""
+
+    def __init__(self, exc: BaseException | None = None) -> None:
+        self.exc = exc or OSError("stream closed")
+
+    def write(self, s: str) -> int:
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=_BrokenSink())
+
+    def body() -> None:
+        getattr(lf, level)("bare line", code=7)
+
+    contextvars.copy_context().run(body)  # must not raise
+
+    err = capsys.readouterr().err
+    assert "absorbed a failure while emitting an orphan log (ConnectionError)" in err
+    assert "the event was lost" in err
+    assert "sink is down" not in err, "the message is never written (arch §6)"
+
+
+def test_an_in_span_log_is_unaffected_by_a_broken_sink() -> None:
+    """FR-003 requires no behaviour change in-span: it buffers and never touches the sink."""
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=_BrokenSink())
+    context = pytest.importorskip("log_foundry.context")
+    seen: list[int] = []
+
+    def body() -> None:
+        span = api.Span(
+            trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="x", start_ts=0.0
+        )
+        token = context.push_span(span)
+        try:
+            lf.info("in-span line")
+            seen.append(len(span.events))
+        finally:
+            context.pop_span(token)
+
+    contextvars.copy_context().run(body)
+    assert seen == [1], "the event was appended to the span's buffer, not emitted"
+
+
+def _break_console(monkeypatch, exc: BaseException | None = None) -> None:
+    """Replace the console writer wholesale, as `test_console_echo.py` does.
+
+    Never poke `_console._stream` and restore it by hand: under `capsys` the "original" is
+    pytest's per-test `CaptureIO`, which is closed at teardown, so the restore leaves the
+    process-global writer permanently broken — and this spec's own echo guard would then
+    absorb the breakage silently for the rest of the session.
+    """
+    console_mod = pytest.importorskip("log_foundry.console")
+    monkeypatch.setattr(
+        api, "_console", console_mod.ConsoleWriter(stream=_BrokenStream(exc))
+    )
+
+
+def test_echo_survives_a_broken_console_and_the_event_still_reaches_the_sink(
+    fake_sink, monkeypatch, capsys
+) -> None:
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=fake_sink)
+    _break_console(monkeypatch)
+
+    def body() -> None:
+        lf.info("echoed", echo=True)
+
+    contextvars.copy_context().run(body)
+
+    assert [e["message"] for e in fake_sink.events] == ["echoed"]
+    assert "absorbed a failure while echoing to the console (OSError)" in capsys.readouterr().err
+
+
+def test_a_broken_sink_still_lets_the_echo_through(monkeypatch, capsys) -> None:
+    """Why the echo is gated on the event existing rather than skipped when the emit fails.
+
+    The event was built before `emit` was reached, so the operator still sees the line on the
+    console even though the sink lost it — which is the more useful of the two outcomes.
+    """
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=_BrokenSink())
+    console_mod = pytest.importorskip("log_foundry.console")
+    stream = io.StringIO()
+    monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=stream))
+
+    def body() -> None:
+        lf.info("echoed", echo=True)
+
+    contextvars.copy_context().run(body)
+
+    assert "echoed" in stream.getvalue(), "a lost event is still worth echoing"
+    err = capsys.readouterr().err
+    assert err.count("absorbed a failure") == 1, "the emit failed; the echo did not"
+    assert "echoing to the console" not in err
+
+
+def test_a_keyboardinterrupt_from_the_console_still_propagates(fake_sink, monkeypatch) -> None:
+    """The echo guard draws the same line as the sink guard: Exception, never BaseException."""
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=fake_sink)
+    _break_console(monkeypatch, KeyboardInterrupt())
+
+    def body() -> None:
+        lf.info("echoed", echo=True)
+
+    with pytest.raises(KeyboardInterrupt):
+        contextvars.copy_context().run(body)
+
+
+def test_the_guard_covers_building_the_orphan_event_not_only_the_emit(monkeypatch, capsys) -> None:
+    """The whole branch is wrapped: `build_event` is inside it too, not just `emit`.
+
+    `echo=True` here also pins the ``event is not None`` gate — with no event built there is
+    nothing to echo, and echoing ``None`` would raise a second, unrelated failure inside the
+    guard that exists to keep this call quiet.
+    """
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t")
+    monkeypatch.setattr(
+        api, "build_event", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cannot build"))
+    )
+
+    def body() -> None:
+        lf.info("bare line", echo=True)
+
+    contextvars.copy_context().run(body)
+    err = capsys.readouterr().err
+    assert "absorbed a failure while emitting an orphan log (RuntimeError)" in err
+    assert err.count("absorbed a failure") == 1, "no second failure from echoing a missing event"
+
+
+def test_an_orphan_log_returns_even_when_stderr_is_broken_too(monkeypatch) -> None:
+    """The channel of last resort has no fallback: losing the line beats raising."""
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=_BrokenSink())
+    monkeypatch.setattr(sys, "stderr", _BrokenStream())
+
+    def body() -> None:
+        lf.info("nowhere to report this")
+
+    contextvars.copy_context().run(body)  # must not raise
+
+
+def test_a_keyboardinterrupt_from_the_sink_still_propagates() -> None:
+    """FR-003, as FR-001: the guard catches Exception, never BaseException."""
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t", sink=_BrokenSink(KeyboardInterrupt()))
+
+    def body() -> None:
+        lf.info("interrupted")
+
+    with pytest.raises(KeyboardInterrupt):
+        contextvars.copy_context().run(body)
+
+
+def test_a_sink_that_fails_to_construct_does_not_fail_an_orphan_log(monkeypatch, capsys) -> None:
+    """`_ensure_sink` builds the sink on first use, so the whole branch is guarded, not `emit`."""
+    lf = pytest.importorskip("log_foundry")
+    lf.configure(service="t")
+    monkeypatch.setattr(
+        api, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("cannot build a sink"))
+    )
+
+    def body() -> None:
+        lf.info("bare line")
+
+    contextvars.copy_context().run(body)
+    err = capsys.readouterr().err
+    assert "absorbed a failure while emitting an orphan log (RuntimeError)" in err
