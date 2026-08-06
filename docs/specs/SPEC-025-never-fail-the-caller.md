@@ -1,7 +1,7 @@
 # Spec: The Library Must Not Fail the Caller
 
 **ID:** SPEC-025  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-05  
 **Depends On:** SPEC-004, SPEC-017
 

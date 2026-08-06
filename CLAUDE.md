@@ -164,11 +164,19 @@ no `src/` file. Three of its own acceptance criteria were amended by evidence: F
 could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
 FR-006 overstated what a missing PAT costs.
 
-**SPEC-025..031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc, validated in a
+**SPEC-026..031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc, validated in a
 second fresh context and unbuilt. Nothing here is caught by CI (the suite was green throughout).
-Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-025**
-is next (three surviving instances of the SPEC-017 shape, where the exception a caller receives is
-one the library invented).
+Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-029**
+is next (it owns `_diag.py`, which SPEC-025 shipped, and moves the twelve `repr(exception)` sink
+sites onto it), then SPEC-026.
+
+**SPEC-025 (the library must not fail the caller) is Completed** — three surviving instances of the
+SPEC-017 shape, where the exception the caller received was one the library invented: an unguarded
+`_close_span` failed a function that had already returned *and* emitted a contradictory second
+`span.end`; a bare `info()` outside a span propagated a sink's failure; and `shutdown()` raised out
+of `atexit` while the once-only flag left the sink unclosed. Every guard now catches `Exception`,
+never `BaseException`. Shipped `_diag.py` (SPEC-029 owns it) and, on instruction, widened scope to
+the pre-body setup so a fault there degrades to an untraced call instead of failing one.
 
 **SPEC-024 (context lifetime) is Completed** — the arc's first, and the only finding that put
 *wrong* data in the log stream rather than losing it. Baggage and the adopted trace context were
@@ -302,6 +310,16 @@ where it starts.
   the span's `finally` runs in — so adopting outside a span and dispatching into an `asyncio.Task`
   needs `reset_context()`, recorded as a constraint in arch §13. Nested spans never reset: "at or
   below" is where baggage starts, the root span's close is where it stops. (SPEC-024, arch §5.1)
+- **Every path the caller stands on is total, and a swallowed fault is announced by *type*** — the
+  decorator (setup, body, close, teardown), the orphan emitter and its echo, and `shutdown()` with
+  its `atexit` drain all absorb an `Exception` and report one `_diag.absorbed` line rather than
+  raising. Never `BaseException`: a `KeyboardInterrupt` or `SystemExit` is the operator's or the
+  runtime's intent and must reach the caller — the same line SPEC-019 drew in the opposite
+  direction for the worker thread, where the *absence* of a handler was the defect. A pre-body
+  fault degrades to an **untraced call**, never a failed one; a failed close is announced, not
+  retried (the once-only flag stays ahead of it, because a second `close()` on a partially
+  released sink is worse than an unclosed one). Only the type is written, never the message
+  (arch §6). `_diag` must import nothing from its own package. (SPEC-025)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
