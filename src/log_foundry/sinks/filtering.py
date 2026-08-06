@@ -1,10 +1,4 @@
-"""FilteringSink — drop events by predicate and/or minimum level (arch §8, SPEC-006 FR-003).
-
-A static, emit-time filter in front of an inner sink: forward only the events that satisfy a
-``predicate`` and/or meet a ``min_level``. This is *not* the reserved tail-sampling
-``should_send`` seam (arch §10) — that stays deferred and owns rate policy at span-decision
-time; this only reshapes an already-built batch on its way to a sink.
-"""
+"""FilteringSink — drop events by predicate and/or minimum level (arch §8, SPEC-006 FR-003)."""
 
 from __future__ import annotations
 
@@ -21,20 +15,15 @@ if TYPE_CHECKING:
 
 __all__ = ["FilteringSink"]
 
-# Standard severity ranks; higher is more severe. Level names are the arch §6 set.
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 
 
 class FilteringSink:
     """A :class:`~log_foundry.sinks.base.Sink` that forwards only events passing a filter.
 
-    Wraps ``inner`` and forwards the subset of each batch that satisfies ``predicate`` and/or
-    meets ``min_level`` (both, when both are given). An event whose ``level`` is unknown or
-    missing is forwarded fail-open rather than dropped; when nothing passes, ``inner.emit`` is
-    not called. Level comparison is case-insensitive.
-
-    Raises:
-        ValueError: if ``min_level`` is not one of the five standard names (case-insensitive).
+    This is a static, emit-time filter in front of an inner sink, not the reserved
+    tail-sampling ``should_send`` seam (arch §10) — that stays deferred and owns rate policy at
+    span-decision time, while this only reshapes an already-built batch on its way to a sink.
     """
 
     def __init__(
@@ -44,6 +33,19 @@ class FilteringSink:
         predicate: Callable[[dict[str, object]], bool] | None = None,
         min_level: str | None = None,
     ) -> None:
+        """Binds the filter to an inner sink and its criteria.
+
+        Args:
+          inner: The sink that receives whatever passes.
+          predicate: An event-level test, or ``None`` to apply none.
+          min_level: The lowest severity to forward, compared case-insensitively, or ``None``.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: If the minimum level is not one of the five standard names.
+        """
         self._inner = inner
         self._stop_signal: threading.Event | None = None
         self._predicate = predicate
@@ -57,19 +59,43 @@ class FilteringSink:
             self._min_rank = rank
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Forward the events that clear both the predicate and min_level, in order (FR-003)."""
+        """Forwards the events that clear both the predicate and the level floor, in order.
+
+        When nothing passes, the inner sink's ``emit`` is not called at all (FR-003).
+
+        Args:
+          batch: The events to filter.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the predicate or the inner sink raises.
+        """
         kept = [event for event in batch if self._passes(event)]
         if kept:
             self._inner.emit(kept)
 
     def _passes(self, event: dict[str, object]) -> bool:
-        """Whether ``event`` clears the predicate and the minimum level (fail-open on level)."""
+        """Reports whether an event clears the predicate and the minimum level.
+
+        A known level below the floor is dropped, while an unknown or missing level fails open
+        and is forwarded.
+
+        Args:
+          event: The event to test.
+
+        Returns:
+          True when the event should be forwarded.
+
+        Raises:
+          Exception: Whatever the predicate raises.
+        """
         if self._predicate is not None and not self._predicate(event):
             return False
         if self._min_rank is not None:
             level = event.get("level")
             rank = _LEVELS.get(level.upper()) if isinstance(level, str) else None
-            # A known level below the floor is dropped; an unknown/missing level fails open.
             if rank is not None and rank < self._min_rank:
                 return False
         return True
@@ -78,15 +104,35 @@ class FilteringSink:
     def stop_signal(self) -> threading.Event | None:
         """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
 
-        The worker sets this on the *configured* sink (SPEC-027 FR-002), and a wrapper is not
+        The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
         where the waiting happens. Without the forward the attribute is set on an object that
         never waits, and the backoff one level down stays uninterruptible — which is the whole
         defect, moved rather than fixed.
+
+        Args:
+          None.
+
+        Returns:
+          The stop signal, or ``None`` if none was offered.
+
+        Raises:
+          None.
         """
         return self._stop_signal
 
     @stop_signal.setter
     def stop_signal(self, signal: threading.Event | None) -> None:
+        """Forwards the stop signal to the inner sink.
+
+        Args:
+          signal: The worker's shutdown event, or ``None``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self._stop_signal = signal
         try:
             self._inner.stop_signal = signal  # type: ignore[attr-defined]
@@ -98,19 +144,37 @@ class FilteringSink:
             )
 
     def losses(self) -> SinkLosses | None:
-        """Report the inner sink's losses (SPEC-026 FR-002). Never raises.
+        """Reports the inner sink's losses (SPEC-026 FR-002).
 
         A wrapper that reported nothing would hide the destination it wraps: ``health().sink``
-        would read ``None`` for a ``FilteringSink`` in front of a sink that counts perfectly well.
-        Events this sink itself declines to forward are not loss — they are the configuration
-        working, the same reason ``NullSink`` reports nothing.
+        would read ``None`` for a filter in front of a sink that counts perfectly well. Events
+        this sink itself declines to forward are not loss — they are the configuration working,
+        the same reason ``NullSink`` reports nothing.
 
-        ``None`` passes through unchanged rather than becoming ``SinkLosses(0, 0)``: FR-003
-        distinguishes "the sink reports nothing" from "the sink reports no loss", and a wrapper
-        that flattened the two would claim a clean bill of health on a sink that never gave one.
+        Args:
+          None.
+
+        Returns:
+          The inner sink's losses. ``None`` passes through unchanged rather than becoming
+          ``SinkLosses(0, 0)``: FR-003 distinguishes "the sink reports nothing" from "the sink
+          reports no loss", and flattening the two would claim a clean bill of health on a sink
+          that never gave one.
+
+        Raises:
+          None.
         """
         return read_losses(self._inner)
 
     def close(self) -> None:
-        """Close the inner sink (FR-003)."""
+        """Closes the inner sink (FR-003).
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the inner sink raises on close.
+        """
         self._inner.close()
