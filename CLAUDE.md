@@ -164,11 +164,19 @@ no `src/` file. Three of its own acceptance criteria were amended by evidence: F
 could not read a PEP 621 project, FR-003's idempotency was impossible under immutable releases, and
 FR-006 overstated what a missing PAT costs.
 
-**SPEC-024..031 are Draft** — the 2026-08-05 full-codebase audit arc, validated in a second fresh
-context and unbuilt. Nothing here is caught by CI (the suite was green throughout). Build order and
-the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; start with **SPEC-024**
-(baggage and the adopted trace context are never cleared, so one request's data lands on the next
-request's events — the only findings that put *wrong* data in the log stream rather than losing it).
+**SPEC-025..031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc, validated in a
+second fresh context and unbuilt. Nothing here is caught by CI (the suite was green throughout).
+Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-025**
+is next (three surviving instances of the SPEC-017 shape, where the exception a caller receives is
+one the library invented).
+
+**SPEC-024 (context lifetime) is Completed** — the arc's first, and the only finding that put
+*wrong* data in the log stream rather than losing it. Baggage and the adopted trace context were
+written into `contextvars` and never taken back out, so on a thread serving requests sequentially
+one request's `user_id` reached the next request's events and a handler kept joining a trace whose
+process had exited. `@trace` now releases both at the **root** span, `reset_context()` covers the
+caller who opens no span, and `architecture.md` §5.1 states where the scope ends rather than only
+where it starts.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
@@ -285,6 +293,15 @@ request's events — the only findings that put *wrong* data in the log stream r
   editable, and `--strict` refuses an editable distribution), and `--strict` is on because a
   silently skipped package is an unaudited one. Suppressions are per-advisory with written reasons
   in `.github/pip-audit-ignores.txt`, never by severity or package. (SPEC-023)
+- **Per-request context is released at the root span — baggage restored, an adopted trace context
+  cleared** — the asymmetry is deliberate. Baggage set before any span is a process-level default,
+  so it is restored *to*; an inbound context is a one-shot handoff to the trace it names, and
+  restoring it would put back an adoption made *before* the span, leaving a warm container joining
+  the first caller's trace forever. Consequences: one `continue_trace()` serves one root span (a
+  batch needs one per record, or one `@trace` entry point), and the release lands in the context
+  the span's `finally` runs in — so adopting outside a span and dispatching into an `asyncio.Task`
+  needs `reset_context()`, recorded as a constraint in arch §13. Nested spans never reset: "at or
+  below" is where baggage starts, the root span's close is where it stops. (SPEC-024, arch §5.1)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

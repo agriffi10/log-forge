@@ -28,7 +28,7 @@ to status only — no prose.
 | [SPEC-021](SPEC-021-open-item-cleanup.md) | Open-Item Cleanup | Completed | SPEC-013, SPEC-017, SPEC-019, SPEC-020 |
 | [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Completed | SPEC-012 |
 | [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Completed | SPEC-012, SPEC-022 |
-| [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Draft | SPEC-014, SPEC-015 |
+| [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Completed | SPEC-014, SPEC-015 |
 | [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Draft | SPEC-004, SPEC-017 |
 | [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
 | [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
@@ -96,10 +96,10 @@ Group related specs and record the order to build them in. Delete this section i
   findings were validated in a second fresh context before being written up. The suite was green
   throughout (568 tests, `ruff`, `mypy --strict`), so every item here is behaviour no gate catches.
   Build order is by blast radius, not by number:
-  **SPEC-024** first and alone — baggage and the adopted trace context are never taken back out of
-  `contextvars`, so a request's data appears on the next request's events and a handler keeps
-  joining a trace whose process has exited. It is the only finding that puts *wrong data* in the
-  log stream rather than losing it, and the fix is small and self-contained.
+  **SPEC-024** first and alone (**shipped**) — baggage and the adopted trace context were never
+  taken back out of `contextvars`, so a request's data appeared on the next request's events and a
+  handler kept joining a trace whose process had exited. It was the only finding that puts *wrong
+  data* in the log stream rather than losing it, and the fix was small and self-contained.
   **SPEC-025** next — three surviving instances of the SPEC-017 shape, where the exception a caller
   receives is one the library invented: an unguarded `_close_span` fails a function that already
   returned (and emits a contradictory second `span.end`), the orphan path propagates a sink's
