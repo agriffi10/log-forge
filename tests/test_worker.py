@@ -657,7 +657,7 @@ def test_first_overflow_drop_warns_once(capsys) -> None:
         err = capsys.readouterr().err
         assert err.count("log queue full") == 1
         assert "log-foundry:" in err
-        assert "dropped 1 submission(s)" in err
+        assert "lost 1 submission(s)" in err
     finally:
         sink.release.set()
         w.shutdown()
@@ -737,7 +737,10 @@ def test_system_exit_from_sink_is_recorded_and_announced(capsys) -> None:
     assert _wait_until(lambda: not w._thread.is_alive()), "the thread must not keep draining"
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    assert err.startswith("log-foundry: worker thread stopped on SystemExit")
+    assert err.startswith(
+        "log-foundry: absorbed a failure while draining the log queue (SystemExit)"
+    )
+    assert "worker thread stopped" in err
     assert "1 undrained event-list(s) held and 0 queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
 
@@ -1196,7 +1199,8 @@ def test_the_line_reports_both_what_was_held_and_what_was_queued(capsys) -> None
     assert _wait_until(lambda: not w._thread.is_alive())
     err = capsys.readouterr().err
     assert err.count("\n") == 1, "still exactly one line"
-    assert err.startswith("log-foundry: worker thread stopped on SystemExit"), "type name only"
+    assert "(SystemExit)" in err, "type name only"
+    assert "SystemExit(" not in err, "the type, not the repr"
     assert "1 undrained event-list(s) held and 3 queued item(s) undelivered" in err
     assert "tok3n" not in err, "still never the exception's message"
 
@@ -1404,3 +1408,128 @@ def test_an_atexit_shutdown_prints_no_traceback_at_interpreter_shutdown(code, tm
     assert "Traceback" not in result.stderr
     assert "cannot close" not in result.stderr, "the message is never written (arch §6)"
     assert "absorbed a failure while closing the sink (OSError)" in result.stderr
+
+
+# -- SPEC-029 FR-003: a diagnostic can never be the failure ---------------------------------
+
+
+class _RaisingStderr:
+    """A ``sys.stderr`` whose ``write`` fails — a closed fd, a broken pipe, a daemonized process."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def write(self, text: str) -> int:
+        self.calls += 1
+        raise ValueError("I/O operation on closed file")
+
+    def flush(self) -> None:
+        return None
+
+
+def test_a_broken_stderr_does_not_kill_the_drain_thread(monkeypatch) -> None:
+    """The motivating defect: ``_emit``'s write was the one unguarded site on this thread.
+
+    Unguarded, the ``ValueError`` rose out of ``_emit``, through ``_drain``, into ``_run``'s
+    terminal handler — so announcing *one* abandoned batch cost every batch after it, and
+    ``health()`` reported ``stopped_reason='ValueError'`` for a fault that had nothing to do with
+    the sink.
+    """
+    stream = _RaisingStderr()
+    monkeypatch.setattr(sys, "stderr", stream)
+    sink = AlwaysFailSink()
+    w = Worker(sink, batch_size=1, max_retries=0)
+    try:
+        w.submit(_span("a"))
+        assert _wait_until(lambda: w.health().failed_batches == 1), (
+            "the counter moves before the announcement, so a failed write cannot lose it"
+        )
+        assert stream.calls >= 1, "it did try to write"
+
+        h = w.health()
+        assert h.stopped_reason is None, "a stderr fault is not a terminal worker failure"
+        assert w._thread.is_alive()
+
+        w.submit(_span("b"))
+        assert _wait_until(lambda: w.health().failed_batches == 2), "still draining"
+    finally:
+        w.shutdown()
+
+
+def test_a_broken_stderr_still_records_the_terminal_failure(monkeypatch) -> None:
+    """Record-before-announce: the line is best-effort, ``stopped_reason`` is not."""
+    monkeypatch.setattr(sys, "stderr", _RaisingStderr())
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+
+    assert _wait_until(lambda: w.health().stopped_reason == "SystemExit")
+
+
+def test_a_broken_stderr_does_not_reach_the_caller_on_overflow(monkeypatch) -> None:
+    """``submit`` runs on the app's thread: a warning about dropped logs must not fail a call."""
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("b"))
+        monkeypatch.setattr(sys, "stderr", _RaisingStderr())
+
+        w.submit(_span("c"))  # first drop -> would warn, and the write raises
+
+        assert w.health().dropped == 1
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+
+class _Detonation(BaseException):
+    """Not an ``Exception``: the one class of fault ``_diag`` deliberately lets through."""
+
+
+class _DetonatingStderr:
+    """A stream whose ``write`` raises past ``_diag``'s guard, killing the announcement mid-flight.
+
+    A custom ``BaseException`` rather than ``KeyboardInterrupt`` on purpose — an interrupt escaping
+    a worker thread reads in CI as an aborted session rather than a failed assertion.
+    """
+
+    def write(self, text: str) -> int:
+        raise _Detonation("stderr detonated")
+
+    def flush(self) -> None:
+        return None
+
+
+# The detonation escapes the worker thread by design — that is the fault being modelled — and
+# pytest reports any such escape as a warning. Silenced per-test so it does not read as flakiness.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_the_batch_counter_survives_an_announcement_that_detonates(monkeypatch) -> None:
+    """Record-before-announce (FR-003), tested where the ordering is actually observable.
+
+    While every write is guarded the ordering looks free — announce-then-record still records.
+    It stops being free for a ``BaseException``, which ``_diag`` passes through by design: with
+    the record placed after the write, the loss the counter exists to report is never counted.
+    """
+    monkeypatch.setattr(sys, "stderr", _DetonatingStderr())
+    w = Worker(AlwaysFailSink(), batch_size=1, max_retries=0)
+    try:
+        w.submit(_span("a"))
+        assert _wait_until(lambda: w.health().failed_batches == 1)
+    finally:
+        w.shutdown()
+
+
+# The detonation escapes the worker thread by design — that is the fault being modelled — and
+# pytest reports any such escape as a warning. Silenced per-test so it does not read as flakiness.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_stopped_reason_survives_an_announcement_that_detonates(monkeypatch) -> None:
+    """The same ordering on the line that is written exactly once and cannot be re-emitted."""
+    monkeypatch.setattr(sys, "stderr", _DetonatingStderr())
+    w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
+    w.submit(_span("a"))
+
+    assert _wait_until(lambda: not w._thread.is_alive())
+    assert w.health().stopped_reason == "SystemExit", (
+        "recorded before the announcement that killed the announcing"
+    )

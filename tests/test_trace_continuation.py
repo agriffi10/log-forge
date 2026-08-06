@@ -12,6 +12,7 @@ releases both on the way out, so no test here leaves either set (verified per te
 
 import asyncio
 import re
+import sys
 
 import pytest
 
@@ -554,9 +555,7 @@ def test_baggage_adopted_from_a_header_does_not_leak_into_the_next_invocation(
     assert all("tenant" not in e["fields"] for e in second)
 
 
-def test_an_adoption_is_consumed_by_one_root_span_not_by_every_later_sibling(
-    lf, fake_sink
-) -> None:
+def test_an_adoption_is_consumed_by_one_root_span_not_by_every_later_sibling(lf, fake_sink) -> None:
     """Pins the narrowing that "consumed by the trace it names" implies (SPEC-024 FR-002).
 
     A batch loop that adopts once and then opens a root span per record joins only the *first*
@@ -630,3 +629,39 @@ def test_reset_context_makes_the_next_root_span_a_fresh_trace(lf, fake_sink) -> 
     assert all(e["trace_id"] != INBOUND_TRACE for e in second)
     assert HEX32.match(second[0]["trace_id"])
     assert all(e["parent_span_id"] is None for e in second)
+
+
+def test_a_rejection_warning_cannot_reach_the_caller(lf, monkeypatch) -> None:
+    """SPEC-029 FR-003: `continue_trace` runs on the app's thread, and never raises.
+
+    The warning moved to `_diag.rejected`, which is guarded; before that the write was bare, so a
+    closed stderr turned an unparseable inbound header — the very case the library is meant to
+    shrug off — into an exception in the handler.
+    """
+
+    class _RaisingStderr:
+        def write(self, text: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self) -> None:
+            return None
+
+    monkeypatch.setattr(sys, "stderr", _RaisingStderr())
+
+    assert lf.continue_trace("00-bad-header-01") is False
+    try:
+        assert lf.continue_trace(TRACEPARENT, baggage="\x00 not a header") is True
+    finally:
+        # The second call adopts, and this test opens no root span to release it — so without
+        # this the adoption outlives the test and the next one to open a root span silently
+        # joins the inbound trace. The module docstring claims no test here leaves either set.
+        lf.reset_context()
+
+
+def test_the_suite_leaves_no_adopted_context_behind(lf) -> None:
+    """The module docstring's claim, asserted rather than assumed.
+
+    Runs last by file order, so it observes whatever every test above left set. It caught a real
+    leak: the FR-003 broken-stderr test adopts and opens no root span to release it.
+    """
+    assert context_mod.get_adopted_context() is None
