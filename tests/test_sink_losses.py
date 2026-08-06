@@ -1035,7 +1035,7 @@ def test_an_all_oversized_batch_never_raises_on_any_chunking_sink() -> None:
 
 
 def test_an_empty_batch_never_raises_on_the_per_item_sinks(monkeypatch) -> None:
-    """FR-001's ``emit([])`` rule, for the four sinks the chunking loop above does not reach."""
+    """FR-001's ``emit([])`` rule, for the five sinks the chunking loop above does not reach."""
     from log_foundry.sinks.eventhubs import AzureEventHubsSink
     from log_foundry.sinks.kafka import KafkaSink
     from log_foundry.sinks.nats import NATSSink
@@ -1073,3 +1073,28 @@ def test_an_empty_batch_never_raises_on_the_per_item_sinks(monkeypatch) -> None:
             sink.emit([])  # an empty batch has not failed to deliver
     finally:
         nats.close()
+
+
+def test_a_duplicate_id_in_the_failed_array_cannot_understate_what_landed() -> None:
+    """Counting failures rather than matching them could turn a partial success into a raise."""
+    from log_foundry.sinks.sqs import SQSSink
+
+    class DuplicateIdClient:
+        """Reports entry '0' as failed twice — a shape real SQS never sends."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+            self.calls += 1
+            return {
+                "Successful": [{"Id": e["Id"]} for e in Entries if e["Id"] != "0"],
+                "Failed": [
+                    {"Id": "0", "SenderFault": False, "Code": "InternalError"},
+                    {"Id": "0", "SenderFault": False, "Code": "InternalError"},
+                ],
+            }
+
+    sink = SQSSink("https://q/x", client=DuplicateIdClient(), max_retries=0)
+    sink.emit([{"log_id": "a"}, {"log_id": "b"}])  # entry '1' landed: must not raise
+    assert sink.failed == 1

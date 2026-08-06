@@ -264,7 +264,12 @@ class SQSSink:
             # Accumulated per attempt, not derived at the end: after the first response
             # ``entries`` is already narrowed to the failures, so each round's difference is
             # what that round put on the queue.
-            accepted += len(entries) - len(failed)
+            # Matched by ``Id`` rather than counted: a ``Failed`` array carrying a duplicate or
+            # an unknown id would otherwise understate ``accepted`` — possibly below zero — and
+            # turn a partial success into a false "nothing landed". Unreachable from real SQS,
+            # guarded anyway because the cost is one set intersection.
+            failed_ids = {item.get("Id") for item in failed}
+            accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
             if not failed:
                 return accepted, False
             # Abandon sender faults immediately and name the code: the retry would re-send the

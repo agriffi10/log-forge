@@ -130,7 +130,6 @@ class KinesisSink:
             records.append({"Data": data, "PartitionKey": key})
         return records
 
-
     def _send(self, records: list[dict[str, Any]]) -> int | None:
         """Send one chunk, retrying only the records the response flags as failed (FR-003).
 
