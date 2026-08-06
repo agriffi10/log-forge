@@ -238,3 +238,54 @@ def test_reset_context_is_exported_from_the_package() -> None:
     lf = pytest.importorskip("log_foundry")
     assert "reset_context" in lf.__all__
     assert callable(lf.reset_context)
+
+
+# -- SPEC-025: `pop_span` is total, on the same terms as `pop_baggage_scope` --------------
+
+
+def test_pop_span_tolerates_a_token_from_another_context() -> None:
+    context = pytest.importorskip("log_foundry.context")
+    model = pytest.importorskip("log_foundry.model")
+    minted: dict[str, object] = {}
+
+    def span(name: str):
+        return model.Span(
+            trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name=name, start_ts=0.0
+        )
+
+    def mint() -> None:
+        minted["token"] = context.push_span(span("inner"))
+
+    def body() -> None:
+        outer = span("outer")
+        context.push_span(outer)
+        contextvars.copy_context().run(mint)
+        # Precondition, asserted so this cannot quietly stop covering the fallback.
+        with pytest.raises(ValueError):
+            context._span_stack.reset(minted["token"])
+        context.pop_span(minted["token"])  # must not raise
+        assert context.current_span() is outer, "the captured stack is restored, not discarded"
+
+    contextvars.copy_context().run(body)
+
+
+def test_pop_span_from_another_context_falls_back_to_empty() -> None:
+    context = pytest.importorskip("log_foundry.context")
+    model = pytest.importorskip("log_foundry.model")
+    minted: dict[str, object] = {}
+
+    def mint() -> None:
+        minted["token"] = context.push_span(
+            model.Span(
+                trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="x", start_ts=0.0
+            )
+        )
+
+    # An empty Context has never had the stack set, so the token's old value is MISSING.
+    contextvars.Context().run(mint)
+
+    def body() -> None:
+        context.pop_span(minted["token"])
+        assert context.current_span() is None
+
+    contextvars.copy_context().run(body)

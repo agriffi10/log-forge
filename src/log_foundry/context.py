@@ -91,8 +91,20 @@ def push_span(span: Span) -> contextvars.Token[tuple[Span, ...]]:
 
 
 def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
-    """Restore the span stack to its state before the matching :func:`push_span`."""
-    _span_stack.reset(token)
+    """Restore the span stack to its state before the matching :func:`push_span`.
+
+    Total — never raises, on the same terms and for the same reason as
+    :func:`pop_baggage_scope`: it runs in the decorator's ``finally``, where an exception would
+    replace the one the caller's own function raised (arch §4, SPEC-025).
+    """
+    try:
+        _span_stack.reset(token)
+    except Exception:
+        # `reset` rejects a token minted in another context and one already used. Restoring the
+        # captured stack directly is equivalent; anything that is not a tuple of spans cannot
+        # have come from `push_span`, so it falls back to empty rather than corrupting the stack.
+        old = getattr(token, "old_value", None)
+        _span_stack.set(old if isinstance(old, tuple) else ())
 
 
 def get_baggage() -> dict[str, object]:

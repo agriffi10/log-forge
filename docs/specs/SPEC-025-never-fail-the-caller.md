@@ -55,9 +55,14 @@ SPEC-017; these are the instances that audit did not reach.
   SPEC-026, which owns loss reporting. A stderr line is the signal for now.
 - **Retrying a failed `_close_span` or orphan emit.** The event is lost; the point is that the
   *caller* survives. Retry policy belongs to the worker and to SPEC-027.
-- **`_open_span`.** It runs before the body and its failure modes (id generation, dataclass
+- ~~**`_open_span`.** It runs before the body and its failure modes (id generation, dataclass
   construction) are not reachable in practice. Left alone deliberately rather than wrapped for
-  symmetry.
+  symmetry.~~ **Brought into scope during the build** (FR-001), by decision: "not reachable in
+  practice" is the same argument that left the three defects above unguarded, and a fault *before*
+  the body is strictly worse than one after it — the library would stop the application doing its
+  work at all, rather than merely losing the log. The pre-body setup (`_open_span`, `push_span`,
+  `push_baggage_scope`) is now guarded as one unit, and SPEC-024's deferred note about
+  `push_baggage_scope` sitting outside the `try` is closed by the same change.
 - **`flush()`.** Already guarded and already documented "Never raises" (`decorator.py:230-235`).
 
 ---
@@ -77,6 +82,15 @@ while closing a span is the operator's or the runtime's intent and must still re
 this is the same line SPEC-019 drew in the opposite direction for the worker thread, where the
 absence of any handler was the defect.
 
+**The pre-body setup is guarded on the same terms** (see Out of Scope, amended during the build).
+`_open_span`, `push_span` and `push_baggage_scope` run *before* the caller's function, so a fault
+there does not merely lose the log — it stops the application doing its work. The three are opened
+as one unit; any fault gives back "no span" and the call proceeds **untraced**, with its own result
+or exception reaching the caller unchanged. Partial setup is kept rather than unwound: a span that
+was created but never pushed still closes and flushes, which preserves more than discarding it.
+`pop_span` becomes total in the same way `pop_baggage_scope` already is (SPEC-024), since both run
+in the `finally` where a raise would replace the caller's own exception.
+
 #### Acceptance Criteria:
 
 - [ ] With a sink whose construction raises, a decorated function that returns `42` returns `42`,
@@ -90,6 +104,17 @@ absence of any handler was the defect.
       states that the span's events were lost. The message is not written (architecture §6, and the
       rule SPEC-019 FR-001 applies to `stopped_reason`).
 - [ ] A normal close writes nothing to stderr and is unmeasurably affected.
+- [ ] With `_open_span` raising, a decorated function still runs and still returns `42`; one stderr
+      line names the type and says the call ran untraced.
+- [ ] With `_open_span` raising, a decorated function that raises still propagates its own
+      exception.
+- [ ] After a failed close the span stack is left clean — `current_span()` is `None` again — so a
+      later call in the same context is not parented to a span that never closed.
+- [ ] An untraced **nested** call leaves its parent current, so the parent's trace is not split.
+- [ ] A root call whose span could not be opened still releases its baggage scope, so baggage set
+      inside it does not reach the next call (SPEC-024's guarantee survives the failure path).
+- [ ] A raising traced call retains no reference cycle: repeated calls do not accumulate objects
+      that only `gc.collect()` can free.
 
 ### FR-002: One span produces one end event
 
@@ -187,11 +212,11 @@ SPEC-029 adopts it; the two must not each invent one.
 ## API / Interface Contract
 
 ```python
-# The sync wrapper, in outline — one close, one flush, on every path:
+# The sync wrapper, in outline — one close, one flush, on every path. `_begin` and `_end` hold
+# the guards so the two near-duplicate wrappers cannot drift apart:
 
 def wrapper(*args, **kwargs):
-    span = _open_span(name or fn.__qualname__, defaults)
-    token = context.push_span(span)
+    span, token, scope = _begin(name or fn.__qualname__, defaults)   # never raises
     status, error = "ok", None
     try:
         result = fn(*args, **kwargs)
@@ -200,15 +225,48 @@ def wrapper(*args, **kwargs):
         raise                       # unchanged, per architecture §4
     finally:
         try:
+            _end(span, token, scope, status, error)                  # never raises
+        finally:
+            del status, error       # break the frame↔exception cycle — see below
+    return result
+
+
+def _end(span, token, scope, status, error):
+    if span is not None:
+        try:
             _close_span(span, status, error)
         except Exception as exc:    # never BaseException — see FR-001
             _diag.absorbed("closing a span", exc, "the span's events were lost")
-        context.pop_span(token)
-    return result
+    if token is not None:
+        context.pop_span(token)          # total (SPEC-025)
+    if scope is not None:
+        context.pop_baggage_scope(scope)  # total (SPEC-024)
 ```
 
 `status`/`error` are set in the `except` and read in the `finally`, so the close runs exactly once
 and knows the outcome. The bare `raise` keeps the caller's exception identity and traceback.
+
+`_begin` keeps whatever succeeded and `_end` releases exactly that much, which is what lets a
+degraded call proceed instead of failing. The **order of its three steps** is what keeps every
+partial state coherent: the baggage scope is taken *first*, so a root call that loses its span
+still has a scope to release, and the state "span kept, scope lost" — a traced call that leaks its
+baggage into the next request, i.e. the SPEC-024 defect reappearing through a failure path — is
+unreachable. A span that exists but was never pushed is still closed and flushed; it is simply not
+current, so nothing nests under it.
+
+`_end`'s `is not None` checks are load-bearing rather than defensive: `pop_span(None)` would fall
+through that function's own guard to `set(())` and wipe the whole stack, detaching the parent of an
+untraced *nested* call.
+
+One ordering constraint inside `_end`, and only one: the baggage scope is released **after** the
+close, so SPEC-015's backfill still reads the baggage that was live inside the span. The stack pop
+is order-independent — `_close_span` reads the span it is handed and the current baggage, never the
+stack.
+
+The outcome must be **deleted after `_end`**. `except ... as exc` auto-deletes its target precisely
+because a local holding an exception whose traceback holds this frame is a reference cycle; keeping
+it in `error` past the handler rebuilds that cycle and pins the caller's own frames and locals until
+a generational collection. Measured at ~13 objects per raising call.
 
 ## Configuration / Environment
 
@@ -218,7 +276,8 @@ None.
 
 ```
 src/log_foundry/
-├── decorator.py       # modified — guarded, single-call close in both wrappers
+├── decorator.py       # modified — guarded `_begin`/`_end`, single-call close in both wrappers
+├── context.py         # modified — `pop_span` made total, as `pop_baggage_scope` already is
 ├── api.py             # modified — guarded orphan emit and echo
 ├── worker.py          # modified — guarded close in shutdown()
 └── _diag.py           # new — the shared absorbed-failure reporter
@@ -236,9 +295,10 @@ tests/
 
 - Restructure both wrappers to the single-close `finally` shape; guard the close.
 - Add `_diag.absorbed`.
+- Guard the pre-body setup in `_begin`; make `pop_span` total.
 - Tests: success survives a broken close; the caller's own exception is preserved; exactly one
   `span.end` on both paths; `KeyboardInterrupt` still propagates; `duration_ms` and flush ordering
-  unchanged; async and cancellation.
+  unchanged; async and cancellation; a call whose span cannot be opened still runs.
 
 ### Phase 2: The orphan path
 
