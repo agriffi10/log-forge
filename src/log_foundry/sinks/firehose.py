@@ -14,6 +14,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["FirehoseSink"]
 
@@ -41,21 +42,55 @@ class FirehoseSink:
             client = boto3.client("firehose")
         self.delivery_stream = delivery_stream
         self.client = client
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # from ``_send`` having sent nothing, and reported success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
         self.dropped_oversized = 0
         self.dropped_unadjudicated = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunk to put_record_batch limits and send each chunk, retrying failures (FR-004)."""
+        """Re-chunk to put_record_batch limits and send each chunk, retrying failures (FR-004).
+
+        Raises when every chunk failed and at least one was sent (SPEC-026 FR-001). Records
+        dropped before sending — too large to ever fit — are not a send failure and do not make
+        a batch of nothing but oversized records raise; they can never be retried into
+        existence, and are reported through ``losses().dropped``.
+
+        An unadjudicable chunk is *unknown*, not *nothing*, and suppresses the raise. SPEC-018
+        settled that such a chunk is abandoned rather than re-sent — the API reported a failure
+        count, so some of it landed, and the worker's retry would duplicate that downstream
+        forever. Raising on it would be exactly the re-send SPEC-018 refuses.
+        """
         records = self._records(batch)
+        chunks = delivered = 0
+        unknown = False
         for chunk in chunk_items(
             records,
             max_count=self.MAX_RECORDS,
             max_bytes=self.MAX_REQUEST_BYTES,
             size_of=lambda record: len(record["Data"]),
         ):
-            self._send(chunk)
+            chunks += 1
+            outcome = self._send(chunk)
+            if outcome is None:
+                unknown = True
+            else:
+                delivered += outcome
+        if chunks and not delivered and not unknown:
+            raise SinkDeliveryError(f"FirehoseSink delivered none of {chunks} chunk(s)")
+
+    def losses(self) -> SinkLosses:
+        """Oversized drops, abandoned records and unadjudicable chunks (FR-002). Never raises.
+
+        ``failed`` sums ``failed`` and ``dropped_unadjudicated``: both are records the stream
+        never confirmed. They stay apart on the instance, because "the stream said these failed"
+        and "the response did not describe them" have different remedies (SPEC-018).
+        """
+        return SinkLosses(
+            dropped=self.dropped_oversized,
+            failed=self.failed + self.dropped_unadjudicated,
+        )
 
     def close(self) -> None:
         """No-op: the sink buffers nothing internally (FR-001)."""
@@ -79,14 +114,23 @@ class FirehoseSink:
             records.append({"Data": data})
         return records
 
-    def _send(self, records: list[dict[str, Any]]) -> None:
-        """Send one chunk, retrying only the entries the response flags as failed (FR-004)."""
+
+    def _send(self, records: list[dict[str, Any]]) -> int | None:
+        """Send one chunk, retrying only the entries the response flags as failed (FR-004).
+
+        Returns how many records the stream accepted, so ``emit`` can tell "nothing landed"
+        from a partial success — or ``None`` when the response could not be adjudicated, which
+        is neither. "The stream did not say" must not be read as "the stream took nothing":
+        that reading would make ``emit`` raise, and the worker's retry would re-send a chunk
+        SPEC-018 settled must never be re-sent.
+        """
+        sent = len(records)
         for attempt in range(self.max_retries + 1):
             response = self.client.put_record_batch(
                 DeliveryStreamName=self.delivery_stream, Records=records
             )
             if not response.get("FailedPutCount"):
-                return
+                return sent
             results = usable_results(response.get("RequestResponses"))
             verdict = adjudicate_positional(records, results)
             if verdict.unadjudicated:
@@ -98,10 +142,10 @@ class FirehoseSink:
                     f"({len(records)} record(s) sent, {len(results)} result(s) returned); "
                     f"abandoned, not retried",
                 )
-                return
+                return None
             records = verdict.retry
             if not records:
-                return
+                return sent
             if attempt >= self.max_retries:
                 self.failed += len(records)
                 _diag.lost(
@@ -109,4 +153,5 @@ class FirehoseSink:
                     len(records),
                     f"FirehoseSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
-                return
+                return sent - len(records)
+        return 0  # unreachable: the loop returns on every path (mypy needs the exit)

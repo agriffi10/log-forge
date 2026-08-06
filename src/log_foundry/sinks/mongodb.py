@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["MongoDBSink"]
 
@@ -46,13 +47,28 @@ class MongoDBSink:
             client = MongoClient(uri)
         self._client = client
         self._collection = client[database][collection]
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # having attempted no insert, and reported success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
         self.dropped_oversized = 0
         self._closed = False
 
+    def losses(self) -> SinkLosses:
+        """Oversized drops and documents the server rejected or never took (FR-002)."""
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Insert every event unordered; count bulk failures, retry connection errors (FR-003)."""
+        """Insert every event unordered; count bulk failures, retry connection errors (FR-003).
+
+        Raises when *nothing* was inserted (SPEC-026 FR-001) — a connection error past the retry
+        bound, or a bulk write every one of whose documents the server rejected. A bulk write
+        that stored some is partial and never raises: the unordered insert already committed
+        them, so the worker's retry would duplicate them.
+
+        A batch of nothing but oversized documents does not raise. They can never fit, so there
+        is nothing to retry; they are reported through ``losses().dropped``.
+        """
         documents = self._documents(batch)
         if not documents:
             return
@@ -70,6 +86,10 @@ class MongoDBSink:
                     _diag.lost(
                         "document", rejects, "MongoDBSink bulk write; the rest were inserted"
                     )
+                    if rejects >= len(documents):
+                        raise SinkDeliveryError(
+                            f"MongoDBSink inserted none of {len(documents)} document(s)"
+                        ) from None
                     return
                 if attempt < self.max_retries:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
@@ -80,7 +100,9 @@ class MongoDBSink:
                     len(documents),
                     f"MongoDBSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
-                return
+                raise SinkDeliveryError(
+                    f"MongoDBSink inserted none of {len(documents)} document(s)"
+                ) from None
 
     def close(self) -> None:
         """Close the client only if the sink owns it; idempotent (FR-005)."""

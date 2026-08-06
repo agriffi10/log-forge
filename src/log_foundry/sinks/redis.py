@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
 
@@ -31,11 +32,22 @@ class _RedisSink:
 
             client = redis.Redis.from_url(url) if url else redis.Redis()
         self.client = client
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value made the
+        # retry range empty, so ``emit`` returned having attempted nothing — a silent success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
 
+    def losses(self) -> SinkLosses:
+        """Events abandoned past the retry bound (SPEC-026 FR-002). Never raises."""
+        return SinkLosses(dropped=0, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Pipeline the whole batch into one round trip, retrying on connection error (FR-005)."""
+        """Pipeline the whole batch into one round trip, retrying on connection error (FR-005).
+
+        The batch travels as one pipeline, so a failure past the retry bound delivered *nothing*:
+        it is counted and then raised, giving the worker its retry and ``health()`` the loss
+        (SPEC-026 FR-001). There is no partial case to protect — the pipeline is all or nothing.
+        """
         if not batch:
             return
         for attempt in range(self.max_retries + 1):
@@ -55,7 +67,9 @@ class _RedisSink:
                     len(batch),
                     f"{type(self).__name__}, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
-                return
+                raise SinkDeliveryError(
+                    f"{type(self).__name__} delivered none of {len(batch)} event(s)"
+                ) from None
 
     def close(self) -> None:
         """Close the connection only if the sink owns it (FR-005)."""

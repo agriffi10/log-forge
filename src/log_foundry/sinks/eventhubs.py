@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["AzureEventHubsSink"]
 
@@ -44,27 +45,47 @@ class AzureEventHubsSink:
                 connection_str, eventhub_name=eventhub
             )
         self.producer = producer
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # from ``_send`` having attempted nothing, and reported success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
         self.dropped_oversized = 0
 
+    def losses(self) -> SinkLosses:
+        """Oversized drops and events in a batch abandoned past the retry bound (FR-002)."""
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Pack events into ≤ 1 MB EventDataBatches and send each; drop oversized events (FR-009)."""
+        """Pack events into ≤ 1 MB EventDataBatches and send each; drop oversized events (FR-009).
+
+        Raises when every ``EventDataBatch`` failed to send and at least one was attempted
+        (SPEC-026 FR-001). An event dropped for being too large is not a send failure — it can
+        never fit, so a batch of nothing but oversized events has nothing to retry and does not
+        raise; it is reported through ``losses().dropped`` instead.
+        """
         if not batch:
             return
         event_data_cls = _event_data_cls()
         current = self.producer.create_batch()
+        attempted = delivered = 0
         for event in batch:
             data = event_data_cls(json.dumps(event).encode("utf-8"))
             if _try_add(current, data):
                 continue
             # current batch is full: send it and start a fresh one for this event.
-            self._send(current)
+            attempted += 1
+            delivered += self._send(current)
             current = self.producer.create_batch()
             if not _try_add(current, data):
                 self.dropped_oversized += 1
                 _diag.lost("event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch")
-        self._send(current)
+        if len(current) > 0:
+            attempted += 1
+            delivered += self._send(current)
+        if attempted and not delivered:
+            raise SinkDeliveryError(
+                f"AzureEventHubsSink sent none of {attempted} EventDataBatch(es)"
+            )
 
     def close(self) -> None:
         """Close the producer (FR-009)."""
@@ -72,14 +93,16 @@ class AzureEventHubsSink:
 
     # -- internals ----------------------------------------------------------------------
 
-    def _send(self, event_batch: Any) -> None:
-        """Send one EventDataBatch (skipping an empty one), retrying failures (FR-009, FR-011)."""
-        if len(event_batch) == 0:
-            return
+    def _send(self, event_batch: Any) -> int:
+        """Send one EventDataBatch, retrying failures; ``1`` if it landed (FR-009, FR-011).
+
+        Callers only reach this with a non-empty batch, and count the result: the "did anything
+        land" question in ``emit`` cannot be answered by a method that returns nothing.
+        """
         for attempt in range(self.max_retries + 1):
             try:
                 self.producer.send_batch(event_batch)
-                return
+                return 1
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 if attempt < self.max_retries:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
@@ -91,7 +114,8 @@ class AzureEventHubsSink:
                     f"AzureEventHubsSink, one batch, {self.max_retries + 1} attempts, "
                     f"{type(err).__name__}",
                 )
-                return
+                return 0
+        return 0  # unreachable: the loop returns on every path (mypy needs the exit)
 
 
 def _try_add(event_batch: Any, data: Any) -> bool:

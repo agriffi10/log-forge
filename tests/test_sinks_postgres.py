@@ -9,7 +9,7 @@ from typing import Self
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.postgres import PostgresSink
 
 
@@ -115,7 +115,8 @@ def test_rollback_and_retry_then_succeed() -> None:
 def test_persistent_failure_counted() -> None:
     conn = FakeConnection(fail_times=-1)
     sink = PostgresSink("logs", connection=conn, max_retries=1)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # the transaction rolled back: nothing was inserted
     assert conn.rollbacks == 2
     assert conn.commits == 0
     assert sink.failed == 2
@@ -185,7 +186,10 @@ def test_an_abandoned_insert_never_reprints_the_event(capsys) -> None:
     conn = LeakyConnection()
     sink = PostgresSink("logs", connection=conn, max_retries=0)
 
-    sink.emit([{"message": "hi", "fields": {"email": "user@example.com", "card": "4111111111111"}}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(
+            [{"message": "hi", "fields": {"email": "user@example.com", "card": "4111111111111"}}]
+        )
 
     err = capsys.readouterr().err
     assert "user@example.com" not in err, "the event must not reach stderr through a driver repr"
@@ -193,6 +197,7 @@ def test_an_abandoned_insert_never_reprints_the_event(capsys) -> None:
     assert "INSERT INTO" not in err, "nor the statement the event was bound to"
     assert "insert failed:" not in err, "nor the exception's own message"
 
+    assert "insert failed" not in err, "nor through the SinkDeliveryError this now raises"
     assert "LeakyDriverError" in err, "the type is what an operator gets, and is enough"
     assert "lost 1 event(s)" in err, "and the count it cost"
     assert sink.failed == 1

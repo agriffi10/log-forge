@@ -6,13 +6,11 @@ SPEC-018 adds the mismatched-response cases: a results array that does not descr
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
 
-from log_foundry.sinks.base import Sink
+import pytest
+
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.kinesis import KinesisSink
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class FakeKinesis:
@@ -89,7 +87,8 @@ def test_persistent_failures_are_counted(capsys) -> None:
     body = json.dumps({"trace_id": "t1", "a": 1}).encode("utf-8")
     client = FakeKinesis(always_fail={body})
     sink = KinesisSink("stream", client=client, max_retries=2)
-    sink.emit([{"trace_id": "t1", "a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"trace_id": "t1", "a": 1}])  # the only record in the only chunk failed (SPEC-026 FR-001)
     assert len(client.calls) == 3  # initial + 2 retries
     assert sink.failed == 1
     assert "lost 1 record(s)" in capsys.readouterr().err

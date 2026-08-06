@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.eventhubs import AzureEventHubsSink
 
 
@@ -89,7 +89,8 @@ def test_oversized_event_is_dropped(capsys) -> None:
 def test_send_failure_is_retried_then_counted(capsys) -> None:
     producer = FakeProducer(fail=True)
     sink = AzureEventHubsSink(producer=producer, max_retries=1)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # the only EventDataBatch failed (SPEC-026 FR-001)
     assert sink.failed == 2  # whole batch abandoned after the bound
     assert "lost 2 event(s)" in capsys.readouterr().err
 

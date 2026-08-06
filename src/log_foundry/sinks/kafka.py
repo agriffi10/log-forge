@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KafkaSink"]
 
@@ -22,6 +23,8 @@ class KafkaSink:
 
     Attributes:
         failed: Messages whose delivery callback reported an error.
+        rejected: Messages ``produce()`` itself refused — a full local queue, a serialization
+            fault — which never reached the producer's batch at all.
     """
 
     def __init__(
@@ -44,14 +47,41 @@ class KafkaSink:
         self.producer = producer
         self.key_field = key_field
         self.failed = 0
+        self.rejected = 0
+
+    def losses(self) -> SinkLosses:
+        """Refused and undelivered messages (SPEC-026 FR-002). Never raises.
+
+        ``rejected`` is ``dropped``: ``produce()`` refused it, so nothing was ever sent. ``failed``
+        is the delivery callback's verdict, which arrives *after* the ``emit`` that produced the
+        message — asynchronously, and usually during a later ``poll``/``flush``. That is why a
+        callback failure can never make ``emit`` raise: by the time it is known, the batch it
+        belonged to has been reported delivered and retrying it would duplicate the rest.
+        """
+        return SinkLosses(dropped=self.rejected, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Produce one message per event; serve delivery callbacks without blocking (FR-002)."""
+        """Produce one message per event; serve delivery callbacks without blocking (FR-002).
+
+        ``produce()`` is a local hand-off, so what it refuses is the only failure this call can
+        observe. When it refused *every* message the batch reached nothing, which is the total
+        failure the worker's retry exists for (SPEC-026 FR-001); a partial refusal is counted and
+        left alone, since the messages that were accepted are already on their way.
+        """
+        accepted = 0
         for event in batch:
             body = json.dumps(event).encode("utf-8")
             key = self._key(event)
-            self.producer.produce(self.topic, value=body, key=key, callback=self._on_delivery)
+            try:
+                self.producer.produce(self.topic, value=body, key=key, callback=self._on_delivery)
+            except Exception as err:  # BufferError on a full local queue, and anything the
+                self.rejected += 1    # driver raises for an unproducible message
+                _diag.lost("message", 1, f"KafkaSink produce, {type(err).__name__}")
+                continue
+            accepted += 1
             self.producer.poll(0)  # serve queued delivery callbacks, non-blocking
+        if batch and not accepted:
+            raise SinkDeliveryError(f"KafkaSink produced none of {len(batch)} message(s)")
 
     def close(self) -> None:
         """Flush the producer so buffered messages are delivered before exit (FR-002)."""
