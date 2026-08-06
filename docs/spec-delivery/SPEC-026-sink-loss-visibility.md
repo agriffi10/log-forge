@@ -22,8 +22,8 @@ success is a sink the worker believes: the retry never engages, `failed_batches`
 - **Absorbed loss is readable** (FR-002, FR-003). An optional `losses()` on each sink, aggregated
   into `Health.sink` — appended exactly as SPEC-019 appended `stopped_reason`, so every earlier
   field keeps its index. Nested rather than flattened: `dropped` on the worker is backpressure at
-  the queue, `dropped` on the sink is an event the destination could never accept, and one number
-  would make the remedies indistinguishable. `read_losses` is total, because `health()` is
+  the queue, `dropped` on the sink is an event that never reached the wire, and one number would
+  make the remedies indistinguishable. `read_losses` is total, because `health()` is
   documented "Never raises" and is the call an operator makes when things are already wrong.
 - **Documented where each audience reads** (FR-004): `architecture.md` §8 (the sink obligations)
   and §9 (what "retries with backoff" is conditional on), the `health()` docstring, and a new
@@ -62,9 +62,11 @@ sends one envelope per event, so it isolates per-event failures and raises only 
   "abandoned and returned" now assert the raise. Anything catching only its driver's exceptions
   around an `emit` should add `SinkDeliveryError`.
 - **`max_retries` is floored at zero in all twelve sink retry loops**, as `Worker._emit` already
-  floors its own (SPEC-021). A negative value made `range(max_retries + 1)` empty: in `HTTPSink`
-  and `SocketTransport` that abandoned with no attempt and no counter; in the other ten it
-  *returned normally*, a silent success.
+  floors its own (SPEC-021). A negative value made `range(max_retries + 1)` empty, so the sink
+  attempted nothing at all — and then reported whatever its loop fell through to: a bare `return`
+  in most of them, indistinguishable from success. No counter moved and nothing reached stderr,
+  which is the shape this whole arc exists to remove. Reachable only by misconfiguration, but
+  reachable.
 - **`ElasticsearchSink` gained `dropped_unadjudicated`**, and adjudicates its `_bulk` response
   through `_batch.usable_results` — the SPEC-018 helper, now used outside the two sinks it was
   written for.

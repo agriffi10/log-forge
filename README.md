@@ -402,12 +402,12 @@ A few conventions hold across every sink below:
   The tables show the destination-defining arguments only; sinks that retry also take `max_retries`.
 - **Ownership.** A resource the sink opens itself is closed on `shutdown()`; an injected one is left
   open for you to manage.
-- **Never crashes the app.** A failing sink is retried with backoff and then counted (`.failed`,
-  `.dropped_oversized`, `.dropped_unadjudicated`, …) rather than raised — a broken destination
-  degrades logging, nothing more.
-  The one deliberate exception is a `MultiSink` whose children *all* failed: it re-raises so the
-  worker's retry engages, since nothing was delivered and there are no duplicates to risk. That
-  still doesn't reach your code — the worker is what catches it.
+- **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
+  delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
+  `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
+  A sink that delivered **none** of it raises instead, so the worker's bounded retry engages and
+  `health().failed_batches` records the loss — there is nothing downstream to duplicate. Either
+  way the exception never reaches your code: the worker is what catches it.
 
 #### Built-in, zero-dependency
 
@@ -699,7 +699,7 @@ They tell you different things, and they want different responses:
 | `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Tune `batch_size`/`flush_interval`, or scale the sink. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
-| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client's local buffer refused. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) means the client is saturated. |
+| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
@@ -707,8 +707,9 @@ the configured sink reports nothing (`losses()` is optional). Note the two `drop
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
 itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
-fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused to accept, which *is*
-backpressure, one layer further out than the worker's.
+fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused outright, which may
+be backpressure one layer further out than the worker's, or may be a misconfiguration. The stderr
+line carries the exception type that distinguishes them.
 
 `sink.failed` is an **upper bound** on loss, not a count of it. A sink that raises on total failure
 counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a
@@ -722,10 +723,9 @@ thread showed up only indirectly, as `dropped` climbing once the queue filled �
 pointing at the wrong fix.
 
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) not yet in a
-tagged release — so unpacking
-it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every field keeps its position
-when a new one is appended, so attribute and index access stay stable.
+fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) not yet in a tagged
+release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
+field keeps its position when a new one is appended, so attribute and index access stay stable.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
