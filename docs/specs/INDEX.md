@@ -33,7 +33,7 @@ to status only — no prose.
 | [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
 | [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
-| [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | In Progress | SPEC-017, SPEC-019 |
+| [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Completed | SPEC-017, SPEC-019 |
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Draft | SPEC-013, SPEC-019 |
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-008, SPEC-009, SPEC-020 |
 
@@ -105,10 +105,11 @@ Group related specs and record the order to build them in. Delete this section i
   function that had already returned (and emitted a contradictory second `span.end`), the orphan
   path propagated a sink's failure, and `shutdown()` raised out of `atexit` while leaving the sink
   open forever. It also brought `_open_span` into scope and shipped `_diag.py`.
-  **SPEC-029** before SPEC-026 — both use `_diag.py`, which SPEC-025 shipped and 029 owns. Twelve
-  sink sites
-  print `repr(exception)` against the arch §6 rule that `_terminal_failure` cites for not doing it,
-  and `_emit`'s one unguarded stderr write kills the drain thread on a broken stream.
+  **SPEC-029** before SPEC-026 (**shipped**) — both use `_diag.py`, which SPEC-025 shipped and 029
+  owns. Twelve sink sites printed `repr(exception)` against the arch §6 rule that
+  `_terminal_failure` cites for not doing it, and two unguarded stderr writes (`_emit` and
+  `SocketTransport`) killed the drain thread on a broken stream. All 28 sites are converted and a
+  test forbids any other module writing to stderr.
   **SPEC-026** then — the largest. Every remote transport absorbs its own failures and returns
   normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract are all inert
   against a down destination, while the counters that *do* record the loss have no accessor. It is

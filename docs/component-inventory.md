@@ -14,7 +14,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | context stack + baggage | `src/log_foundry/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
 | root-span context scope | `src/log_foundry/context.py` | `push_baggage_scope` / `pop_baggage_scope` — bracket a root span so baggage is restored and the adopted context cleared on exit; total, tolerates a foreign-context token (SPEC-024). |
 | `reset_context` | `src/log_foundry/context.py` | Public clear of baggage + adopted context, for callers who open no span (the orphan path) or adopt before dispatching into a child context. Never raises. |
-| `_diag.absorbed` | `src/log_foundry/_diag.py` | The library's own diagnostic channel: one stderr line per swallowed failure, exception **type** only (arch §6), total in itself. Must import nothing from its own package (SPEC-025; SPEC-029 owns it). |
+| diagnostic channel | `src/log_foundry/_diag.py` | `absorbed` / `lost` / `rejected` + `errno_of` — **every** stderr line the library writes about itself. Exception **type** only (arch §6), detail escaped then bounded, each write total in itself. A test forbids any other module writing to stderr. Must import nothing from its own package (SPEC-025, SPEC-029). |
 | `_begin` / `_end` | `src/log_foundry/decorator.py` | The `@trace` span lifecycle, guarded end to end — degraded setup rather than a failed call, one close per span, total teardown (SPEC-025). |
 | `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
 | `StdoutSink` | `src/log_foundry/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
