@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import gzip as _gzip
 import json
-import sys
 import time
 import urllib.error
 import urllib.request
 from base64 import b64encode
 from typing import TYPE_CHECKING, Any
+
+from log_foundry import _diag
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -128,7 +129,11 @@ class HTTPSink:
                 if attempt < self.max_retries:
                     self._sleep_backoff(attempt, None)
                     continue
-                self._abandon(f"connection error: {err!r}")
+                # The type plus the OS code, never the message: a ``URLError``'s text embeds the
+                # URL and whatever the resolver said (SPEC-029 FR-002).
+                self._abandon(
+                    f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
+                )
                 return None
             if 200 <= status < 300:
                 return payload
@@ -198,11 +203,14 @@ class HTTPSink:
         time.sleep(delay)
 
     def _abandon(self, reason: str) -> None:
-        """Count and log a request abandoned past the retry bound (FR-012)."""
+        """Count and log a request abandoned past the retry bound (FR-012).
+
+        ``reason`` carries only library-controlled values — an HTTP status, an exception type, an
+        ``errno`` — never a server-supplied body or an exception's text (SPEC-029 FR-002).
+        """
         self.failed += 1
-        sys.stderr.write(
-            f"log-foundry: {type(self).__name__} abandoned a request after "
-            f"{self.max_retries + 1} attempt(s) ({reason})\n"
+        _diag.lost(
+            "request", 1, f"{type(self).__name__}, {self.max_retries + 1} attempt(s), {reason}"
         )
 
 

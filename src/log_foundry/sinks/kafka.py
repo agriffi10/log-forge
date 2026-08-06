@@ -10,8 +10,9 @@ raised out of ``emit``.
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["KafkaSink"]
 
@@ -65,7 +66,34 @@ class KafkaSink:
         return str(value).encode("utf-8") if value is not None else None
 
     def _on_delivery(self, err: object, msg: object) -> None:
-        """confluent-kafka delivery callback: count and log failures (FR-002)."""
+        """confluent-kafka delivery callback: count and log failures (FR-002).
+
+        ``err`` is a ``KafkaError``, not an exception, so it goes to :func:`~_diag.lost` rather
+        than :func:`~_diag.absorbed`. Its ``str`` is a human message that can quote the record, so
+        only the type and the numeric ``code()`` are written — the code is librdkafka's own
+        enumeration and is what makes a delivery failure diagnosable (SPEC-029 FR-002).
+        """
         if err is not None:
             self.failed += 1
-            sys.stderr.write(f"log-foundry: KafkaSink delivery failed: {err!r}\n")
+            _diag.lost("message", 1, f"KafkaSink delivery, {type(err).__name__}{_code(err)}")
+
+
+def _code(err: object) -> str:
+    """Render a ``KafkaError``'s numeric code as ``" code=N"``, or ``""`` if it has none.
+
+    ``code()`` is a method on confluent-kafka's ``KafkaError``, returns one of librdkafka's
+    integer constants, and carries no caller data. Deliberately narrow: only an ``int`` is written,
+    so a stub or a future version returning something else contributes nothing rather than
+    smuggling text past the type-name rule.
+
+    Total, and the ``int()`` is inside the guard for the same reason ``_diag.errno_of`` puts it
+    there: ``isinstance(code, int)`` admits a *subclass*, whose ``__int__`` is Python that can
+    raise — and this runs in a delivery callback, so an escaping exception would surface from
+    ``emit`` and cost the whole batch. A diagnostic can never be the failure (SPEC-029 FR-003).
+    """
+    try:
+        code = getattr(err, "code", None)
+        value = code() if callable(code) else None
+        return f" code={int(value)}" if isinstance(value, int) else ""
+    except Exception:
+        return ""

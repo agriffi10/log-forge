@@ -10,8 +10,8 @@ without discarding the successfully-indexed items. OpenSearch speaks the same bu
 from __future__ import annotations
 
 import json
-import sys
 
+from log_foundry import _diag
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
@@ -61,7 +61,7 @@ class ElasticsearchSink(HTTPSink):
                 errors += 1
         if errors:
             self.item_errors += errors
-            sys.stderr.write(f"log-foundry: ElasticsearchSink saw {errors} failed bulk item(s)\n")
+            _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
 
 
 class OpenSearchSink(ElasticsearchSink):

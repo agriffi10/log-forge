@@ -20,12 +20,11 @@ def test_bulk_framing_action_and_source_lines() -> None:
     assert call["url"] == "http://es:9200/_bulk"
     assert call["headers"]["content-type"] == "application/x-ndjson"
     assert call["body"].decode("utf-8") == (
-        '{"index": {"_index": "logs"}}\n{"a": 1}\n'
-        '{"index": {"_index": "logs"}}\n{"b": 2}\n'
+        '{"index": {"_index": "logs"}}\n{"a": 1}\n{"index": {"_index": "logs"}}\n{"b": 2}\n'
     )
 
 
-def test_bulk_item_errors_are_counted() -> None:
+def test_bulk_item_errors_are_counted(capsys) -> None:
     response = FakeResponse(
         200,
         json.dumps(
@@ -42,6 +41,7 @@ def test_bulk_item_errors_are_counted() -> None:
     sink = ElasticsearchSink("http://es:9200", index="logs", opener=opener)
     sink.emit([{"a": 1}, {"b": 2}])
     assert sink.item_errors == 1  # only the errored item counts; the indexed one is retained
+    assert "lost 1 bulk item(s)" in capsys.readouterr().err
 
 
 def test_no_errors_flag_skips_item_parsing() -> None:

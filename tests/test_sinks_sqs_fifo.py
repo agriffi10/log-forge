@@ -397,6 +397,7 @@ def test_abandoned_sender_faults_name_the_sqs_code(capsys) -> None:
     SQSSink(STD_URL, client=client).emit([_event()])
 
     err = capsys.readouterr().err
+    assert "lost 1 message(s)" in err, "the line carries the count"
     assert "MissingParameter" in err, "the code is what makes the cause diagnosable"
     assert "not retried" in err
 

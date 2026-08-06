@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["NATSSink"]
 
@@ -64,7 +65,7 @@ class NATSSink:
                 await target.publish(self._subject, json.dumps(event).encode("utf-8"))
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 self.failed += 1
-                sys.stderr.write(f"log-foundry: NATSSink publish failed: {err!r}\n")
+                _diag.lost("event", 1, f"NATSSink publish, {type(err).__name__}")
 
     async def _drain(self) -> None:
         drain = getattr(self._client, "drain", None)

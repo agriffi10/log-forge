@@ -144,20 +144,26 @@ def test_retries_on_429_then_succeeds() -> None:
     assert sink.failed == 0
 
 
-def test_persistent_5xx_is_abandoned_and_counted() -> None:
+def test_persistent_5xx_is_abandoned_and_counted(capsys) -> None:
     opener = FakeOpener([FakeResponse(500, b"err")])
     sink = HTTPSink("http://x", max_retries=2, opener=opener)
     sink.emit([{"a": 1}])
     assert len(opener.calls) == 3  # initial + 2 retries
     assert sink.failed == 1
+    err = capsys.readouterr().err
+    assert "lost 1 request(s)" in err
+    assert "HTTP 500" in err, "the status is the library-controlled detail"
 
 
-def test_connection_error_is_retried_then_abandoned() -> None:
+def test_connection_error_is_retried_then_abandoned(capsys) -> None:
     opener = FakeOpener([urllib.error.URLError("boom")])
     sink = HTTPSink("http://x", max_retries=1, opener=opener)
     sink.emit([{"a": 1}])
     assert len(opener.calls) == 2  # initial + 1 retry
     assert sink.failed == 1
+    err = capsys.readouterr().err
+    assert "lost 1 request(s)" in err
+    assert "URLError" in err and "boom" not in err, "the type, never the message"
 
 
 def test_httperror_is_treated_as_a_response() -> None:

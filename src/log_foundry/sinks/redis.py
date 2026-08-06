@@ -11,9 +11,10 @@ shadows or requires the real ``redis`` package at import time.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
 
@@ -49,9 +50,10 @@ class _RedisSink:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += len(batch)
-                sys.stderr.write(
-                    f"log-foundry: {type(self).__name__} abandoned {len(batch)} event(s) after "
-                    f"{self.max_retries + 1} attempts ({err!r})\n"
+                _diag.lost(
+                    "event",
+                    len(batch),
+                    f"{type(self).__name__}, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
                 return
 

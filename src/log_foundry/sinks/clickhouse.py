@@ -9,10 +9,10 @@ idempotent ``MergeTree`` ``create_table`` convenience is off by default. Write-o
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
 
+from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 
 __all__ = ["ClickHouseSink"]
@@ -97,9 +97,10 @@ class ClickHouseSink:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += len(rows)
-                sys.stderr.write(
-                    f"log-foundry: ClickHouseSink abandoned {len(rows)} row(s) after "
-                    f"{self.max_retries + 1} attempts ({err!r})\n"
+                _diag.lost(
+                    "row",
+                    len(rows),
+                    f"ClickHouseSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
                 return
 

@@ -188,13 +188,14 @@ def test_worker_survives_emit_exception_and_keeps_processing() -> None:
     assert {"a", "b"} <= {e["message"] for e in sink.events}
 
 
-def test_batch_abandoned_after_retry_bound_is_counted() -> None:
+def test_batch_abandoned_after_retry_bound_is_counted(capsys) -> None:
     sink = AlwaysFailSink()
     w = Worker(sink, batch_size=1, flush_interval=0.02, max_retries=2)
     w.submit(_span("x"))
     w.shutdown()
 
     assert w.failed_batches >= 1, "an unrecoverable batch is counted, not silently dropped"
+    assert "lost 1 event(s)" in capsys.readouterr().err, "the line carries the count"
     assert sink.events == [], "nothing was ever successfully emitted"
     assert sink.attempts >= 3, "tried max_retries + 1 times before abandoning"
 

@@ -53,7 +53,7 @@ class FakeProducer:
 @pytest.fixture(autouse=True)
 def _identity_event_data(monkeypatch):
     """EventData(body) -> body, so the fake batch sees raw bytes (no azure dependency)."""
-    monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: (lambda body: body))
+    monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body)
 
 
 @pytest.fixture(autouse=True)
@@ -76,20 +76,22 @@ def test_packs_events_across_batches_by_size() -> None:
     assert len(producer.sent) > 1  # actually split into multiple batches
 
 
-def test_oversized_event_is_dropped() -> None:
+def test_oversized_event_is_dropped(capsys) -> None:
     producer = FakeProducer(max_bytes=30)
     sink = AzureEventHubsSink(producer=producer)
     sink.emit([{"pad": "x" * 100}, {"ok": 1}])
     assert sink.dropped_oversized == 1
+    assert "lost 1 event(s)" in capsys.readouterr().err
     sent_events = [json.loads(body) for batch in producer.sent for body in batch]
     assert sent_events == [{"ok": 1}]
 
 
-def test_send_failure_is_retried_then_counted() -> None:
+def test_send_failure_is_retried_then_counted(capsys) -> None:
     producer = FakeProducer(fail=True)
     sink = AzureEventHubsSink(producer=producer, max_retries=1)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.failed == 2  # whole batch abandoned after the bound
+    assert "lost 2 event(s)" in capsys.readouterr().err
 
 
 def test_close_closes_producer() -> None:

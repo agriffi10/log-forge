@@ -12,8 +12,9 @@ substitute a fake socket without any network access.
 from __future__ import annotations
 
 import socket
-import sys
 import time
+
+from log_foundry import _diag
 
 __all__ = ["SocketTransport"]
 
@@ -81,9 +82,15 @@ class SocketTransport:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += 1
-                sys.stderr.write(
-                    f"log-foundry: SocketTransport abandoned a message after "
-                    f"{self._max_retries + 1} attempt(s) ({err!r})\n"
+                # Guarded now (SPEC-029 FR-003): this runs on the worker thread, and the bare
+                # ``sys.stderr.write`` this replaced could end delivery for good. ``errno``
+                # because an ``OSError`` type name alone does not tell "connection refused" from
+                # "host unknown", and the code is an integer from the OS — not caller data.
+                _diag.lost(
+                    "message",
+                    1,
+                    f"SocketTransport, {self._max_retries + 1} attempt(s), "
+                    f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                 )
                 return
 

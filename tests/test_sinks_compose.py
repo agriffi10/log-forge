@@ -333,3 +333,21 @@ def test_worker_records_a_failed_batch_when_every_child_is_down() -> None:
         worker.shutdown()
 
     assert worker.failed_batches == 1
+
+
+def test_a_child_class_name_is_bounded(capsys: pytest.CaptureFixture[str]) -> None:
+    """A child's ``__name__`` is a runtime value, so it belongs in the bounded ``detail``.
+
+    ``_diag.absorbed`` bounds ``detail`` and not ``where`` — ``where`` is documented as a literal.
+    Put the class name in ``where`` and a generated or dynamically renamed class writes an
+    unbounded line (SPEC-029 FR-002).
+    """
+    huge = type("X" * 5000, (BoomSink,), {})
+
+    with pytest.raises(RuntimeError):
+        MultiSink(huge()).emit([ev()])
+
+    line = capsys.readouterr().err
+    assert len(line) < 400, "the class name went through the detail's bound"
+    assert line.endswith("…\n")
+    assert "XXXX" in line, "bounded, not dropped — the name is still the diagnosis"

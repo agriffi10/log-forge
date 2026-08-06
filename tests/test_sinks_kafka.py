@@ -63,13 +63,78 @@ def test_close_flushes() -> None:
     assert producer.flushes == 1
 
 
-def test_delivery_errors_are_counted() -> None:
+def test_delivery_errors_are_counted(capsys) -> None:
     producer = FakeProducer(deliver_error="broker down")
     sink = KafkaSink("logs", producer=producer)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.failed == 2
+    err = capsys.readouterr().err
+    assert err.count("lost 1 message(s)") == 2, "one line per failed delivery"
+    assert "broker down" not in err, "the driver's text is never written"
 
 
 def test_requires_bootstrap_servers_without_producer() -> None:
     with pytest.raises(ValueError):
         KafkaSink("logs")
+
+
+# -- SPEC-029 FR-002/FR-003: the delivery-error line -----------------------------------------
+
+
+class FakeKafkaError:
+    """A ``confluent_kafka.KafkaError``: a numeric ``code()`` and a leaky human ``str``.
+
+    Not an exception, which is why the sink reports it with ``_diag.lost`` rather than
+    ``_diag.absorbed`` — and why the code is the only part of it worth writing.
+    """
+
+    def __init__(self, code: int = -195) -> None:
+        self._code = code
+
+    def code(self) -> int:
+        return self._code
+
+    def __str__(self) -> str:
+        return "Local: Broker transport failure — record {'user': 'user@example.com'}"
+
+    __repr__ = __str__
+
+
+def test_a_delivery_error_reports_the_code_not_the_message(capsys) -> None:
+    sink = KafkaSink("logs", producer=FakeProducer(deliver_error=FakeKafkaError()))
+
+    sink.emit([{"a": 1}])
+
+    err = capsys.readouterr().err
+    assert "user@example.com" not in err, "the driver's text can quote the record (arch §6)"
+    assert "Broker transport failure" not in err
+    assert "FakeKafkaError" in err, "the type"
+    assert "code=-195" in err, "and librdkafka's own code, which is what makes it diagnosable"
+    assert sink.failed == 1
+
+
+class HostileCodeError(FakeKafkaError):
+    """A ``code()`` returning an ``int`` subclass whose ``__int__`` raises.
+
+    Contrived, but ``_code`` runs inside a delivery callback: an exception escaping it surfaces
+    from ``emit``, and the worker would then count and retry the whole batch because a *diagnostic*
+    failed. FR-003 says a diagnostic can never be the failure.
+    """
+
+    def code(self) -> object:  # type: ignore[override]
+        class Hostile(int):
+            def __int__(self) -> int:
+                raise ValueError("driver quirk")
+
+        return Hostile(7)
+
+
+def test_a_hostile_code_cannot_reach_the_caller(capsys) -> None:
+    sink = KafkaSink("logs", producer=FakeProducer(deliver_error=HostileCodeError()))
+
+    sink.emit([{"a": 1}])  # must not raise
+
+    err = capsys.readouterr().err
+    assert "lost 1 message(s)" in err, "the loss is still announced"
+    assert "code=" not in err, "the unusable code contributes nothing rather than failing"
+    assert sink.failed == 1

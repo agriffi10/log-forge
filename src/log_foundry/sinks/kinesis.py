@@ -10,9 +10,9 @@ unless a sink is built without an injected client. Each incoming batch is re-chu
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any
 
+from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 
@@ -77,9 +77,11 @@ class KinesisSink:
             data = json.dumps(event).encode("utf-8")
             if len(data) > self.MAX_RECORD_BYTES:
                 self.dropped_oversized += 1
-                sys.stderr.write(
-                    f"log-foundry: KinesisSink dropped an event of {len(data)} bytes exceeding "
-                    f"the {self.MAX_RECORD_BYTES}-byte per-record limit\n"
+                _diag.lost(
+                    "event",
+                    1,
+                    f"KinesisSink, {len(data)} bytes exceeds the "
+                    f"{self.MAX_RECORD_BYTES}-byte per-record limit",
                 )
                 continue
             key = str(event.get(self.partition_key_field) or "log-foundry")[:256]
@@ -96,10 +98,11 @@ class KinesisSink:
             verdict = adjudicate_positional(records, results)
             if verdict.unadjudicated:
                 self.dropped_unadjudicated += verdict.unadjudicated
-                sys.stderr.write(
-                    f"log-foundry: KinesisSink could not adjudicate a put_records response "
-                    f"({len(records)} record(s) sent, {len(results)} result(s) returned); "
-                    f"{verdict.unadjudicated} record(s) abandoned\n"
+                _diag.lost(
+                    "record",
+                    verdict.unadjudicated,
+                    f"KinesisSink could not adjudicate a put_records response ({len(records)} "
+                    f"record(s) sent, {len(results)} result(s) returned); abandoned, not retried",
                 )
                 return
             records = verdict.retry
@@ -107,8 +110,9 @@ class KinesisSink:
                 return
             if attempt >= self.max_retries:
                 self.failed += len(records)
-                sys.stderr.write(
-                    f"log-foundry: {len(records)} Kinesis record(s) still failing after "
-                    f"{self.max_retries + 1} attempts; abandoned\n"
+                _diag.lost(
+                    "record",
+                    len(records),
+                    f"KinesisSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
                 return

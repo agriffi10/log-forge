@@ -10,9 +10,10 @@ documents retained. Write-only — querying is the downstream tool's job.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from typing import Any
+
+from log_foundry import _diag
 
 __all__ = ["MongoDBSink"]
 
@@ -66,18 +67,18 @@ class MongoDBSink:
                     # do not retry (successes are already in, a retry would duplicate/re-error).
                     rejects = len(details["writeErrors"])
                     self.failed += rejects
-                    sys.stderr.write(
-                        f"log-foundry: MongoDBSink had {rejects} document(s) rejected by a bulk "
-                        f"write; the rest were inserted\n"
+                    _diag.lost(
+                        "document", rejects, "MongoDBSink bulk write; the rest were inserted"
                     )
                     return
                 if attempt < self.max_retries:
                     time.sleep(_BACKOFF_BASE * (2**attempt))
                     continue
                 self.failed += len(documents)
-                sys.stderr.write(
-                    f"log-foundry: MongoDBSink abandoned {len(documents)} document(s) after "
-                    f"{self.max_retries + 1} attempts ({err!r})\n"
+                _diag.lost(
+                    "document",
+                    len(documents),
+                    f"MongoDBSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
                 return
 
@@ -97,9 +98,7 @@ class MongoDBSink:
         for event in batch:
             if len(json.dumps(event).encode("utf-8")) > _MAX_DOC_BYTES:
                 self.dropped_oversized += 1
-                sys.stderr.write(
-                    "log-foundry: MongoDBSink dropped a document exceeding the 16 MB limit\n"
-                )
+                _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
                 continue
             documents.append(dict(event))
         return documents
