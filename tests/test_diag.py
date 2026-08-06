@@ -442,3 +442,54 @@ def test_the_enforcement_actually_sees_the_call_sites() -> None:
         len(_diag_calls(ast.parse(p.read_text(encoding="utf-8")))) for p in _SRC.rglob("*.py")
     )
     assert calls >= 30, f"expected the converted call sites to be found, saw {calls}"
+
+
+def _stderr_writes(tree: ast.AST) -> list[ast.Call]:
+    """Every ``sys.stderr.write(...)`` / ``stderr.write(...)`` call in a module.
+
+    Matched on the AST, not by grepping the source: ``sinks/_socket.py`` names
+    ``sys.stderr.write`` in a comment explaining what it replaced, and a text search would read
+    that as a violation — the sort of false positive that gets an enforcement test deleted.
+    """
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "stderr"
+    ]
+
+
+@pytest.mark.parametrize(
+    "path", sorted(p for p in _SRC.rglob("*.py") if p.name != "_diag.py"), ids=lambda p: p.name
+)
+def test_only_diag_writes_to_stderr(path: Path) -> None:
+    """One module owns every diagnostic line (SPEC-029 FR-001).
+
+    The twenty-odd sites this spec converted disagreed with each other precisely because each one
+    was written from scratch; a new bare write would start the drift again — and would arrive
+    unguarded, which on the worker thread ends delivery for good.
+
+    Referencing ``sys.stderr`` is still fine and deliberate: ``console.py`` and ``sinks/util.py``
+    use it as a *destination for the user's events*, which is the opposite direction from a
+    diagnostic about the library itself.
+    """
+    writes = _stderr_writes(ast.parse(path.read_text(encoding="utf-8")))
+    assert not writes, (
+        f"{path.name}:{writes[0].lineno} writes to stderr directly; "
+        f"use _diag.absorbed / _diag.lost / _diag.rejected"
+    )
+
+
+def test_the_stderr_walker_actually_matches_a_write() -> None:
+    """Guards the guard: a walker that matched nothing would pass every file vacuously.
+
+    The last case states the limitation rather than hiding it — a stream rebound to a bare name
+    is invisible to this check. That is a lint, not a sandbox: it catches the shape someone
+    actually writes when they reach for stderr, and nothing here defends against evasion.
+    """
+    assert len(_stderr_writes(ast.parse((_SRC / "_diag.py").read_text(encoding="utf-8")))) == 3
+    assert _stderr_writes(ast.parse("import sys\nsys.stderr.write('x')\n"))
+    assert _stderr_writes(ast.parse("from sys import stderr\nstderr.write('x')\n")) == []
