@@ -41,10 +41,12 @@ class SinkDeliveryError(Exception):
 class SinkLosses(NamedTuple):
     """What a sink discarded or could not confirm, cumulative for its lifetime (SPEC-026 FR-002).
 
-    Two fields rather than one because the remedies differ: ``dropped`` means the destination
-    could never have accepted the event as built (an oversized record), so the fix is upstream in
-    what the application logs; ``failed`` means delivery was attempted and the destination did not
-    confirm it, so the fix is the destination or the network.
+    Two fields rather than one because the remedies differ. ``dropped`` is an event the sink
+    discarded *before* attempting delivery — usually one the destination could never have accepted
+    as built (an oversized record), so the fix is upstream in what the application logs; for a sink
+    whose client owns a local buffer it also covers what that buffer refused, which is
+    backpressure. The stderr line names which. ``failed`` means delivery was attempted and the
+    destination did not confirm it, so the fix is the destination or the network.
 
     ``failed`` is an **upper bound** on loss, not a count of it. A sink that also raises on total
     failure counts the attempt here *and* hands the batch back to the worker, whose retry may

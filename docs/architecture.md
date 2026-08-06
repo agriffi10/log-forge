@@ -335,8 +335,10 @@ decorated call ends
 - **Graceful shutdown:** an `atexit` (and explicit `log_foundry.shutdown()`) hook drains
   the worker queue and `close()`s the sink so buffered events aren't lost on exit.
 - **Backpressure policy:** if the worker queue is full (sink is down / slow), default to
-  **drop-newest with a counted warning** rather than blocking the app. *(Open item — the
-  drop-vs-block tradeoff should be configurable; see §12.)*
+  **drop-newest with a counted warning** rather than blocking the app. Making drop-vs-block
+  configurable is **not built** and is a constraint rather than a wart — blocking would put sink
+  latency back on the caller's thread, which is the one thing this section exists to prevent
+  (§12, §13).
 - **"Retries with backoff on failure" means: on a failure the sink reports.** The worker can
   only retry what reaches it as an exception, so the guarantee is conditional on §8's
   raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no
@@ -345,8 +347,10 @@ decorated call ends
 - **Loss the sink absorbs on purpose is reported, not retried** — a partially-failed batch, an
   oversized record, an unadjudicable response. `health().sink` carries the configured sink's
   `losses()` snapshot so the documented alert idiom covers it; it is nested rather than folded
-  into the worker's own counters because `dropped` at the queue (backpressure) and `dropped` at
-  the sink (the destination could never accept it) have different remedies.
+  into the worker's own counters because `dropped` at the queue and `dropped` at the sink count
+  different things. The sink's is what never reached the wire — usually an event that can never
+  fit, but for the sinks whose client owns a local buffer (`KafkaSink`, `GooglePubSubSink`) also
+  what that buffer refused, which is backpressure one layer further out.
 
 ### 9.1 The sink is a durable buffer, not the final store
 

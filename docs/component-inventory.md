@@ -16,7 +16,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `reset_context` | `src/log_foundry/context.py` | Public clear of baggage + adopted context, for callers who open no span (the orphan path) or adopt before dispatching into a child context. Never raises. |
 | diagnostic channel | `src/log_foundry/_diag.py` | `absorbed` / `lost` / `rejected` + `errno_of` — **every** stderr line the library writes about itself. Exception **type** only (arch §6), detail escaped then bounded, each write total in itself. A test forbids any other module writing to stderr. Must import nothing from its own package (SPEC-025, SPEC-029). |
 | `_begin` / `_end` | `src/log_foundry/decorator.py` | The `@trace` span lifecycle, guarded end to end — degraded setup rather than a failed call, one close per span, total teardown (SPEC-025). |
-| `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement. |
+| `Sink` protocol | `src/log_foundry/sinks/base.py` | The `emit`/`close` output interface sinks implement (plus the loss contract below). |
 | `StdoutSink` | `src/log_foundry/sinks/stdout.py` | Zero-dependency JSON-lines sink (default). |
 | `SQSSink` | `src/log_foundry/sinks/sqs.py` | SQS sink (optional `aws` extra): lazy boto3, count/byte chunking, Failed-list retry, oversized drop. FIFO queues supported — `MessageGroupId` defaults to the event's `trace_id`, configurable; sender faults are not retried. |
 | `CallbackSink` | `src/log_foundry/sinks/callback.py` | Adapt any callable into a `Sink` (+ optional `on_close`); the escape hatch for unsupported destinations. |

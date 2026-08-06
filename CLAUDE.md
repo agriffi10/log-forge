@@ -355,7 +355,7 @@ where it starts.
   because there is nothing downstream to duplicate — which is also why partial failure must **not**
   raise (the worker retries whole batches). Absorbed loss goes to an optional `losses()`, aggregated
   into `Health.sink` and kept *nested*: `dropped` at the queue is backpressure, `dropped` at the sink
-  is an event the destination could never accept, and one number would hide which fix applies.
+  is an event that never reached the wire, and one number would hide which fix applies.
   `losses()` is probed by name rather than declared on the Protocol, so a pre-SPEC-026 sink still
   satisfies `Sink`. Three cases stay silent by prior decision — an unadjudicable response (SPEC-018:
   cannot prove nothing landed, so a retry may duplicate), an SQS sender fault (SPEC-016: provably

@@ -58,13 +58,13 @@ sends one envelope per event, so it isolates per-event failures and raises only 
   positional and attribute access to every earlier field are unchanged.
 - **`HTTPSink._send` returns `bytes`, not `bytes | None`.** Every caller spelled `None` as "nothing
   to parse" and the worker read it as a successful emit. `_abandon` is now `NoReturn`.
-- **Sinks raise where they used to return.** Nineteen existing per-sink tests that asserted
+- **Sinks raise where they used to return.** Eighteen existing per-sink tests that asserted
   "abandoned and returned" now assert the raise. Anything catching only its driver's exceptions
   around an `emit` should add `SinkDeliveryError`.
 - **`max_retries` is floored at zero in all twelve sink retry loops**, as `Worker._emit` already
   floors its own (SPEC-021). A negative value made `range(max_retries + 1)` empty: in `HTTPSink`
-  that abandoned with no attempt and no counter; in the other ten it *returned normally*, a silent
-  success.
+  and `SocketTransport` that abandoned with no attempt and no counter; in the other ten it
+  *returned normally*, a silent success.
 - **`ElasticsearchSink` gained `dropped_unadjudicated`**, and adjudicates its `_bulk` response
   through `_batch.usable_results` — the SPEC-018 helper, now used outside the two sinks it was
   written for.

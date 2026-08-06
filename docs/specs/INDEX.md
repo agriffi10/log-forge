@@ -110,10 +110,10 @@ Group related specs and record the order to build them in. Delete this section i
   `_terminal_failure` cites for not doing it, and two unguarded stderr writes (`_emit` and
   `SocketTransport`) killed the drain thread on a broken stream. All 28 sites are converted and a
   test forbids any other module writing to stderr.
-  **SPEC-026** then — the largest. Every remote transport absorbs its own failures and returns
-  normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract are all inert
-  against a down destination, while the counters that *do* record the loss have no accessor. It is
-  SPEC-017 FR-004's rule generalized to the whole sink family.
+  **SPEC-026** (**shipped**) — the largest. Every remote transport absorbed its own failures and
+  returned normally, so `failed_batches`, the worker's retry and SPEC-021's `flush()` contract were
+  all inert against a down destination, while the counters that *did* record the loss had no
+  accessor. SPEC-017 FR-004's rule, generalized to the whole sink family.
   **SPEC-027** and **SPEC-028** may go in either order after 026, and both touch every sink: 027
   bounds a server-supplied `Retry-After` (a measured 22 s `shutdown()` hang, and 24 h is reachable)
   and makes every sink wait interruptible; 028 states the concurrency contract the orphan path has

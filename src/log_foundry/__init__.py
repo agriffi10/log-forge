@@ -77,10 +77,11 @@ def health() -> Health:
     *sink* absorbed rather than the worker, which the worker's counters cannot see (SPEC-026).
     It is ``None`` when no worker exists and when the sink reports nothing, since ``losses()`` is
     optional. Its ``dropped`` is not the worker's: the worker's is backpressure at the queue, the
-    sink's is an event the destination could never have accepted — different fixes, so not one
-    number. Its ``failed`` is an upper bound on loss, not a count of it: a sink that raises on
-    total failure counts the attempt *and* hands the batch back, and the worker's retry may then
-    deliver it.
+    sink's is an event that never reached the wire — usually one too large to ever fit, and for the
+    sinks whose client owns a local buffer (Kafka, Pub/Sub) also what that buffer refused. The
+    stderr line names which. Its ``failed`` is an upper bound on loss, not a count of it: a sink
+    that raises on total failure counts the attempt *and* hands the batch back, and the worker's
+    retry may then deliver it.
 
     A process that has never logged has no worker, and asking after its health does not create
     one — the snapshot is simply zeroed. Valid after :func:`shutdown`, which leaves the final

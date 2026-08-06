@@ -1117,4 +1117,4 @@ def test_the_sink_protocol_documents_both_rules() -> None:
     doc = Sink.emit.__doc__ or ""
     assert "delivered nothing" in doc, "the raise-on-total-failure rule"
     assert "Do not raise on partial failure" in doc
-    assert "never raises" in (Sink.emit.__doc__ or "") or "no-op" in doc
+    assert "no-op and never raises" in doc, "the empty-batch rule"

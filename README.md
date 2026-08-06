@@ -699,14 +699,16 @@ They tell you different things, and they want different responses:
 | `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Tune `batch_size`/`flush_interval`, or scale the sink. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
-| `sink.dropped` | The sink discarded events it could never send — an oversized record, most often. | Fix what you log: shrink the field. Scaling the destination will not help. |
+| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client's local buffer refused. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) means the client is saturated. |
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
-the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields mean
-different things and have different fixes: the worker's is backpressure at the queue, the sink's is
-an event the destination could never have accepted however fast it was. That is why they are not
-one number.
+the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
+different things: the worker's is backpressure at *its* queue, the sink's is an event that never
+reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
+itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
+fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused to accept, which *is*
+backpressure, one layer further out than the worker's.
 
 `sink.failed` is an **upper bound** on loss, not a count of it. A sink that raises on total failure
 counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a
@@ -720,7 +722,8 @@ thread showed up only indirectly, as `dropped` climbing once the queue filled �
 pointing at the wrong fix.
 
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) since — so unpacking
+fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) not yet in a
+tagged release — so unpacking
 it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every field keeps its position
 when a new one is appended, so attribute and index access stay stable.
 
