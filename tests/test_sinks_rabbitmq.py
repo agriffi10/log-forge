@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.rabbitmq import RabbitMQSink
 
 
@@ -66,7 +66,7 @@ def test_publishes_persistent_message_per_event() -> None:
 def test_reconnects_after_channel_error() -> None:
     conn = FakeConnection(fail_channels=1)  # first channel fails, reconnect succeeds
     sink = RabbitMQSink(exchange="logs", routing_key="rk", connection=conn, max_retries=2)
-    sink.emit([{"a": 1}])
+    sink.emit([{"a": 1}])  # the reconnect published it, so nothing failed
     assert sink.failed == 0
     assert len(conn.channels) == 2
     assert len(conn.channels[1].published) == 1
@@ -75,7 +75,8 @@ def test_reconnects_after_channel_error() -> None:
 def test_persistent_failure_is_counted(capsys) -> None:
     conn = FakeConnection(fail_channels=99)  # every reconnect also fails
     sink = RabbitMQSink(exchange="logs", routing_key="rk", connection=conn, max_retries=2)
-    sink.emit([{"a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])  # the broker took nothing (SPEC-026 FR-001)
     assert len(conn.channels) == 3  # initial + 2 retries, each a fresh channel
     assert sink.failed == 1
     assert "lost 1 message(s)" in capsys.readouterr().err

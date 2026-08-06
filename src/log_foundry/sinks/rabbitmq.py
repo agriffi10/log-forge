@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RabbitMQSink"]
 
@@ -45,17 +46,32 @@ class RabbitMQSink:
         self._exchange = exchange
         self._routing_key = routing_key
         self._url = url
-        self._max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value abandoned
+        # each message with no attempt made and no counter moved.
+        self._max_retries = max(max_retries, 0)
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
         self._channel: Any = None
         self._properties: Any = None
         self.failed = 0
 
+    def losses(self) -> SinkLosses:
+        """Messages abandoned past the reconnect-retry bound (SPEC-026 FR-002). Never raises."""
+        return SinkLosses(dropped=0, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publish one persistent message per event, reconnecting on error (FR-006)."""
+        """Publish one persistent message per event, reconnecting on error (FR-006).
+
+        Raises when *no* message reached the broker (SPEC-026 FR-001) — a down broker is the
+        case the worker's retry and ``failed_batches`` exist for. A partial publish is counted
+        and left alone: retrying it would re-publish the messages already on the exchange.
+        """
+        published = 0
         for event in batch:
-            self._publish(json.dumps(event).encode("utf-8"))
+            if self._publish(json.dumps(event).encode("utf-8")):
+                published += 1
+        if batch and not published:
+            raise SinkDeliveryError(f"RabbitMQSink published none of {len(batch)} message(s)")
 
     def close(self) -> None:
         """Close the channel and (owned) connection; idempotent (FR-006)."""
@@ -68,7 +84,8 @@ class RabbitMQSink:
 
     # -- internals ----------------------------------------------------------------------
 
-    def _publish(self, body: bytes) -> None:
+    def _publish(self, body: bytes) -> bool:
+        """Publish one message within the retry bound; ``False`` once it is abandoned."""
         for attempt in range(self._max_retries + 1):
             try:
                 self._active_channel().basic_publish(
@@ -77,7 +94,7 @@ class RabbitMQSink:
                     body=body,
                     properties=self._persistent_properties(),
                 )
-                return
+                return True
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 self._reset()
                 if attempt < self._max_retries:
@@ -89,7 +106,8 @@ class RabbitMQSink:
                     1,
                     f"RabbitMQSink, {self._max_retries + 1} attempts, {type(err).__name__}",
                 )
-                return
+                return False
+        return False  # unreachable: the loop returns on every path (mypy needs the exit)
 
     def _active_channel(self) -> Any:
         if self._connection is None:

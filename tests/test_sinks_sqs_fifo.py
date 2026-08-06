@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.sqs import DEFAULT_GROUP_ID, MAX_ID_LEN, SQSSink
 
 FIFO_URL = "https://sqs.example/q.fifo"
@@ -371,12 +372,19 @@ def test_sender_fault_entries_are_not_resent() -> None:
 
     assert len(client.calls) == 1, "a deterministic rejection is never worth re-sending"
     assert sink.failed == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=2), (
+        "lost and reported — but not raised, or the worker's retry would re-send them "
+        "byte-identical, which is what FR-006 refuses (SPEC-026 FR-001)"
+    )
 
 
 def test_non_sender_faults_are_still_retried_under_the_bound() -> None:
     client = FaultingClient(sender_fault=False, code="InternalError")
     sink = SQSSink(STD_URL, client=client, max_retries=3)
-    sink.emit([_event()])
+    with pytest.raises(SinkDeliveryError):
+        # Retryable and still failing at the bound: a genuine total failure, so the worker
+        # gets its signal (SPEC-026 FR-001). A sender fault would not raise — see below.
+        sink.emit([_event()])
 
     assert len(client.calls) == 4, "1 attempt + 3 retries"
     assert sink.failed == 1
@@ -385,7 +393,8 @@ def test_non_sender_faults_are_still_retried_under_the_bound() -> None:
 def test_mixed_response_retries_only_the_retryable_entries() -> None:
     client = MixedFaultClient()
     sink = SQSSink(STD_URL, client=client, max_retries=2)
-    sink.emit([_event(log_id=f"log-{i}") for i in range(3)])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([_event(log_id=f"log-{i}") for i in range(3)])  # nothing landed
 
     assert [len(call) for call in client.calls] == [3, 2, 2], "entry '0' drops out after call 1"
     assert all(e["Id"] != "0" for call in client.calls[1:] for e in call)
@@ -413,7 +422,8 @@ def test_a_missing_sender_fault_flag_degrades_to_retrying() -> None:
             return {"Successful": [], "Failed": [{"Id": e["Id"], "Code": "Weird"} for e in Entries]}
 
     client = NoFlagClient()
-    SQSSink(STD_URL, client=client, max_retries=2).emit([_event()])
+    with pytest.raises(SinkDeliveryError):
+        SQSSink(STD_URL, client=client, max_retries=2).emit([_event()])
     assert len(client.calls) == 3
 
 

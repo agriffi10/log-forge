@@ -15,6 +15,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["PostgresSink"]
 
@@ -39,7 +40,9 @@ class PostgresSink:
     ) -> None:
         self._table = valid_identifier(table)
         self._chunk_size = chunk_size
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # having attempted no insert at all, and reported success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
         self._closed = False
         self._owns_connection = connection is None
@@ -54,8 +57,17 @@ class PostgresSink:
         if create_table:
             self._ensure_schema()
 
+    def losses(self) -> SinkLosses:
+        """Events abandoned past the retry bound (SPEC-026 FR-002). Never raises."""
+        return SinkLosses(dropped=0, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Insert the whole batch in one transaction, rolling back and retrying on error (FR-004)."""
+        """Insert the whole batch in one transaction, rolling back and retrying on error (FR-004).
+
+        One transaction, rolled back on failure, so a batch past the retry bound inserted
+        *nothing*: it is counted and then raised (SPEC-026 FR-001). The rollback is what makes
+        the worker's retry safe here — there are no committed rows to duplicate.
+        """
         if not batch:
             return
         for attempt in range(self.max_retries + 1):
@@ -80,7 +92,9 @@ class PostgresSink:
                     len(batch),
                     f"PostgresSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
-                return
+                raise SinkDeliveryError(
+                    f"PostgresSink inserted none of {len(batch)} event(s)"
+                ) from None
 
     def close(self) -> None:
         """Commit pending work; close only an owned connection; idempotent (FR-005)."""

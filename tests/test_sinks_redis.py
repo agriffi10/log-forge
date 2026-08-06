@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
 
 
@@ -79,7 +79,8 @@ def test_list_rpush_pipelined() -> None:
 def test_connection_error_retried_then_counted(capsys) -> None:
     client = FakeRedis(fail=True)
     sink = RedisStreamsSink("s", client=client, max_retries=2)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # one pipeline, all or nothing (SPEC-026 FR-001)
     assert len(client.pipelines) == 3  # initial + 2 retries
     assert sink.failed == 2  # whole batch abandoned
     assert "lost 2 event(s)" in capsys.readouterr().err

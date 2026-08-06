@@ -12,6 +12,7 @@ import json
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["GooglePubSubSink"]
 
@@ -27,13 +28,41 @@ class GooglePubSubSink:
         self.topic = topic
         self.client = client
         self.failed = 0
+        self.rejected = 0
         self._futures: list[Any] = []
 
+    def losses(self) -> SinkLosses:
+        """Refused publishes and futures that resolved to an error (SPEC-026 FR-002).
+
+        ``failed`` only moves when the futures are resolved, which happens in :meth:`close` —
+        so a long-lived process reads zero here until it shuts down. That is a property of the
+        client's asynchronous publish, not of this accessor. Never raises.
+        """
+        return SinkLosses(dropped=self.rejected, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publish one message per event, retaining each future for flush on close (FR-008)."""
+        """Publish one message per event, retaining each future for flush on close (FR-008).
+
+        ``publish()`` is a local hand-off returning a future, so a refusal here is the only
+        failure this call can observe; it is isolated per event and raises only when *every*
+        event was refused (SPEC-026 FR-001). Letting the first refusal propagate would hand the
+        worker a batch whose earlier events are already in flight, and the retry would duplicate
+        them.
+        """
+        published = 0
         for event in batch:
-            future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
+            try:
+                future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
+            except Exception as err:  # isolation boundary: one event must not fail the batch
+                self.rejected += 1
+                _diag.lost("event", 1, f"GooglePubSubSink publish, {type(err).__name__}")
+                continue
             self._futures.append(future)
+            published += 1
+        if batch and not published:
+            raise SinkDeliveryError(
+                f"GooglePubSubSink published none of {len(batch)} event(s)"
+            )
 
     def close(self) -> None:
         """Resolve all pending publish futures, counting/logging errors; idempotent (FR-008)."""

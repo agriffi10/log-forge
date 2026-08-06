@@ -35,6 +35,7 @@ from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SQSSink"]
 
@@ -95,7 +96,9 @@ class SQSSink:
             client = boto3.client("sqs")
         self.queue_url = queue_url
         self.client = client
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # from ``_send`` having sent nothing, and reported success.
+        self.max_retries = max(max_retries, 0)
         # AWS requires every FIFO queue name to end in '.fifo', so the suffix is a contract
         # rather than a guess — but an explicit flag still wins. Decided once, not per emit.
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
@@ -104,10 +107,45 @@ class SQSSink:
         self.dropped_oversized = 0  # events too large to ever fit one message
         self.failed = 0  # entries still failing after the retry bound
 
+    def losses(self) -> SinkLosses:
+        """Oversized drops and entries still failing past the retry bound (FR-002).
+
+        Sender faults land in ``failed`` alongside the retry-exhausted entries: SQS rejected the
+        request itself, so the entry is as lost as one that timed out, and SPEC-016 settled that
+        it must not be re-sent byte-identical. Never raises.
+        """
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunk ``batch`` to SQS limits and send each chunk (FR-001, FR-002)."""
+        """Re-chunk ``batch`` to SQS limits and send each chunk (FR-001, FR-002).
+
+        Raises when every chunk failed and at least one was sent (SPEC-026 FR-001). An event
+        dropped for exceeding the message limit is not a send failure — it can never fit — so a
+        batch of nothing but oversized events produces no chunks and does not raise; it is
+        reported through ``losses().dropped``.
+
+        Nor does a batch whose chunks SQS rejected *entirely* as sender faults. Those entries
+        are lost, but re-sending them byte-identical can only fail the same way, and SPEC-016
+        FR-006 settled that they are abandoned rather than retried — so making the worker retry
+        them would undo that decision one level up. They are reported through ``losses().failed``.
+
+        That suppression is conditional, not batch-wide. If any chunk was lost for a *retryable*
+        reason — a throttle, an internal error, still failing at the bound — the raise stands,
+        because those events are recoverable and nothing landed for the retry to duplicate. The
+        cost is that the sender-fault chunk is re-sent and re-rejected alongside them, which is
+        futile but harmless; silently dropping recoverable events to avoid it would be the
+        failure SPEC-026 exists to remove. A batch of nothing *but* sender faults still keeps
+        FR-006 exactly.
+        """
+        chunks = delivered = 0
+        recoverable_loss = False
         for chunk in self._chunks(batch):
-            self._send(chunk)
+            chunks += 1
+            accepted, retryable_lost = self._send(chunk)
+            delivered += accepted
+            recoverable_loss = recoverable_loss or retryable_lost
+        if chunks and not delivered and recoverable_loss:
+            raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """No-op: the sink buffers nothing internally (FR-005)."""
@@ -192,8 +230,14 @@ class SQSSink:
             chunks.append(current)
         return chunks
 
-    def _send(self, prepared: list[_Prepared]) -> None:
+    def _send(self, prepared: list[_Prepared]) -> tuple[int, bool]:
         """Send one valid chunk, retrying only the ``Failed`` entries with a bounded count.
+
+        Returns ``(accepted, retryable_lost)``. ``accepted`` lets ``emit`` tell "nothing landed"
+        from a partial success (SPEC-026 FR-001); ``retryable_lost`` says whether anything was
+        given up on that a re-send could plausibly recover. A chunk SQS rejected wholesale as
+        invalid reports ``False`` there, because re-sending those entries byte-identical can
+        only fail the same way (SPEC-016 FR-006).
 
         Successfully-sent entries are never re-sent; entries still failing past ``max_retries``
         are counted (``failed``) and logged, not silently dropped (FR-003). The FIFO parameters
@@ -213,11 +257,21 @@ class SQSSink:
             if item.dedup_id is not None:
                 entry["MessageDeduplicationId"] = item.dedup_id
             entries.append(entry)
+        accepted = 0
         for attempt in range(self.max_retries + 1):
             response = self.client.send_message_batch(QueueUrl=self.queue_url, Entries=entries)
             failed = response.get("Failed", [])
+            # Accumulated per attempt, not derived at the end: after the first response
+            # ``entries`` is already narrowed to the failures, so each round's difference is
+            # what that round put on the queue.
+            # Matched by ``Id`` rather than counted: a ``Failed`` array carrying a duplicate or
+            # an unknown id would otherwise understate ``accepted`` — possibly below zero — and
+            # turn a partial success into a false "nothing landed". Unreachable from real SQS,
+            # guarded anyway because the cost is one set intersection.
+            failed_ids = {item.get("Id") for item in failed}
+            accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
             if not failed:
-                return
+                return accepted, False
             # Abandon sender faults immediately and name the code: the retry would re-send the
             # entry byte-identical, and the code is the only thing that makes a rejection
             # diagnosable from the log line alone. A missing flag is treated as retryable, so
@@ -237,7 +291,10 @@ class SQSSink:
 
             retryable_ids = {item["Id"] for item in failed if not item.get("SenderFault")}
             if not retryable_ids:
-                return
+                # Everything left is a sender fault: counted, and not worth re-sending
+                # (SPEC-016 FR-006). ``False`` keeps this chunk alone from making ``emit``
+                # report a total failure the worker would answer with that re-send.
+                return accepted, False
             entries = [entry for entry in entries if entry["Id"] in retryable_ids]
             if attempt >= self.max_retries:
                 self.failed += len(entries)
@@ -246,4 +303,5 @@ class SQSSink:
                     len(entries),
                     f"SQSSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
-                return
+                return accepted, True
+        return accepted, False  # unreachable: the loop returns on every path

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 
-from log_foundry.sinks.base import Sink
+import pytest
+
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.nats import NATSSink
 
 
@@ -64,7 +66,8 @@ def test_jetstream_path_publishes_via_jetstream() -> None:
 def test_publish_errors_counted(capsys) -> None:
     client = FakeNATS(fail=True)
     sink = NATSSink("logs", client=client)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # nothing published (SPEC-026 FR-001)
     sink.close()
     assert sink.failed == 2
     assert capsys.readouterr().err.count("lost 1 event(s)") == 2

@@ -7,6 +7,8 @@ fake sockets/openers — so no test touches the network.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
@@ -681,3 +683,418 @@ def test_an_error_under_a_second_action_key_is_still_an_error() -> None:
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])  # the one event was rejected, so nothing was indexed
     assert sink.item_errors == 1
+
+
+# ============================================================================================
+# Phase 3 — the queue, stream and database sinks (SPEC-026 FR-001, FR-002)
+# ============================================================================================
+
+
+def _worker_sees(sink) -> tuple[int, bool]:
+    """Drive one batch through a real Worker; return (failed_batches, flush_verdict)."""
+    worker = Worker(sink, batch_size=1, max_retries=0)
+    try:
+        worker.submit(_span("a"))
+        verdict = worker.flush(timeout=2.0)
+        return worker.health().failed_batches, verdict
+    finally:
+        worker.shutdown()
+
+
+def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> None:
+    """The two assertions SPEC-026 was written from, against each shipped remote transport."""
+    from log_foundry.sinks.clickhouse import ClickHouseSink
+    from log_foundry.sinks.eventhubs import AzureEventHubsSink
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.postgres import PostgresSink
+    from log_foundry.sinks.rabbitmq import RabbitMQSink
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from log_foundry.sinks.sns import SNSSink
+    from log_foundry.sinks.sqs import SQSSink
+    from test_sinks_clickhouse import FakeClickHouse
+    from test_sinks_eventhubs import FakeProducer
+    from test_sinks_firehose import FakeFirehose
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_mongodb import FakeCollection
+    from test_sinks_mongodb import make_sink as make_mongo_sink
+    from test_sinks_postgres import FakeConnection as FakePG
+    from test_sinks_rabbitmq import FakeConnection as FakeAMQP
+    from test_sinks_redis import FakeRedis
+    from test_sinks_sns import FakeSNS
+    from test_sinks_sqs_fifo import FaultingClient
+
+    # EventData(body) -> body, so the fake producer sees raw bytes and no azure import is
+    # attempted (the same seam test_sinks_eventhubs.py patches).
+    monkeypatch.setattr(
+        "log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body
+    )
+    body = json.dumps({"event": "a"}).encode("utf-8")
+    sinks = [
+        RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=0),
+        PostgresSink("logs", connection=FakePG(fail_times=-1), max_retries=0),
+        ClickHouseSink("logs", client=FakeClickHouse(fail_times=-1), max_retries=0),
+        make_mongo_sink(
+            FakeCollection(error=RuntimeError("down"), error_times=-1), max_retries=0
+        ),
+        RabbitMQSink(
+            exchange="e", routing_key="r", connection=FakeAMQP(fail_channels=99), max_retries=0
+        ),
+        AzureEventHubsSink(producer=FakeProducer(fail=True), max_retries=0),
+        SQSSink("https://q/x", client=FaultingClient(sender_fault=False), max_retries=0),
+        SNSSink("arn", client=FakeSNS(always_fail={"0"}), max_retries=0),
+        KinesisSink("s", client=FakeKinesis(always_fail={body}), max_retries=0),
+        FirehoseSink("s", client=FakeFirehose(always_fail={body}), max_retries=0),
+    ]
+    for sink in sinks:
+        failed_batches, delivered = _worker_sees(sink)
+        assert failed_batches == 1, type(sink).__name__
+        assert delivered is False, type(sink).__name__
+        losses = read_losses(sink)
+        assert losses is not None and losses.failed >= 1, type(sink).__name__
+
+
+def test_kafka_raises_only_when_every_produce_was_refused() -> None:
+    from log_foundry.sinks.kafka import KafkaSink
+
+    class Producer:
+        def __init__(self, refuse_from: int = 0) -> None:
+            self.produced: list[bytes] = []
+            self._refuse_from = refuse_from
+
+        def produce(self, topic, value, key, callback) -> None:
+            if len(self.produced) >= self._refuse_from:
+                raise BufferError("local queue full")
+            self.produced.append(value)
+
+        def poll(self, _timeout) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+    sink = KafkaSink("t", producer=Producer(refuse_from=0))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+
+    partial = KafkaSink("t", producer=Producer(refuse_from=1))
+    partial.emit([{"a": 1}, {"b": 2}])  # one was accepted: retrying would duplicate it
+    assert partial.losses() == SinkLosses(dropped=1, failed=0)
+
+
+def test_pubsub_raises_only_when_every_publish_was_refused() -> None:
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+
+    class Client:
+        def __init__(self, refuse_from: int = 0) -> None:
+            self.calls = 0
+            self._refuse_from = refuse_from
+
+        def publish(self, topic, data):
+            self.calls += 1
+            if self.calls > self._refuse_from:
+                raise RuntimeError("no credentials")
+            return object()
+
+    sink = GooglePubSubSink("t", client=Client(refuse_from=0))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+
+    partial = GooglePubSubSink("t", client=Client(refuse_from=1))
+    partial.emit([{"a": 1}, {"b": 2}])
+    assert partial.losses() == SinkLosses(dropped=1, failed=0)
+
+
+def test_a_partly_delivered_batch_never_raises() -> None:
+    """A retry there re-delivers what already landed — worse than the counted loss."""
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.sns import SNSSink
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_sns import FakeSNS
+
+    first = json.dumps({"trace_id": "t1", "a": 1}).encode("utf-8")
+    kinesis = KinesisSink("s", client=FakeKinesis(always_fail={first}), max_retries=0)
+    kinesis.emit([{"trace_id": "t1", "a": 1}, {"trace_id": "t2", "a": 2}])
+    assert kinesis.failed == 1
+
+    sns = SNSSink("arn", client=FakeSNS(always_fail={"0"}), max_retries=0)
+    sns.emit([{"a": 1}, {"b": 2}])
+    assert sns.failed == 1
+
+
+def test_an_all_oversized_batch_reports_drops_and_does_not_raise() -> None:
+    """An event that can never fit has nothing to retry, so it is not a delivery failure."""
+    from log_foundry.sinks.kinesis import KinesisSink
+    from test_sinks_kinesis import FakeKinesis
+
+    sink = KinesisSink("s", client=FakeKinesis())
+    sink.emit([{"pad": "x" * (1024 * 1024 + 100)}])  # no chunk is produced at all
+    assert sink.losses() == SinkLosses(dropped=1, failed=0)
+
+
+def test_an_empty_batch_never_raises_on_any_phase_3_sink() -> None:
+    from log_foundry.sinks.clickhouse import ClickHouseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from log_foundry.sinks.sqs import SQSSink
+    from test_sinks_clickhouse import FakeClickHouse
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_redis import FakeRedis
+    from test_sinks_sqs_fifo import FaultingClient
+
+    for sink in (
+        RedisStreamsSink("s", client=FakeRedis(fail=True)),
+        ClickHouseSink("logs", client=FakeClickHouse(fail_times=-1)),
+        KinesisSink("s", client=FakeKinesis(always_fail={b"x"})),
+        SQSSink("https://q/x", client=FaultingClient(sender_fault=False)),
+    ):
+        sink.emit([])  # must not raise: an empty batch has not failed to deliver
+
+
+def test_a_negative_max_retries_still_makes_one_attempt_on_every_retry_loop() -> None:
+    """``Worker._emit`` floors its own (SPEC-021); an unfloored loop reports silent success."""
+    from log_foundry.sinks.clickhouse import ClickHouseSink
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from test_sinks_clickhouse import FakeClickHouse
+    from test_sinks_redis import FakeRedis
+
+    redis_client = FakeRedis(fail=True)
+    with pytest.raises(SinkDeliveryError):
+        RedisStreamsSink("s", client=redis_client, max_retries=-1).emit([{"a": 1}])
+    assert len(redis_client.pipelines) == 1
+
+    ch_client = FakeClickHouse(fail_times=-1)
+    with pytest.raises(SinkDeliveryError):
+        ClickHouseSink("logs", client=ch_client, max_retries=-1).emit([{"a": 1}])
+    assert len(ch_client.inserts) == 1
+
+
+def test_an_unadjudicable_chunk_does_not_make_emit_raise() -> None:
+    """SPEC-018 abandons it rather than re-sending; raising would be that re-send."""
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from test_sinks_firehose import MalformedFirehose
+    from test_sinks_kinesis import MalformedKinesis
+
+    kinesis = KinesisSink("s", client=MalformedKinesis(None))
+    kinesis.emit([{"a": 1}])
+    assert kinesis.losses() == SinkLosses(dropped=0, failed=1)
+
+    firehose = FirehoseSink("s", client=MalformedFirehose(None))
+    firehose.emit([{"a": 1}])
+    assert firehose.losses() == SinkLosses(dropped=0, failed=1)
+
+
+def test_nats_reports_its_losses_and_raises_only_on_a_total_failure() -> None:
+    """NATS drives its own loop, so it sits outside the shared worker loop above."""
+    from log_foundry.sinks.nats import NATSSink
+    from test_sinks_nats import FakeNATS
+
+    dead = NATSSink("logs", client=FakeNATS(fail=True))
+    try:
+        with pytest.raises(SinkDeliveryError):
+            dead.emit([{"a": 1}, {"b": 2}])
+        assert read_losses(dead) == SinkLosses(dropped=0, failed=2)
+    finally:
+        dead.close()
+
+    live = NATSSink("logs", client=FakeNATS())
+    try:
+        live.emit([{"a": 1}])
+        assert read_losses(live) == SinkLosses(dropped=0, failed=0)
+    finally:
+        live.close()
+
+
+# --- Phase 3 review follow-ups -------------------------------------------------------------
+
+
+def test_an_oversized_event_does_not_cause_a_phantom_eventhubs_send(monkeypatch) -> None:
+    """The SDK returns immediately on an empty batch — that is not a delivery anyone made."""
+    from log_foundry.sinks.eventhubs import AzureEventHubsSink
+    from test_sinks_eventhubs import FakeBatch
+
+    monkeypatch.setattr(
+        "log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body
+    )
+
+    class SDKFaithfulProducer:
+        """``send_batch`` short-circuits an empty batch, as azure-eventhub's does."""
+
+        def __init__(self, max_bytes: int) -> None:
+            self.sizes: list[int] = []
+            self._max = max_bytes
+
+        def create_batch(self) -> FakeBatch:
+            return FakeBatch(self._max)
+
+        def send_batch(self, batch: FakeBatch) -> None:
+            self.sizes.append(len(batch))
+            if len(batch) == 0:
+                return  # the SDK never contacts the hub
+            raise RuntimeError("hub is down")
+
+        def close(self) -> None:
+            pass
+
+    producer = SDKFaithfulProducer(max_bytes=64)
+    sink = AzureEventHubsSink(producer=producer, max_retries=0)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"pad": "x" * 200}, {"ok": 1}])  # oversized, then a normal event
+
+    assert 0 not in producer.sizes, "an empty batch is never sent"
+    assert sink.losses() == SinkLosses(dropped=1, failed=1)
+
+
+def test_a_sender_fault_chunk_does_not_mask_a_recoverable_one() -> None:
+    """Suppressing FR-006's re-send must not silently drop a chunk the retry could recover."""
+    from log_foundry.sinks.sqs import SQSSink
+
+    class SplitFaultClient:
+        """The first request is all sender faults; every later one is a retryable error."""
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+            self.calls.append([dict(e) for e in Entries])
+            fault = len(self.calls) == 1
+            return {
+                "Successful": [],
+                "Failed": [
+                    {
+                        "Id": e["Id"],
+                        "SenderFault": fault,
+                        "Code": "MissingParameter" if fault else "InternalError",
+                    }
+                    for e in Entries
+                ],
+            }
+
+    client = SplitFaultClient()
+    sink = SQSSink("https://q/x", client=client, max_retries=0)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"log_id": f"l{i}"} for i in range(11)])  # 10 + 1 chunks
+    assert len(client.calls) == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=11)
+
+
+def test_a_batch_of_nothing_but_sender_faults_still_keeps_fr006() -> None:
+    from log_foundry.sinks.sqs import SQSSink
+    from test_sinks_sqs_fifo import FaultingClient
+
+    client = FaultingClient(sender_fault=True)
+    sink = SQSSink("https://q/x", client=client, max_retries=3)
+    sink.emit([{"log_id": "a"}, {"log_id": "b"}])  # must not raise
+    assert len(client.calls) == 1, "and must not be re-sent"
+
+
+def test_a_wholly_rejected_mongo_bulk_write_raises(capsys) -> None:
+    """A bulk write the server rejected every document of inserted nothing (FR-001)."""
+    from test_sinks_mongodb import FakeCollection, make_sink
+
+    class Rejecting(FakeCollection):
+        def insert_many(self, documents, ordered: bool = True):
+            self.inserted.append((list(documents), ordered))
+            err = RuntimeError("bulk failed")
+            err.details = {"writeErrors": [{}] * len(list(documents))}  # type: ignore[attr-defined]
+            raise err
+
+    sink = make_sink(Rejecting())
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.losses() == SinkLosses(dropped=0, failed=2)
+    assert "none were inserted" in capsys.readouterr().err
+
+
+def test_an_all_oversized_batch_never_raises_on_any_chunking_sink() -> None:
+    from log_foundry.sinks.firehose import FirehoseSink
+    from log_foundry.sinks.kinesis import KinesisSink
+    from log_foundry.sinks.sns import SNSSink
+    from log_foundry.sinks.sqs import SQSSink
+    from test_sinks_firehose import FakeFirehose
+    from test_sinks_kinesis import FakeKinesis
+    from test_sinks_sns import FakeSNS
+    from test_sinks_sqs_fifo import FaultingClient
+
+    huge = {"pad": "x" * (1024 * 1024 + 100)}
+    for sink in (
+        KinesisSink("s", client=FakeKinesis(always_fail={b"never"})),
+        FirehoseSink("s", client=FakeFirehose(always_fail={b"never"})),
+        SNSSink("arn", client=FakeSNS(always_fail={"0"})),
+        SQSSink("https://q/x", client=FaultingClient(sender_fault=False)),
+    ):
+        sink.emit([huge])  # no chunk is produced, so there is nothing to have failed
+        losses = read_losses(sink)
+        assert losses is not None and losses == SinkLosses(dropped=1, failed=0), (
+            type(sink).__name__
+        )
+
+
+def test_an_empty_batch_never_raises_on_the_per_item_sinks(monkeypatch) -> None:
+    """FR-001's ``emit([])`` rule, for the five sinks the chunking loop above does not reach."""
+    from log_foundry.sinks.eventhubs import AzureEventHubsSink
+    from log_foundry.sinks.kafka import KafkaSink
+    from log_foundry.sinks.nats import NATSSink
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+    from log_foundry.sinks.rabbitmq import RabbitMQSink
+    from test_sinks_eventhubs import FakeProducer
+    from test_sinks_nats import FakeNATS
+    from test_sinks_rabbitmq import FakeConnection
+
+    monkeypatch.setattr(
+        "log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body
+    )
+
+    class Refusing:
+        def produce(self, *a, **kw):
+            raise BufferError("full")
+
+        def publish(self, *a, **kw):
+            raise RuntimeError("down")
+
+        def poll(self, _t): ...
+        def flush(self): ...
+
+    nats = NATSSink("logs", client=FakeNATS(fail=True))
+    try:
+        for sink in (
+            KafkaSink("t", producer=Refusing()),
+            GooglePubSubSink("t", client=Refusing()),
+            RabbitMQSink(
+                exchange="e", routing_key="r", connection=FakeConnection(fail_channels=99)
+            ),
+            AzureEventHubsSink(producer=FakeProducer(fail=True)),
+            nats,
+        ):
+            sink.emit([])  # an empty batch has not failed to deliver
+    finally:
+        nats.close()
+
+
+def test_a_duplicate_id_in_the_failed_array_cannot_understate_what_landed() -> None:
+    """Counting failures rather than matching them could turn a partial success into a raise."""
+    from log_foundry.sinks.sqs import SQSSink
+
+    class DuplicateIdClient:
+        """Reports entry '0' as failed twice — a shape real SQS never sends."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send_message_batch(self, *, QueueUrl: str, Entries: list[dict]) -> dict:
+            self.calls += 1
+            return {
+                "Successful": [{"Id": e["Id"]} for e in Entries if e["Id"] != "0"],
+                "Failed": [
+                    {"Id": "0", "SenderFault": False, "Code": "InternalError"},
+                    {"Id": "0", "SenderFault": False, "Code": "InternalError"},
+                ],
+            }
+
+    sink = SQSSink("https://q/x", client=DuplicateIdClient(), max_retries=0)
+    sink.emit([{"log_id": "a"}, {"log_id": "b"}])  # entry '1' landed: must not raise
+    assert sink.failed == 1

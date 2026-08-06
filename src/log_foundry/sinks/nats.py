@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["NATSSink"]
 
@@ -47,6 +48,10 @@ class NATSSink:
             return
         self._loop.run_until_complete(self._publish_all(batch))
 
+    def losses(self) -> SinkLosses:
+        """Events whose publish raised (SPEC-026 FR-002). Never raises."""
+        return SinkLosses(dropped=0, failed=self.failed)
+
     def close(self) -> None:
         """Drain/flush and close the connection, then close the managed loop (FR-007)."""
         if self._loop.is_closed():
@@ -59,13 +64,23 @@ class NATSSink:
     # -- internals ----------------------------------------------------------------------
 
     async def _publish_all(self, batch: list[dict[str, object]]) -> None:
+        """Publish each event, raising only when *none* of them landed (SPEC-026 FR-001).
+
+        Per-event isolation stays: a partial batch must not be retried wholesale, because the
+        events that published would be delivered twice.
+        """
         target = self._client.jetstream() if self._jetstream else self._client
+        published = 0
         for event in batch:
             try:
                 await target.publish(self._subject, json.dumps(event).encode("utf-8"))
-            except Exception as err:  # isolation boundary: never crash the worker (FR-011)
+            except Exception as err:  # isolation boundary: one event must not fail the batch
                 self.failed += 1
                 _diag.lost("event", 1, f"NATSSink publish, {type(err).__name__}")
+            else:
+                published += 1
+        if batch and not published:
+            raise SinkDeliveryError(f"NATSSink published none of {len(batch)} event(s)")
 
     async def _drain(self) -> None:
         drain = getattr(self._client, "drain", None)

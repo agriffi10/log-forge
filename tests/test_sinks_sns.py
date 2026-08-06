@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 
-from log_foundry.sinks.base import Sink
+import pytest
+
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.sns import SNSSink
 
 
@@ -70,7 +72,8 @@ def test_failed_entries_retried_then_succeed() -> None:
 def test_persistent_failures_counted(capsys) -> None:
     client = FakeSNS(always_fail={"0"})
     sink = SNSSink("arn", client=client, max_retries=2)
-    sink.emit([{"a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])  # the only entry in the only chunk failed (SPEC-026 FR-001)
     assert len(client.calls) == 3
     assert sink.failed == 1
     assert "lost 1 message(s)" in capsys.readouterr().err

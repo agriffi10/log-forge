@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.mongodb import MongoDBSink
 
 
@@ -95,7 +95,8 @@ def test_bulk_write_error_counts_rejects_without_retry(capsys) -> None:
 def test_connection_error_retried_then_counted(capsys) -> None:
     collection = FakeCollection(error=RuntimeError("no primary"), error_times=-1)
     sink = make_sink(collection, max_retries=2)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # nothing was inserted (SPEC-026 FR-001)
     assert len(collection.inserted) == 3  # initial + 2 retries
     assert sink.failed == 2
     assert "lost 2 document(s)" in capsys.readouterr().err

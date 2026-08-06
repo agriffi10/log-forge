@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.clickhouse import ClickHouseSink
 
 
@@ -91,7 +91,8 @@ def test_create_table_runs_mergetree_ddl() -> None:
 def test_insert_failure_retried_then_counted(capsys) -> None:
     client = FakeClickHouse(fail_times=-1)
     sink = ClickHouseSink("log_events", client=client, max_retries=1)
-    sink.emit([{"a": 1}, {"a": 2}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])  # the only chunk failed (SPEC-026 FR-001)
     assert len(client.inserts) == 2  # initial + 1 retry
     assert sink.failed == 2
     assert "lost 2 row(s)" in capsys.readouterr().err, "the line carries the count"

@@ -12,6 +12,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SNSSink"]
 
@@ -29,17 +30,33 @@ class SNSSink:
             client = boto3.client("sns")
         self.topic_arn = topic_arn
         self.client = client
-        self.max_retries = max_retries
+        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
+        # from ``_send`` having published nothing, and reported success.
+        self.max_retries = max(max_retries, 0)
         self.failed = 0
         self.dropped_oversized = 0
 
+    def losses(self) -> SinkLosses:
+        """Oversized drops and entries still failing past the retry bound (FR-002)."""
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunk to publish_batch limits and send each chunk, retrying failures (FR-010)."""
+        """Re-chunk to publish_batch limits and send each chunk, retrying failures (FR-010).
+
+        Raises when every chunk failed and at least one was sent (SPEC-026 FR-001). Events
+        dropped before sending — too large to ever fit — are not a send failure and do not
+        make a batch of nothing but oversized events raise; they can never be retried into
+        existence, and are reported through ``losses().dropped``.
+        """
         bodies = self._bodies(batch)
+        chunks = delivered = 0
         for chunk in chunk_items(
             bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
         ):
-            self._send(chunk)
+            chunks += 1
+            delivered += self._send(chunk)
+        if chunks and not delivered:
+            raise SinkDeliveryError(f"SNSSink published none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """No-op: the sink buffers nothing internally (FR-001)."""
@@ -58,8 +75,13 @@ class SNSSink:
             bodies.append(body)
         return bodies
 
-    def _send(self, bodies: list[str]) -> None:
-        """Publish one chunk, retrying only the ``Failed`` entries (bounded) (FR-010)."""
+    def _send(self, bodies: list[str]) -> int:
+        """Publish one chunk, retrying only the ``Failed`` entries (bounded) (FR-010).
+
+        Returns how many entries SNS accepted, so ``emit`` can tell "nothing landed" from a
+        partial success. A chunk whose entries all failed contributes ``0``.
+        """
+        sent = len(bodies)
         entries = [{"Id": str(i), "Message": body} for i, body in enumerate(bodies)]
         for attempt in range(self.max_retries + 1):
             response = self.client.publish_batch(
@@ -67,7 +89,7 @@ class SNSSink:
             )
             failed = response.get("Failed", [])
             if not failed:
-                return
+                return sent
             failed_ids = {entry["Id"] for entry in failed}
             entries = [entry for entry in entries if entry["Id"] in failed_ids]
             if attempt >= self.max_retries:
@@ -77,4 +99,5 @@ class SNSSink:
                     len(entries),
                     f"SNSSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
-                return
+                return sent - len(entries)
+        return 0  # unreachable: the loop returns on every path (mypy needs the exit)
