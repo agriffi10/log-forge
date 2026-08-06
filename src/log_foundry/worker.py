@@ -370,8 +370,9 @@ class Worker:
     def _close_if_owed(self) -> None:
         """Close the sink exactly once, and only once the drain thread has ended.
 
-        Both exits from :meth:`shutdown` come through here, so the decision is made in one place
-        under one lock. Two concurrent ``shutdown()`` calls are the case that needs it — the
+        Every exit from :meth:`shutdown` that *may* close comes through here — the expired one
+        deliberately does not, since the thread is still using the sink — so the decision is made
+        in one place under one lock. Two concurrent ``shutdown()`` calls are what needs it: the
         docstring above names a double ``close()`` on a partially-released sink as the thing this
         design avoids, and ``atexit`` plus user code calling it at once is documented as normal.
         A success path that closed unconditionally could race a deferred call that had just

@@ -753,17 +753,21 @@ def test_a_huge_finite_delay_does_not_raise_on_the_drain_thread(monkeypatch) -> 
     # without ever looking at the timeout, so setting it first tests nothing.
     errors: list[str] = []
 
-    def waiting() -> None:
+    stop = threading.Event()
+
+    def waiting_on(event: threading.Event) -> None:
         try:
-            wait(1e18, threading.Event())
+            wait(1e18, event)
         except BaseException as err:
             errors.append(type(err).__name__)
 
-    thread = threading.Thread(target=waiting, daemon=True)
+    thread = threading.Thread(target=waiting_on, args=(stop,), daemon=True)
     thread.start()
     thread.join(0.3)
     assert errors == [], "Event.wait overflows past the platform's time_t too"
     assert thread.is_alive(), "and is still waiting out the capped delay, not returning early"
+    stop.set()  # released rather than left parked on an 86,400 s wait for the session
+    thread.join(2.0)
 
 
 def test_a_later_shutdown_closes_a_sink_an_expired_one_left_open() -> None:
@@ -873,8 +877,12 @@ def test_the_three_aws_stream_sinks_back_off_between_attempts(monkeypatch) -> No
         )
 
 
-def test_the_three_aws_stream_sinks_do_not_wait_before_abandoning(monkeypatch) -> None:
-    """FR-003: a wait before giving up is pure delay on the drain thread."""
+def test_a_stream_sink_does_not_wait_before_abandoning(monkeypatch) -> None:
+    """FR-003: a wait before giving up is pure delay on the drain thread.
+
+    Kinesis stands for the three: the exact ``[0.1, 0.2, 0.4]`` sequence asserted above already
+    pins the property for all of them, since a wait before abandoning would make it four.
+    """
     from log_foundry.sinks.kinesis import KinesisSink
     from test_sinks_kinesis import FakeKinesis
 
@@ -911,9 +919,11 @@ def test_an_unadjudicable_chunk_is_abandoned_with_no_wait(monkeypatch) -> None:
 def test_concurrent_shutdowns_close_the_sink_exactly_once() -> None:
     """atexit and user code both call it; a double close on a released sink is what we avoid.
 
-    A guard on the invariant rather than a reproduction of the race — the window between the
-    join returning and the flag being read is microseconds wide. The structural fix is that both
-    exits from ``shutdown`` go through one lock-guarded decision; this pins the observable.
+    It *does* reproduce the race: measured against the pre-fix worker it fails ~60% of runs with
+    ``assert 2 == 1``, no artificial delay needed — the barrier releases three callers while
+    ``batch_size=1`` lets the drain thread exit almost immediately, which is exactly the window.
+    Not a certainty per run, so the structural fix is what makes it right: one lock-guarded
+    decision owns the close, and this pins the observable.
     """
     from conftest import FakeSink
 
