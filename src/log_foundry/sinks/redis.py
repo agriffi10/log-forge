@@ -11,10 +11,13 @@ shadows or requires the real ``redis`` package at import time.
 from __future__ import annotations
 
 import json
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
@@ -35,6 +38,8 @@ class _RedisSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value made the
         # retry range empty, so ``emit`` returned having attempted nothing — a silent success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self.failed = 0
 
     def losses(self) -> SinkLosses:
@@ -59,7 +64,7 @@ class _RedisSink:
                 return
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 if attempt < self.max_retries:
-                    time.sleep(_BACKOFF_BASE * (2**attempt))
+                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += len(batch)
                 _diag.lost(

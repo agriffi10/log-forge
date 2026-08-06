@@ -9,10 +9,13 @@ and counted; ``close()`` closes the channel and connection.
 from __future__ import annotations
 
 import json
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RabbitMQSink"]
@@ -49,6 +52,8 @@ class RabbitMQSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value abandoned
         # each message with no attempt made and no counter moved.
         self._max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
         self._channel: Any = None
@@ -98,7 +103,7 @@ class RabbitMQSink:
             except Exception as err:  # isolation boundary: never crash the worker (FR-011)
                 self._reset()
                 if attempt < self._max_retries:
-                    time.sleep(_BACKOFF_BASE * (2**attempt))
+                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += 1
                 _diag.lost(

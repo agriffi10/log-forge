@@ -9,6 +9,12 @@ import sys
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
+
 sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
 SQSSink = sqs_mod.SQSSink
 

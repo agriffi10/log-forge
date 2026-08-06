@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 from log_foundry.sinks._socket import SocketTransport
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["SyslogSink"]
@@ -57,6 +59,7 @@ class SyslogSink:
         self._socket = SocketTransport(
             host, port, transport=transport, timeout=timeout, max_retries=max_retries
         )
+        self._stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Frame each event as RFC 5424 and send it over the socket (FR-006)."""
@@ -67,6 +70,22 @@ class SyslogSink:
     def close(self) -> None:
         """Close the underlying socket (FR-006)."""
         self._socket.close()
+
+    @property
+    def stop_signal(self) -> threading.Event | None:
+        """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
+
+        The worker sets this on the *configured* sink (SPEC-027 FR-002), and a wrapper is not
+        where the waiting happens. Without the forward the attribute is set on an object that
+        never waits, and the backoff one level down stays uninterruptible — which is the whole
+        defect, moved rather than fixed.
+        """
+        return self._stop_signal
+
+    @stop_signal.setter
+    def stop_signal(self, signal: threading.Event | None) -> None:
+        self._stop_signal = signal
+        self._socket.stop_signal = signal
 
     @property
     def failed(self) -> int:

@@ -13,6 +13,12 @@ import pytest
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.sqs import DEFAULT_GROUP_ID, MAX_ID_LEN, SQSSink
 
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
+
 FIFO_URL = "https://sqs.example/q.fifo"
 STD_URL = "https://sqs.example/q"
 

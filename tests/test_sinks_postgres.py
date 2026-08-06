@@ -58,7 +58,7 @@ class FakeConnection:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr("log_foundry.sinks.postgres.time.sleep", lambda _s: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", lambda _s: None)
 
 
 def test_is_a_sink() -> None:

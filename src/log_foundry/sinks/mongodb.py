@@ -10,10 +10,13 @@ documents retained. Write-only — querying is the downstream tool's job.
 from __future__ import annotations
 
 import json
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["MongoDBSink"]
@@ -50,6 +53,8 @@ class MongoDBSink:
         # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
         # having attempted no insert, and reported success.
         self.max_retries = max(max_retries, 0)
+        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
+        self.stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
         self._closed = False
@@ -96,7 +101,7 @@ class MongoDBSink:
                         ) from None
                     return
                 if attempt < self.max_retries:
-                    time.sleep(_BACKOFF_BASE * (2**attempt))
+                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += len(documents)
                 _diag.lost(

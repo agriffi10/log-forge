@@ -242,3 +242,266 @@ def test_shutdown_is_not_held_by_a_sink_mid_backoff() -> None:
     time.sleep(0.2)  # let the drain thread reach the backoff
 
     assert _run_bounded(worker.shutdown, bound=5.0), "held by the sink's backoff"
+
+
+# --- FR-002 (Phase 2): every retrying sink waits through the shared helper ------------------
+
+
+RETRYING_SINKS = (
+    "_socket", "clickhouse", "eventhubs", "http", "mongodb", "postgres", "rabbitmq", "redis",
+    "sqs",
+)
+
+
+def test_no_sink_calls_time_sleep_directly() -> None:
+    """A lint on the idiom: a new `time.sleep` in a retry loop is uninterruptible again."""
+    import ast
+    import pathlib
+
+    import log_foundry
+
+    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    offenders: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        if path.name == "_retry.py":  # the one module allowed to sleep
+            continue
+        offenders.extend(
+            f"{path.name}:{node.lineno}"
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "sleep"
+        )
+    assert offenders == [], f"uninterruptible sleeps: {offenders}"
+
+
+def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
+    """A constructed instance of every sink with a retry loop, with fake transports."""
+    from log_foundry.sinks.clickhouse import ClickHouseSink
+    from log_foundry.sinks.eventhubs import AzureEventHubsSink
+    from log_foundry.sinks.mongodb import MongoDBSink
+    from log_foundry.sinks.postgres import PostgresSink
+    from log_foundry.sinks.rabbitmq import RabbitMQSink
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from log_foundry.sinks.sqs import SQSSink
+    from log_foundry.sinks.syslog import SyslogSink
+    from test_sinks_clickhouse import FakeClickHouse
+    from test_sinks_eventhubs import FakeProducer
+    from test_sinks_mongodb import FakeCollection, FakeMongoClient
+    from test_sinks_postgres import FakeConnection as FakePG
+    from test_sinks_rabbitmq import FakeConnection as FakeAMQP
+    from test_sinks_redis import FakeRedis
+    from test_sinks_sqs import FakeSQSClient
+    from test_sinks_syslog import FakeSocket
+
+    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    return [
+        HTTPSink("http://x", opener=FakeOpener()),
+        SyslogSink("h", transport="udp"),
+        RedisStreamsSink("s", client=FakeRedis()),
+        PostgresSink("logs", connection=FakePG()),
+        ClickHouseSink("logs", client=FakeClickHouse()),
+        MongoDBSink(
+            client=FakeMongoClient(FakeCollection()), database="d", collection="c"
+        ),
+        RabbitMQSink(exchange="e", routing_key="r", connection=FakeAMQP()),
+        AzureEventHubsSink(producer=FakeProducer()),
+        SQSSink("https://q/x", client=FakeSQSClient()),
+    ]
+
+
+def test_every_retrying_sink_accepts_a_stop_signal(monkeypatch) -> None:
+    """The worker probes by name; a sink without the attribute silently keeps sleeping."""
+    for sink in _one_of_each_retrying_sink(monkeypatch):
+        assert hasattr(sink, "stop_signal"), type(sink).__name__
+        assert sink.stop_signal is None, f"{type(sink).__name__} starts uninterruptible"
+
+
+def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
+    """The wiring is what makes the attribute worth having."""
+    for sink in _one_of_each_retrying_sink(monkeypatch):
+        worker = Worker(sink, batch_size=1)
+        try:
+            assert sink.stop_signal is worker._stop, type(sink).__name__
+        finally:
+            worker.shutdown()
+
+
+def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch) -> None:
+    """``SyslogSink`` and ``LogstashSink`` hold the retry loop one level down."""
+    from log_foundry.sinks.logstash import LogstashSink
+    from log_foundry.sinks.syslog import SyslogSink
+    from test_sinks_syslog import FakeSocket
+
+    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: FakeSocket())
+
+    for sink, backend in (
+        (SyslogSink("h", transport="udp"), lambda s: s._socket),
+        (LogstashSink(host="h", port=1), lambda s: s._socket),
+        (LogstashSink(url="http://x", opener=FakeOpener()), lambda s: s._http),
+    ):
+        worker = Worker(sink, batch_size=1)
+        try:
+            assert backend(sink).stop_signal is worker._stop, type(sink).__name__
+        finally:
+            worker.shutdown()
+
+
+def test_sentry_forwards_to_its_http_fallback() -> None:
+    from log_foundry.sinks.sentry import SentrySink
+
+    sink = SentrySink("http://k@sentry.local/1", opener=FakeOpener())
+    worker = Worker(sink, batch_size=1)
+    try:
+        assert sink._http is not None and sink._http.stop_signal is worker._stop
+    finally:
+        worker.shutdown()
+
+
+def _drain_one(sink) -> float:
+    """Submit one span through a real worker and time how long shutdown takes."""
+    worker = Worker(sink, batch_size=1, max_retries=0)
+    worker.submit([{"a": 1}])
+    time.sleep(0.2)  # let the drain thread reach the sink's backoff
+    started = time.monotonic()
+    finished = _run_bounded(worker.shutdown, bound=6.0)
+    return time.monotonic() - started if finished else float("inf")
+
+
+def test_a_long_sink_backoff_does_not_hold_shutdown() -> None:
+    """One drain thread, so a sink's backoff is a global pause — and it spans shutdown()."""
+    import log_foundry.sinks.redis as redis_mod
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from test_sinks_redis import FakeRedis
+
+    original = redis_mod._BACKOFF_BASE
+    redis_mod._BACKOFF_BASE = 20.0  # one attempt's backoff far exceeds the bound
+    try:
+        sink = RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=3)
+        assert _drain_one(sink) < 6.0, "shutdown waited out the sink's backoff"
+    finally:
+        redis_mod._BACKOFF_BASE = original
+
+
+def test_a_standalone_sink_backs_off_exactly_as_before(monkeypatch) -> None:
+    """No worker, no signal — the pre-SPEC-027 behaviour, unchanged."""
+    from log_foundry.sinks.base import SinkDeliveryError
+    from log_foundry.sinks.redis import RedisStreamsSink
+    from test_sinks_redis import FakeRedis
+
+    slept: list[float] = []
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", slept.append)
+
+    sink = RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=2)
+    assert sink.stop_signal is None
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert slept == [0.1, 0.2], "1 + 2 retries, doubling"
+
+
+# --- FR-003: SQSSink backs off between attempts ---------------------------------------------
+
+
+def _sqs_slept(monkeypatch, client, **kwargs) -> list[float]:
+    from log_foundry.sinks.sqs import SQSSink
+
+    slept: list[float] = []
+    monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", slept.append)
+    sink = SQSSink("https://q/x", client=client, **kwargs)
+    try:
+        sink.emit([{"log_id": "a"}])
+    except Exception:  # SPEC-026's raise; this test is about the waits
+        pass
+    return slept
+
+
+def test_sqs_separates_attempts_by_a_growing_delay(monkeypatch) -> None:
+    """It was alone in re-sending immediately, while naming throttling as the retryable case."""
+    from test_sinks_sqs_fifo import FaultingClient
+
+    slept = _sqs_slept(
+        monkeypatch, FaultingClient(sender_fault=False, code="Throttled"), max_retries=3
+    )
+    assert slept == [0.1, 0.2, 0.4], "one wait before each retry, none before giving up"
+
+
+def test_a_first_attempt_that_succeeds_never_waits(monkeypatch) -> None:
+    from test_sinks_sqs import FakeSQSClient
+
+    assert _sqs_slept(monkeypatch, FakeSQSClient()) == []
+
+
+def test_a_sender_fault_is_abandoned_with_no_backoff_first(monkeypatch) -> None:
+    """SPEC-016 FR-006 abandons on the attempt that observed it; a wait would be pure delay."""
+    from test_sinks_sqs_fifo import FaultingClient
+
+    assert _sqs_slept(monkeypatch, FaultingClient(sender_fault=True), max_retries=3) == []
+
+
+def test_the_sqs_backoff_is_interruptible() -> None:
+    import log_foundry.sinks.sqs as sqs_mod
+    from log_foundry.sinks.sqs import SQSSink
+    from test_sinks_sqs_fifo import FaultingClient
+
+    original = sqs_mod._BACKOFF_BASE
+    sqs_mod._BACKOFF_BASE = 20.0
+    try:
+        sink = SQSSink(
+            "https://q/x", client=FaultingClient(sender_fault=False), max_retries=3
+        )
+        assert _drain_one(sink) < 6.0
+    finally:
+        sqs_mod._BACKOFF_BASE = original
+
+
+def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> None:
+    """Set on a wrapper the signal reaches nothing — the defect moved, not fixed."""
+    from log_foundry.sinks.filtering import FilteringSink
+    from log_foundry.sinks.multi import MultiSink
+    from log_foundry.sinks.syslog import SyslogSink
+    from log_foundry.sinks.transform import TransformSink
+    from test_sinks_syslog import FakeSocket
+
+    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    inner = SyslogSink("h", transport="udp")
+    http = HTTPSink("http://x", opener=FakeOpener())
+
+    for wrapper, leaves in (
+        (MultiSink(inner, http), (inner, http)),
+        (FilteringSink(http), (http,)),
+        (TransformSink(http, lambda e: e), (http,)),
+    ):
+        http.stop_signal = None
+        inner.stop_signal = None
+        worker = Worker(wrapper, batch_size=1)
+        try:
+            for leaf in leaves:
+                assert leaf.stop_signal is worker._stop, type(wrapper).__name__
+            if inner in leaves:
+                assert inner._socket.stop_signal is worker._stop, (
+                    "and on through SyslogSink to the transport that actually waits"
+                )
+        finally:
+            worker.shutdown()
+
+
+def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> None:
+    from log_foundry.sinks.multi import MultiSink
+
+    class Stubborn:
+        stop_signal = None
+
+        def __setattr__(self, name: str, value: object) -> None:
+            raise AttributeError("read-only")
+
+        def emit(self, batch: list[dict[str, object]]) -> None: ...
+        def close(self) -> None: ...
+
+    willing = HTTPSink("http://x", opener=FakeOpener())
+    worker = Worker(MultiSink(Stubborn(), willing), batch_size=1)
+    try:
+        assert willing.stop_signal is worker._stop, "the sibling still got it"
+    finally:
+        worker.shutdown()
+    assert "handing a MultiSink child its stop signal" in capsys.readouterr().err
