@@ -1,10 +1,4 @@
-"""Span model + log-event construction and serialization (arch §6, guide Phase 3).
-
-This is the heart of "structured, never free-form": every event is assembled here into one
-identical JSON shape, which is what makes logs queryable downstream. This module only
-*builds* records — it deliberately imports neither ``context`` nor ``decorator`` and does
-not know where the "current" span lives (arch §6 watch-out).
-"""
+"""Span model + log-event construction and serialization (arch §6, guide Phase 3)."""
 
 from __future__ import annotations
 
@@ -21,14 +15,9 @@ if TYPE_CHECKING:
 
 __all__ = ["Span", "backfill_baggage", "build_event", "end_event", "start_event"]
 
-# Auto-generated span-boundary event messages. Tests assert on contract fields
-# (``status``, ``trace_id``), never on this text — rename freely.
 _START_MESSAGE = "span.start"
 _END_MESSAGE = "span.end"
 
-# Marks an event that a ceiling clipped (SPEC-017 FR-002). Set **only ever to True**, never to
-# False — that single invariant is what makes "OR with whatever an earlier stage set" and
-# "absent, not false, on a clean event" both fall out with no read-modify-write anywhere.
 _TRUNCATED = "truncated"
 
 
@@ -36,9 +25,9 @@ _TRUNCATED = "truncated"
 class Span:
     """One decorated function call: its identity, timing, and buffered events.
 
-    ``start_ts`` is a ``time.monotonic()`` reading (not wall-clock) so ``duration_ms`` can
-    never go negative across a clock change. ``defaults`` are per-decorator field overrides;
-    ``events`` is the queue flushed together at span end.
+    ``start_ts`` is a ``time.monotonic()`` reading rather than wall-clock, so
+    ``duration_ms`` can never go negative across a clock change. ``defaults`` are per-
+    decorator field overrides, and ``events`` is the queue flushed together at span end.
     """
 
     trace_id: str
@@ -51,7 +40,17 @@ class Span:
 
 
 def _iso_now() -> str:
-    """Return the current UTC time as ISO-8601 with millisecond precision and a 'Z'."""
+    """Returns the current UTC time as ISO-8601 with millisecond precision and a ``Z``.
+
+    Args:
+      None.
+
+    Returns:
+      The formatted timestamp.
+
+    Raises:
+      None.
+    """
     now = datetime.now(UTC)
     return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 1000:03d}Z"
 
@@ -64,19 +63,27 @@ def build_event(
     fields: dict[str, object],
     baggage: dict[str, object],
 ) -> dict[str, object]:
-    """Assemble one log record in the arch §6 schema.
+    """Assembles one log record in the arch §6 schema.
 
-    Field precedence, lowest to highest: config ``defaults`` → ``span.defaults`` → ``baggage``
-    → per-call ``fields`` (arch §5.1). Later sources win on a key conflict.
+    Field precedence runs lowest to highest: config ``defaults`` → ``span.defaults`` →
+    ``baggage`` → per-call ``fields`` (arch §5.1). The merged mapping is coerced and
+    size-bounded here (SPEC-017 FR-001/FR-002), which is what makes every sink's bare
+    ``json.dumps`` safe without any of them changing. ``message`` and ``function`` are
+    bounded too, since both are caller-supplied text and leaving either out would keep
+    ``info(huge_string)`` unbounded.
 
-    The merged mapping is coerced and size-bounded here (SPEC-017 FR-001/FR-002), which is what
-    makes every sink's bare ``json.dumps`` safe without any of them changing.
+    Args:
+      span: The span the event belongs to, supplying identity and defaults.
+      level: The severity label, such as ``"INFO"``.
+      message: The caller-supplied message text.
+      fields: Per-call fields, which win over every other source.
+      baggage: Context baggage merged beneath the per-call fields.
 
-    ``message`` and ``function`` are bounded too. They are base fields, but unlike the other ten
-    both are caller-supplied text: ``message`` directly, and ``function`` via ``@trace(name=...)``
-    or — on the orphan path, where ``api`` names the standalone span after the message itself —
-    from the same unbounded string. Leaving either out would keep ``info(huge_string)`` unbounded,
-    which is the hole this ceiling exists to close.
+    Returns:
+      The assembled event, safe for any sink to serialize.
+
+    Raises:
+      None.
     """
     from log_foundry.config import get_config
     from log_foundry.ids import new_log_id
@@ -99,7 +106,6 @@ def build_event(
         "version": cfg.version,
         "env": cfg.env,
     }
-    # Before ``fields`` so it reads ahead of the payload blob in a rendered log line.
     if clipped or message_clipped or function_clipped:
         event[_TRUNCATED] = True
     event["fields"] = safe
@@ -107,47 +113,83 @@ def build_event(
 
 
 def start_event(span: Span) -> dict[str, object]:
-    """Build the span-start boundary event."""
+    """Builds the span-start boundary event.
+
+    Args:
+      span: The span being opened.
+
+    Returns:
+      The ``span.start`` event.
+
+    Raises:
+      None.
+    """
     return build_event(span, "INFO", _START_MESSAGE, fields={}, baggage={})
 
 
 def _exception_message(exc: BaseException) -> str:
-    """``str(exc)`` — ``""`` for an exception raised with no arguments (SPEC-017 FR-003).
+    """Returns ``str(exc)``, or an empty string for an exception raised with no arguments.
 
-    Guarded because a user exception may define a ``__str__`` that itself raises. This runs
-    inside the decorator's ``except`` block, so an exception escaping here would *replace* the
-    one the user's code raised, demoting theirs to ``__context__`` — logging breaking the app,
-    which is the thing this spec exists to stop.
+    This is guarded because a user exception may define a ``__str__`` that itself raises.
+    It runs inside the decorator's ``except`` block, so an exception escaping here would
+    replace the one the user's code raised, demoting theirs to ``__context__`` — logging
+    breaking the app, which is the thing SPEC-017 FR-003 exists to stop.
+
+    Args:
+      exc: The exception to render.
+
+    Returns:
+      The message text, or ``"<unprintable message>"`` if rendering failed.
+
+    Raises:
+      None.
     """
     try:
         return str(exc)
-    except Exception:  # see above; a hostile __str__ must not escape.
+    except Exception:
         return "<unprintable message>"
 
 
 def _exception_stack(exc: BaseException) -> str:
-    """The formatted traceback.
+    """Returns the formatted traceback for an exception.
 
     ``traceback.format_exception`` already renders a failing ``__str__`` as
-    ``<exception str() failed>`` rather than propagating, so this guard is for the rarer case of
-    a frame that cannot be rendered at all.
+    ``<exception str() failed>`` rather than propagating, so this guard is for the rarer
+    case of a frame that cannot be rendered at all.
+
+    Args:
+      exc: The exception whose traceback is formatted.
+
+    Returns:
+      The formatted traceback, or a placeholder naming the exception type.
+
+    Raises:
+      None.
     """
     try:
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    except Exception:  # same reasoning as _exception_message.
+    except Exception:
         return f"<unformattable traceback: {type(exc).__name__}>"
 
 
 def _error_fields(exc: BaseException, *, cfg: Config) -> tuple[dict[str, object], bool]:
-    """Build the bounded ``error`` sub-document; report whether a ceiling fired.
+    """Builds the bounded ``error`` sub-document and reports whether a ceiling fired.
 
-    ``type`` keeps the bare class name consumers already index; ``module`` is added alongside it
-    so two same-named exception classes from different packages stay distinguishable, rather
-    than qualifying ``type`` in place and breaking every existing query (SPEC-017 FR-003).
+    ``type`` keeps the bare class name consumers already index, and ``module`` is added
+    alongside it so two same-named exception classes from different packages stay
+    distinguishable rather than qualifying ``type`` in place and breaking every existing
+    query (SPEC-017 FR-003). ``stack`` gets its own larger ceiling and is clipped from the
+    head, because ``format_exception`` puts the exception and innermost frames last.
 
-    ``stack`` gets its own, larger ceiling: a traceback is legitimately long and is the most
-    valuable thing on the event. It is clipped from the *head*, because ``format_exception``
-    puts the exception and the innermost frames last.
+    Args:
+      exc: The exception being recorded.
+      cfg: The config supplying the ceilings.
+
+    Returns:
+      The ``error`` sub-document and whether any ceiling clipped a value.
+
+    Raises:
+      None.
     """
     type_name, t1 = truncate_str(type(exc).__name__, cfg.max_value_bytes)
     module, t2 = truncate_str(str(getattr(type(exc), "__module__", "")), cfg.max_value_bytes)
@@ -167,11 +209,22 @@ def end_event(
     status: str,
     exc: BaseException | None = None,
 ) -> dict[str, object]:
-    """Build the span-end boundary event.
+    """Builds the span-end boundary event.
 
-    Adds ``duration_ms`` (from a monotonic delta), ``status`` (``"ok"``/``"error"``), and on
-    failure a nested ``error`` with the exception type, module, message and formatted stack
-    (arch §6, SPEC-017 FR-003).
+    Adds ``duration_ms`` from a monotonic delta, ``status``, and on failure a nested
+    ``error`` carrying the exception type, module, message and formatted stack (arch §6,
+    SPEC-017 FR-003).
+
+    Args:
+      span: The span being closed.
+      status: The span outcome, ``"ok"`` or ``"error"``.
+      exc: The exception that ended the span, if it failed.
+
+    Returns:
+      The ``span.end`` event.
+
+    Raises:
+      None.
     """
     from log_foundry.config import get_config
 
@@ -183,33 +236,33 @@ def end_event(
         error, clipped = _error_fields(exc, cfg=get_config())
         event["error"] = error
         if clipped:
-            event[_TRUNCATED] = True  # only ever True — this *is* the OR with build_event's
+            event[_TRUNCATED] = True
     return event
 
 
 def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
-    """Merge the span's final baggage into its buffered **boundary** events.
+    """Merges the span's final baggage into its buffered boundary events.
 
-    ``@trace`` buffers ``span.start`` before the body runs, so baggage the body sets on its first
-    line did not exist when that event was built — and :func:`build_event` snapshots ``fields``
-    into each event dict, so a later value has to be written back. Same structural reason as
-    :func:`~log_foundry.decorator._reparent_current_span`. The whole span flushes as one batch at
-    close, so this completes the events before any of them is emitted.
+    ``@trace`` buffers ``span.start`` before the body runs, so baggage the body sets on its
+    first line did not exist when that event was built, and :func:`build_event` snapshots
+    ``fields`` into each event dict. Boundary events only: an ``info`` emitted before
+    ``set_baggage`` genuinely did not carry it, and merging over mid-span events would let
+    baggage override a per-call field, inverting :func:`build_event`'s precedence.
 
-    Boundary events only. An ``info`` emitted before ``set_baggage`` genuinely did not carry it,
-    and rewriting a record of a moment would be a lie; merging over mid-span events would also let
-    baggage override a per-call field, inverting :func:`build_event`'s precedence. Boundary events
-    describe the span as a whole and carry no per-call fields, so baggage correctly wins there over
-    ``cfg.defaults`` and ``span.defaults``.
+    The values bypass :func:`build_event`'s pass entirely, so they are coerced here once
+    above the loop. The merge can push a mapping past ``max_keys``, which is deliberate:
+    re-capping would drop the correlation keys SPEC-015 shipped to add (SPEC-017 FR-001).
 
-    The baggage is a parameter rather than read from ``context``: this module does not know where
-    the current span lives (arch §6).
+    Args:
+      span: The span whose buffered events are completed.
+      baggage: The span's final baggage, passed in because this module does not know where
+        the current span lives (arch §6).
 
-    These values bypass :func:`build_event`'s pass entirely — ``set_baggage`` accepts arbitrary
-    objects — so they are coerced here, **once** above the loop rather than per event: the same
-    mapping is merged into every boundary event, and ``fields`` is already sanitized. The merge
-    can push a mapping past ``max_keys``; that is deliberate, because re-capping here would drop
-    the correlation keys SPEC-015 shipped to add (SPEC-017 FR-001).
+    Returns:
+      None.
+
+    Raises:
+      None.
     """
     if not baggage:
         return
@@ -217,8 +270,6 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
 
     safe, clipped = sanitize_fields(baggage, cfg=get_config())
     for event in span.events:
-        # Matched on the message constants, not a position — that ``span.start`` is index 0 is an
-        # implementation detail of when it happens to be appended.
         if event.get("message") in (_START_MESSAGE, _END_MESSAGE):
             fields = event.get("fields")
             if isinstance(fields, dict):

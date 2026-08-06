@@ -1,37 +1,4 @@
-"""Context propagation: span stack + baggage via contextvars (arch §5, guide Phase 4).
-
-``contextvars`` (not thread-locals) is correct under both threads and asyncio — each task
-inherits its own copy — so ``log_foundry.info(...)`` can find "the span I'm inside" with no
-manual passing. This module holds a *stack* of active spans (the top is the current span and
-the parent of the next nested call) plus trace-scoped baggage.
-
-**The three variables and how long each lives** (SPEC-024 — before it, the last two lived as
-long as the context did, so one request's data reached the next request's events):
-
-``_span_stack``
-    One entry per active decorated call. Pushed on enter, popped in the ``finally`` on exit.
-
-``_baggage``
-    Restored to its pre-span value when the **root** span closes — the span opened when no
-    other was active. Nested spans do not reset, so baggage set three calls deep stays visible
-    to its parent and to later siblings in the same trace: that is what "trace-scoped" means.
-    Baggage set before any span is a process-level default and is restored *to*, not erased.
-
-``_adopted``
-    Cleared when the root span closes, and consumed by that one span — an inbound context is a
-    one-shot handoff to the trace it names, not a standing setting. Restoring it instead would
-    leave a warm container joining the first caller's trace forever.
-
-The last two are released together by :func:`pop_baggage_scope`; the span stack is released by
-:func:`pop_span`. A caller who opens no span clears both with :func:`reset_context`.
-
-Two footguns, both avoided below:
-  * Never mutate a ContextVar's default mutable value — the ``()`` / ``{}`` defaults are shared
-    across all contexts. Always ``.set()`` a new tuple/dict. The same applies to any value a
-    *parent* context can still see: emptying a baggage dict in place reaches back into it.
-  * Use the token/``reset`` pattern, not a manual pop — ``reset(token)`` restores the exact
-    prior state even when tasks branch.
-"""
+"""Context propagation: span stack + baggage via contextvars (arch §5, guide Phase 4)."""
 
 from __future__ import annotations
 
@@ -63,215 +30,315 @@ _span_stack: contextvars.ContextVar[tuple[Span, ...]] = contextvars.ContextVar(
 )
 _baggage: contextvars.ContextVar[dict[str, object]] = contextvars.ContextVar(
     "log_foundry_baggage",
-    default={},  # noqa: B039 - the never-mutate rule in this module's docstring is what
-    # makes the shared default safe: `set_baggage` replaces the dict, `get_baggage` is not
-    # exported, and both internal readers treat it read-only.
+    default={},  # noqa: B039
 )
-# An inbound trace context adopted via ``continue_trace`` (SPEC-014), applied by ``_open_span``
-# to the next *root* span. A ContextVar for the same reason as the two above: it is then correct
-# under threads and asyncio for free, and a task that adopts a context cannot leak it to siblings.
 _adopted: contextvars.ContextVar[tuple[str, str | None] | None] = contextvars.ContextVar(
     "log_foundry_adopted_context", default=None
 )
 
-# W3C suggests 8192 bytes for the whole `baggage` header. Bounded on the way in so a hostile or
-# runaway header cannot inflate every subsequent event emitted by this process.
 BAGGAGE_MAX_BYTES = 8192
 
 
 def current_span() -> Span | None:
-    """Return the innermost active span, or ``None`` when no span is active."""
+    """Returns the innermost active span.
+
+    Args:
+      None.
+
+    Returns:
+      The current span, or ``None`` when no span is active.
+
+    Raises:
+      None.
+    """
     stack = _span_stack.get()
     return stack[-1] if stack else None
 
 
 def push_span(span: Span) -> contextvars.Token[tuple[Span, ...]]:
-    """Push ``span`` onto the stack; return a token to hand back to :func:`pop_span`."""
+    """Pushes a span onto the stack.
+
+    Args:
+      span: The span being opened.
+
+    Returns:
+      A token to hand back to :func:`pop_span`.
+
+    Raises:
+      None.
+    """
     return _span_stack.set((*_span_stack.get(), span))
 
 
 def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
-    """Restore the span stack to its state before the matching :func:`push_span`.
+    """Restores the span stack to its state before the matching :func:`push_span`.
 
-    Total — never raises, on the same terms and for the same reason as
-    :func:`pop_baggage_scope`: it runs in the decorator's ``finally``, where an exception would
-    replace the one the caller's own function raised (arch §4, SPEC-025).
+    This is total and never raises, on the same terms and for the same reason as
+    :func:`pop_baggage_scope`: it runs in the decorator's ``finally``, where an exception
+    would replace the one the caller's own function raised (arch §4, SPEC-025). ``reset``
+    rejects a token minted in another context and one already used, so the fallback
+    restores the captured stack directly, treating anything that is not a tuple as empty.
+
+    Args:
+      token: The token returned by :func:`push_span`.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
     """
     try:
         _span_stack.reset(token)
     except Exception:
-        # `reset` rejects a token minted in another context and one already used. Restoring the
-        # captured stack directly is equivalent; anything that is not a tuple of spans cannot
-        # have come from `push_span`, so it falls back to empty rather than corrupting the stack.
         old = getattr(token, "old_value", None)
         _span_stack.set(old if isinstance(old, tuple) else ())
 
 
 def get_baggage() -> dict[str, object]:
-    """Return the current trace's baggage (do not mutate the returned dict in place).
+    """Returns the current trace's baggage, which must not be mutated in place.
 
-    The trace's own keys are discarded when the enclosing **root** span closes, restoring the
-    baggage in effect before it — so a later trace sees only a process-level default set before
-    any span opened. With no span open at all nothing releases them and they accumulate for the
-    life of the context; :func:`reset_context` is the release on that path.
+    The trace's own keys are discarded when the enclosing root span closes, restoring the
+    baggage in effect before it, so a later trace sees only a process-level default set
+    before any span opened. With no span open at all nothing releases them and they
+    accumulate for the life of the context; :func:`reset_context` is the release there.
+
+    Args:
+      None.
+
+    Returns:
+      The baggage mapping, to be treated as read-only.
+
+    Raises:
+      None.
     """
     return _baggage.get()
 
 
 def set_baggage(**kv: object) -> None:
-    """Merge key/values into the current trace's baggage (replaces with a new dict).
+    """Merges key/values into the current trace's baggage.
 
-    The keys live until the enclosing **root** span closes, then the baggage in effect before
-    that span is restored — so they ride every event at or below this point in the trace and
-    none of the next trace's. Called with no span open they become a process-level default that
-    later traces inherit and restore to; :func:`reset_context` is what erases those, and
-    ``configure(defaults=...)`` is the better tool for setting them in the first place.
+    The keys live until the enclosing root span closes, then the baggage in effect before
+    that span is restored, so they ride every event at or below this point in the trace and
+    none of the next trace's. Called with no span open they become a process-level default
+    that later traces inherit and restore to, which ``configure(defaults=...)`` expresses
+    better.
+
+    Args:
+      **kv: Fields to merge into the baggage.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
     """
     _baggage.set({**_baggage.get(), **kv})
 
 
-# -- the root-span scope (SPEC-024) ------------------------------------------------------
-
-
 def push_baggage_scope() -> contextvars.Token[dict[str, object]]:
-    """Open a root span's baggage scope; hand the token back to :func:`pop_baggage_scope`.
+    """Opens a root span's baggage scope.
 
-    Setting the variable to its own current value is what mints the token — there is no other
-    way to say "restore whatever was here", including the case where nothing was ever set. It
-    is safe because no baggage dict is ever mutated in place (see this module's docstring).
+    Setting the variable to its own current value is what mints the token — there is no
+    other way to say "restore whatever was here", including the case where nothing was ever
+    set. It is safe because no baggage dict is ever mutated in place.
+
+    Args:
+      None.
+
+    Returns:
+      A token to hand back to :func:`pop_baggage_scope`.
+
+    Raises:
+      None.
     """
     return _baggage.set(_baggage.get())
 
 
 def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
-    """Close a root span's scope: restore baggage, discard any adopted trace context.
+    """Closes a root span's scope: restores baggage, discards any adopted trace context.
 
-    The two are deliberately **asymmetric**. Baggage is *restored*, so a process-level default
-    set before any span outlives the traces that run under it while a request's own keys do not
-    (SPEC-024 FR-001). The adopted context is *cleared*, because it is a one-shot handoff to the
-    trace it was adopted for: restoring it would leave the next invocation still joining the
-    previous caller's trace, which is the defect this scope exists to close (FR-002). A caller
-    who opens no span at all clears both with :func:`reset_context`.
+    The two are deliberately asymmetric. Baggage is restored, so a process-level default set
+    before any span outlives the traces that run under it while a request's own keys do not
+    (SPEC-024 FR-001); the adopted context is cleared, because it is a one-shot handoff and
+    restoring it would leave the next invocation joining the previous caller's trace
+    (FR-002). The adopted context is cleared first, ahead of anything that could fail: a
+    stale trace id puts wrong data in the log stream, while a missed baggage restore only
+    leaves a stale field.
 
-    Total — never raises, because a decorated function must not fail on the way out (arch §4).
-
-    One caveat the ``contextvars`` model makes unavoidable: both writes land in the context the
-    root span's ``finally`` runs in. An adoption made *outside* a span that then runs in a child
-    context — any ``asyncio.Task``, including the one ``asyncio.run`` creates — is cleared in
-    the copy, not in the parent that holds it. :func:`continue_trace` is documented to be called on
-    the entry point's first line, which is inside the span and unaffected; a caller who adopts
+    Both writes land in the context the root span's ``finally`` runs in, so an adoption made
+    outside a span that then runs in a child context — any ``asyncio.Task`` — is cleared in
+    the copy rather than the parent. :func:`continue_trace` is documented to be called on the
+    entry point's first line, which is inside the span and unaffected; a caller who adopts
     before dispatching across a task boundary clears it with :func:`reset_context`.
+
+    Args:
+      token: The token returned by :func:`push_baggage_scope`.
+
+    Returns:
+      None.
+
+    Raises:
+      None. A decorated function must not fail on the way out (arch §4), so a token minted
+        in another context or already used falls back to setting the captured value.
     """
-    # Cleared first, and deliberately ahead of anything that could fail: a stale trace id puts
-    # *wrong* data in the log stream, while a missed baggage restore only leaves a stale field.
     _adopted.set(None)
     try:
         _baggage.reset(token)
     except Exception:
-        # `reset` rejects a token minted in another context (``ValueError``, reachable when a
-        # span body hands work to another thread) and one already used (``RuntimeError``).
-        # Setting the captured value directly is equivalent: this context never had the scope
-        # pushed onto it, so there is nothing else to unwind. Broad because the alternative is
-        # raising from a `finally` and replacing the caller's own exception (arch §4).
-        # `old_value` is ``Token.MISSING`` when the variable was unset at capture, and absent
-        # entirely if this was never a Token; neither can have come from `set_baggage`, so both
-        # land on empty rather than poisoning baggage with whatever was passed.
         old = getattr(token, "old_value", None)
         _baggage.set(old if isinstance(old, dict) else {})
 
 
 def reset_context() -> None:
-    """Clear baggage and any adopted trace context outright (SPEC-024 FR-003).
+    """Clears baggage and any adopted trace context outright (SPEC-024 FR-003).
 
-    For the caller who uses the emitters **without** ``@trace``: the orphan path opens no span,
-    so there is no root-span exit to hang the release on, and both values would otherwise live
-    as long as the context does. A ``@trace`` user does not need this —
-    :func:`pop_baggage_scope` already runs at every root span's exit.
+    This is for the caller who uses the emitters without ``@trace``: the orphan path opens no
+    span, so there is no root-span exit to hang the release on. It is also the remedy for the
+    one case that scope cannot reach, an adoption made outside a span whose root span then
+    runs in a child context, and must be called in the context that made the adoption.
 
-    It is also the remedy for the one case that scope cannot reach: an adoption made outside a
-    span whose root span then runs in a child context, where the clear lands in the copy. Call
-    this in the context that made the adoption.
+    Unlike the scope release this clears rather than restores, erasing a process-level
+    baggage default too. Prefer calling it outside a span: inside one it does the obvious
+    thing to the events that follow, but SPEC-015 backfills ``span.start`` and ``span.end``
+    from the baggage live at close, so a mid-span reset also empties the two boundary events
+    of baggage that was live for most of the span.
 
-    One function rather than two because the two values have the same lifetime and the same
-    failure mode, and a caller who wants one almost always wants the other.
+    Args:
+      None.
 
-    Unlike the scope release this **clears** rather than restores — a process-level baggage
-    default set before any span is erased too, which is the point of an explicit reset. Safe
-    with nothing ever set, with no span open, and inside an open span. Never raises, like every
-    other entry point on this path (arch §4).
+    Returns:
+      None.
 
-    Prefer calling it **outside** a span. Inside one it does the obvious thing to the events
-    that follow, but SPEC-015 backfills ``span.start`` and ``span.end`` from the baggage live at
-    *close*, so a mid-span reset also empties the two boundary events — which describe the whole
-    span and carry ``duration_ms``/``status`` — of baggage that was live for most of it. That
-    span's exit then restores the baggage from before the span, as it always does.
+    Raises:
+      None.
     """
-    # Cleared in the same order as `pop_baggage_scope`, for the reason given there: a stale
-    # trace id is wrong data, a stale baggage field is only stale.
     _adopted.set(None)
     _baggage.set({})
 
 
-# -- adopted inbound context (SPEC-014) --------------------------------------------------
-
-
 def get_adopted_context() -> tuple[str, str | None] | None:
-    """Return the adopted ``(trace_id, parent_span_id)``, or ``None`` if none was adopted."""
+    """Returns the inbound trace context adopted for the next root span.
+
+    Args:
+      None.
+
+    Returns:
+      The adopted ``(trace_id, parent_span_id)``, or ``None`` if none was adopted.
+
+    Raises:
+      None.
+    """
     return _adopted.get()
 
 
 def set_adopted_context(trace_id: str, parent_span_id: str | None) -> None:
-    """Record an inbound trace context for the next root span opened in this context."""
+    """Records an inbound trace context for the next root span opened in this context.
+
+    Args:
+      trace_id: The inbound trace id to join.
+      parent_span_id: The caller's span id, or ``None`` if the header carried none.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
     _adopted.set((trace_id, parent_span_id))
 
 
-# -- the producer side: publish where this process is ------------------------------------
-
-
 def current_traceparent() -> str | None:
-    """Return the current span as a W3C ``traceparent`` string, or ``None`` if none is active."""
+    """Returns the current span as a W3C ``traceparent`` string.
+
+    Args:
+      None.
+
+    Returns:
+      The formatted header value, or ``None`` if no span is active.
+
+    Raises:
+      None.
+    """
     span = current_span()
     return format_traceparent(span.trace_id, span.span_id) if span else None
 
 
 def current_trace_context() -> tuple[str, str] | None:
-    """Return ``(trace_id, span_id)`` for the current span, or ``None`` if none is active.
+    """Returns the current span's trace and span ids as a pair.
 
-    For callers who would rather move two fields than a formatted string — a Step Functions
-    payload, a queue message attribute. It exists so nobody is pushed into
+    This is for callers who would rather move two fields than a formatted string — a Step
+    Functions payload, a queue message attribute. It exists so nobody is pushed into
     :func:`current_span`, which is internal and hands back a mutable :class:`~.model.Span`.
+
+    Args:
+      None.
+
+    Returns:
+      A ``(trace_id, span_id)`` tuple, or ``None`` if no span is active.
+
+    Raises:
+      None.
     """
     span = current_span()
     return (span.trace_id, span.span_id) if span else None
 
 
-# -- the W3C `baggage` header codec ------------------------------------------------------
-
-
 def current_baggage_header() -> str:
-    """Return the current baggage in W3C ``baggage`` header format (``""`` when empty).
+    """Returns the current baggage in W3C ``baggage`` header format.
 
-    The baggage store is ``dict[str, object]`` but the wire format is text, so **non-string
-    values are serialized with ``str()``** — put a dict in baggage and it arrives at the next
-    process as its repr, not as a dict. Keys and values are percent-encoded, so a value
-    containing ``,``, ``=`` or non-ASCII round-trips through :func:`parse_baggage_header`.
+    The baggage store holds arbitrary objects but the wire format is text, so non-string
+    values are serialized with ``str()`` — put a dict in baggage and it arrives at the next
+    process as its repr, not as a dict.
+
+    Args:
+      None.
+
+    Returns:
+      The formatted header value, empty when there is no baggage.
+
+    Raises:
+      None.
     """
     return format_baggage_header(get_baggage())
 
 
 def format_baggage_header(baggage: dict[str, object]) -> str:
-    """Serialize a baggage mapping to the W3C ``key1=value1,key2=value2`` format."""
-    # safe="" so the separators themselves (`,` `=` `;`) are encoded rather than corrupting the
-    # framing — the whole reason a value containing a comma can survive the hop.
+    """Serializes a baggage mapping to the W3C ``key1=value1,key2=value2`` format.
+
+    Keys and values are percent-encoded with ``safe=""``, so the separators themselves are
+    encoded rather than corrupting the framing — the whole reason a value containing a comma
+    survives the hop and round-trips through :func:`parse_baggage_header`.
+
+    Args:
+      baggage: The mapping to serialize.
+
+    Returns:
+      The formatted header value.
+
+    Raises:
+      None.
+    """
     return ",".join(f"{quote(k, safe='')}={quote(str(v), safe='')}" for k, v in baggage.items())
 
 
 def parse_baggage_header(header: object) -> dict[str, object] | None:
-    """Parse a W3C ``baggage`` header into a mapping, or ``None`` if it is unusable.
+    """Parses a W3C ``baggage`` header into a mapping.
 
-    Total, like the ``traceparent`` parser: the header arrives from outside the process. Returns
-    ``None`` for a non-string, an empty header, one over :data:`BAGGAGE_MAX_BYTES`, or a
-    malformed member — never a partial parse, which would silently drop correlating fields.
+    This is total, like the ``traceparent`` parser, because the header arrives from outside
+    the process. W3C allows per-member properties after a ``;`` and nothing here consumes
+    them, so they are dropped rather than treated as part of the value.
+
+    Args:
+      header: An inbound header value of any type.
+
+    Returns:
+      The parsed mapping, or ``None`` for a non-string, an empty header, one over
+      :data:`BAGGAGE_MAX_BYTES`, or a malformed member — never a partial parse, which would
+      silently drop correlating fields.
+
+    Raises:
+      None.
     """
     if not isinstance(header, str) or not header.strip():
         return None
@@ -279,8 +346,6 @@ def parse_baggage_header(header: object) -> dict[str, object] | None:
         return None
     parsed: dict[str, object] = {}
     for member in header.split(","):
-        # W3C allows per-member properties after a `;` (e.g. `k=v;metadata`). Nothing here
-        # consumes them, so they are dropped rather than treated as part of the value.
         entry = member.split(";", 1)[0].strip()
         if not entry:
             continue
