@@ -275,38 +275,54 @@ def _flush(span: Span) -> None:
     _get_worker().submit(span.events)
 
 
-_Scope = tuple[
+type _SpanScope = tuple[
     Span | None,
-    "contextvars.Token[tuple[Span, ...]] | None",
-    "contextvars.Token[dict[str, object]] | None",
+    contextvars.Token[tuple[Span, ...]] | None,
+    contextvars.Token[dict[str, object]] | None,
 ]
 
 
-def _begin(name: str, defaults: dict[str, object] | None) -> _Scope:
-    """Open a span and make it current, or give up on tracing this call. Never raises.
+def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
+    """Open a span and make it current, degrading rather than failing. Never raises.
 
     Everything here runs **before** the caller's function body, so a failure would mean the
     library prevented the application from doing its work at all — the worst reading of arch §4,
-    and worse than the close-path faults (SPEC-025 FR-001) because nothing has run yet. Any
-    fault gives back ``(None, None, None)``: the call proceeds untraced, its own result or
-    exception is the caller's, and :func:`_end` skips whatever was never set up. Partial setup
-    is kept rather than unwound — a span that exists but was never pushed still closes and
-    flushes, which is more than discarding it would preserve.
+    and worse than the close-path faults (SPEC-025 FR-001) because nothing has run yet.
 
-    ``is_root`` is read before :func:`_open_span`, which is what makes the new span current
-    (SPEC-024).
+    Whatever succeeded is kept, and :func:`_end` releases exactly that much. Four shapes reach
+    it, and the *order of the three steps* is what keeps every one of them coherent:
+
+    * ``(span, token, scope)`` — everything worked; ``scope`` is ``None`` for a nested call,
+      which has no root scope to open.
+    * ``(span, token, None)`` — a nested call, or a root whose scope failed. **The scope is
+      taken first for this reason**: opened last, a root call that lost only its scope would
+      keep the span *and* leak its baggage into the next request, which is the SPEC-024 defect
+      reappearing through a failure path. Taken first, a lost scope means no span either.
+    * ``(None, None, scope)`` — the span could not be opened; the call runs untraced and the
+      scope is still released, so nothing leaks.
+    * ``(None, None, None)`` — nothing was set up.
+
+    A span that exists but was never pushed (``token is None``) is still closed and flushed by
+    :func:`_end`: it is not *current*, so nested calls will not parent to it and its own events
+    are all it carries, but that is more than discarding it would preserve.
+
+    The root test reads :func:`~log_foundry.context.current_span` before :func:`_open_span`,
+    which is what makes the new span current (SPEC-024).
     """
     span: Span | None = None
     token: contextvars.Token[tuple[Span, ...]] | None = None
     scope: contextvars.Token[dict[str, object]] | None = None
     try:
-        is_root = context.current_span() is None
+        if context.current_span() is None:
+            scope = context.push_baggage_scope()
         span = _open_span(name, defaults)
         token = context.push_span(span)
-        if is_root:
-            scope = context.push_baggage_scope()
     except Exception as exc:
-        _diag.absorbed("opening a span", exc, "this call runs untraced")
+        _diag.absorbed(
+            "opening a span",
+            exc,
+            "this call runs untraced" if span is None else "this call is traced incompletely",
+        )
     return span, token, scope
 
 
@@ -329,9 +345,15 @@ def _end(
     the caller. That is the same line SPEC-019 drew in the opposite direction for the worker
     thread, where the *absence* of a handler was the defect.
 
-    Order is fixed and load-bearing: close first, so SPEC-015's backfill reads the baggage that
-    was live inside the span; then pop the stack; then release the baggage scope (SPEC-024).
-    Both releases are total in their own right, so neither needs a guard here.
+    One ordering constraint, and only one: the baggage scope is released **after** the close, so
+    SPEC-015's backfill still reads the baggage that was live inside the span. The stack pop is
+    order-independent — ``_close_span`` reads the span it is handed and the current baggage,
+    never the stack — and simply mirrors the setup. Both releases are total in their own right
+    (SPEC-024, SPEC-025), so neither needs a guard here.
+
+    The ``is not None`` checks are load-bearing, not defensive tidiness: ``pop_span(None)`` would
+    fall through that function's own guard to ``set(())`` and wipe the whole stack, detaching the
+    parent of an untraced *nested* call and splitting its trace.
     """
     if span is not None:
         try:
@@ -394,7 +416,14 @@ def trace(
                     status, error = "error", exc
                     raise
                 finally:
-                    _end(span, token, scope, status, error)
+                    try:
+                        _end(span, token, scope, status, error)
+                    finally:
+                        # `except ... as exc` auto-deletes its target for exactly this reason.
+                        # `error` holds an exception whose traceback holds this frame, so
+                        # keeping it past the handler builds a cycle only the collector can
+                        # break — and pins the caller's own frames and locals along with it.
+                        del status, error
                 return result
 
             return cast("F", async_wrapper)
@@ -410,7 +439,14 @@ def trace(
                 status, error = "error", exc
                 raise
             finally:
-                _end(span, token, scope, status, error)
+                try:
+                    _end(span, token, scope, status, error)
+                finally:
+                    # `except ... as exc` auto-deletes its target for exactly this reason.
+                    # `error` holds an exception whose traceback holds this frame, so keeping
+                    # it past the handler builds a cycle only the collector can break — and
+                    # pins the caller's own frames and locals along with it.
+                    del status, error
             return result
 
         return cast("F", wrapper)

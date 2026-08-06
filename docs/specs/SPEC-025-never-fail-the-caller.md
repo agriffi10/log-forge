@@ -110,6 +110,11 @@ in the `finally` where a raise would replace the caller's own exception.
       exception.
 - [ ] After a failed close the span stack is left clean — `current_span()` is `None` again — so a
       later call in the same context is not parented to a span that never closed.
+- [ ] An untraced **nested** call leaves its parent current, so the parent's trace is not split.
+- [ ] A root call whose span could not be opened still releases its baggage scope, so baggage set
+      inside it does not reach the next call (SPEC-024's guarantee survives the failure path).
+- [ ] A raising traced call retains no reference cycle: repeated calls do not accumulate objects
+      that only `gc.collect()` can free.
 
 ### FR-002: One span produces one end event
 
@@ -219,7 +224,10 @@ def wrapper(*args, **kwargs):
         status, error = "error", exc
         raise                       # unchanged, per architecture §4
     finally:
-        _end(span, token, scope, status, error)                      # never raises
+        try:
+            _end(span, token, scope, status, error)                  # never raises
+        finally:
+            del status, error       # break the frame↔exception cycle — see below
     return result
 
 
@@ -238,10 +246,27 @@ def _end(span, token, scope, status, error):
 `status`/`error` are set in the `except` and read in the `finally`, so the close runs exactly once
 and knows the outcome. The bare `raise` keeps the caller's exception identity and traceback.
 
-`_begin` returns `(None, None, None)` when the setup itself fails, and `_end` skips whatever was
-never set up — which is what lets an untraced call proceed instead of failing. The close comes
-first in `_end`, so SPEC-015's backfill still reads the baggage that was live inside the span, and
-SPEC-024's release still runs after it.
+`_begin` keeps whatever succeeded and `_end` releases exactly that much, which is what lets a
+degraded call proceed instead of failing. The **order of its three steps** is what keeps every
+partial state coherent: the baggage scope is taken *first*, so a root call that loses its span
+still has a scope to release, and the state "span kept, scope lost" — a traced call that leaks its
+baggage into the next request, i.e. the SPEC-024 defect reappearing through a failure path — is
+unreachable. A span that exists but was never pushed is still closed and flushed; it is simply not
+current, so nothing nests under it.
+
+`_end`'s `is not None` checks are load-bearing rather than defensive: `pop_span(None)` would fall
+through that function's own guard to `set(())` and wipe the whole stack, detaching the parent of an
+untraced *nested* call.
+
+One ordering constraint inside `_end`, and only one: the baggage scope is released **after** the
+close, so SPEC-015's backfill still reads the baggage that was live inside the span. The stack pop
+is order-independent — `_close_span` reads the span it is handed and the current baggage, never the
+stack.
+
+The outcome must be **deleted after `_end`**. `except ... as exc` auto-deletes its target precisely
+because a local holding an exception whose traceback holds this frame is a reference cycle; keeping
+it in `error` past the handler rebuilds that cycle and pins the caller's own frames and locals until
+a generational collection. Measured at ~13 objects per raising call.
 
 ## Configuration / Environment
 

@@ -12,10 +12,12 @@ Two rules, both load-bearing:
   provoked it, and arch §6 keeps user data out of anything the library emits about itself — the
   same rule SPEC-019 applies to ``Health.stopped_reason``. A type name is enough to tell a
   ``ConnectionError`` from a ``TypeError``, which is what the reader needs.
-* **This function cannot raise.** It is called from ``except`` blocks and ``finally`` blocks whose
-  entire purpose is to stop an exception reaching the caller, so a failure here — a closed stderr
-  at interpreter shutdown, a stream that rejects the write — must not become the exception those
-  guards existed to prevent.
+* **No stream fault escapes.** It is called from ``except`` and ``finally`` blocks whose entire
+  purpose is to stop an exception reaching the caller, so a failure here — a closed stderr at
+  interpreter shutdown, a stream that rejects the write, ``sys.stderr`` set to ``None`` — must not
+  become the exception those guards existed to prevent. A ``BaseException`` still passes through,
+  as everywhere else in this library: a ``KeyboardInterrupt`` landing mid-write is the operator's
+  intent, not a stream fault to swallow.
 
 SPEC-029 takes ownership of this module and moves the ``repr(exception)`` sink sites onto it.
 """
@@ -28,7 +30,9 @@ __all__ = ["absorbed"]
 
 
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
-    """Report a failure the library swallowed rather than propagated. Never raises.
+    """Report a failure the library swallowed rather than propagated.
+
+    Never raises on a stream fault; a ``BaseException`` from the write still propagates.
 
     Args:
         where: What was being attempted, as a participle phrase that reads after "while" —
