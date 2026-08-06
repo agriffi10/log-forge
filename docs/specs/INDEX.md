@@ -29,7 +29,7 @@ to status only — no prose.
 | [SPEC-022](SPEC-022-security-scanning.md) | Security Scanning in CI | Completed | SPEC-012 |
 | [SPEC-023](SPEC-023-supply-chain-transparency.md) | Supply-Chain Transparency and Dependency Auditing | Completed | SPEC-012, SPEC-022 |
 | [SPEC-024](SPEC-024-context-lifetime.md) | Context Lifetime — Scoping Baggage and Adopted Trace Context | Completed | SPEC-014, SPEC-015 |
-| [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Draft | SPEC-004, SPEC-017 |
+| [SPEC-025](SPEC-025-never-fail-the-caller.md) | The Library Must Not Fail the Caller | Completed | SPEC-004, SPEC-017 |
 | [SPEC-026](SPEC-026-sink-loss-visibility.md) | Sink Loss Visibility | Draft | SPEC-017, SPEC-018, SPEC-019, SPEC-021 |
 | [SPEC-027](SPEC-027-bounded-interruptible-retry.md) | Bounded, Interruptible Retry | Draft | SPEC-004, SPEC-009, SPEC-013 |
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Draft | SPEC-002, SPEC-004, SPEC-008 |
@@ -100,11 +100,13 @@ Group related specs and record the order to build them in. Delete this section i
   taken back out of `contextvars`, so a request's data appeared on the next request's events and a
   handler kept joining a trace whose process had exited. It was the only finding that puts *wrong
   data* in the log stream rather than losing it, and the fix was small and self-contained.
-  **SPEC-025** next — three surviving instances of the SPEC-017 shape, where the exception a caller
-  receives is one the library invented: an unguarded `_close_span` fails a function that already
-  returned (and emits a contradictory second `span.end`), the orphan path propagates a sink's
-  failure, and `shutdown()` raises out of `atexit` while leaving the sink open forever.
-  **SPEC-029** before SPEC-026 — both introduce `_diag.py`, and 029 owns it. Twelve sink sites
+  **SPEC-025** next (**shipped**) — three surviving instances of the SPEC-017 shape, where the
+  exception a caller received was one the library invented: an unguarded `_close_span` failed a
+  function that had already returned (and emitted a contradictory second `span.end`), the orphan
+  path propagated a sink's failure, and `shutdown()` raised out of `atexit` while leaving the sink
+  open forever. It also brought `_open_span` into scope and shipped `_diag.py`.
+  **SPEC-029** before SPEC-026 — both use `_diag.py`, which SPEC-025 shipped and 029 owns. Twelve
+  sink sites
   print `repr(exception)` against the arch §6 rule that `_terminal_failure` cites for not doing it,
   and `_emit`'s one unguarded stderr write kills the drain thread on a broken stream.
   **SPEC-026** then — the largest. Every remote transport absorbs its own failures and returns
