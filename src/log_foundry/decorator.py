@@ -120,6 +120,13 @@ def continue_trace(
     batch that fans out to several *sibling* root spans needs one call per item — or, better, a
     single ``@trace`` entry point so the items are nested spans of one trace.
 
+    One constraint on that release: it happens in whichever context the root span's ``finally``
+    runs in. Adopt here and then dispatch the span into a **child** context — any
+    ``asyncio.Task``, including the one ``asyncio.run`` creates — and the clear lands in the
+    copy while this context keeps the adoption. Calling this on the entry point's first line, as
+    above, is inside the span and unaffected; a caller who adopts before dispatching should call
+    :func:`~log_foundry.reset_context` when the work is done.
+
     ``baggage`` is a W3C ``baggage`` header merged into the current context. It succeeds or
     fails independently of the trace context.
 

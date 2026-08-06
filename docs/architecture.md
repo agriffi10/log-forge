@@ -144,6 +144,21 @@ def handle_request(req):
 
 - Baggage lives in the same `contextvars` context as the span stack, so it propagates
   across nested calls, threads, and `async` tasks automatically.
+- **The scope ends at the root span** (SPEC-024). "At or below the point they were set" is
+  where baggage *starts*; where it stops is the close of the **root** span — the one opened
+  when no other was active — at which point the baggage in effect before that span is
+  restored. Nested spans deliberately do **not** reset: baggage set three calls deep must
+  stay visible to its parent and to the siblings that follow it inside the same trace, which
+  is the whole point of the feature. Without that boundary the scope is the whole
+  `contextvars` context forever, and a long-lived process serving requests sequentially on
+  one thread — the main thread, a pooled worker, a warm Lambda container — stamps one
+  request's `user_id` onto the next request's events.
+- **Set outside any span, baggage is a process-level default** and is restored *to* rather
+  than erased, so it survives the traces beneath it. `configure(defaults=...)` is the better
+  tool for that; `reset_context()` is what erases it, and is the only release available to a
+  caller who uses the emitters without `@trace` (there is no root span to hang one on).
+- The adopted inbound trace context (§12, SPEC-014) is released at the same point but is
+  **cleared** rather than restored — it is a one-shot handoff to the trace it names.
 - It is merged into each event's `fields` (see §6) at emit time. Precedence, lowest to
   highest: global `defaults` → per-decorator `defaults` → baggage → explicit per-call
   fields.
