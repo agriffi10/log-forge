@@ -61,6 +61,13 @@ class FirehoseSink:
         settled that such a chunk is abandoned rather than re-sent — the API reported a failure
         count, so some of it landed, and the worker's retry would duplicate that downstream
         forever. Raising on it would be exactly the re-send SPEC-018 refuses.
+
+        That suppression is batch-wide, unlike ``SQSSink``'s. A sender fault is a rejection —
+        the entries provably did not land, so re-sending them is futile rather than harmful —
+        while "unadjudicable" means this sink *cannot tell* whether they landed. Once any chunk
+        is in that state the emit can no longer prove nothing was delivered, so a raise would
+        risk duplicating it, and the events in a plainly-failed sibling chunk stay a counted
+        loss rather than a duplicated delivery. SPEC-018 chose that trade once already.
         """
         records = self._records(batch)
         chunks = delivered = 0

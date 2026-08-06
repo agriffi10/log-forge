@@ -52,11 +52,15 @@ class KafkaSink:
     def losses(self) -> SinkLosses:
         """Refused and undelivered messages (SPEC-026 FR-002). Never raises.
 
-        ``rejected`` is ``dropped``: ``produce()`` refused it, so nothing was ever sent. ``failed``
-        is the delivery callback's verdict, which arrives *after* the ``emit`` that produced the
-        message — asynchronously, and usually during a later ``poll``/``flush``. That is why a
-        callback failure can never make ``emit`` raise: by the time it is known, the batch it
-        belonged to has been reported delivered and retrying it would duplicate the rest.
+        ``rejected`` is ``dropped``: ``produce()`` refused it, so nothing ever left the process.
+        ``failed`` is the delivery callback's verdict on a message the producer *did* accept.
+
+        A callback failure never makes ``emit`` raise, and the reason is ownership rather than
+        timing — ``poll(0)`` runs inside ``emit``, so a callback for a message produced earlier
+        in the same batch can and does fire before it returns. Once the producer has accepted a
+        message it owns delivery, including its own retries; re-producing it from here would
+        duplicate whatever the producer eventually lands. So the raise decision reads only what
+        ``produce()`` refused.
         """
         return SinkLosses(dropped=self.rejected, failed=self.failed)
 

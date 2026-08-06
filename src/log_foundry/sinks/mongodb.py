@@ -83,10 +83,14 @@ class MongoDBSink:
                     # do not retry (successes are already in, a retry would duplicate/re-error).
                     rejects = len(details["writeErrors"])
                     self.failed += rejects
+                    total = rejects >= len(documents)
                     _diag.lost(
-                        "document", rejects, "MongoDBSink bulk write; the rest were inserted"
+                        "document",
+                        rejects,
+                        "MongoDBSink bulk write; none were inserted" if total
+                        else "MongoDBSink bulk write; the rest were inserted",
                     )
-                    if rejects >= len(documents):
+                    if total:
                         raise SinkDeliveryError(
                             f"MongoDBSink inserted none of {len(documents)} document(s)"
                         ) from None

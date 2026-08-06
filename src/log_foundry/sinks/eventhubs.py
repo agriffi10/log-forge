@@ -72,9 +72,14 @@ class AzureEventHubsSink:
             data = event_data_cls(json.dumps(event).encode("utf-8"))
             if _try_add(current, data):
                 continue
-            # current batch is full: send it and start a fresh one for this event.
-            attempted += 1
-            delivered += self._send(current)
+            # current batch is full: send it and start a fresh one for this event. Guarded on
+            # emptiness because ``_try_add`` also fails against a *fresh* batch when the event
+            # is oversized, and the SDK short-circuits ``send_batch`` on an empty batch and
+            # returns — a phantom success that counted as delivery and suppressed the raise for
+            # everything else in the emit.
+            if len(current) > 0:
+                attempted += 1
+                delivered += self._send(current)
             current = self.producer.create_batch()
             if not _try_add(current, data):
                 self.dropped_oversized += 1
@@ -96,8 +101,10 @@ class AzureEventHubsSink:
     def _send(self, event_batch: Any) -> int:
         """Send one EventDataBatch, retrying failures; ``1`` if it landed (FR-009, FR-011).
 
-        Callers only reach this with a non-empty batch, and count the result: the "did anything
-        land" question in ``emit`` cannot be answered by a method that returns nothing.
+        Callers only reach this with a non-empty batch — both call sites check — and count the
+        result: the "did anything land" question in ``emit`` cannot be answered by a method that
+        returns nothing. An empty one must never be sent: the SDK returns immediately without
+        contacting the hub, which would score as a delivery nobody made.
         """
         for attempt in range(self.max_retries + 1):
             try:
