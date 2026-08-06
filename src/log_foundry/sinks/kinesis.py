@@ -1,11 +1,4 @@
-"""KinesisSink — put event records to a Kinesis Data Stream (arch §8, §9.1, SPEC-010).
-
-Extends the durable-buffer path ``SQSSink`` established: a queue/stream absorbs spikes and outages
-while a separate consumer (out of scope) drains it into ELK. ``boto3`` is the optional ``aws`` extra,
-imported lazily inside the sink (never at module top) so importing this module needs no ``boto3``
-unless a sink is built without an injected client. Each incoming batch is re-chunked to Kinesis's
-``put_records`` limits (≤ 500 records **and** ≤ 5 MB); partial failures are retried within a bound.
-"""
+"""KinesisSink — put event records to a Kinesis Data Stream (arch §8, §9.1, SPEC-010)."""
 
 from __future__ import annotations
 
@@ -23,26 +16,29 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KinesisSink"]
 
-_BACKOFF_BASE = 0.1  # seconds; delay before retry attempt n is _BACKOFF_BASE * 2**n
+_BACKOFF_BASE = 0.1
 
 
 class KinesisSink:
     """A :class:`~log_foundry.sinks.base.Sink` that writes events to a Kinesis Data Stream.
 
-    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` per chunk —
-    0.7 s at the default 3. The waits are interruptible, so ``shutdown()`` cuts one short.
+    This extends the durable-buffer path ``SQSSink`` established: a stream absorbs spikes and
+    outages while a separate consumer drains it into ELK. ``boto3`` is the optional ``aws``
+    extra, imported lazily inside the sink. The worst-case delay (SPEC-027 FR-005) is
+    ``max_retries`` interruptible waits per chunk, 0.7 s at the defaults.
 
-    Three counters report what was not delivered: ``failed`` (the stream told us these failed, and
-    they still failed after ``max_retries``), ``dropped_oversized`` (too large for the per-record
-    limit to ever accept), and ``dropped_unadjudicated`` (a ``put_records`` response whose results
-    array did not describe the chunk that was sent, so no record in it could be paired to an
-    outcome). A non-zero ``dropped_unadjudicated`` means those records were abandoned without the
-    stream ever confirming them — treat it as loss, and as a sign the client is not AWS-shaped.
+    Attributes:
+      failed: Records the stream said failed, which still failed after every retry.
+      dropped_oversized: Records too large for the per-record limit to ever accept.
+      dropped_unadjudicated: Records in a ``put_records`` response whose results array did not
+        describe the chunk sent, so none could be paired to an outcome. A non-zero count means
+        those records were abandoned without the stream ever confirming them — treat it as loss,
+        and as a sign the client is not AWS-shaped.
     """
 
-    MAX_RECORDS = 500  # put_records hard limit: records per request
-    MAX_REQUEST_BYTES = 5 * 1024 * 1024  # 5 MB per put_records request
-    MAX_RECORD_BYTES = 1024 * 1024  # 1 MB per record (Data)
+    MAX_RECORDS = 500
+    MAX_REQUEST_BYTES = 5 * 1024 * 1024
+    MAX_RECORD_BYTES = 1024 * 1024
 
     def __init__(
         self,
@@ -52,41 +48,59 @@ class KinesisSink:
         partition_key_field: str = "trace_id",
         max_retries: int = 3,
     ) -> None:
+        """Binds the sink to a stream.
+
+        Args:
+          stream_name: The stream to write to.
+          client: A boto3-shaped Kinesis client, or ``None`` to build one lazily.
+          partition_key_field: The event key used as the record's partition key.
+          max_retries: Retries for the failed records of a chunk, floored at zero as
+            ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
+            having sent nothing, and reported success.
+
+        Returns:
+          None.
+
+        Raises:
+          ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
+        """
         if client is None:
-            import boto3  # type: ignore[import-not-found]  # optional 'aws' extra
+            import boto3  # type: ignore[import-not-found]
 
             client = boto3.client("kinesis")
         self.stream_name = stream_name
         self.client = client
         self.partition_key_field = partition_key_field
-        # Floored as ``Worker._emit`` floors its own (SPEC-021): a negative value returned
-        # from ``_send`` having sent nothing, and reported success.
         self.max_retries = max(max_retries, 0)
-        # Set by the worker when this sink is the configured one (SPEC-027 FR-002).
         self.stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
         self.dropped_unadjudicated = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunk to put_records limits and send each chunk, retrying failures (FR-003).
+        """Re-chunks to the request limits and sends each chunk, retrying failures (FR-003).
 
-        Raises when every chunk failed and at least one was sent (SPEC-026 FR-001). Records
-        dropped before sending — too large to ever fit — are not a send failure and do not make
-        a batch of nothing but oversized records raise; they can never be retried into
-        existence, and are reported through ``losses().dropped``.
+        An unadjudicable chunk is unknown, not nothing, and suppresses the raise: SPEC-018
+        settled that such a chunk is abandoned rather than re-sent, because the API reported a
+        failure count, so some of it landed and the worker's retry would duplicate that
+        downstream forever.
 
-        An unadjudicable chunk is *unknown*, not *nothing*, and suppresses the raise. SPEC-018
-        settled that such a chunk is abandoned rather than re-sent — the API reported a failure
-        count, so some of it landed, and the worker's retry would duplicate that downstream
-        forever. Raising on it would be exactly the re-send SPEC-018 refuses.
+        That suppression is batch-wide, unlike ``SQSSink``'s. A sender fault is a rejection, so
+        re-sending is futile rather than harmful, while "unadjudicable" means this sink cannot
+        tell whether the records landed — once any chunk is in that state the emit can no longer
+        prove nothing was delivered, so the events in a plainly-failed sibling chunk stay a
+        counted loss rather than a duplicated delivery.
 
-        That suppression is batch-wide, unlike ``SQSSink``'s. A sender fault is a rejection —
-        the entries provably did not land, so re-sending them is futile rather than harmful —
-        while "unadjudicable" means this sink *cannot tell* whether they landed. Once any chunk
-        is in that state the emit can no longer prove nothing was delivered, so a raise would
-        risk duplicating it, and the events in a plainly-failed sibling chunk stay a counted
-        loss rather than a duplicated delivery. SPEC-018 chose that trade once already.
+        Args:
+          batch: The events to write.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When every chunk failed, at least one was sent, and none was
+            unadjudicable (SPEC-026 FR-001). Records dropped before sending are not a send
+            failure and are reported through :meth:`losses`.
         """
         records = self._records(batch)
         chunks = delivered = 0
@@ -107,11 +121,19 @@ class KinesisSink:
             raise SinkDeliveryError(f"KinesisSink delivered none of {chunks} chunk(s)")
 
     def losses(self) -> SinkLosses:
-        """Oversized drops, abandoned records and unadjudicable chunks (FR-002). Never raises.
+        """Reports oversized drops, abandoned records and unadjudicable chunks (FR-002).
 
-        ``failed`` sums ``failed`` and ``dropped_unadjudicated``: both are records the stream
-        never confirmed. They stay apart on the instance, because "the stream said these failed"
-        and "the response did not describe them" have different remedies (SPEC-018).
+        Args:
+          None.
+
+        Returns:
+          The counters. ``failed`` sums the abandoned and the unadjudicated, since both are
+          records the stream never confirmed; they stay apart on the instance because "the
+          stream said these failed" and "the response did not describe them" have different
+          remedies (SPEC-018).
+
+        Raises:
+          None.
         """
         return SinkLosses(
             dropped=self.dropped_oversized,
@@ -119,12 +141,30 @@ class KinesisSink:
         )
 
     def close(self) -> None:
-        """No-op: the sink buffers nothing internally (FR-001)."""
+        """Does nothing, since the sink buffers nothing internally (FR-001).
 
-    # -- internals ----------------------------------------------------------------------
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
 
     def _records(self, batch: list[dict[str, object]]) -> list[dict[str, Any]]:
-        """Build put_records entries, dropping any single record too large to ever fit (FR-011)."""
+        """Builds the request entries, dropping any record too large to ever fit (FR-011).
+
+        Args:
+          batch: The events to convert.
+
+        Returns:
+          The records that can be sent.
+
+        Raises:
+          None.
+        """
         records: list[dict[str, Any]] = []
         for event in batch:
             data = json.dumps(event).encode("utf-8")
@@ -142,13 +182,24 @@ class KinesisSink:
         return records
 
     def _send(self, records: list[dict[str, Any]]) -> int | None:
-        """Send one chunk, retrying only the records the response flags as failed (FR-003).
+        """Sends one chunk, retrying only the records the response flags as failed (FR-003).
 
-        Returns how many records the stream accepted, so ``emit`` can tell "nothing landed"
-        from a partial success — or ``None`` when the response could not be adjudicated, which
-        is neither. "The stream did not say" must not be read as "the stream took nothing":
-        that reading would make ``emit`` raise, and the worker's retry would re-send a chunk
-        SPEC-018 settled must never be re-sent.
+        The wait comes before the next attempt and never before abandoning (SPEC-027 FR-003):
+        this loop re-sends the records the destination flagged, and the canonical reason it flags
+        them is throttling, which an immediate re-send makes worse.
+
+        Args:
+          records: One chunk's request entries.
+
+        Returns:
+          How many records the stream accepted, so :meth:`emit` can tell "nothing landed" from a
+          partial success, or ``None`` when the response could not be adjudicated, which is
+          neither. "The stream did not say" must not be read as "the stream took nothing": that
+          reading would make :meth:`emit` raise, and the worker's retry would re-send a chunk
+          SPEC-018 settled must never be re-sent.
+
+        Raises:
+          Exception: Whatever the client raises.
         """
         sent = len(records)
         for attempt in range(self.max_retries + 1):
@@ -170,9 +221,6 @@ class KinesisSink:
             if not records:
                 return sent
             if attempt < self.max_retries:
-                # Before the next attempt, never before abandoning (SPEC-027 FR-003). This loop
-                # re-sends the entries the destination flagged, and the canonical reason it
-                # flags them is throttling — which an immediate re-send makes worse.
                 wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
                 self.failed += len(records)
@@ -182,4 +230,4 @@ class KinesisSink:
                     f"KinesisSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
                 return sent - len(records)
-        return 0  # unreachable: the loop returns on every path (mypy needs the exit)
+        return 0
