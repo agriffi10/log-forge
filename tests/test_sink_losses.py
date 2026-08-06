@@ -459,10 +459,14 @@ def test_filtering_and_transform_report_the_inner_sinks_losses() -> None:
     assert TransformSink(inner, lambda e: e).losses() == SinkLosses(dropped=2, failed=3)
 
 
-def test_a_wrapper_over_a_silent_sink_reports_zero_not_none() -> None:
+def test_a_wrapper_passes_an_unreporting_inner_sink_through_as_none() -> None:
+    """FR-003 separates "reports nothing" from "reports no loss"; a wrapper must not flatten it."""
     from log_foundry.sinks.filtering import FilteringSink
+    from log_foundry.sinks.transform import TransformSink
 
-    assert FilteringSink(QuietSink()).losses() == SinkLosses(dropped=0, failed=0)
+    assert FilteringSink(QuietSink()).losses() is None
+    assert TransformSink(QuietSink(), lambda e: e).losses() is None
+    assert Worker(FilteringSink(QuietSink()), batch_size=1).health().sink is None
 
 
 def test_sentry_sdk_errors_are_isolated_per_event() -> None:
@@ -483,7 +487,7 @@ def test_sentry_sdk_errors_are_isolated_per_event() -> None:
 
     sink.emit([{"level": "ERROR"}, {"level": "ERROR"}])  # the second lands: must not raise
 
-    assert (sdk.calls, sink.sent, sink.sdk_errors) == (2, 1, 1)
+    assert (sdk.calls, sink.sent, sink.transport_errors) == (2, 1, 1)
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
 
 
@@ -550,3 +554,77 @@ def test_a_negative_max_retries_still_makes_one_attempt() -> None:
         sink.emit([{"a": 1}])
     assert len(opener.calls) == 1, "abandoned with no attempt made is a silent loss"
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+# --- re-review follow-ups -----------------------------------------------------------------
+
+
+class _RaisingOpener:
+    """An opener whose Nth call raises something that is neither URLError nor OSError."""
+
+    def __init__(self, fail_on: int, exc: Exception) -> None:
+        self.calls = 0
+        self._fail_on = fail_on
+        self._exc = exc
+
+    def __call__(self, request, timeout=None):
+        from test_sinks_http import FakeResponse
+
+        self.calls += 1
+        if self.calls == self._fail_on:
+            raise self._exc
+        return FakeResponse(200, b"{}")
+
+
+def test_sentry_absorbs_a_response_error_http_sink_does_not_retry() -> None:
+    """``HTTPSink`` catches (URLError, OSError); ``IncompleteRead`` is neither."""
+    import http.client
+
+    from log_foundry.sinks.sentry import SentrySink
+
+    opener = _RaisingOpener(3, http.client.IncompleteRead(b""))
+    sink = SentrySink("http://k@sentry.local/1", max_retries=0, opener=opener)
+
+    sink.emit([{"level": "ERROR"}] * 5)  # two already accepted: must not propagate
+
+    assert (sink.sent, sink.transport_errors) == (4, 1)
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+def test_a_longer_items_array_does_not_turn_a_partial_success_into_a_raise() -> None:
+    """Reading a positional response that does not describe the batch is SPEC-018's rule."""
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    sink = ElasticsearchSink(
+        "http://x",
+        index="i",
+        opener=FakeOpener([FakeResponse(200, _bulk(True, True, True))]),
+    )
+    sink.emit([{"a": 1}, {"b": 2}])  # 3 items for 2 events: unadjudicable, never a raise
+    assert (sink.item_errors, sink.dropped_unadjudicated) == (0, 2)
+    assert sink.losses() == SinkLosses(dropped=0, failed=2)
+
+
+def test_a_short_items_array_is_not_read_as_a_partial_success() -> None:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    sink = ElasticsearchSink(
+        "http://x", index="i", opener=FakeOpener([FakeResponse(200, _bulk(True))])
+    )
+    sink.emit([{"a": 1}, {"b": 2}])  # 1 item for 2 events: the outcome is simply unknown
+    assert sink.dropped_unadjudicated == 2
+
+
+def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
+    from test_sinks_syslog import RefusingSocket
+
+    sock = RefusingSocket()
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda: sock)
+    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=-1)
+
+    with pytest.raises(SinkDeliveryError):
+        transport.send_all([b"a"])
+    assert transport.losses() == SinkLosses(dropped=0, failed=1), "abandoned without a counter"

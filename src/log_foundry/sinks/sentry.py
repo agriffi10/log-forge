@@ -34,8 +34,8 @@ class SentrySink:
     Attributes:
         sent: Events captured/sent to Sentry.
         skipped: Events below ``min_level`` (or without a usable level) that were not sent.
-        sdk_errors: Events the SDK's ``capture_event`` raised on (SDK path only; the HTTP
-            fallback counts its abandoned requests on ``failed`` instead).
+        transport_errors: Events whose send raised something other than an already-counted
+            abandonment — an SDK fault, or a response error ``HTTPSink`` does not retry.
     """
 
     def __init__(
@@ -51,7 +51,7 @@ class SentrySink:
         self._min_rank = _LEVEL_RANK.get(min_level.upper(), _LEVEL_RANK["ERROR"])
         self.sent = 0
         self.skipped = 0
-        self.sdk_errors = 0
+        self.transport_errors = 0
         self._sdk = sdk if sdk is not None else _import_sdk()
         self._http: HTTPSink | None = None
         self._auth_header = ""
@@ -105,34 +105,41 @@ class SentrySink:
 
         ``skipped`` is deliberately **not** ``dropped``: an event below ``min_level`` was never
         meant for Sentry, and reporting a configured filter as loss would make the alert idiom
-        fire on every INFO log. The SDK path reports nothing — ``capture_event`` is fire-and-
-        forget and the SDK owns its own delivery.
+        fire on every INFO log. What *is* reported is an abandoned envelope (``failed``, counted
+        by ``HTTPSink``) and an event whose send raised (``transport_errors``) — on either
+        transport. Delivery the SDK accepts and then loses internally is the SDK's to report.
         """
-        return SinkLosses(dropped=0, failed=self.failed + self.sdk_errors)
+        return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
 
     # -- internals ----------------------------------------------------------------------
 
     def _capture(self, event: dict[str, object]) -> bool:
         """Send one event by whichever transport is configured; ``False`` if it did not land.
 
-        Both branches are guarded, not just the HTTP one. ``capture_event`` is a third-party
-        call — an SDK misconfiguration or a transport error raising on event 3 of 10 would
-        otherwise propagate mid-batch and hand the worker a batch Sentry had already accepted
-        the first two events of, which is the duplicate delivery this per-event design exists
-        to prevent. Only the type is written (arch §6), and the counter moves first.
+        One guard over **both** branches, catching ``Exception`` rather than an enumerated set.
+        Anything escaping here propagates mid-batch and hands the worker a batch Sentry has
+        already accepted the earlier events of, and the retry duplicates them — the failure this
+        per-event design exists to prevent. Enumerating was tried and was wrong twice over: the
+        SDK branch is third-party code that can raise anything, and ``HTTPSink._send`` catches
+        ``(URLError, OSError)``, which does **not** cover ``http.client.HTTPException`` — an
+        ``IncompleteRead`` off ``response.read()`` came straight through. A caller-injected
+        ``opener`` widens that further, since it is arbitrary code too.
+
+        ``SinkDeliveryError`` is caught separately only because ``HTTPSink._abandon`` has already
+        counted and announced it; counting it again here would double-report. Only the exception
+        type is ever written (arch §6).
         """
-        if self._sdk is not None:
-            try:
-                self._sdk.capture_event(self._sentry_event(event))
-            except Exception as err:  # isolation boundary: one event must not fail the batch
-                self.sdk_errors += 1
-                _diag.lost("event", 1, f"SentrySink capture_event, {type(err).__name__}")
-                return False
-            return True
         try:
-            self._post_envelope(event)
+            if self._sdk is not None:
+                self._sdk.capture_event(self._sentry_event(event))
+            else:
+                self._post_envelope(event)
         except SinkDeliveryError:
             return False  # already counted and logged by HTTPSink._abandon
+        except Exception as err:  # isolation boundary: one event must not fail the batch
+            self.transport_errors += 1
+            _diag.lost("event", 1, f"SentrySink, {type(err).__name__}")
+            return False
         return True
 
     def _qualifies(self, event: dict[str, object]) -> bool:
