@@ -35,6 +35,15 @@ __all__ = ["Health", "Worker"]
 # instead of waiting out the flush_interval. It is never emitted.
 _SHUTDOWN = object()
 
+DEFAULT_SHUTDOWN_TIMEOUT = 30.0
+"""Seconds :meth:`Worker.shutdown` will wait for the drain thread (SPEC-027 FR-004).
+
+Generous, because the ordinary case is a fast drain and expiring early would abandon events that
+were about to be delivered. Bounded at all, because ``shutdown()`` runs from ``atexit`` and an
+unbounded join there is a hung process — a sink blocked in a network call with a generous socket
+timeout can still hold the thread even after FR-002 removed the common cause.
+"""
+
 # Queue overflow is a high-rate condition by nature: a line per dropped submission would be its
 # own outage. Warn on the first drop, then every this-many-th (SPEC-017 FR-005).
 _DROP_WARN_EVERY = 1000
@@ -53,7 +62,10 @@ class Health(NamedTuple):
             if it never died — which is also what a live worker and a process that never
             logged report. Non-``None`` is categorically worse than the two counters above:
             they measure loss the worker absorbed and kept running through, this one means
-            the worker is gone and nothing further will be delivered (SPEC-019 FR-003).
+            the worker is gone and nothing further will be delivered (SPEC-019 FR-003). Also
+            ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown` expired before the
+            drain finished (SPEC-027 FR-004) — the same thing to a reader, which is why it
+            extends this vocabulary rather than adding a field.
         sink: The configured sink's own loss counters, or ``None`` when there is no worker or
             the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the two
             integers above because they count different things: ``dropped`` here is backpressure
@@ -272,8 +284,19 @@ class Worker:
             return False  # timed out: the drain never happened, so it delivered nothing.
         return marker.delivered
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         """Stop the thread, drain + emit everything queued, then ``close()`` the sink.
+
+        **Bounded** (SPEC-027 FR-004). ``timeout`` caps how long the join may take; ``None``
+        waits indefinitely, which is what this did unconditionally and is still available on
+        request. On expiry it returns having stopped what it could, records
+        ``stopped_reason="ShutdownTimeout"`` and writes one line — it does not kill the thread,
+        which Python cannot do and which would leave a sink mid-write if it could.
+
+        An expired shutdown does **not** close the sink. The drain thread may still be inside
+        ``emit``, and closing a transport out from under it would turn a slow shutdown into a
+        corrupt one. The cost is a leaked resource in a process that is exiting anyway, which is
+        the cheaper of the two.
 
         Idempotent: a second call is a no-op (FR-005). Registered via ``atexit`` by the
         decorator's lazy worker so a program that logs and exits immediately still flushes.
@@ -298,7 +321,20 @@ class Worker:
             self._queue.put_nowait(_SHUTDOWN)  # wake a blocked get() for a prompt stop
         except queue.Full:
             pass
-        self._thread.join()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            # Recorded before the line, as SPEC-019's terminal failure is: stderr may be wedged,
+            # and this is written exactly once.
+            with self._lock:
+                if self.stopped_reason is None:
+                    self.stopped_reason = "ShutdownTimeout"
+            _diag.lost(
+                "drain",
+                1,
+                f"shutdown timed out after {timeout}s; the sink is left open because the "
+                f"worker thread is still using it",
+            )
+            return
         try:
             self.sink.close()
         except Exception as exc:

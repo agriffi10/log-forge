@@ -21,7 +21,7 @@ from log_foundry.context import (
 )
 from log_foundry.decorator import continue_trace, trace
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.worker import Health
+from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health
 
 try:
     # Distribution name ("log-foundry") differs from the import name ("log_foundry").
@@ -92,7 +92,7 @@ def health() -> Health:
     return _worker_health()
 
 
-def shutdown() -> None:
+def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Flush buffered events and close the sink, blocking until drained. Idempotent.
 
     Also registered via ``atexit``; call it explicitly before a fast process exit when you
@@ -101,13 +101,21 @@ def shutdown() -> None:
     This is **terminal** — the worker does not come back. Do not call it per-invocation in a
     serverless handler: the first invocation on a warm container would log and every later one
     would silently log nothing. Use :func:`flush` there, which drains and keeps the worker.
+
+    ``timeout`` bounds the wait for the background thread (SPEC-027 FR-004). ``None`` waits
+    indefinitely, which is what this did unconditionally before and is still available on
+    request — but it is unsafe anywhere with an execution deadline, and ``atexit`` is one such
+    place: a sink blocked in a network call would hold the process open. An expired shutdown
+    reports ``health().stopped_reason == "ShutdownTimeout"`` and leaves the sink **open**, since
+    the drain thread may still be inside ``emit``. Never raises.
     """
     from log_foundry.decorator import _shutdown_worker
 
-    _shutdown_worker()
+    _shutdown_worker(timeout)
 
 
 __all__ = [
+    "DEFAULT_SHUTDOWN_TIMEOUT",
     "Health",
     "SinkDeliveryError",
     "SinkLosses",

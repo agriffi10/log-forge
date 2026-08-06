@@ -505,3 +505,125 @@ def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> N
     finally:
         worker.shutdown()
     assert "handing a MultiSink child its stop signal" in capsys.readouterr().err
+
+
+# --- FR-004: shutdown() cannot block forever ------------------------------------------------
+
+
+class _WedgedSink:
+    """A sink whose ``emit`` blocks until released — a network call with a generous timeout."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.closed = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        self.entered.set()
+        self.release.wait(30.0)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_shutdown_returns_within_its_bound_on_a_blocked_drain() -> None:
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0), "the drain thread is inside emit"
+    try:
+        started = time.monotonic()
+        assert _run_bounded(lambda: worker.shutdown(timeout=0.5), bound=5.0)
+        assert time.monotonic() - started < 5.0
+    finally:
+        sink.release.set()
+
+
+def test_an_expired_shutdown_is_recorded_and_announced(capsys) -> None:
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+    try:
+        worker.shutdown(timeout=0.2)
+        health = worker.health()
+        err = capsys.readouterr().err
+    finally:
+        sink.release.set()
+
+    assert health.stopped_reason == "ShutdownTimeout"
+    assert "shutdown timed out" in err
+    assert err.count("\n") == 1, "one line"
+
+
+def test_an_expired_shutdown_leaves_the_sink_open() -> None:
+    """The drain thread may still be inside emit; closing under it corrupts rather than delays."""
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+    try:
+        worker.shutdown(timeout=0.2)
+        assert sink.closed == 0
+    finally:
+        sink.release.set()
+
+
+def test_an_expired_shutdown_does_not_overwrite_a_terminal_reason() -> None:
+    """A thread that died on SystemExit is worse news than the timeout that followed it."""
+    sink = _WedgedSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    assert sink.entered.wait(2.0)
+    with worker._lock:
+        worker.stopped_reason = "SystemExit"
+    try:
+        worker.shutdown(timeout=0.2)
+        assert worker.health().stopped_reason == "SystemExit"
+    finally:
+        sink.release.set()
+
+
+def test_a_normal_shutdown_is_unaffected() -> None:
+    from conftest import FakeSink
+
+    sink = FakeSink()
+    worker = Worker(sink, batch_size=1)
+    worker.submit([{"a": 1}])
+    worker.shutdown()
+    health = worker.health()
+
+    assert health.stopped_reason is None
+    assert [e["a"] for e in sink.events] == [1]
+    worker.shutdown()  # still idempotent
+
+
+def test_the_public_shutdown_takes_a_timeout() -> None:
+    import inspect
+
+    import log_foundry
+    from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT
+
+    signature = inspect.signature(log_foundry.shutdown)
+    assert signature.parameters["timeout"].default == DEFAULT_SHUTDOWN_TIMEOUT
+
+
+def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
+    """An unbounded join in an atexit handler is a process that will not exit."""
+    import log_foundry
+    from log_foundry import decorator
+    from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT
+
+    seen: list[float | None] = []
+
+    class SpyWorker:
+        def shutdown(self, timeout: float | None = None) -> None:
+            seen.append(timeout)
+
+    monkeypatch.setattr(decorator, "_worker", SpyWorker())
+
+    decorator._shutdown_worker()  # what atexit calls: no argument
+    log_foundry.shutdown()  # and what a caller gets by default
+    log_foundry.shutdown(timeout=None)  # None is still available on request
+
+    assert seen == [DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SHUTDOWN_TIMEOUT, None]
