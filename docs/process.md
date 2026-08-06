@@ -157,6 +157,13 @@ list project-specific; seed it the first time a trap bites and never again.
   environment — running it from the repo root vs. the package dir changes behavior.
 - _(example)_ Config/env values the app reads at runtime must also be wired into the deploy/build
   environment, or production ships them undefined.
+- **`OSError`'s concrete type is per-platform.** CPython maps an `errno` to an `OSError` *subclass*
+  at construction, from a table that differs by OS — `OSError(111, …)` is a `ConnectionRefusedError`
+  on CI's Linux and a plain `OSError` on macOS (ECONNREFUSED is 61 there). Never assert a hardcoded
+  type name for a constructed `OSError`; derive it (`type(exc).__name__`). Bit in SPEC-029 Phase 3.
+- **`ruff format` is not a CI gate, and this repo is not clean under it.** Running it over a
+  directory rewrites files your change never touched (and it reformats code blocks inside `.md`).
+  Format only the files you edited, and check `git status` before committing.
 - _(add your own as they bite — one line each, with the fix.)_
 
 ---

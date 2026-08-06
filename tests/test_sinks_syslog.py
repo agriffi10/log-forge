@@ -99,7 +99,10 @@ def test_an_abandoned_message_reports_the_errno_not_the_message(monkeypatch, cap
     err = capsys.readouterr().err
     assert "Connection refused" not in err, "the exception's message is never written (arch §6)"
     assert "loghost.internal" not in err
-    assert "OSError" in err
+    # Derived, not hardcoded: CPython maps an errno to an ``OSError`` *subclass* at construction,
+    # and the mapping is per-platform — 111 is ECONNREFUSED on Linux (so the type is
+    # ``ConnectionRefusedError``) and something else on macOS (so it stays ``OSError``).
+    assert type(RefusingSocket()._exc).__name__ in err
     assert "errno=111" in err, "the OS code is what makes the line actionable"
     assert "lost 1 message(s)" in err
     assert "2 attempt(s)" in err, "the attempt count survived the conversion"
