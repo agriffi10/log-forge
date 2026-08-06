@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 from log_foundry import _diag
+from log_foundry.sinks._batch import usable_results
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
@@ -86,6 +87,13 @@ class ElasticsearchSink(HTTPSink):
         raise (and the worker's retry would duplicate what landed), and a shorter one could
         report a total failure as success.
 
+        Shape is adjudicated as well as length, through ``_batch.usable_results`` — the same
+        helper and the same reason: a list of non-mappings carries no per-record outcome that
+        can be read, so it describes nothing rather than describing success. And a body that
+        says ``errors: true`` while no entry yields a readable one contradicts itself, which is
+        the same "cannot tell" as a short array; reading it as "no items failed" is how a total
+        failure came back as success one level below the length check.
+
         An array that cannot be adjudicated is counted on ``dropped_unadjudicated`` and left
         alone — like ``KinesisSink``'s, the request itself succeeded, so re-sending it would
         duplicate whatever did land. An unparseable or errors-free body returns ``False``: the
@@ -97,26 +105,34 @@ class ElasticsearchSink(HTTPSink):
             return False
         if not isinstance(data, dict) or not data.get("errors"):
             return False
-        items = data.get("items")
-        items = items if isinstance(items, list) else []
-        if len(items) != sent:
+        items = usable_results(data.get("items"))
+        errors = sum(1 for item in items if _has_error(item))
+        if len(items) != sent or not errors:
+            # ``not errors`` is unadjudicable rather than clean *because* the server said
+            # ``errors: true``: the two disagree, and this sink is the one that cannot read the
+            # answer. An errors-free response never reaches here — it returned above.
             self.dropped_unadjudicated += sent
             _diag.lost(
                 "event",
                 sent,
                 f"{type(self).__name__} could not adjudicate a _bulk response "
-                f"({sent} event(s) sent, {len(items)} item(s) returned); not retried",
+                f"({sent} event(s) sent, {len(items)} readable item(s), {errors} error(s)); "
+                f"not retried",
             )
             return False
-        errors = 0
-        for item in items:
-            result: object = next(iter(item.values()), {}) if isinstance(item, dict) else {}
-            if isinstance(result, dict) and result.get("error"):
-                errors += 1
-        if errors:
-            self.item_errors += errors
-            _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
+        self.item_errors += errors
+        _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
         return errors == sent
+
+
+def _has_error(item: dict[str, object]) -> bool:
+    """Whether a ``_bulk`` item reports a failure under *any* of its action keys.
+
+    Every value is examined, not just the first: a real response carries one key per item, but
+    reading only ``next(iter(...))`` would score an item whose error sits under a second key as
+    a success — and a miscounted success is what turns a total failure into a partial one.
+    """
+    return any(isinstance(result, dict) and result.get("error") for result in item.values())
 
 
 class OpenSearchSink(ElasticsearchSink):

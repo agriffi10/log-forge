@@ -84,13 +84,22 @@ class Sink(Protocol):
     # a third-party sink written against the pre-SPEC-026 interface must keep satisfying it.
     # ``read_losses`` below is the probe; an absent method reads as "reports nothing".
     #
-    #     def losses(self) -> SinkLosses:
-    #         """Cumulative loss this sink absorbed. Never raises; safe to call during emit."""
+    #     def losses(self) -> SinkLosses | None:
+    #         """Cumulative loss this sink absorbed. Never raises; safe to call during emit.
+    #
+    #         ``None`` is the same answer as having no method at all — "this sink reports
+    #         nothing". A wrapper returns it when what it wraps reports nothing.
+    #         """
     #         return SinkLosses(dropped=self._dropped, failed=self._failed)
 
 
 def read_losses(sink: object) -> SinkLosses | None:
-    """Read a sink's optional ``losses()``; ``None`` when absent, broken or the wrong shape.
+    """Read a sink's optional ``losses()``; ``None`` when it reports nothing.
+
+    ``None`` covers four cases deliberately treated alike: no ``losses`` attribute, one that is
+    not callable, one that raised, and one that returned anything other than a ``SinkLosses`` —
+    including ``None`` itself, which the shipped wrapper sinks return when what they wrap
+    reports nothing.
 
     The single reader for the optional half of the protocol (SPEC-026 FR-002), shared by
     ``Worker.health`` and ``MultiSink.losses`` so the probe and its guarantees are written once.

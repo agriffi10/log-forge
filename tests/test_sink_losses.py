@@ -207,8 +207,13 @@ def test_multisink_excludes_its_own_call_counter() -> None:
     assert multi.losses() == SinkLosses(dropped=0, failed=6), "and excluded from the aggregate"
 
 
-def test_an_empty_multisink_reports_zero() -> None:
-    assert MultiSink().losses() == SinkLosses(dropped=0, failed=0)
+def test_a_fan_out_whose_children_all_report_nothing_reports_nothing() -> None:
+    """A tree of silent children has not given a clean bill of health (FR-003)."""
+    assert MultiSink().losses() is None
+    assert MultiSink(QuietSink(), QuietSink()).losses() is None
+    assert MultiSink(QuietSink(), CountingSink()).losses() == SinkLosses(0, 0), (
+        "one reporting child makes the total meaningful"
+    )
 
 
 # --- FR-004: the contract is on the interface --------------------------------------------
@@ -469,7 +474,7 @@ def test_a_wrapper_passes_an_unreporting_inner_sink_through_as_none() -> None:
     assert Worker(FilteringSink(QuietSink()), batch_size=1).health().sink is None
 
 
-def test_sentry_sdk_errors_are_isolated_per_event() -> None:
+def test_sentry_transport_errors_are_isolated_per_event() -> None:
     """A ``capture_event`` that raises mid-batch would duplicate what Sentry already took."""
     from log_foundry.sinks.sentry import SentrySink
 
@@ -628,3 +633,45 @@ def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
     with pytest.raises(SinkDeliveryError):
         transport.send_all([b"a"])
     assert transport.losses() == SinkLosses(dropped=0, failed=1), "abandoned without a counter"
+
+
+def _es(payload: bytes):
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    return ElasticsearchSink(
+        "http://x", index="i", opener=FakeOpener([FakeResponse(200, payload)])
+    )
+
+
+def test_a_bulk_body_whose_items_cannot_be_read_is_not_read_as_success() -> None:
+    """``errors: true`` plus nothing readable is "cannot tell", not "nothing failed"."""
+    import json as _json
+
+    unreadable = [
+        _json.dumps({"errors": True, "items": ["x", "y"]}).encode("utf-8"),
+        _json.dumps({"errors": True, "items": [{"index": "boom"}, {"index": "boom"}]}).encode(
+            "utf-8"
+        ),
+        _json.dumps({"errors": True, "items": []}).encode("utf-8"),
+        _json.dumps({"errors": True}).encode("utf-8"),
+    ]
+    for payload in unreadable:
+        sink = _es(payload)
+        sink.emit([{"a": 1}, {"b": 2}])  # never a raise: the request itself succeeded
+        assert sink.dropped_unadjudicated == 2, payload
+        assert sink.item_errors == 0, payload
+        assert sink.losses() == SinkLosses(dropped=0, failed=2), payload
+
+
+def test_an_error_under_a_second_action_key_is_still_an_error() -> None:
+    """Reading only the first key would score a rejected item as indexed."""
+    import json as _json
+
+    payload = _json.dumps(
+        {"errors": True, "items": [{"create": {}, "index": {"error": "nope"}}]}
+    ).encode("utf-8")
+    sink = _es(payload)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])  # the one event was rejected, so nothing was indexed
+    assert sink.item_errors == 1
