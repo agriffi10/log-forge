@@ -205,6 +205,14 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
   separate from reserved/base fields. High-cardinality values (`user_id`) are fine
   here — cardinality is a *metrics* concern, not a logs concern, **as long as we never
   auto-promote these into metric labels**.
+- **The rule holds for what the library says about *itself*, not just for events.** A stderr
+  diagnostic is also a place caller data was not asked to reach, and an exception's message
+  routinely carries the value that provoked it — so an absorbed failure is reported by
+  `type(exc).__name__`, never its message, and `sanitize`'s placeholder is a type name for the
+  same reason (as is SPEC-019's `Health.stopped_reason`). Every such line goes through one
+  module, `src/log_foundry/_diag.py`, whose docstring states this rule and the two that travel
+  with it. A test asserts no other module *calls* `stderr.write` (or `print(file=…)`, or
+  `traceback.print_*`) — a lint on the idiom, not a sandbox. (SPEC-029)
 
 ### 6.1 Two ways to emit, from inside a function
 

@@ -411,7 +411,9 @@ def _diag_calls(tree: ast.AST) -> list[ast.Call]:
     ]
 
 
-@pytest.mark.parametrize("path", sorted(_SRC.rglob("*.py")), ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "path", sorted(_SRC.rglob("*.py")), ids=lambda p: p.relative_to(_SRC).as_posix()
+)
 def test_no_diagnostic_interpolates_a_repr(path: Path) -> None:
     """No ``_diag`` call site may re-introduce the twelve sinks' ``{err!r}`` (SPEC-029 FR-002).
 
@@ -425,15 +427,16 @@ def test_no_diagnostic_interpolates_a_repr(path: Path) -> None:
     exception); the per-sink tests carry that one, `test_an_abandoned_insert_never_reprints_the_event`
     above all.
     """
+    where = path.relative_to(_SRC).as_posix()
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for call in _diag_calls(tree):
         for node in ast.walk(call):
             if isinstance(node, ast.FormattedValue):
-                assert node.conversion != ord("r"), f"{path.name}: !r in a diagnostic"
+                assert node.conversion != ord("r"), f"{where}: !r in a diagnostic"
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                assert node.func.id != "repr", f"{path.name}: repr() in a diagnostic"
+                assert node.func.id != "repr", f"{where}: repr() in a diagnostic"
             if isinstance(node, ast.Attribute):
-                assert node.attr != "args", f"{path.name}: exception args in a diagnostic"
+                assert node.attr != "args", f"{where}: exception args in a diagnostic"
 
 
 def test_the_enforcement_actually_sees_the_call_sites() -> None:
@@ -442,3 +445,125 @@ def test_the_enforcement_actually_sees_the_call_sites() -> None:
         len(_diag_calls(ast.parse(p.read_text(encoding="utf-8")))) for p in _SRC.rglob("*.py")
     )
     assert calls >= 30, f"expected the converted call sites to be found, saw {calls}"
+
+
+_STDERR_NAMES = {"stderr", "__stderr__"}
+_WRITE_METHODS = {"write", "writelines"}
+
+
+def _stderr_writes(tree: ast.AST) -> list[ast.Call]:
+    """Every ``sys.stderr.write(...)`` / ``stderr.write(...)`` call in a module.
+
+    Matched on the AST, not by grepping the source: ``sinks/_socket.py`` names
+    ``sys.stderr.write`` in a comment explaining what it replaced, and a text search would read
+    that as a violation — the sort of false positive that gets an enforcement test deleted.
+
+    Three shapes, because ``.write`` alone is not the one a person reaches for by accident:
+
+    * ``sys.stderr.write(...)`` / ``.writelines(...)``, and the ``sys.__stderr__`` spelling.
+    * ``print(..., file=sys.stderr)`` — the most common way a Python author writes to stderr at
+      all, and invisible to ``ruff`` here (``T20`` is not in this repo's ``select``).
+    * ``traceback.print_exc()`` and its siblings, which default to stderr. This is the one that
+      matters most: it is the natural thing to reach for inside exactly the ``except Exception:``
+      blocks this spec converted, it arrives unguarded, and it prints the exception's **message
+      and stack** — so it reopens FR-002's leak as well as FR-003's.
+    """
+    found: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            target = func.value
+            writes_a_stream = (
+                func.attr in _WRITE_METHODS
+                and isinstance(target, ast.Attribute)
+                and target.attr in _STDERR_NAMES
+            )
+            prints_a_traceback = (
+                func.attr.startswith("print_")
+                and isinstance(target, ast.Name)
+                and target.id == "traceback"
+            )
+            if writes_a_stream or prints_a_traceback:
+                found.append(node)
+        elif isinstance(func, ast.Name) and func.id == "print":
+            found.extend(
+                node
+                for kw in node.keywords
+                if kw.arg == "file"
+                and isinstance(kw.value, ast.Attribute)
+                and kw.value.attr in _STDERR_NAMES
+            )
+    return found
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(p for p in _SRC.rglob("*.py") if p != _SRC / "_diag.py"),
+    ids=lambda p: p.relative_to(_SRC).as_posix(),
+)
+def test_only_diag_writes_to_stderr(path: Path) -> None:
+    """One module owns every diagnostic line (SPEC-029 FR-001).
+
+    The twenty-odd sites this spec converted disagreed with each other precisely because each one
+    was written from scratch; a new bare write would start the drift again — and would arrive
+    unguarded, which on the worker thread ends delivery for good.
+
+    Referencing ``sys.stderr`` is still fine and deliberate: ``console.py`` and ``sinks/util.py``
+    use it as a *destination for the user's events*, which is the opposite direction from a
+    diagnostic about the library itself.
+    """
+    writes = _stderr_writes(ast.parse(path.read_text(encoding="utf-8")))
+    assert not writes, (
+        f"{path.relative_to(_SRC).as_posix()}:{writes[0].lineno} writes to stderr directly; "
+        f"use _diag.absorbed / _diag.lost / _diag.rejected"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sys\nsys.stderr.write('x')\n",
+        "import sys\nsys.stderr.writelines(['x'])\n",
+        "import sys\nsys.__stderr__.write('x')\n",
+        "import sys\nprint('x', file=sys.stderr)\n",
+        "import traceback\ntraceback.print_exc()\n",
+        "import traceback\ntraceback.print_exception(err)\n",
+    ],
+)
+def test_the_stderr_walker_matches_every_shape_a_person_writes(source: str) -> None:
+    """Guards the guard: a walker that matched nothing would pass every file vacuously."""
+    assert _stderr_writes(ast.parse(source))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sys\nfrom sys import stderr\nstderr.write('x')\n",
+        "import sys\nout = sys.stderr\nout.write('x')\n",
+        "import os\nos.write(2, b'x')\n",
+    ],
+)
+def test_the_stderr_walker_states_what_it_does_not_catch(source: str) -> None:
+    """A lint, not a sandbox.
+
+    A stream rebound to a bare name, or a raw fd, is invisible to it. Recorded as a test so the
+    limitation is a decision someone made rather than a gap they will discover — but none of
+    these is a shape reached for by accident, which is the bar an enforcement lint has to clear.
+    """
+    assert _stderr_writes(ast.parse(source)) == []
+
+
+def test_diag_still_has_exactly_the_three_writers_it_documents() -> None:
+    """A tripwire, separate from the vacuity check above, and deliberately brittle.
+
+    ``architecture.md`` §6 and ``_diag``'s own docstring both describe three writers. A fourth is
+    fine — it just has to be a decision, taken with the docs in front of you, rather than a
+    quiet fourth spelling of a line the other three already write.
+    """
+    writes = _stderr_writes(ast.parse((_SRC / "_diag.py").read_text(encoding="utf-8")))
+    assert len(writes) == 3, (
+        f"_diag has {len(writes)} stderr writes, not 3 — if a writer was added, update "
+        f"_diag's docstring and architecture.md §6 to match"
+    )
