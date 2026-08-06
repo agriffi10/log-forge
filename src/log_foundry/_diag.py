@@ -58,8 +58,7 @@ _MAX_DETAIL = 200
 # the value is attacker-controllable, and its shape is the diagnosis, not its contents.
 _MAX_REJECTED_ECHO = 64
 
-_ESCAPES = {0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}
-_CONTROL = {code: _ESCAPES.get(code, f"\\x{code:02x}") for code in (*range(0x20), 0x7F)}
+_ESCAPES = {"\t": "\\t", "\n": "\\n", "\r": "\\r"}
 
 
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
@@ -77,8 +76,8 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     """
     try:
         sys.stderr.write(
-            f"log-foundry: absorbed a failure while {where} "
-            f"({type(exc).__name__}){_suffix(detail)}\n"
+            f"log-foundry: absorbed a failure while {_escape(where)} "
+            f"({_escape(type(exc).__name__)}){_suffix(detail)}\n"
         )
     except Exception:
         # The channel of last resort has no fallback of its own. Reporting is best-effort by
@@ -100,7 +99,7 @@ def lost(what: str, count: int, detail: str = "") -> None:
             an exception *type*. Escaped and truncated to ``_MAX_DETAIL``.
     """
     try:
-        sys.stderr.write(f"log-foundry: lost {count} {what}(s){_suffix(detail)}\n")
+        sys.stderr.write(f"log-foundry: lost {count} {_escape(what)}(s){_suffix(detail)}\n")
     except Exception:
         pass  # best-effort, as above; the counter this line describes is already recorded.
 
@@ -111,20 +110,28 @@ def rejected(reason: str, value: object) -> None:
     The offending value is echoed as a **bounded ``repr``** — the one place in the library where a
     ``repr`` is correct, because the input is an inbound *header* rather than an exception, and its
     exact shape is what makes a rejection diagnosable. Unbounded it would be a log-injection
-    surface: the value is attacker-controllable, and ``repr`` additionally escapes newlines and
-    control characters so it cannot forge a second line in an operator's console.
+    surface: the value is attacker-controllable.
+
+    The ``repr`` is escaped afterwards even though ``repr`` of a ``str`` is already printable
+    throughout, which makes this a no-op for every value the call sites actually pass. It is not a
+    no-op in general: ``repr`` runs ``__repr__``, which is user code free to *return* a raw newline
+    no matter what the built-in reprs would have done. Escaping the result is the difference
+    between "the built-ins happen to escape" and "this cannot forge a line".
 
     Never raises on a stream fault; a ``BaseException`` from the write still propagates.
 
     Args:
-        reason: Why it was refused — ``"unparseable traceparent"``, ``"invalid trace_id"``.
+        reason: Why it was refused — ``"unparseable traceparent"``, ``"invalid trace_id"``. A
+            literal, never a runtime value: unlike the echo, it is not bounded.
         value: The refused value, echoed as a ``repr`` bounded to ``_MAX_REJECTED_ECHO``.
     """
     try:
-        shown = repr(value)
+        shown = _escape(repr(value))
         if len(shown) > _MAX_REJECTED_ECHO:
             shown = shown[:_MAX_REJECTED_ECHO] + "…"
-        sys.stderr.write(f"log-foundry: ignoring inbound trace context ({reason}): {shown}\n")
+        sys.stderr.write(
+            f"log-foundry: ignoring inbound trace context ({_escape(reason)}): {shown}\n"
+        )
     except Exception:
         pass  # best-effort, as above.
 
@@ -139,12 +146,17 @@ def errno_of(exc: BaseException) -> str:
     ``urllib``'s ``URLError`` carries the underlying socket error on ``.reason`` rather than
     setting its own ``errno``, so that is consulted too. Total: attribute access on an arbitrary
     exception can run a property that raises, and a helper for a diagnostic must not become one.
+
+    The value is rendered through ``int()`` rather than interpolated as found. ``isinstance(x,
+    int)`` admits any *subclass*, and a driver's error code is routinely one — an ``IntEnum`` or a
+    bespoke class whose ``__str__`` returns whatever its author chose, which the f-string would
+    then have written verbatim. That is the leak this helper exists to be the alternative to.
     """
     try:
         code = getattr(exc, "errno", None)
         if code is None:
             code = getattr(getattr(exc, "reason", None), "errno", None)
-        return f"errno={code}" if isinstance(code, int) else ""
+        return f"errno={int(code)}" if isinstance(code, int) else ""
     except Exception:
         return ""
 
@@ -155,10 +167,46 @@ def _suffix(detail: str) -> str:
     Escaping precedes truncation so the bound applies to what is written, and so truncation can
     only ever remove characters from an already-safe string rather than split an escape into
     something that isn't one.
+
+    Guarded in its own right, and returning ``""`` rather than propagating: this runs inside the
+    caller's f-string, so a detail that cannot be rendered would otherwise take the *whole* line
+    with it — including the count, which is the part an operator cannot reconstruct.
     """
     if not detail:
         return ""
-    shown = detail.translate(_CONTROL)
-    if len(shown) > _MAX_DETAIL:
-        shown = shown[:_MAX_DETAIL] + "…"
-    return f"; {shown}"
+    try:
+        shown = _escape(detail)
+        if len(shown) > _MAX_DETAIL:
+            shown = shown[:_MAX_DETAIL] + "…"
+        return f"; {shown}"
+    except Exception:
+        return ""
+
+
+def _escape(text: str) -> str:
+    """Render every non-printable character visibly, so nothing in ``text`` can forge a line.
+
+    ``str.isprintable()`` is the test rather than a table over ``range(0x20)``: it is ``False`` for
+    the C0 block *and* for DEL, the C1 block (U+009B is CSI, which a terminal reads as the start of
+    an escape sequence), U+0085, U+2028, U+2029, and the bidi format characters. Python's own
+    ``splitlines()`` breaks on three of those a C0 table misses, so a log shipper or a reader doing
+    the obvious thing would see a forged ``log-foundry:`` line that a newline count says is not
+    there. Space is printable, so ordinary text is untouched.
+
+    The whole-string fast path keeps the overwhelmingly common case — a sink name, an attempt
+    count, an exception type — to a single C-level call.
+    """
+    if text.isprintable():
+        return text
+    return "".join(char if char.isprintable() else _escaped(char) for char in text)
+
+
+def _escaped(char: str) -> str:
+    """Escape one non-printable character, following Python's own ``repr`` conventions."""
+    escape = _ESCAPES.get(char)
+    if escape is not None:
+        return escape
+    code = ord(char)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"

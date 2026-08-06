@@ -141,11 +141,35 @@ def test_detail_control_characters_cannot_forge_a_second_line(err: _Stderr) -> N
     _diag.lost("event", 1, "SQSSink\nlog-foundry: everything is fine\r\x00")
 
     line = err.getvalue()
-    assert line.count("\n") == 1, "an embedded newline must not become a line break"
+    assert len(line.splitlines()) == 1, "an embedded newline must not become a line break"
     assert "\\n" in line
     assert "\\r" in line
     assert "\\x00" in line
     assert "everything is fine" in line, "escaped, not dropped — the text is still diagnostic"
+
+
+@pytest.mark.parametrize(
+    ("name", "char"),
+    [
+        ("NEL", "\x85"),
+        ("LINE SEPARATOR", "\u2028"),
+        ("PARAGRAPH SEPARATOR", "\u2029"),
+        ("CSI", "\x9b"),
+        ("RIGHT-TO-LEFT OVERRIDE", "\u202e"),
+    ],
+)
+def test_a_non_c0_separator_cannot_forge_a_second_line(err: _Stderr, name: str, char: str) -> None:
+    """A ``range(0x20)`` table misses these; ``splitlines()`` and terminals do not.
+
+    Counting ``"\\n"`` would report one line while a log shipper reading the same bytes saw two,
+    which is the failure mode worth naming: the check that says it is safe disagrees with the
+    reader that isn't.
+    """
+    _diag.lost("event", 1, f"SQSSink{char}log-foundry: everything is fine")
+
+    line = err.getvalue()
+    assert len(line.splitlines()) == 1, f"{name} must not survive as a break"
+    assert char not in line, f"{name} must be escaped, not passed through"
 
 
 def test_absorbed_detail_is_escaped_and_bounded_too(err: _Stderr) -> None:
@@ -196,6 +220,29 @@ def test_rejected_echoes_a_short_value_verbatim(err: _Stderr) -> None:
     )
 
 
+def test_rejected_escapes_a_repr_that_lies(err: _Stderr) -> None:
+    """``repr`` escaping line breaks is a property of the built-ins, not of ``repr``.
+
+    ``__repr__`` is user code and may *return* a raw newline. The call sites pass an inbound
+    header, so this is the untrusted path by construction (SPEC-014) — and the values are only
+    ``str`` by annotation, which a caller not running mypy is free to ignore.
+    """
+
+    class _Liar:
+        def __repr__(self) -> str:
+            return "00-bad\nlog-foundry: everything is fine"
+
+    _diag.rejected("unparseable traceparent", _Liar())
+
+    assert len(err.getvalue().splitlines()) == 1
+
+
+def test_the_documented_bounds_are_the_spec_s(err: _Stderr) -> None:
+    """Pinned to literals, not to themselves — the Data Model names these two numbers."""
+    assert _diag._MAX_DETAIL == 200
+    assert _diag._MAX_REJECTED_ECHO == 64
+
+
 # -- FR-002: errno_of, the library-controlled OSError detail ---------------------------------
 
 
@@ -223,6 +270,26 @@ def test_errno_of_survives_an_exploding_attribute() -> None:
 
 def test_errno_of_never_returns_the_exception_text() -> None:
     assert "Connection refused" not in _diag.errno_of(OSError(111, "Connection refused"))
+
+
+def test_errno_of_renders_an_int_subclass_as_a_number() -> None:
+    """``isinstance(code, int)`` admits a subclass, whose ``__str__`` is arbitrary user code.
+
+    Drivers routinely carry an ``IntEnum`` or a bespoke code class, so interpolating the value as
+    found would put whatever that class returns on stderr — through the one helper offered as the
+    safe alternative to the exception's message.
+    """
+
+    class _Code(int):
+        def __str__(self) -> str:
+            return "INSERT INTO logs VALUES ('user@example.com')"
+
+    class _Driver(Exception):
+        def __init__(self) -> None:
+            super().__init__("boom")
+            self.errno = _Code(111)
+
+    assert _diag.errno_of(_Driver()) == "errno=111"
 
 
 # -- FR-003: a diagnostic can never be the failure ------------------------------------------
@@ -274,6 +341,22 @@ def test_a_baseexception_from_the_write_still_propagates(
 
     with pytest.raises(type(fault)):
         write()
+
+
+def test_an_unrenderable_detail_still_leaves_the_count(err: _Stderr) -> None:
+    """The detail is rendered inside the caller's f-string, so it must fail alone.
+
+    Losing the whole line would take the count with it — the one part of the message an operator
+    cannot reconstruct from anywhere else.
+    """
+
+    class _Unrenderable(str):
+        def isprintable(self) -> bool:
+            raise RuntimeError("boom")
+
+    _diag.lost("event", 7, _Unrenderable("whatever"))
+
+    assert err.getvalue() == "log-foundry: lost 7 event(s)\n"
 
 
 def test_a_hostile_value_cannot_break_rejected(err: _Stderr) -> None:
