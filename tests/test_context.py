@@ -137,3 +137,85 @@ def test_pop_baggage_scope_from_another_context_falls_back_to_empty() -> None:
         assert context.get_baggage() == {}
 
     contextvars.copy_context().run(body)
+
+
+# -- SPEC-024 FR-003: the explicit reset -------------------------------------------------
+
+
+def test_reset_context_clears_baggage() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_baggage(tenant="acme", request="r1")
+        context.reset_context()
+        assert context.get_baggage() == {}
+
+    contextvars.copy_context().run(body)
+
+
+def test_reset_context_clears_the_adopted_context() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_adopted_context("a" * 32, "b" * 16)
+        context.reset_context()
+        assert context.get_adopted_context() is None
+
+    contextvars.copy_context().run(body)
+
+
+def test_reset_context_clears_a_process_level_baggage_default() -> None:
+    """Unlike the scope release, an explicit reset erases rather than restores."""
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_baggage(process="p1")  # set before any span — a deliberate default
+        context.reset_context()
+        assert context.get_baggage() == {}
+
+    contextvars.copy_context().run(body)
+
+
+def test_reset_context_is_safe_when_nothing_was_ever_set() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.reset_context()
+        context.reset_context()  # and idempotent
+        assert context.get_baggage() == {}
+        assert context.get_adopted_context() is None
+
+    contextvars.copy_context().run(body)
+
+
+def test_reset_context_inside_a_span_clears_for_the_remainder_then_the_scope_restores() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_baggage(process="p1")
+        scope = context.push_baggage_scope()  # what @trace's root span does
+        context.set_baggage(request="r1")
+        context.reset_context()
+        assert context.get_baggage() == {}, "cleared for the rest of the span"
+        context.pop_baggage_scope(scope)
+        assert context.get_baggage() == {"process": "p1"}, "the scope still restores"
+
+    contextvars.copy_context().run(body)
+
+
+def test_reset_context_never_mutates_the_shared_contextvar_default() -> None:
+    """The module's never-mutate rule: `reset_context` must `.set()` a new dict, not clear one."""
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.reset_context()
+        context.set_baggage(leaked="x")
+
+    contextvars.copy_context().run(body)
+    assert contextvars.copy_context().run(context.get_baggage) == {}
+
+
+def test_reset_context_is_exported_from_the_package() -> None:
+    lf = pytest.importorskip("log_foundry")
+    assert "reset_context" in lf.__all__
+    assert callable(lf.reset_context)

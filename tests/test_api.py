@@ -221,3 +221,29 @@ def test_an_over_long_int_inside_a_span_does_not_destroy_its_batch(lf, fake_sink
     assert "big" in messages
     assert "small" in messages, "the unrelated span survives intact"
     assert worker.health().failed_batches == 0, "the batch was delivered, not abandoned"
+
+
+# -- SPEC-024 FR-003: the orphan path is what `reset_context` exists for -----------------
+
+
+def test_reset_context_clears_baggage_for_a_later_orphan_log(lf, fake_sink) -> None:
+    """The case with no root span to hang the release on — the emitters used without @trace."""
+
+    def body() -> None:
+        lf.set_baggage(user_id="alice")
+        lf.info("serving alice")
+        lf.reset_context()
+        lf.info("serving bob")
+
+    contextvars.copy_context().run(body)
+
+    alice, bob = fake_sink.events
+    assert alice["fields"]["user_id"] == "alice"
+    assert "user_id" not in bob["fields"]
+
+
+def test_reset_context_is_safe_with_no_span_open_and_never_raises(lf) -> None:
+    def body() -> None:
+        assert lf.reset_context() is None
+
+    contextvars.copy_context().run(body)
