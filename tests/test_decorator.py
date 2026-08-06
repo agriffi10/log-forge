@@ -9,8 +9,6 @@ import contextvars
 
 import pytest
 
-context_mod = pytest.importorskip("log_foundry.context")
-
 
 def test_single_span_records_status_ok_and_user_log(lf, fake_sink) -> None:
     @lf.trace(name="work")
@@ -149,6 +147,8 @@ def test_baggage_from_a_nested_call_reaches_the_parent_and_later_siblings(lf, fa
 
 
 def test_baggage_set_before_any_span_survives_the_span(lf, fake_sink) -> None:
+    context_mod = pytest.importorskip("log_foundry.context")
+
     @lf.trace(name="work")
     def work() -> None:
         lf.set_baggage(request="r1")

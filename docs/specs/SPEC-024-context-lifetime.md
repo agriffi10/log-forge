@@ -50,6 +50,13 @@ documented to have, and adds the explicit reset that a caller not using `@trace`
 - **Clearing baggage set outside any span.** A `set_baggage` call made before any `@trace` call is a
   deliberate process-level default and is restored to, not erased. (`configure(defaults=...)` remains
   the better tool for that, and the docs should keep saying so.)
+- **An adoption made outside a span that then runs in a *child* context.** The release writes to
+  whichever context the root span's `finally` runs in, so adopting before dispatching into an
+  `asyncio.Task` (including the one `asyncio.run` creates) clears the copy while the parent keeps
+  the adoption. `contextvars` offers no way to write to a parent context, so this is a **constraint,
+  not a defect**: it is recorded in the docstrings and README, pinned by a test, and remedied by
+  adopting on the entry point's first line — the documented placement, which is inside the span —
+  or by calling `reset_context()` in the outer context.
 - **A `traceparent` on the outbound side.** `current_traceparent()` and friends are unaffected.
 - **Any new config key or constructor argument.**
 
@@ -118,6 +125,12 @@ parent. SPEC-014's re-parenting of an already-open root span is likewise untouch
       (SPEC-014 FR-001 behaviour is unchanged, including the "not a root → leave alone" rule).
 - [ ] `continue_trace` called with nothing valid remains a silent no-op and does not clear a context
       adopted earlier in the *same* trace.
+- [ ] One adoption is consumed by **one** root span: a batch that adopts once and then opens a root
+      span per record joins only the first record to the inbound trace. This narrowing follows from
+      the clear and is indistinguishable from the warm-container case inside the library, so it is
+      pinned by a test and stated in `continue_trace`'s docstring rather than worked around.
+- [ ] The task-boundary constraint above is pinned by a test that records the surviving adoption, so
+      a later reader cannot mistake it for an unfixed bug.
 - [ ] The existing `tests/test_trace_continuation.py` fixture no longer needs to reset the private
       `context._adopted` by hand; the reset is removed and the suite still passes.
 
@@ -158,7 +171,9 @@ reader is most likely to get wrong.
 - [ ] `set_baggage`'s and `get_baggage`'s docstrings say when baggage is discarded.
 - [ ] `architecture.md` §5 "Baggage — trace-scoped dynamic context" states the root-span boundary
       explicitly, rather than only "at or below the point they were set".
-- [ ] `continue_trace`'s docstring states that the adopted context does not survive the trace.
+- [ ] `continue_trace`'s docstring states that the adopted context is **consumed by the first root
+      span** — not merely that it "does not survive the trace", which a reader would not expand into
+      the sibling-root-span rule — and names the task-boundary constraint.
 - [ ] The README documents `reset_context()` and notes that a long-lived process reusing one thread
       is the case it exists for.
 

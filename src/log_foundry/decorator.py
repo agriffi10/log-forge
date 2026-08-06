@@ -114,6 +114,12 @@ def continue_trace(
     Call it on the **first line** of the entry point: a child span that already finished has
     been handed to the worker and can no longer be rewritten.
 
+    The adoption is **consumed by that one root span** and does not survive it (SPEC-024): the
+    next root span opened with no fresh call of its own starts a new trace, which is what stops
+    a warm container from logging every later invocation into the first caller's trace. So a
+    batch that fans out to several *sibling* root spans needs one call per item — or, better, a
+    single ``@trace`` entry point so the items are nested spans of one trace.
+
     ``baggage`` is a W3C ``baggage`` header merged into the current context. It succeeds or
     fails independently of the trace context.
 
