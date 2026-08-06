@@ -29,7 +29,9 @@ __all__ = [
     "current_trace_context",
     "current_traceparent",
     "get_baggage",
+    "pop_baggage_scope",
     "pop_span",
+    "push_baggage_scope",
     "push_span",
     "set_baggage",
 ]
@@ -79,6 +81,56 @@ def get_baggage() -> dict[str, object]:
 def set_baggage(**kv: object) -> None:
     """Merge key/values into the current trace's baggage (replaces with a new dict)."""
     _baggage.set({**_baggage.get(), **kv})
+
+
+# -- the root-span scope (SPEC-024) ------------------------------------------------------
+
+
+def push_baggage_scope() -> contextvars.Token[dict[str, object]]:
+    """Open a root span's baggage scope; hand the token back to :func:`pop_baggage_scope`.
+
+    Setting the variable to its own current value is what mints the token — there is no other
+    way to say "restore whatever was here", including the case where nothing was ever set. It
+    is safe because no baggage dict is ever mutated in place (see this module's docstring).
+    """
+    return _baggage.set(_baggage.get())
+
+
+def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
+    """Close a root span's scope: restore baggage, discard any adopted trace context.
+
+    The two are deliberately **asymmetric**. Baggage is *restored*, so a process-level default
+    set before any span outlives the traces that run under it while a request's own keys do not
+    (SPEC-024 FR-001). The adopted context is *cleared*, because it is a one-shot handoff to the
+    trace it was adopted for: restoring it would leave the next invocation still joining the
+    previous caller's trace, which is the defect this scope exists to close (FR-002). A caller
+    who opens no span at all clears both with :func:`reset_context`.
+
+    Total — never raises, because a decorated function must not fail on the way out (arch §4).
+
+    One caveat the ``contextvars`` model makes unavoidable: both writes land in the context the
+    root span's ``finally`` runs in. An adoption made *outside* a span that then runs in a child
+    context — any ``asyncio.Task``, including the one ``asyncio.run`` creates — is cleared in
+    the copy, not in the parent that holds it. :func:`continue_trace` is documented to be called on
+    the entry point's first line, which is inside the span and unaffected; a caller who adopts
+    before dispatching across a task boundary clears it with :func:`reset_context`.
+    """
+    # Cleared first, and deliberately ahead of anything that could fail: a stale trace id puts
+    # *wrong* data in the log stream, while a missed baggage restore only leaves a stale field.
+    _adopted.set(None)
+    try:
+        _baggage.reset(token)
+    except Exception:
+        # `reset` rejects a token minted in another context (``ValueError``, reachable when a
+        # span body hands work to another thread) and one already used (``RuntimeError``).
+        # Setting the captured value directly is equivalent: this context never had the scope
+        # pushed onto it, so there is nothing else to unwind. Broad because the alternative is
+        # raising from a `finally` and replacing the caller's own exception (arch §4).
+        # `old_value` is ``Token.MISSING`` when the variable was unset at capture, and absent
+        # entirely if this was never a Token; neither can have come from `set_baggage`, so both
+        # land on empty rather than poisoning baggage with whatever was passed.
+        old = getattr(token, "old_value", None)
+        _baggage.set(old if isinstance(old, dict) else {})
 
 
 # -- adopted inbound context (SPEC-014) --------------------------------------------------

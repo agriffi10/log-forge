@@ -253,7 +253,7 @@ def test_reparenting_never_overwrites_span_id(lf, fake_sink) -> None:
 def test_a_non_root_span_is_not_reparented(lf, fake_sink) -> None:
     @lf.trace
     def inner() -> None:
-        assert lf.continue_trace(TRACEPARENT) is True, "still adopted for the next root"
+        assert lf.continue_trace(TRACEPARENT) is True, "adopted, for the next root span opened"
 
     @lf.trace
     def outer() -> None:
@@ -459,3 +459,159 @@ def test_new_names_are_exported(lf) -> None:
     ):
         assert name in lf.__all__
         assert callable(getattr(lf, name))
+
+
+# -- SPEC-024 FR-002: the adopted context does not outlive its trace ----------------------
+
+SECOND_TRACE = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+SECOND_SPAN = "a1b2c3d4e5f6a1b2"
+SECOND_TRACEPARENT = f"00-{SECOND_TRACE}-{SECOND_SPAN}-01"
+
+
+def _handler_batches(fake_sink) -> list[list[dict]]:
+    """Every emitted batch for a span named ``handler``, in order."""
+    return [b for b in fake_sink.batches if b and b[0].get("function") == "handler"]
+
+
+def test_an_adopted_context_does_not_survive_into_the_next_root_span(lf, fake_sink) -> None:
+    """The contract example: adopted *outside* the span, on a warm container."""
+
+    @lf.trace(name="handler")
+    def handler() -> None:
+        lf.info("working")
+
+    lf.continue_trace(TRACEPARENT)  # invocation 1 supplied a header
+    handler()
+    handler()  # invocation 2 supplied none
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] != INBOUND_TRACE for e in second), (
+        "invocation 2 must not still be joining invocation 1's caller's trace"
+    )
+    assert HEX32.match(second[0]["trace_id"])
+    assert all(e["parent_span_id"] is None for e in second)
+
+
+def test_an_adopted_context_adopted_inside_the_span_also_does_not_survive(lf, fake_sink) -> None:
+    """The documented placement — first line of the decorated entry point."""
+    headers = [TRACEPARENT, None]
+
+    @lf.trace(name="handler")
+    def handler(header) -> None:
+        lf.continue_trace(header)
+        lf.info("working")
+
+    for header in headers:
+        handler(header)
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] != INBOUND_TRACE for e in second)
+    assert HEX32.match(second[0]["trace_id"])
+    assert all(e["parent_span_id"] is None for e in second)
+
+
+def test_sequential_invocations_land_in_their_own_adopted_traces(lf, fake_sink) -> None:
+    @lf.trace(name="handler")
+    def handler(header: str) -> None:
+        lf.continue_trace(header)
+        lf.info("working")
+
+    handler(TRACEPARENT)
+    handler(SECOND_TRACEPARENT)
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] == SECOND_TRACE for e in second)
+    assert second[0]["parent_span_id"] == SECOND_SPAN
+
+
+def test_an_invalid_continue_trace_does_not_clear_a_context_adopted_in_the_same_trace(
+    lf, fake_sink, capsys
+) -> None:
+    @lf.trace(name="handler")
+    def handler() -> None:
+        assert lf.continue_trace(TRACEPARENT) is True
+        capsys.readouterr()  # drop anything written so far; the next call must add nothing
+        assert lf.continue_trace(None) is False
+        assert capsys.readouterr().err == "", "nothing supplied at all is a *silent* no-op"
+        assert lf.continue_trace("garbage") is False
+        assert context_mod.get_adopted_context() == (INBOUND_TRACE, INBOUND_SPAN)
+        lf.info("working")
+
+    handler()
+
+    (batch,) = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in batch)
+
+
+def test_baggage_adopted_from_a_header_does_not_leak_into_the_next_invocation(
+    lf, fake_sink
+) -> None:
+    @lf.trace(name="handler")
+    def handler(header) -> None:
+        lf.continue_trace(header, baggage="tenant=acme" if header else None)
+        lf.info("working")
+
+    handler(TRACEPARENT)
+    handler(None)
+
+    _, second = _handler_batches(fake_sink)
+    assert all("tenant" not in e["fields"] for e in second)
+
+
+def test_an_adoption_is_consumed_by_one_root_span_not_by_every_later_sibling(
+    lf, fake_sink
+) -> None:
+    """Pins the narrowing that "consumed by the trace it names" implies (SPEC-024 FR-002).
+
+    A batch loop that adopts once and then opens a root span per record joins only the *first*
+    record to the inbound trace. This is the same one-shot rule that stops a warm container from
+    logging every later invocation into the first caller's trace — the two shapes are
+    indistinguishable from inside the library. The remedy is one call per record, or a single
+    ``@trace`` entry point so the records are nested spans of one trace.
+    """
+
+    @lf.trace(name="handler")
+    def handler() -> None:
+        lf.info("working")
+
+    lf.continue_trace(TRACEPARENT)
+    for _ in range(3):
+        handler()
+
+    first, *rest = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert [b[0]["trace_id"] for b in rest] != [INBOUND_TRACE, INBOUND_TRACE]
+    assert len({b[0]["trace_id"] for b in rest}) == 2, "each later sibling gets its own trace"
+
+
+async def test_an_adoption_outside_a_task_boundary_is_not_cleared(lf, fake_sink) -> None:
+    """Pins the one shape SPEC-024 FR-002 cannot close — a documented constraint, not a bug.
+
+    ``pop_baggage_scope`` clears the adopted context in whichever context the root span's
+    ``finally`` runs in. Adopt *outside* a span and then run the span inside a child context —
+    any ``asyncio.Task``, including the one ``asyncio.run`` creates — and the clear lands in the
+    copy while the parent keeps the adoption. ``contextvars`` offers no way to write to a parent
+    context, so the remedy is documentary: adopt on the entry point's first line (inside the
+    span, which works — see the test above), or call ``reset_context()`` in the outer context.
+    """
+
+    @lf.trace(name="handler")
+    def handler() -> None:
+        lf.info("working")
+
+    async def dispatch() -> None:
+        handler()
+
+    lf.continue_trace(TRACEPARENT)
+    for _ in range(2):
+        await asyncio.create_task(dispatch())  # Task copies the context; the clear lands there
+
+    first, second = _handler_batches(fake_sink)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in first)
+    assert all(e["trace_id"] == INBOUND_TRACE for e in second), (
+        "the adoption survives a task boundary — the constraint this test exists to record"
+    )
+    assert context_mod.get_adopted_context() == (INBOUND_TRACE, INBOUND_SPAN)

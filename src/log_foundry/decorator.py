@@ -114,6 +114,12 @@ def continue_trace(
     Call it on the **first line** of the entry point: a child span that already finished has
     been handed to the worker and can no longer be rewritten.
 
+    The adoption is **consumed by that one root span** and does not survive it (SPEC-024): the
+    next root span opened with no fresh call of its own starts a new trace, which is what stops
+    a warm container from logging every later invocation into the first caller's trace. So a
+    batch that fans out to several *sibling* root spans needs one call per item — or, better, a
+    single ``@trace`` entry point so the items are nested spans of one trace.
+
     ``baggage`` is a W3C ``baggage`` header merged into the current context. It succeeds or
     fails independently of the trace context.
 
@@ -298,8 +304,11 @@ def trace(
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                # Before _open_span, which is what makes the new span current (SPEC-024).
+                is_root = context.current_span() is None
                 span = _open_span(name or fn.__qualname__, defaults)
                 token = context.push_span(span)
+                scope = context.push_baggage_scope() if is_root else None
                 try:
                     result = await fn(*args, **kwargs)
                     _close_span(span, "ok", None)
@@ -312,13 +321,18 @@ def trace(
                     raise
                 finally:
                     context.pop_span(token)
+                    if scope is not None:
+                        context.pop_baggage_scope(scope)
 
             return cast("F", async_wrapper)
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Before _open_span, which is what makes the new span current (SPEC-024).
+            is_root = context.current_span() is None
             span = _open_span(name or fn.__qualname__, defaults)
             token = context.push_span(span)
+            scope = context.push_baggage_scope() if is_root else None
             try:
                 result = fn(*args, **kwargs)
                 _close_span(span, "ok", None)
@@ -329,6 +343,8 @@ def trace(
                 raise
             finally:
                 context.pop_span(token)
+                if scope is not None:
+                    context.pop_baggage_scope(scope)
 
         return cast("F", wrapper)
 

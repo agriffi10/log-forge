@@ -50,6 +50,13 @@ documented to have, and adds the explicit reset that a caller not using `@trace`
 - **Clearing baggage set outside any span.** A `set_baggage` call made before any `@trace` call is a
   deliberate process-level default and is restored to, not erased. (`configure(defaults=...)` remains
   the better tool for that, and the docs should keep saying so.)
+- **An adoption made outside a span that then runs in a *child* context.** The release writes to
+  whichever context the root span's `finally` runs in, so adopting before dispatching into an
+  `asyncio.Task` (including the one `asyncio.run` creates) clears the copy while the parent keeps
+  the adoption. `contextvars` offers no way to write to a parent context, so this is a **constraint,
+  not a defect**: it is recorded in the docstrings and README, pinned by a test, and remedied by
+  adopting on the entry point's first line — the documented placement, which is inside the span —
+  or by calling `reset_context()` in the outer context.
 - **A `traceparent` on the outbound side.** `current_traceparent()` and friends are unaffected.
 - **Any new config key or constructor argument.**
 
@@ -91,9 +98,18 @@ path, and the async wrapper identically — the same three paths `_close_span` a
 
 #### Description:
 
-`context._adopted` is restored on the same token discipline and at the same point as baggage. A
-handler that adopted a context on one invocation must not still be joining that trace on the next
-invocation that adopted nothing.
+`context._adopted` is released at the same point as baggage — the root span's exit — but it is
+**cleared**, not restored. A handler that adopted a context on one invocation must not still be
+joining that trace on the next invocation that adopted nothing.
+
+The asymmetry with FR-001 is deliberate, and restoring would defeat the requirement. The documented
+call site is the first line of the decorated entry point, but adopting *before* the span opens is
+equally legitimate (a framework middleware that dispatches, and the caller-side example in this
+spec's API contract). A token restore puts back whatever was current at root-span **entry**, so an
+adoption made before the span survives it — leaving invocation 2 joined to invocation 1's trace,
+exactly the defect this spec exists to close. Baggage set outside a span is a process-level default
+and is restored to (Out of Scope); an adopted context is a one-shot handoff to the trace it names,
+consumed by it. A caller who opens no span clears it with FR-003's `reset_context()`.
 
 Within a single trace the adopted context keeps its current meaning exactly: it is consulted only
 when no span is open (`decorator.py:72-73`), so a nested call still inherits from its in-process
@@ -109,6 +125,12 @@ parent. SPEC-014's re-parenting of an already-open root span is likewise untouch
       (SPEC-014 FR-001 behaviour is unchanged, including the "not a root → leave alone" rule).
 - [ ] `continue_trace` called with nothing valid remains a silent no-op and does not clear a context
       adopted earlier in the *same* trace.
+- [ ] One adoption is consumed by **one** root span: a batch that adopts once and then opens a root
+      span per record joins only the first record to the inbound trace. This narrowing follows from
+      the clear and is indistinguishable from the warm-container case inside the library, so it is
+      pinned by a test and stated in `continue_trace`'s docstring rather than worked around.
+- [ ] The task-boundary constraint above is pinned by a test that records the surviving adoption, so
+      a later reader cannot mistake it for an unfixed bug.
 - [ ] The existing `tests/test_trace_continuation.py` fixture no longer needs to reset the private
       `context._adopted` by hand; the reset is removed and the suite still passes.
 
@@ -149,7 +171,9 @@ reader is most likely to get wrong.
 - [ ] `set_baggage`'s and `get_baggage`'s docstrings say when baggage is discarded.
 - [ ] `architecture.md` §5 "Baggage — trace-scoped dynamic context" states the root-span boundary
       explicitly, rather than only "at or below the point they were set".
-- [ ] `continue_trace`'s docstring states that the adopted context does not survive the trace.
+- [ ] `continue_trace`'s docstring states that the adopted context is **consumed by the first root
+      span** — not merely that it "does not survive the trace", which a reader would not expand into
+      the sibling-root-span rule — and names the task-boundary constraint.
 - [ ] The README documents `reset_context()` and notes that a long-lived process reusing one thread
       is the case it exists for.
 
@@ -160,29 +184,24 @@ reader is most likely to get wrong.
 ```python
 # src/log_foundry/context.py — new token accessors, mirroring push_span/pop_span
 
-def push_baggage_scope() -> tuple[
-    contextvars.Token[dict[str, object]],
-    contextvars.Token[tuple[str, str | None] | None],
-]:
-    """Capture the current baggage + adopted-context tokens, for restoration at root-span exit."""
+def push_baggage_scope() -> contextvars.Token[dict[str, object]]:
+    """Capture the current baggage token, for restoration at root-span exit."""
 
 
-def pop_baggage_scope(
-    tokens: tuple[
-        contextvars.Token[dict[str, object]],
-        contextvars.Token[tuple[str, str | None] | None],
-    ],
-) -> None:
-    """Restore both variables to their pre-scope values. Total — never raises."""
+def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
+    """Restore baggage to its pre-scope value; clear the adopted context. Never raises."""
 
 
 def reset_context() -> None:
     """Clear baggage and any adopted context outright. Public, re-exported from `log_foundry`."""
 ```
 
+Only baggage needs a token: FR-002's adopted context is cleared rather than restored, so there is
+nothing to capture for it.
+
 `pop_baggage_scope` must tolerate a token created in a different context — `contextvars.Token`
 raises `ValueError` when reset from a context other than the one that made it, which is reachable if
-a caller pushes work onto another thread mid-span. It catches and falls back to setting the values
+a caller pushes work onto another thread mid-span. It catches and falls back to setting the value
 directly, because a decorated function must not fail on the way out (architecture §4).
 
 ---
@@ -202,7 +221,7 @@ def wrapper(*args, **kwargs):
     finally:
         context.pop_span(token)
         if scope is not None:
-            context.pop_baggage_scope(scope)
+            context.pop_baggage_scope(scope)   # restores baggage, clears the adopted context
 
 
 # Caller side — the case this spec fixes:

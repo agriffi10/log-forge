@@ -43,3 +43,97 @@ def test_baggage_does_not_leak_across_contexts() -> None:
     contextvars.copy_context().run(lambda: context.set_baggage(secret="leak"))
     # a fresh context sees nothing the previous one set
     assert contextvars.copy_context().run(context.get_baggage) == {}
+
+
+# -- SPEC-024: the root-span scope ------------------------------------------------------
+
+
+def test_baggage_scope_restores_the_prior_value() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_baggage(process="default")
+        scope = context.push_baggage_scope()
+        context.set_baggage(request="r1")
+        assert context.get_baggage() == {"process": "default", "request": "r1"}
+        context.pop_baggage_scope(scope)
+        # restored to the pre-scope value, not cleared (FR-001)
+        assert context.get_baggage() == {"process": "default"}
+
+    contextvars.copy_context().run(body)
+
+
+def test_baggage_scope_restores_to_empty_when_nothing_was_set() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        scope = context.push_baggage_scope()
+        context.set_baggage(request="r1")
+        context.pop_baggage_scope(scope)
+        assert context.get_baggage() == {}
+
+    contextvars.copy_context().run(body)
+
+
+def test_baggage_scope_clears_the_adopted_context() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        scope = context.push_baggage_scope()
+        context.set_adopted_context("a" * 32, "b" * 16)
+        context.pop_baggage_scope(scope)
+        # cleared, not restored — a one-shot handoff to the trace it named (FR-002)
+        assert context.get_adopted_context() is None
+
+    contextvars.copy_context().run(body)
+
+
+def test_baggage_scope_clears_an_adopted_context_that_predates_it() -> None:
+    context = pytest.importorskip("log_foundry.context")
+
+    def body() -> None:
+        context.set_adopted_context("a" * 32, "b" * 16)
+        scope = context.push_baggage_scope()
+        context.pop_baggage_scope(scope)
+        # the case a token restore would get wrong: adopted *before* the span opened
+        assert context.get_adopted_context() is None
+
+    contextvars.copy_context().run(body)
+
+
+def test_pop_baggage_scope_tolerates_a_token_from_another_context() -> None:
+    """A span body that hands work to another thread can make `reset` raise ValueError."""
+    context = pytest.importorskip("log_foundry.context")
+    minted: dict[str, object] = {}
+
+    def mint() -> None:
+        minted["scope"] = context.push_baggage_scope()
+        context.set_baggage(request="r1")
+
+    def body() -> None:
+        context.set_baggage(process="default")
+        contextvars.copy_context().run(mint)
+        # Precondition, asserted so this test cannot quietly stop covering the fallback:
+        # the raw reset is exactly what `pop_baggage_scope` has to survive.
+        with pytest.raises(ValueError):
+            context._baggage.reset(minted["scope"])
+        context.pop_baggage_scope(minted["scope"])  # must not raise
+        assert context.get_baggage() == {"process": "default"}
+
+    contextvars.copy_context().run(body)
+
+
+def test_pop_baggage_scope_from_another_context_falls_back_to_empty() -> None:
+    """The same fallback when the foreign token captured an unset variable."""
+    context = pytest.importorskip("log_foundry.context")
+    minted: dict[str, object] = {}
+
+    # An empty Context has never had the baggage var set, so the token's old value is MISSING.
+    contextvars.Context().run(lambda: minted.__setitem__("scope", context.push_baggage_scope()))
+
+    def body() -> None:
+        context.set_baggage(leftover="x")
+        context.pop_baggage_scope(minted["scope"])
+        assert context.get_baggage() == {}
+
+    contextvars.copy_context().run(body)
