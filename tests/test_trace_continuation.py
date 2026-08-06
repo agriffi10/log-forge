@@ -649,4 +649,19 @@ def test_a_rejection_warning_cannot_reach_the_caller(lf, monkeypatch) -> None:
     monkeypatch.setattr(sys, "stderr", _RaisingStderr())
 
     assert lf.continue_trace("00-bad-header-01") is False
-    assert lf.continue_trace(TRACEPARENT, baggage="\x00 not a header") is True
+    try:
+        assert lf.continue_trace(TRACEPARENT, baggage="\x00 not a header") is True
+    finally:
+        # The second call adopts, and this test opens no root span to release it — so without
+        # this the adoption outlives the test and the next one to open a root span silently
+        # joins the inbound trace. The module docstring claims no test here leaves either set.
+        lf.reset_context()
+
+
+def test_the_suite_leaves_no_adopted_context_behind(lf) -> None:
+    """The module docstring's claim, asserted rather than assumed.
+
+    Runs last by file order, so it observes whatever every test above left set. It caught a real
+    leak: the FR-003 broken-stderr test adopts and opens no root span to release it.
+    """
+    assert context_mod.get_adopted_context() is None

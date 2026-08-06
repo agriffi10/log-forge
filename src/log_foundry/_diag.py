@@ -94,7 +94,10 @@ def lost(what: str, count: int, detail: str = "") -> None:
     Args:
         what: Singular noun for the unit lost — ``"event"``, ``"message"``, ``"row"``. Rendered
             with the corpus-wide ``(s)`` suffix, so it must be a literal, never a runtime value.
-        count: How many were lost. The caller's counter has already moved by this much.
+        count: How many this line reports as lost — normally the increment the caller's counter
+            has just taken. A **throttled** site instead passes its running total, because a line
+            written on every thousandth drop that said "lost 1" would read as one loss rather than
+            a thousand; such a site says so in ``detail``. Recorded before this call either way.
         detail: Optional circumstances — the sink's class name, the attempt count, an ``errno``,
             an exception *type*. Escaped and truncated to ``_MAX_DETAIL``.
     """
