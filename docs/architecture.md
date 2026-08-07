@@ -623,27 +623,26 @@ constraint — never by being deleted quietly.
   process with no worker has captured no sink to swap — but it means the orphan path's sink
   handoff is unmanaged. Measured; recorded by SPEC-031 as explicitly out of its scope.
 
-- **`Worker` reads *and writes* `queue.Queue`'s internals, and there is no public
-  alternative.** Two sites take `self._queue.mutex` and touch `self._queue.queue` — both
-  private. `_release_waiters` **reads** it, to find the `flush()` markers still queued when the
-  drain thread has died terminally, so no caller sits out its full timeout on a thread that is
-  never coming back. The audit that produced SPEC-024..031 flagged it; **SPEC-031 FR-005
-  records it rather than changing it**, per SPEC-021's rule that an open item is closed by being
-  fixed, settled, or recorded.
+- **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
+  alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
+  to find the `flush()` markers still queued when nothing will ever read them again, so no
+  caller sits out its full timeout, and no caller who passed `timeout=None` waits forever. The
+  audit that produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than
+  changing it**, per SPEC-021's rule that an open item is closed by being fixed, settled, or
+  recorded. It is called on the terminal-failure path and, since the shutdown-sentinel fix, on
+  the clean shutdown path too — the same enqueue-after-the-drain race reaches both.
 
-  `_discard_spent_sentinel` **writes** it, rebuilding the deque without the `_SHUTDOWN` sentinel
-  after a completed join. `shutdown()` sets `_stop` before queueing that sentinel — the reverse
-  order would let a thread consume it while `_stop` was still clear and block for another
-  `flush_interval`, so the order is not negotiable — and the cost is a window in which the drain
-  loop exits and finishes its final drain before the sentinel lands. Measured at roughly one
-  shutdown in 1500; it strands the sentinel only, never an event, but `health().queued` then
-  reads 1 permanently, contradicting a field documented as counting submissions and the three
-  tests that assert the final drain empties the queue. `Queue` publishes nothing that removes a
-  *specific* item, and draining to reach it is not available either: post-shutdown submissions
-  must stay queued, because that is exactly what `submitted_after_shutdown` reports (SPEC-030).
-  It is safe where a general one would not be — it runs only once the thread is provably gone,
-  a concurrent `submit` is serialized by the queue's own mutex, nothing here ever blocks on
-  `put` (so no `not_full` waiter goes unnotified), and `task_done`/`join` are unused.
+  It stays a **read**. A write was built and reverted: the first fix for a stranded `_SHUTDOWN`
+  sentinel rebuilt the deque without it, and rested on the claim that "nothing in this module
+  ever blocks on `put`" — which is false, `flush()` uses a blocking `put` by design, so freeing
+  capacity without notifying `not_full` would leave that caller parked with space available.
+  Fixing the sentinel by **ordering** instead (queue it before setting `_stop`, and break the
+  drain loop on it) makes stranding impossible rather than repairable, and needs no write at
+  all. The residual is that a marker stranded by the sibling race is answered but left queued,
+  so `health().queued` counts it; removing it would mean deleting a *specific* item, which
+  `Queue` cannot do, and draining to reach it is not available either — post-shutdown
+  submissions must stay queued, since that is exactly what `submitted_after_shutdown` reports
+  (SPEC-030).
 
   Why no alternative: the markers must be *read* and not *consumed*, and **every public method
   `Queue` has either removes an item or reports only a count** — none of them inspects without
