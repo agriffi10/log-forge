@@ -24,6 +24,10 @@ class FilteringSink:
     This is a static, emit-time filter in front of an inner sink, not the reserved
     tail-sampling ``should_send`` seam (arch §10) — that stays deferred and owns rate policy at
     span-decision time, while this only reshapes an already-built batch on its way to a sink.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
+    belong to the inner sink. A guard here would refuse batches the inner sink would have taken.
     """
 
     def __init__(

@@ -74,6 +74,13 @@ class HTTPSink:
       failed: Requests abandoned past the retry bound.
       dropped_oversized: Events dropped for exceeding a destination's hard size limit, used by
         subclasses that enforce one; the generic core imposes no universal limit.
+
+    The two lifecycle decisions this class records, inherited by every platform subclass. It
+    takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
+    ``urllib`` opens a fresh connection per request and nothing is rebound after construction.
+    And it **accepts emit after close** (SPEC-032 FR-003), because ``close()`` releases nothing —
+    a batch emitted afterwards still reaches the endpoint, and refusing it would be loss the
+    library invented rather than loss it reported.
     """
 
     def __init__(

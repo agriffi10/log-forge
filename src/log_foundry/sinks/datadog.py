@@ -16,6 +16,10 @@ class DatadogSink(HTTPSink):
 
     The batch goes as a JSON array to the region-specific intake with a ``DD-API-KEY`` header,
     each entry enriched with ``ddsource``, ``service`` and ``ddtags``.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
+    is no transport held and ``close()`` releases nothing.
     """
 
     def __init__(

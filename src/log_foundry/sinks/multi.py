@@ -29,6 +29,13 @@ class MultiSink:
         batch, so one batch against an all-down fan-out of *n* children increments this by *n*
         per attempt, with a stderr line each. That is the visible cost of the loss no longer
         being silent.
+
+    It takes **no** transport lock (SPEC-028 FR-002) — it holds no transport, and a lock spanning
+    a child's ``emit`` would serialize every destination behind the slowest one. And it
+    **accepts emit after close** (SPEC-032 FR-003), because the post-close rule is each child's:
+    ``close()`` here only forwards, so a guard added at this level would refuse batches the
+    children would have taken, while a child that must refuse already does and is counted here
+    like any other failure.
     """
 
     def __init__(self, *sinks: Sink) -> None:

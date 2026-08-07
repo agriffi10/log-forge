@@ -14,6 +14,11 @@ class StdoutSink:
 
     This is the zero-dependency default sink, for local dev and container log scraping. Like
     every sink it receives already-built event dicts and knows nothing about spans or context.
+
+    It takes **no** transport lock (SPEC-028 FR-002): the stream is bound once at construction
+    and ``TextIOWrapper.write`` holds its own lock, so a line cannot be spliced. And it
+    **accepts emit after close** (SPEC-032 FR-003), because ``close()`` only flushes — the
+    stream belongs to the process, not to this sink, so a later batch still lands.
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:

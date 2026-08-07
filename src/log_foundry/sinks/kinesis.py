@@ -36,6 +36,10 @@ class KinesisSink:
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``boto3`` clients are documented thread-safe, this one is built once in
     ``__init__``, and the sink rebinds nothing after construction.
+
+    It also **accepts emit after close** (SPEC-032 FR-003): ``close()`` is a documented no-op,
+    because the client is the caller's to release or the SDK's to reap, so a batch emitted
+    afterwards still reaches the stream.
     """
 
     MAX_RECORDS = 500

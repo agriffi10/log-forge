@@ -602,13 +602,19 @@ def _takes_the_transport_lock(
     return False
 
 
-def _sink_classes_holding_a_driver() -> list[tuple[str, ast.ClassDef]]:
-    """Returns every sink class that owns something a concurrent caller could corrupt.
+def _sink_classes_with_an_emit() -> list[tuple[str, ast.ClassDef]]:
+    """Returns every class in ``sinks/`` that defines ``emit`` or ``send_all`` (SPEC-032 FR-003).
 
-    In scope: a class with an ``emit`` (or ``send_all``) whose module lazily imports a
-    third-party driver — the repo's optional-extra idiom — or which opens a socket, an event
-    loop, a database connection or a file handle of its own. ``AsyncFunctionDef`` is walked
-    alongside ``FunctionDef`` so a future async sink cannot drop out of scope silently.
+    This gate used to guess, admitting a *module* that imported something inside a function or
+    whose source contained one of six hardcoded handle tokens. SPEC-028's delivery doc recorded
+    what that costs — a lock added to ``HTTPSink.emit`` would have been invisible to the lint,
+    and so is anything else the guess does not happen to reach. A roster whose completeness is
+    the point cannot rest on a heuristic, so scope is now every implementation and the decision
+    is what varies.
+
+    ``base.Sink`` is excluded by name: it is the Protocol stating the contract, not a sink that
+    can satisfy it. ``AsyncFunctionDef`` is walked alongside ``FunctionDef`` so a future async
+    sink cannot drop out of scope silently.
 
     Args:
       None.
@@ -626,27 +632,12 @@ def _sink_classes_holding_a_driver() -> list[tuple[str, ast.ClassDef]]:
     root = pathlib.Path(log_foundry.__file__).parent / "sinks"
     found: list[tuple[str, ast.ClassDef]] = []
     for path in sorted(root.glob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        lazily_imported = any(
-            isinstance(inner, ast.Import | ast.ImportFrom)
-            for fn in ast.walk(tree)
-            if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
-            for inner in ast.walk(fn)
-        )
-        owns_a_handle = any(
-            token in source
-            for token in (
-                "socket.socket", "create_connection", "new_event_loop",
-                "sqlite3.connect", 'open(path, "a"', "open(self._path",
-            )
-        )
-        if not (lazily_imported or owns_a_handle):
-            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         found.extend(
             (path.stem, node)
             for node in tree.body
             if isinstance(node, ast.ClassDef)
+            and not (path.stem == "base" and node.name == "Sink")
             and any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
                 and m.name in ("emit", "send_all")
@@ -673,9 +664,14 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
     one; the next accepted any class docstring citing the spec, so a sink documenting *why it
     locks* stayed exempt after its lock was deleted. The exemption is therefore the specific
     claim ``**no** transport lock`` — a sink may only opt out by asserting it needs none.
+
+    Scope widened in SPEC-032 FR-003 from the classes a heuristic believed held a driver to
+    every sink class, which brought in sixteen more. None of them needs a lock — they are
+    wrappers, ``urllib`` subclasses and in-memory sinks — but a class silently outside the lint
+    has recorded no decision at all, which is the state the three sinks SPEC-032 fixes were in.
     """
     undecided: list[str] = []
-    for stem, cls in _sink_classes_holding_a_driver():
+    for stem, cls in _sink_classes_with_an_emit():
         helpers = {
             m.name: m
             for m in cls.body
@@ -1009,73 +1005,135 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     assert all(isinstance(err, Exception) for err in errors)
 
 
-def _classes_taking_a_transport_lock() -> set[str]:
-    """Returns ``module.Class`` for every sink whose ``emit`` enters ``self._lock``.
+# The claim a sink makes to opt out of the post-close rule (SPEC-032 FR-003). Like SPEC-028's
+# lock exemption it is a specific assertion about behaviour rather than a mention of the topic,
+# so a docstring that merely discusses close() cannot satisfy it.
+ACCEPTS_AFTER_CLOSE = "**accepts emit after close**"
 
-    Derived from the same AST walk the contract lint uses, so the post-close roster below cannot
-    drift away from the code the way a written list does.
+# Every sink proved to refuse a post-close emit, mapped to the key its driver double is built
+# under. Hand-written only because each needs its own double; what is *not* hand-written is which
+# sinks belong here — a class absent from both this map and the exemption claim fails the lint
+# below, which is the check the old CLOSED_SINKS roster could not make.
+POST_CLOSE_BUILDERS = {
+    "sqlite.SQLiteSink": "sqlite",
+    "rabbitmq.RabbitMQSink": "rabbitmq",
+    "mongodb.MongoDBSink": "mongodb",
+    "clickhouse.ClickHouseSink": "clickhouse",
+    "eventhubs.AzureEventHubsSink": "eventhubs",
+    "nats.NATSSink": "nats",
+    "_socket.SocketTransport": "socket",
+    "file.FileSink": "file",
+    "file.RotatingFileSink": "rotating",
+    "postgres.PostgresSink": "postgres",
+    "kafka.KafkaSink": "kafka",
+    "pubsub.GooglePubSubSink": "pubsub",
+    "redis._RedisSink": "redis",
+    # These two refuse through the transport they hold rather than a guard of their own, which is
+    # a claim worth testing rather than assuming (SPEC-032 FR-004).
+    "syslog.SyslogSink": "syslog",
+    "logstash.LogstashSink": "logstash",
+}
+
+
+def _undecided_post_close(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
+    """Returns the classes that neither have a post-close case nor claim they accept.
+
+    Written as a function over its input rather than over the package so the failure path can be
+    exercised directly (see the synthetic-class test below). A lint whose red path never runs is
+    a lint a refactor can defeat silently.
 
     Args:
-      None.
+      entries: ``(module_stem, class node)`` pairs to judge.
 
     Returns:
-      The qualified names.
+      The qualified names of the undecided classes, sorted.
 
     Raises:
       None.
     """
-    locked = set()
-    for stem, cls in _sink_classes_holding_a_driver():
-        helpers = {
-            m.name: m
-            for m in cls.body
-            if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-        }
-        entry = helpers.get("emit") or helpers.get("send_all")
-        if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
-            locked.add(f"{stem}.{cls.name}")
-    return locked
+    undecided = []
+    for stem, cls in entries:
+        name = f"{stem}.{cls.name}"
+        if name in POST_CLOSE_BUILDERS:
+            continue
+        documented = " ".join((ast.get_docstring(cls) or "").split())
+        if ACCEPTS_AFTER_CLOSE in documented and "SPEC-032 FR-003" in documented:
+            continue
+        undecided.append(name)
+    return sorted(undecided)
 
 
-# Hand-written only because each sink needs its own driver double; the *coverage* of this map is
-# asserted against the AST by test_every_locked_sink_has_a_post_close_case below.
-CLOSED_SINKS = [
-    "sqlite", "rabbitmq", "mongodb", "clickhouse", "eventhubs", "nats",
-    "socket", "file", "rotating", "postgres",
-]
+def test_every_sink_class_records_a_post_close_decision() -> None:
+    """Every sink either refuses a post-close emit or asserts that it accepts one.
 
-_BUILDER_CLASSES = {
-    "sqlite": "sqlite.SQLiteSink",
-    "rabbitmq": "rabbitmq.RabbitMQSink",
-    "clickhouse": "clickhouse.ClickHouseSink",
-    "eventhubs": "eventhubs.AzureEventHubsSink",
-    "nats": "nats.NATSSink",
-    "socket": "_socket.SocketTransport",
-    "file": "file.FileSink",
-    "rotating": "file.RotatingFileSink",
-    "postgres": "postgres.PostgresSink",
-    # MongoDBSink takes no transport lock by design, but still needs the post-close rule.
-    "mongodb": "mongodb.MongoDBSink",
-}
+    The roster this replaces was written by hand and checked afterwards against the sinks taking
+    a *transport lock* — which is how ``KafkaSink`` and ``GooglePubSubSink`` stayed outside it
+    for four specs while losing every event emitted after ``close()``. Neither takes a lock, so
+    neither was ever a candidate.
 
-
-def test_every_locked_sink_has_a_post_close_case() -> None:
-    """The post-close roster is derived from the code, not written alongside it.
-
-    This PR missed the roster three times before this test existed: FR-002's own list of seven
-    sinks, then the lint's module scan, then ``CLOSED_SINKS`` itself — which named six sinks
-    while nine classes took a transport lock, leaving ``SocketTransport`` reopening and leaking a
-    live TCP connection on the orphan path after ``shutdown()``. A list maintained by hand next
-    to a rule is a list that drifts; this makes a new locked sink fail until someone gives it a
-    double.
+    Refusal is established behaviourally, by :func:`test_a_closed_sink_refuses_a_batch_instead_of
+    _reaching_its_driver` below, not by finding a ``_closed`` token in the source: a flag checked
+    after the driver call would satisfy a source scan and lose the batch anyway. So a sink is
+    covered here only by having a driver double, and the alternative is the explicit claim — a
+    sink may opt out by asserting it accepts, never by being unreachable by a heuristic.
     """
-    covered = {_BUILDER_CLASSES[name] for name in CLOSED_SINKS}
-    missing = _classes_taking_a_transport_lock() - covered
-    assert not missing, f"locked sinks with no post-close test: {sorted(missing)}"
+    in_scope = _sink_classes_with_an_emit()
+    undecided = _undecided_post_close(in_scope)
+    assert not undecided, (
+        "these sinks neither have a post-close case proving they refuse, nor claim in the class "
+        f"docstring that they accept: {undecided}"
+    )
+    # The map must not outlive the code either: a renamed or deleted sink leaves a builder key
+    # nothing parametrizes, and the case it used to cover disappears without a failure.
+    stale = set(POST_CLOSE_BUILDERS) - {f"{stem}.{cls.name}" for stem, cls in in_scope}
+    assert not stale, f"post-close builders naming no sink class: {sorted(stale)}"
+
+
+def _synthetic_class(docstring: str) -> tuple[str, ast.ClassDef]:
+    """Parses a one-off sink class with the given docstring, for the lint's red path.
+
+    Args:
+      docstring: The class docstring to give it.
+
+    Returns:
+      A ``(module_stem, class node)`` pair shaped like the package scan's.
+
+    Raises:
+      None.
+    """
+    module = ast.parse(f'class BrandNewSink:\n    """{docstring}"""\n    def emit(self, b): ...\n')
+    cls = module.body[0]
+    assert isinstance(cls, ast.ClassDef)
+    return ("brandnew", cls)
+
+
+def test_a_sink_recording_no_post_close_decision_is_reported() -> None:
+    """The lint's red path runs, against the exact state ``KafkaSink`` was in for four specs.
+
+    FR-003 asks for a demonstration rather than a prose claim, because a lint whose failure path
+    is never exercised is one a refactor of its own matching can defeat silently. Three cases:
+    a docstring that says nothing, one that discusses ``close()`` without asserting anything, and
+    one making the claim but citing no spec — each must still be reported, and the third is the
+    mutant SPEC-028's review actually found (an exemption satisfied by topic rather than claim).
+    """
+    silent = _synthetic_class("A sink that records nothing at all.")
+    chatty = _synthetic_class("Its close() releases the connection and emit() ships a batch.")
+    uncited = _synthetic_class(f"This sink {ACCEPTS_AFTER_CLOSE}, but names no spec.")
+
+    assert _undecided_post_close([silent]) == ["brandnew.BrandNewSink"]
+    assert _undecided_post_close([chatty]) == ["brandnew.BrandNewSink"]
+    assert _undecided_post_close([uncited]) == ["brandnew.BrandNewSink"]
+
+    claimed = _synthetic_class(f"This sink {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003): nothing held.")
+    assert _undecided_post_close([claimed]) == []
 
 
 def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Builds one locked sink with an injected driver double, or skips if unavailable.
+    """Builds one roster sink with an injected driver double, or skips if unavailable.
+
+    Every double keeps *working* after ``close()`` on purpose. A double that started failing then
+    would let a deleted guard still produce an exception, and the test would pass against the
+    bug it exists to catch.
 
     Args:
       name: Which sink to build.
@@ -1213,21 +1271,99 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
         return nats_mod.NATSSink("events", client=FakeClient()), lambda: len(opened)
 
+    if name == "kafka":
+        from log_foundry.sinks.kafka import KafkaSink
+
+        class Producer:
+            # Deliberately still working after flush(), as confluent-kafka's is: produce()
+            # accepts into the local batch whether or not anything will ever drain it again.
+            # A double that broke after close would pass with the guard deleted.
+            def produce(self, topic: str, **kwargs: object) -> None:
+                opened.append("produce")
+
+            def poll(self, timeout: float) -> int:
+                return 0
+
+            def flush(self) -> None:
+                pass
+
+        return KafkaSink("logs", producer=Producer()), lambda: len(opened)
+
+    if name == "pubsub":
+        from log_foundry.sinks.pubsub import GooglePubSubSink
+
+        class Future:
+            def result(self) -> None:
+                pass
+
+        class Publisher:
+            def publish(self, topic: str, data: bytes | None = None) -> Future:
+                opened.append("publish")
+                return Future()
+
+        return GooglePubSubSink("projects/p/topics/t", client=Publisher()), lambda: len(opened)
+
+    if name == "redis":
+        from log_foundry.sinks.redis import RedisListSink
+
+        class Pipeline:
+            def rpush(self, key: str, value: str) -> None:
+                pass
+
+            def execute(self) -> None:
+                pass
+
+        class Client:
+            # close() disconnects redis-py's pool and the next command transparently reopens, so
+            # a post-close emit *succeeds* against a real client — leaking a connection nothing
+            # will reap rather than raising. That is what the counter here records.
+            def pipeline(self) -> Pipeline:
+                opened.append("pipeline")
+                return Pipeline()
+
+            def close(self) -> None:
+                pass
+
+        sink = RedisListSink("logs", client=Client())
+        sink._owns_client = True
+        return sink, lambda: len(opened)
+
+    if name in ("syslog", "logstash"):
+        # Neither holds a guard of its own: both delegate to SocketTransport, and the point of
+        # the case is that the delegation actually carries the refusal (FR-004).
+        fake = SplittingSocket()
+
+        def make_tcp(host: str, port: int, timeout: float):
+            opened.append("connect")
+            return fake
+
+        monkeypatch.setattr(_socket, "_make_tcp", make_tcp)
+        if name == "syslog":
+            sink = SyslogSink(host="localhost", port=5140, transport="tcp")
+        else:
+            from log_foundry.sinks.logstash import LogstashSink
+
+            sink = LogstashSink(host="localhost", port=5140, transport="tcp")
+        sink.emit([event(0, 0)])
+        return sink, lambda: len(opened)
+
     raise AssertionError(f"no double for {name!r}")
 
 
-@pytest.mark.parametrize("name", CLOSED_SINKS)
+@pytest.mark.parametrize("name", sorted(POST_CLOSE_BUILDERS.values()))
 def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emitting after ``close()`` raises ``SinkDeliveryError`` and touches no driver.
 
-    Every locked sink gets the same rule, because three of them had three different answers. The
-    driver-contact assertion is the load-bearing half: ``RabbitMQSink`` had a ``_closed`` flag
-    that ``close()`` honoured and ``emit`` did not, and ``_active_channel`` reopens a connection
-    whenever it finds none — so one ``log_foundry.info()`` after ``shutdown()`` opened an AMQP
-    connection nothing would ever reap. Asserting only that a ``SinkDeliveryError`` came back
-    would have passed against that leak.
+    Every sink on the roster gets the same rule, because they kept arriving at different answers
+    on their own. The driver-contact assertion is the load-bearing half: ``RabbitMQSink`` had a
+    ``_closed`` flag that ``close()`` honoured and ``emit`` did not, and ``_active_channel``
+    reopens a connection whenever it finds none — so one ``log_foundry.info()`` after
+    ``shutdown()`` opened an AMQP connection nothing would ever reap. ``RedisListSink`` did the
+    same through ``redis-py``'s reconnecting pool. Asserting only that a ``SinkDeliveryError``
+    came back would have passed against both leaks, and against ``KafkaSink`` accepting a produce
+    into a batch nothing would flush again.
     """
     sink, driver_calls = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
@@ -1242,7 +1378,7 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     assert driver_calls() == before, f"{name} reached its driver after close()"
 
 
-@pytest.mark.parametrize("name", CLOSED_SINKS)
+@pytest.mark.parametrize("name", sorted(POST_CLOSE_BUILDERS.values()))
 def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -38,6 +38,9 @@ class SentrySink:
     lock. This sink owns no transport: it delegates to a ``sentry_sdk`` built for capture from any
     thread, or to an ``HTTPSink`` that builds a fresh request per call and rebinds nothing.
     Its counters take the counter lock like every other sink's.
+
+    It also **accepts emit after close** (SPEC-032 FR-003), for the same reason: neither backend
+    holds anything ``close()`` releases, so a batch emitted afterwards still reaches Sentry.
     """
 
     def __init__(

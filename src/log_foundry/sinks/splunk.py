@@ -17,6 +17,10 @@ class SplunkHECSink(HTTPSink):
     concatenated-JSON-objects body with an ``Authorization: Splunk <token>`` header. The
     envelope's epoch-seconds ``time`` is parsed from the event's ISO-8601 ``timestamp``, falling
     back to emit-time now.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
+    is no transport held and ``close()`` releases nothing.
     """
 
     def __init__(

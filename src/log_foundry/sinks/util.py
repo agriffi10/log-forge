@@ -43,6 +43,10 @@ class NullSink:
     what this sink is for, and reporting it as loss would make ``health()``'s alert idiom fire
     on every batch for anyone who chose this sink to turn logging off. The counter stays
     readable on the instance.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    (SPEC-032 FR-003): there is no transport and ``close()`` releases nothing, so discarding a
+    batch after close is the same operation as discarding one before it.
     """
 
     def __init__(self) -> None:
@@ -96,6 +100,10 @@ class MemorySink:
     eyeballing in a notebook. With ``maxlen`` set it behaves as a bounded ring, keeping only the
     most recent events; the list object identity is stable, so a held reference keeps seeing
     updates.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    (SPEC-032 FR-003): there is no transport, and ``close()`` releases nothing — a test that
+    closes the sink and then asserts on a later batch still sees it in ``.events``.
     """
 
     def __init__(self, maxlen: int | None = None) -> None:
