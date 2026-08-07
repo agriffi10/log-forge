@@ -580,9 +580,15 @@ constraint — never by being deleted quietly.
   active span — those emit synchronously on the caller's thread and build no worker. Measured: with
   a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open,
   so **every** event is lost, not only the one after `shutdown()`. Found reviewing SPEC-032, whose
-  post-close guard is invisible here precisely because `close()` never happens. It is a worker
-  lifecycle defect rather than a sink one and is **not** fixed by SPEC-032; recorded here so the
-  post-close guarantee is not read as covering it. A process that opens even one span is unaffected.
+  post-close guard is invisible here precisely because `close()` never happens. A process that opens
+  even one span is unaffected.
+
+  What makes it worth a spec rather than an accepted limit: **`health()` reads all-clear**
+  — `retired=False`, `submitted_after_shutdown=0`, `stopped_reason=None`, `sink=None` — because
+  every one of those describes a worker, and there is no worker. So SPEC-030's alert idiom is
+  structurally blind to it, which is the silent-loss shape SPEC-030 exists to end. It is a worker
+  lifecycle defect rather than a sink one, so SPEC-032 did not fix it; it is recorded here so the
+  post-close guarantee is not read as covering it, and it is **awaiting a spec**, not settled.
 
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,

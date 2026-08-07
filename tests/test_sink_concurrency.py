@@ -1054,11 +1054,26 @@ def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
     into an exempt one, and the suite went **green** while quietly losing two cases (1029 → 1027,
     no red — the silent-test-deletion shape, reached through prose).
 
-    So two code-derived facts outrank the claim. Taking a transport lock in ``emit`` is the
-    stronger of the two and restores the floor the pre-SPEC-032 roster had: that roster was
-    derived from exactly this property, and no docstring could exempt a locked sink from it.
-    Carrying a ``self._closed`` flag is the second: a class maintaining one is a class that
-    refuses, so claiming it accepts contradicts its own code rather than describing it.
+    So three code-derived facts outrank the claim. Taking a transport lock in ``emit`` is the
+    strongest and restores the floor the pre-SPEC-032 roster had: that roster was derived from
+    exactly this property, and no docstring could exempt a locked sink from it. Carrying a
+    ``self._closed`` flag is the second — a class maintaining one is a class that refuses, so
+    claiming it accepts contradicts its own code. Nulling a ``self`` attribute in ``close`` is
+    the third: releasing a handle by dropping the reference to it is the one release shape that
+    cannot be confused with delegation.
+
+    **What this does not catch, stated rather than implied.** A second review defeated the first
+    two facts with a real module whose ``close`` called ``self._conn.close()`` and took no lock —
+    it walked through with the claim in its docstring. The third fact closes that particular
+    shape but not the general one, and the general one is deliberately left open: a rule reading
+    "calls ``.close()`` on a ``self`` attribute" also fires on ``FilteringSink``, ``TransformSink``
+    and ``SentrySink``, which release nothing of their own and correctly forward to an inner
+    sink. Telling ownership from delegation by syntax is the guesswork this spec removed from the
+    scope gate, so it is not reintroduced here. Two shipped sinks are outside all three facts for
+    the same reason — ``SyslogSink`` and ``LogstashSink`` refuse *through* the ``SocketTransport``
+    they hold — and both are on the roster with behavioural tests, which is what actually covers
+    them. The floor moved from "any sink may claim" to "any sink that neither locks, nor flags,
+    nor nulls a handle may claim"; a reviewer still has to read a new claim.
 
     Args:
       cls: The class to judge.
@@ -1082,6 +1097,21 @@ def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
             and isinstance(node.ctx, ast.Store)
         ):
             return "it maintains a _closed flag, which is what a refusing sink does"
+    close = helpers.get("close")
+    if close is not None:
+        for node in ast.walk(close):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is None
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    for target in node.targets
+                )
+            ):
+                return "its close() drops a handle it holds, so a later emit has nothing to use"
     return None
 
 
@@ -1514,7 +1544,7 @@ def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
     assert producer.sent == THREADS * PER_THREAD * per_batch
 
 
-def test_pubsub_sets_its_closed_flag_in_the_same_critical_section_as_the_swap() -> None:
+def test_pubsub_sets_its_closed_flag_before_it_releases_the_futures_lock() -> None:
     """When ``close()`` releases the futures lock, the flag it guards is already set.
 
     This is the ordering :meth:`GooglePubSubSink.close`'s docstring claims, and review found it
@@ -1529,7 +1559,13 @@ def test_pubsub_sets_its_closed_flag_in_the_same_critical_section_as_the_swap() 
     close used. The window is real but a few instructions wide. So this observes the invariant
     directly rather than trying to land inside it — at the instant the closing thread leaves the
     critical section, is the flag set? Correct code: yes. Flag moved after the swap: no. That is
-    deterministic, needs no timing, and is exactly the claim the docstring makes.
+    deterministic, needs no timing, and is exactly the claim it is named for.
+
+    It is named for the flag and not for the swap because that is all it checks: moving the
+    *swap* out of the lock while leaving the flag in leaves this green. A second review found
+    that, and it was a fair reading of the old name. The swap's placement is SPEC-028's decision
+    rather than this spec's, and with the flag set first an append cannot be orphaned either
+    way — the cost of moving it is two concurrent closes resolving one list, not loss.
     """
     from log_foundry.sinks.pubsub import GooglePubSubSink
 
@@ -1652,13 +1688,21 @@ def test_the_lints_reject_a_real_new_sink_module_that_records_nothing(tmp_path: 
     ], "a new sink recording no post-close decision was not reported"
 
 
-def test_a_state_holding_sink_cannot_claim_the_exemption(tmp_path: Path) -> None:
-    """A docstring cannot exempt a sink whose code says it holds something (SPEC-032 FR-003).
+def test_three_code_derived_facts_outrank_the_exemption_claim(tmp_path: Path) -> None:
+    """A docstring cannot exempt a sink that locks, flags, or drops a handle (SPEC-032 FR-003).
 
     Review defeated the first version of this lint by deleting ``SQLiteSink`` from the builder
     map and adding the exemption claim to its docstring: the suite went green and quietly lost
     two cases (1029 → 1027, no red). The claim is a docstring assertion, and an assertion is only
-    as good as what it cannot override — so two code-derived facts outrank it.
+    as good as what it cannot override.
+
+    A second review then defeated the first two facts with ``DelegatingLiar``'s shape below, so
+    the third was added. It is deliberately *not* general — see
+    :func:`_may_not_claim_it_accepts` for why "calls ``.close()`` on a ``self`` attribute" is not
+    a rule this lint can carry, and which sinks are consequently covered by their behavioural
+    tests rather than by this floor. ``DelegatingLiar`` is asserted as **not caught** so that
+    limit is pinned rather than forgotten: it fails here the day someone widens the rule, which
+    is the prompt to check the wrappers for false positives.
     """
     claim = f"It {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003): nothing is held."
     (tmp_path / "liar.py").write_text(
@@ -1676,6 +1720,18 @@ def test_a_state_holding_sink_cannot_claim_the_exemption(tmp_path: Path) -> None
         "    def emit(self, batch): ...\n"
         "    def close(self): self._closed = True\n"
         "\n"
+        "class NullingLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): self._conn.write(batch)\n"
+        "    def close(self):\n"
+        "        self._conn.close()\n"
+        "        self._conn = None\n"
+        "\n"
+        "class DelegatingLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): self._conn.write(batch)\n"
+        "    def close(self): self._conn.close()\n"
+        "\n"
         "class HonestSink:\n"
         f'    """{claim}"""\n'
         "    def emit(self, batch): ...\n"
@@ -1684,12 +1740,12 @@ def test_a_state_holding_sink_cannot_claim_the_exemption(tmp_path: Path) -> None
     )
 
     reported = _undecided_post_close(_sink_classes_with_an_emit(tmp_path))
-    assert any(name.startswith("liar.LockedLiar") for name in reported), (
-        f"a sink locking its transport talked its way out of the roster: {reported}"
-    )
-    assert any(name.startswith("liar.FlaggedLiar") for name in reported), (
-        f"a sink carrying a _closed flag claimed it accepts: {reported}"
-    )
-    assert not any(name.startswith("liar.HonestSink") for name in reported), (
-        f"a genuinely stateless sink was refused its claim: {reported}"
+    caught = {name.split(" ", 1)[0] for name in reported}
+    assert "liar.LockedLiar" in caught, f"a sink locking its transport claimed it accepts: {reported}"
+    assert "liar.FlaggedLiar" in caught, f"a sink carrying a _closed flag claimed it accepts: {reported}"
+    assert "liar.NullingLiar" in caught, f"a sink dropping its handle claimed it accepts: {reported}"
+    assert "liar.HonestSink" not in caught, f"a stateless sink was refused its claim: {reported}"
+    assert "liar.DelegatingLiar" not in caught, (
+        "the recorded limit has moved: a rule now catches the delegation shape. Check "
+        "FilteringSink, TransformSink and SentrySink for false positives before widening it."
     )

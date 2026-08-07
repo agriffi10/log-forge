@@ -123,9 +123,12 @@ class SentrySink:
             )
 
     def close(self) -> None:
-        """Releases the HTTP fallback resource, if any (FR-012).
+        """Forwards to the HTTP fallback, whose own close releases nothing (FR-012).
 
-        Idempotent.
+        Idempotent, and it releases nothing — which is why the class docstring's post-close claim
+        holds despite this method calling a ``close()``. ``HTTPSink.close`` is a documented no-op,
+        since ``urllib`` builds a fresh connection per request; the forward exists so a future
+        ``HTTPSink`` that *did* hold a pool would be released here rather than leaked.
 
         Args:
           None.

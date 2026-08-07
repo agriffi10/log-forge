@@ -18,8 +18,13 @@
   proving they refuse and the other **19** assert `**adds no post-close guard**` (SPEC-032 FR-003)
   in their class docstring, in three groups with three reasons (fresh connection per request, no-op
   boto3 close, delegation to a child or transport). `CLOSED_SINKS` and its after-the-fact coverage
-  check are gone. Two code-derived facts outrank the docstring claim — taking a transport lock in
-  `emit`, or carrying a `_closed` flag — so a state-holding sink cannot talk its way out.
+  check are gone. Three code-derived facts outrank the docstring claim — taking a transport lock in
+  `emit`, carrying a `_closed` flag, or nulling a `self` handle in `close` — which moves the floor
+  from "any sink may claim" to "any sink that does none of those may claim". It is **not** "a
+  state-holding sink cannot talk its way out": a sink calling `self._conn.close()` and taking no
+  lock still can, and that hole is left open deliberately, because the rule that would close it
+  also fires on the delegating wrappers. `_may_not_claim_it_accepts` records the limit and a test
+  pins it.
 - **The contract is stated where an implementer reads it** — `Sink.emit`/`Sink.close` in
   `sinks/base.py`, `architecture.md` §8, and the README's "Writing your own sink", which now shows
   the flag in its worked example.
@@ -79,9 +84,9 @@ docstring claims it was not holding anyone to. All are fixed; the findings are w
   docstring settle it. Demonstrated: deleting `SQLiteSink` from the builder map and adding the
   exemption claim to its docstring turned a sink that commits and closes a connection into an
   exempt one — **suite green, 1029 → 1027, no red.** That is the silent-test-deletion shape reached
-  through prose. Fixed by `_may_not_claim_it_accepts`: a transport lock in `emit` or a `_closed`
-  flag now outranks the claim, restoring the old floor and extending it to the unlocked sinks the
-  old roster never covered.
+  through prose. Fixed by `_may_not_claim_it_accepts`, restoring the old floor and extending it to
+  unlocked sinks the old roster never covered — though not as far as this round first claimed; see
+  the second review below.
 - **Two ordering claims were asserted in docstrings and tested by nothing.** Moving
   `GooglePubSubSink.close`'s flag assignment to *after* the swap, and `KafkaSink.close`'s to after
   the flush, both left the whole suite green while restoring the loss each placement prevents. The
@@ -118,3 +123,43 @@ assertion is vacuous (inherited from SPEC-028); and `shutdown()` is a no-op when
 created, so a process that only ever used the orphan path never closes its sink and still loses
 post-`shutdown()` events silently. The second is recorded in `architecture.md` §13 — it is a
 limit on *this* spec's headline scenario, so leaving it unstated would overstate what shipped.
+
+## Second review round (the fix delta, PR #118)
+
+The fix commit was itself reviewed in a fresh context, scoped to the delta. Verdict MERGE WITH
+CHANGES; every substantive fix was independently mutated and confirmed working. The changes asked
+for were wording that overstated what shipped, plus one optional strengthening.
+
+- **The floor was overclaimed.** It caught the reported defeat but was itself defeated by a real
+  module whose `close()` called `self._conn.close()` with no lock and no flag. A third fact —
+  nulling a `self` handle in `close` — now catches that shape; the general rule is deliberately
+  **not** adopted, because "calls `.close()` on a `self` attribute" also fires on `FilteringSink`,
+  `TransformSink` and `SentrySink`, which release nothing of their own. Telling ownership from
+  delegation by syntax is the guesswork this spec removed from the scope gate, so it was not
+  reintroduced. `SyslogSink` and `LogstashSink` are outside all three facts for the same reason and
+  are covered by their behavioural tests instead. The limit is now stated in
+  `_may_not_claim_it_accepts` and **pinned by a test** that asserts the delegation shape is *not*
+  caught, so widening the rule fails loudly and prompts a false-positive check on the wrappers.
+- **A test name was wider than the test.** `..._in_the_same_critical_section_as_the_swap` stayed
+  green when the *swap* moved out of the lock while the flag stayed in. Renamed to
+  `..._before_it_releases_the_futures_lock`, which is what it checks. Not a loss either way: with
+  the flag set first an append cannot be orphaned, and the swap's placement is SPEC-028's decision.
+- **`ObservingLock` was challenged and upheld.** `_closed` is written only by `close()`, so "the
+  flag is set when close releases the lock" is logically equivalent to "any thread acquiring it
+  afterwards sees it set" — a complete characterization of the invariant `emit`'s second check
+  depends on, not a proxy. A refactor away from `with` fails loudly rather than silently.
+- **The orphan-only entry was filed as a constraint while calling itself a defect.** It now states
+  the part that makes it serious — `health()` reads all-clear, since every field describes a worker
+  that does not exist — says it is awaiting a spec rather than settled, and has a handoff line in
+  `docs/specs/INDEX.md` → Arcs.
+- **`SentrySink.close`'s docstring contradicted its class docstring** — "Releases the HTTP fallback
+  resource" against "neither backend holds anything `close()` releases". Both were true only
+  because `HTTPSink.close` is a no-op; it now says so.
+
+Confirmed unchanged by the review: no deadlock on `KafkaSink._close_lock` (taken only by `close`,
+never nested under `_counter_lock`, never touched by `emit`); the `_diag.lost` move counts exactly
+once per orphaned publish; the scope gate's in-scope set is identical at 34 classes; all 19 renamed
+claims are literally true (no `_closed` in any claiming module); and the mutation counts in this
+doc are accurate. One liveness cost is accepted and documented: a second `close()` on a dead broker
+now blocks in `producer.flush()`, which is the `architecture.md` §13 constraint that already
+applies to every sink.

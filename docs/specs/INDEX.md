@@ -132,4 +132,8 @@ Group related specs and record the order to build them in. Delete this section i
   generalizes, SPEC-028 for the lint and roster it widens, and SPEC-030 for the finding that its own
   signals cannot reach this. Also absorbs the lint-scope item SPEC-028 had provisionally left to
   SPEC-031, since the post-close roster derives from that gate. Build after 030; nothing depends
-  on it.
+  on it. **It hands one item on, unowned:** a process that only ever uses the orphan path builds
+  no worker, so `shutdown()` is a no-op, `atexit` is never registered, the sink is never closed
+  and every event is lost — with `health()` reading all-clear, because each field describes a
+  worker that does not exist. Found in SPEC-032's review, recorded in `architecture.md` §13, and
+  out of its scope: it is `decorator.py` lifecycle, not sink behaviour. Needs a spec.
