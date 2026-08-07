@@ -214,15 +214,19 @@ It also took SPEC-028's recorded lint-scope gap off SPEC-031, because the post-c
 from that gate: scope is now every sink class with an `emit`, and each records its post-close
 decision or has a double proving it refuses.
 
-**SPEC-031 is Draft and is the only unbuilt spec** — the last of the 2026-08-05 audit arc, validated
-in a second fresh context. Nothing in it is caught by CI (the suite was green throughout). Build
-order and the grouping's reasoning are in `@docs/specs/INDEX.md` → Arcs. It gained **FR-006** on
-2026-08-07, which is *not* residue and should be built last and reviewed on its own: a process that
-only ever logs outside a span creates no worker, so `atexit` is never registered (it is registered
-*inside* `_get_worker`) and `shutdown()` returns early — the sink is never closed (every event lost
-on a locally-buffering sink; the flush and the resource on a synchronous one) and `health()` reads
-all-clear, because every field describes a worker that does not exist.
-Found reviewing SPEC-032, whose post-close guard is invisible there because `close()` never happens.
+**SPEC-031 (audit small corrections) is Completed** — the last of the 2026-08-05 audit arc, and
+the arc is now fully shipped. Five FRs were residue: `RotatingFileSink` measured its rotation
+interval on the wall clock (a backward NTP step deferred rotation indefinitely), `_make_udp`
+hardcoded `AF_INET` so UDP syslog to an IPv6 host silently could not work, four documentation
+claims contradicted the code, `sanitize` read the interpreter's integer limit per value on a hot
+path, and `Worker._release_waiters`'s use of `queue.Queue` internals is now a recorded §13
+constraint rather than a flagged wart. **FR-006 was the exception** and shipped in its own PR: a
+process that only ever logs outside a span creates no worker, so `atexit` was never registered
+(it is registered *inside* `_get_worker`) and `shutdown()` returned early — the sink was never
+closed, and `health()` read all-clear because every field describes a worker that does not exist.
+One item is deliberately **still open** and needs its own spec: the orphan-path sink swap
+(`configure(sink=A)` → `info()` → `configure(sink=B)` leaves A unclosed, `incomplete_swaps` at
+zero), recorded in `architecture.md` §13.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
@@ -491,6 +495,30 @@ where it starts.
   lint's scope gate stopped guessing at the same time — every class in `sinks/` with an `emit`,
   because a roster whose completeness is the point cannot rest on a heuristic, which is exactly how
   two of the three sinks stayed invisible for four specs. (SPEC-032, arch §8, §13)
+- **The close is once-only across both delivery paths; the `atexit` *registration* is not the
+  thing being guarded** — a process that only ever logs outside a span builds no worker, so
+  nothing owned its sink's close and nothing performed it. The arming lives in `api._log`'s
+  orphan branch and fires **after** the emit returns, because what has to be recorded is that an
+  event *reached* the sink: keying on a configured sink is the obvious phrasing and is wrong,
+  since `configure()` runs `_ensure_sink()` unconditionally and would close a `StdoutSink`
+  nothing was ever written to. One `atexit` handler covers both paths — `_shutdown_worker` drains
+  a worker if there is one and closes the orphan sink otherwise — which is what makes a single
+  registration under the existing flag correct. Two handlers double-close (`atexit` runs LIFO)
+  and reusing the flag for a worker-only handler costs a mixed process its exit drain
+  (SPEC-004 FR-005); **both traps are green against every in-process test**, and trap A is caught
+  by exactly one test in the suite — the orphan→span subprocess case. A live worker still owns
+  the close, which is what makes a mixed process one `close()` in either order, and it inherits
+  the worker's reasons for *not* closing (an expired shutdown leaves the sink open). No worker
+  is created to answer any of this: `health().retired` is synthesized from a module flag, the
+  same refusal `_swap_sink` and `_flush_worker` already make. `submitted_after_shutdown` is
+  deliberately **not** incremented here — SPEC-030 defines it as a submission queued where
+  nothing will drain it, and a later orphan log is refused at a closed sink and announced, which
+  is not the same claim; `retired` alone is what stops being vacuous. (SPEC-031 FR-006, arch §13)
+- **A value on the wire is measured on the clock that cannot move** — `RotatingFileSink`'s
+  rotation deadline is `time.monotonic()`, as `Span.start_ts` already was, because a wall-clock
+  deadline is defeated by any step larger than the interval. The *label* stays wall-clock
+  wherever one exists; here none does, since backups are numbered rather than timestamped.
+  (SPEC-031 FR-001)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

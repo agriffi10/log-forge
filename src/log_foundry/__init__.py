@@ -98,7 +98,9 @@ def health() -> Health:
       ``failed`` is an upper bound on loss rather than a count of it, since a sink that raises
       on total failure counts the attempt and hands the batch back for the worker to retry. A
       process that has never logged has no worker, and asking does not create one — the
-      snapshot is simply zeroed. Valid after :func:`shutdown`.
+      snapshot is simply zeroed, except for ``retired``, which stays truthful even for a
+      process that only ever logged outside a span and so built no worker at all (SPEC-031
+      FR-006). Valid after :func:`shutdown`.
 
     Raises:
       None.
@@ -121,6 +123,15 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     will drain them. It is not silent any more — :func:`health` then reports ``retired`` with a
     non-zero ``submitted_after_shutdown``, and the first such submission writes one stderr line
     (SPEC-030). That pair is the reading that catches the mistake above.
+
+    A process that only ever logged **outside** a span built no worker, and this used to be a
+    no-op there, leaving the sink open forever: every event lost on a sink whose ``close()`` is
+    what delivers them, the flush and the resource on a synchronous one. It now closes that
+    sink — exactly once, and without creating a worker to do it — and ``health().retired``
+    reads ``True`` afterwards rather than staying vacuously ``False`` (SPEC-031 FR-006). A
+    later level call reaches a closed sink, so a sink that guards its own post-close state
+    refuses it and one stderr line is written; a stateless one such as ``StdoutSink`` still
+    accepts it (SPEC-032).
 
     Args:
       timeout: Seconds bounding the wait for the background thread and, carved from the same

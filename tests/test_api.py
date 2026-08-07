@@ -472,3 +472,537 @@ def test_a_sink_that_fails_to_construct_does_not_fail_an_orphan_log(monkeypatch,
     contextvars.copy_context().run(body)
     err = capsys.readouterr().err
     assert "absorbed a failure while emitting an orphan log (RuntimeError)" in err
+
+
+# -- SPEC-031 FR-006: a process that never created a worker still closes its sink ------------
+
+
+class _CountingSink:
+    """Records the events it took and how many times it was closed."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self.closes = 0
+
+    def emit(self, batch: list[dict]) -> None:
+        self.events.extend(batch)
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def test_an_orphan_only_process_closes_its_sink_exactly_once_on_shutdown() -> None:
+    """The defect: shutdown() returned early on a null worker, so close() never happened."""
+    lf = pytest.importorskip("log_foundry")
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    lf.info("no span anywhere")
+    assert sink.closes == 0, "nothing closes while the process is still logging"
+
+    lf.shutdown()
+
+    assert sink.closes == 1
+    assert len(sink.events) == 1, "the event landed synchronously, as it always did"
+
+
+def test_shutdown_stays_idempotent_on_the_orphan_path() -> None:
+    lf = pytest.importorskip("log_foundry")
+    sink = _CountingSink()
+    lf.configure(service="t", sink=sink)
+    lf.info("x")
+
+    lf.shutdown()
+    lf.shutdown()
+    lf.shutdown()
+
+    assert sink.closes == 1, "the once-only guard sits ahead of the close, as Worker's does"
+
+
+def test_a_close_that_raises_does_not_reach_the_caller(capsys) -> None:
+    """SPEC-025: this runs from atexit, where an escape makes CPython print the message."""
+    lf = pytest.importorskip("log_foundry")
+
+    class _Exploding(_CountingSink):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("the destination went away")
+
+    sink = _Exploding()
+    lf.configure(service="t", sink=sink)
+    lf.info("x")
+
+    lf.shutdown()  # must not raise
+
+    assert sink.closes == 1
+    err = capsys.readouterr().err
+    assert "absorbed a failure while closing the sink (RuntimeError)" in err
+    assert "the destination went away" not in err, "the message is never written (arch §6)"
+
+    lf.shutdown()
+    assert sink.closes == 1, "a failed close is announced, not retried"
+
+
+def test_configure_without_ever_logging_closes_nothing_and_creates_nothing() -> None:
+    """AC-8. Not because the sink was never built — configure() always builds one."""
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", sink=sink)
+
+    lf.shutdown()
+
+    assert sink.closes == 0, "no event ever reached it, so closing it is cost with no benefit"
+    assert decorator._worker is None
+
+
+def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
+    """AC-7. Out of Scope bans standing up a thread at exit to prove there is nothing to drain."""
+    import threading
+
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    before = threading.active_count()
+    sink = _CountingSink()
+    lf.configure(service="t", sink=sink)
+    lf.info("one")
+    lf.info("two")
+    lf.shutdown()
+
+    assert threading.active_count() == before
+    assert decorator._worker is None
+    assert sink.closes == 1
+
+
+def test_health_reports_retired_after_an_orphan_only_shutdown() -> None:
+    """AC-4/AC-5: `retired` stops being vacuous; `submitted_after_shutdown` keeps its meaning."""
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", sink=sink)
+    lf.info("x")
+    assert lf.health().retired is False
+
+    lf.shutdown()
+
+    health = lf.health()
+    assert health.retired is True
+    assert health.submitted_after_shutdown == 0, (
+        "SPEC-030 defines that as queued-where-nothing-drains; this is refused-and-announced"
+    )
+    assert health.stopped_reason is None, "a clean shutdown is not a terminal failure (SPEC-019)"
+    assert decorator._worker is None, "health() must not create a worker to answer this"
+
+
+def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys) -> None:
+    """AC-6, against a sink that actually carries a post-close guard (SPEC-032)."""
+    lf = pytest.importorskip("log_foundry")
+    sqlite_mod = pytest.importorskip("log_foundry.sinks.sqlite")
+
+    sink = sqlite_mod.SQLiteSink(str(tmp_path / "events.db"))
+    lf.configure(service="t", sink=sink)
+    lf.info("before")
+    lf.shutdown()
+    capsys.readouterr()
+
+    def body() -> None:
+        lf.info("after the close")
+
+    contextvars.copy_context().run(body)
+
+    err = capsys.readouterr().err
+    assert err.count("absorbed a failure while emitting an orphan log (SinkDeliveryError)") == 1, (
+        "refused at the closed sink and announced once, not silently buffered — and named, so "
+        "an unrelated fault in this branch cannot satisfy the assertion"
+    )
+
+
+def test_the_default_stdout_sink_is_not_expected_to_refuse(capsys) -> None:
+    """The counterpart to AC-6: 19 of 34 sink classes add no post-close guard, by design."""
+    lf = pytest.importorskip("log_foundry")
+    stream = io.StringIO()
+    from log_foundry.sinks.stdout import StdoutSink
+
+    lf.configure(service="t", sink=StdoutSink(stream=stream))
+    lf.info("before")
+    lf.shutdown()
+
+    def body() -> None:
+        lf.info("after the close")
+
+    contextvars.copy_context().run(body)
+
+    assert "after the close" in stream.getvalue(), (
+        "StdoutSink's close() only flushes; an implementer testing AC-6 here misreads the fix"
+    )
+    assert "absorbed a failure" not in capsys.readouterr().err
+
+
+def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -> None:
+    """AC-3, first order. Both failure modes the FR names are green without this test.
+
+    A reused ``_atexit_registered`` would have the orphan log consume the worker's
+    registration, costing a mixed process its exit drain (SPEC-004 FR-005); a second ``atexit``
+    handler would double-close, since ``atexit`` runs LIFO. Neither shows up in a span-only or
+    an orphan-only test.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    lf.info("orphan first")
+
+    @lf.trace
+    def traced() -> None:
+        lf.info("inside the span")
+
+    traced()
+    assert decorator._worker is not None, "the span built a worker"
+
+    lf.shutdown()
+
+    assert sink.closes == 1, "the worker owns the close; the orphan path must defer to it"
+    messages = [event["message"] for event in sink.events]
+    assert "orphan first" in messages
+    assert "inside the span" in messages, "the worker's drain still ran"
+    assert "span.end" in messages
+
+
+def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_span_first() -> None:
+    """AC-3, the other order — the worker exists before anything arms the orphan close."""
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    @lf.trace
+    def traced() -> None:
+        lf.info("inside the span")
+
+    traced()
+
+    def body() -> None:
+        lf.info("orphan second")
+
+    contextvars.copy_context().run(body)
+    assert decorator._worker is not None
+
+    lf.shutdown()
+
+    assert sink.closes == 1
+    messages = [event["message"] for event in sink.events]
+    assert "inside the span" in messages
+    assert "orphan second" in messages
+    assert lf.health().retired is True
+
+
+def test_a_span_only_process_still_closes_exactly_once() -> None:
+    """The regression guard: nothing about FR-006 may add a close to the path that worked."""
+    lf = pytest.importorskip("log_foundry")
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    @lf.trace
+    def traced() -> None:
+        return None
+
+    traced()
+    lf.shutdown()
+
+    assert sink.closes == 1
+
+
+_ORPHAN_EXIT_PROGRAM = """
+import log_foundry as lf
+
+class CountingSink:
+    def __init__(self):
+        self.closes = 0
+    def emit(self, batch):
+        pass
+    def close(self):
+        self.closes += 1
+        print("CLOSES=%d" % self.closes, flush=True)
+
+sink = CountingSink()
+lf.configure(service="t", env="t", sink=sink)
+lf.info("no span anywhere")
+{shutdown}
+print("END OF MAIN", flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    ("shutdown", "label"),
+    [("", "atexit alone"), ("lf.shutdown()", "explicit shutdown, then atexit")],
+)
+def test_interpreter_exit_closes_an_orphan_only_sink_exactly_once(
+    shutdown, label, tmp_path
+) -> None:
+    """AC-2. A real subprocess, and the *count* is what is asserted.
+
+    ``atexit`` handlers do not run inside pytest, and ``atexit._run_exitfuncs()`` would fire the
+    whole registry and corrupt suite state. The count rather than the mere fact of a close is
+    what distinguishes the fix from a second ``atexit`` handler, which closes twice — that
+    variant passes a "did it close?" assertion and is the trap the FR names.
+    """
+    import os
+    import pathlib
+    import subprocess
+    import sys as sys_mod
+
+    lf = pytest.importorskip("log_foundry")
+    src = pathlib.Path(lf.__file__).resolve().parent.parent
+    script = tmp_path / f"orphan_exit_{len(shutdown)}.py"
+    script.write_text(_ORPHAN_EXIT_PROGRAM.format(shutdown=shutdown))
+
+    # Suppressed for the reason the sibling atexit test in test_worker.py gives: this
+    # interpreter plus a script written into pytest's own tmp_path. No shell, no outside input.
+    result = subprocess.run(  # noqa: S603
+        [sys_mod.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(src)},
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "END OF MAIN" in result.stdout
+    assert result.stdout.count("CLOSES=") == 1, (
+        f"{label}: expected exactly one close, got {result.stdout.count('CLOSES=')}"
+    )
+    assert "CLOSES=1" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+_MIXED_EXIT_PROGRAM = """
+import log_foundry as lf
+
+class CountingSink:
+    def __init__(self):
+        self.closes = 0
+        self.delivered = []
+    def emit(self, batch):
+        self.delivered.extend(e["message"] for e in batch)
+    def close(self):
+        self.closes += 1
+        print("CLOSES=%d DELIVERED=%s" % (self.closes, sorted(set(self.delivered))), flush=True)
+
+sink = CountingSink()
+lf.configure(service="t", env="t", sink=sink)
+
+@lf.trace(name="work")
+def work():
+    lf.info("inside the span")
+
+{first}
+{second}
+print("END OF MAIN", flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "order"),
+    [
+        ('lf.info("orphan")', "work()", "orphan-then-span"),
+        ("work()", 'lf.info("orphan")', "span-then-orphan"),
+    ],
+)
+def test_a_mixed_process_at_interpreter_exit_closes_once_and_still_drains(
+    first, second, order, tmp_path
+) -> None:
+    """AC-3's other half, and the only test that can see it.
+
+    The in-process siblings call ``shutdown()`` explicitly, so the ``atexit`` registration is
+    never exercised there — and that is precisely where the FR's first trap lives. Reusing
+    ``_atexit_registered`` to arm the orphan close makes ``_get_worker`` skip
+    ``atexit.register``, so a mixed process silently loses its exit drain (SPEC-004 FR-005) with
+    every in-process test still green. The second trap, a separate handler, shows up here as
+    ``CLOSES=2``.
+    """
+    import os
+    import pathlib
+    import subprocess
+    import sys as sys_mod
+
+    lf = pytest.importorskip("log_foundry")
+    src = pathlib.Path(lf.__file__).resolve().parent.parent
+    script = tmp_path / f"mixed_exit_{order}.py"
+    script.write_text(_MIXED_EXIT_PROGRAM.format(first=first, second=second))
+
+    # Suppressed for the reason the sibling atexit test in test_worker.py gives.
+    result = subprocess.run(  # noqa: S603
+        [sys_mod.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(src)},
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "END OF MAIN" in result.stdout
+    assert result.stdout.count("CLOSES=") == 1, f"{order}: expected exactly one close"
+    assert "CLOSES=1" in result.stdout
+    assert "inside the span" in result.stdout, (
+        f"{order}: the worker's atexit drain must still run — the span's events reached the sink"
+    )
+    assert "orphan" in result.stdout
+    assert "span.end" in result.stdout, "the whole span, not just the level call inside it"
+
+
+# -- SPEC-031 FR-006: the guards a first review found untested ------------------------------
+
+
+def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() -> None:
+    """The `_worker is not None` guard, exercised in isolation.
+
+    A first review found it dead under test: removing it alone left the whole suite green,
+    because `_shutdown_worker` returns before reaching here whenever a worker exists. It is
+    still the guard that keeps a `shutdown()` racing a first `@trace` from closing the sink the
+    new worker just captured, so it is asserted directly rather than only through that caller.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("arms the close")
+
+    @lf.trace
+    def traced() -> None:
+        return None
+
+    traced()
+    assert decorator._worker is not None
+
+    decorator._close_orphan_sink()
+
+    assert sink.closes == 0, "the worker owns this sink; the orphan close must stand down"
+
+
+def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> None:
+    """A shutdown() racing a first @trace must not close the sink the worker just captured.
+
+    The race needs an injected preemption point — the repo's own SPEC-028 precedent. The lock
+    wrapper creates the worker inside `__enter__`, i.e. exactly while a thread is blocked
+    acquiring `_worker_lock`, which is the interleaving a bare unlocked read admits.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("arms the close")
+
+    real_lock = decorator._worker_lock
+
+    class _PreemptingLock:
+        """Publishes a worker while a caller is mid-acquire, as a real thread could."""
+
+        def __init__(self) -> None:
+            self.fired = False
+
+        def __enter__(self):
+            real_lock.acquire()
+            if not self.fired:
+                self.fired = True
+                decorator._worker = decorator.Worker(sink)
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            real_lock.release()
+
+    decorator._worker_lock = _PreemptingLock()  # type: ignore[assignment]
+    try:
+        decorator._close_orphan_sink()
+    finally:
+        decorator._worker_lock = real_lock
+
+    assert sink.closes == 0, (
+        "the worker was published under the lock, so the close must observe it and stand down"
+    )
+
+
+def test_a_sink_that_raises_on_emit_is_still_closed() -> None:
+    """SPEC-026 FR-001 makes total failure raise, so this is the case most likely to leak.
+
+    An orphan-only process against a dead destination raises on every call. Arming after the
+    emit would leave the socket that failure came from open forever — the exact leak FR-006
+    exists to stop. A sink that raised is still a sink that was written to.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry.sinks.base import SinkDeliveryError
+
+    class _DeadDestination(_CountingSink):
+        def emit(self, batch: list[dict]) -> None:
+            raise SinkDeliveryError("delivered none of 1 event(s)")
+
+    sink = _DeadDestination()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    def body() -> None:
+        lf.info("never lands")
+
+    contextvars.copy_context().run(body)
+    lf.shutdown()
+
+    assert sink.closes == 1, "the resource behind the failure is released, not leaked"
+
+
+def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
+    """The other side of it: there is no sink, so there is nothing to close."""
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    lf.configure(service="t")
+    original = api._ensure_sink
+
+    def _explode():
+        raise RuntimeError("cannot build a sink")
+
+    api._ensure_sink = _explode  # type: ignore[assignment]
+    try:
+
+        def body() -> None:
+            lf.info("no sink to write to")
+
+        contextvars.copy_context().run(body)
+    finally:
+        api._ensure_sink = original  # type: ignore[assignment]
+
+    assert decorator._orphan_close_owed is False
+
+
+def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:
+    """A first review's finding: `retired` reverted to False and contradicted this API.
+
+    An orphan-only `shutdown()` leaves `_worker` unset, so a later `@trace` builds a fresh
+    worker whose own `retired` is False. Reading that alone says the process was never shut
+    down — false, and it contradicts what `health()` reported one call earlier.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("orphan")
+    lf.shutdown()
+    assert lf.health().retired is True
+
+    @lf.trace
+    def traced() -> None:
+        return None
+
+    traced()
+    assert decorator._worker is not None, "a fresh worker really was built"
+
+    assert lf.health().retired is True, "shutdown() happened; a new worker cannot un-happen it"

@@ -1,7 +1,7 @@
 # Spec: Audit Small Corrections
 
 **ID:** SPEC-031  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-07  
 **Depends On:** SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032
 
