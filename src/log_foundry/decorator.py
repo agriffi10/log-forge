@@ -243,7 +243,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
 
     Args:
       new_sink: The sink already written to the config, to be made the live delivery target.
-      timeout: Seconds bounding the drain of the previous sink.
+      timeout: Seconds bounding the whole swap — both drains and the close of the previous
+        sink share it as one deadline.
 
     Returns:
       None.

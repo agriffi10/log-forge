@@ -86,10 +86,11 @@ def configure(
     is already live is a no-op: no drain, no close. The previous sink is closed and must not be
     handed back to a later call.
 
-    The bound covers the whole call, the close included. ``Sink.close`` takes no timeout, so
-    that close runs on its own non-daemon thread and is joined for what is left of the budget:
-    a destination that hangs in ``close()`` delays this call by the budget and no more, and the
-    close still runs to completion rather than being abandoned.
+    The bound covers the whole call, the close included. ``Sink.close`` takes no timeout, so that
+    close runs on its own daemon thread and is joined for what is left of the budget: a
+    destination that hangs in ``close()`` delays this call by the budget and no more, then carries
+    on in the background. An expired join reports nothing, since a slow close and a stuck one
+    cannot be told apart at that moment; ``health().closing_sinks`` reports the live fact instead.
 
     This is still a startup call. It is not thread-safe, and a span finishing on another thread
     during a swap may land on either sink.

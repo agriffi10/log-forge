@@ -233,20 +233,27 @@ def test_the_swap_drains_the_old_sink_then_fences_before_closing_it() -> None:
     """
     old, new = SwapSink(), SwapSink()
     worker = _worker_with(old)
-    real_flush, drains = worker.flush, []
+    real_flush, real_close, drains, close_budget = worker.flush, worker._close_swapped_out, [], []
 
     def recording_flush(timeout=None):
         drains.append((worker.sink, timeout))
         return real_flush(timeout)
 
+    def recording_close(sink, timeout):
+        close_budget.append(timeout)
+        return real_close(sink, timeout)
+
     worker.flush = recording_flush
+    worker._close_swapped_out = recording_close
     config.configure(sink=new)
 
     assert [sink for sink, _ in drains] == [old, new], "drain to the old sink, then fence after"
     assert old.closed == 1, "and only then close it"
-    # One deadline covers both, so a hung sink cannot cost twice the budget. The first drain is a
-    # real queue round-trip, so the monotonic clock has moved by the time the fence is granted.
+    # One deadline covers all three waits, so a hung sink cannot cost a multiple of the budget.
+    # Each step is a real queue round-trip, so the monotonic clock has moved between them; a
+    # step handed a *fresh* budget would read equal to its predecessor rather than less.
     assert drains[1][1] < drains[0][1], "the fence gets what is left of the budget, not a fresh one"
+    assert close_budget and close_budget[0] < drains[1][1], "and the close gets what is left of that"
 
 
 def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
@@ -431,18 +438,48 @@ def test_the_swap_budget_bounds_the_previous_sinks_close() -> None:
     loaded machine while passing 25 for 25 idle. What must be tight is the gap between the
     budget and the close, not the budget.
     """
+    budget = 0.3
     slow = SlowCloseSink()
     _worker_with(slow)
     try:
         start = time.monotonic()
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        decorator._swap_sink(SwapSink(), timeout=budget)
         elapsed = time.monotonic() - start
 
         assert slow.in_close.is_set(), "the close was started"
-        assert elapsed < 5.0, f"configure() waited on a hung close for {elapsed:.2f}s"
-        assert slow.closed == 0, "and returned while it was still running"
+        assert slow.closed == 0, "and configure() returned while it was still running"
+        # Against the budget, not against the 10 s close: a bare "did not take forever" passes
+        # for a fresh full budget, a 10x join, and a fire-and-forget that never waits at all.
+        assert elapsed < budget * 3, f"the wait must track the budget, took {elapsed:.2f}s"
     finally:
         slow.release.set()
+
+
+def test_the_swap_waits_for_a_close_that_fits_inside_the_budget() -> None:
+    """The other half of the bound: waiting is the default, and expiry is the exception.
+
+    The close must take *measurable* time, or a fire-and-forget swap passes on luck — an
+    instant close finishes before the assertion runs whether or not anything joined it. The
+    elapsed check is what actually distinguishes the two, and it is a floor rather than a
+    window, so load can only make it more true.
+    """
+    close_seconds = 0.2
+    old = SwapSink()
+    original_close = old.close
+
+    def unhurried_close() -> None:
+        time.sleep(close_seconds)
+        original_close()
+
+    old.close = unhurried_close  # type: ignore[method-assign]
+    _worker_with(old)
+
+    start = time.monotonic()
+    decorator._swap_sink(SwapSink(), timeout=5.0)
+    elapsed = time.monotonic() - start
+
+    assert old.closed == 1, "a close that fits in the budget has completed on return"
+    assert elapsed >= close_seconds, "and configure() waited for it rather than firing and forgetting"
 
 
 def test_an_expired_close_is_neither_abandoned_nor_reported() -> None:
@@ -462,6 +499,30 @@ def test_an_expired_close_is_neither_abandoned_nor_reported() -> None:
 
         slow.release.set()
         assert _eventually(lambda: slow.closed == 1), "the close ran to completion regardless"
+    finally:
+        slow.release.set()
+
+
+def test_a_close_still_running_is_visible_in_health_while_it_runs() -> None:
+    """The observable that replaces a signal derived from the expiry (review finding F3).
+
+    A live gauge carries none of the ambiguity that made SPEC-028 revert a guessed one: read it
+    non-zero and a close *is* running now. Read it non-zero every time and the destination is
+    stuck, holding resources nothing will reclaim.
+    """
+    slow = SlowCloseSink()
+    _worker_with(slow)
+    try:
+        assert log_foundry.health().closing_sinks == 0, "nothing is closing yet"
+
+        decorator._swap_sink(SwapSink(), timeout=0.1)
+        assert slow.in_close.wait(5.0)
+        assert log_foundry.health().closing_sinks == 1, "the hung close is visible"
+
+        slow.release.set()
+        assert _eventually(lambda: log_foundry.health().closing_sinks == 0), (
+            "and the gauge falls again once it finishes — it is not a counter"
+        )
     finally:
         slow.release.set()
 
@@ -489,12 +550,12 @@ def test_a_closer_thread_that_cannot_start_is_announced_not_run_inline(monkeypat
     assert "starting the thread that closes a swapped-out sink" in capsys.readouterr().err
 
 
-def test_the_closer_thread_is_not_a_daemon() -> None:
-    """Structural, and load-bearing: a daemon is killed wherever it has reached at exit.
+def test_the_closer_thread_is_a_daemon(monkeypatch) -> None:
+    """Structural, and load-bearing in the opposite direction to the first attempt here.
 
-    SPEC-028 measured that for ``SQLiteSink`` — between ``commit()`` and ``close()`` — turning a
-    leaked handle into a partial write. A swap runs in a live process, so a non-daemon thread
-    can finish; that is the whole reason this site may thread a close and ``shutdown()`` may not.
+    A non-daemon closer was tried and is worse: CPython joins non-daemon threads *before*
+    ``atexit``, so one hung close stops the exit drain from ever running. The subprocess test in
+    ``test_worker.py`` measures that consequence; this one pins the flag it turns on.
     """
     started: list[threading.Thread] = []
     real_thread = threading.Thread
@@ -504,16 +565,13 @@ def test_the_closer_thread_is_not_a_daemon() -> None:
             started.append(self)
             super().start()
 
-    threading.Thread = RecordingThread  # type: ignore[misc]
-    try:
-        _worker_with(SwapSink())
-        decorator._swap_sink(SwapSink())
-    finally:
-        threading.Thread = real_thread  # type: ignore[misc]
+    monkeypatch.setattr(threading, "Thread", RecordingThread)
+    _worker_with(SwapSink())
+    decorator._swap_sink(SwapSink())
 
     closers = [t for t in started if t.name == "log-foundry-sink-close"]
     assert closers, "the close ran on its own thread"
-    assert all(not t.daemon for t in closers), "a daemon closer is killed mid-write at exit"
+    assert all(t.daemon for t in closers), "a non-daemon closer holds the whole exit path hostage"
 
 
 def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:

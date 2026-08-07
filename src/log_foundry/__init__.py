@@ -70,6 +70,9 @@ def health() -> Health:
 
     ``retired`` alone is not a fault — a process that shuts down and then stops logging is
     doing the right thing, which is why it is paired with the count rather than alerted on.
+    ``closing_sinks`` is deliberately absent for the same kind of reason: it is briefly non-zero
+    during a perfectly healthy sink swap, so alerting on a single reading would fire on correct
+    use. It is a gauge to watch over time, not a term in this test.
 
     Args:
       None.
@@ -81,8 +84,11 @@ def health() -> Health:
       afterwards, which are queued where nothing will drain them — non-zero together, that is
       the ``shutdown()``-per-invocation mistake, and the remedy is :func:`flush`.
       ``incomplete_swaps`` counts late ``configure(sink=...)`` calls whose drain of the
-      previous sink could not be confirmed, leaving that sink open. ``sink`` is the configured
-      sink's own
+      previous sink could not be confirmed, leaving that sink open. ``closing_sinks`` is the
+      odd one out — a live gauge rather than a counter, reporting how many swapped-out sinks
+      are inside ``close()`` right now, so a destination stuck there is visible at all; it
+      falls back to zero on its own, and only a *persistently* non-zero reading is a fault.
+      ``sink`` is the configured sink's own
       :class:`~log_foundry.sinks.base.SinkLosses` — loss the sink absorbed rather than the
       worker (SPEC-026) — and is ``None`` when no worker exists or the sink reports nothing.
       Note ``sink`` describes whichever sink is live now, so a swap takes the previous sink's

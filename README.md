@@ -220,11 +220,22 @@ do not hand it back to a later call.
 
 The 5 s covers the **whole** call — both drains and the previous sink's `close()`. `Sink.close()`
 takes no timeout of its own (`KafkaSink.close()` flushes its producer, so an unreachable broker
-blocks it), so that close runs on its own thread and is joined for whatever is left of the budget.
-A hung `close()` therefore costs you the budget, once, and the close still runs to completion in
-the background rather than being abandoned — the thread is deliberately **not** a daemon. Nothing
-is reported when the join expires: a slow close is not a failed swap, and a counter that could not
-tell the two apart would be worse than no counter.
+blocks it), so that close runs on its own daemon thread and is joined for whatever is left of the
+budget. A hung `close()` therefore costs you the budget, once, and the close carries on in the
+background afterwards.
+
+Nothing is *reported* when that join expires — a slow close is not a failed swap, and a counter
+that could not tell the two apart would be worse than none. What you get instead is a live
+reading: `health().closing_sinks` is how many swapped-out sinks are inside `close()` at the moment
+you ask. Non-zero once is a swap in progress; non-zero every time you look is a destination that
+is not coming back, still holding its resources.
+
+The thread is a daemon deliberately, and this is the one place where that is the *safer* choice.
+CPython joins non-daemon threads **before** running `atexit`, so a non-daemon closer stuck in a
+hung `close()` would stop the exit drain from ever running — the live sink would never be drained
+or closed, and your own `atexit` handlers would not run either. As a daemon it lets `atexit` finish
+first: the sink still receiving events is closed properly, and only the sink already fenced out of
+the delivery path is abandoned.
 
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
 thread mid-swap may land on either sink.
@@ -768,6 +779,9 @@ if (
     ...  # logs were silently lost — worth an alert
 ```
 
+`closing_sinks` is deliberately not a term here: it is briefly non-zero during a perfectly healthy
+sink swap, so a single reading is not a fault. Watch it over time instead — see the table below.
+
 They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
@@ -779,6 +793,7 @@ They tell you different things, and they want different responses:
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
+| `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter, and the only field that falls as well as rises. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
 the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
@@ -806,8 +821,8 @@ means every log line since the shutdown has gone nowhere. That state used to rea
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus a sixth,
-seventh and eighth (`retired`, `submitted_after_shutdown`, `incomplete_swaps`) not yet in a tagged
+fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus four more
+(`retired`, `submitted_after_shutdown`, `incomplete_swaps`, `closing_sinks`) not yet in a tagged
 release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
 field keeps its position when a new one is appended, so attribute and index access stay stable.
 

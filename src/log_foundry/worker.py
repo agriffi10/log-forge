@@ -100,6 +100,14 @@ class Health(NamedTuple):
         call may have been carried to the new sink instead of the old one, and the old sink was
         left **open** rather than closed, because the drain thread may still be inside its
         ``emit`` — the reasoning SPEC-027 FR-004 applies to an expired ``shutdown()``.
+      closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
+        gauge, not a counter, and the only field here that can fall as well as rise. A close is
+        bounded only in how long ``configure()`` waits for it, so this is how a destination
+        stuck in ``close()`` becomes visible at all. Reading it non-zero once means a swap just
+        happened; reading it non-zero repeatedly means a close is not coming back, and that sink
+        still holds its resources. It is deliberately a live read rather than a count of expired
+        joins: a slow close and a stuck one are indistinguishable at the moment a join expires,
+        and SPEC-028 reverted a design that guessed.
     """
 
     queued: int
@@ -110,6 +118,7 @@ class Health(NamedTuple):
     retired: bool = False
     submitted_after_shutdown: int = 0
     incomplete_swaps: int = 0
+    closing_sinks: int = 0
 
 
 class _FlushMarker:
@@ -203,6 +212,7 @@ class Worker:
         self.stopped_reason: str | None = None
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
+        self._closers: list[threading.Thread] = []
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
@@ -337,6 +347,8 @@ class Worker:
             retired = self._shutdown_done
             submitted_after_shutdown = self.submitted_after_shutdown
             incomplete_swaps = self.incomplete_swaps
+            self._closers = [closer for closer in self._closers if closer.is_alive()]
+            closing_sinks = len(self._closers)
         return Health(
             queued=self._queue.qsize(),
             dropped=dropped,
@@ -346,6 +358,7 @@ class Worker:
             retired=retired,
             submitted_after_shutdown=submitted_after_shutdown,
             incomplete_swaps=incomplete_swaps,
+            closing_sinks=closing_sinks,
         )
 
     def _sink_losses(self) -> SinkLosses | None:
@@ -518,19 +531,21 @@ class Worker:
         (SPEC-028 FR-001), and why the sinks holding transport state take their lock in both.
 
         ``Sink.close`` takes no timeout, so the close is run on its own thread and joined for
-        what is left of the swap's budget. **The join decides who waits, and nothing else** —
-        an expired one reports nothing, moves no counter, and does not abandon the close. That
-        is what makes this safe where :meth:`_close_if_owed` is not: SPEC-028 reverted a threaded
-        close there because an expired join could not tell a slow-but-successful close from a
-        stuck one and reported a loss for closes that had in fact completed, and because at
-        interpreter exit its daemon was killed mid-``commit()``. Neither reaches this site — the
-        first because no signal is derived from the expiry, the second because the thread is
-        **not** a daemon, so the close always runs to completion in a process that is running.
+        what is left of the swap's budget. **An expired join decides only who waits** — it moves
+        no counter and writes no line, which is what dissolves SPEC-028's objection that an
+        expired join cannot tell a slow-but-successful close from a stuck one and so reports a
+        loss for closes that completed. What *is* observable is a live fact rather than an
+        inference: ``health().closing_sinks`` counts the closes running at the moment it is read.
 
-        The residual cost is that a ``close()`` which never returns holds a non-daemon thread and
-        delays interpreter exit (``architecture.md`` §13). That is strictly better than what it
-        replaces, where the same sink hung ``configure()`` itself and the application never
-        started.
+        The thread is a **daemon**, and the reasoning is the opposite of the reading that
+        SPEC-028's revert first suggests. A non-daemon thread was tried and is worse: CPython
+        joins non-daemon threads *before* running ``atexit``, so one hung close would stop the
+        exit drain from ever running and lose everything buffered in the **live** sink, along
+        with the application's own exit handlers. A daemon lets ``atexit`` finish first, so the
+        live sink is drained and closed, and only then is a still-running close abandoned. What
+        SPEC-028 refused to abandon was the sink the worker was *still delivering to*; this one
+        has been fenced out of the delivery path by two confirmed drains, so what is at risk is
+        its own cleanup and whatever it chose to buffer, never the events still arriving.
 
         It is deliberately not :meth:`_close_sink`, which answers a different question — that
         one closes the sink the worker still holds, exactly once, and only after the thread has
@@ -555,7 +570,7 @@ class Worker:
             target=self._close_detached,
             args=(sink,),
             name="log-foundry-sink-close",
-            daemon=False,
+            daemon=True,
         )
         try:
             closer.start()
@@ -566,6 +581,8 @@ class Worker:
                 "it is left open and may still hold its resources",
             )
             return
+        with self._lock:
+            self._closers.append(closer)
         closer.join(timeout)
 
     def _close_detached(self, sink: Sink) -> None:
