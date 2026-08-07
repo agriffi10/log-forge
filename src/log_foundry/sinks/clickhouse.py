@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
@@ -42,6 +40,12 @@ class ClickHouseSink:
     columns plus the full event as a ``String`` column, inserted in a single call per chunk. The
     sink is write-only, and the worst-case delay (SPEC-027 FR-005) is ``max_retries``
     interruptible waits per chunk, 0.7 s at the defaults.
+
+    The driver requirement satisfied (SPEC-028 FR-002): a ``clickhouse-connect`` client holds
+    per-session state across an insert and the project does not publish it as safe to share
+    between threads, so this sink serializes its use rather than assuming otherwise. A lock is
+    the conservative reading — one client per thread would be the alternative, and that is the
+    connection-pool design FR-002 puts out of scope.
     """
 
     def __init__(
@@ -81,6 +85,8 @@ class ClickHouseSink:
         self.stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False
+        self._lock = threading.Lock()
+        self._counter_lock = threading.Lock()
         self._owns_client = client is None
         if client is None:
             import clickhouse_connect  # type: ignore[import-not-found]
@@ -93,6 +99,9 @@ class ClickHouseSink:
     def losses(self) -> SinkLosses:
         """Reports rows in a chunk abandoned past the retry bound (SPEC-026 FR-002).
 
+        Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
+        never waits on an in-flight insert and its backoff.
+
         Args:
           None.
 
@@ -102,7 +111,8 @@ class ClickHouseSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts each chunk as one columnar call, retrying on failure (FR-002).
@@ -122,16 +132,18 @@ class ClickHouseSink:
         if not batch:
             return
         chunks = inserted = 0
-        for chunk in chunk_list(batch, self._chunk_size):
-            chunks += 1
-            inserted += self._insert([self._row(event) for event in chunk])
+        with self._lock:
+            for chunk in chunk_list(batch, self._chunk_size):
+                chunks += 1
+                inserted += self._insert([self._row(event) for event in chunk])
         if chunks and not inserted:
             raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
 
-        Idempotent.
+        Idempotent, and takes the emit lock so the client is never closed mid-insert
+        (SPEC-028 FR-002).
 
         Args:
           None.
@@ -142,11 +154,12 @@ class ClickHouseSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        if self._closed:
-            return
-        if self._owns_client:
-            self.client.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            if self._owns_client:
+                self.client.close()
+            self._closed = True
 
     def _row(self, event: dict[str, object]) -> list[object]:
         """Builds one row: the extracted columns, then the whole event as JSON.
@@ -182,7 +195,8 @@ class ClickHouseSink:
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += len(rows)
+                with self._counter_lock:
+                    self.failed += len(rows)
                 _diag.lost(
                     "row",
                     len(rows),

@@ -108,6 +108,7 @@ class SocketTransport:
         self._max_retries = max(max_retries, 0)
         self._sock: socket.socket | None = None
         self.failed = 0
+        self._counter_lock = threading.Lock()
         self.stop_signal: threading.Event | None = None
         self._lock = threading.Lock()
 
@@ -153,7 +154,8 @@ class SocketTransport:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).
@@ -205,7 +207,8 @@ class SocketTransport:
                 if attempt < self._max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 _diag.lost(
                     "message",
                     1,

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag
 from log_foundry.sinks.base import SinkLosses, read_losses
 
 if TYPE_CHECKING:
-    import threading
-
     from log_foundry.sinks.base import Sink
 
 __all__ = ["MultiSink"]
@@ -46,6 +45,7 @@ class MultiSink:
         """
         self._sinks = sinks
         self.failed = 0
+        self._counter_lock = threading.Lock()
         self._stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -77,7 +77,8 @@ class MultiSink:
             try:
                 sink.emit(batch)
             except Exception as err:
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 if first_error is None:
                     first_error = err
                 _diag.absorbed(
@@ -185,5 +186,6 @@ class MultiSink:
             try:
                 sink.close()
             except Exception as err:
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 _diag.absorbed("closing a MultiSink child", err, f"{type(sink).__name__} skipped")

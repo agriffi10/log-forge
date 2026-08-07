@@ -98,10 +98,11 @@ class ElasticsearchSink(HTTPSink):
         Raises:
           None.
         """
-        return SinkLosses(
-            dropped=self.dropped_oversized,
-            failed=self.failed + self.item_errors + self.dropped_unadjudicated,
-        )
+        with self._counter_lock:
+            return SinkLosses(
+                dropped=self.dropped_oversized,
+                failed=self.failed + self.item_errors + self.dropped_unadjudicated,
+            )
 
     def _parse_bulk_response(self, payload: bytes, sent: int) -> bool:
         """Counts rejected items and reports whether the response proves nothing was indexed.
@@ -139,7 +140,8 @@ class ElasticsearchSink(HTTPSink):
         items = usable_results(data.get("items"))
         errors = sum(1 for item in items if _has_error(item))
         if len(items) != sent or not errors:
-            self.dropped_unadjudicated += sent
+            with self._counter_lock:
+                self.dropped_unadjudicated += sent
             _diag.lost(
                 "event",
                 sent,
@@ -148,7 +150,8 @@ class ElasticsearchSink(HTTPSink):
                 f"not retried",
             )
             return False
-        self.item_errors += errors
+        with self._counter_lock:
+            self.item_errors += errors
         _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
         return errors == sent
 

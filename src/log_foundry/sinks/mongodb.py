@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
@@ -26,6 +24,13 @@ class MongoDBSink:
     document does not abort the rest of the batch, and the sink is write-only — querying is the
     downstream tool's job. The worst-case delay (SPEC-027 FR-005) is ``max_retries``
     interruptible waits per batch, 0.7 s at the defaults.
+
+    The driver requirement satisfied (SPEC-028 FR-002): ``pymongo``'s ``MongoClient`` is
+    thread-safe and owns a connection pool, so this sink deliberately takes **no** transport lock
+    — serializing it would funnel a driver built for concurrency through one caller at a time,
+    and FR-002 asks for correctness under concurrent calls, not for parallelism to be removed.
+    Only the loss counters are guarded, since those are the sink's own state rather than the
+    driver's.
 
     Attributes:
       failed: Documents the server rejected, or a whole batch abandoned past the retry bound.
@@ -70,9 +75,13 @@ class MongoDBSink:
         self.failed = 0
         self.dropped_oversized = 0
         self._closed = False
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and documents the server rejected or never took (FR-002).
+
+        Both fields are read under one lock so the pair comes from the same instant rather than
+        straddling a concurrent emit's increments (SPEC-028 FR-003).
 
         Args:
           None.
@@ -83,7 +92,8 @@ class MongoDBSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts every event unordered, counting bulk failures and retrying errors (FR-003).
@@ -116,7 +126,8 @@ class MongoDBSink:
                 details = getattr(err, "details", None)
                 if isinstance(details, dict) and "writeErrors" in details:
                     rejects = len(details["writeErrors"])
-                    self.failed += rejects
+                    with self._counter_lock:
+                        self.failed += rejects
                     total = rejects >= len(documents)
                     _diag.lost(
                         "document",
@@ -132,7 +143,8 @@ class MongoDBSink:
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += len(documents)
+                with self._counter_lock:
+                    self.failed += len(documents)
                 _diag.lost(
                     "document",
                     len(documents),
@@ -179,7 +191,8 @@ class MongoDBSink:
         documents: list[dict[str, object]] = []
         for event in batch:
             if len(json.dumps(event).encode("utf-8")) > _MAX_DOC_BYTES:
-                self.dropped_oversized += 1
+                with self._counter_lock:
+                    self.dropped_oversized += 1
                 _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
                 continue
             documents.append(dict(event))

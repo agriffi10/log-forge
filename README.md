@@ -633,7 +633,16 @@ in `CallbackSink`.
 #### Writing your own sink
 
 `Sink` is two required methods, `emit(batch)` and `close()`, plus two rules about *how* `emit`
-fails. They are not stylistic — the library's whole loss-reporting apparatus is built on them:
+fails and one about *when* it is called. They are not stylistic — the library's whole
+loss-reporting apparatus is built on them:
+
+- **Tolerate concurrent calls.** `emit` may run on more than one thread at once, and `close` may
+  be called while an `emit` is in flight. The worker drains on its own thread, but a level call
+  made with no active span emits synchronously on the *caller's* thread — which is any thread of
+  your application. If your sink holds mutable transport state (a stream it rebinds, a socket it
+  reuses, a connection with transaction scope), guard it with a `threading.Lock` held for the
+  whole operation that assumes exclusivity. If it holds none, you need do nothing. The library
+  cannot serialize this for you: it does not own the calling thread.
 
 - **Raise when you delivered none of the batch**, after your own retries are spent. That is the
   signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
@@ -649,29 +658,38 @@ never engages, `failed_batches` stays at zero, and `flush()` returns `True` whil
 lost.
 
 Optionally add `losses()` to report what you absorbed. It must never raise and must be safe to call
-while `emit` is running (`health()` is a poll):
+while `emit` is running (`health()` is a poll) — which means the counters need their own lock, kept
+separate from the transport one so a poll never waits on an in-flight send:
 
 ```python
+import threading
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 class MySink:
     def __init__(self) -> None:
         self._dropped = self._failed = 0
+        self._lock = threading.Lock()          # transport state
+        self._counter_lock = threading.Lock()  # counters only, never held across I/O
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         delivered = 0
-        for chunk in self._chunks(batch):
-            if self._send(chunk):          # your own bounded retry
-                delivered += len(chunk)
-            else:
-                self._failed += len(chunk)
+        with self._lock:                       # your connection, socket or stream
+            for chunk in self._chunks(batch):
+                if self._send(chunk):          # your own bounded retry
+                    delivered += len(chunk)
+                else:
+                    with self._counter_lock:   # transport -> counter, never the reverse
+                        self._failed += len(chunk)
         if batch and not delivered:
             raise SinkDeliveryError(f"MySink delivered none of {len(batch)} event(s)")
 
     def losses(self) -> SinkLosses:
-        return SinkLosses(dropped=self._dropped, failed=self._failed)
+        with self._counter_lock:               # both fields from one instant
+            return SinkLosses(dropped=self._dropped, failed=self._failed)
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        with self._lock:                       # never release under an active writer
+            ...
 ```
 
 `losses()` is optional and probed by name, so a sink written before it existed keeps working and

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
@@ -69,6 +67,7 @@ class AzureEventHubsSink:
         self.stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and events in a batch abandoned past the bound (FR-002).
@@ -82,7 +81,8 @@ class AzureEventHubsSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Packs events into batches within the size limit and sends each (FR-009).
@@ -118,7 +118,8 @@ class AzureEventHubsSink:
                 delivered += self._send(current)
             current = self.producer.create_batch()
             if not _try_add(current, data):
-                self.dropped_oversized += 1
+                with self._counter_lock:
+                    self.dropped_oversized += 1
                 _diag.lost("event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch")
         if len(current) > 0:
             attempted += 1
@@ -167,7 +168,8 @@ class AzureEventHubsSink:
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += len(event_batch)
+                with self._counter_lock:
+                    self.failed += len(event_batch)
                 _diag.lost(
                     "event",
                     len(event_batch),

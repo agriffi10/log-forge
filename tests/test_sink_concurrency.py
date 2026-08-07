@@ -8,6 +8,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import Self
 
 import pytest
 
@@ -336,3 +337,210 @@ def test_the_orphan_path_and_the_worker_emit_into_one_sink_concurrently(
     orphans = [json.loads(line) for line in lines]
     assert len(orphans) == len(lines), "a line was spliced and no longer parses"
     assert sum(1 for e in orphans if e["message"] == "orphan") == THREADS * PER_THREAD
+
+
+class CountingLock:
+    """A real lock that counts acquisitions, so a test can prove a counter is guarded.
+
+    The exact-count assertion these tests also make does **not** distinguish a guarded counter
+    from an unguarded one: `+=` on an attribute is formally a read-modify-write and Python
+    promises no atomicity, but on a GIL build it was measured losing nothing across 1.6M
+    concurrent increments, so a race-reproduction test cannot be written for the interpreters CI
+    runs. What *is* deterministic is whether the increment happens inside the critical section,
+    which is what the acquisition count shows — and it is the property that keeps holding when
+    the GIL is not there to help (SPEC-028 FR-003).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._meta = threading.Lock()
+        self.acquisitions = 0
+
+    def __enter__(self) -> Self:
+        self._lock.acquire()
+        with self._meta:
+            self.acquisitions += 1
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self._lock.release()
+        return False
+
+
+class AlwaysFailingSink:
+    """A child sink whose every ``emit`` raises, so ``MultiSink.failed`` moves once per call."""
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        raise RuntimeError("down")
+
+    def close(self) -> None:
+        pass
+
+
+class ExclusiveConnection:
+    """A fake driver connection that reports any overlap between two threads' sequences.
+
+    A real `psycopg` connection carries one transaction, so an interleaved
+    ``cursor``/``commit`` pair from another thread commits or rolls back work that is not its
+    own. This double cannot corrupt anything, so it records the overlap instead — which is the
+    property under test rather than its consequence.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._inside = 0
+        self.overlaps = 0
+        self.commits = 0
+
+    def _enter(self) -> None:
+        with self._guard:
+            self._inside += 1
+            if self._inside > 1:
+                self.overlaps += 1
+
+    def _leave(self) -> None:
+        with self._guard:
+            self._inside -= 1
+
+    def cursor(self):
+        connection = self
+
+        class _Cursor:
+            def __enter__(self):
+                connection._enter()
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                connection._leave()
+                return False
+
+            def executemany(self, sql: str, rows: list) -> None:
+                time.sleep(0)
+
+            def execute(self, sql: str, params: object = None) -> None:
+                pass
+
+        return _Cursor()
+
+    def commit(self) -> None:
+        with self._guard:
+            self.commits += 1
+
+    def rollback(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_multi_sink_counts_every_child_failure_under_concurrent_emitters() -> None:
+    """``MultiSink.failed`` loses no increment when several threads emit at once.
+
+    ``self.failed += 1`` is a read-modify-write, so unlocked it undercounts — and SPEC-026 made
+    this one of the numbers an operator alerts on, where an undercount is a missed alert.
+
+    On the exactness of the count: it holds on a GIL build whether or not the increment is
+    guarded, so the assertion below is a regression guard rather than a reproduction of the
+    race. See :class:`CountingLock` for what actually distinguishes the two.
+    """
+    from log_foundry.sinks.multi import MultiSink
+
+    children = 2
+    sink = MultiSink(*[AlwaysFailingSink() for _ in range(children)])
+    lock = CountingLock()
+    sink._counter_lock = lock
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+
+    assert len(errors) == THREADS * PER_THREAD, "every emit should have raised: all children down"
+    assert sink.failed == THREADS * PER_THREAD * children
+    assert lock.acquisitions == sink.failed, "an increment ran outside the counter lock"
+
+
+def test_sqs_sink_counts_every_oversized_drop_under_concurrent_emitters() -> None:
+    """``dropped_oversized`` and the ``losses()`` pair are guarded under concurrent emitters.
+
+    ``MAX_BYTES`` is lowered rather than building 256 KB payloads: the counter is what is under
+    test, not the threshold. The ``losses()`` call adds one acquisition on top of the drops,
+    which is the pair read taken under the same lock.
+    """
+    sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
+
+    class NeverCalledClient:
+        def send_message_batch(self, **kwargs: object) -> dict:
+            raise AssertionError("every event should have been dropped as oversized")
+
+    sink = sqs_mod.SQSSink(queue_url="https://example/q", client=NeverCalledClient())
+    sink.MAX_BYTES = 50
+    lock = CountingLock()
+    sink._counter_lock = lock
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+
+    assert errors == []
+    assert sink.dropped_oversized == THREADS * PER_THREAD
+    assert lock.acquisitions == sink.dropped_oversized, "a drop was counted outside the lock"
+    assert sink.losses() == (THREADS * PER_THREAD, 0)
+    assert lock.acquisitions == sink.dropped_oversized + 1, "losses() read outside the lock"
+
+
+def test_postgres_transaction_is_not_interleaved_by_a_concurrent_emit() -> None:
+    """One thread's ``cursor``/``commit`` sequence completes before another's begins."""
+    from log_foundry.sinks.postgres import PostgresSink
+
+    connection = ExclusiveConnection()
+    sink = PostgresSink("events", connection=connection)
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+
+    assert errors == []
+    assert connection.overlaps == 0, f"{connection.overlaps} interleaved transactions"
+    assert connection.commits == THREADS * PER_THREAD
+
+
+def test_losses_does_not_block_behind_an_in_flight_emit(tmp_path: Path) -> None:
+    """A ``health()`` poll reads the counters while an emit is parked inside the sink.
+
+    This is the two-lock decision under test (SPEC-028 FR-003). Counters guarded by the *emit*
+    lock — which is what the spec originally called for — would make this call wait for the
+    insert and its retry backoff to finish, and ``health()`` is precisely the call an operator
+    makes when a destination is already hanging.
+    """
+    from log_foundry.sinks.postgres import PostgresSink
+
+    parked = threading.Event()
+    may_finish = threading.Event()
+
+    class ParkingConnection(ExclusiveConnection):
+        def commit(self) -> None:
+            parked.set()
+            may_finish.wait(timeout=10)
+            super().commit()
+
+    sink = PostgresSink("events", connection=ParkingConnection())
+    emitter = threading.Thread(target=lambda: sink.emit([event(0, 0)]))
+    emitter.start()
+    assert parked.wait(timeout=10), "the emitting thread never reached the parked commit"
+
+    read = threading.Thread(target=sink.losses)
+    read.start()
+    read.join(timeout=5)
+    blocked = read.is_alive()
+
+    may_finish.set()
+    emitter.join(timeout=10)
+    read.join(timeout=5)
+
+    assert not blocked, "losses() blocked behind an in-flight emit"

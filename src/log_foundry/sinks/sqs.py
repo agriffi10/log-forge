@@ -8,15 +8,13 @@ failure would trade log delivery for ordering the consumer can rebuild from ``ti
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-
-if TYPE_CHECKING:
-    import threading
 
 __all__ = ["SQSSink"]
 
@@ -141,6 +139,7 @@ class SQSSink:
         self.message_deduplication_id = message_deduplication_id
         self.dropped_oversized = 0
         self.failed = 0
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and entries still failing past the retry bound (FR-002).
@@ -156,7 +155,8 @@ class SQSSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks the batch to SQS limits and sends each chunk (FR-001, FR-002).
@@ -286,7 +286,8 @@ class SQSSink:
                 dedup_id = self._dedup_id(event)
                 size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if size > self.MAX_BYTES:
-                self.dropped_oversized += 1
+                with self._counter_lock:
+                    self.dropped_oversized += 1
                 _diag.lost(
                     "event",
                     1,
@@ -350,7 +351,8 @@ class SQSSink:
                 return accepted, False
             sender_faults = [item for item in failed if item.get("SenderFault")]
             if sender_faults:
-                self.failed += len(sender_faults)
+                with self._counter_lock:
+                    self.failed += len(sender_faults)
                 _diag.lost(
                     "message",
                     len(sender_faults),
@@ -365,7 +367,8 @@ class SQSSink:
             if attempt < self.max_retries:
                 wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
-                self.failed += len(entries)
+                with self._counter_lock:
+                    self.failed += len(entries)
                 _diag.lost(
                     "message",
                     len(entries),

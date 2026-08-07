@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
@@ -50,6 +48,7 @@ class _RedisSink:
         self.max_retries = max(max_retries, 0)
         self.stop_signal: threading.Event | None = None
         self.failed = 0
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports events abandoned past the retry bound (SPEC-026 FR-002).
@@ -63,7 +62,8 @@ class _RedisSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Pipelines the whole batch into one round trip, retrying on error (FR-005).
@@ -93,7 +93,8 @@ class _RedisSink:
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += len(batch)
+                with self._counter_lock:
+                    self.failed += len(batch)
                 _diag.lost(
                     "event",
                     len(batch),

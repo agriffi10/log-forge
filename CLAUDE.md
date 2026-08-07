@@ -188,10 +188,17 @@ thread that delivers anything, so a sink's backoff was a global pause on log del
 wait now goes through `sinks/_retry.py` and is cut short by a shutdown, `SQSSink` gained the backoff
 it alone lacked, and `shutdown()` takes a timeout.
 
-**SPEC-028, 030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
+**SPEC-028 (the sink concurrency contract) is Completed** — sinks were built for one caller and
+`file.py`/`sqlite.py` said so, but the orphan path has emitted on the *caller's* thread since
+SPEC-002, against the sink the worker is draining into, and `base.py` stated no contract at all.
+`emit`/`close` now document that concurrency, the sinks holding transport state take a lock, and
+every loss counter takes a second one. Unlocked `SQLiteSink` turned out to kill the interpreter
+(bus error), not lose rows.
+
+**SPEC-030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
 validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
 throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
-Arcs; **SPEC-028** is next.
+Arcs; **SPEC-030** is next.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
@@ -391,6 +398,24 @@ where it starts.
   `emit`, and a leaked resource in an exiting process beats a corrupt write. It reports through
   `stopped_reason` (`"ShutdownTimeout"`) rather than a new field, extending SPEC-019's vocabulary
   as that spec intended. (SPEC-027, arch §9)
+- **A sink tolerates concurrent callers; the library cannot serialize them for it** — the worker
+  drains on one thread, but a level call with no active span emits on the *caller's* thread, so
+  `emit`/`close` are called concurrently against one sink object and `sinks/base.py` states that as
+  a requirement on implementations. It cannot be a promise: the library does not own that thread.
+  The lock is held for the **whole** operation assuming exclusivity, `threading.Lock` not `RLock`
+  (a sink re-entering its own `emit` is a bug an `RLock` would hide), and `close()` takes it too, so
+  it waits rather than releasing under a writer. Per driver, not per family: Postgres locks (one
+  connection, one transaction), ClickHouse locks (per-session state, not published as shareable),
+  **Mongo does not** (`pymongo` is thread-safe with its own pool, and the goal is correctness under
+  concurrency, not the removal of parallelism) — each says which requirement it satisfies, Mongo
+  included, or its bare emit reads as an oversight. Counters take a **second, dedicated** lock,
+  ordered transport → counter: sharing one would make `health()` block behind an in-flight insert
+  and its backoff, contradicting SPEC-026's "safe to call during an emit". The accepted cost is that
+  an orphan log can now wait on the lock (arch §13) — bounded by SPEC-027, and the alternative is
+  measured: unlocked `SQLiteSink` does not lose rows, it kills the interpreter with a bus error.
+  The counter race itself is **not reproducible under the GIL** (1.6M concurrent increments, zero
+  lost), so the tests assert the increment happens *inside* the lock rather than reproducing a loss
+  — the property that survives free-threading. (SPEC-028, arch §9, §13)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
