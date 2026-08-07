@@ -979,7 +979,7 @@ def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     finally:
         api._ensure_sink = original  # type: ignore[assignment]
 
-    assert decorator._orphan_close_owed is False
+    assert decorator._orphan_sink is None
 
 
 def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:

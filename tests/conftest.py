@@ -92,10 +92,16 @@ def _reset_worker() -> None:
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
     ``_orphan_retired`` is what ``health()`` synthesizes when there is no worker, so a test
     that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
-    ``_orphan_close_owed`` would make "nothing was ever logged, so nothing is closed"
+    ``_orphan_sink`` would make "nothing was ever logged, so nothing is closed"
     untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
     handler really is registered for the life of the interpreter, and re-arming the flag would
     have the next worker register a second one.
+
+    SPEC-033 adds three more. ``_orphan_stop`` is replaced rather than cleared, since an
+    ``Event`` cannot be un-set and a test that called ``shutdown()`` would otherwise leave every
+    later test's sink backing off not at all. ``_lifecycle._closers`` is now process-global, so a
+    hung closer from one test — the capped-grace tests create them deliberately — would
+    otherwise leak a non-zero ``closing_sinks`` into the next.
     """
     try:
         from log_foundry import decorator
@@ -105,9 +111,19 @@ def _reset_worker() -> None:
     if worker is not None:
         worker.shutdown()
         decorator._worker = None
-    for flag in ("_orphan_close_owed", "_orphan_sink_closed", "_orphan_retired"):
+    for flag in ("_orphan_sink", "_orphan_closed_sink"):
         if hasattr(decorator, flag):
-            setattr(decorator, flag, False)
+            setattr(decorator, flag, None)
+    if hasattr(decorator, "_orphan_retired"):
+        decorator._orphan_retired = False
+    if hasattr(decorator, "_orphan_stop"):
+        decorator._orphan_stop = threading.Event()
+    try:
+        from log_foundry import _lifecycle
+    except ImportError:
+        return
+    with _lifecycle._closers_lock:
+        _lifecycle._closers.clear()
 
 
 class FakeSink:

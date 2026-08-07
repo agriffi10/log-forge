@@ -77,14 +77,22 @@ def configure(
     assigned, so a rejected call leaves the config exactly as it found it.
 
     A ``sink=`` passed after logging has already started is the one argument that needs more
-    than an assignment, because the background worker captured its sink when it was built
-    (arch §7). It **swaps the live delivery target**: everything submitted so far is drained to
-    the previous sink, that sink is closed, and subsequent events go to the new one. The drains
-    are bounded, and a swap whose drain could not be confirmed leaves the previous sink open and
-    records ``health().incomplete_swaps`` (SPEC-030 FR-003) — so "repeated calls compose rather
-    than reset" holds for the sink too, at the cost of one bounded wait. Passing the sink that
-    is already live is a no-op: no drain, no close. The previous sink is closed and must not be
-    handed back to a later call.
+    than an assignment, because whatever is delivering captured its sink before the call
+    (arch §7). It **swaps the live delivery target**: the previous sink is closed and subsequent
+    events go to the new one, so "repeated calls compose rather than reset" holds for the sink
+    too, at the cost of one bounded wait. Passing the sink that is already live is a no-op: no
+    drain, no close. The previous sink is closed and must not be handed back to a later call —
+    doing so closes it twice.
+
+    **What the swap promises differs by delivery path**, because the two have different work to
+    do. With a background worker — anything using ``@trace`` — everything submitted so far is
+    drained to the previous sink before it is closed, and a drain that could not be confirmed
+    leaves that sink open and records ``health().incomplete_swaps`` (SPEC-030 FR-003). A process
+    that has only ever logged outside a span has no worker and nothing buffered: those events
+    were emitted synchronously and have already returned, so the handoff is the close alone
+    (SPEC-033 FR-002). There is no drain to confirm there and ``incomplete_swaps`` stays at zero
+    by design; the close is still bounded, and ``health().closing_sinks`` still reports one that
+    has not come back.
 
     The bound covers the whole call, the close included. ``Sink.close`` takes no timeout, so that
     close runs on its own daemon thread and is joined for what is left of the budget: a

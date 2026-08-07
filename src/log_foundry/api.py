@@ -89,7 +89,7 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             )
             event = build_event(orphan, level, message, fields=fields, baggage=baggage)
             sink = _ensure_sink()
-            _note_orphan_emit()
+            _note_orphan_emit(sink)
             sink.emit([event])
         except Exception as exc:
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")

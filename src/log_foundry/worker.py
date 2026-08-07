@@ -7,7 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from log_foundry import _diag
+from log_foundry import _diag, _lifecycle
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -25,15 +25,6 @@ and an unbounded join there is a hung process.
 """
 
 _DROP_WARN_EVERY = 1000
-
-DEFAULT_CLOSER_GRACE = 2.0
-"""Seconds :meth:`Worker.shutdown` gives an outstanding swapped-out close to finish.
-
-Deliberately much smaller than the shutdown budget it is carved from. This is a last chance for
-a close that is *nearly* done, not a second full attempt: it already had the swap's whole budget
-(``DEFAULT_SWAP_TIMEOUT``) before ``shutdown`` was ever called, so one still running here is far
-more likely stuck than slow, and every second spent on it is a second the process does not exit.
-"""
 
 DEFAULT_SWAP_TIMEOUT = 5.0
 """Seconds a late ``configure(sink=...)`` will spend draining the previous sink (FR-003).
@@ -114,6 +105,12 @@ class Health(NamedTuple):
         call may have been carried to the new sink instead of the old one, and the old sink was
         left **open** rather than closed, because the drain thread may still be inside its
         ``emit`` — the reasoning SPEC-027 FR-004 applies to an expired ``shutdown()``.
+        It describes the **worker's drain** and nothing else. A swap on the orphan path has no
+        queue and no drain, so there is nothing to confirm and this stays zero there (SPEC-033
+        FR-006); an expired *close* join reports nothing on either path, by the decision that
+        made the bounded close available at all. A non-zero value therefore always means events
+        may have been misrouted, never merely that a close was slow — ``closing_sinks`` is the
+        field for that.
       closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
         gauge, not a counter, and the only field here that can fall as well as rise. A close is
         bounded only in how long ``configure()`` waits for it, so this is how a destination
@@ -226,7 +223,6 @@ class Worker:
         self.stopped_reason: str | None = None
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
-        self._closers: list[threading.Thread] = []
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
@@ -258,13 +254,7 @@ class Worker:
             ``__setattr__`` objects, loses interruptibility rather than preventing the worker
             from starting.
         """
-        try:
-            if hasattr(self.sink, "stop_signal"):
-                self.sink.stop_signal = self._stop
-        except Exception as exc:
-            _diag.absorbed(
-                "handing the sink its stop signal", exc, "its backoff stays uninterruptible"
-            )
+        _lifecycle.offer_stop_signal(self.sink, self._stop)
 
     def submit(self, events: list[dict[str, object]]) -> None:
         """Hands a finished span's events to the worker, without blocking.
@@ -337,6 +327,30 @@ class Worker:
                 "flush() in a process that logs again. Count is cumulative",
             )
 
+    @property
+    def retired(self) -> bool:
+        """Whether :meth:`shutdown` has begun, so this worker will deliver nothing further.
+
+        A retired worker still *holds* its sink — ``self.sink`` never changes again, because
+        :meth:`swap_sink` returns early once shut down — so "a worker exists" and "a worker is
+        still delivering" stop being the same question, and callers deciding who owns a sink's
+        close need the second one (SPEC-033 FR-002). Read without the lock, as ``submit``'s check
+        is: the flag is written once and never cleared, so a racing reader sees one of two
+        answers and both are momentarily true.
+
+        Args:
+          None.
+
+        Returns:
+          Whether shutdown has begun. ``True`` for an expired shutdown too, which is why
+          ``_close_orphan_sink`` deliberately does *not* use this — there the drain thread may
+          still be inside the sink's ``emit``.
+
+        Raises:
+          None.
+        """
+        return self._shutdown_done
+
     def health(self) -> Health:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
 
@@ -365,8 +379,6 @@ class Worker:
             retired = self._shutdown_done
             submitted_after_shutdown = self.submitted_after_shutdown
             incomplete_swaps = self.incomplete_swaps
-            self._closers = [closer for closer in self._closers if closer.is_alive()]
-            closing_sinks = len(self._closers)
         return Health(
             queued=self._queue.qsize(),
             dropped=dropped,
@@ -376,7 +388,7 @@ class Worker:
             retired=retired,
             submitted_after_shutdown=submitted_after_shutdown,
             incomplete_swaps=incomplete_swaps,
-            closing_sinks=closing_sinks,
+            closing_sinks=_lifecycle.closing_count(),
         )
 
     def _sink_losses(self) -> SinkLosses | None:
@@ -606,47 +618,9 @@ class Worker:
             wait this method exists to remove, in the one situation where the process is
             already under resource pressure.
         """
-        closer = threading.Thread(
-            target=self._close_detached,
-            args=(sink,),
-            name="log-foundry-sink-close",
-            daemon=True,
-        )
-        try:
-            closer.start()
-        except Exception as exc:
-            _diag.absorbed(
-                "starting the thread that closes a swapped-out sink",
-                exc,
-                "it is left open and may still hold its resources",
-            )
-            return
-        with self._lock:
-            self._closers = [old for old in self._closers if old.is_alive()]
-            self._closers.append(closer)
-        closer.join(timeout)
-
-    def _close_detached(self, sink: Sink) -> None:
-        """Closes a swapped-out sink on its own thread, absorbing a failure.
-
-        The guard is what makes the thread safe to leave unattended: an exception escaping here
-        would reach CPython's thread bootstrap, which prints a full traceback carrying the
-        exception's message — the user data arch §6 keeps out of anything the library says about
-        itself, and the reason :meth:`shutdown` guards its own close.
-
-        Args:
-          sink: The sink to close.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        try:
-            sink.close()
-        except Exception as exc:
-            _diag.absorbed("closing a swapped-out sink", exc, "it may still hold its resources")
+        closer = _lifecycle.close_detached(sink)
+        if closer is not None:
+            closer.join(timeout)
 
     def shutdown(self, timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         """Stops the thread, drains and emits everything queued, then closes the sink.
@@ -784,13 +758,7 @@ class Worker:
           None. A join on a thread that has already finished is a no-op, and one that has not
             is abandoned at the deadline — which is the daemon's contract, not a failure.
         """
-        with self._lock:
-            closers = [closer for closer in self._closers if closer.is_alive()]
-            self._closers = closers
-        grace = DEFAULT_CLOSER_GRACE if timeout is None else min(timeout, DEFAULT_CLOSER_GRACE)
-        deadline = time.monotonic() + grace
-        for closer in closers:
-            closer.join(max(0.0, deadline - time.monotonic()))
+        _lifecycle.join_closers(timeout)
 
     def _close_if_owed(self) -> None:
         """Closes the sink exactly once, and only once the drain thread has ended.

@@ -1,7 +1,7 @@
 # Spec: Orphan-Path Sink Handoff
 
 **ID:** SPEC-033  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-07  
 **Depends On:** SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031
 

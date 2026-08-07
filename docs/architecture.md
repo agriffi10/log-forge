@@ -305,12 +305,30 @@ does **not** cancel the swap — the caller asked for the
 new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
 left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
 leaked resource in a running process beats a close raced against a write. Passing the sink already
-live is a no-op. After `shutdown()` nothing is swapped: the worker is retired, so the config is
-updated and the retirement signals (§9) continue to apply.
+live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
+updated and the retirement signals (§9) continue to apply — but the sink adopted by that call is
+still delivered to and is closed by the orphan path below, since a retired worker owns nothing
+further.
+
+**The swap covers both delivery paths, but only the *close* is shared** (SPEC-033 FR-002). A
+process that has only ever logged outside a span builds no worker, and steps 1–3 above have
+nothing to do there: those events were emitted synchronously on the caller's thread and returned
+before `configure()` was entered, so there is no queue to drain and no drain thread to fence out.
+What remains is step 4, on the same terms — the same daemon closer, the same shared budget, the
+same `closing_sinks` gauge, and the same refusal to derive anything from an expired join. The
+consequence is that `incomplete_swaps` stays at zero on that path *by design*: it records a drain
+that could not be confirmed, and there is no drain. Which sink to close comes from the identity
+the orphan emitter recorded, not from the config, which by then names the new one; that record is
+re-pointed at the new sink rather than cleared, so a process that swaps and then exits without
+logging again still closes what it swapped to. The one writer neither path can fence out is an
+orphan emitter on another application thread, which is why `sinks/base.py` requires `close()` to
+tolerate a concurrent `emit` (§9, SPEC-028).
 
 `configure()` remains a startup call and is not thread-safe. A span finishing on another thread
 during a swap may land on either sink; what is guaranteed is that everything submitted *before* the
-call reached the old one.
+call reached the old one. The `_worker` read that selects between the two paths *is* taken under
+the process lock, because it decides whether this call may close a sink at all — unlocked, a first
+`@trace` mid-construction on another thread would have its sink closed underneath it.
 
 ---
 
@@ -425,6 +443,19 @@ decorated call ends
   destination, not an instruction the application must obey); and `shutdown()` itself takes a
   timeout, because a sink blocked *in* a network call can still hold the thread. Each retrying
   sink's docstring states its worst-case total delay.
+
+  **The signal reaches a sink with no worker too** (SPEC-033 FR-004). `Worker._offer_stop_signal`
+  was the only caller, so an orphan-only process handed its sink nothing and the guarantee above
+  was simply false there — a backoff on an application thread ran to completion through
+  `shutdown()` and interpreter exit, and the inline close at exit could sit behind it via the
+  emit lock. The orphan path now offers its own event, skipped only for a sink a **live worker
+  owns**: overwriting the worker's event there would leave its drain thread serving a full
+  backoff across the join, which is the pause this rule exists to remove, while skipping merely
+  because a worker *exists* would strand a sink adopted after that worker retired. The event is
+  replaced with a fresh one whenever it is already set — an `Event` never clears, and a sink
+  still holding the shutdown's event has every subsequent backoff collapse to zero, which
+  against a rate-limited destination is a tight retry loop. The contract is "cut short *by a
+  shutdown*", not "never wait again".
 - **"Retries with backoff on failure" means: on a failure the sink reports.** The worker can
   only retry what reaches it as an exception, so the guarantee is conditional on §8's
   raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no
@@ -617,11 +648,59 @@ constraint — never by being deleted quietly.
   this path: SPEC-030 defines it as a submission queued where nothing will drain it, and a later
   orphan log is refused at a closed sink and announced, which is not the same claim.
 
-  **One variant is not fixed and needs its own home:** `configure(sink=A)` → `info()` →
-  `configure(sink=B)` → `info()` leaves **A** unclosed with `incomplete_swaps` at zero, because
-  `_swap_sink` returns early on a null worker. That early return is correct on its own terms — a
-  process with no worker has captured no sink to swap — but it means the orphan path's sink
-  handoff is unmanaged. Measured; recorded by SPEC-031 as explicitly out of its scope.
+  ~~**One variant is not fixed and needs its own home:**~~ — **closed by SPEC-033.** What it was:
+  `configure(sink=A)` → `info()` → `configure(sink=B)` → `info()` left **A** unclosed with
+  `incomplete_swaps` at zero, because `_swap_sink` returned early on a null worker. That early
+  return was correct on its own terms — a process with no worker has captured no sink to *swap* —
+  but it was the whole function for that path, so the handoff was unmanaged.
+
+  What the fix is. The orphan path records the sink **object** an emit reached rather than a
+  boolean saying one did: `configure()` assigns `_config.sink` before it calls the swap, so by
+  the time anything could close the previous sink the config no longer names it. The record is
+  **re-pointed** at the new sink rather than cleared — clearing leaves nothing armed until the
+  next orphan emit, so a process that swaps and exits without logging again leaks the *new* sink,
+  which is a case the boolean got right; re-pointing is also what the worker path does, since
+  `Worker.shutdown` closes `self.sink` whether or not anything reached it since the swap. There
+  is no drain and no fence: orphan emits are synchronous and have returned, and the one writer a
+  fence could not exclude is the same one `Worker._close_swapped_out` documents itself as not
+  covering, which is why `sinks/base.py` requires `close()` to tolerate a concurrent `emit`.
+
+  Two things came with it that the same boolean had been hiding, both found by review of the
+  spec rather than by the audit. `_orphan_sink_closed` made the close once per **process**, so a
+  sink configured after `shutdown()` was closed by nothing at all — measured losing a
+  locally-buffering sink's whole batch while `health()` read `retired=True`,
+  `submitted_after_shutdown=0`, `failed_batches=0`, since SPEC-030's pair needs a worker to count
+  a submission. The latch is now the closed sink's identity, so the rule is once per *sink*. And
+  an orphan-only process never received a SPEC-027 stop signal — `Worker._offer_stop_signal` was
+  the only caller — so "a shutdown cuts a backoff short" was false on this path.
+
+  Two guards are keyed on **ownership** rather than on a worker existing, and the distinction is
+  load-bearing: `Worker.swap_sink` returns early once `_shutdown_done`, so a retired worker keeps
+  its old sink forever while every orphan event goes to a newly configured one. `_worker.sink is
+  owed` still declines on an *expired* shutdown, which is what the original guard existed for.
+  `incomplete_swaps` is untouched throughout — it records a drain that could not be confirmed,
+  and there is no drain here.
+
+- **A sink handed back after being swapped out is closed twice, on both paths.** The orphan
+  path's closed-sink latch (SPEC-033) is a **single slot**, so it is the latch *moving* to a
+  second sink that re-admits the first: `configure(A)` → `info()` → `configure(B)` →
+  `configure(A)` closes A again. The **worker path behaves identically** — measured
+  `A.closes=2, B.closes=1` — and `configure()`'s own docstring already says the previous sink
+  "must not be handed back to a later call", so this is a documented user error rather than a
+  divergence. `sinks/base.py` requires `close()` to be idempotent, which is what makes it
+  tolerable. Tracking every sink ever closed would pin them all against garbage collection to fix
+  what the sibling path does not fix either.
+
+  Two further shapes need a concurrent emit during `configure()`, which that call's documented
+  "not thread-safe" already covers, and are recorded because the single slot is what permits
+  them. An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the
+  latch on B, re-arms A, and orphans the live sink. And an emit that resolved the old sink and
+  arrives after the *worker* branch cleared the record re-arms it, so `Worker.swap_sink` closes
+  that sink and the ownership guard — finding `_worker.sink` is now the new one — closes it
+  again at exit. That one is **measured** (`A.closed == 2`, with a preemption point injected at
+  `_ensure_sink`) and is **pre-existing**: it reproduces identically before SPEC-033, because the
+  worker branch has never recorded a closed sink. The orphan branch's equivalent *is* closed, by
+  `_orphan_closed_sink`, and a test pins it.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
