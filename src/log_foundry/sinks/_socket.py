@@ -61,12 +61,17 @@ def _make_udp(host: str) -> socket.socket:
       OSError: If the host resolves to nothing, or the socket cannot be created. Both reach
         ``_send_one``'s handler, which counts and announces rather than raising — a
         ``gaierror`` is an ``OSError``, so an unresolvable host fails exactly as an
-        unreachable one already did.
+        unreachable one already did. The empty-result case is raised as one explicitly: CPython
+        raises rather than returning ``[]``, but indexing it would produce an ``IndexError``,
+        which is *not* an ``OSError`` and would escape that handler into the caller — the one
+        thing SPEC-025 says this library may never do.
     """
-    resolved = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
-    families = [entry[0] for entry in resolved]
-    family = socket.AF_INET if socket.AF_INET in families else families[0]
-    return socket.socket(family, socket.SOCK_DGRAM)
+    families = [entry[0] for entry in socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)]
+    if not families:
+        raise socket.gaierror(socket.EAI_NONAME, "resolution returned no address family")
+    return socket.socket(
+        socket.AF_INET if socket.AF_INET in families else families[0], socket.SOCK_DGRAM
+    )
 
 
 class SocketTransport:

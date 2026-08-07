@@ -89,23 +89,51 @@ def test_make_udp_picks_the_family_the_host_resolves_to() -> None:
         v4.close()
 
 
-def test_a_dual_stack_hostname_still_goes_to_ipv4() -> None:
-    """AC-2. ``getaddrinfo`` sorts AAAA first, so the obvious ``[0]`` moves the destination.
+def _dual_stack_localhost() -> set[int]:
+    """The families ``localhost`` resolves to here, skipping when it offers no IPv4."""
+    import socket as socket_lib
 
-    Every deployment of this library has sent UDP over IPv4, and a collector bound to
-    ``0.0.0.0:514`` is the common one. Taking the first result would route a dual-stack name to
-    IPv6 and that collector would never see the datagram — silently, since UDP is unconnected:
-    ``sendto`` succeeds locally, ``emit`` returns, and no counter moves.
+    families = {
+        entry[0]
+        for entry in socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)
+    }
+    if socket_lib.AF_INET not in families:  # pragma: no cover - depends on the host's stack
+        pytest.skip("localhost does not resolve to IPv4 here")
+    return families
+
+
+@pytest.mark.parametrize("v6_first", [True, False])
+def test_ipv4_wins_whatever_order_the_resolver_returns(monkeypatch, v6_first) -> None:
+    """AC-2, independent of this machine's resolver — which is what makes it a real guard.
+
+    Both live-resolver tests below assert "the code picks IPv4 *here*", and on a host whose
+    RFC 6724 policy already puts ``A`` first — as a review demonstrated — an implementation
+    that simply took the *last* result would satisfy them while reintroducing the regression
+    everywhere else. Fabricating both orderings pins the rule rather than the platform, and it
+    needs no network stack at all, so it cannot skip.
     """
     import socket as socket_lib
 
-    families = {entry[0] for entry in socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)}
-    if socket_lib.AF_INET not in families:  # pragma: no cover - depends on the host's stack
-        pytest.skip("localhost does not resolve to IPv4 here")
+    v6 = (socket_lib.AF_INET6, socket_lib.SOCK_DGRAM, 0, "", ("::1", 0, 0, 0))
+    v4 = (socket_lib.AF_INET, socket_lib.SOCK_DGRAM, 0, "", ("127.0.0.1", 0))
+    order = [v6, v4] if v6_first else [v4, v6]
+    monkeypatch.setattr(socket_lib, "getaddrinfo", lambda *a, **k: order)
 
-    sock = socket_mod._make_udp("localhost")
+    sock = socket_mod._make_udp("dual.example")
     try:
         assert sock.family == socket_lib.AF_INET, "IPv4 wins wherever the host offers it"
+    finally:
+        sock.close()
+
+
+def test_a_dual_stack_hostname_still_goes_to_ipv4() -> None:
+    """The same rule against the real resolver, so the fabricated one above stays honest."""
+    import socket as socket_lib
+
+    _dual_stack_localhost()
+    sock = socket_mod._make_udp("localhost")
+    try:
+        assert sock.family == socket_lib.AF_INET
     finally:
         sock.close()
 
@@ -120,10 +148,7 @@ def test_a_dual_stack_hostname_reaches_an_ipv4_only_collector() -> None:
     """
     import socket as socket_lib
 
-    families = {entry[0] for entry in socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)}
-    if socket_lib.AF_INET not in families:  # pragma: no cover - depends on the host's stack
-        pytest.skip("localhost does not resolve to IPv4 here")
-
+    _dual_stack_localhost()
     receiver, port = _loopback_receiver(socket_lib.AF_INET)
     try:
         SyslogSink("localhost", port, transport="udp").emit(
@@ -134,23 +159,44 @@ def test_a_dual_stack_hostname_reaches_an_ipv4_only_collector() -> None:
         receiver.close()
 
 
-def test_an_ipv6_only_host_still_selects_ipv6() -> None:
+def test_an_ipv6_only_host_still_selects_ipv6(monkeypatch) -> None:
     """The IPv4 preference must not become the old unconditional AF_INET."""
     import socket as socket_lib
 
-    def only_v6(*args: object, **kwargs: object) -> list:
-        return [(socket_lib.AF_INET6, socket_lib.SOCK_DGRAM, 0, "", ("::1", 0, 0, 0))]
+    monkeypatch.setattr(
+        socket_lib,
+        "getaddrinfo",
+        lambda *a, **k: [(socket_lib.AF_INET6, socket_lib.SOCK_DGRAM, 0, "", ("::1", 0, 0, 0))],
+    )
 
-    original = socket_lib.getaddrinfo
-    socket_lib.getaddrinfo = only_v6  # type: ignore[assignment]
-    try:
-        sock = socket_mod._make_udp("v6-only.example")
-    finally:
-        socket_lib.getaddrinfo = original  # type: ignore[assignment]
+    sock = socket_mod._make_udp("v6-only.example")
     try:
         assert sock.family == socket_lib.AF_INET6
     finally:
         sock.close()
+
+
+def test_a_resolution_with_no_families_raises_an_oserror(monkeypatch, capsys) -> None:
+    """An ``IndexError`` here would escape ``_send_one``'s ``OSError`` handler into the caller.
+
+    CPython raises rather than returning ``[]``, so this is unreachable in practice — guarded
+    anyway, because the alternative is the library inventing an exception for the application
+    (SPEC-025), and AC-3 requires this to be counted and announced instead.
+    """
+    import socket as socket_lib
+
+    monkeypatch.setattr(socket_lib, "getaddrinfo", lambda *a, **k: [])
+    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+
+    with pytest.raises(OSError) as caught:
+        socket_mod._make_udp("nothing.example")
+    assert not isinstance(caught.value, IndexError)
+
+    sink = SyslogSink("nothing.example", transport="udp", max_retries=0)
+    with pytest.raises(SinkDeliveryError):  # SPEC-026 FR-001, not the IndexError
+        sink.emit([{"level": "INFO", "message": "x"}])
+    assert sink._socket.losses().failed == 1
+    assert "lost 1 message(s)" in capsys.readouterr().err
 
 
 def test_udp_syslog_delivers_to_an_ipv6_destination() -> None:

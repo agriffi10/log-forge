@@ -1852,11 +1852,19 @@ def test_release_waiters_answers_markers_among_queued_event_lists() -> None:
     assert remaining == [_span("a"), _span("b"), _span("c")]
 
 
-def test_release_waiters_is_a_no_op_on_an_empty_queue() -> None:
+def test_release_waiters_is_a_no_op_with_no_markers_queued() -> None:
+    """Asserted on the contents rather than ``qsize()``, which has a shutdown window.
+
+    ``Worker.shutdown`` sets ``_stop`` and puts ``_SHUTDOWN`` non-atomically, so a drain thread
+    that finishes between the two leaves the sentinel queued forever. That is a reporting
+    artifact rather than loss — it is a sentinel, not an event — but it is enough to flake a
+    bare ``qsize() == 0``.
+    """
     sink = RecordingSink()
     worker = Worker(sink)
     worker.shutdown()
 
     worker._release_waiters()  # must not raise
 
-    assert worker._queue.qsize() == 0
+    assert [item for item in worker._queue.queue if isinstance(item, list)] == []
+    assert not [item for item in worker._queue.queue if isinstance(item, worker_mod._FlushMarker)]
