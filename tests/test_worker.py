@@ -857,10 +857,12 @@ def test_existing_health_fields_keep_their_positions() -> None:
     h = w.health()
     assert (h[0], h[1], h[2]) == (h.queued, h.dropped, h.failed_batches)
     assert h[3] is h.stopped_reason
-    # SPEC-026 appended ``sink`` exactly as SPEC-019 appended ``stopped_reason``: every field
-    # that came before keeps its index, so positional reads written against either shape hold.
-    assert len(h) == 5
+    # SPEC-026 appended ``sink`` exactly as SPEC-019 appended ``stopped_reason``, and SPEC-030
+    # appended three more after it: every field that came before keeps its index, so positional
+    # reads written against any earlier shape hold.
+    assert len(h) == 8
     assert h[4] is h.sink
+    assert (h[5], h[6], h[7]) == (h.retired, h.submitted_after_shutdown, h.incomplete_swaps)
 
 
 def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:
@@ -1538,3 +1540,186 @@ def test_stopped_reason_survives_an_announcement_that_detonates(monkeypatch) -> 
     assert w.health().stopped_reason == "SystemExit", (
         "recorded before the announcement that killed the announcing"
     )
+
+
+# -- SPEC-030 FR-001: a retired worker still receiving submissions is visible ---------------
+
+
+def test_a_clean_shutdown_reports_retired_with_a_zero_count() -> None:
+    """Correct usage: shut down, then stop logging. Retired is a state, not yet a fault."""
+    w = Worker(RecordingSink(), batch_size=1)
+    w.submit(_span("a"))
+    w.shutdown()
+
+    h = w.health()
+    assert h.retired is True
+    assert h.submitted_after_shutdown == 0
+
+
+def test_submissions_after_shutdown_are_counted() -> None:
+    """The measured defect: three submissions delivered nothing and every counter read zero."""
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1)
+    w.shutdown()
+
+    for i in range(3):
+        w.submit(_span(i))
+
+    h = w.health()
+    assert h.submitted_after_shutdown == 3
+    assert h.retired is True
+    assert sink.events == [], "the worker is retired; nothing drains these"
+
+
+def test_stopped_reason_stays_none_through_post_shutdown_submissions() -> None:
+    """SPEC-019 FR-003 unchanged: a clean shutdown is not a terminal failure, ever."""
+    w = Worker(RecordingSink(), batch_size=1)
+    w.shutdown()
+    w.submit(_span("a"))
+
+    assert w.health().stopped_reason is None
+
+
+def test_a_worker_that_was_never_shut_down_reports_false_and_zero() -> None:
+    w = Worker(RecordingSink(), batch_size=1)
+    try:
+        w.submit(_span("a"))
+        assert _wait_until(lambda: w.health().queued == 0)
+
+        h = w.health()
+        assert h.retired is False
+        assert h.submitted_after_shutdown == 0
+    finally:
+        w.shutdown()
+
+
+def test_a_process_that_never_logged_reports_the_zeroed_lifecycle_snapshot() -> None:
+    """No worker means nothing was retired — and asking must not build one to say so."""
+    import log_foundry
+    from log_foundry import decorator
+
+    decorator._worker = None
+    h = log_foundry.health()
+
+    assert (h.retired, h.submitted_after_shutdown, h.incomplete_swaps) == (False, 0, 0)
+    assert decorator._worker is None, "health() must not create a worker"
+
+
+def test_decorated_calls_after_a_module_shutdown_are_counted() -> None:
+    """End to end, through the public API: the serverless mistake, made and then seen."""
+    import log_foundry
+
+    sink = RecordingSink()
+    log_foundry.configure(service="t", version="0", env="t", sink=sink)
+
+    @log_foundry.trace
+    def handler() -> str:
+        return "ok"
+
+    handler()
+    assert log_foundry.flush(timeout=5.0) is True
+    delivered = len(sink.events)
+    assert delivered > 0
+
+    log_foundry.shutdown()  # the mistake: terminal, called where flush() was meant
+
+    for _ in range(3):
+        assert handler() == "ok", "the caller is never affected (SPEC-025)"
+
+    h = log_foundry.health()
+    assert h.submitted_after_shutdown == 3
+    assert h.retired is True
+    assert h.stopped_reason is None, "a clean shutdown is not a terminal failure"
+    assert len(sink.events) == delivered, "nothing more reached the sink"
+    # The documented alert idiom must now fire on a state that used to read entirely healthy.
+    assert h.retired and h.submitted_after_shutdown
+
+
+# -- SPEC-030 FR-002: the first post-shutdown submission warns ------------------------------
+
+
+def test_the_first_post_shutdown_submission_warns_once(capsys) -> None:
+    w = Worker(RecordingSink(), batch_size=1)
+    w.shutdown()
+    capsys.readouterr()  # discard anything shutdown itself wrote
+
+    w.submit(_span("a"))
+    w.submit(_span("b"))  # throttled -> silent
+
+    err = capsys.readouterr().err
+    assert err.count("logged after shutdown()") == 1
+    assert "log-foundry:" in err
+    assert "lost 1 submission(s)" in err
+    assert "flush()" in err, "the line must name what to use instead"
+
+
+def test_the_post_shutdown_warning_is_throttled(capsys) -> None:
+    """2,500 submissions must produce exactly 3 lines (1, 1000, 2000), as overflow does."""
+    w = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
+    w.shutdown()
+    capsys.readouterr()
+
+    for i in range(2500):
+        w.submit(_span(i))
+
+    err = capsys.readouterr().err
+    assert w.health().submitted_after_shutdown == 2500
+    assert err.count("logged after shutdown()") == 3
+
+
+def test_a_shutdown_with_no_later_logging_writes_nothing(capsys) -> None:
+    w = Worker(RecordingSink(), batch_size=1)
+    w.submit(_span("a"))
+    w.shutdown()
+
+    assert capsys.readouterr().err == "", "correct usage must stay silent"
+
+
+def test_the_post_shutdown_warning_never_reaches_the_caller(monkeypatch) -> None:
+    """submit() runs on the caller's thread; SPEC-029 FR-003 applies to this line too."""
+    import io
+
+    class BrokenStderr(io.TextIOBase):
+        def write(self, s: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+    w = Worker(RecordingSink(), batch_size=1)
+    w.shutdown()
+    monkeypatch.setattr("sys.stderr", BrokenStderr())
+
+    w.submit(_span("a"))  # warns -> stderr raises internally -> must not escape
+
+    assert w.health().submitted_after_shutdown == 1, "recording precedes announcing"
+
+
+def test_the_post_shutdown_counter_survives_an_announcement_that_detonates(monkeypatch) -> None:
+    """Record-before-announce, tested where the ordering is observable (SPEC-029 FR-003).
+
+    While every write is guarded the ordering looks free — announce-then-record still records.
+    It stops being free for a ``BaseException``, which ``_diag`` passes through by design: with
+    the record placed after the write, the loss the counter exists to report is never counted,
+    and here the exception reaches the application's own thread on its way out.
+    """
+    w = Worker(RecordingSink(), batch_size=1)
+    w.shutdown()
+    monkeypatch.setattr(sys, "stderr", _DetonatingStderr())
+
+    with pytest.raises(_Detonation):
+        w.submit(_span("a"))
+
+    assert w.health().submitted_after_shutdown == 1, "recorded before the announcement"
+
+
+def test_a_live_worker_pays_nothing_for_the_check(capsys) -> None:
+    """The normal path must not warn, count, or otherwise notice the flag."""
+    sink = RecordingSink()
+    w = Worker(sink, batch_size=1)
+    try:
+        for i in range(50):
+            w.submit(_span(i))
+        assert _wait_until(lambda: len(sink.events) == 50)
+
+        assert w.health().submitted_after_shutdown == 0
+        assert capsys.readouterr().err == ""
+    finally:
+        w.shutdown()

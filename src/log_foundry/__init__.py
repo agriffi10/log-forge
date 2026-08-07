@@ -58,22 +58,35 @@ def health() -> Health:
     code non-blocking, and a non-zero ``failed_batches`` means a sink stayed broken through the
     whole retry budget — both are losses the library absorbs on purpose, and this is how you
     notice them. A non-``None`` ``stopped_reason`` is worse than either: the background thread
-    died on that exception type, so nothing further will be delivered at all (SPEC-019)::
+    died on that exception type, so nothing further will be delivered at all (SPEC-019). A
+    ``retired`` worker still being handed events is the same total loss arrived at from the
+    other direction — someone called :func:`shutdown` in a process that logs again (SPEC-030)::
 
         h = log_foundry.health()
-        if h.dropped or h.failed_batches or h.stopped_reason or (
+        if h.dropped or h.failed_batches or h.stopped_reason or h.incomplete_swaps or (
             h.sink and (h.sink.dropped or h.sink.failed)
-        ):
+        ) or (h.retired and h.submitted_after_shutdown):
             ...  # raise an alert; logs were silently lost
+
+    ``retired`` alone is not a fault — a process that shuts down and then stops logging is
+    doing the right thing, which is why it is paired with the count rather than alerted on.
 
     Args:
       None.
 
     Returns:
-      The snapshot: ``queued``, ``dropped``, ``failed_batches``, ``stopped_reason`` and
-      ``sink``. The last is the configured sink's own
+      The snapshot: ``queued``, ``dropped``, ``failed_batches``, ``stopped_reason``, ``sink``,
+      ``retired``, ``submitted_after_shutdown`` and ``incomplete_swaps``. ``retired`` says
+      :func:`shutdown` was called, and ``submitted_after_shutdown`` counts events accepted
+      afterwards, which are queued where nothing will drain them — non-zero together, that is
+      the ``shutdown()``-per-invocation mistake, and the remedy is :func:`flush`.
+      ``incomplete_swaps`` counts late ``configure(sink=...)`` calls whose drain of the
+      previous sink could not be confirmed, leaving that sink open. ``sink`` is the configured
+      sink's own
       :class:`~log_foundry.sinks.base.SinkLosses` — loss the sink absorbed rather than the
       worker (SPEC-026) — and is ``None`` when no worker exists or the sink reports nothing.
+      Note ``sink`` describes whichever sink is live now, so a swap takes the previous sink's
+      absorbed losses out of the snapshot with it.
       Its ``dropped`` is not the worker's: the worker's is backpressure at the queue, the
       sink's is an event that never reached the wire, and the stderr line names which. Its
       ``failed`` is an upper bound on loss rather than a count of it, since a sink that raises
@@ -97,6 +110,11 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     and every later one would silently log nothing; use :func:`flush` there. It is also
     registered via ``atexit``, so call it explicitly only when you want to be certain the tail
     of the queue reached the sink before a fast process exit (SPEC-004 FR-005).
+
+    Logging afterwards is **accepted and undeliverable**: those events are queued and nothing
+    will drain them. It is not silent any more — :func:`health` then reports ``retired`` with a
+    non-zero ``submitted_after_shutdown``, and the first such submission writes one stderr line
+    (SPEC-030). That pair is the reading that catches the mistake above.
 
     Args:
       timeout: Seconds bounding the wait for the background thread (SPEC-027 FR-004). ``None``
