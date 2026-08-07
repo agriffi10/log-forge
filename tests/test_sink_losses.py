@@ -1132,6 +1132,23 @@ def test_the_sink_protocol_documents_both_rules() -> None:
     assert "no-op and never raises" in doc, "the empty-batch rule"
 
 
+def test_the_sink_protocol_documents_the_post_close_rule_in_both_directions() -> None:
+    """Both halves, because either one alone is a rule an implementer gets wrong (SPEC-032 FR-002).
+
+    Three shipped sinks absorbed a post-close batch, and stating only that half would have led
+    the stateless sinks to refuse batches they deliver perfectly well — the defect inverted.
+    ``close()`` carries the other end of it: the flag it sets is what ``emit`` reads.
+    """
+    emit_doc = Sink.emit.__doc__ or ""
+    assert "released or invalidated something, raise rather than absorb" in emit_doc
+    assert "keeps accepting" in emit_doc, "the converse, for a sink holding nothing to release"
+    assert "loss the library invented" in emit_doc, "why refusing is not the safe default"
+
+    close_doc = Sink.close.__doc__ or ""
+    assert "the one a later" in close_doc and "reads" in close_doc, "the two are one decision"
+    assert "before* releasing anything" in close_doc, "the ordering an implementer must follow"
+
+
 def test_pubsub_names_which_counter_moved(capsys) -> None:
     """``rejected`` and ``failed`` mean different things; the line is where an operator sees which."""
     from log_foundry.sinks.pubsub import GooglePubSubSink

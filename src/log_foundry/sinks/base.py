@@ -94,9 +94,25 @@ class Sink(Protocol):
         re-delivered wholesale by the worker's retry, and duplicates downstream are worse than
         the counted loss (SPEC-017 FR-004, SPEC-018). Report that through ``losses()`` instead.
 
+        **After ``close()`` has released or invalidated something, raise rather than absorb**
+        (SPEC-032 FR-002). This is the same obligation applied to the sink's own lifecycle
+        rather than the destination's: an absorbed batch is one the worker believes, so the
+        retry never engages, ``failed_batches`` stays at zero and ``flush()`` returns True while
+        the events are gone — reached not through a destination that is down but through a
+        transport the library itself has already let go. Three shipped sinks failed this rule
+        for four specs, in three different ways: a produce into a batch nothing would flush
+        again, a future nothing would resolve, and a client that quietly reconnected.
+
+        The converse is equally binding: a sink holding nothing to release **keeps accepting**.
+        ``close()`` on a sink that opens a fresh connection per request, or whose client belongs
+        to the caller, has invalidated nothing, so a later batch still delivers and refusing it
+        would be loss the library invented rather than loss it reported. Which of the two
+        applies is a property of the sink, so each shipped sink records its answer in its class
+        docstring and a test holds it to it.
+
         Args:
           batch: The events to ship. ``emit([])`` is a no-op and never raises, since an empty
-            batch has not failed to deliver.
+            batch has not failed to deliver — closed or not.
 
         Returns:
           None.
@@ -115,6 +131,12 @@ class Sink(Protocol):
         an unreleased one, because the emit then fails against a closed handle instead of
         succeeding. Taking the same lock ``emit`` takes satisfies this; so does an idempotent
         guard checked under that lock.
+
+        The flag this sets is the one a later :meth:`emit` reads, so the two are one decision
+        rather than two (SPEC-032 FR-002). Set it *before* releasing anything: an emit arriving
+        during a release must be refused rather than handed a half-released transport. Make the
+        release idempotent for the same reason a second ``close()`` is expected at all —
+        ``atexit`` racing a caller's own cleanup is the documented case.
 
         Args:
           None.

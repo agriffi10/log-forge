@@ -93,17 +93,22 @@ publishes that `losses()` then never reported.
 
 **Two limits of the lint, recorded rather than hidden.** It proves a lock is *entered on the
 path*, not that it covers the body — an empty `with self._lock: pass` satisfies it, which is why
-every locked sink also has a behavioural test. And its *scope* gate still admits a module by a
-lazy driver import or a hardcoded handle token, so a lock added to `HTTPSink.emit` would be
-invisible to both it and the post-close roster. No present instance; the honest fix is to widen
-scope to every class in `sinks/` with an `emit`, which belongs with SPEC-031's residue.
+every locked sink also has a behavioural test. That limit stands. ~~And its *scope* gate still
+admits a module by a lazy driver import or a hardcoded handle token, so a lock added to
+`HTTPSink.emit` would be invisible to both it and the post-close roster. No present instance; the
+honest fix is to widen scope to every class in `sinks/` with an `emit`, which belongs with
+SPEC-031's residue.~~ — **closed by SPEC-032**, which widened the gate to exactly that and moved
+the item off SPEC-031: the post-close roster derives from the same gate and would have inherited
+the gap.
 
-**Post-close loss outside this spec's scope.** `GooglePubSubSink.emit` after `close()` still
+~~**Post-close loss outside this spec's scope.** `GooglePubSubSink.emit` after `close()` still
 appends futures nothing will resolve, and `KafkaSink` accepts produces past close — the silent-loss
 shape SPEC-026 exists to end, reached one call later. Neither sink takes a transport lock, so
 neither is in the roster this spec enforces. SPEC-030 owns what the library should *signal* after a
 completed shutdown; Pub/Sub's case is loss rather than signalling and should be named there
-explicitly.
+explicitly.~~ — **closed by SPEC-032.** SPEC-030 confirmed it was loss rather than signalling and
+handed it on; SPEC-032 fixed both sinks and a third the survey found (`_RedisSink`, which
+*succeeded* after close by reconnecting).
 
 **Not done, and deliberately.** `MemorySink`, `NullSink` and `StdoutSink` got the counter fix and no
 lock, per the spec's Out of Scope. `MultiSink` holds no lock across a child's `emit`, and its

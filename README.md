@@ -660,7 +660,7 @@ in `CallbackSink`.
 
 #### Writing your own sink
 
-`Sink` is two required methods, `emit(batch)` and `close()`, plus two rules about *how* `emit`
+`Sink` is two required methods, `emit(batch)` and `close()`, plus three rules about *how* `emit`
 fails and one about *when* it is called. They are not stylistic — the library's whole
 loss-reporting apparatus is built on them:
 
@@ -680,6 +680,15 @@ loss-reporting apparatus is built on them:
 - **Do not raise when you delivered some of it.** The worker retries whole batches, so raising on a
   partial success re-delivers the records that already arrived, and duplicates downstream are worse
   than a counted loss.
+- **Raise after your own `close()`, if `close()` released anything.** A batch handed to a
+  released transport has delivered nothing, so it is the first rule again by another route — and
+  it is easy to miss, because the sink looks like it worked. Three of the shipped sinks got this
+  wrong for four releases: one accepted a produce into a client buffer nothing would flush again,
+  one appended a delivery future nothing would resolve, and one transparently *reconnected*,
+  leaking a connection nothing would reap. Set the flag before you release, and read it in `emit`.
+  If your `close()` releases nothing — you open a fresh connection per request, or the client is
+  the caller's — then **keep accepting**: refusing a batch you would have delivered is loss you
+  invented. `emit([])` stays a no-op either way.
 
 A sink that absorbs a total failure and returns normally is a sink the worker believes: the retry
 never engages, `failed_batches` stays at zero, and `flush()` returns `True` while every event is
@@ -696,12 +705,19 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 class MySink:
     def __init__(self) -> None:
         self._dropped = self._failed = 0
+        self._closed = False
         self._lock = threading.Lock()          # transport state
         self._counter_lock = threading.Lock()  # counters only, never held across I/O
 
     def emit(self, batch: list[dict[str, object]]) -> None:
+        if not batch:
+            return
         delivered = 0
         with self._lock:                       # your connection, socket or stream
+            if self._closed:                   # refuse: nothing here can deliver it
+                raise SinkDeliveryError(
+                    f"MySink delivered none of {len(batch)} event(s): the sink is closed"
+                )
             for chunk in self._chunks(batch):
                 if self._send(chunk):          # your own bounded retry
                     delivered += len(chunk)
@@ -717,6 +733,9 @@ class MySink:
 
     def close(self) -> None:
         with self._lock:                       # never release under an active writer
+            if self._closed:                   # idempotent: atexit races your own cleanup
+                return
+            self._closed = True                # set the flag, *then* release
             ...
 ```
 

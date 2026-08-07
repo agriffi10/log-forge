@@ -36,6 +36,7 @@ to status only — no prose.
 | [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Completed | SPEC-017, SPEC-019 |
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Completed | SPEC-013, SPEC-019 |
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-008, SPEC-009, SPEC-020 |
+| [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 
 ## Arcs (build order)
 
@@ -123,3 +124,12 @@ Group related specs and record the order to build them in. Delete this section i
   total silent loss with no signal: logging after `shutdown()`, and a late `configure(sink=...)`.
   **SPEC-031** last, and independent of all of them — the residue too small to spec individually,
   handled per SPEC-021's rule that an open item is fixed, settled, or recorded as a constraint.
+- **Post-close sink behaviour:** SPEC-032 — the arc's coda, and the only spec here whose subject
+  was found *by* the arc rather than by the audit. SPEC-028 hit it while locking the sinks that hold
+  transport state and could not fix it: neither offending sink takes a lock, so neither was in the
+  roster it enforced. SPEC-030 established it was sink-level loss rather than lifecycle signalling
+  (`retired` describes the worker) and handed it on again. Depends on SPEC-026 for the rule it
+  generalizes, SPEC-028 for the lint and roster it widens, and SPEC-030 for the finding that its own
+  signals cannot reach this. Also absorbs the lint-scope item SPEC-028 had provisionally left to
+  SPEC-031, since the post-close roster derives from that gate. Build after 030; nothing depends
+  on it.

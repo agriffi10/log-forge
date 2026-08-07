@@ -1,7 +1,7 @@
 # Spec: Post-Close Sink Behaviour
 
 **ID:** SPEC-032  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-07  
 **Depends On:** SPEC-026, SPEC-028, SPEC-030
 
@@ -95,25 +95,29 @@ two sinks that already do this. Where the sink has a transport lock the check go
 
 #### Acceptance Criteria:
 
-- [ ] `KafkaSink.emit`, `GooglePubSubSink.emit` and `_RedisSink.emit` raise `SinkDeliveryError` on a
+- [x] `KafkaSink.emit`, `GooglePubSubSink.emit` and `_RedisSink.emit` raise `SinkDeliveryError` on a
       non-empty batch after `close()`, with a message naming the sink and the count in the form the
       shipped sinks already use.
-- [ ] None of the three touches its driver after `close()` — no `produce`, no `publish`, no
+- [x] None of the three touches its driver after `close()` — no `produce`, no `publish`, no
       `pipeline`. The assertion is on driver contact, not only on the exception, because a double
       that breaks after close would let a deleted guard still pass.
-- [ ] `emit([])` after `close()` returns without raising, for all three.
-- [ ] `close()` is idempotent on all three, and a second call reaches the driver no further than the
+- [x] `emit([])` after `close()` returns without raising, for all three.
+- [x] `close()` is idempotent on all three, and a second call reaches the driver no further than the
       first.
-- [ ] The Redis guard fires only where the sink owns the client. A borrowed client the sink never
-      closed is still refused after `close()` — the sink is closed either way, and a caller's client
-      surviving is not permission to keep writing through a released sink.
-- [ ] `losses()` on a refused batch is unchanged: refusing is not a loss the sink absorbed, it is a
+- [x] The Redis guard fires **regardless of** whether the sink owns the client. A borrowed client
+      the sink never closed is still refused after `close()` — the sink is closed either way, and a
+      caller's client surviving is not permission to keep writing through a released sink.
+      *(Amended during build: this criterion was drafted as "fires only where the sink owns the
+      client", which contradicted its own second sentence and the behaviour the spec intends.
+      Keying on ownership would leave every injected-client sink accepting after `shutdown()` —
+      the majority configuration. Recorded in `architecture.md` §13.)*
+- [x] `losses()` on a refused batch is unchanged: refusing is not a loss the sink absorbed, it is a
       failure it reported, so the batch reaches `failed_batches` through the worker rather than
       `losses()`. Stated in each `emit` docstring.
-- [ ] Each of the three appears in the parametrized post-close test in
+- [x] Each of the three appears in the parametrized post-close test in
       `tests/test_sink_concurrency.py`, with a driver double that keeps *succeeding* after close, so
       an emit slipping past the guard lands rather than failing for an unrelated reason.
-- [ ] Each test kills its mutant: with the guard deleted, the driver-contact assertion fails.
+- [x] Each test kills its mutant: with the guard deleted, the driver-contact assertion fails.
 
 ### FR-002: The `Sink` protocol states what `emit` after `close` must do
 
@@ -131,18 +135,18 @@ deliver — and the second half is why "always refuse after close" would be wron
 
 #### Acceptance Criteria:
 
-- [ ] `Sink.emit`'s docstring states that a sink whose `close()` released or invalidated transport
+- [x] `Sink.emit`'s docstring states that a sink whose `close()` released or invalidated transport
       state must raise on a non-empty batch afterwards rather than absorbing it, and why: an absorbed
       batch is one the worker believes, so retry, `failed_batches` and `flush()`'s verdict are all
       inert (the SPEC-026 FR-001 reasoning, applied to the sink's own lifecycle rather than the
       destination's).
-- [ ] It states the converse explicitly: a sink holding nothing to release keeps accepting, because
+- [x] It states the converse explicitly: a sink holding nothing to release keeps accepting, because
       refusing a deliverable batch is loss the library invented.
-- [ ] `Sink.close`'s docstring notes that the flag a `close()` sets is what a later `emit` reads, so
+- [x] `Sink.close`'s docstring notes that the flag a `close()` sets is what a later `emit` reads, so
       the two are one decision rather than two.
-- [ ] `emit([])` remains a no-op after `close()` in the contract as well as the code — an empty batch
+- [x] `emit([])` remains a no-op after `close()` in the contract as well as the code — an empty batch
       has not failed to deliver.
-- [ ] `docs/architecture.md` §8 records the rule in one sentence alongside the existing sink
+- [x] `docs/architecture.md` §8 records the rule in one sentence alongside the existing sink
       obligations.
 
 ### FR-003: Both sink rosters are derived from every sink class, not from a heuristic
@@ -172,23 +176,23 @@ asserting its `close()` releases nothing rather than by being unreachable by a h
 
 #### Acceptance Criteria:
 
-- [ ] The scope gate returns every class in `sinks/*.py` defining `emit` or `send_all`, excluding
+- [x] The scope gate returns every class in `sinks/*.py` defining `emit` or `send_all`, excluding
       `base.Sink`, and no longer inspects imports or matches source tokens.
-- [ ] `test_every_driver_backed_sink_records_a_concurrency_decision` passes over the widened set,
+- [x] `test_every_driver_backed_sink_records_a_concurrency_decision` passes over the widened set,
       with each newly in-scope class either locking in `emit` or carrying the existing
       `**no** transport lock` / `SPEC-028 FR-002` claim.
-- [ ] A new lint asserts every in-scope class either refuses a post-close emit or carries an
+- [x] A new lint asserts every in-scope class either refuses a post-close emit or carries an
       explicit claim that its `close()` releases nothing. The claim is a fixed phrase checked as a
       substring, as SPEC-028's is, so a docstring merely *mentioning* close cannot satisfy it.
-- [ ] "Refuses a post-close emit" is established behaviourally, by the parametrized test, not by
+- [x] "Refuses a post-close emit" is established behaviourally, by the parametrized test, not by
       reading the source for a `_closed` token — a flag checked in the wrong place would otherwise
       satisfy the lint.
-- [ ] `CLOSED_SINKS` and `_BUILDER_CLASSES` stop being a hand-written roster whose *coverage* is
+- [x] `CLOSED_SINKS` and `_BUILDER_CLASSES` stop being a hand-written roster whose *coverage* is
       checked after the fact: the parametrization is derived from the same scan, and a sink with no
       double fails the run rather than being skipped.
-- [ ] Adding a new sink class with a releasing `close()` and no guard fails the suite. Demonstrated
+- [x] Adding a new sink class with a releasing `close()` and no guard fails the suite. Demonstrated
       by a temporary class in the test run, not asserted in prose.
-- [ ] The two limits SPEC-028 recorded are re-stated as they now stand: the lock check still proves
+- [x] The two limits SPEC-028 recorded are re-stated as they now stand: the lock check still proves
       only that a lock is entered on the path, and the scope gate no longer guesses.
 
 ### FR-004: The sinks that keep accepting are recorded, not assumed
@@ -215,17 +219,17 @@ Three groups, three different reasons, and each says its own:
 
 #### Acceptance Criteria:
 
-- [ ] Each in-scope class that keeps accepting carries the FR-003 exemption claim in its class
+- [x] Each in-scope class that keeps accepting carries the FR-003 exemption claim in its class
       docstring, naming which of the three reasons applies to it.
-- [ ] The wrapper sinks' docstrings state that the rule is the child's to enforce, so a reader does
+- [x] The wrapper sinks' docstrings state that the rule is the child's to enforce, so a reader does
       not add a guard that would break delegation.
-- [ ] `SyslogSink` and `LogstashSink` state that their post-close refusal comes from the transport
+- [x] `SyslogSink` and `LogstashSink` state that their post-close refusal comes from the transport
       they hold, and a test shows a closed `SyslogSink` refusing through `SocketTransport` rather
       than through a guard of its own.
-- [ ] `docs/architecture.md` §13 Known Constraints records that a borrowed client outlives the sink
+- [x] `docs/architecture.md` §13 Known Constraints records that a borrowed client outlives the sink
       that used it: closing a sink built on an injected client does not close the client, and the
       sink refuses regardless.
-- [ ] No behaviour changes under this FR.
+- [x] No behaviour changes under this FR.
 
 ---
 

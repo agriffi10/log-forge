@@ -333,6 +333,14 @@ retry risks duplicating), an **SQS sender fault** (SPEC-016 FR-006 — provably 
 byte-identical re-send can only fail the same way), and an **oversized** event (it can never fit,
 so there is nothing to retry). All three are reported through `losses()` instead.
 
+**The same rule reaches the sink's own lifecycle** (SPEC-032): a sink whose `close()` released or
+invalidated a transport must **raise** on a later non-empty `emit` rather than absorb it — a
+produce into a batch nothing will flush again, or a future nothing will resolve, is total failure
+by a different route. A sink holding nothing to release keeps **accepting**, because refusing a
+batch that would have delivered is loss the library invented. Which applies is a property of the
+sink, so each records its answer in its class docstring and a lint holds every sink to one.
+`emit([])` remains a no-op either way.
+
 Planned implementations:
 
 - **`StdoutSink`** — JSON lines to stdout. The **default**; zero-dependency, great for
@@ -565,6 +573,16 @@ constraint — never by being deleted quietly.
   the worker queue and the decorated function returns without waiting on anything. A caller who
   wants the orphan path off the critical path should open a span; that is what the
   buffer-then-flush pipeline is for.
+
+- **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
+  sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
+  `MongoDBSink(client=…)`) does **not** close that client: it is the caller's to release, and
+  reaping a connection pool an application still uses elsewhere would be the library reaching
+  outside its own lifetime. The consequence is that a closed sink's client will happily take a
+  write, which is why the post-close refusal is keyed on the *sink* being released rather than on
+  ownership (SPEC-032 FR-001). A guard keyed on ownership would leave every injected-client sink
+  accepting after `shutdown()` — the majority configuration in tests and in any application that
+  manages its own pool.
 
 - **`shutdown()`'s timeout bounds the drain, not the sink's `close()`.** This narrows SPEC-027
   FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an
