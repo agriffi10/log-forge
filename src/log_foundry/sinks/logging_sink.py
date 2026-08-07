@@ -38,7 +38,7 @@ class LoggingSink:
     ``logging_sink`` so it never shadows the stdlib module.
 
     It takes **no** transport lock (SPEC-028 FR-002): ``logging`` serializes its own handlers,
-    and this sink holds nothing else. And it **accepts emit after close** (SPEC-032 FR-003) —
+    and this sink holds nothing else. And it **adds no post-close guard** (SPEC-032 FR-003) —
     ``close()`` is a no-op by design, since tearing down handlers this sink did not configure is
     not its to do, so a later batch still reaches the framework.
     """

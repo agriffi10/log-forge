@@ -574,6 +574,16 @@ constraint — never by being deleted quietly.
   wants the orphan path off the critical path should open a span; that is what the
   buffer-then-flush pipeline is for.
 
+- **A process that only ever used the orphan path never closes its sink.** `shutdown()` is a no-op
+  when no worker was created (`_shutdown_worker` returns early), and the `atexit` registration
+  happens *inside* `_get_worker`, so neither runs for a process that only made level calls with no
+  active span — those emit synchronously on the caller's thread and build no worker. Measured: with
+  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open,
+  so **every** event is lost, not only the one after `shutdown()`. Found reviewing SPEC-032, whose
+  post-close guard is invisible here precisely because `close()` never happens. It is a worker
+  lifecycle defect rather than a sink one and is **not** fixed by SPEC-032; recorded here so the
+  post-close guarantee is not read as covering it. A process that opens even one span is unaffected.
+
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
   `MongoDBSink(client=…)`) does **not** close that client: it is the caller's to release, and

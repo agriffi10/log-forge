@@ -117,7 +117,11 @@ two sinks that already do this. Where the sink has a transport lock the check go
 - [x] Each of the three appears in the parametrized post-close test in
       `tests/test_sink_concurrency.py`, with a driver double that keeps *succeeding* after close, so
       an emit slipping past the guard lands rather than failing for an unrelated reason.
-- [x] Each test kills its mutant: with the guard deleted, the driver-contact assertion fails.
+- [x] Each test kills its mutant. *(Amended during build: as drafted this said "with the guard
+      deleted, the driver-contact assertion fails", which is not what happens — a deleted guard
+      fails the `pytest.raises` first, so the driver-contact assertion never runs. The claim it was
+      reaching for is true and was verified separately: a guard **moved to after** the driver call
+      still raises `SinkDeliveryError`, and only the driver-contact assertion catches it.)*
 
 ### FR-002: The `Sink` protocol states what `emit` after `close` must do
 
@@ -188,10 +192,18 @@ asserting its `close()` releases nothing rather than by being unreachable by a h
       reading the source for a `_closed` token — a flag checked in the wrong place would otherwise
       satisfy the lint.
 - [x] `CLOSED_SINKS` and `_BUILDER_CLASSES` stop being a hand-written roster whose *coverage* is
-      checked after the fact: the parametrization is derived from the same scan, and a sink with no
-      double fails the run rather than being skipped.
+      checked after the fact: a sink with no double and no valid claim fails the run rather than
+      being skipped, and a builder key naming no live class fails too. *(Amended: as drafted this
+      also said "the parametrization is derived from the same scan", which overstates — the
+      parametrization is over the builder map, and the scan checks membership. Review also found
+      the first version was **weaker** than what it replaced, since a docstring could exempt a
+      locked sink; two code-derived facts now outrank the claim. See the delivery doc.)*
 - [x] Adding a new sink class with a releasing `close()` and no guard fails the suite. Demonstrated
-      by a temporary class in the test run, not asserted in prose.
+      by a temporary class in the test run, not asserted in prose. *(Strengthened after review: the
+      first version passed a synthetic AST node with no `close()` straight to the judging function,
+      exercising neither the file scan nor a releasing close. `_sink_classes_with_an_emit` now takes
+      a root, and the test writes real modules into `tmp_path` — one releasing sink, one subclass
+      overriding only `close()`, and three whose docstring claim contradicts their code.)*
 - [x] The two limits SPEC-028 recorded are re-stated as they now stand: the lock check still proves
       only that a lock is entered on the path, and the scope gate no longer guesses.
 

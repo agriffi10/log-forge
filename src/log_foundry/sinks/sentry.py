@@ -39,7 +39,7 @@ class SentrySink:
     thread, or to an ``HTTPSink`` that builds a fresh request per call and rebinds nothing.
     Its counters take the counter lock like every other sink's.
 
-    It also **accepts emit after close** (SPEC-032 FR-003), for the same reason: neither backend
+    It also **adds no post-close guard** (SPEC-032 FR-003), for the same reason: neither backend
     holds anything ``close()`` releases, so a batch emitted afterwards still reaches Sentry.
     """
 

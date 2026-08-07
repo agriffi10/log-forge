@@ -32,7 +32,7 @@ class MultiSink:
 
     It takes **no** transport lock (SPEC-028 FR-002) — it holds no transport, and a lock spanning
     a child's ``emit`` would serialize every destination behind the slowest one. And it
-    **accepts emit after close** (SPEC-032 FR-003), because the post-close rule is each child's:
+    **adds no post-close guard** (SPEC-032 FR-003), because the post-close rule is each child's:
     ``close()`` here only forwards, so a guard added at this level would refuse batches the
     children would have taken, while a child that must refuse already does and is counted here
     like any other failure.

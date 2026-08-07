@@ -44,7 +44,7 @@ class NullSink:
     on every batch for anyone who chose this sink to turn logging off. The counter stays
     readable on the instance.
 
-    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): there is no transport and ``close()`` releases nothing, so discarding a
     batch after close is the same operation as discarding one before it.
     """
@@ -101,7 +101,7 @@ class MemorySink:
     most recent events; the list object identity is stable, so a held reference keeps seeing
     updates.
 
-    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): there is no transport, and ``close()`` releases nothing — a test that
     closes the sink and then asserts on a later batch still sees it in ``.events``.
     """

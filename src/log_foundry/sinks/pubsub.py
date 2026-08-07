@@ -93,7 +93,10 @@ class GooglePubSubSink:
         purpose — once for the batch, and again under ``_futures_lock`` for each append, which
         is the lock ``close`` swaps under. Without the second read a close landing mid-loop
         would leave exactly the orphaned future this guard exists to prevent, and the read costs
-        nothing because the append already takes that lock.
+        nothing because the append already takes that lock. Only the read happens under it: the
+        counter bump and the stderr line are taken *after* the lock is released, because
+        ``close`` waits on the same lock and a blocked stderr would otherwise hold it — an I/O
+        call inside a transport lock is what SPEC-028's two-lock decision exists to avoid.
 
         A close that lands mid-batch does **not** raise, even when it catches every event. Each
         one had ``publish()`` called on it and may well land, so raising would have the worker
@@ -130,14 +133,15 @@ class GooglePubSubSink:
                 _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
                 continue
             with self._futures_lock:
-                if self._closed:
-                    with self._counter_lock:
-                        self.failed += 1
-                    _diag.lost(
-                        "event", 1, "GooglePubSubSink publish unconfirmed, the sink closed mid-batch"
-                    )
-                    continue
-                self._futures.append(future)
+                orphaned = self._closed
+                if not orphaned:
+                    self._futures.append(future)
+            if orphaned:
+                with self._counter_lock:
+                    self.failed += 1
+                _diag.lost(
+                    "event", 1, "GooglePubSubSink publish unconfirmed, the sink closed mid-batch"
+                )
         if refused == len(batch):
             raise SinkDeliveryError(
                 f"GooglePubSubSink published none of {len(batch)} event(s)"

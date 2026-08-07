@@ -602,22 +602,31 @@ def _takes_the_transport_lock(
     return False
 
 
-def _sink_classes_with_an_emit() -> list[tuple[str, ast.ClassDef]]:
-    """Returns every class in ``sinks/`` that defines ``emit`` or ``send_all`` (SPEC-032 FR-003).
+def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
+    """Returns every class in ``sinks/`` defining ``emit``, ``send_all`` or ``close``.
 
     This gate used to guess, admitting a *module* that imported something inside a function or
     whose source contained one of six hardcoded handle tokens. SPEC-028's delivery doc recorded
     what that costs — a lock added to ``HTTPSink.emit`` would have been invisible to the lint,
     and so is anything else the guess does not happen to reach. A roster whose completeness is
     the point cannot rest on a heuristic, so scope is now every implementation and the decision
-    is what varies.
+    is what varies (SPEC-032 FR-003).
+
+    ``close`` is in the trigger set as well as ``emit``, because the post-close decision is a
+    property of what ``close`` releases: a subclass overriding only ``close`` to release
+    something, while inheriting its parent's ``emit`` and its parent's recorded decision, would
+    otherwise be judged by nobody. No shipped class does that today; the gate is what keeps it
+    that way. A subclass overriding *neither* stays out of scope deliberately — it inherits both
+    the guard and the answer, and a duplicated claim would be noise.
 
     ``base.Sink`` is excluded by name: it is the Protocol stating the contract, not a sink that
     can satisfy it. ``AsyncFunctionDef`` is walked alongside ``FunctionDef`` so a future async
     sink cannot drop out of scope silently.
 
     Args:
-      None.
+      root: The directory to scan, defaulting to the installed ``sinks/``. A test passes a
+        temporary directory to exercise the lints end to end against a real module, which is
+        what FR-003 asks for and what a synthetic AST node cannot demonstrate.
 
     Returns:
       One ``(module_stem, class node)`` pair per in-scope class.
@@ -629,7 +638,8 @@ def _sink_classes_with_an_emit() -> list[tuple[str, ast.ClassDef]]:
 
     import log_foundry
 
-    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    if root is None:
+        root = pathlib.Path(log_foundry.__file__).parent / "sinks"
     found: list[tuple[str, ast.ClassDef]] = []
     for path in sorted(root.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -640,7 +650,7 @@ def _sink_classes_with_an_emit() -> list[tuple[str, ast.ClassDef]]:
             and not (path.stem == "base" and node.name == "Sink")
             and any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-                and m.name in ("emit", "send_all")
+                and m.name in ("emit", "send_all", "close")
                 for m in node.body
             )
         )
@@ -1008,7 +1018,7 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
 # The claim a sink makes to opt out of the post-close rule (SPEC-032 FR-003). Like SPEC-028's
 # lock exemption it is a specific assertion about behaviour rather than a mention of the topic,
 # so a docstring that merely discusses close() cannot satisfy it.
-ACCEPTS_AFTER_CLOSE = "**accepts emit after close**"
+ACCEPTS_AFTER_CLOSE = "**adds no post-close guard**"
 
 # Every sink proved to refuse a post-close emit, mapped to the key its driver double is built
 # under. Hand-written only because each needs its own double; what is *not* hand-written is which
@@ -1035,18 +1045,59 @@ POST_CLOSE_BUILDERS = {
 }
 
 
+def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
+    """Returns why a class is barred from the exemption claim, or ``None`` if it may make it.
+
+    The exemption is a docstring assertion, and an assertion is only as good as what it cannot
+    override. Review found it could override everything: removing ``SQLiteSink`` from the builder
+    map and adding the claim to its docstring turned a sink that commits and closes a connection
+    into an exempt one, and the suite went **green** while quietly losing two cases (1029 → 1027,
+    no red — the silent-test-deletion shape, reached through prose).
+
+    So two code-derived facts outrank the claim. Taking a transport lock in ``emit`` is the
+    stronger of the two and restores the floor the pre-SPEC-032 roster had: that roster was
+    derived from exactly this property, and no docstring could exempt a locked sink from it.
+    Carrying a ``self._closed`` flag is the second: a class maintaining one is a class that
+    refuses, so claiming it accepts contradicts its own code rather than describing it.
+
+    Args:
+      cls: The class to judge.
+
+    Returns:
+      A short reason the claim is refused, or ``None``.
+
+    Raises:
+      None.
+    """
+    helpers = {
+        m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    entry = helpers.get("emit") or helpers.get("send_all")
+    if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
+        return "it takes a transport lock in emit, so it holds state a close releases"
+    for node in ast.walk(cls):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "_closed"
+            and isinstance(node.ctx, ast.Store)
+        ):
+            return "it maintains a _closed flag, which is what a refusing sink does"
+    return None
+
+
 def _undecided_post_close(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
-    """Returns the classes that neither have a post-close case nor claim they accept.
+    """Returns the classes that neither have a post-close case nor validly claim they accept.
 
     Written as a function over its input rather than over the package so the failure path can be
-    exercised directly (see the synthetic-class test below). A lint whose red path never runs is
+    exercised directly (see the synthetic-class tests below). A lint whose red path never runs is
     a lint a refactor can defeat silently.
 
     Args:
       entries: ``(module_stem, class node)`` pairs to judge.
 
     Returns:
-      The qualified names of the undecided classes, sorted.
+      The qualified names of the undecided classes, sorted, each carrying why a claim it made
+      was refused.
 
     Raises:
       None.
@@ -1057,9 +1108,11 @@ def _undecided_post_close(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
         if name in POST_CLOSE_BUILDERS:
             continue
         documented = " ".join((ast.get_docstring(cls) or "").split())
-        if ACCEPTS_AFTER_CLOSE in documented and "SPEC-032 FR-003" in documented:
+        claimed = ACCEPTS_AFTER_CLOSE in documented and "SPEC-032 FR-003" in documented
+        barred = _may_not_claim_it_accepts(cls)
+        if claimed and barred is None:
             continue
-        undecided.append(name)
+        undecided.append(f"{name} ({barred})" if claimed else name)
     return sorted(undecided)
 
 
@@ -1459,3 +1512,184 @@ def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
     assert errors == []
     assert producer.overlaps == 0, f"{producer.overlaps} interleaved producer sequences"
     assert producer.sent == THREADS * PER_THREAD * per_batch
+
+
+def test_pubsub_sets_its_closed_flag_in_the_same_critical_section_as_the_swap() -> None:
+    """When ``close()`` releases the futures lock, the flag it guards is already set.
+
+    This is the ordering :meth:`GooglePubSubSink.close`'s docstring claims, and review found it
+    tested by nothing: moving ``self._closed = True`` to *after* the swap left the whole suite
+    green while restoring the orphaned-future loss the flag exists to prevent. The existing
+    mid-batch test cannot see it — it calls ``close()`` synchronously from inside ``publish()``,
+    so the swap and the flag set are atomic with respect to the append.
+
+    Nor can a two-thread race see it reliably, and the first version of this test proved that by
+    passing against the mutant: parking an emitter and running the close to completion before
+    releasing it means the flag *is* set by the time the emitter looks, whichever order the
+    close used. The window is real but a few instructions wide. So this observes the invariant
+    directly rather than trying to land inside it — at the instant the closing thread leaves the
+    critical section, is the flag set? Correct code: yes. Flag moved after the swap: no. That is
+    deterministic, needs no timing, and is exactly the claim the docstring makes.
+    """
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+
+    class ObservingLock:
+        """A real lock that records the sink's closed flag as each holder leaves."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.flag_on_exit: list[bool] = []
+
+        def __enter__(self) -> Self:
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            self.flag_on_exit.append(sink._closed)
+            self._lock.release()
+            return False
+
+    class Future:
+        def result(self) -> None:
+            pass
+
+    class Publisher:
+        def publish(self, topic: str, data: bytes | None = None) -> Future:
+            return Future()
+
+    sink = GooglePubSubSink("projects/p/topics/t", client=Publisher())
+    observer = ObservingLock()
+    sink._futures_lock = observer  # type: ignore[assignment]
+
+    sink.emit([{"a": 1}])
+    assert observer.flag_on_exit == [False], "the emit's append saw a closed sink"
+
+    sink.close()
+    assert observer.flag_on_exit[-1] is True, (
+        "close() left the futures lock with _closed still False: an append winning the lock "
+        "between the swap and the flag lands on a list nothing will ever resolve"
+    )
+
+
+def test_kafka_sets_its_closed_flag_before_flushing() -> None:
+    """An emit arriving during the flush is refused, not produced into a drained batch.
+
+    ``close()``'s docstring claims the flag is set *before* ``flush()`` for exactly this reason,
+    and review found the claim untested: moving the assignment after the flush left the suite
+    green. The producer double parks inside ``flush()``, which is the only window in which the
+    two orderings differ.
+    """
+    from log_foundry.sinks.kafka import KafkaSink
+
+    flushing = threading.Event()
+    may_finish = threading.Event()
+    produced: list[object] = []
+
+    class ParkingProducer:
+        def produce(self, topic: str, **kwargs: object) -> None:
+            produced.append(topic)
+
+        def poll(self, timeout: float) -> int:
+            return 0
+
+        def flush(self) -> None:
+            flushing.set()
+            may_finish.wait(timeout=10)
+
+    sink = KafkaSink("logs", producer=ParkingProducer())
+    closer = threading.Thread(target=sink.close)
+    closer.start()
+    assert flushing.wait(timeout=10), "the closing thread never reached flush()"
+
+    refused: list[BaseException] = []
+    try:
+        sink.emit([{"a": 1}])
+    except BaseException as exc:
+        refused.append(exc)
+
+    may_finish.set()
+    closer.join(timeout=10)
+
+    assert produced == [], "a message was produced into a batch the flush had walked past"
+    assert refused and isinstance(refused[0], SinkDeliveryError), (
+        f"an emit during the flush was not refused: {refused}"
+    )
+
+
+def test_the_lints_reject_a_real_new_sink_module_that_records_nothing(tmp_path: Path) -> None:
+    """The end-to-end path, against a real module rather than a synthetic AST node.
+
+    FR-003 asks that adding a sink with a releasing ``close()`` and no guard fails the suite, and
+    asks for it *demonstrated in the run*. The synthetic-class test above exercises the judging
+    function; this exercises the scan that feeds it — file discovery, the ``base.Sink``
+    exclusion, and the trigger set — which is the half a refactor of the glob or the method names
+    would silently break.
+
+    The second class is the hole review found: it overrides only ``close()`` and inherits its
+    ``emit``, so under the old ``emit``-only trigger set it was judged by nobody.
+    """
+    (tmp_path / "newsink.py").write_text(
+        '"""A brand-new sink module."""\n'
+        "\n"
+        "class BrandNewSink:\n"
+        '    """Holds a connection and releases it, and records no decision."""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): self._conn = None\n"
+        "\n"
+        "class SubclassOverridingOnlyClose(BrandNewSink):\n"
+        '    """Inherits emit, overrides close to release a pool."""\n'
+        "    def close(self): self._pool = None\n",
+        encoding="utf-8",
+    )
+
+    found = {f"{stem}.{cls.name}" for stem, cls in _sink_classes_with_an_emit(tmp_path)}
+    assert found == {"newsink.BrandNewSink", "newsink.SubclassOverridingOnlyClose"}, (
+        f"the scan missed a class: {found}"
+    )
+    assert _undecided_post_close(_sink_classes_with_an_emit(tmp_path)) == [
+        "newsink.BrandNewSink",
+        "newsink.SubclassOverridingOnlyClose",
+    ], "a new sink recording no post-close decision was not reported"
+
+
+def test_a_state_holding_sink_cannot_claim_the_exemption(tmp_path: Path) -> None:
+    """A docstring cannot exempt a sink whose code says it holds something (SPEC-032 FR-003).
+
+    Review defeated the first version of this lint by deleting ``SQLiteSink`` from the builder
+    map and adding the exemption claim to its docstring: the suite went green and quietly lost
+    two cases (1029 → 1027, no red). The claim is a docstring assertion, and an assertion is only
+    as good as what it cannot override — so two code-derived facts outrank it.
+    """
+    claim = f"It {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003): nothing is held."
+    (tmp_path / "liar.py").write_text(
+        '"""Sinks whose code contradicts their docstring."""\n'
+        "\n"
+        "class LockedLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch):\n"
+        "        with self._lock:\n"
+        "            self._conn.write(batch)\n"
+        "    def close(self): ...\n"
+        "\n"
+        "class FlaggedLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): self._closed = True\n"
+        "\n"
+        "class HonestSink:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): ...\n",
+        encoding="utf-8",
+    )
+
+    reported = _undecided_post_close(_sink_classes_with_an_emit(tmp_path))
+    assert any(name.startswith("liar.LockedLiar") for name in reported), (
+        f"a sink locking its transport talked its way out of the roster: {reported}"
+    )
+    assert any(name.startswith("liar.FlaggedLiar") for name in reported), (
+        f"a sink carrying a _closed flag claimed it accepts: {reported}"
+    )
+    assert not any(name.startswith("liar.HonestSink") for name in reported), (
+        f"a genuinely stateless sink was refused its claim: {reported}"
+    )

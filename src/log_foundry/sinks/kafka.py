@@ -151,10 +151,16 @@ class KafkaSink:
     def close(self) -> None:
         """Flushes the producer so buffered messages are delivered before exit (FR-002).
 
-        Idempotent, with the flag set under a lock so two concurrent calls cannot both reach
-        ``flush()`` — ``atexit`` racing user code is the documented case (SPEC-032 FR-001). The
-        flag is set *before* the flush rather than after, so an emit arriving during a flush is
-        refused rather than producing into a batch the flush has already walked past.
+        Idempotent, and the lock is held *across* the flush rather than only around the flag, as
+        every other guarded sink holds its own (SPEC-032 FR-001). Releasing it early would let a
+        second concurrent ``close()`` return while the first is still draining, so a caller would
+        believe the producer was flushed when it was not — and ``atexit`` racing user cleanup is
+        the documented case for a second call. The cost is that a second close waits on an
+        unreachable broker, which is the ``architecture.md`` §13 constraint that already applies
+        to every sink here.
+
+        The flag is set *before* the flush rather than after, so an emit arriving during a flush
+        is refused rather than producing into a batch the flush has already walked past.
 
         Args:
           None.
@@ -169,7 +175,7 @@ class KafkaSink:
             if self._closed:
                 return
             self._closed = True
-        self.producer.flush()
+            self.producer.flush()
 
     def _key(self, event: dict[str, object]) -> bytes | None:
         """Derives one message's partition key from the configured field.

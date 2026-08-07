@@ -15,9 +15,16 @@ class StdoutSink:
     This is the zero-dependency default sink, for local dev and container log scraping. Like
     every sink it receives already-built event dicts and knows nothing about spans or context.
 
-    It takes **no** transport lock (SPEC-028 FR-002): the stream is bound once at construction
-    and ``TextIOWrapper.write`` holds its own lock, so a line cannot be spliced. And it
-    **accepts emit after close** (SPEC-032 FR-003), because ``close()`` only flushes — the
+    It takes **no** transport lock (SPEC-028 FR-002), and the honest reason is that locking it
+    was out of scope there rather than that it needs none: ``emit`` writes one line per event, so
+    two threads' *batches* do interleave, exactly as they did in ``FileSink`` before its lock.
+    Individual lines survive — ``TextIOWrapper.write`` holds its own lock — but line integrity is
+    not the guarantee at stake, as ``test_file_sink_keeps_each_batch_contiguous_under_concurrent
+    _emitters`` records. Interleaved batches are harmless in a line-oriented stream that a
+    scraper reads per line, which is what this sink is for; a caller needing contiguity should
+    use ``FileSink``.
+
+    It **adds no post-close guard** (SPEC-032 FR-003), because ``close()`` only flushes — the
     stream belongs to the process, not to this sink, so a later batch still lands.
     """
 

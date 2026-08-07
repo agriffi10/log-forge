@@ -24,7 +24,7 @@ class TransformSink:
     are never mutated in place: only the function's return values are forwarded, so a transform
     must copy before mutating.
 
-    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
     belong to the inner sink. A guard here would refuse batches the inner sink would have taken.
     """

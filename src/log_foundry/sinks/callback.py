@@ -18,7 +18,7 @@ class CallbackSink:
     contract is that ``emit`` hands the batch to the callable unchanged and ``close`` invokes
     the close hook once when one was supplied.
 
-    It takes **no** transport lock (SPEC-028 FR-002) and **accepts emit after close**
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003). Both decisions belong to the callable: this class holds nothing, and what
     a hook releases is not knowable from here — a callable needing either guarantee must provide
     it, exactly as a hand-written ``Sink`` implementation would.
