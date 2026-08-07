@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from log_foundry import _diag
@@ -682,8 +683,53 @@ class Worker:
                 f"because the worker thread is still using it",
             )
             return
+        self._discard_spent_sentinel()
         self._close_if_owed()
         self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+    def _discard_spent_sentinel(self) -> None:
+        """Removes a ``_SHUTDOWN`` the drain thread exited without consuming.
+
+        ``shutdown`` sets ``_stop`` and *then* queues the sentinel, and that order is
+        deliberate — reversed, a thread that consumed the sentinel before ``_stop`` was set
+        would loop back into ``queue.get`` and block for another ``flush_interval``, turning a
+        cosmetic problem into a slow shutdown. The cost of the correct order is a window: the
+        drain loop can read ``_stop``, exit, and run :meth:`_final_drain` to completion in
+        between, leaving the sentinel in a queue nothing will ever read. Measured at roughly one
+        shutdown in 1500, and it stranded only the sentinel — never an event — but
+        ``health().queued`` then reports 1 for the life of the process, against a field
+        documented as counting submissions.
+
+        This runs only after a successful join, so the thread is provably gone and there is no
+        competing consumer; a concurrent ``submit`` is serialized by the queue's own mutex. Only
+        the sentinel is removed. Post-shutdown submissions stay queued on purpose — SPEC-030
+        defines ``submitted_after_shutdown`` as events "queued where nothing will drain them",
+        and draining them here to reach the sentinel would erase the evidence of that mistake,
+        which is also why ``get_nowait`` is not usable for this.
+
+        The private ``mutex``/``queue`` access is the one ``architecture.md`` §13 records for
+        :meth:`_release_waiters`, extended from a read to a write for the same reason: ``Queue``
+        publishes nothing that removes a *specific* item. Nothing in this module ever blocks on
+        ``put``, so no ``not_full`` waiter has to be notified, and ``task_done``/``join`` are
+        unused.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. A tidy-up must never become the reason ``shutdown()`` fails, least of all from
+            ``atexit`` (SPEC-025 FR-004).
+        """
+        try:
+            with self._queue.mutex:
+                self._queue.queue = deque(
+                    item for item in self._queue.queue if item is not _SHUTDOWN
+                )
+        except Exception:
+            pass
 
     def _join_closers(self, timeout: float | None) -> None:
         """Gives a swapped-out sink's close its last chance before the process exits.

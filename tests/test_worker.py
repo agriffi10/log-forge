@@ -1868,3 +1868,109 @@ def test_release_waiters_is_a_no_op_with_no_markers_queued() -> None:
 
     assert [item for item in worker._queue.queue if isinstance(item, list)] == []
     assert not [item for item in worker._queue.queue if isinstance(item, worker_mod._FlushMarker)]
+
+
+# -- The shutdown sentinel is not left behind (flake from SPEC-025's dd10712) ----------------
+
+
+def test_a_sentinel_the_thread_never_consumed_is_discarded() -> None:
+    """The race's end-state, reached deterministically instead of waited for.
+
+    `shutdown()` sets `_stop` and *then* queues `_SHUTDOWN`, so the drain loop can exit and
+    finish `_final_drain` in between, leaving the sentinel in a queue nothing will read. Here
+    the thread is stopped and joined first, so `shutdown()` is guaranteed to queue the sentinel
+    with no consumer left — which is precisely the losing interleaving, at 100% rather than the
+    ~1-in-1500 it occurs naturally.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.submit(_span("a"))
+
+    worker._stop.set()
+    worker._thread.join(timeout=5)
+    assert not worker._thread.is_alive(), "the thread must be gone before shutdown() runs"
+
+    worker.shutdown()
+
+    assert worker.health().queued == 0, "a spent sentinel is not a queued submission"
+    assert worker_mod._SHUTDOWN not in list(worker._queue.queue)
+    assert sink.events == [{"message": "a"}], "and the event was delivered, as it always was"
+
+
+def test_the_discard_leaves_real_submissions_that_are_queued_when_it_runs() -> None:
+    """SPEC-030 counts those as "queued where nothing will drain them" — the evidence stays.
+
+    This is why the sentinel is removed by rebuilding the deque rather than by draining the
+    queue: a `get_nowait` sweep would take these with it and erase the mistake being reported.
+
+    The submissions have to be in the queue **at the moment the discard runs**, or the test
+    cannot tell a selective removal from a wholesale one — during an ordinary shutdown the final
+    drain has already emptied the queue, so "drain everything here" is indistinguishable from
+    "remove the sentinel". Stopping the thread first is what puts real items in front of it.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker._stop.set()
+    worker._thread.join(timeout=5)
+    assert not worker._thread.is_alive()
+
+    worker.submit(_span("late"))
+    worker.submit(_span("later"))
+
+    worker.shutdown()  # queues the sentinel behind them, then discards only it
+
+    health = worker.health()
+    assert health.queued == 2, "the undeliverable submissions are still visible"
+    assert [item for item in worker._queue.queue if item is worker_mod._SHUTDOWN] == []
+    assert list(worker._queue.queue) == [_span("late"), _span("later")]
+
+
+def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
+    """The ordinary form of the same guarantee: submit after a completed shutdown."""
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.shutdown()
+
+    worker.submit(_span("late"))
+    worker.submit(_span("later"))
+
+    health = worker.health()
+    assert health.queued == 2
+    assert health.submitted_after_shutdown == 2
+
+
+def test_a_second_shutdown_does_not_disturb_what_is_queued() -> None:
+    """The idempotent path returns before the discard, and must leave the evidence alone."""
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.shutdown()
+    worker.submit(_span("late"))
+
+    worker.shutdown()
+
+    assert worker.health().queued == 1
+
+
+def test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread() -> None:
+    """A thread still running may yet consume it, so the discard must not run on that path.
+
+    Taking the sentinel away from a live thread removes the wake-up it was queued for: blocked
+    in ``queue.get(timeout=flush_interval)``, it would then linger for that whole interval, and
+    the idempotent second ``shutdown()`` does not re-queue one. The expired path returns before
+    the discard, and this pins that ordering.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set()), "the sink must be inside emit"
+
+    worker.shutdown(timeout=0.2)  # expires; the thread is still in emit
+
+    assert worker._thread.is_alive(), "the premise: the drain thread outlived the join"
+    assert worker.health().stopped_reason == "ShutdownTimeout"
+    assert worker_mod._SHUTDOWN in list(worker._queue.queue), (
+        "the sentinel is still the live thread's to consume"
+    )
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
