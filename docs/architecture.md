@@ -530,9 +530,9 @@ constraint — never by being deleted quietly.
   application thread parked on the orphan path inside a driver call with no timeout of its own
   delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and nothing
   after it. Running the close on a joinable daemon thread was built and **reverted**: at
-  interpreter exit that daemon is killed wherever it has reached — for `SQLiteSink`, between
-  `commit()` and `close()` — which converts the leaked handle FR-004 knowingly accepts into the
-  partial write it exists to avoid, and it could not tell a slow-but-successful close from a
+  interpreter exit that daemon is killed wherever it has reached — and for `SQLiteSink` that can
+  be *inside* `commit()`, which is the partial write FR-004 exists to avoid rather than the
+  leaked handle it knowingly accepts — and it could not tell a slow-but-successful close from a
   stuck one, so it reported `ShutdownTimeout` and "left open" for closes that had completed.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.

@@ -98,13 +98,13 @@ class SQLiteSink:
             *signal* about logging after a completed shutdown is a separate question, and
             SPEC-030's; this only keeps driver internals out of the answer.
         """
+        if not batch:
+            return
         rows = [
             (*(event.get(col) for col in _COLUMNS), json.dumps(event)) for event in batch
         ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
-        if not batch:
-            return
         with self._lock:
             if self._closed:
                 raise SinkDeliveryError(

@@ -111,6 +111,7 @@ class SocketTransport:
         self._counter_lock = threading.Lock()
         self.stop_signal: threading.Event | None = None
         self._lock = threading.Lock()
+        self._closed = False
 
     def send_all(self, messages: list[bytes]) -> None:
         """Sends each pre-framed message, reconnecting on error (FR-005, FR-006).
@@ -118,6 +119,11 @@ class SocketTransport:
         The lock spans the whole call, not each message: it also guards ``_sock``, which a
         reconnect rebinds, so releasing between messages would let another thread send on a
         socket this one is about to reset (SPEC-028 FR-002).
+
+        A closed transport refuses rather than reconnecting. ``_socket`` opens a connection
+        whenever it holds none and ``close`` only drops the one it has, so without this a single
+        ``log_foundry.info()`` after ``shutdown()`` would open a TCP connection nothing will ever
+        reap — measured, and the same leak ``RabbitMQSink`` had (SPEC-028).
 
         Args:
           messages: The exact bytes to put on the wire, one call per message.
@@ -130,9 +136,16 @@ class SocketTransport:
             this transport propagate a dead destination to the worker instead of reporting
             success (SPEC-026 FR-001). A partial send does not raise, because the worker's retry
             would re-send the messages that already landed, and an empty call is a no-op rather
-            than a total failure.
+            than a total failure. Also when the transport is already closed.
         """
+        if not messages:
+            return
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"SocketTransport delivered none of {len(messages)} message(s): "
+                    f"the transport is closed"
+                )
             delivered = 0
             for message in messages:
                 if self._send_one(message):
@@ -175,6 +188,7 @@ class SocketTransport:
           None.
         """
         with self._lock:
+            self._closed = True
             self._reset()
 
     def _send_one(self, message: bytes) -> bool:

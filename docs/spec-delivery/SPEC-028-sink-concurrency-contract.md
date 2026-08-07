@@ -193,9 +193,11 @@ green: fixes asserted rather than demonstrated.
   the corrections with only a docstring behind it, and its lock survived being narrowed to `with
   self._lock: pass` with the full suite green. The new test reports overlap across the whole
   `create_batch` → `add` → `send_batch` sequence, so narrowing is caught, not just removal.
-- **Post-close behaviour is now one rule across all six locked sinks** rather than three answers;
-  `ClickHouseSink`, `AzureEventHubsSink` and `NATSSink` had `close()` set their flag while `emit`
-  reached the driver anyway. An empty batch stays a no-op whether the sink is closed or not.
+- **Post-close behaviour is now one rule across every locked sink** rather than three answers.
+  That sentence read "all six locked sinks" for one round and was false three ways — nine classes
+  take a transport lock, one of the six named does not, and three unnamed ones still gave the old
+  answer. See the fourth round below. An empty batch stays a no-op whether the sink is closed
+  or not.
 - **`architecture.md` §13 said the opposite of what this branch claimed it said.** The worker
   docstring and this doc both stated the residual `shutdown()` delay was "recorded in §13"; §13
   asserted the delay was *bounded* because `shutdown()` takes a timeout — true before the revert,
@@ -207,3 +209,33 @@ Known and accepted: the lint proves a lock is entered on the path, not that it c
 is why every locked sink now has one. And a regression in `NATSSink`'s lock presents in CI as a
 job timeout rather than a red test, because the wedged threads are non-daemon; stated in the
 test's own docstring.
+
+
+## Fourth review round (pre-merge, PR #116)
+
+The third review confirmed every earlier blocker fixed and demonstrably tested, and then found the
+roster miss **again** — the fourth on this PR, and this time inside the fix for the third.
+`CLOSED_SINKS` was written by hand next to a rule it was supposed to enforce, naming six sinks when
+nine classes take a transport lock. The gap was not cosmetic: `SocketTransport` has no closed flag
+at all, `close()` is only `_reset()`, and `_socket()` reopens on demand — so one
+`log_foundry.info()` after `shutdown()` opened and leaked a live TCP connection, measured through
+the public API. That is verbatim the `RabbitMQSink` defect the previous round had just fixed and
+written up, in the more commonly deployed sink (`SyslogSink` and `LogstashSink` are core; `amqp` is
+an extra). `FileSink`, `RotatingFileSink` and `PostgresSink` carried the same shape more mildly:
+a flag `close()` honoured and `emit` ignored.
+
+- **All ten post-close guards now exist and are individually mutation-checked.** Removing any one
+  fails at least one test.
+- **The roster is derived, not written.** `test_every_locked_sink_has_a_post_close_case` computes
+  the locked classes from the same AST walk the contract lint uses and asserts the double map
+  covers them; locking a new sink's `emit` fails it until someone supplies a double. Verified by
+  dropping an entry and by locking `SNSSink` — both fail. Writing this also caught the parametrized
+  builder falling through to `NATSSink` for unrecognized names, which would have run four more NATS
+  cases while claiming to cover four new sinks.
+- **`_closed` is now written before the resources it guards disappear**, in all of them, matching
+  SPEC-025's recorded rule that a failed close is announced rather than retried.
+
+The pattern across four rounds is worth stating: the code has been broadly sound and the *claims
+about it* have not — an unbacked "recorded in §13", a fix with no test, a docstring describing a
+guarantee its lock did not provide, and three hand-written rosters. Every one was caught by a fresh
+context and none by CI, which is why `CLAUDE.md` now says green CI is not a review.

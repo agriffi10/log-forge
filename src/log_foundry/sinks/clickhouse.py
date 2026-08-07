@@ -162,9 +162,9 @@ class ClickHouseSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             if self._owns_client:
                 self.client.close()
-            self._closed = True
 
     def _row(self, event: dict[str, object]) -> list[object]:
         """Builds one row: the extracted columns, then the whole event as JSON.

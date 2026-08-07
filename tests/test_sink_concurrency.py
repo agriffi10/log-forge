@@ -1009,7 +1009,69 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     assert all(isinstance(err, Exception) for err in errors)
 
 
-CLOSED_SINKS = ["sqlite", "rabbitmq", "mongodb", "clickhouse", "eventhubs", "nats"]
+def _classes_taking_a_transport_lock() -> set[str]:
+    """Returns ``module.Class`` for every sink whose ``emit`` enters ``self._lock``.
+
+    Derived from the same AST walk the contract lint uses, so the post-close roster below cannot
+    drift away from the code the way a written list does.
+
+    Args:
+      None.
+
+    Returns:
+      The qualified names.
+
+    Raises:
+      None.
+    """
+    locked = set()
+    for stem, cls in _sink_classes_holding_a_driver():
+        helpers = {
+            m.name: m
+            for m in cls.body
+            if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        entry = helpers.get("emit") or helpers.get("send_all")
+        if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
+            locked.add(f"{stem}.{cls.name}")
+    return locked
+
+
+# Hand-written only because each sink needs its own driver double; the *coverage* of this map is
+# asserted against the AST by test_every_locked_sink_has_a_post_close_case below.
+CLOSED_SINKS = [
+    "sqlite", "rabbitmq", "mongodb", "clickhouse", "eventhubs", "nats",
+    "socket", "file", "rotating", "postgres",
+]
+
+_BUILDER_CLASSES = {
+    "sqlite": "sqlite.SQLiteSink",
+    "rabbitmq": "rabbitmq.RabbitMQSink",
+    "clickhouse": "clickhouse.ClickHouseSink",
+    "eventhubs": "eventhubs.AzureEventHubsSink",
+    "nats": "nats.NATSSink",
+    "socket": "_socket.SocketTransport",
+    "file": "file.FileSink",
+    "rotating": "file.RotatingFileSink",
+    "postgres": "postgres.PostgresSink",
+    # MongoDBSink takes no transport lock by design, but still needs the post-close rule.
+    "mongodb": "mongodb.MongoDBSink",
+}
+
+
+def test_every_locked_sink_has_a_post_close_case() -> None:
+    """The post-close roster is derived from the code, not written alongside it.
+
+    This PR missed the roster three times before this test existed: FR-002's own list of seven
+    sinks, then the lint's module scan, then ``CLOSED_SINKS`` itself — which named six sinks
+    while nine classes took a transport lock, leaving ``SocketTransport`` reopening and leaking a
+    live TCP connection on the orphan path after ``shutdown()``. A list maintained by hand next
+    to a rule is a list that drifts; this makes a new locked sink fail until someone gives it a
+    double.
+    """
+    covered = {_BUILDER_CLASSES[name] for name in CLOSED_SINKS}
+    missing = _classes_taking_a_transport_lock() - covered
+    assert not missing, f"locked sinks with no post-close test: {sorted(missing)}"
 
 
 def _build_closable(name: str, tmp_path: Path):
@@ -1114,13 +1176,41 @@ def _build_closable(name: str, tmp_path: Path):
 
         return eventhubs.AzureEventHubsSink(producer=Producer()), lambda: len(opened)
 
-    nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+    if name == "file":
+        return FileSink(str(tmp_path / "closed.ndjson")), lambda: 0
+    if name == "rotating":
+        return (
+            RotatingFileSink(str(tmp_path / "closed-rot.ndjson"), max_bytes=10_000),
+            lambda: 0,
+        )
+    if name == "socket":
+        fake = SplittingSocket()
 
-    class FakeClient:
-        async def publish(self, subject: str, payload: bytes) -> None:
-            opened.append("publish")
+        def make(host: str, port: int, timeout: float):
+            opened.append("connect")
+            return fake
 
-    return nats_mod.NATSSink("events", client=FakeClient()), lambda: len(opened)
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(_socket, "_make_tcp", make)
+        transport = _socket.SocketTransport("localhost", 5140)
+        transport.send_all([b"warm up "])
+        return transport, lambda: len(opened)
+    if name == "postgres":
+        from log_foundry.sinks.postgres import PostgresSink
+
+        connection = ExclusiveConnection()
+        return PostgresSink("events", connection=connection), lambda: connection.commits
+
+    if name == "nats":
+        nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+
+        class FakeClient:
+            async def publish(self, subject: str, payload: bytes) -> None:
+                opened.append("publish")
+
+        return nats_mod.NATSSink("events", client=FakeClient()), lambda: len(opened)
+
+    raise AssertionError(f"no double for {name!r}")
 
 
 @pytest.mark.parametrize("name", CLOSED_SINKS)
@@ -1141,7 +1231,10 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     before = driver_calls()
 
     with pytest.raises(SinkDeliveryError):
-        sink.emit([event(0, 0)])
+        if name == "socket":
+            sink.send_all([b"<14>1 after close"])
+        else:
+            sink.emit([event(0, 0)])
 
     assert driver_calls() == before, f"{name} reached its driver after close()"
 
@@ -1153,7 +1246,10 @@ def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver."""
     sink, _ = _build_closable(name, tmp_path)
     sink.close()
-    sink.emit([])
+    if name == "socket":
+        sink.send_all([])
+    else:
+        sink.emit([])
 
 
 def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(

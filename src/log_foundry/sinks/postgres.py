@@ -125,6 +125,10 @@ class PostgresSink:
         if not batch:
             return
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
+                )
             self._insert_batch(batch)
 
     def _insert_batch(self, batch: list[dict[str, object]]) -> None:
@@ -183,10 +187,10 @@ class PostgresSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             self._conn.commit()
             if self._owns_connection:
                 self._conn.close()
-            self._closed = True
 
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the extracted columns, then the whole event as JSON.
