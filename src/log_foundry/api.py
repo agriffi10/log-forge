@@ -30,6 +30,12 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     the sink resolved through ``_ensure_sink`` so a zero-config orphan log falls back to
     ``StdoutSink`` rather than crashing.
 
+    That direct handoff is **settled, not pending**: SPEC-004's worker took over the traced
+    path and this branch was deliberately left synchronous, so a level call outside a span is
+    never silently dropped for want of a worker (``architecture.md`` §12 Resolved, "Orphan
+    logs"). It carried a comment saying the worker "will later" own it long after the
+    decision was made (SPEC-031 FR-003).
+
     The orphan branch is the one that reaches the sink on the caller's own thread, with no
     worker between them to absorb a failure, so the whole branch is guarded (SPEC-025
     FR-003) — ``_ensure_sink`` constructs the sink on first use, so a sink that fails to

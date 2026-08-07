@@ -1802,3 +1802,56 @@ def test_a_hung_swapped_out_close_does_not_stop_the_exit_drain(tmp_path) -> None
         "atexit ran, so the sink still receiving events was drained and closed"
     )
     assert "delivered=4" in result.stdout, "and its buffered events reached it"
+
+
+# -- SPEC-031 FR-005: _release_waiters against queue.Queue's internals -----------------------
+
+
+def test_release_waiters_answers_markers_among_queued_event_lists() -> None:
+    """A CPython change to ``Queue.mutex``/``Queue.queue`` must fail here, not go silent.
+
+    ``_release_waiters`` swallows its own exceptions, so without this the symptom of a broken
+    private access would be flush waiters timing out after a terminal worker failure — nothing
+    raised, nothing logged. The mixed queue is the case that matters: the markers must be
+    picked out of real submissions, and those submissions must survive the sweep because
+    ``health().queued`` and the terminal-failure line report them as the evidence of what was
+    lost (architecture.md §13).
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=1000, flush_interval=60.0)
+    try:
+        worker._stop.set()  # keep the drain thread out of the queue for the duration
+        time.sleep(0.05)
+
+        first = worker_mod._FlushMarker(seen_failures=0)
+        second = worker_mod._FlushMarker(seen_failures=0)
+        worker._queue.put_nowait(_span("a"))
+        worker._queue.put_nowait(first)
+        worker._queue.put_nowait(_span("b"))
+        worker._queue.put_nowait(second)
+        worker._queue.put_nowait(_span("c"))
+        depth = worker._queue.qsize()
+
+        worker._release_waiters()
+
+        assert first.event.is_set(), "a marker mid-queue was not answered"
+        assert second.event.is_set(), "a second marker mid-queue was not answered"
+        assert first.delivered is False, "each keeps its pessimistic verdict, which is the truth"
+        assert second.delivered is False
+        assert worker._queue.qsize() == depth, (
+            "the markers were read, not consumed — the queued event-lists are the evidence"
+        )
+        remaining = [item for item in worker._queue.queue if isinstance(item, list)]
+        assert remaining == [_span("a"), _span("b"), _span("c")]
+    finally:
+        worker.shutdown()
+
+
+def test_release_waiters_is_a_no_op_on_an_empty_queue() -> None:
+    sink = RecordingSink()
+    worker = Worker(sink)
+    try:
+        worker._release_waiters()  # must not raise
+        assert worker._queue.qsize() == 0
+    finally:
+        worker.shutdown()

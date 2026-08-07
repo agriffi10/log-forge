@@ -223,8 +223,9 @@ While a span is active, user code has two complementary capabilities:
    to the sink (→ ELK). This is the bread-and-butter path.
 
 2. **Echo a message to the console** — for surfacing something to an **end user at a
-   terminal** or to a **Lambda's stdout** (→ CloudWatch) *immediately*, without waiting
-   for the async flush. Triggered per-call via `echo=True`:
+   terminal** or to a **Lambda's captured console output** (→ CloudWatch) *immediately*,
+   without waiting for the async flush. It goes to **stderr**, not stdout (SPEC-031 FR-003
+   corrected the earlier claim here and in §12). Triggered per-call via `echo=True`:
 
    ```python
    log_foundry.info("payment complete", echo=True)
@@ -238,9 +239,13 @@ Console echo characteristics:
   a person or a log scraper, distinct from the structured record sent to the sink.
 - **Additive, not a redirect** — an echoed event *still* goes into the span queue and on
   to the sink. Echo just gives it a second, instant audience.
-- **Configurable** — global defaults set the destination (stdout/stderr), the line
-  format, and an optional `echo_level` (e.g. auto-echo everything `>= WARNING`);
-  per-call `echo=` overrides. Implemented behind a tiny `ConsoleWriter`, kept separate
+- ~~**Configurable** — global defaults set the destination (stdout/stderr), the line
+  format, and an optional `echo_level` (e.g. auto-echo everything `>= WARNING`)~~ —
+  **corrected by SPEC-031 FR-003**, which found this describes a configuration surface that
+  was never built and that §12 Resolved had already declined. What shipped: **per-call
+  `echo=` only**, a fixed `LEVEL   message` line, and a stream chosen at `ConsoleWriter`
+  construction (stderr by default) — there is no global echo destination, format or
+  threshold, and no `set_stream()`. Implemented behind a tiny `ConsoleWriter`, kept separate
   from the async `Sink`.
 
 ---
@@ -541,9 +546,13 @@ constraint — never by being deleted quietly.
   silently conditional on decorator placement, which is the opposite of what a logging call should
   promise. That synchronous path is also why `sanitize` must be total (SPEC-017).
 - **Console echo defaults** (destination, line format, an `echo_level` threshold) → **shipped in
-  SPEC-002**: `console.py` echoes to **stdout**, opt-in per call, no automatic `echo_level`
+  SPEC-002**: ~~`console.py` echoes to **stdout**~~ — **corrected by SPEC-031 FR-003**, which
+  found the claim false against the code: `ConsoleWriter` has defaulted to **stderr** since it
+  shipped, per the twelve-factor convention `StderrSink` cites (logs on stderr, the application's
+  own output on stdout). Echo is opt-in per call with no automatic `echo_level`
   threshold. Auto-echo was declined rather than deferred — it would double every event's cost by
-  default for a development convenience.
+  default for a development convenience. The stream is bound at construction, so a later
+  `redirect_stderr` is not honoured and an explicit `stream=` is how a test captures the output.
 - **Backpressure** (make drop-vs-block configurable) → **not built; a constraint, not a wart.**
   Overflow is drop-newest with a counter and a throttled stderr warning (§9, SPEC-017 FR-005), and
   blocking would put sink latency back on the caller's thread — the one thing arch §9 exists to
@@ -599,6 +608,27 @@ constraint — never by being deleted quietly.
   post-close guarantee is not read as covering it. **Owned by SPEC-031 FR-006** (added 2026-08-07),
   which strikes this entry through when it lands: it is a defect awaiting a fix, not a constraint
   this project accepts, and it sits in §13 only until then.
+
+- **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
+  alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
+  to find the `flush()` markers still queued when the drain thread has died terminally, so no
+  caller sits out its full timeout on a thread that is never coming back. The audit that
+  produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than changing it**,
+  per SPEC-021's rule that an open item is closed by being fixed, settled, or recorded.
+
+  Why no alternative: the markers must be *read* and not *consumed*. `Queue` publishes only
+  `get`/`put`/`qsize` — nothing that inspects without removing — and the draining alternative
+  (get everything, answer the markers, put the rest back) would destroy the queued event-lists
+  that `health().queued` and SPEC-019's terminal-failure line report as the evidence of what was
+  lost. Snapshotting under the queue's own mutex is also what makes it impossible to miss a
+  marker mid-iteration.
+
+  What would break: a future CPython that renames or removes `Queue.mutex` or `Queue.queue`, or
+  changes `queue` to a non-iterable container. The failure would be an `AttributeError` or
+  `TypeError` inside `_release_waiters`, which swallows it — so the visible symptom would be
+  flush waiters silently timing out after a terminal worker failure, not a crash. A test
+  exercises the method against a queue holding a mix of markers and event-lists, so the change
+  surfaces as a test failure on a new interpreter rather than as that silence.
 
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,

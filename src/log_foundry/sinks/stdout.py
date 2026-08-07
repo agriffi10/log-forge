@@ -29,10 +29,15 @@ class StdoutSink:
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:
-        """Binds the sink to an output stream.
+        """Binds the sink to an output stream, once, at construction.
+
+        The binding is deliberate and permanent for the life of the sink: a later
+        ``contextlib.redirect_stdout`` or a test's capture of ``sys.stdout`` is not honoured,
+        because the attribute was resolved here. Passing ``stream=`` explicitly is how a caller
+        — a test above all — captures the output (SPEC-031 FR-003).
 
         Args:
-          stream: The stream to write to, defaulting to ``sys.stdout``.
+          stream: The stream to write to, defaulting to ``sys.stdout`` as resolved now.
 
         Returns:
           None.

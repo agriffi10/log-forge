@@ -543,3 +543,47 @@ def test_the_sign_test_cannot_be_diverted_by_an_int_subclass() -> None:
             return False  # claims to be non-negative, to buy a byte past the ceiling
 
     assert isinstance(coerce(Liar(-(10**9)), cfg=Config(max_value_bytes=10)), str)
+
+
+# -- SPEC-031 FR-004: the interpreter's integer limit is read once per pass ------------------
+
+
+def test_the_interpreter_limit_is_read_once_per_pass_not_once_per_integer(monkeypatch) -> None:
+    """It cannot change during a pass, and it sat on a hot path measured per value."""
+    import sys as sys_mod
+
+    real = sys_mod.get_int_max_str_digits
+    calls: list[int] = []
+
+    def counting() -> int:
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(sys_mod, "get_int_max_str_digits", counting)
+    fields, _ = sanitize_fields(
+        {"a": list(range(200)), "b": {str(i): i for i in range(200)}}, cfg=Config(max_keys=500)
+    )
+
+    assert fields["a"][7] == 7, "the pass really did coerce integers"
+    assert len(calls) <= 1, f"read the interpreter limit {len(calls)} times in one pass"
+
+
+def test_the_boundary_behaviour_of_spec_020_is_unchanged_by_the_cached_ceiling() -> None:
+    """The same integers are replaced and the same placeholders produced, sign included."""
+    import sys as sys_mod
+
+    limit = sys_mod.get_int_max_str_digits()
+    at_limit = 10 ** (limit - 1)  # exactly `limit` digits
+    past_limit = 10**limit  # one digit too many
+
+    cfg = Config(max_value_bytes=limit + 10)  # the interpreter's limit is the lower of the two
+    fields, truncated = sanitize_fields(
+        {"at": at_limit, "past": past_limit, "neg_at": -at_limit}, cfg=cfg
+    )
+
+    assert fields["at"] == at_limit
+    assert fields["past"] == f"<int: ~{limit + 1} digits>"
+    assert fields["neg_at"] == f"<int: ~{limit} digits>", (
+        "the sign pushes a negative at the limit one over — SPEC-021 FR-003, unchanged"
+    )
+    assert truncated is True

@@ -196,3 +196,38 @@ def test_function_is_bounded_like_message() -> None:
     event = model.build_event(span, "INFO", "m", fields={}, baggage={})
     assert len(event["function"].encode()) <= 32
     assert event["truncated"] is True
+
+
+# -- SPEC-031 FR-004: the per-call imports are resolved once ---------------------------------
+
+
+def test_the_event_builders_carry_no_function_local_imports() -> None:
+    """They were local to dodge a cycle that does not exist; this is the hottest path here."""
+    import inspect
+
+    for func in (model.build_event, model.end_event, model.backfill_baggage):
+        body = inspect.getsource(func)
+        code = body.split('"""')[2] if body.count('"""') >= 2 else body
+        assert "import " not in code, f"{func.__name__} still imports per call"
+
+
+def test_the_resolved_names_are_the_real_ones() -> None:
+    from log_foundry import ids
+
+    assert model.get_config is config.get_config
+    assert model.new_log_id is ids.new_log_id
+
+
+def test_importing_the_package_in_a_clean_interpreter_still_works() -> None:
+    """The module-scope imports must not have introduced a cycle (FR-004 acceptance)."""
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-c", "import log_foundry; import log_foundry.model; print('ok')"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "ok" in done.stdout

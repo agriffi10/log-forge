@@ -34,6 +34,10 @@ class SyslogSink:
     and a severity mapped from the event's level. UDP sends one datagram per event, TCP uses
     octet-counted framing (RFC 6587), and the whole sink is dependency-free.
 
+    Both IPv4 and IPv6 destinations are supported, on either transport (SPEC-031 FR-002): the
+    UDP socket's address family is resolved from ``host`` rather than assumed, which is what an
+    unconditional ``AF_INET`` used to make impossible.
+
     It takes **no** transport lock (SPEC-028 FR-002) of its own: the socket it holds is a
     :class:`~log_foundry.sinks._socket.SocketTransport`, which locks its own sends. Its
     post-close refusal comes from there too (SPEC-032 FR-004) — a batch emitted after

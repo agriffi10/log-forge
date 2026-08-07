@@ -113,12 +113,16 @@ class RotatingFileSink:
     Two independent triggers may be enabled, either or both. With a positive ``max_bytes`` it
     rotates before the write that would push the active file past that size, so the file never
     grows unbounded; with a ``when`` unit code and an interval it rotates on the first emit after
-    that period has elapsed since the last rotation.
+    that period has elapsed since the last rotation. That period is measured on the monotonic
+    clock (SPEC-031 FR-001), so a wall-clock step in either direction neither defers a rotation
+    nor forces an early one.
 
     Rotation renames the active file through numbered backups, prunes any beyond the backup
     count, and opens a fresh active file — a backup count of zero keeps none, simply replacing
-    the active file. No event is lost across a rotation, because the rotate happens before the
-    pending event is written and the event lands in the fresh file.
+    the active file. Backups are numbered rather than timestamped, so no filename derives from
+    a clock at all and the monotonic deadline has no naming consequence. No event is lost across
+    a rotation, because the rotate happens before the pending event is written and the event
+    lands in the fresh file.
 
     A rotation rebinds the active stream, so it is the sink where concurrent writers did real
     damage: a second thread mid-``emit`` could write to the handle rotation had just closed, or
@@ -249,23 +253,33 @@ class RotatingFileSink:
         return unit * interval
 
     def _schedule_next(self) -> float | None:
-        """Returns the wall-clock time of the next time-based rotation.
+        """Returns the monotonic-clock deadline for the next time-based rotation (SPEC-031).
+
+        Monotonic rather than wall-clock for the reason ``Span.start_ts`` is: a backward step —
+        an NTP correction, a container clock sync — larger than the interval would otherwise
+        defer every time-based rotation until wall-clock caught up, silently defeating this
+        class's promise to bound on-disk growth. Nothing here is a timestamp anyone reads; it is
+        only ever compared against another reading of the same clock.
 
         Args:
           None.
 
         Returns:
-          The absolute time, or ``None`` when there is no time trigger.
+          The deadline as a ``time.monotonic()`` reading, or ``None`` when there is no time
+          trigger.
 
         Raises:
           None.
         """
         if self._interval_seconds is None:
             return None
-        return time.time() + self._interval_seconds
+        return time.monotonic() + self._interval_seconds
 
     def _should_rotate(self, incoming: int) -> bool:
         """Decides whether to rotate before writing the next event.
+
+        The time trigger reads ``time.monotonic()``, the same clock :meth:`_schedule_next`
+        wrote the deadline on; comparing the two clocks is what the SPEC-031 fix removes.
 
         Args:
           incoming: The byte cost of the event about to be written.
@@ -282,7 +296,7 @@ class RotatingFileSink:
             and self._size + incoming > self._max_bytes
         ):
             return True
-        return self._next_rollover is not None and time.time() >= self._next_rollover
+        return self._next_rollover is not None and time.monotonic() >= self._next_rollover
 
     def _rotate(self) -> None:
         """Closes the active file, shifts and prunes backups, then opens a fresh active file.
