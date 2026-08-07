@@ -212,7 +212,7 @@ def test_a_sink_that_refuses_the_signal_does_not_stop_the_worker(capsys) -> None
 def test_the_socket_transport_backoff_is_interruptible(monkeypatch) -> None:
     from test_sinks_syslog import RefusingSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", RefusingSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=3)
     transport.stop_signal = threading.Event()
     transport.stop_signal.set()
@@ -376,7 +376,7 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
     from test_sinks_sqs import FakeSQSClient
     from test_sinks_syslog import FakeSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: FakeSocket())
     return [
         HTTPSink("http://x", opener=FakeOpener()),
         SyslogSink("h", transport="udp"),
@@ -418,7 +418,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
     from log_foundry.sinks.syslog import SyslogSink
     from test_sinks_syslog import FakeSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: FakeSocket())
     monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: FakeSocket())
 
     for sink, backend in (
@@ -548,7 +548,7 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
     from log_foundry.sinks.transform import TransformSink
     from test_sinks_syslog import FakeSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", FakeSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: FakeSocket())
     inner = SyslogSink("h", transport="udp")
     http = HTTPSink("http://x", opener=FakeOpener())
 

@@ -49,7 +49,7 @@ def test_tcp_socket_mode_sends_json_lines(monkeypatch) -> None:
 
 def test_udp_socket_mode_sends_datagrams(monkeypatch) -> None:
     fake = FakeSocket()
-    monkeypatch.setattr(socket_mod, "_make_udp", lambda: fake)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: fake)
     sink = LogstashSink(host="ls", port=5044, transport="udp")
     sink.emit([{"a": 1}])
     assert fake.sent == [(b'{"a": 1}\n', ("ls", 5044))]

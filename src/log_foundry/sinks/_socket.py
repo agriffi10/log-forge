@@ -33,21 +33,45 @@ def _make_tcp(host: str, port: int, timeout: float) -> socket.socket:
     return socket.create_connection((host, port), timeout=timeout)
 
 
-def _make_udp() -> socket.socket:
-    """Opens an unconnected UDP socket.
+def _make_udp(host: str) -> socket.socket:
+    """Opens an unconnected UDP socket in an address family the host resolves to (SPEC-031).
+
+    The family is resolved rather than assumed: a hardcoded ``AF_INET`` made every ``sendto``
+    to an IPv6 destination fail, silently, until the retry bound abandoned the message. TCP
+    never had the defect because ``socket.create_connection`` resolves for itself.
+
+    **IPv4 wins when the host offers it**, and taking the first result instead was measured
+    losing logs. ``getaddrinfo`` sorts by RFC 6724, which puts AAAA first, so a dual-stack
+    name like ``localhost`` would move from IPv4 — where every deployment of this library has
+    sent — to IPv6, and a collector bound to ``0.0.0.0:514`` would never see the datagram. UDP
+    is unconnected, so that failure is *silent*: ``sendto`` succeeds locally, ``emit`` returns,
+    and no counter moves. FR-002 AC-2 requires delivery to a hostname to be unchanged, and
+    this is what makes it so while AC-1 still holds. It is a fixed preference, not
+    happy-eyeballs, address caching, or a setting — none of which this FR builds.
 
     This is a module-level seam so tests can substitute a fake socket without network access.
 
     Args:
-      None.
+      host: The destination host, resolved to choose the family.
 
     Returns:
       The socket.
 
     Raises:
-      OSError: If the socket cannot be created.
+      OSError: If the host resolves to nothing, or the socket cannot be created. Both reach
+        ``_send_one``'s handler, which counts and announces rather than raising — a
+        ``gaierror`` is an ``OSError``, so an unresolvable host fails exactly as an
+        unreachable one already did. The empty-result case is raised as one explicitly: CPython
+        raises rather than returning ``[]``, but indexing it would produce an ``IndexError``,
+        which is *not* an ``OSError`` and would escape that handler into the caller — the one
+        thing SPEC-025 says this library may never do.
     """
-    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    families = [entry[0] for entry in socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)]
+    if not families:
+        raise socket.gaierror(socket.EAI_NONAME, "resolution returned no address family")
+    return socket.socket(
+        socket.AF_INET if socket.AF_INET in families else families[0], socket.SOCK_DGRAM
+    )
 
 
 class SocketTransport:
@@ -235,6 +259,10 @@ class SocketTransport:
     def _socket(self) -> socket.socket:
         """Returns the held socket, opening one if none is held.
 
+        The UDP address family is resolved here rather than per message, because this is the
+        only place a socket is created and the socket outlives every send made through it
+        (SPEC-031 FR-002).
+
         Args:
           None.
 
@@ -242,11 +270,11 @@ class SocketTransport:
           The socket.
 
         Raises:
-          OSError: If the socket cannot be created or connected.
+          OSError: If the socket cannot be created, resolved or connected.
         """
         if self._sock is None:
             self._sock = (
-                _make_udp() if self._transport == "udp" else _make_tcp(
+                _make_udp(self._host) if self._transport == "udp" else _make_tcp(
                     self._host, self._port, self._timeout
                 )
             )

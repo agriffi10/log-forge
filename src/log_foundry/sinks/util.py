@@ -20,11 +20,16 @@ class StderrSink(StdoutSink):
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:
-        """Binds the sink to an output stream.
+        """Binds the sink to an output stream, once, at construction.
+
+        The binding is resolved here and not re-read per write, so a later
+        ``contextlib.redirect_stderr`` is not honoured — the same property
+        :class:`~log_foundry.sinks.stdout.StdoutSink` documents (SPEC-031 FR-003), restated
+        because this override means none of that docstring is inherited.
 
         Args:
-          stream: The stream to write to, defaulting to ``sys.stderr``. An explicit one, such
-            as a ``StringIO``, can be injected for capture.
+          stream: The stream to write to, defaulting to ``sys.stderr`` as resolved now. An
+            explicit one, such as a ``StringIO``, can be injected for capture.
 
         Returns:
           None.

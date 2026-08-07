@@ -24,6 +24,18 @@ class LogstashSink:
     :class:`~log_foundry.sinks._socket.SocketTransport`. Either backend handles its own bounded
     retry and raises on total failure of its own accord, so ``emit`` needs no rule of its own.
 
+    In socket mode both IPv4 and IPv6 destinations are supported, over either transport
+    (SPEC-031 FR-002): the UDP socket's address family is resolved from ``host`` rather than
+    assumed, which is what an unconditional ``AF_INET`` used to make impossible.
+
+    **A hostname that resolves to both families goes to IPv4**, because that is where every
+    release before this one sent and moving it silently would strand a collector bound to
+    ``0.0.0.0``. The consequence is the mirror case, stated because nothing else states it: a
+    dual-stack *name* whose collector listens on IPv6 only will not be reached over UDP, and
+    since UDP is unconnected that failure is silent — no exception, no counter. Give the IPv6
+    literal, or a name with no ``A`` record, to select IPv6 for such a destination. TCP is
+    unaffected either way; ``create_connection`` tries each candidate in turn.
+
     It takes **no** transport lock (SPEC-028 FR-002) of its own: whichever backend it built owns
     that decision — ``SocketTransport`` locks its sends, ``HTTPSink`` holds no transport to
     guard. The post-close rule follows the same split (SPEC-032 FR-004), and the two modes

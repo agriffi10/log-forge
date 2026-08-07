@@ -1802,3 +1802,69 @@ def test_a_hung_swapped_out_close_does_not_stop_the_exit_drain(tmp_path) -> None
         "atexit ran, so the sink still receiving events was drained and closed"
     )
     assert "delivered=4" in result.stdout, "and its buffered events reached it"
+
+
+# -- SPEC-031 FR-005: _release_waiters against queue.Queue's internals -----------------------
+
+
+def test_release_waiters_answers_markers_among_queued_event_lists() -> None:
+    """A CPython change to ``Queue.mutex``/``Queue.queue`` must fail here, not go silent.
+
+    ``_release_waiters`` swallows its own exceptions, so without this the symptom of a broken
+    private access would be flush waiters timing out after a terminal worker failure — nothing
+    raised, nothing logged. The mixed queue is the case that matters: the markers must be
+    picked out of real submissions, and those submissions must survive the sweep because
+    ``health().queued`` and the terminal-failure line report them as the evidence of what was
+    lost (architecture.md §13).
+
+    The worker is shut down *before* the queue is seeded, which is both the real scenario — this
+    method exists for a drain thread that is gone — and the only way to make the test
+    deterministic. Setting ``_stop`` is not enough and looks like it is: the thread is parked in
+    ``queue.get(timeout=flush_interval)`` and only re-reads the flag after that returns, so it
+    is still on the queue and consumes the first item put there. The earlier shape passed only
+    because the puts fit inside one switch interval, and failed as ``deque mutated during
+    iteration`` under a tightened one.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=1000, flush_interval=60.0)
+    worker.shutdown()
+    assert not worker._thread.is_alive(), "nothing may consume what this test puts on the queue"
+
+    first = worker_mod._FlushMarker(seen_failures=0)
+    second = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(_span("a"))
+    worker._queue.put_nowait(first)
+    worker._queue.put_nowait(_span("b"))
+    worker._queue.put_nowait(second)
+    worker._queue.put_nowait(_span("c"))
+    depth = worker._queue.qsize()
+
+    worker._release_waiters()
+
+    assert first.event.is_set(), "a marker mid-queue was not answered"
+    assert second.event.is_set(), "a second marker mid-queue was not answered"
+    assert first.delivered is False, "each keeps its pessimistic verdict, which is the truth"
+    assert second.delivered is False
+    assert worker._queue.qsize() == depth, (
+        "the markers were read, not consumed — the queued event-lists are the evidence"
+    )
+    remaining = [item for item in worker._queue.queue if isinstance(item, list)]
+    assert remaining == [_span("a"), _span("b"), _span("c")]
+
+
+def test_release_waiters_is_a_no_op_with_no_markers_queued() -> None:
+    """Asserted on the contents rather than ``qsize()``, which has a shutdown window.
+
+    ``Worker.shutdown`` sets ``_stop`` and puts ``_SHUTDOWN`` non-atomically, so a drain thread
+    that finishes between the two leaves the sentinel queued forever. That is a reporting
+    artifact rather than loss — it is a sentinel, not an event — but it is enough to flake a
+    bare ``qsize() == 0``.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink)
+    worker.shutdown()
+
+    worker._release_waiters()  # must not raise
+
+    assert [item for item in worker._queue.queue if isinstance(item, list)] == []
+    assert not [item for item in worker._queue.queue if isinstance(item, worker_mod._FlushMarker)]

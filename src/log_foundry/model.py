@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from log_foundry.config import get_config
+from log_foundry.ids import new_log_id
 from log_foundry.sanitize import sanitize_fields, truncate_str, truncate_tail
 
 if TYPE_CHECKING:
@@ -72,6 +74,12 @@ def build_event(
     bounded too, since both are caller-supplied text and leaving either out would keep
     ``info(huge_string)`` unbounded.
 
+    ``get_config`` and ``new_log_id`` are imported at module scope (SPEC-031 FR-004). They were
+    function-local to avoid a cycle, but there is none to avoid: neither ``config`` nor ``ids``
+    imports this module, and ``config``'s own back-references to ``decorator`` stay local for
+    the reason its docstrings give. This is the hottest path in the library, so resolving them
+    once at import is what ``sanitize`` already does with its one-time bindings.
+
     Args:
       span: The span the event belongs to, supplying identity and defaults.
       level: The severity label, such as ``"INFO"``.
@@ -85,9 +93,6 @@ def build_event(
     Raises:
       None.
     """
-    from log_foundry.config import get_config
-    from log_foundry.ids import new_log_id
-
     cfg = get_config()
     merged: dict[str, object] = {**cfg.defaults, **span.defaults, **baggage, **fields}
     safe, clipped = sanitize_fields(merged, cfg=cfg)
@@ -226,8 +231,6 @@ def end_event(
     Raises:
       None.
     """
-    from log_foundry.config import get_config
-
     level = "INFO" if status == "ok" else "ERROR"
     event = build_event(span, level, _END_MESSAGE, fields={}, baggage={})
     event["duration_ms"] = (time.monotonic() - span.start_ts) * 1000.0
@@ -266,8 +269,6 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
     """
     if not baggage:
         return
-    from log_foundry.config import get_config
-
     safe, clipped = sanitize_fields(baggage, cfg=get_config())
     for event in span.events:
         if event.get("message") in (_START_MESSAGE, _END_MESSAGE):

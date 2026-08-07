@@ -260,7 +260,7 @@ class _HalfDeadSocket:
 def test_socket_transport_raises_when_nothing_was_sent(monkeypatch) -> None:
     from test_sinks_syslog import RefusingSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", RefusingSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
 
@@ -272,7 +272,7 @@ def test_socket_transport_raises_when_nothing_was_sent(monkeypatch) -> None:
 def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
     """The worker's retry would re-send the message that already landed."""
     sock = _HalfDeadSocket()
-    monkeypatch.setattr(socket_mod, "_make_udp", lambda: sock)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
 
@@ -283,7 +283,7 @@ def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
 
 
 def test_an_empty_send_is_not_a_total_failure(monkeypatch) -> None:
-    monkeypatch.setattr(socket_mod, "_make_udp", lambda: _HalfDeadSocket())
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: _HalfDeadSocket())
     socket_mod.SocketTransport("h", 1, transport="udp").send_all([])  # must not raise
 
 
@@ -292,7 +292,7 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
     from log_foundry.sinks.syslog import SyslogSink
     from test_sinks_syslog import RefusingSocket
 
-    monkeypatch.setattr(socket_mod, "_make_udp", RefusingSocket)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     sink = SyslogSink("loghost", transport="udp", max_retries=0)
     worker = Worker(sink, batch_size=1, max_retries=0)
@@ -640,7 +640,7 @@ def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
     from test_sinks_syslog import RefusingSocket
 
     sock = RefusingSocket()
-    monkeypatch.setattr(socket_mod, "_make_udp", lambda: sock)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=-1)
 

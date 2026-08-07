@@ -142,7 +142,7 @@ class _Coercer:
     ``build_event`` already allocates per event, it is noise.
     """
 
-    __slots__ = ("_cfg", "_parents", "truncated")
+    __slots__ = ("_cfg", "_int_ceiling", "_parents", "truncated")
 
     def __init__(self, cfg: Config) -> None:
         """Starts a pass with the configured ceilings and an empty ancestor chain.
@@ -151,6 +151,11 @@ class _Coercer:
         Ancestors only, never a global "visited" set: an ancestor is held alive by the
         recursion for the whole descent, so its ``id()`` cannot be recycled underneath us, and
         two siblings referencing the same object are not a cycle and must both render.
+
+        The integer ceiling is resolved here, once per pass rather than once per integer
+        (SPEC-031 FR-004): it reads ``sys.get_int_max_str_digits()``, which cannot change
+        during a coercion pass, and the alternative sat four lines below an ``int.__lt__``
+        binding justified by this being a per-value hot path.
 
         Args:
           cfg: The config supplying ``max_value_bytes``, ``max_keys`` and ``max_depth``.
@@ -162,6 +167,7 @@ class _Coercer:
           None.
         """
         self._cfg = cfg
+        self._int_ceiling = _int_digit_ceiling(cfg.max_value_bytes)
         self.truncated = False
         self._parents: list[int] = []
 
@@ -368,7 +374,7 @@ class _Coercer:
         """
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
         rendered = digits + 1 if _INT_LT(value, 0) else digits
-        if rendered <= _int_digit_ceiling(self._cfg.max_value_bytes):
+        if rendered <= self._int_ceiling:
             return value
         self.truncated = True
         return f"<int: ~{digits} digits>"

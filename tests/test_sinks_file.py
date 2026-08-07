@@ -137,12 +137,64 @@ def test_time_trigger_rotates_once_interval_elapsed(tmp_path) -> None:
     path = str(tmp_path / "t.ndjson")
     sink = RotatingFileSink(path, when="S", interval=1, backup_count=1)
     sink.emit([{"n": 1}])
-    # Force the interval to have elapsed rather than sleeping (deterministic).
-    sink._next_rollover = time.time() - 1
+    # Force the interval to have elapsed rather than sleeping (deterministic). The deadline is
+    # a time.monotonic() reading since SPEC-031 FR-001, so it is stepped on that clock.
+    sink._next_rollover = time.monotonic() - 1
     sink.emit([{"n": 2}])
     sink.close()
     assert read_events(f"{path}.1") == [{"n": 1}]
     assert read_events(path) == [{"n": 2}]
+
+
+def test_a_backward_wall_clock_step_does_not_defer_rotation(tmp_path, monkeypatch) -> None:
+    """SPEC-031 FR-001 — the defect: an NTP correction used to postpone every time rotation.
+
+    The wall clock is stepped back by a day, far more than the one-second interval, while the
+    monotonic clock advances by one interval of *real* elapsed time. Against ``time.time()``
+    the deadline sat 86400 s in the future and nothing rotated.
+    """
+    path = str(tmp_path / "back.ndjson")
+    sink = RotatingFileSink(path, when="S", interval=1, backup_count=1)
+    sink.emit([{"n": 1}])
+
+    elapsed = time.monotonic()
+    monkeypatch.setattr(time, "time", lambda: 0.0)
+    monkeypatch.setattr(time, "monotonic", lambda: elapsed + 1.5)
+    sink.emit([{"n": 2}])
+    sink.close()
+
+    assert read_events(f"{path}.1") == [{"n": 1}]
+    assert read_events(path) == [{"n": 2}]
+
+
+def test_a_forward_wall_clock_step_does_not_rotate_early(tmp_path, monkeypatch) -> None:
+    """SPEC-031 FR-001 — the trigger no longer tracks the wall clock in either direction.
+
+    The step is a day, which clears the one-hour wall-clock deadline the old code computed, so
+    it rotated. The monotonic deadline is untouched and an hour away, so this one does not.
+    """
+    path = str(tmp_path / "fwd.ndjson")
+    sink = RotatingFileSink(path, when="H", interval=1, backup_count=1)
+    sink.emit([{"n": 1}])
+
+    stepped = time.time() + 86_400.0
+    monkeypatch.setattr(time, "time", lambda: stepped)
+    sink.emit([{"n": 2}])
+    sink.close()
+
+    assert not os.path.exists(f"{path}.1")
+    assert read_events(path) == [{"n": 1}, {"n": 2}]
+
+
+def test_the_rotation_deadline_is_a_monotonic_reading(tmp_path) -> None:
+    """The two clocks are orders of magnitude apart, so this cannot pass on wall-clock."""
+    path = str(tmp_path / "clock.ndjson")
+    sink = RotatingFileSink(path, when="S", interval=60, backup_count=1)
+    try:
+        assert sink._next_rollover is not None
+        assert abs(sink._next_rollover - (time.monotonic() + 60)) < 5
+    finally:
+        sink.close()
 
 
 def test_invalid_when_unit_raises_before_opening(tmp_path) -> None:

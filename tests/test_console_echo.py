@@ -62,3 +62,50 @@ def test_echo_on_orphan_log_still_writes_console(lf, fake_sink, monkeypatch) -> 
 
     assert "orphan echo" in stream.getvalue()
     assert any(e["message"] == "orphan echo" for e in fake_sink.events)
+
+
+# -- SPEC-031 FR-003: the documented stream and binding are the real ones --------------------
+
+
+def test_the_console_default_stream_is_stderr_not_stdout() -> None:
+    """Two documents said stdout; the code has always said stderr (SPEC-031 FR-003)."""
+    import sys
+
+    writer = console_mod.ConsoleWriter()
+    assert writer._stream is sys.stderr
+
+
+def test_the_stream_is_bound_at_construction_not_read_per_write(capsys) -> None:
+    """The surprise FR-003 documents: a later redirect is not honoured, an explicit one is."""
+    import contextlib
+    import io
+    import sys
+
+    writer = console_mod.ConsoleWriter()
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        writer.write({"level": "INFO", "message": "not-redirected"})
+    assert captured.getvalue() == "", "the writer kept the stream it resolved at construction"
+    assert "not-redirected" in capsys.readouterr().err
+
+    explicit = io.StringIO()
+    console_mod.ConsoleWriter(stream=explicit).write({"level": "INFO", "message": "captured"})
+    assert "captured" in explicit.getvalue(), "stream= is how a caller captures the output"
+    assert sys.stderr is not explicit
+
+
+def test_the_stdout_sink_binds_its_stream_at_construction_too() -> None:
+    import contextlib
+    import io
+
+    from log_foundry.sinks.stdout import StdoutSink
+
+    sink = StdoutSink()
+    redirected = io.StringIO()
+    with contextlib.redirect_stdout(redirected):
+        sink.emit([{"message": "x"}])
+    assert redirected.getvalue() == "", "documented on StdoutSink.__init__ (SPEC-031 FR-003)"
+
+    explicit = io.StringIO()
+    StdoutSink(stream=explicit).emit([{"message": "y"}])
+    assert "y" in explicit.getvalue()

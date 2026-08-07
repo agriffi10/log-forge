@@ -854,6 +854,12 @@ class Worker:
         this sweep, and that one waits out its timeout — then returns False, which is correct
         either way.
 
+        The reliance on ``queue.Queue``'s private ``mutex`` and ``queue`` is deliberate and is
+        recorded in ``architecture.md`` §13 Known Constraints (SPEC-031 FR-005): there is no
+        public "inspect without consuming", and the draining alternative would destroy the
+        evidence the terminal-failure line reports. A CPython change would surface as the test
+        that exercises this against a mixed queue, rather than as waiters silently timing out.
+
         Args:
           None.
 
