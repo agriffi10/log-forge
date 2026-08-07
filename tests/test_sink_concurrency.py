@@ -4,6 +4,7 @@ The suite had no concurrent-emitter test before this module, which is why none o
 covers ever surfaced. Every test here fails against the pre-SPEC-028 sinks and passes after.
 """
 
+import asyncio
 import json
 import threading
 import time
@@ -14,6 +15,7 @@ import pytest
 
 from conftest import run_concurrently
 from log_foundry.sinks import _socket
+from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.sqlite import SQLiteSink
 from log_foundry.sinks.syslog import SyslogSink
@@ -544,3 +546,302 @@ def test_losses_does_not_block_behind_an_in_flight_emit(tmp_path: Path) -> None:
     read.join(timeout=5)
 
     assert not blocked, "losses() blocked behind an in-flight emit"
+
+
+def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
+    """Every sink holding a driver either locks it or says in writing why it need not.
+
+    SPEC-028's own FR-002 enumerated seven sinks by name, and the review found three it had
+    missed — ``NATSSink`` (which could hang an application thread permanently), ``RabbitMQSink``
+    and ``AzureEventHubsSink``. That is the SPEC-027 failure repeated: a hand-written roster and
+    a test that agrees with the roster rather than with the code.
+
+    Whether a given driver needs a lock is not derivable from syntax — it is the vendor's
+    contract, which lives in their docs, not in this tree. So this lint does not try to decide;
+    it makes the *decision* mandatory and visible. A sink that lazily imports a driver, or opens
+    a socket or event loop of its own, must either take ``self._lock`` or carry the
+    ``SPEC-028 FR-002`` marker explaining why it does not. A new sink joins this set the day it
+    is written, and the author has to choose rather than inherit silence.
+    """
+    import ast
+    import pathlib
+
+    import log_foundry
+
+    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    undecided: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        lazily_imported = any(
+            isinstance(inner, ast.Import | ast.ImportFrom)
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef)
+            for inner in ast.walk(fn)
+        )
+        owns_a_handle = any(
+            token in source
+            for token in ("socket.socket", "create_connection", "new_event_loop")
+        )
+        if not (lazily_imported or owns_a_handle):
+            continue
+        if "with self._lock" in source or "SPEC-028 FR-002" in source:
+            continue
+        undecided.append(path.name)
+
+    assert not undecided, (
+        "these sinks hold a driver but neither lock it nor record why they need not: "
+        f"{undecided}"
+    )
+
+
+def test_nats_sink_does_not_reenter_its_managed_event_loop() -> None:
+    """Concurrent emits never enter one ``asyncio`` loop twice — the worst finding of the arc.
+
+    Unlocked, a second thread calling ``run_until_complete`` on a running loop raises
+    ``RuntimeError: This event loop is already running``, and can leave the loop's task
+    machinery in a state where a thread **never returns from ``emit``**. On the orphan path that
+    is an application thread hung forever inside ``log_foundry.info()``. The 30 s join inside
+    ``run_concurrently`` is what turns that hang into a failure rather than a stalled CI run.
+
+    Like the SQLite case, this one kills its mutant by hanging rather than by asserting: measured
+    against the unlocked sink, threads wedge inside ``run_until_complete`` and never return. A
+    regression here therefore presents as a slow failure, not a clean one.
+    """
+    nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.published: list[bytes] = []
+
+        async def publish(self, subject: str, payload: bytes) -> None:
+            await asyncio.sleep(0)
+            self.published.append(payload)
+
+    client = FakeClient()
+    sink = nats_mod.NATSSink("events", client=client)
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+    sink.close()
+
+    assert errors == [], f"emits collided on the loop: {errors[:3]}"
+    assert len(client.published) == THREADS * PER_THREAD
+    assert sink.losses() == (0, 0)
+
+
+def test_rabbitmq_publishes_are_not_interleaved_on_one_channel() -> None:
+    """One thread's publish completes before another's begins on the shared channel.
+
+    ``pika`` states one connection must not be shared across threads, and this sink also
+    *rebinds* the channel on error — so an unlocked ``_reset`` can close the channel object
+    another thread is mid-publish on.
+    """
+    rabbit_mod = pytest.importorskip("log_foundry.sinks.rabbitmq")
+
+    class ExclusiveChannel:
+        def __init__(self) -> None:
+            self._guard = threading.Lock()
+            self._inside = 0
+            self.overlaps = 0
+            self.published = 0
+
+        def basic_publish(self, **kwargs: object) -> None:
+            with self._guard:
+                self._inside += 1
+                if self._inside > 1:
+                    self.overlaps += 1
+            time.sleep(0)
+            with self._guard:
+                self.published += 1
+                self._inside -= 1
+
+        def close(self) -> None:
+            pass
+
+    channel = ExclusiveChannel()
+
+    class FakeConnection:
+        def channel(self) -> ExclusiveChannel:
+            return channel
+
+        def close(self) -> None:
+            pass
+
+    sink = rabbit_mod.RabbitMQSink(
+        exchange="logs", routing_key="events", connection=FakeConnection()
+    )
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+    sink.close()
+
+    assert errors == []
+    assert channel.overlaps == 0, f"{channel.overlaps} interleaved publishes on one channel"
+    assert channel.published == THREADS * PER_THREAD
+
+
+def test_clickhouse_insert_is_not_interleaved_by_a_concurrent_emit() -> None:
+    """FR-002 names ClickHouse, and its lock was verified by nothing until now."""
+    clickhouse_mod = pytest.importorskip("log_foundry.sinks.clickhouse")
+
+    class ExclusiveClient:
+        def __init__(self) -> None:
+            self._guard = threading.Lock()
+            self._inside = 0
+            self.overlaps = 0
+            self.rows = 0
+
+        def insert(self, table: str, data: list, column_names: list) -> None:
+            with self._guard:
+                self._inside += 1
+                if self._inside > 1:
+                    self.overlaps += 1
+            time.sleep(0)
+            with self._guard:
+                self.rows += len(data)
+                self._inside -= 1
+
+        def close(self) -> None:
+            pass
+
+    client = ExclusiveClient()
+    sink = clickhouse_mod.ClickHouseSink("events", client=client)
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+    sink.close()
+
+    assert errors == []
+    assert client.overlaps == 0, f"{client.overlaps} interleaved inserts"
+    assert client.rows == THREADS * PER_THREAD
+
+
+def test_dropped_unadjudicated_is_counted_under_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third loss counter FR-003 names, guarded and asserted (SPEC-018's counter).
+
+    The retry backoff is neutralized as ``test_sinks_sqs.py`` does: this test is about the
+    counter, and 200 emits each spending their full 0.7 s budget would take minutes.
+    """
+    kinesis_mod = pytest.importorskip("log_foundry.sinks.kinesis")
+    monkeypatch.setattr(kinesis_mod, "wait", lambda _delay, _stop=None: None)
+
+    class ShortResponseClient:
+        """Returns a per-record array too short to adjudicate, which is SPEC-018's case."""
+
+        def put_records(self, *, StreamName: str, Records: list) -> dict:
+            return {"FailedRecordCount": 1, "Records": [{"SequenceNumber": "1"}]}
+
+    sink = kinesis_mod.KinesisSink("stream", client=ShortResponseClient())
+    lock = CountingLock()
+    sink._counter_lock = lock
+
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit([event(thread, iteration), event(thread, iteration)]),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+
+    # Two records per emit, and the whole chunk is abandoned together, so the counter moves by
+    # two per acquisition — the acquisition count tracks emits, not records.
+    assert sink.dropped_unadjudicated == THREADS * PER_THREAD * 2
+    assert lock.acquisitions == THREADS * PER_THREAD, "a drop was counted outside the lock"
+    # SPEC-018 folds an unadjudicable record into ``failed``, not ``dropped``: it may have
+    # landed, so it is unconfirmed rather than known-discarded.
+    assert sink.losses().failed == THREADS * PER_THREAD * 2
+    assert all(isinstance(err, Exception) for err in errors)
+
+
+@pytest.mark.parametrize("build", ["file", "rotating", "sqlite"])
+def test_close_waits_for_an_in_flight_emit_on_every_locked_sink(
+    build: str, tmp_path: Path
+) -> None:
+    """``close()`` never releases a resource under an active writer, for each locked sink.
+
+    Review found five lock sites verified by nothing — the ``close`` half of FR-002's criterion
+    was demonstrated for ``FileSink`` alone and asserted for the rest. Each sink is parked by the
+    hook that actually reaches it: the file sinks through their stream, which is inside the lock,
+    and ``SQLiteSink`` through column projection, which is outside it. That asymmetry is the
+    point — the file sinks hold the lock for the whole emit and simply finish, while SQLite has a
+    real window and must refuse the batch in the library's own vocabulary.
+    """
+    parked = threading.Event()
+    may_finish = threading.Event()
+
+    class ParkingStream:
+        """Holds the first write until released."""
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self._writes = 0
+
+        def write(self, data: str) -> int:
+            self._writes += 1
+            if self._writes == 1:
+                parked.set()
+                may_finish.wait(timeout=10)
+            return self._inner.write(data)
+
+        def flush(self) -> None:
+            self._inner.flush()
+
+        def close(self) -> None:
+            self._inner.close()
+
+    class ParkingEvent(dict):
+        """An event whose column projection parks the emitting thread."""
+
+        def get(self, key, default=None):
+            parked.set()
+            may_finish.wait(timeout=10)
+            return super().get(key, default)
+
+    batch: list[dict[str, object]]
+    if build == "sqlite":
+        sink = SQLiteSink(str(tmp_path / "c.db"))
+        batch = [ParkingEvent(log_id="1", marker="x"), {"log_id": "2", "marker": "after"}]
+    elif build == "file":
+        sink = FileSink(str(tmp_path / "a.ndjson"))
+        sink._stream = ParkingStream(sink._stream)  # type: ignore[assignment]
+        batch = [{"marker": "x"}, {"marker": "after"}]
+    else:
+        sink = RotatingFileSink(str(tmp_path / "b.ndjson"), max_bytes=10_000, backup_count=5)
+        sink._stream = ParkingStream(sink._stream)  # type: ignore[assignment]
+        batch = [{"marker": "x"}, {"marker": "after"}]
+
+    failures: list[BaseException] = []
+
+    def emitter() -> None:
+        try:
+            sink.emit(batch)
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=emitter)
+    worker.start()
+    assert parked.wait(timeout=10), f"could not park inside {build}'s emit"
+
+    closer = threading.Thread(target=sink.close)
+    closer.start()
+    may_finish.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+    assert not worker.is_alive() and not closer.is_alive(), "close and emit deadlocked"
+
+    # A close landing mid-emit must never surface as driver internals. The file sinks take the
+    # lock before touching anything, so they complete; SQLite projects columns outside the lock,
+    # so the batch is refused in the library's own vocabulary instead of "closed database".
+    assert all(isinstance(exc, SinkDeliveryError) for exc in failures), (
+        f"close() stranded the in-flight emit on {build}: {failures}"
+    )

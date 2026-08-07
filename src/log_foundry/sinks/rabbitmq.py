@@ -73,6 +73,8 @@ class RabbitMQSink:
         self._properties: Any = None
         self.failed = 0
         self._counter_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._closed = False
 
     def losses(self) -> SinkLosses:
         """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
@@ -95,6 +97,12 @@ class RabbitMQSink:
         A partial publish is counted and left alone: retrying it would re-publish the messages
         already on the exchange.
 
+        The driver requirement satisfied (SPEC-028 FR-002): ``pika`` states that one connection
+        must not be shared across threads, and this sink shares one connection, one channel, and
+        *rebinds* both — ``_reset`` closes and nulls the channel another thread may be mid-publish
+        on. It is structurally the same sink as ``SocketTransport``, one AMQP frame stream over
+        one socket, so it takes the same lock.
+
         Args:
           batch: The events to publish.
 
@@ -106,9 +114,10 @@ class RabbitMQSink:
             is the case the worker's retry and ``failed_batches`` exist for.
         """
         published = 0
-        for event in batch:
-            if self._publish(json.dumps(event).encode("utf-8")):
-                published += 1
+        with self._lock:
+            for event in batch:
+                if self._publish(json.dumps(event).encode("utf-8")):
+                    published += 1
         if batch and not published:
             raise SinkDeliveryError(f"RabbitMQSink published none of {len(batch)} message(s)")
 
@@ -126,12 +135,16 @@ class RabbitMQSink:
         Raises:
           None.
         """
-        if self._channel is not None:
-            _safe_close(self._channel)
-            self._channel = None
-        if self._connection is not None:
-            _safe_close(self._connection)
-            self._connection = None
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._channel is not None:
+                _safe_close(self._channel)
+                self._channel = None
+            if self._connection is not None:
+                _safe_close(self._connection)
+                self._connection = None
 
     def _publish(self, body: bytes) -> bool:
         """Publishes one message within the retry bound.

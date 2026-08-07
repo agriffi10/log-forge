@@ -84,6 +84,13 @@ class SQSSink:
 
     The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per chunk, 0.7 s at the
     defaults. The waits are interruptible, so ``shutdown()`` cuts one short.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. ``boto3`` documents that clients — unlike Sessions and Resources — are
+    thread-safe, and this sink builds its client once in ``__init__`` rather than inside
+    ``emit`` — which is what keeps it clear of the documented caveat that calling
+    ``boto3.client()`` concurrently can produce response-ordering faults. Nothing else here is
+    rebound after construction.
     """
 
     MAX_BATCH = 10

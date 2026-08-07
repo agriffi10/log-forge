@@ -76,6 +76,7 @@ class MongoDBSink:
         self.dropped_oversized = 0
         self._closed = False
         self._counter_lock = threading.Lock()
+        self._close_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and documents the server rejected or never took (FR-002).
@@ -157,7 +158,13 @@ class MongoDBSink:
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
 
-        Idempotent.
+        Idempotent. The *close* half of the concurrency contract still needs a lock even though
+        ``emit`` does not (SPEC-028 FR-002): ``pymongo`` is thread-safe for concurrent operations
+        but a closed client is unusable — any later use raises ``InvalidOperation`` — so
+        releasing
+        it under an in-flight ``insert_many`` is exactly the half-released resource
+        :meth:`~log_foundry.sinks.base.Sink.close` forbids. This lock is held only across the
+        close, never across an insert, so it costs concurrent emits nothing.
 
         Args:
           None.
@@ -168,11 +175,12 @@ class MongoDBSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        if self._closed:
-            return
-        if self._owns_client:
-            self._client.close()
-        self._closed = True
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owns_client:
+                self._client.close()
 
     def _documents(self, batch: list[dict[str, object]]) -> list[dict[str, object]]:
         """Copies each event and drops any document too large to ever fit.

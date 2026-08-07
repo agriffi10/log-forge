@@ -347,9 +347,21 @@ decorated call ends
   two application threads and `log-foundry-worker` at once, with overlapping calls. So `emit` and
   `close` **may be called concurrently, and a sink must tolerate it** — a requirement on
   implementations rather than something the library serializes on their behalf, since it does not
-  own the orphan path's thread. The shipped sinks that hold mutable transport state (a rebindable
-  stream, a reused socket, a connection with transaction scope) each take a lock; `sinks/base.py`
-  states the contract for third-party ones (SPEC-028).
+  own the orphan path's thread. `sinks/base.py` states the contract for third-party ones
+  (SPEC-028).
+
+  Which shipped sinks lock is **decided per driver, and the decision is recorded in each sink's
+  docstring** — it is the vendor's contract, not something derivable from this tree. A rebindable
+  stream (`FileSink`, `RotatingFileSink`), a reused socket (`SocketTransport`, `RabbitMQSink`), a
+  connection with transaction scope (`SQLiteSink`, `PostgresSink`), a session-bound client
+  (`ClickHouseSink`), a single-entry event loop (`NATSSink`) and a producer that is not published
+  as shareable (`AzureEventHubsSink`) all take one. The sinks whose client documents its own
+  thread-safety — `MongoDBSink`, the boto3 four, `RedisSink`, `KafkaSink`, `SentrySink` — take
+  none, and say why. A lint (`test_every_driver_backed_sink_records_a_concurrency_decision`) fails
+  any driver-backed sink that neither locks nor records a reason, because the first pass at this
+  worked from a hand-written roster and missed three sinks — one of which could hang an
+  application thread permanently. That is the SPEC-027 roster lesson, repeated once and now
+  enforced.
 - **A sink's backoff pauses the single drain thread** (SPEC-027). There is one drain thread by
   design, so a sink sleeping between attempts is not making a local decision — it is a global
   pause on log delivery, and it spans `shutdown()`, which joins that thread from `atexit`. Every

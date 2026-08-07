@@ -68,6 +68,8 @@ class AzureEventHubsSink:
         self.failed = 0
         self.dropped_oversized = 0
         self._counter_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._closed = False
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and events in a batch abandoned past the bound (FR-002).
@@ -106,6 +108,27 @@ class AzureEventHubsSink:
         """
         if not batch:
             return
+        with self._lock:
+            self._send_batch(batch)
+
+    def _send_batch(self, batch: list[dict[str, object]]) -> None:
+        """Packs and sends the batch, with the emit lock already held.
+
+        Split out so the lock's extent is one line in :meth:`emit`. The driver requirement
+        satisfied (SPEC-028 FR-002): the ``EventHubProducerClient`` is not documented as
+        thread-safe, and the ``EventDataBatch`` this builds up across the loop is single-owner
+        state by construction — two threads packing into batches from one producer interleave
+        ``create_batch``/``add``/``send`` on it.
+
+        Args:
+          batch: The events to send, known non-empty.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When every attempted send failed.
+        """
         event_data_cls = _event_data_cls()
         current = self.producer.create_batch()
         attempted = delivered = 0
@@ -141,7 +164,11 @@ class AzureEventHubsSink:
         Raises:
           Exception: Whatever the producer raises on close.
         """
-        self.producer.close()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.producer.close()
 
     def _send(self, event_batch: Any) -> int:
         """Sends one ``EventDataBatch``, retrying failures (FR-009, FR-011).

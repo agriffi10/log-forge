@@ -42,6 +42,7 @@ class GooglePubSubSink:
         self.failed = 0
         self.rejected = 0
         self._counter_lock = threading.Lock()
+        self._futures_lock = threading.Lock()
         self._futures: list[Any] = []
 
     def losses(self) -> SinkLosses:
@@ -88,7 +89,8 @@ class GooglePubSubSink:
                     self.rejected += 1
                 _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
                 continue
-            self._futures.append(future)
+            with self._futures_lock:
+                self._futures.append(future)
             published += 1
         if batch and not published:
             raise SinkDeliveryError(
@@ -98,7 +100,12 @@ class GooglePubSubSink:
     def close(self) -> None:
         """Resolves all pending publish futures, counting and logging errors (FR-008).
 
-        Idempotent.
+        Idempotent. The pending list is swapped out under a lock rather than iterated and then
+        cleared (SPEC-028 FR-002): ``emit`` appends to it from any thread, so the old
+        iterate-then-``clear()`` discarded any future appended after the loop passed its index —
+        an unconfirmed publish whose ``result()`` was never called, never counted in ``failed``
+        and never reported by ``losses()``. That is the silent loss SPEC-026 exists to end,
+        reached through the one piece of shared state this sink has.
 
         Args:
           None.
@@ -110,7 +117,9 @@ class GooglePubSubSink:
           None. This is an isolation boundary: an unresolved future must never crash the worker
             (FR-011).
         """
-        for future in self._futures:
+        with self._futures_lock:
+            pending, self._futures = self._futures, []
+        for future in pending:
             try:
                 future.result()
             except Exception as err:
@@ -119,4 +128,3 @@ class GooglePubSubSink:
                 _diag.lost(
                     "event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}"
                 )
-        self._futures.clear()

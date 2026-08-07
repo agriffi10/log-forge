@@ -51,6 +51,7 @@ class NATSSink:
         self._loop = asyncio.new_event_loop()
         self.failed = 0
         self._counter_lock = threading.Lock()
+        self._lock = threading.Lock()
         if client is None:
             import nats  # type: ignore[import-not-found]
 
@@ -61,6 +62,13 @@ class NATSSink:
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Drives the async publishes to completion on the managed loop (FR-007).
+
+        The driver requirement satisfied (SPEC-028 FR-002): an ``asyncio`` event loop is
+        single-entry. A second thread calling ``run_until_complete`` on a loop that is already
+        running raises ``RuntimeError``, and can leave the loop's task machinery in a state where
+        a thread never returns from ``emit`` at all — measured as a permanently hung application
+        thread on the orphan path, which is the one outcome this library must never produce. The
+        lock makes the loop what the sink already assumed it was: entered by one caller at a time.
 
         Args:
           batch: The events to publish. An empty batch is a no-op.
@@ -73,7 +81,8 @@ class NATSSink:
         """
         if not batch:
             return
-        self._loop.run_until_complete(self._publish_all(batch))
+        with self._lock:
+            self._loop.run_until_complete(self._publish_all(batch))
 
     def losses(self) -> SinkLosses:
         """Reports events whose publish raised (SPEC-026 FR-002).
@@ -102,12 +111,13 @@ class NATSSink:
         Raises:
           Exception: Whatever draining raises; the loop is closed regardless.
         """
-        if self._loop.is_closed():
-            return
-        try:
-            self._loop.run_until_complete(self._drain())
-        finally:
-            self._loop.close()
+        with self._lock:
+            if self._loop.is_closed():
+                return
+            try:
+                self._loop.run_until_complete(self._drain())
+            finally:
+                self._loop.close()
 
     async def _publish_all(self, batch: list[dict[str, object]]) -> None:
         """Publishes each event, isolating a per-event failure.
