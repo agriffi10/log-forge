@@ -111,10 +111,18 @@ class RabbitMQSink:
 
         Raises:
           SinkDeliveryError: When no message reached the broker (SPEC-026 FR-001) — a down broker
-            is the case the worker's retry and ``failed_batches`` exist for.
+            is the case the worker's retry and ``failed_batches`` exist for. Also when the sink
+            is already closed, which is not fussiness: ``_active_channel`` reopens a connection
+            whenever it finds none, and ``close`` is now idempotent, so an emit arriving after a
+            shutdown would open an AMQP connection that nothing will ever reap. One
+            ``log_foundry.info()`` after ``shutdown()`` reaches this on the caller's own thread.
         """
         published = 0
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"RabbitMQSink published none of {len(batch)} message(s): the sink is closed"
+                )
             for event in batch:
                 if self._publish(json.dumps(event).encode("utf-8")):
                     published += 1

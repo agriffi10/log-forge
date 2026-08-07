@@ -115,9 +115,10 @@ class AzureEventHubsSink:
         """Packs and sends the batch, with the emit lock already held.
 
         Split out so the lock's extent is one line in :meth:`emit`. The driver requirement
-        satisfied (SPEC-028 FR-002): the ``EventHubProducerClient`` is not documented as
-        thread-safe, and the ``EventDataBatch`` this builds up across the loop is single-owner
-        state by construction — two threads packing into batches from one producer interleave
+        satisfied (SPEC-028 FR-002): Microsoft affirmatively states that the
+        ``EventHubProducerClient`` is not thread-safe and recommends guarding it with a
+        ``threading.Lock``; the ``EventDataBatch`` this builds up across the loop is single-owner
+        state besides — two threads packing into batches from one producer interleave
         ``create_batch``/``add``/``send`` on it.
 
         Args:

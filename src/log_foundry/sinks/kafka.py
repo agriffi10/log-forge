@@ -26,8 +26,8 @@ class KafkaSink:
         — which never reached the producer's batch at all.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
-    lock. ``confluent-kafka``'s ``Producer`` is thread-safe, and sharing one across threads is the
-    usage its own documentation recommends. The sink adds no state of its own to guard.
+    lock. ``confluent-kafka`` documents its ``Producer`` as thread-safe, and this sink adds no state
+    of its own to guard — ``produce()`` is a local hand-off into the client's internal queue.
     """
 
     def __init__(

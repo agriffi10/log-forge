@@ -371,7 +371,6 @@ class Worker:
             self._queue.put_nowait(_SHUTDOWN)
         except queue.Full:
             pass
-        deadline = None if timeout is None else time.monotonic() + timeout
         self._thread.join(timeout)
         if self._thread.is_alive():
             queued = self._queued_or_unknown()
@@ -385,9 +384,9 @@ class Worker:
                 f"because the worker thread is still using it",
             )
             return
-        self._close_if_owed(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        self._close_if_owed()
 
-    def _close_if_owed(self, timeout: float | None = None) -> None:
+    def _close_if_owed(self) -> None:
         """Closes the sink exactly once, and only once the drain thread has ended.
 
         Every exit from :meth:`shutdown` that may close comes through here — the expired one
@@ -396,64 +395,39 @@ class Worker:
         it, and ``atexit`` plus user code calling it at once is documented as normal.
 
         ``is_alive()`` is the safety condition rather than a heuristic: it reads ``False`` only
-        after ``_run`` has returned, so the sink is provably out of use *by the worker*. It is
-        not proof the sink is idle: SPEC-028 made ``close()`` take the sink's emit lock, and an
-        application thread on the orphan path can be holding that lock inside a driver call with
-        no timeout of its own. The close therefore runs on a daemon thread and is joined for
-        whatever is left of the caller's budget, or ``shutdown(timeout=...)`` would be bounded
-        in its join and unbounded in its close — which is the guarantee SPEC-027 FR-004 makes.
-        An expiry here lands on SPEC-027's existing rule: the sink is left open, which in an
-        exiting process is a leaked handle rather than a corrupt write.
+        after ``_run`` has returned, so the sink is provably out of use *by the worker*.
 
-        The close runs outside the lock either way, because it can reach ``_diag`` and a wedged
-        console must not stall a lock :meth:`submit` also takes.
+        The close runs to completion, inline, and is deliberately **not** bounded — which leaves
+        one honest gap. SPEC-028 made ``close()`` take the sink's emit lock, so an application
+        thread on the orphan path can hold that lock inside a driver call with no timeout of its
+        own and delay this past ``shutdown``'s budget. Running the close on a joinable daemon
+        thread was tried and reverted: at interpreter exit the daemon is killed wherever it has
+        reached, which for ``SQLiteSink`` is between ``commit()`` and ``close()`` — turning the
+        leaked handle SPEC-027 FR-004 accepts into the partial write it was avoiding. It also
+        could not tell a slow-but-successful close from a stuck one, so it reported
+        ``ShutdownTimeout`` and "left open" for closes that had in fact completed, latching
+        SPEC-019's alert term on a healthy shutdown. A wrong signal is worse than a slow one.
+        The residual delay is recorded in ``architecture.md`` §13 rather than papered over.
 
-        A ``BaseException`` is carried back across the thread boundary and re-raised here.
-        ``_close_sink`` absorbs ``Exception`` but deliberately lets a ``KeyboardInterrupt`` or
-        ``SystemExit`` through to the caller (SPEC-025 FR-004), and a bare ``Thread`` would have
-        discarded it into CPython's thread bootstrap — turning an operator's interrupt into a
-        stderr warning, which is the silent-loss shape this whole arc exists to remove.
+        The close runs outside the lock, because it can reach ``_diag`` and a wedged console must
+        not stall a lock :meth:`submit` also takes.
 
         Args:
-          timeout: Seconds to wait for the close, or ``None`` to wait indefinitely.
+          None.
 
         Returns:
           None.
 
         Raises:
           BaseException: Whatever the sink's ``close`` raised that is not an ``Exception``.
+            ``_close_sink`` absorbs ``Exception`` but lets a ``KeyboardInterrupt`` or
+            ``SystemExit`` through to the caller (SPEC-025 FR-004).
         """
         with self._lock:
             if self._sink_closed or self._thread.is_alive():
                 return
             self._sink_closed = True
-        if timeout is None:
-            self._close_sink()
-            return
-        escaped: list[BaseException] = []
-
-        def run() -> None:
-            """Closes the sink, carrying a ``BaseException`` back to the joining thread."""
-            try:
-                self._close_sink()
-            except BaseException as exc:
-                escaped.append(exc)
-
-        closer = threading.Thread(target=run, name="log-foundry-close", daemon=True)
-        closer.start()
-        closer.join(timeout)
-        if escaped:
-            raise escaped[0]
-        if closer.is_alive():
-            with self._lock:
-                if self.stopped_reason is None:
-                    self.stopped_reason = "ShutdownTimeout"
-            _diag.lost(
-                "resource",
-                1,
-                f"the sink did not close within {_bounded_seconds(timeout)}; it is left open "
-                f"because another thread is still inside it",
-            )
+        self._close_sink()
 
     def _close_sink(self) -> None:
         """Closes the sink, absorbing a failure.

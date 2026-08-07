@@ -18,6 +18,15 @@ class GooglePubSubSink:
     This is a durable-buffer sink on ``google-cloud-pubsub``, the optional ``gcp-pubsub`` extra,
     imported lazily. ``publish()`` returns a future that resolves asynchronously, so the sink
     accumulates the batch's futures and resolves them on :meth:`close`.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport lock —
+    the publisher client owns its own batching and threading, and ``publish()`` is a local
+    hand-off. What it does hold is the pending-futures list, which is genuinely shared between
+    ``emit`` (appending) and ``close`` (resolving), so that list has its own small lock and
+    ``close`` swaps it out rather than iterating and clearing. Without the swap, a future
+    appended after the loop passed its index was dropped unresolved: an unconfirmed publish
+    never counted in ``failed`` and never reported by :meth:`losses`, which is precisely the
+    silent loss SPEC-026 exists to end.
     """
 
     def __init__(self, topic: str, *, client: Any = None) -> None:

@@ -356,8 +356,9 @@ decorated call ends
   connection with transaction scope (`SQLiteSink`, `PostgresSink`), a session-bound client
   (`ClickHouseSink`), a single-entry event loop (`NATSSink`) and a producer that is not published
   as shareable (`AzureEventHubsSink`) all take one. The sinks whose client documents its own
-  thread-safety — `MongoDBSink`, the boto3 four, `RedisSink`, `KafkaSink`, `SentrySink` — take
-  none, and say why. A lint (`test_every_driver_backed_sink_records_a_concurrency_decision`) fails
+  thread-safety — `MongoDBSink`, the boto3 four, the Redis pair, `KafkaSink`, `SentrySink`,
+  `GooglePubSubSink` — take no *transport* lock, and say why; several still guard a small piece
+  of their own state (Mongo's close flag, Pub/Sub's pending-futures list). A lint (`test_every_driver_backed_sink_records_a_concurrency_decision`) fails
   any driver-backed sink that neither locks nor records a reason, because the first pass at this
   worked from a hand-written roster and missed three sinks — one of which could hang an
   application thread permanently. That is the SPEC-027 roster lesson, repeated once and now

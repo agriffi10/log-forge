@@ -122,15 +122,54 @@ exactly as before.
 - **SPEC-026's `losses()` contract is now a concurrency contract.** `base.py` said `losses()` must
   be "safe to call during an emit"; this spec says what that costs — a dedicated counter lock,
   never the transport lock — and the README's sink-author example was rewritten to show both.
-- **SPEC-027's `shutdown(timeout=...)` was silently weakened and then restored.** Making `close()`
-  take the emit lock meant an application thread on the orphan path could block the close
-  indefinitely, so the bound covered the join and not the call. `_close_if_owed` now runs the close
-  on a daemon thread joined for the remaining budget, and reports through the existing
-  `"ShutdownTimeout"` vocabulary. A `BaseException` is carried back across that thread boundary,
-  because SPEC-025 FR-004 requires a `KeyboardInterrupt` from `close()` to reach the caller and a
-  bare `Thread` would have discarded it — the suite caught that regression.
+- **SPEC-027's `shutdown(timeout=...)` is weakened by this spec, and that is recorded rather than
+  fixed.** Making `close()` take the emit lock means an application thread on the orphan path can
+  hold it inside a driver call and delay the close past `shutdown`'s budget — the bound covers the
+  join, not the call. A joinable daemon-thread close was written to restore the bound and then
+  **reverted after review**: at interpreter exit the daemon is killed wherever it has reached,
+  which for `SQLiteSink` is between `commit()` and `close()`, converting the leaked handle
+  SPEC-027 FR-004 accepts into the partial write it was avoiding. It also could not distinguish a
+  slow-but-successful close from a stuck one, so it latched SPEC-019's `stopped_reason` alert term
+  and wrote "the sink is left open" for closes that had completed. A wrong signal is worse than a
+  slow one. The residual delay is now a constraint in `architecture.md` §13.
 - **SPEC-027's roster lesson is now enforced rather than remembered.** That spec found three sinks
   missed by a hand-written list and derived its roster from the AST. This spec's FR-002 enumerated
   seven sinks and missed three more, so
   `test_every_driver_backed_sink_records_a_concurrency_decision` fails any driver-backed sink that
   neither locks nor records why it need not.
+
+
+## Second review round (pre-merge, PR #116)
+
+The first two PRs merged on green CI without an independent review; that was the process error
+behind everything above, and `CLAUDE.md` now states that green CI is not a review and does not
+authorize a merge. A third review, run *before* merging the corrections, returned DO NOT MERGE with
+13 findings. The ones that changed code:
+
+- **The daemon-thread close was a net regression** (above). Reverted.
+- **`RabbitMQSink`'s new `_closed` flag created a permanent connection leak.** `close()` began
+  returning early on the flag, but `emit` never consulted it and `_active_channel` reopens whenever
+  it finds no connection — so one `log_foundry.info()` after `shutdown()` opened an AMQP connection
+  nothing would ever reap. `emit` now refuses when closed, as `SQLiteSink` and `MongoDBSink` do.
+- **The lint was insensitive to the regression it exists to prevent.** Its first form scanned each
+  *module* for the substring `with self._lock`, and passed with the locks stripped from three
+  sinks' `emit` methods because each module's `close` still contained one. Its second form accepted
+  any class docstring citing the spec, so a sink documenting *why it locks* stayed exempt after its
+  lock was deleted. It is now per class, walks `emit` and the helpers `emit` calls via the AST, and
+  the only exemption is the specific claim `**no** transport lock`. Verified by stripping each of
+  the five locked sinks' `emit` locks in turn.
+- **`MongoDBSink._close_lock` did not do what its docstring said** — it serializes concurrent
+  closes, not a close against an in-flight insert. The docstring now says so, and `emit` gained the
+  `_closed` check that actually covers the overlap.
+- **Two test defects.** The RabbitMQ test survived its mutant about one run in five (one publish
+  per emit is too short a critical section); it now emits batches and killed the mutant 20/20. The
+  `dropped_unadjudicated` test never failed on the value it advertised, so a new test uses the
+  reviewer's own storage-injection technique — a descriptor that yields inside the counter's
+  read-modify-write — to observe **real lost increments** against the unguarded code. That is also
+  the concrete demonstration that the corrected FR-003 amendment was right and the first one wrong.
+
+**A near-miss worth recording.** The scripted edit that rewrote the lint spliced the file by index
+and silently deleted four tests — nats, rabbitmq, clickhouse and `dropped_unadjudicated`. The suite
+stayed green, because deleted tests do not fail, and the PR would have claimed coverage that no
+longer existed. Caught by comparing the collected test count against the expected one. A scripted
+edit to a test file needs `pytest --collect-only` before and after, not just a green run.

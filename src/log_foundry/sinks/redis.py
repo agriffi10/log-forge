@@ -25,10 +25,9 @@ class _RedisSink:
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``redis-py`` documents that a client may be shared between threads — a
     connection is taken from its pool only for the duration of a command, and command
-    execution never mutates the client. Its one documented exception is that a ``Pipeline``
-    must not be passed between
-    threads, which is why the pipeline here is built and executed inside a single ``emit`` call
-    and never stored on the instance.
+    execution never mutates the client. Its documented exceptions are ``PubSub`` and
+    ``Pipeline`` objects, which must not be passed between threads — which is why the pipeline
+    here is built and executed inside a single ``emit`` call and never stored on the instance.
     """
 
     def __init__(self, *, client: Any, url: str | None, max_retries: int) -> None:

@@ -91,13 +91,12 @@ class SQLiteSink:
 
         Raises:
           sqlite3.Error: If the insert fails.
-          SinkDeliveryError: If the sink was closed while this call was building its rows. That
-            window is why the check exists: row-building sits outside the lock, so a ``close()``
-            can complete between it and the insert, and the batch would otherwise reach the
-            driver as "Cannot operate on a closed database" — a driver-internals error where the
-            library has a word of its own for "none of this was delivered" (SPEC-026 FR-001).
-            What a sink should do when emitted to *after* a completed shutdown is a separate
-            question, and SPEC-030's.
+          SinkDeliveryError: If the sink is closed — whether the close landed while this call
+            was building its rows, or long before it. Either way the batch would otherwise reach
+            the driver as "Cannot operate on a closed database", and the library has a word of
+            its own for "none of this was delivered" (SPEC-026 FR-001). What the library should
+            *signal* about logging after a completed shutdown is a separate question, and
+            SPEC-030's; this only keeps driver internals out of the answer.
         """
         rows = [
             (*(event.get(col) for col in _COLUMNS), json.dumps(event)) for event in batch
