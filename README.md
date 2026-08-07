@@ -19,6 +19,62 @@ calls form a tree you can query later.
 
 ---
 
+## Stability
+
+**`1.0.0` is the first stable release, and the public API is now under semantic versioning.**
+Everything exported from `log_foundry` — that is, every name in `log_foundry.__all__`, including
+`configure`, `trace`, `continue_trace`, the level emitters, `set_baggage`, `flush`, `shutdown`,
+`health`, `reset_context`, the `current_*` context readers, `get_config`, `Health`, `SinkLosses`
+and `SinkDeliveryError` — keeps its behaviour across `1.x`, as do the `Sink` protocol
+(`log_foundry.sinks.base.Sink`) and every shipped sink class. Anything that would break a caller
+waits for `2.0.0`.
+
+Two deliberate carve-outs, because pretending otherwise would be the lie:
+
+- **`Health` grows by appending.** It is a `NamedTuple`, so a new field never moves an existing
+  one — read it by attribute (`h.dropped`), never by unpacking the whole tuple.
+- **Anything underscore-prefixed is internal** (`_lifecycle`, `_diag`, `sinks/_retry`, and every
+  `_`-named function). Those move without notice.
+
+What `1.0.0` reflects is not new features — the API has been stable in practice since `0.7`. It is
+that the failure modes are now the part that has been audited hardest: the 2026-08 audit arc went
+through every path where the library could lose an event, fail its caller, or report health it
+could not back up, and closed them. See [Reliability](#reliability).
+
+## Reliability
+
+Logging is infrastructure: it should degrade, never take the application with it, and never claim
+success it cannot back up. Concretely, in `1.0.0`:
+
+- **A destination can never fail your call.** Every path you stand on at runtime — the decorator's
+  setup, body, close and teardown, the level emitters, and `shutdown()` — absorbs an `Exception`
+  from the sink and reports it as one line on stderr. A fault before the body degrades to an
+  *untraced* call, not a failed one. `KeyboardInterrupt` and `SystemExit` are deliberately **not**
+  absorbed: those are your intent, or the runtime's. Argument validation is the one thing that
+  still raises — `configure()` rejects a ceiling below `1` with a `ValueError`, at startup, where
+  you want to hear about it.
+- **A destination that breaks costs you logs, and says so.** A sink that delivered nothing raises,
+  so the retry engages and `health().failed_batches` counts it; one that absorbed partial loss
+  reports it through `health().sink`. Silence is not success anywhere.
+- **Waits are bounded, with one documented exception.** Every retry backoff is bounded and is cut
+  short by a shutdown — on the buffered *and* the synchronous path. `shutdown(timeout=...)` bounds
+  the drain, and a late `configure(sink=...)` bounds the whole swap including the previous sink's
+  `close()`. The exception: `shutdown()`'s close of the **live** sink runs inline and unbounded,
+  because `Sink.close()` takes no timeout and killing it mid-write risks a partial one — the
+  trade-off and the two designs rejected for it are in
+  [`docs/architecture.md`](docs/architecture.md#known-constraints).
+- **Your data is not in the diagnostics.** Every line the library writes about itself names an
+  exception by *type*, never its message, so a driver that reprints your statement and its bound
+  parameters cannot leak them through an error path. Arguments and return values are never captured
+  at all.
+- **`health()` reports what actually happened.** Each counter means one thing and is documented
+  with the fix it implies — see the table under [Flushing and shutdown](#flushing-and-shutdown).
+  The design rule is that a signal which cannot distinguish two situations is worse than no signal,
+  so several plausible-looking counters were deliberately *not* added.
+
+The reasoning behind each of these, including the alternatives that were built and rejected, is in
+[`docs/architecture.md`](docs/architecture.md) §13 and the specs under [`docs/specs/`](docs/specs/).
+
 ## Requirements
 
 - **Python ≥ 3.12** — the full gate (ruff, mypy, pytest) runs on 3.12 and 3.13 in CI.
@@ -198,11 +254,11 @@ lf.configure(
 If you never set a `sink`, the first decorated call falls back to `StdoutSink()`, so `@trace`
 works with zero configuration.
 
-**Passing `sink=` after logging has started swaps the live destination.** The background worker
-captures its sink when it is built, so a later `configure(sink=...)` has to do more than update
-what `get_config()` reports — otherwise the config and the behaviour disagree silently, which is
-what it used to do. The swap drains everything submitted so far to the **previous** sink, closes
-it, and points the worker at the new one:
+**Passing `sink=` after logging has started swaps the live destination.** Whatever is delivering
+captured its sink before the call, so a later `configure(sink=...)` has to do more than update what
+`get_config()` reports — otherwise the config and the behaviour disagree silently, which is what it
+used to do. The swap drains everything submitted so far to the **previous** sink, closes it, and
+points delivery at the new one:
 
 ```python
 lf.configure(sink=StdoutSink())
@@ -243,8 +299,22 @@ non-daemon threads **before** running `atexit`, so a single stuck `close()` woul
 drain from ever running — the live sink never drained, and your own `atexit` handlers never run
 either. The grace is what recovers the slow-close case that the daemon flag alone would lose.
 
+**A program with no background worker swaps too, and it is simpler.** If you only ever call
+`info()`/`error()` outside a span, there is no worker: those events are emitted synchronously and
+have already landed by the time `configure()` runs. So there is nothing to drain and nothing to
+fence — the handoff is just the close, on the same terms as above (same bounded wait, same
+`closing_sinks` gauge, same background daemon). One consequence worth knowing: `incomplete_swaps`
+stays `0` on that path *by design*, because it records a drain that could not be confirmed and
+there is no drain. It is not a sign the swap did nothing.
+
+This also holds after `shutdown()`. A retired worker delivers nothing further, so a sink you
+configure afterwards is handled by the synchronous path and closed when the process exits — where
+previously it was closed by nothing at all, quietly losing whatever a locally-buffering sink still
+held.
+
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
-thread mid-swap may land on either sink.
+thread mid-swap may land on either sink. Configure the sink before the first log where you can —
+that path has no worker and nothing to close.
 
 ### `@trace`
 
@@ -826,20 +896,23 @@ logging is doing the right thing; it is the *pair* — retired, and still being 
 means every log line since the shutdown has gone nowhere. That state used to read as perfectly
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
-`retired` is also the one field reported for a process that has **no worker at all**. A program
-that only ever calls `info()`/`error()` outside a span emits synchronously and builds no background
-worker, so every other field describes something that does not exist and reads zero. Its
+`retired` and `closing_sinks` are the two fields reported for a process that has **no worker at
+all**. A program that only ever calls `info()`/`error()` outside a span emits synchronously and
+builds no background worker, so the rest describe something that does not exist and read zero. Its
 `shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
-`True` afterwards rather than staying vacuously `False`. `submitted_after_shutdown` stays `0` there
-by design: a later level call is *refused* at the closed sink and announced on stderr — if the sink
-guards its own post-close state — rather than queued where nothing will drain it, and those are not
-the same claim. A stateless sink such as the default `StdoutSink` still accepts it.
+`True` afterwards rather than staying vacuously `False`. `closing_sinks` still counts a swapped-out
+sink's `close()`, because that is a fact about the process rather than about a thread.
+`submitted_after_shutdown` stays `0` there by design: a later level call is *refused* at the closed
+sink and announced on stderr — if the sink guards its own post-close state — rather than queued
+where nothing will drain it, and those are not the same claim. A stateless sink such as the default
+`StdoutSink` still accepts it.
 
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus four more
-(`retired`, `submitted_after_shutdown`, `incomplete_swaps`, `closing_sinks`) not yet in a tagged
-release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
-field keeps its position when a new one is appended, so attribute and index access stay stable.
+fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and five more (`sink`, `retired`,
+`submitted_after_shutdown`, `incomplete_swaps`, `closing_sinks`) in `v1.0.0` — so unpacking it whole
+(`queued, dropped, failed = health()`) raises `ValueError`. Every field keeps its position when a
+new one is appended, so attribute and index access stay stable, and appending is the only change
+`1.x` will make to it.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
@@ -1085,8 +1158,8 @@ pip ignores pre-releases unless you pass `--pre`.
 Cutting a release is one tag:
 
 ```bash
-git tag -a v0.9.0 -m "log-foundry 0.9.0"
-git push origin v0.9.0
+git tag -a v1.0.0 -m "log-foundry 1.0.0"
+git push origin v1.0.0
 ```
 
 Uploads authenticate with PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
