@@ -61,6 +61,12 @@ deliberate constraint — new runtime deps belong behind an optional extra (as `
 - **No auto-capture of args/return values** — function name only, to avoid leaking secrets/PII (arch §6).
 - Structured JSON only — named fields, never free-form text; user fields go in nested `fields` (arch §6).
 - `ruff` line-length 100; keep modules single-concept per the module map (no import cycles).
+- **Docstrings are the only prose in `src/` — no inline comments.** Every function, method and class
+  carries a Google-style docstring: a description of **≤3 sentences**, then `Args:` / `Returns:` /
+  `Raises:`, each filled with `None.` where it doesn't apply. Reasoning that would have been an
+  inline comment belongs *in* the docstring. Module docstrings are one line. `# noqa` / `# type:
+  ignore` are directives, not comments, and stay. Three docstrings are asserted by tests — `_diag`'s
+  module docstring, `sinks/sqs`'s, and `Sink.emit`'s — so check before trimming those.
 - When writing/refactoring Python, consult `@docs/best-practices/INDEX.md` → `python/python.md` first and load only the relevant section(s); the repo's `ruff`/`mypy` config wins over PEP 8 defaults.
 
 ## Common Commands
