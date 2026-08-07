@@ -47,8 +47,9 @@ exactly the fields that read zero here.
 - **Renaming `producer=` or `connection=` to `client=`.** A survey of every sink shows the
   injection kwarg follows the **service's own vocabulary**, consistently: `client` (10 sinks),
   `producer` (Kafka, Azure Event Hubs — both genuinely producers), `connection` (Postgres,
-  RabbitMQ, SQLite — all connections), `logger` (`LoggingSink`). That is a convention, not
-  drift. `sdk` is the only name with no family, which is why FR-002 moves it and nothing else.
+  RabbitMQ, SQLite — all connections), `logger` (`LoggingSink`), and `opener` (`HTTPSink`,
+  `SentrySink` — a urllib opener). That is a convention, not drift. `sdk` is the only name with
+  no family, which is why FR-002 moves it and nothing else.
 - **Aligning `KinesisSink(partition_key_field=)` with `KafkaSink(key_field=)`.** Cut from this
   spec after review. It is a breaking change that does not buy the consistency it exists for:
   SQS's equivalent is a third name again (`message_group_id`) and this would not touch it, so
@@ -110,6 +111,12 @@ the repository or the README uses the positional form.
       SPEC-028 and SPEC-032 each recorded. Those four names are the injected-transport family;
       `stream` and `logger` are deliberately not in it, per the rule above, and the test's
       docstring says why.
+      It is a **blacklist of four names, not a rule derived from syntax**, and says so: role is
+      not inferable from a parameter's name alone — `stream` is a positional *transport* in
+      `StdoutSink` and a positional *destination* in `RedisStreamsSink` (the Redis key). The same
+      concession `test_every_driver_backed_sink_records_a_concurrency_decision` makes for locks.
+      Verified today: across all 39 sink classes with an `emit`, exactly one of the 17 parameters
+      with these names is positional — `SQSSink.client`.
 - [ ] AC-3: No call site in `src/`, `tests/` or `README.md` passes it positionally.
 
 ### FR-002: `SentrySink` injects through `client=`
@@ -125,15 +132,16 @@ injected, which is what the other names get right.
 - [ ] AC-1: `SentrySink(client=fake_sdk)` works and `sdk=` raises `TypeError` — no alias. An
       alias kept for compatibility would have to live for the whole of `1.x`, which is the cost
       this spec exists to avoid paying.
-- [ ] AC-2: The parameter is covered by FR-001 AC-2's roster test.
-- [ ] AC-3: `README.md`'s injected-client list names it.
+- [ ] AC-2: `sdk` appears nowhere in `src/`, `tests/` or `README.md`. FR-001's roster test cannot
+      observe this rename — `SentrySink.sdk` is *already* keyword-only, so that test passes
+      identically before and after — which is why this AC is a grep rather than a reuse.
 
 ### FR-003: `RotatingFileSink`'s default keeps a generation, and says what it costs
 
 #### Description:
 
 With `backup_count=0` — the **default** — `_rotate` calls `os.remove(self._path)`
-(`sinks/file.py:331`), so every event written since the last rotation is destroyed. Configure
+(`sinks/file.py:332`), so every event written since the last rotation is destroyed. Configure
 `RotatingFileSink("app.log", max_bytes=10_000_000)` and the sink silently throws away 10 MB of
 logs at each rollover. The default becomes `backup_count=1`.
 
@@ -157,15 +165,23 @@ so.
 - [ ] AC-1: `RotatingFileSink(path, max_bytes=N)` with no `backup_count` retains one previous
       generation; a rotation leaves `path` and `path.1`.
 - [ ] AC-2: `backup_count=0` still truncates on rotation, unchanged.
-- [ ] AC-3: No counter is added and `losses()` is not implemented on this sink — the docstring
-      states that rotation is retention rather than loss, so a later reader does not read its
-      absence as an oversight (the reason SPEC-028 requires every sink to record its decision).
-- [ ] AC-4: The class docstring and the README row state that `backup_count=0` discards
-      everything since the last rotation, **and** that the new default costs up to
-      2 × `max_bytes` on disk — a behaviour change for anyone who chose `max_bytes` to bound
-      disk usage.
-- [ ] AC-5: A test writes past `max_bytes` twice with the default and asserts both generations
-      exist, so the second-rotation case the first draft missed is pinned.
+- [ ] AC-3: No counter is added and `losses()` is not implemented — the docstring states that
+      rotation is retention rather than loss, so its absence does not read as an oversight. The
+      precedent is SPEC-026 FR-002's `NullSink` and `MemorySink(maxlen)`, which "behaves as a
+      bounded ring" and counts nothing; **not** SPEC-028, which mandates the transport-lock
+      decision, or SPEC-032, which mandates the post-close one. Whether to keep the count readable
+      on the instance while reporting nothing — the middle ground `NullSink` takes — is decided in
+      the docstring rather than left implicit.
+- [ ] AC-4: The class docstring and the README row state what `backup_count=0` discards, and what
+      the new default costs on disk: **one extra generation — 2 × `max_bytes` under a size
+      trigger, one full rollover *period* under a time-only one**, where `max_bytes` defaults to
+      `0` and bounds nothing. The time-triggered case is where the default change bites hardest
+      and the first draft's "2 × `max_bytes`" did not describe it.
+- [ ] AC-5: The class docstring's existing claim **"No event is lost across a rotation"** is
+      narrowed to the pending event it actually means, or it contradicts this FR on its own page.
+- [ ] AC-6: A test writes past `max_bytes` **twice** and asserts `path.1` holds the *second*
+      generation and `path.2` does not exist. Asserting only that both files exist cannot tell a
+      correct second rotation from a broken one — the case the first draft missed entirely.
 
 ### FR-004: The synchronous path reports its loss
 
@@ -183,7 +199,7 @@ the last place it survives, and it is the one the README's serverless recipe poi
 **Two things the first draft got wrong, both corrected here.**
 
 *It folded the count into `failed_batches`.* That field is defined in four places as batches
-abandoned **after the retry budget was spent** (`worker.py:78`, `README.md:796`, `:844`,
+abandoned **after the retry budget was spent** (`worker.py:75`, `README.md:796`, `:844`,
 `architecture.md:462`), and delivery continues afterwards. An orphan loss has no retry budget,
 no batch — it is one event — and no worker that continues. The sum would also mix units, per
 *batch* against per *event*. SPEC-026 faced this exact choice and nested rather than flattened,
@@ -197,24 +213,34 @@ incur" (`worker.py:414-421`), with `_nothing_lost_since` "deliberately not a run
 anything ever failed' flag" (`:1043-1051`) and the public docstring stating "a batch lost before
 the call belongs to `health`" (`__init__.py:44`). In the very recipe this FR cites, one
 transient failure would make `flush()` report undelivered logs for the life of a warm container.
-A window-based alternative does not exist either: an orphan emit is synchronous and complete
-before `flush()` is entered, so any honest window is empty. **`flush()` is left alone.**
+A window-based alternative is not wanted either, and the reason is already written in the
+public docstring: "Events submitted concurrently by another thread may or may not be included,
+since the caller cannot have meant those" (`__init__.py:44`). An orphan emit on *this* thread has
+completed before `flush()` is entered; one on another thread is exactly what that sentence
+excludes. (An earlier draft of this FR claimed no cross-thread window exists at all — false, since
+the orphan path runs on arbitrary application threads by design, which is why SPEC-028 exists.)
+**`flush()` is left alone**, and `health()`-reports-what-`flush()`-ignores is the relationship
+`failed_batches` has had since SPEC-021, not a new inconsistency.
 `health()` is the documented channel for cumulative loss, and once the new field exists the
 recipe reads it there.
 
 #### Acceptance Criteria:
 
 - [ ] AC-1: Five `info()` calls with no span against a sink whose `emit` raises leave
-      `health().unbuffered_failed == 5`.
+      `health().orphan_lost == 5`.
 - [ ] AC-2: `flush()` is unchanged — it still returns `True` in that process, and a test pins
       that, with a comment naming SPEC-021 so a later reader does not "fix" it.
 - [ ] AC-3: The new field is **appended** to `Health`, so every existing field keeps its index;
       `Health._fields[:9]` is unchanged.
-- [ ] AC-4: A mixed process reports orphan losses in `unbuffered_failed` and worker losses in
+- [ ] AC-4: A mixed process reports orphan losses in `orphan_lost` and worker losses in
       `failed_batches`, separately — a test asserts both, and that neither absorbs the other.
-- [ ] AC-5: The counter is incremented under its **own** lock, not `_worker_lock`: the orphan
-      path runs on arbitrary application threads, and `_worker_lock` is held across sink handoffs
-      by `_swap_sink`/`_close_orphan_sink` (SPEC-028's dedicated-counter-lock rule).
+- [ ] AC-5: The counter is incremented under its **own** lock, not `_worker_lock` — SPEC-028's
+      dedicated-counter-lock rule, because the orphan path runs on arbitrary application threads.
+      The reason is *not* that `_worker_lock` is held across a blocking close: it is released
+      before `owed.close()` and `close_detached` only starts a thread. The blocking hold that
+      matters is `_get_worker` across `Worker(_ensure_sink())`. A dedicated lock also cannot
+      deadlock here: the increment sits in `api._log`'s `except`, where `_note_orphan_emit` has
+      already released `_worker_lock` and the propagating exception has released any sink lock.
 - [ ] AC-6: A loss anywhere inside the orphan guard counts — a sink that fails to *construct* or
       an event that fails to build, not only a failing `emit` — since `api._log` wraps all three
       and the event is lost either way. A test covers the construction failure specifically,
@@ -224,9 +250,25 @@ recipe reads it there.
 - [ ] AC-8: A successful orphan emit moves nothing.
 - [ ] AC-9: The stderr line SPEC-025 already writes is unchanged; this adds a counter, not a
       second announcement.
-- [ ] AC-10: `README.md`'s alert idiom and the `Health` table gain the new field as their own
-      term, and `__init__.py`'s `health()` docstring names it.
-- [ ] AC-11: Each assertion is mutation-tested.
+- [ ] AC-10: **SPEC-033 FR-006 AC-5 ("No field is added to `Health`") is superseded**, struck
+      through in place and marked with this spec per SPEC-021's rule, in the spec, in
+      `architecture.md` §13, and in `tests/test_orphan_sink_handoff.py::test_health_gains_no_field`
+      — which is **rewritten** to pin the tenth field and the unchanged first nine indices, not
+      deleted. `tests/test_worker.py`'s `len(h) == 9` assertion moves with it.
+- [ ] AC-11: `Health`'s own `Attributes:` block documents the field, as every appended field
+      before it does.
+- [ ] AC-12: Every surface that currently states this loss is counted nowhere is corrected:
+      `README.md`'s alert idiom, its `Health` table, **its serverless recipe — which hand-writes
+      its own condition and is the motivation this FR cites** — the post-`shutdown()` paragraph at
+      `README.md:830-836`, `architecture.md` §13, `decorator.py`'s `_worker_health` docstring, and
+      `__init__.py`'s `health()` docstring.
+- [ ] AC-13: `tests/conftest.py`'s reset fixture clears the counter alongside the SPEC-031/033
+      flags. Its docstring already names the failure this prevents: state leaking into every later
+      test.
+- [ ] AC-14: **The README PR (`docs/readme-1.0`) merges before this spec is built.** All the README
+      criteria above target text that PR rewrites, and one of them ("silence is not success
+      anywhere") exists only there.
+- [ ] AC-15: Each assertion is mutation-tested.
 
 ---
 
@@ -236,14 +278,14 @@ recipe reads it there.
 # src/log_foundry/worker.py
 class Health(NamedTuple):
     ...                          # the nine existing fields, positions unchanged
-    unbuffered_failed: int = 0   # NEW, appended (FR-004): events lost on the synchronous
+    orphan_lost: int = 0   # NEW, appended (FR-004): events lost on the synchronous
                                  #   no-span path, where there is no worker and no retry.
                                  #   Separate from `failed_batches`, which counts *batches* a
                                  #   worker abandoned after spending its retry budget.
 
 # src/log_foundry/decorator.py — module state
-_unbuffered_failed = 0           # the counter behind it; lives outside Worker because there may
-_unbuffered_lock = threading.Lock()   # be no worker. Its own lock, never `_worker_lock`
+_orphan_lost = 0           # the counter behind it; lives outside Worker because there may
+_orphan_lost_lock = threading.Lock()   # be no worker. Its own lock, never `_worker_lock`
                                  #   (SPEC-028), which is held across sink handoffs.
 ```
 
@@ -258,7 +300,7 @@ SentrySink(dsn: str | None = None, *, client: Any = None, ...)   # was: sdk=
 RotatingFileSink(path: str, *, backup_count: int = 1, ...)       # was: 0
 
 # unchanged signature, one appended field
-health() -> Health                            # + unbuffered_failed
+health() -> Health                            # + orphan_lost
 flush(timeout: float | None = 5.0) -> bool    # unchanged, deliberately (FR-004)
 ```
 
@@ -280,7 +322,7 @@ flush(timeout: float | None = 5.0) -> bool    # unchanged, deliberately (FR-004)
 
 ### Phase 3: Synchronous-path loss (FR-004)
 
-- Append `unbuffered_failed` to `Health`; `_unbuffered_failed` + its own lock in `decorator`,
+- Append `orphan_lost` to `Health`; `_orphan_lost` + its own lock in `decorator`,
   incremented from `api._log`'s guard; surfaced by `_worker_health()` on both branches.
 - README alert idiom, `Health` table, and `health()`'s docstring.
 - Tests for FR-004, mutation-tested, with the mixed-process and sink-construction-failure cases
