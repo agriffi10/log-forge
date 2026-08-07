@@ -76,8 +76,10 @@ class Health(NamedTuple):
 
     Attributes:
       queued: Submissions currently buffered. Approximate by nature: it is read without
-        stopping the world, and briefly counts the internal flush/shutdown markers alongside
-        real submissions.
+        stopping the world, and counts the internal flush/shutdown markers alongside real
+        submissions — normally only in passing, but a ``flush()`` marker stranded by racing
+        ``shutdown()`` is answered and then counted for the life of the process, since
+        ``Queue`` offers no way to remove one specific item.
       dropped: Submissions discarded because the queue was full (backpressure).
       failed_batches: Batches abandoned after the retry budget was spent.
       stopped_reason: The exception type name that terminated the drain thread, or ``None`` if
@@ -664,20 +666,25 @@ class Worker:
         taking the sentinel, or seeing ``_stop`` — can only happen once it is already in the
         queue, so either that ``get`` consumes it or :meth:`_final_drain` does. The reverse
         order left a window in which the loop read ``_stop``, exited, and finished its final
-        drain before the sentinel landed: measured stranding it once in roughly 29 shutdowns
-        under load, which never lost an event but left ``health().queued`` reading 1 for the
-        life of the process. Paying for it needs :meth:`_drain` to break on the sentinel rather
-        than loop, or a thread taking it before ``_stop`` was set would block for another
-        ``flush_interval`` — measured stalling about 1% of shutdowns for the entire budget and
-        latching a ``stopped_reason`` of ``"ShutdownTimeout"``, which is far worse than the
-        cosmetic problem being fixed.
+        drain before the sentinel landed. It never lost an event, but left ``health().queued``
+        reading 1 for the life of the process. The rate is load-dependent and not worth
+        quoting as a property — rare when idle, and repeatedly reproduced between roughly one
+        shutdown in 14 and one in 50 with spinner threads and a tightened switch interval.
 
-        The premise is the loop, so the put is skipped when the thread is already gone. A
-        drain that died terminally (SPEC-019) is not coming back to read a wake-up, and
-        queueing one for it would strand it permanently — reintroducing the symptom on the one
-        path the ordering cannot reach. What remains is a thread that dies terminally *between*
-        that check and the put; its ``stopped_reason`` is non-``None``, so unlike the original
-        race it is not silent.
+        Paying for that order needs :meth:`_drain` to break on the sentinel rather than loop, or
+        a thread taking it before ``_stop`` was set would block for another ``flush_interval``
+        — measured stalling low single-digit percentages of shutdowns under load for the entire
+        budget, latching a ``stopped_reason`` of ``"ShutdownTimeout"``, which is far worse than
+        the cosmetic problem being fixed.
+
+        The premise is the loop, so the put is skipped once the drain has stopped reading. A
+        drain that died terminally (SPEC-019) is not coming back for a wake-up, and queueing one
+        for it would strand it permanently — reintroducing the symptom on the one path the
+        ordering cannot reach. The gate is ``_drain_finished`` rather than ``is_alive()``,
+        because they are not the same instant: the thread is still alive throughout
+        :meth:`_terminal_failure`, which writes to stderr and can block on a slow reader, and a
+        liveness test would queue a sentinel through that whole window. The flag is set before
+        that call, so this one does not.
 
         :meth:`_release_waiters` runs on the way out for the sibling case the ordering cannot
         reach: a ``flush()`` that passed its liveness check microseconds before the thread
@@ -710,7 +717,7 @@ class Worker:
             self._close_if_owed()
             self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
             return
-        if self._thread.is_alive():
+        if not self._drain_finished.is_set():
             try:
                 self._queue.put_nowait(_SHUTDOWN)
             except queue.Full:
@@ -874,6 +881,18 @@ class Worker:
         ``BaseException``. It records and exits; looping onward past a ``KeyboardInterrupt``
         would be a worse failure than the one this prevents.
 
+        The two ``finally`` blocks are nested rather than merged, and the order they impose is
+        load-bearing twice over. ``_drain_finished`` is set the instant the loop stops reading
+        the queue — *before* :meth:`_terminal_failure`, which writes to stderr and can block on
+        a slow reader — so a ``shutdown()`` arriving during that window sees a drain that is
+        already finished and declines to queue a sentinel nothing would consume. And it is set
+        before :meth:`_release_waiters`, so a marker either lands ahead of that sweep's snapshot
+        and is answered by it, or lands behind it and finds the flag set; both take the queue's
+        own mutex, which is what leaves no gap between the two. Sweeping here rather than only
+        in :meth:`Worker.shutdown` is what covers the paths ``shutdown`` never reaches — a
+        terminal failure, and a bounded shutdown that expired while this thread was still
+        inside an emit.
+
         Args:
           None.
 
@@ -885,13 +904,14 @@ class Worker:
         """
         pending: list[list[dict[str, object]]] = []
         try:
-            self._drain(pending)
+            try:
+                self._drain(pending)
+            finally:
+                self._drain_finished.set()
         except BaseException as exc:
             self._terminal_failure(exc, len(pending))
-            self._drain_finished.set()
-            self._release_waiters()
         finally:
-            self._drain_finished.set()
+            self._release_waiters()
 
     def _release_waiters(self) -> None:
         """Answers every ``flush()`` marker still queued, so no caller waits out its timeout.

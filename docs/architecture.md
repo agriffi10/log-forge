@@ -641,7 +641,11 @@ constraint — never by being deleted quietly.
   repairable, and needs no write at all. The put is skipped for a thread that is already gone,
   since a terminally dead drain will never read a wake-up and one queued for it would strand
   permanently — the one path the ordering cannot reach, and not a silent one, because
-  `stopped_reason` is non-`None` there. The residual is that a marker stranded by the sibling race is answered but left queued,
+  `stopped_reason` is non-`None` there. The gate is `_drain_finished` rather than `is_alive()`,
+  because the thread stays alive throughout `_terminal_failure`, which writes to stderr and can
+  block on a slow reader; the flag is set before that call.
+
+  The residual is that a marker stranded by the sibling race is answered but left queued,
   so `health().queued` counts it; removing it would mean deleting a *specific* item, which
   `Queue` cannot do, and draining to reach it is not available either — post-shutdown
   submissions must stay queued, since that is exactly what `submitted_after_shutdown` reports
