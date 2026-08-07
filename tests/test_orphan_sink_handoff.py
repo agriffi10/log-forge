@@ -1006,3 +1006,41 @@ def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
         assert not wedged.closed_while_emitting
     finally:
         wedged.release.set()
+
+
+def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypatch) -> None:
+    """What `_orphan_closed_sink = old` defends, which needs an injected preemption point.
+
+    An orphan emit resolves its sink and *then* records it. One that resolved the old sink and
+    resumes after the swap has closed it must find it latched and decline, or it re-arms a closed
+    sink and the exit close makes that two. The window is a few instructions wide, so it is
+    injected — the technique SPEC-028 uses for races that need one.
+    """
+    api = pytest.importorskip("log_foundry.api")
+    old, new = CountingSink("old"), CountingSink("new")
+    log_foundry.configure(service="t", sink=old)
+    log_foundry.info("arms the record at old")
+
+    resolved, resume = threading.Event(), threading.Event()
+
+    def preempting_ensure_sink():
+        resolved.set()
+        assert resume.wait(10.0), "the swap completed"
+        return old  # this caller resolved `old` before the swap and still holds it
+
+    emitter = threading.Thread(target=lambda: log_foundry.info("in flight across the swap"))
+    monkeypatch.setattr(api, "_ensure_sink", preempting_ensure_sink)
+    emitter.start()
+    try:
+        assert resolved.wait(5.0), "the emitter is parked holding the old sink"
+
+        log_foundry.configure(sink=new)
+        assert old.closed == 1, "the swap closed it"
+    finally:
+        resume.set()
+        emitter.join(15.0)
+
+    assert decorator._orphan_sink is new, "the stale emit must not re-arm the closed sink"
+    log_foundry.shutdown()
+    assert old.closed == 1, "or the exit close makes it two"
+    assert new.closed == 1

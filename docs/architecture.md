@@ -697,7 +697,10 @@ constraint — never by being deleted quietly.
   latch on B, re-arms A, and orphans the live sink. And an emit that resolved the old sink and
   arrives after the *worker* branch cleared the record re-arms it, so `Worker.swap_sink` closes
   that sink and the ownership guard — finding `_worker.sink` is now the new one — closes it
-  again at exit.
+  again at exit. That one is **measured** (`A.closed == 2`, with a preemption point injected at
+  `_ensure_sink`) and is **pre-existing**: it reproduces identically before SPEC-033, because the
+  worker branch has never recorded a closed sink. The orphan branch's equivalent *is* closed, by
+  `_orphan_closed_sink`, and a test pins it.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

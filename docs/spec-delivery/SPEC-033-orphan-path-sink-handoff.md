@@ -14,7 +14,7 @@
 - Two defects found by review of the spec and fixed here, not deferred: a sink configured **after**
   `shutdown()` was closed by nothing at all, and an orphan-only process never received a SPEC-027
   stop signal.
-- `tests/test_orphan_sink_handoff.py` — 43 tests. Suite 1106 → 1151, none removed.
+- `tests/test_orphan_sink_handoff.py` — 44 tests. Suite 1106 → 1152, none removed.
 
 **Deviation from the spec:** none in substance. `close_detached` returns the thread rather than
 joining (the spec's own final revision), so a caller can start it under `_worker_lock` and wait
@@ -75,7 +75,7 @@ it:
 | hanging `close()` on the swap | n/a (no close at all) | bounded by `DEFAULT_SWAP_TIMEOUT`, `closing_sinks=1` |
 | `_retry.wait(5.0)` on a set event | 0.000 s (vs 0.405 s unset) | fresh event armed; post-shutdown sinks still back off |
 
-Sixteen mutants, all caught. Six from the build: swap returns early (13 failures), clear instead of
+Seventeen mutants, all caught. Six from the build: swap returns early (13 failures), clear instead of
 re-point (5), `_close_orphan_sink` guards on existence (1), `_shutdown_worker` returns early (1),
 never refresh a set event (2), skip the signal offer on existence (1). Six more added after the
 PR review found them escaping: `_swap_sink` guards on existence (1), remove both record clears (2 —
@@ -84,7 +84,10 @@ grace twice (1), route the live close through `close_detached` (1), signal offer
 mixed process (1). Four more after the review of those fixes: decide the swap's close by
 liveness (2 — the double close and the close-under-a-live-writer), and two runtime-import forms
 the cycle test missed (`import log_foundry.worker`, `from log_foundry import worker as _w`) —
-the forms a regression would actually take, since that is the import style this package uses.
+the forms a regression would actually take, since that is the import style this package uses. One
+more after a verification pass found it surviving: dropping `_orphan_closed_sink = old` from the
+swap, which defends an emit preempted across it and so needs an injected preemption point to
+observe.
 
 Three of those six escaped because the **test** was wrong, not the code: the mixed-process test
 asserted before `shutdown()` so a close at exit was invisible; the lock test timed an emit that
