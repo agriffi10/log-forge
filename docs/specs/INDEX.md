@@ -37,7 +37,7 @@ to status only — no prose.
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Completed | SPEC-013, SPEC-019 |
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Completed | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
-| [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Draft | SPEC-026, SPEC-028, SPEC-030, SPEC-031 |
+| [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Draft | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
 
 ## Arcs (build order)
 
@@ -145,6 +145,9 @@ Group related specs and record the order to build them in. Delete this section i
   process that never opened a span leaves the previous sink open with `incomplete_swaps` at zero,
   because `_swap_sink` returns early on a null worker. Depends on SPEC-031 for the arming it
   extends from a boolean to an identity, SPEC-030 for the bounded closer it reuses and the field it
-  declines to widen, SPEC-028 for the concurrent-`close()` contract that lets it skip the fence, and
-  SPEC-026 for why a sink that raised is still a sink to close. Build after 031; nothing depends
-  on it.
+  declines to widen, SPEC-028 for the concurrent-`close()` contract that lets it skip the fence,
+  SPEC-027 for the stop signal this path never receives, and SPEC-026 for why a sink that raised is
+  still a sink to close. Review of its first draft widened it twice, both from the same boolean:
+  a sink configured after `shutdown()` is never closed, and an orphan-only process never hands its
+  sink a stop signal — so SPEC-027's "a shutdown cuts a backoff short" is false on this path. Build
+  after 031; nothing depends on it.

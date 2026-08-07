@@ -3,7 +3,7 @@
 **ID:** SPEC-033  
 **Status:** Draft  
 **Last Updated:** 2026-08-07  
-**Depends On:** SPEC-026, SPEC-028, SPEC-030, SPEC-031
+**Depends On:** SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031
 
 ## Overview
 
@@ -11,8 +11,8 @@
 back to a later call. That promise holds only when a background worker exists. A process that logs
 exclusively through the level calls — `info()`, `warning()` and friends, with no `@trace` anywhere —
 never builds one, so the promise silently does not apply to it: the previous sink is left open, its
-locally-buffered events are never delivered, and `health()` reports nothing at all, because the
-field that would report it (`incomplete_swaps`) describes a worker that does not exist.
+locally-buffered events are never delivered, and `health()` reports nothing, because the field that
+would report it (`incomplete_swaps`) describes a worker that does not exist.
 
 This is the last item from the 2026-08-05 audit arc. SPEC-031 FR-006 fixed the *shutdown* half of
 the same root cause — a process with no worker now closes its sink exactly once at exit — and
@@ -20,12 +20,12 @@ explicitly scoped this half out, recording it in `architecture.md` §13 so that 
 paragraph it replaced would not be read as closing this variant too. This spec is the home §13 says
 it needs.
 
-The fix is small in behaviour and specific in mechanism. The library already knows which sink an
-orphan log reached — it resolves one immediately before emitting — but records only *that* one was
-reached, not *which*. Recording the identity is what lets a late `configure(sink=...)` close it. The
-close itself reuses the bounded, abandonable closer SPEC-030 built for the worker path rather than
-inventing a second one, and that machinery moves to a module both paths can reach, because a
-facility used by a path with no worker does not belong to the worker.
+The library already knows which sink an orphan log reached — it resolves one immediately before
+emitting — but records only *that* one was reached, not *which*. Recording the identity is what lets
+a late `configure(sink=...)` close it, and it turns out to be worth more than the swap: the same
+boolean is why a sink configured **after** `shutdown()` is never closed at all, and why an
+orphan-only process never hands its sink the stop signal SPEC-027 built. Both are fixed here with
+*less* state, not more, and both were found by independent review of this spec's first draft.
 
 **Measured, on `f17edd4`**, `configure(sink=A)` → `info()` → `configure(sink=B)` → `info()` →
 `shutdown()`:
@@ -39,25 +39,49 @@ incomplete_swaps = 0   closing_sinks = 0   retired = True   failed_batches = 0
 The same sequence with one `@trace` call ahead of it — which builds the worker — closes A correctly
 and is the control that isolates the defect to the no-worker path.
 
+**Also measured, and the reason FR-002 re-points rather than clears:** `configure(A)` → `info()` →
+`configure(B)` → `shutdown()`, *with no second `info()`*, closes B today (`B.closes = 1`) precisely
+because the boolean is path-agnostic and `_ensure_sink()` still names B at exit. A fix that cleared
+the record at the swap would trade A's leak for B's. This one keeps both closed.
+
+**And the second defect, measured:** `configure(A)` → `info()` → `shutdown()` → `configure(B)` →
+`info()` leaves B open at exit, losing a locally-buffering sink's whole batch, while every counter
+reads clean:
+
+```
+B accepted the event: held=1   (no exception, no refusal)
+health(): retired=True  submitted_after_shutdown=0  failed_batches=0  dropped=0
+AT EXIT -> B.closed=False  delivered=0  still-held=1
+```
+
+SPEC-030's `retired` + `submitted_after_shutdown` pair cannot fire, because there is no worker to
+count a submission — the arc's signature failure shape, and strictly less visible than the worker
+path, where the same mistake at least queues and counts.
+
 ## Scope
 
 ### In Scope
 
 - Recording the **identity** of the sink an orphan emit reached, not merely that one was reached.
-- Closing that sink when a late `configure(sink=...)` retargets a process that has no worker.
-- Bounding that close on the same terms as the worker path's, and granting it the same exit grace.
+- Closing that sink when a late `configure(sink=...)` retargets a process that has no worker, and
+  re-pointing the record at the new one.
+- Making the once-only close **per sink** rather than per process, which is what closes a sink
+  configured after `shutdown()`.
+- Handing an orphan-only process's sink the SPEC-027 stop signal, which today it never receives.
+- Bounding the swapped-out close on the same terms as the worker path's, and granting it the same
+  exit grace.
 - Making `health().closing_sinks` reachable on the no-worker path.
-- Extracting the daemon-closer machinery into one module both paths use.
-- Recording the resolution in `architecture.md` §13 and correcting `configure()`'s docstring, whose
-  swap paragraph currently describes behaviour this path does not have.
+- Extracting the shared sink-lifecycle machinery into one module both paths use.
+- Recording the resolution in `architecture.md` §13 and splitting `configure()`'s swap paragraph by
+  path, since it currently describes a drain this path does not have.
 
 ### Out of Scope
 
 - **Any new `Health` field.** SPEC-030 settled that vocabulary and SPEC-031 declined to extend it
   for the same root cause. `closing_sinks` becomes *reachable* on this path; it is not new, and
   nothing else is added.
-- **Widening `incomplete_swaps`.** FR-005 settles it in the other direction — it keeps its
-  worker-only meaning, and this path never moves it. That is a decision, not an omission.
+- **Widening `incomplete_swaps`.** FR-006 settles it in the other direction — it keeps its
+  worker-only meaning. That is a decision, not an omission.
 - **Creating a worker to perform the swap.** The refusal SPEC-030 FR-003 made, SPEC-031 FR-006
   repeated, and `_flush_worker` and `_worker_health` also make: standing up a thread to prove there
   is nothing to drain is pure cost.
@@ -66,35 +90,53 @@ and is the control that isolates the defect to the no-worker path.
   concurrent writer a fence could not exclude is the same one the *worker* path cannot exclude
   either. FR-002 states the contract that already covers it.
 - **Making `configure()` thread-safe.** It remains a startup call, as its docstring says and as
-  `Worker.swap_sink` restates. This spec does not change that and does not make a concurrent
-  orphan emit during a swap deterministic.
+  `Worker.swap_sink` restates. FR-002 AC-10 closes one specific race that this spec would otherwise
+  *introduce*; it does not make a concurrent orphan emit during a swap deterministic.
 - **Bounding the *live* sink's close at shutdown.** SPEC-031 FR-006's `_close_orphan_sink` closes
   inline and unbounded, matching `Worker._close_if_owed`, and arch §13 records why running that one
   on a daemon was built and reverted. Only a **swapped-out** sink's close is bounded here.
-- **Closing a sink configured after `shutdown()`.** `configure(sink=B)` → `info()` on a retired
-  orphan-only process leaves B open, because the close is once-only across the process (SPEC-031
-  FR-006) and logging after `shutdown()` is a documented user error that SPEC-030 settled as
-  reported rather than prevented. FR-001 AC-7 pins this as intended, not incidental.
-- **Reviving the worker path's swap semantics on this path.** No `_offer_stop_signal`, no double
-  drain, no `_record_incomplete_swap`. What is shared is the *close*, not the swap protocol.
+- **Closing a sink more than once when the caller hands back a sink already swapped out.**
+  `configure(A)` → `info()` → `configure(B)` → `configure(A)` closes A twice. This is a documented
+  user error — `configure()`'s own docstring says the previous sink "must not be handed back to a
+  later call" — `sinks/base.py:138` requires `close()` to be idempotent, and **the worker path
+  behaves identically** (measured: `A.closes=2, B.closes=1`). Tracking every sink ever closed would
+  pin them all against collection to fix a case the sibling path does not fix either. Recorded by
+  FR-007, not built.
+- **Reviving the worker path's swap semantics.** No double drain, no `_record_incomplete_swap`.
+  What is shared is the *close*, not the swap protocol.
 
 ---
 
 ## Functional Requirements
 
-### FR-001: The orphan path records which sink it wrote to
+### FR-001: The orphan path records which sink it wrote to, and which it has closed
 
 #### Description:
 
-`decorator._orphan_close_owed` is a boolean: it records that *a* sink was written to, which is
-sufficient for a close at exit (where `_ensure_sink()` still returns that same sink) and
-insufficient for a close at swap time (where `configure()` has already reassigned `_config.sink`
-before the swap runs — see `config.py:128,143`, the assignment precedes `_swap_live_sink`). By the
-time anything could close the old sink, the config no longer names it.
+`decorator._orphan_close_owed` and `_orphan_sink_closed` are both booleans. The first records that
+*a* sink was written to, which suffices for a close at exit (where `_ensure_sink()` still names that
+sink) and fails at swap time, because `configure()` assigns `_config.sink` at `config.py:129`
+*before* calling `_swap_live_sink` at `config.py:144` — by the time anything could close the old
+sink, the config no longer names it. The second makes the close once per **process**, which is why a
+sink configured after `shutdown()` is never closed.
 
-Replace the flag with the sink object. `api._log` resolves `_ensure_sink()` immediately before
-emitting and is the only place in the library that holds that identity; it passes it to
-`_note_orphan_emit`, which stores it.
+Replace both with sink references. `api._log` resolves `_ensure_sink()` immediately before emitting
+and is the only place in the library that holds that identity; it passes it to `_note_orphan_emit`.
+
+- `_orphan_sink` — the sink the orphan path owns the close of. `None` means nothing is owed.
+- `_orphan_closed_sink` — the most recently closed orphan-owned sink, which is refused re-arming.
+
+That second reference is what makes the rule "each sink is closed at most once" instead of "at most
+one close ever", and it is strictly less state than the boolean it replaces: it prevents the
+double-close hazard the boolean existed for *and* lets a post-`shutdown()` `configure(sink=B)` →
+`info()` be closed at exit.
+
+**An alternative that keeps the booleans was considered and rejected:** `configure()` could capture
+`_config.sink` before reassigning it and pass the old sink to `_swap_sink`. It needs no module-level
+reference and no conftest change, but it is strictly less precise — a second swap with no
+intervening emit would then close a sink that was configured and never written to, which AC-3
+forbids — and it does nothing for the post-`shutdown()` case or the stop signal, both of which fall
+out of the identity for free.
 
 The two properties SPEC-031 FR-006 established are preserved verbatim, and both are load-bearing:
 arming is keyed on an event **reaching** a sink rather than on a sink being **configured** (because
@@ -112,25 +154,41 @@ must be released).
 - [ ] AC-3: A process that calls `configure()` and never makes an orphan emit records nothing, and
       closes nothing at swap or at exit (SPEC-031 FR-006 AC-8, unchanged).
 - [ ] AC-4: A sink whose orphan `emit` **raised** is still recorded and still closed.
-- [ ] AC-5: The hot path stays one unlocked read plus an identity comparison; the lock is taken only
-      when the recorded sink is not the one being emitted to.
-- [ ] AC-6: The reference is cleared when the sink is closed or when a worker takes ownership, so a
-      swapped-out sink becomes collectable rather than pinned for the process lifetime.
-- [ ] AC-7: An orphan emit made **after** the once-only close has been performed does not re-arm it.
-      A refused post-`shutdown()` emit against the closed sink therefore cannot cause a second
-      `close()` on it — the outcome SPEC-031 FR-006 ranks worse than an unclosed sink.
-- [ ] AC-8: `tests/conftest.py`'s reset fixture covers the new state; no test leaks a recorded sink
-      into the next test.
+- [ ] AC-5: An orphan emit against the sink recorded in `_orphan_closed_sink` does not re-arm it, so
+      a refused post-`shutdown()` emit cannot cause a second `close()` — the outcome SPEC-031 FR-006
+      ranks worse than an unclosed sink.
+- [ ] AC-6: `configure(sink=B)` → `info()` after `shutdown()` on an orphan-only process closes B at
+      exit. The test uses a sink whose `close()` is its delivery and asserts the event lands, since
+      an unclosed `close()`-delivers sink is the loss this criterion exists to stop.
+- [ ] AC-7: The record is cleared when the sink is closed and when a worker takes ownership. The
+      reason is correctness, not collectability — a stale reference is a reference the *next* close
+      would target after it was already closed.
+- [ ] AC-8: The hot path stays one unlocked read plus an identity comparison; `_worker_lock` is
+      taken only when the recorded sink is not the one being emitted to. The docstring states the
+      replacement invariant, since SPEC-031's ("written once and never cleared") no longer holds:
+      a reference read is atomic, so the unlocked read is **stale, never invalid**; a stale mismatch
+      self-corrects under the lock; and a stale *match* is reachable only when an emit races a
+      close, which is the lifecycle error SPEC-030 documents rather than a new one.
+- [ ] AC-9: The Data Model comment in `decorator.py` names which reads are unlocked and why, rather
+      than claiming `_worker_lock` guards every access.
+- [ ] AC-10: `tests/conftest.py`'s reset fixture covers both new references; no test leaks a
+      recorded sink into the next test.
 
-### FR-002: A late `configure(sink=...)` with no worker closes the sink the orphan path was using
+### FR-002: A late `configure(sink=...)` with no worker closes the old sink and adopts the new one
 
 #### Description:
 
-`decorator._swap_sink` returns early when `_worker is None`. That early return is correct on its own
-terms — a process with no worker has captured no sink to *swap* — but it is currently the whole
-function for this path, so nothing performs the handoff at all. Give it a second branch: with no
-worker and a recorded orphan sink that is not the incoming one, close the recorded sink and clear
-the record.
+`decorator._swap_sink` returns early when `_worker is None` (`decorator.py:368-370`). That early
+return is correct on its own terms — a process with no worker has captured no sink to *swap* — but
+it is currently the whole function for this path, so nothing performs the handoff. Give it a second
+branch: with no worker and a recorded orphan sink that is not the incoming one, **re-point the
+record at the new sink**, record the old one as closed, and close it.
+
+Re-pointing rather than clearing is the correction the first draft needed. Clearing would leave
+nothing armed until the next orphan emit, and a process that swaps and then exits without logging
+again would leak the *new* sink — measured, that case closes B correctly today, so clearing would
+trade one leak for another. Re-pointing is also what the worker path does: `Worker.shutdown` closes
+`self.sink` whether or not anything was emitted to it since the swap.
 
 No drain and no fence. The worker path drains twice because events sit in a queue and because the
 drain thread may be inside the old sink's `emit`; neither is true here. Orphan events are emitted
@@ -138,36 +196,53 @@ synchronously on the caller's thread and have returned before `configure()` is e
 writer that could still be inside the old sink's `emit` is an orphan emitter on *another*
 application thread — and that is precisely the writer `Worker._close_swapped_out` documents itself
 as **not** covering either, which is why `sinks/base.py` requires `close()` to tolerate a concurrent
-`emit` (SPEC-028 FR-001) and why the sinks holding transport state take their lock in both. This
-path inherits that contract unchanged; it does not weaken it.
+`emit` (SPEC-028 FR-001). This path inherits that contract unchanged; it does not weaken it.
+
+**The `_worker` read must move under `_worker_lock`.** Today's unlocked read at `decorator.py:368`
+is harmless because the no-worker branch does nothing. Once it closes a sink it is the race
+`_close_orphan_sink`'s docstring (`decorator.py:286-290`) describes: a first `@trace` on another
+thread can be inside `Worker.__init__` — having already resolved `_ensure_sink()` to A — while this
+thread reads `_worker` as `None` and detaches a close of the sink that worker is about to deliver
+to. `_get_worker` assigns `_worker` under that lock, which is what makes the locked read sufficient.
 
 #### Acceptance Criteria:
 
 - [ ] AC-1: `configure(sink=A)` → `info()` → `configure(sink=B)` calls `A.close()` exactly once,
       with no `@trace` anywhere in the process.
 - [ ] AC-2: After that swap, `info()` reaches B and not A.
-- [ ] AC-3: A subsequent `shutdown()` closes B, and does not close A a second time.
+- [ ] AC-3: `configure(A)` → `info()` → `configure(B)` → `shutdown()`, **with no second `info()`**,
+      closes both A and B, exactly once each. This is the case the first draft regressed and it is
+      the reason the record is re-pointed rather than cleared.
 - [ ] AC-4: `configure(sink=A)` → `configure(sink=B)` with no orphan emit between them closes
-      nothing (AC-3 of FR-001, asserted end to end).
+      nothing (FR-001 AC-3, asserted end to end).
 - [ ] AC-5: `configure(sink=A)` → `info()` → `configure(sink=A)` — the same object — closes nothing
-      and leaves the record armed, so A is still closed at exit. This mirrors
-      `Worker.swap_sink`'s `self.sink is new_sink` no-op.
-- [ ] AC-6: With a worker present, this branch closes nothing and `Worker.swap_sink` still owns the
-      close. A test covers the mixed process — orphan log, then `@trace`, then the swap — and
-      asserts exactly one `close()` on the old sink. This is the case an independent review of
-      SPEC-031 FR-006 found uncovered, and it is the one most likely to double-close.
+      and leaves the record armed, mirroring `Worker.swap_sink`'s `self.sink is new_sink` no-op.
+- [ ] AC-6: With a worker present, this branch closes nothing, `Worker.swap_sink` still owns the
+      close, and the orphan record is cleared so nothing closes it a second time. A test covers the
+      mixed process in **both** orders — orphan-then-`@trace` and `@trace`-then-orphan — and asserts
+      exactly one `close()` on the old sink. This is the case an independent review of SPEC-031
+      FR-006 found uncovered, and the one most likely to double-close.
 - [ ] AC-7: A `close()` that raises is absorbed and announced through `_diag.absorbed`; `configure()`
-      returns normally and the swap still stands (SPEC-025 FR-004).
-- [ ] AC-8: After the swap, the next orphan emit re-arms the record against the new sink, so B is
-      closed at exit by `_close_orphan_sink` on the path SPEC-031 FR-006 built.
-- [ ] AC-9: Each assertion above is mutation-tested — the branch is stashed and the test re-run — so
-      no criterion is ticked by a test that passes against the defect it claims to catch.
+      returns normally and the swap still stands. The test **joins the closer before asserting**,
+      since with FR-003's detached close the line may otherwise be written after `configure()`
+      returns and the assertion would pass vacuously.
+- [ ] AC-8: A `Thread.start` that fails announces, leaves the old sink open, and **still re-points**
+      the record — matching `Worker._close_swapped_out`, which leaves the sink open rather than
+      falling back to an inline close. The order is specified because both readings of "close and
+      re-point" satisfy prose and they leak different sinks.
+- [ ] AC-9: A three-sink chain `A → info → B → C → info → shutdown` closes each of A, B and C
+      exactly once.
+- [ ] AC-10: `_swap_sink` reads `_worker` and both records under `_worker_lock`. A test reproduces
+      the first-`@trace` race with an injected preemption point — the technique SPEC-028 uses and
+      `_close_orphan_sink` was built against — and asserts the worker's live sink is not closed.
+- [ ] AC-11: Each assertion above is mutation-tested — the branch is stashed and the test re-run —
+      so no criterion is ticked by a test that passes against the defect it claims to catch.
 
 ### FR-003: The swapped-out sink's close is bounded, abandonable, and granted the exit grace
 
 #### Description:
 
-Close it on the shared daemon closer of FR-004 rather than inline. The reason is SPEC-030 FR-003's,
+Close it on the shared daemon closer of FR-005 rather than inline. The reason is SPEC-030 FR-003's,
 measured again here: a sink that hangs in `close()` blocks the caller for as long as it hangs, and
 `configure()` is on the application's startup path. **Measured on `f17edd4`** against a sink whose
 `close()` sleeps 8 s, the worker path returns in 5.00 s — its `DEFAULT_SWAP_TIMEOUT` — and reports
@@ -177,11 +252,15 @@ on this path the exact gap arch §13 records as closed for the other one.
 Everything SPEC-030 settled about that closer carries over unchanged and is not re-litigated: the
 thread is a daemon; the join is capped; **an expired join derives no signal** — no counter moves and
 no line is written, which is what dissolved SPEC-028's wrong-signal objection — and the live fact is
-published as `health().closing_sinks` instead. `shutdown()` on this path must grant an outstanding
-closer the same `DEFAULT_CLOSER_GRACE`, carved from its own budget, after the live sink's inline
-close; without it a daemon closer that is slow but *succeeding* is killed at interpreter exit,
-losing the buffer of a sink whose `close()` is its delivery — the loss `Worker._join_closers` exists
-to prevent, and one this path would otherwise take.
+published as `health().closing_sinks` instead.
+
+**The grace belongs in `_shutdown_worker`, not inside `_close_orphan_sink`.** Placing it inside the
+close would skip it in exactly the cases that need it: a shutdown where nothing is armed, and the
+idempotent second `shutdown()` — the explicit call followed by `atexit` — which
+`Worker._join_closers` (`worker.py:766-772`) documents at length as load-bearing, because a first
+shutdown that expired returns before reaching the grace and the `atexit` call is the only one left
+to grant it. Without the grace a daemon closer that is slow but *succeeding* is killed at
+interpreter exit, losing the buffer of a sink whose `close()` is its delivery.
 
 #### Acceptance Criteria:
 
@@ -191,59 +270,105 @@ to prevent, and one this path would otherwise take.
 - [ ] AC-2: An expired join increments no counter and writes no `_diag` line.
 - [ ] AC-3: `health().closing_sinks` reads 1 while such a close is running **in a process with no
       worker**, and returns to 0 once it finishes.
-- [ ] AC-4: `shutdown()` on an orphan-only process joins an outstanding closer for at most
+- [ ] AC-4: `shutdown()` on an orphan-only process joins outstanding closers for at most
       `DEFAULT_CLOSER_GRACE`, and for no more than what remains of its own timeout.
-- [ ] AC-5: That grace runs **after** the live orphan sink's inline close, matching
+- [ ] AC-5: The grace runs when **nothing is armed** and on the **second** `shutdown()` call, not
+      only on a shutdown that performs a close. Two tests, one per case.
+- [ ] AC-6: The grace runs **after** the live orphan sink's inline close, matching
       `Worker.shutdown`'s order, and a test pins the ordering rather than only the outcome.
-- [ ] AC-6: The live orphan sink's own close at shutdown stays inline and unbounded — unchanged from
+- [ ] AC-7: The live orphan sink's own close at shutdown stays inline and unbounded — unchanged from
       SPEC-031 FR-006, and asserted so a future refactor cannot quietly move it onto the closer.
-- [ ] AC-7: A `Thread.start` that fails leaves the sink open and announces it; there is no inline
+- [ ] AC-8: A `Thread.start` that fails leaves the sink open and announces it; there is no inline
       fallback, for the reason `Worker._close_swapped_out` gives — the fallback reintroduces the
       unbounded wait in the one situation where the process is already under resource pressure.
 
-### FR-004: One process-wide closer registry, used by both paths
+### FR-004: An orphan-only process hands its sink the stop signal
 
 #### Description:
 
-`DEFAULT_CLOSER_GRACE`, the live-closer list, the daemon spawn, the guarded close body and the
-capped grace join currently live on `Worker` (`worker.py:29,229,561-646,746-793`) and are reachable
-only through a worker instance. Move them to a leaf module — `src/log_foundry/_closing.py`, on the
-precedent of `_diag.py`, `sinks/_retry.py` and `sinks/_batch.py` — holding process-global state, and
-have `Worker` and `decorator` both call it.
+`Worker._offer_stop_signal` (`worker.py:242`) is called only from `Worker.__init__` and
+`Worker.swap_sink`. A process with no worker therefore never gives its sink a stop event, so
+SPEC-027's guarantee — every sink wait is cut short by a shutdown — is **false on the path this
+spec is about**, and a retrying sink's backoff on an application thread runs to completion during
+shutdown and interpreter exit. That matters here rather than in the abstract: FR-003 deliberately
+leaves the live sink's close inline and unbounded, and SPEC-028 made `close()` take the sink's emit
+lock, so that close can now sit behind an uninterruptible backoff held by another orphan writer —
+the constraint arch §13 already records, with its ceiling removed.
 
-Duplicating the machinery instead was considered and rejected on two grounds. First it is the
-mistake SPEC-029 diagnosed: rules applied in one place stay applied, and rules remembered in two
-drift — twelve of twenty-eight diagnostic sites drifted exactly that way. Second, a per-path
-registry is measurably blind in a mixed process: a closer started before a worker existed would be
-invisible to `health().closing_sinks` and would be denied the exit grace once the worker owned
-`shutdown()` — the "every field describes a worker that does not exist" shape this arc has now
+This is a widening of the spec's original subject, taken deliberately. It is the same roster lesson
+SPEC-027 and SPEC-028 both record — a facility built for one caller and never wired to the other —
+found in the same function this spec is rewiring, and leaving it unfixed while writing three FRs
+about bounding this path's waits would be recording a ceiling that does not exist.
+
+Arm a module-level `threading.Event` at the same point FR-001 arms the record, offered with the same
+`hasattr` probe and the same absorbed failure, and set it in `_shutdown_worker` on **both** branches.
+Setting it on the worker branch too is what closes the mixed-process case: if the orphan path offered
+its event and a worker was built afterwards, the sink may hold either, and setting both costs one
+call.
+
+#### Acceptance Criteria:
+
+- [ ] AC-1: After an orphan emit with no worker, a sink advertising `stop_signal` has been given one.
+- [ ] AC-2: `shutdown()` sets it, and a sink parked in `sinks/_retry.py`'s wait returns promptly
+      rather than serving its full backoff. The test measures the gap between the backoff and the
+      budget, not a tight budget.
+- [ ] AC-3: A sink with no `stop_signal` attribute is unaffected, and one whose assignment raises is
+      absorbed and announced — the sink loses interruptibility rather than the emit failing, exactly
+      as `Worker._offer_stop_signal` behaves.
+- [ ] AC-4: In a mixed process the sink ends up with an event that `shutdown()` sets, in both
+      orders (orphan-then-`@trace`, `@trace`-then-orphan).
+- [ ] AC-5: The offer is made on the swap too, so the sink adopted by FR-002 receives one without
+      waiting for the next emit.
+- [ ] AC-6: The probe and the absorbed failure are the shared helper of FR-005, not a second copy of
+      `Worker._offer_stop_signal`'s body.
+
+### FR-005: One process-wide sink-lifecycle module, used by both paths
+
+#### Description:
+
+`DEFAULT_CLOSER_GRACE`, the live-closer list, the daemon spawn, the guarded close body, the capped
+grace join and the stop-signal probe currently live on `Worker` (`worker.py:29,229,242-267,561-649,
+746-793`) and are reachable only through a worker instance. Move them to a leaf module —
+`src/log_foundry/_lifecycle.py`, on the precedent of `_diag.py`, `sinks/_retry.py` and
+`sinks/_batch.py` — holding process-global state, and have `Worker` and `decorator` both call it.
+
+**The load-bearing requirement is that the state is process-global, not that the file is new.**
+A per-path registry is measurably blind in a mixed process: a closer started before a worker existed
+would be invisible to `health().closing_sinks` and would be denied the exit grace once the worker
+owned `shutdown()` — the "every field describes a worker that does not exist" shape this arc has now
 fixed three times. `closing_sinks` is inherently process-scoped; there is only ever one worker.
+Duplicating the machinery instead is the mistake SPEC-029 diagnosed, where twelve of twenty-eight
+diagnostic sites drifted from the other eight.
 
-Keeping it at module scope inside `worker.py` was also considered and rejected: a facility whose
-whole purpose here is to serve a path with **no worker** does not belong in the worker module, and
-CLAUDE.md's single-concept rule applies to a file already at 1176 lines.
+The separate module is the secondary argument and is taste plus file size: `decorator` already
+imports `worker` at module scope, so module-scope functions in `worker.py` would be equally correct
+and a smaller diff. The file is chosen anyway because a facility whose purpose here is to serve a
+path with no worker does not belong to the worker, and `worker.py` is 1176 lines.
 
 #### Acceptance Criteria:
 
 - [ ] AC-1: `health().closing_sinks` reports the same number whether or not a worker exists, and a
       closer started before the worker was built is still counted after one is built.
 - [ ] AC-2: `shutdown()` joins closers started on either path, under one shared grace.
-- [ ] AC-3: `_closing.py` imports nothing from the package but `_diag`, and `Sink` only under
+- [ ] AC-3: `_lifecycle.py` imports nothing from the package but `_diag`, and `Sink` only under
       `TYPE_CHECKING`; `mypy --strict` and the import-cycle expectations are unchanged.
 - [ ] AC-4: Every SPEC-030 behaviour currently asserted through `Worker._close_swapped_out`,
       `Worker._join_closers`, `Worker._closers` and `worker.DEFAULT_CLOSER_GRACE` still holds; those
       tests are re-pointed at the new seams rather than deleted.
-- [ ] AC-5: The re-point is verified by diffing `pytest --collect-only` test **names** before and
-      after, not pass counts — a scripted rewrite of a test file has silently removed tests in this
-      repo before.
+- [ ] AC-5: The re-point is verified by **asserting the patched value takes effect**, not by a
+      `pytest --collect-only` name diff alone. `tests/test_config.py:530` monkeypatches
+      `worker.DEFAULT_CLOSER_GRACE` to 0.3 and asserts an elapsed time under 5.0 — left pointing at
+      a stale module that test passes with the real 2.0 grace, under an unchanged name, so a name
+      diff cannot see it. The name diff is still run, for the separate hazard of a rewrite silently
+      dropping tests.
 - [ ] AC-6: `Worker.health()` no longer prunes the closer list under the worker's own lock; the
       registry's lock is its own, and `health()` remains safe to call during an emit (SPEC-026).
 
-### FR-005: `incomplete_swaps` keeps its worker-only meaning
+### FR-006: `incomplete_swaps` keeps its worker-only meaning
 
 #### Description:
 
-SPEC-030 defines `incomplete_swaps` as a **drain** that could not be confirmed, and pairs it with a
+SPEC-030 defines `incomplete_swaps` as a **drain** that could not be confirmed, paired with a
 specific consequence: queued items may have reached the new sink instead of the old one, and the old
 sink was left open. Neither half exists on this path. There is no queue and no drain, so there is
 nothing to confirm; and an expired *close* join is explicitly not a signal, by the decision that
@@ -254,24 +379,33 @@ non-zero `incomplete_swaps` would no longer tell an operator whether events were
 whether a close was slow. It stays where it is, and this is recorded rather than left to inference,
 because the obvious reading of "the swap didn't fully complete" points the wrong way.
 
+The criteria below are deliberately framed as *this spec adds no increment*, not as *the field is
+always zero*. On the no-worker path the field is a `NamedTuple` default (`worker.py:134`) that no
+implementation could make non-zero, so a bare `assert incomplete_swaps == 0` there passes against
+every mutant; and in the mixed process of FR-002 AC-6 the worker legitimately increments it on an
+unconfirmed drain, which this must not be read as forbidding.
+
 #### Acceptance Criteria:
 
-- [ ] AC-1: No orphan-path swap increments `incomplete_swaps`, on any path — including a close that
+- [ ] AC-1: No code path added by this spec increments `incomplete_swaps` — including a close that
       raises, a close whose join expires, and a `Thread.start` that fails.
-- [ ] AC-2: A test asserts `incomplete_swaps == 0` after an orphan-path swap whose close hangs past
-      the budget, so the field cannot be widened later without a failing test.
-- [ ] AC-3: `Health`'s docstring states that `incomplete_swaps` describes the worker's drain and
-      does not cover the orphan path.
-- [ ] AC-4: No field is added to `Health`.
+- [ ] AC-2: The test asserting this drives an orphan-path swap whose close hangs past the budget and
+      **first asserts the scenario really occurred** (`closing_sinks` reached 1, `configure()` was
+      bounded) before asserting `incomplete_swaps == 0`, so it is not a tautology over a default.
+- [ ] AC-3: The mixed-process case is exempt and stated as such: `Worker.swap_sink` still increments
+      on its own unconfirmed drain, and a test pins that it still does.
+- [ ] AC-4: `Health`'s docstring states that `incomplete_swaps` describes the worker's drain and does
+      not cover the orphan path.
+- [ ] AC-5: No field is added to `Health`.
 
-### FR-006: Record the resolution
+### FR-007: Record the resolution
 
 #### Description:
 
 Per SPEC-021's rule, an open item is closed by being fixed, settled, or recorded — never deleted.
 The §13 paragraph recording this variant is struck through in place and marked with the spec that
 closed it, as SPEC-031 did to the paragraph above it. `configure()`'s docstring currently describes
-a swap contract that this path does not honour; that becomes true rather than aspirational.
+one swap contract; there are two, and they differ in what they promise.
 
 #### Acceptance Criteria:
 
@@ -279,13 +413,14 @@ a swap contract that this path does not honour; that becomes true rather than as
       is struck through in place, marked **closed by SPEC-033**, with its reasoning left readable.
 - [ ] AC-2: `architecture.md` §7 and §9 describe the swap as covering both delivery paths, and state
       that the close is shared while the swap protocol is not.
-- [ ] AC-3: `configure()`'s docstring no longer implies a worker; its swap paragraph holds for a
-      process that has never opened a span.
-- [ ] AC-4: `architecture.md` §13 carries no open item introduced by this spec.
+- [ ] AC-3: `configure()`'s swap paragraph is **split by path**. It cannot hold unchanged for a
+      process with no worker: it promises a bounded drain and `health().incomplete_swaps` on an
+      unconfirmed one, and FR-006 removes both from this path.
+- [ ] AC-4: `architecture.md` §13 records the two residuals this spec accepts rather than fixes —
+      handing back an already-swapped-out sink closes it twice, symmetrically with the worker path
+      (measured `A.closes=2`); and the orphan path's own emit can still block a shutdown-time close
+      via the emit lock, now bounded by FR-004's stop signal rather than unbounded.
 - [ ] AC-5: `sh scripts/spec-lint.sh` passes.
-- [ ] AC-6: On completion: spec `Status: Completed`, the `INDEX.md` row updated, a delivery doc from
-      the template, a `component-inventory.md` row for `_closing.py`, and one Key Decisions line in
-      `CLAUDE.md`.
 
 ---
 
@@ -294,25 +429,45 @@ a swap contract that this path does not honour; that becomes true rather than as
 ```python
 # src/log_foundry/decorator.py — module state
 _worker: Worker | None                # unchanged
-_worker_lock: threading.Lock          # unchanged; guards all of the below
+_worker_lock: threading.Lock          # unchanged
 _atexit_registered: bool              # unchanged
 _orphan_sink: Sink | None             # REPLACES _orphan_close_owed: bool.
-                                      #   the sink an orphan emit reached and which nothing else
-                                      #   has closed. None == nothing owed.
-_orphan_sink_closed: bool             # unchanged: the once-only latch for the terminal close.
-                                      #   also gates re-arming (FR-001 AC-7).
+                                      #   the sink the orphan path owns the close of.
+                                      #   read unlocked on the emit hot path (FR-001 AC-8);
+                                      #   written only under _worker_lock.
+_orphan_closed_sink: Sink | None      # REPLACES _orphan_sink_closed: bool.
+                                      #   the most recently closed orphan-owned sink; refused
+                                      #   re-arming, which is what makes the close once *per
+                                      #   sink* rather than once per process.
+_orphan_stop: threading.Event         # NEW (FR-004): the stop signal handed to a sink when no
+                                      #   worker exists; set by _shutdown_worker on both branches.
 _orphan_retired: bool                 # unchanged: synthesizes health().retired
 
-# src/log_foundry/_closing.py — new leaf module, process-global state
+# src/log_foundry/_lifecycle.py — new leaf module, process-global state
 DEFAULT_CLOSER_GRACE: float = 2.0     # moved from worker.py
 _closers: list[threading.Thread]
 _closers_lock: threading.Lock
 ```
 
+**The state transitions, which are the whole design:**
+
+| Event | Guard | `_orphan_sink` | `_orphan_closed_sink` | Close performed |
+|---|---|---|---|---|
+| orphan emit to `S` | `S is _orphan_sink` | unchanged | unchanged | none |
+| orphan emit to `S` | `S is _orphan_closed_sink` | unchanged | unchanged | none (FR-001 AC-5) |
+| orphan emit to `S` | otherwise | `S` | unchanged | none |
+| `_swap_sink(N)` | worker exists | `None` | unchanged | `Worker.swap_sink` owns it |
+| `_swap_sink(N)` | `_orphan_sink is None` | `None` | unchanged | none (FR-001 AC-3) |
+| `_swap_sink(N)` | `_orphan_sink is N` | unchanged | unchanged | none (FR-002 AC-5) |
+| `_swap_sink(N)` | otherwise | `N` | old | old, detached + bounded |
+| `_close_orphan_sink()` | worker exists | unchanged | unchanged | worker owns it |
+| `_close_orphan_sink()` | `_orphan_sink is None` | `None` | unchanged | none |
+| `_close_orphan_sink()` | otherwise | `None` | old | old, inline + unbounded |
+
 ## API / Interface Contract
 
 ```python
-# src/log_foundry/_closing.py
+# src/log_foundry/_lifecycle.py
 def close_detached(sink: Sink, timeout: float | None) -> None:
     """Closes a sink no longer being delivered to, on a daemon thread joined for `timeout`."""
 
@@ -321,6 +476,9 @@ def join_closers(timeout: float | None) -> None:
 
 def closing_count() -> int:
     """Closes running at this instant — the gauge behind Health.closing_sinks."""
+
+def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
+    """Hands a sink an interruptible-wait signal if it advertises one (SPEC-027 FR-002)."""
 
 # src/log_foundry/decorator.py
 def _note_orphan_emit(sink: Sink) -> None: ...     # was _note_orphan_emit() -> None
@@ -339,59 +497,65 @@ No public API changes. `configure`, `shutdown`, `flush` and `health` keep their 
 ## Configuration / Environment
 
 None. No new config keys, env vars or settings; `DEFAULT_CLOSER_GRACE` and `DEFAULT_SWAP_TIMEOUT`
-keep their values and move or stay as FR-004 describes.
+keep their values.
 
 ## File & Folder Structure
 
 ```
 src/log_foundry/
-├── _closing.py          # NEW — the shared daemon closer + grace join + gauge
+├── _lifecycle.py        # NEW — shared closer registry, grace join, gauge, stop-signal probe
 ├── _diag.py             # unchanged
 ├── api.py               # one call site: pass the sink to _note_orphan_emit
 ├── config.py            # docstring only
-├── decorator.py         # _orphan_sink identity; the no-worker branch of _swap_sink
-└── worker.py            # closer machinery delegates to _closing
+├── decorator.py         # the two records, the stop event, the no-worker swap branch
+└── worker.py            # lifecycle machinery delegates to _lifecycle
 
 tests/
-├── conftest.py                  # reset fixture covers _orphan_sink
-├── test_config.py               # SPEC-030 closer tests re-pointed at _closing
-└── test_orphan_sink_handoff.py  # NEW — FR-001..FR-005
+├── conftest.py                  # reset fixture covers both records and the stop event
+├── test_config.py               # SPEC-030 closer tests re-pointed at _lifecycle
+└── test_orphan_sink_handoff.py  # NEW — FR-001..FR-006
 docs/
 ├── architecture.md                                    # §7, §9, §13
 ├── specs/{INDEX.md,SPEC-033-orphan-path-sink-handoff.md}
 ├── spec-delivery/SPEC-033-orphan-path-sink-handoff.md  # on completion
-└── component-inventory.md                              # a row for _closing.py
+└── component-inventory.md                              # a row for _lifecycle.py
 ```
 
 ## Implementation Phases
 
-### Phase 1: Extract the closer
+### Phase 1: Extract the lifecycle facilities
 
-- Create `_closing.py` with the process-global registry, `close_detached`, `join_closers` and
-  `closing_count`, moving `DEFAULT_CLOSER_GRACE` and the guarded close body out of `worker.py`.
-- Point `Worker._close_swapped_out`, `Worker._join_closers` and `Worker.health()` at it.
-- Re-point the SPEC-030 closer tests in `test_config.py`; diff `--collect-only` names to prove
-  nothing was dropped (FR-004 AC-5).
+- Create `_lifecycle.py` with the process-global registry, `close_detached`, `join_closers`,
+  `closing_count` and `offer_stop_signal`, moving `DEFAULT_CLOSER_GRACE` and the guarded bodies out
+  of `worker.py`.
+- Point `Worker._close_swapped_out`, `Worker._join_closers`, `Worker._offer_stop_signal` and
+  `Worker.health()` at it.
+- Re-point the SPEC-030 closer tests in `test_config.py`; assert the patched grace takes effect
+  (FR-005 AC-5) and diff `--collect-only` names.
 - Green on `pytest`, `ruff`, `mypy` before touching behaviour.
 
-### Phase 2: The recorded identity
+### Phase 2: The two records
 
-- `_orphan_close_owed` → `_orphan_sink`; thread the sink through `_note_orphan_emit` from
-  `api._log`; gate re-arming on the terminal latch.
-- Update `_close_orphan_sink` to close the recorded sink and clear the record.
-- Update `tests/conftest.py`'s reset fixture.
-- Tests for FR-001, including the reassignment case (AC-2) and the post-shutdown re-arm (AC-7).
+- `_orphan_close_owed` → `_orphan_sink`; `_orphan_sink_closed` → `_orphan_closed_sink`; thread the
+  sink through `_note_orphan_emit` from `api._log`.
+- Update `_close_orphan_sink` to the transition table, and `tests/conftest.py`'s reset fixture.
+- Tests for FR-001, including the reassignment case (AC-2), the refused re-arm (AC-5) and the
+  post-`shutdown()` reconfigure (AC-6).
 
-### Phase 3: The swap branch
+### Phase 3: The swap branch and the mixed process
 
-- Give `_swap_sink` its no-worker branch: no-op checks, close via `_closing.close_detached`, clear
-  the record, defer to the worker when one exists.
-- Grant the grace join on the orphan `shutdown()` path, after the inline close.
-- Tests for FR-002, FR-003 and FR-005 — the mixed process (FR-002 AC-6) and the hanging close
-  (FR-003 AC-1) first, since they are the two most likely to be wrong.
-- Mutation-test every new assertion (FR-002 AC-9).
+- Give `_swap_sink` its no-worker branch under `_worker_lock`: no-op checks, re-point, close via
+  `_lifecycle.close_detached`.
+- Tests for FR-002 — AC-3 (swap then shutdown with no second emit), AC-6 (mixed, both orders) and
+  AC-10 (the first-`@trace` race) first, since they are the three most likely to be wrong.
 
-### Phase 4: Documentation
+### Phase 4: Bounding, the grace, and the stop signal
 
-- `architecture.md` §13 strike-through, §7 and §9 updates; `configure()`'s docstring.
-- Completion ritual per FR-006 AC-6.
+- Grant the grace join in `_shutdown_worker`, on all three paths of FR-003 AC-5.
+- Arm and set `_orphan_stop`; wire the offer into the emit and the swap.
+- Tests for FR-003, FR-004 and FR-006; mutation-test every new assertion (FR-002 AC-11).
+
+### Phase 5: Documentation
+
+- `architecture.md` §13 strike-through and the two recorded residuals; §7 and §9; `configure()`'s
+  swap paragraph split by path.
