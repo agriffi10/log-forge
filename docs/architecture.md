@@ -520,11 +520,22 @@ constraint — never by being deleted quietly.
   emits on the caller's own thread — can block behind an in-flight emit, including its retry
   backoff. This is a deliberate trade and the alternative is worse: unserialized, those same two
   callers corrupt the sink's state, which for `SQLiteSink` was measured crashing the interpreter
-  outright rather than merely losing rows. It is bounded, not open-ended — every wait inside a
-  sink is interruptible and `shutdown()` takes a timeout (SPEC-027) — and it does not touch the
-  traced path, where events go to the worker queue and the decorated function returns without
-  waiting on anything. A caller who wants the orphan path off the critical path should open a
-  span; that is what the buffer-then-flush pipeline is for.
+  outright rather than merely losing rows. It does not touch the traced path, where events go to
+  the worker queue and the decorated function returns without waiting on anything. A caller who
+  wants the orphan path off the critical path should open a span; that is what the
+  buffer-then-flush pipeline is for.
+
+- **`shutdown()`'s timeout bounds the drain, not the sink's `close()`.** This narrows SPEC-027
+  FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an
+  application thread parked on the orphan path inside a driver call with no timeout of its own
+  delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and nothing
+  after it. Running the close on a joinable daemon thread was built and **reverted**: at
+  interpreter exit that daemon is killed wherever it has reached — for `SQLiteSink`, between
+  `commit()` and `close()` — which converts the leaked handle FR-004 knowingly accepts into the
+  partial write it exists to avoid, and it could not tell a slow-but-successful close from a
+  stuck one, so it reported `ShutdownTimeout` and "left open" for closes that had completed.
+  A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
+  be interruptible, which is a change to the sink contract rather than to the worker.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

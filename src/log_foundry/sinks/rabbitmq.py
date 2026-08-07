@@ -117,6 +117,8 @@ class RabbitMQSink:
             shutdown would open an AMQP connection that nothing will ever reap. One
             ``log_foundry.info()`` after ``shutdown()`` reaches this on the caller's own thread.
         """
+        if not batch:
+            return
         published = 0
         with self._lock:
             if self._closed:

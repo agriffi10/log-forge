@@ -103,6 +103,8 @@ class SQLiteSink:
         ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
+        if not batch:
+            return
         with self._lock:
             if self._closed:
                 raise SinkDeliveryError(
@@ -149,10 +151,10 @@ class SQLiteSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             self._conn.commit()
             if self._owns_connection:
                 self._conn.close()
-            self._closed = True
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

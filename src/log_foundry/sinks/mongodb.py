@@ -118,6 +118,8 @@ class MongoDBSink:
             nothing but oversized documents does not raise either: they can never fit, so there
             is nothing to retry, and they are reported through :meth:`losses`.
         """
+        if not batch:
+            return
         if self._closed:
             raise SinkDeliveryError(
                 f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"

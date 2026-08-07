@@ -554,9 +554,14 @@ def _takes_the_transport_lock(
 ) -> bool:
     """True when this node, or a same-class helper it calls, enters ``self._lock``.
 
-    Following calls one level down matters: several sinks split the locked body into a helper
-    (``PostgresSink._insert_batch``, ``AzureEventHubsSink._send_batch``), and a check that only
-    looked at ``emit`` itself would read those as unlocked.
+    Calls to same-class helpers are followed to any depth, which matters because several sinks
+    split the locked body out (``PostgresSink._insert_batch``, ``AzureEventHubsSink._send_batch``)
+    and a check looking only at ``emit`` would read those as unlocked. ``seen`` makes self- and
+    mutual recursion terminate.
+
+    What this proves is that a lock is *entered on the path*, not that it covers anything: an
+    empty ``with self._lock: pass`` satisfies it. Narrowing a lock is caught by the sinks'
+    behavioural tests instead, which is why every locked sink has one.
 
     Args:
       node: The function node to inspect.
@@ -1002,3 +1007,220 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     # landed, so it is unconfirmed rather than known-discarded.
     assert sink.losses().failed == THREADS * PER_THREAD * 2
     assert all(isinstance(err, Exception) for err in errors)
+
+
+CLOSED_SINKS = ["sqlite", "rabbitmq", "mongodb", "clickhouse", "eventhubs", "nats"]
+
+
+def _build_closable(name: str, tmp_path: Path):
+    """Builds one locked sink with an injected driver double, or skips if unavailable.
+
+    Args:
+      name: Which sink to build.
+      tmp_path: A scratch directory for the file-backed one.
+
+    Returns:
+      A tuple of the sink and a zero-argument probe returning how many driver connections or
+      loops have been opened, so a test can prove a closed sink opened no more.
+
+    Raises:
+      None.
+    """
+    opened = []
+
+    if name == "sqlite":
+        return SQLiteSink(str(tmp_path / "closed.db")), lambda: 0
+    if name == "rabbitmq":
+        rabbit = pytest.importorskip("log_foundry.sinks.rabbitmq")
+
+        class Channel:
+            def basic_publish(self, **kwargs: object) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class Connection:
+            def channel(self) -> Channel:
+                opened.append("channel")
+                return Channel()
+
+            def close(self) -> None:
+                pass
+
+        sink = rabbit.RabbitMQSink(
+            exchange="logs", routing_key="events", connection=Connection()
+        )
+        # close() nulls the connection and _active_channel reopens whenever it finds none, so
+        # _connect must succeed for this test to mean anything: without it the post-close emit
+        # would fail on a missing `pika` rather than on the guard, and deleting the guard would
+        # still look correct. With it, a missing guard opens a real connection — the leak.
+        sink._connect = Connection  # type: ignore[method-assign]
+        sink._properties = object()
+        return sink, lambda: len(opened)
+    if name == "mongodb":
+        mongo = pytest.importorskip("log_foundry.sinks.mongodb")
+
+        class Collection:
+            def insert_many(self, documents: list, ordered: bool = False) -> None:
+                opened.append("insert")
+
+        class Database:
+            def __getitem__(self, key: str) -> Collection:
+                return Collection()
+
+        class Client:
+            # A working double on purpose: it keeps succeeding after close(), so an emit that
+            # slips past the guard *lands* rather than failing for an unrelated reason. A double
+            # that broke after close would make this test pass with the guard deleted.
+            def __getitem__(self, key: str) -> Database:
+                return Database()
+
+            def close(self) -> None:
+                pass
+
+        return (
+            mongo.MongoDBSink(client=Client(), database="d", collection="c"),
+            lambda: len(opened),
+        )
+    if name == "clickhouse":
+        clickhouse = pytest.importorskip("log_foundry.sinks.clickhouse")
+
+        class Client:
+            def insert(self, table: str, data: list, column_names: list) -> None:
+                opened.append("insert")
+
+            def close(self) -> None:
+                pass
+
+        return clickhouse.ClickHouseSink("events", client=Client()), lambda: len(opened)
+    if name == "eventhubs":
+        eventhubs = pytest.importorskip("log_foundry.sinks.eventhubs")
+
+        class Batch(list):
+            def add(self, data: object) -> None:
+                self.append(data)
+
+        class Producer:
+            def create_batch(self):
+                opened.append("batch")
+                return Batch()
+
+            def send_batch(self, batch: object) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        return eventhubs.AzureEventHubsSink(producer=Producer()), lambda: len(opened)
+
+    nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+
+    class FakeClient:
+        async def publish(self, subject: str, payload: bytes) -> None:
+            opened.append("publish")
+
+    return nats_mod.NATSSink("events", client=FakeClient()), lambda: len(opened)
+
+
+@pytest.mark.parametrize("name", CLOSED_SINKS)
+def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
+    name: str, tmp_path: Path
+) -> None:
+    """Emitting after ``close()`` raises ``SinkDeliveryError`` and touches no driver.
+
+    Every locked sink gets the same rule, because three of them had three different answers. The
+    driver-contact assertion is the load-bearing half: ``RabbitMQSink`` had a ``_closed`` flag
+    that ``close()`` honoured and ``emit`` did not, and ``_active_channel`` reopens a connection
+    whenever it finds none — so one ``log_foundry.info()`` after ``shutdown()`` opened an AMQP
+    connection nothing would ever reap. Asserting only that a ``SinkDeliveryError`` came back
+    would have passed against that leak.
+    """
+    sink, driver_calls = _build_closable(name, tmp_path)
+    sink.close()
+    before = driver_calls()
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([event(0, 0)])
+
+    assert driver_calls() == before, f"{name} reached its driver after close()"
+
+
+@pytest.mark.parametrize("name", CLOSED_SINKS)
+def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
+    name: str, tmp_path: Path
+) -> None:
+    """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver."""
+    sink, _ = _build_closable(name, tmp_path)
+    sink.close()
+    sink.emit([])
+
+
+def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The producer and the batch it builds are entered by one thread at a time.
+
+    ``AzureEventHubsSink`` was the one sink FR-002's correction locked without a behavioural
+    test — and it is the one whose docstring cites Microsoft affirmatively stating the producer
+    is *not* thread-safe. The double reports overlap on the whole ``create_batch`` → ``add`` →
+    ``send_batch`` sequence, so narrowing the lock to cover less than the batch is caught, not
+    just removing it.
+    """
+    eventhubs = pytest.importorskip("log_foundry.sinks.eventhubs")
+    # The `azure` extra is not installed in CI, and the SDK's EventData is a plain wrapper here.
+    monkeypatch.setattr(eventhubs, "_event_data_cls", lambda: bytes)
+
+    class ExclusiveProducer:
+        def __init__(self) -> None:
+            self._guard = threading.Lock()
+            self._inside = 0
+            self.overlaps = 0
+            self.sent = 0
+
+        def _enter(self) -> None:
+            with self._guard:
+                self._inside += 1
+                if self._inside > 1:
+                    self.overlaps += 1
+
+        def _leave(self) -> None:
+            with self._guard:
+                self._inside -= 1
+
+        def create_batch(self):
+            self._enter()
+            time.sleep(0)
+
+            class Batch(list):
+                def add(self, data: object) -> None:
+                    time.sleep(0)
+                    self.append(data)
+
+            return Batch()
+
+        def send_batch(self, batch: object) -> None:
+            time.sleep(0)
+            with self._guard:
+                self.sent += len(batch)  # type: ignore[arg-type]
+            self._leave()
+
+        def close(self) -> None:
+            pass
+
+    producer = ExclusiveProducer()
+    sink = eventhubs.AzureEventHubsSink(producer=producer)
+
+    per_batch = 10
+    errors = run_concurrently(
+        lambda thread, iteration: sink.emit(
+            [event(thread, iteration) for _ in range(per_batch)]
+        ),
+        THREADS,
+        per_thread=PER_THREAD,
+    )
+    sink.close()
+
+    assert errors == []
+    assert producer.overlaps == 0, f"{producer.overlaps} interleaved producer sequences"
+    assert producer.sent == THREADS * PER_THREAD * per_batch

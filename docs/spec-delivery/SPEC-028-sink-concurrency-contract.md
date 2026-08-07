@@ -100,7 +100,7 @@ exactly as before.
 
 ## Verification
 
-- 959 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean on 3.12 and 3.13.
+- 973 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean on 3.12 and 3.13.
 - Every new test was mutation-checked against the specific mutant it claims to catch, one at a
   time. Nine kill their mutant on the assertion they advertise. Three deserve a caveat: unlocked
   `SQLiteSink` and unlocked `NATSSink` kill theirs by **crashing or hanging the interpreter**
@@ -173,3 +173,37 @@ and silently deleted four tests — nats, rabbitmq, clickhouse and `dropped_unad
 stayed green, because deleted tests do not fail, and the PR would have claimed coverage that no
 longer existed. Caught by comparing the collected test count against the expected one. A scripted
 edit to a test file needs `pytest --collect-only` before and after, not just a green run.
+
+
+## Third review round (pre-merge, PR #116)
+
+Returned DO NOT MERGE with the code judged correct but under-tested — and it caught this branch
+repeating the defect it had just documented. The `_closed` checks added for `MongoDBSink` and
+`RabbitMQSink` *in response to the second review* could both be deleted with all 960 tests still
+green: fixes asserted rather than demonstrated.
+
+- **Every locked sink now has an emit-after-close test**, parametrized across all six, asserting
+  both that `SinkDeliveryError` comes back *and that the driver was not touched*. The second half
+  is load-bearing: `RabbitMQSink`'s `_active_channel` reopens whenever it finds no connection, so
+  a test asserting only the exception would have passed against the leak. Writing them exposed a
+  further trap — the first doubles failed after close for unrelated reasons (Mongo's fake lacked
+  `insert_many`, RabbitMQ's reconnect hit a missing `pika`), so the tests passed with the guards
+  deleted. Both doubles now keep working after close, so an emit that slips past a guard *lands*.
+- **`AzureEventHubsSink` gained the behavioural test it never had.** It was the one sink locked by
+  the corrections with only a docstring behind it, and its lock survived being narrowed to `with
+  self._lock: pass` with the full suite green. The new test reports overlap across the whole
+  `create_batch` → `add` → `send_batch` sequence, so narrowing is caught, not just removal.
+- **Post-close behaviour is now one rule across all six locked sinks** rather than three answers;
+  `ClickHouseSink`, `AzureEventHubsSink` and `NATSSink` had `close()` set their flag while `emit`
+  reached the driver anyway. An empty batch stays a no-op whether the sink is closed or not.
+- **`architecture.md` §13 said the opposite of what this branch claimed it said.** The worker
+  docstring and this doc both stated the residual `shutdown()` delay was "recorded in §13"; §13
+  asserted the delay was *bounded* because `shutdown()` takes a timeout — true before the revert,
+  false after. §13 now records the real constraint: the timeout bounds the drain join, and
+  bounding the close properly would need an interruptible `close()`, a sink-contract change.
+
+Known and accepted: the lint proves a lock is entered on the path, not that it covers the body
+(an empty `with self._lock: pass` satisfies it) — narrowing is the behavioural tests' job, which
+is why every locked sink now has one. And a regression in `NATSSink`'s lock presents in CI as a
+job timeout rather than a red test, because the wedged threads are non-daemon; stated in the
+test's own docstring.

@@ -82,6 +82,10 @@ class NATSSink:
         if not batch:
             return
         with self._lock:
+            if self._loop.is_closed():
+                raise SinkDeliveryError(
+                    f"NATSSink published none of {len(batch)} event(s): the sink is closed"
+                )
             self._loop.run_until_complete(self._publish_all(batch))
 
     def losses(self) -> SinkLosses:

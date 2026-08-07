@@ -134,6 +134,10 @@ class ClickHouseSink:
             return
         chunks = inserted = 0
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
+                )
             for chunk in chunk_list(batch, self._chunk_size):
                 chunks += 1
                 inserted += self._insert([self._row(event) for event in chunk])

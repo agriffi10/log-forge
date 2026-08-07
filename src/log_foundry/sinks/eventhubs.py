@@ -109,6 +109,10 @@ class AzureEventHubsSink:
         if not batch:
             return
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
+                )
             self._send_batch(batch)
 
     def _send_batch(self, batch: list[dict[str, object]]) -> None:
@@ -155,6 +159,9 @@ class AzureEventHubsSink:
 
     def close(self) -> None:
         """Closes the producer (FR-009).
+
+        Idempotent, and takes the emit lock so the producer is never closed out from under an
+        in-flight send (SPEC-028 FR-002).
 
         Args:
           None.
