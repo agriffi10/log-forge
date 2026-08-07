@@ -447,17 +447,47 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
-    """Retargets the process worker at a new sink, backing a late ``configure(sink=...)``.
+    """Retargets delivery at a new sink, backing a late ``configure(sink=...)``.
 
     Like :func:`_flush_worker` this deliberately does not call :func:`_get_worker`: a process
     that has not logged has captured no sink, so there is nothing to swap and building a thread
-    to prove it would be pure cost — that is also the case where the old behaviour was already
-    correct (SPEC-030 FR-003).
+    to prove it would be pure cost (SPEC-030 FR-003).
+
+    **Both delivery paths are handled here** (SPEC-033 FR-002). A worker delegates to
+    :meth:`Worker.swap_sink`, which owns the drains. With no worker there is nothing buffered to
+    drain — an orphan emit is synchronous and has returned before ``configure()`` was entered —
+    so the handoff is the close alone. Returning early there, as this did, left the previous sink
+    open forever with ``incomplete_swaps`` at zero, since every field of ``Health`` describes a
+    worker that does not exist.
+
+    The record is **re-pointed** at the new sink rather than cleared. Clearing would leave nothing
+    armed until the next orphan emit, so a process that swaps and then exits without logging again
+    would leak the *new* sink — measured, that case closes correctly today, so clearing would trade
+    one leak for another. Re-pointing is also what the worker path does: :meth:`Worker.shutdown`
+    closes ``self.sink`` whether or not anything was emitted to it since the swap.
+
+    No fence, either. The only writer that could still be inside the old sink's ``emit`` is an
+    orphan emitter on another application thread, and that is exactly the writer
+    :meth:`Worker._close_swapped_out` documents itself as not covering — which is why
+    ``sinks/base.py`` requires ``close()`` to tolerate a concurrent ``emit`` (SPEC-028 FR-001).
+    This inherits that contract rather than weakening it.
+
+    ``_worker`` is read **under** ``_worker_lock``. Unlocked it was harmless, because the
+    no-worker branch did nothing; once that branch closes a sink it is the race
+    :func:`_close_orphan_sink` was built against — a first ``@trace`` on another thread can be
+    inside ``Worker(...)`` with its sink already resolved while this thread reads ``None`` and
+    closes the sink that worker is about to deliver to. The closer's **join is outside** the
+    lock: it waits up to the swap's whole budget, and holding the process-wide lock across that
+    would park every concurrent emit behind it.
+
+    ``incomplete_swaps`` is deliberately not touched on the orphan path. It records a *drain*
+    that could not be confirmed (SPEC-030), and there is no drain here; an expired close join
+    reports nothing at all, by the decision that made the bounded close available.
 
     Args:
       new_sink: The sink already written to the config, to be made the live delivery target.
-      timeout: Seconds bounding the whole swap — both drains and the close of the previous
-        sink share it as one deadline.
+      timeout: Seconds bounding the whole swap — the drains, where there are any, and the close
+        of the previous sink share it as one deadline.
 
     Returns:
       None.
@@ -467,15 +497,29 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         rejected ceiling, and a sink swap that fails must not become the reason an application
         cannot start.
     """
-    worker = _worker
-    if worker is None:
+    global _orphan_sink, _orphan_closed_sink
+    with _worker_lock:
+        worker = _worker
+        if worker is not None:
+            _orphan_sink = None
+        else:
+            old = _orphan_sink
+            if old is None or old is new_sink:
+                return
+            _orphan_sink = new_sink
+            _orphan_closed_sink = old
+            _offer_orphan_signal(new_sink)
+            closer = _lifecycle.close_detached(old)
+    if worker is not None:
+        try:
+            worker.swap_sink(new_sink, timeout)
+        except Exception as exc:
+            _diag.absorbed(
+                "swapping the log sink", exc, "events may still be delivered to the previous sink"
+            )
         return
-    try:
-        worker.swap_sink(new_sink, timeout)
-    except Exception as exc:
-        _diag.absorbed(
-            "swapping the log sink", exc, "events may still be delivered to the previous sink"
-        )
+    if closer is not None:
+        closer.join(timeout)
 
 
 def _flush_worker(timeout: float | None = 5.0) -> bool:
