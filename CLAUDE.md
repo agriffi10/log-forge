@@ -219,8 +219,9 @@ in a second fresh context. Nothing in it is caught by CI (the suite was green th
 order and the grouping's reasoning are in `@docs/specs/INDEX.md` → Arcs. It gained **FR-006** on
 2026-08-07, which is *not* residue and should be built last and reviewed on its own: a process that
 only ever logs outside a span creates no worker, so `atexit` is never registered (it is registered
-*inside* `_get_worker`) and `shutdown()` returns early — the sink is never closed, every event is
-lost, and `health()` reads all-clear because every field describes a worker that does not exist.
+*inside* `_get_worker`) and `shutdown()` returns early — the sink is never closed (every event lost
+on a locally-buffering sink; the flush and the resource on a synchronous one) and `health()` reads
+all-clear, because every field describes a worker that does not exist.
 Found reviewing SPEC-032, whose post-close guard is invisible there because `close()` never happens.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites

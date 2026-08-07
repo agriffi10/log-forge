@@ -578,8 +578,9 @@ constraint — never by being deleted quietly.
   when no worker was created (`_shutdown_worker` returns early), and the `atexit` registration
   happens *inside* `_get_worker`, so neither runs for a process that only made level calls with no
   active span — those emit synchronously on the caller's thread and build no worker. Measured: with
-  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open,
-  so **every** event is lost, not only the one after `shutdown()`. Found reviewing SPEC-032, whose
+  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open, so
+  every event is lost — the cost is sink-dependent, and against a *synchronous* sink the events land
+  and what is lost is the flush and the released resource. Found reviewing SPEC-032, whose
   post-close guard is invisible here precisely because `close()` never happens. A process that opens
   even one span is unaffected.
 
