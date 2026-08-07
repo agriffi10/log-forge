@@ -635,22 +635,32 @@ constraint — never by being deleted quietly.
   `health().closing_sinks` reports the closes running at the instant it is read, a live fact rather
   than an inference from a timeout.
 
-  **The closer is a daemon, and a non-daemon one was built first and measured worse.** CPython
-  joins non-daemon threads *before* running `atexit`, so a single hung close stopped the exit drain
-  from ever running: the **live** sink was never drained or closed, its buffered events were lost,
-  the application's own exit handlers never ran, and the process hung until it was killed. As a
-  daemon the ordering inverts — `atexit` completes first, so the sink still receiving events is
-  drained and closed, and only then is a still-running close abandoned. The reading that says
-  SPEC-028 forbids this is the wrong one: what that spec refused to abandon was the sink the worker
-  was *still delivering to*, and this one has been fenced out of the delivery path by two confirmed
-  drains, so what a kill risks is its own cleanup and whatever it chose to buffer — never the
-  events still arriving.
+  **The closer is a daemon, and neither thread flag is sufficient on its own** — both were built
+  and measured. Non-daemon: CPython joins non-daemon threads *before* running `atexit`, so a single
+  hung close stopped the exit drain from ever running — the **live** sink never drained or closed,
+  its buffered events lost, the application's own exit handlers never run, and the process hung
+  until killed. Daemon alone loses the opposite case: a close that is slow but *succeeding* is
+  killed at exit, and for a sink whose `close()` **is** its delivery (`KafkaSink.close()` flushes
+  the producer) that is its whole buffer — measured, the same swap kept those events under a
+  non-daemon thread and lost them under a daemon.
 
-  The residual cost, recorded rather than hidden: a `close()` that never returns is abandoned at
-  exit, so that sink's own tail (a `KafkaSink`'s unflushed producer buffer, say) is lost, and
-  `closing_sinks` is the only warning. That is the smaller of the two losses on offer and it does
-  not weaken `shutdown()`, whose close stays inline for the reasons above. Configure the sink
-  before the first log where you can — that path has no worker and nothing to close.
+  So the flag is not the mechanism. `shutdown()` drains and closes the live sink, **then** joins
+  any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE`, carved from its own budget).
+  A slow close finishes, a hung one costs only the grace, and neither can reach the live sink. The
+  cap matters as much as the join: without it a stuck close would hold a process at exit for the
+  whole 30 s shutdown budget, and a close still running here already had the swap's entire budget,
+  so it is far more likely stuck than slow.
+
+  Two residual costs, recorded rather than hidden. First, a `close()` still running after the grace
+  is abandoned, losing that sink's own tail, with `closing_sinks` as the only warning. Second — and
+  this is `_close_if_owed`'s objection genuinely reaching a swap, where it did not while the close
+  ran inline — an abandoned close is killed *wherever it has reached*, which for `SQLiteSink` can
+  be inside `commit()`. That is the partial write SPEC-027 FR-004 ranks worse than a leaked handle,
+  now reachable here, and the grace is what makes it unlikely rather than impossible: the sink must
+  still be stuck after the swap's budget *and* the grace, which for a swapped-out SQLite connection
+  means an orphan-path writer has held its emit lock across both. Neither weakens `shutdown()`,
+  whose close stays inline. Configure the sink before the first log where you can — that path has
+  no worker and nothing to close.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

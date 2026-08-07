@@ -230,12 +230,17 @@ reading: `health().closing_sinks` is how many swapped-out sinks are inside `clos
 you ask. Non-zero once is a swap in progress; non-zero every time you look is a destination that
 is not coming back, still holding its resources.
 
-The thread is a daemon deliberately, and this is the one place where that is the *safer* choice.
-CPython joins non-daemon threads **before** running `atexit`, so a non-daemon closer stuck in a
-hung `close()` would stop the exit drain from ever running — the live sink would never be drained
-or closed, and your own `atexit` handlers would not run either. As a daemon it lets `atexit` finish
-first: the sink still receiving events is closed properly, and only the sink already fenced out of
-the delivery path is abandoned.
+**What happens to that background close when the process exits.** `shutdown()` (which `atexit`
+runs for you) drains and closes the live sink first, then gives any still-running swapped-out close
+a short grace — 2 s — to finish. A close that was merely slow completes. One that is genuinely
+stuck is abandoned there, and **its own buffered data is lost**: for a sink whose `close()` *is*
+its delivery, like `KafkaSink.close()` flushing the producer, that is everything it had not yet
+sent. `health().closing_sinks` is the only warning you get, which is why it is worth watching.
+
+The closer runs as a daemon thread deliberately. A non-daemon one is worse: CPython joins
+non-daemon threads **before** running `atexit`, so a single stuck `close()` would stop the exit
+drain from ever running — the live sink never drained, and your own `atexit` handlers never run
+either. The grace is what recovers the slow-close case that the daemon flag alone would lose.
 
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
 thread mid-swap may land on either sink.

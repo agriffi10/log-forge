@@ -464,12 +464,16 @@ where it starts.
   **dissolved by deriving no signal from an expired join** — no counter, no line, so a slow close
   can never latch a loss on a healthy swap — and the live fact is published instead, as
   `Health.closing_sinks`, a gauge that falls as well as rises and is deliberately *not* a term in
-  the alert idiom. Daemon is the safer choice here and a non-daemon closer was built and measured
-  worse: CPython joins non-daemon threads **before** `atexit`, so one hung close stopped the exit
-  drain entirely and lost everything buffered in the *live* sink. What SPEC-028 refused to abandon
-  was the sink still being delivered to; this one is fenced out by two confirmed drains, so which
-  object the thread holds is the distinction, not whether a thread is used. `shutdown()`'s close
-  stays inline; only the swap's half of §13's constraint is closed. (SPEC-030, arch §7, §9, §13)
+  the alert idiom. **Neither thread flag is sufficient alone and both were built:** non-daemon
+  stopped `atexit` from ever running (CPython joins non-daemon threads first), losing the *live*
+  sink; daemon alone kills a slow-but-succeeding close, losing the buffer of a sink whose
+  `close()` *is* its delivery. So the ordering is the mechanism — `shutdown()` closes the live
+  sink, **then** joins any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE`), carved
+  from its own budget so it neither extends shutdown nor lets a stuck close hold the exit for the
+  full 30 s. What SPEC-028 refused to abandon was the sink still being delivered to; this one is
+  fenced out by two confirmed drains — but its interpreter-exit objection *does* reach here once
+  the close outlives `configure()`, so §13 records that an abandoned close can land inside a
+  `commit()`. `shutdown()`'s own close stays inline. (SPEC-030, arch §7, §9, §13)
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — the
   SPEC-026 rule applied to the sink's own lifecycle, where an absorbed batch is a batch the worker
   believes just the same. Both halves bind: three shipped sinks lost every post-`close()` event

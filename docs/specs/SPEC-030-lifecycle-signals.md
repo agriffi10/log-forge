@@ -141,11 +141,14 @@ criterion.)
       The first amendment narrowed this to "the drains", because closing the previous sink was
       unbounded — `Sink.close` takes no timeout — and recorded it as an `architecture.md` §13
       constraint alongside `shutdown()`'s. On instruction it was then **bounded properly** and the
-      criterion restored as written: the close runs on a non-daemon thread joined for the
-      remainder of the budget. What made that available here and not at `shutdown()` is that both
-      of SPEC-028's objections are defeated by a swap running in a live process — the daemon killed
-      mid-`commit()` cannot happen, and the wrong-signal objection is dissolved by deriving *no*
-      signal from an expired join.
+      criterion restored as written: the close runs on a **daemon** thread joined for the
+      remainder of the budget, with `shutdown()` giving any outstanding close a capped grace after
+      the live sink is drained. What made that available is that SPEC-028's wrong-signal objection
+      is dissolved by deriving *no* signal from an expired join, and its interpreter-exit objection
+      is answered by the grace rather than by the thread flag. **A non-daemon thread was shipped
+      for review first and was wrong**: CPython joins non-daemon threads before `atexit`, so one
+      hung close stopped the exit drain and lost the live sink's buffered events. See the delivery
+      doc's follow-up for the measurements on both.
 - [x] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
 - [x] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
 - [x] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;
@@ -189,13 +192,23 @@ class Health(NamedTuple):
     sink: SinkLosses | None = None          # SPEC-026
     retired: bool = False                   # new — shutdown() has completed
     submitted_after_shutdown: int = 0       # new — accepted, undeliverable
-    incomplete_swaps: int = 0               # new — see the amendment below
+    incomplete_swaps: int = 0               # new — see the amendments below
+    closing_sinks: int = 0                  # new — a live gauge, not a counter
 
 
 # on Worker, guarded by the existing _lock:
 self.submitted_after_shutdown = 0
 self.incomplete_swaps = 0
+self._closers: list[threading.Thread] = []   # backs closing_sinks; pruned on append and read
 ```
+
+**Amended again — a fourth field, `closing_sinks`.** Bounding the swap's close (see the delivery
+doc's follow-up) moved it onto its own thread, which made a destination stuck in `close()`
+invisible: `health()` read all-clear, the alert-idiom failure this whole spec exists to end. It is
+a **live gauge** rather than a counter — the closes running at the instant it is read — because
+that is a fact, where a count of expired joins would be an inference, and SPEC-028 reverted a
+design that inferred. It is the only field here that falls as well as rises, and deliberately not
+a term in the documented alert idiom, since a healthy swap makes it briefly non-zero.
 
 **Amended during implementation — a third field.** FR-003's fourth acceptance criterion requires
 an unconfirmed drain to be "recorded in `health()`", and this outline provided nowhere to record

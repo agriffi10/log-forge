@@ -26,6 +26,15 @@ and an unbounded join there is a hung process.
 
 _DROP_WARN_EVERY = 1000
 
+DEFAULT_CLOSER_GRACE = 2.0
+"""Seconds :meth:`Worker.shutdown` gives an outstanding swapped-out close to finish.
+
+Deliberately much smaller than the shutdown budget it is carved from. This is a last chance for
+a close that is *nearly* done, not a second full attempt: it already had the swap's whole budget
+(``DEFAULT_SWAP_TIMEOUT``) before ``shutdown`` was ever called, so one still running here is far
+more likely stuck than slow, and every second spent on it is a second the process does not exit.
+"""
+
 DEFAULT_SWAP_TIMEOUT = 5.0
 """Seconds a late ``configure(sink=...)`` will spend draining the previous sink (FR-003).
 
@@ -537,15 +546,17 @@ class Worker:
         loss for closes that completed. What *is* observable is a live fact rather than an
         inference: ``health().closing_sinks`` counts the closes running at the moment it is read.
 
-        The thread is a **daemon**, and the reasoning is the opposite of the reading that
-        SPEC-028's revert first suggests. A non-daemon thread was tried and is worse: CPython
-        joins non-daemon threads *before* running ``atexit``, so one hung close would stop the
-        exit drain from ever running and lose everything buffered in the **live** sink, along
-        with the application's own exit handlers. A daemon lets ``atexit`` finish first, so the
-        live sink is drained and closed, and only then is a still-running close abandoned. What
-        SPEC-028 refused to abandon was the sink the worker was *still delivering to*; this one
-        has been fenced out of the delivery path by two confirmed drains, so what is at risk is
-        its own cleanup and whatever it chose to buffer, never the events still arriving.
+        The thread is a **daemon**, and it is :meth:`_join_closers` that makes that safe rather
+        than merely available. A non-daemon thread was tried and is worse on its own: CPython
+        joins non-daemon threads *before* running ``atexit``, so one hung close stops the exit
+        drain from ever running and loses everything buffered in the **live** sink, along with
+        the application's own exit handlers. A daemon alone is also worse on its own, in the
+        opposite case: a close that is slow but *succeeding* is killed at exit, losing whatever
+        it was flushing. ``shutdown`` therefore drains and closes the live sink first, then
+        joins any outstanding closer for what is left of its budget — so a slow close finishes,
+        a hung one costs only the grace, and neither can reach the live sink. What SPEC-028
+        refused to abandon was the sink the worker was *still delivering to*; this one has been
+        fenced out of the delivery path by two confirmed drains.
 
         It is deliberately not :meth:`_close_sink`, which answers a different question — that
         one closes the sink the worker still holds, exactly once, and only after the thread has
@@ -582,6 +593,7 @@ class Worker:
             )
             return
         with self._lock:
+            self._closers = [old for old in self._closers if old.is_alive()]
             self._closers.append(closer)
         closer.join(timeout)
 
@@ -641,6 +653,7 @@ class Worker:
             a full traceback carrying the exception's message, which arch §6 keeps out of
             anything the library says about itself.
         """
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._lock:
             first = not self._shutdown_done
             self._shutdown_done = True
@@ -666,6 +679,46 @@ class Worker:
             )
             return
         self._close_if_owed()
+        self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+    def _join_closers(self, timeout: float | None) -> None:
+        """Gives a swapped-out sink's close its last chance before the process exits.
+
+        This is what makes the daemon closer of :meth:`_close_swapped_out` safe rather than
+        merely available. A daemon is killed wherever it has reached at interpreter exit, so
+        without this a close that was slow but *succeeding* — a ``KafkaSink`` flushing its
+        producer, where the close is the delivery — would lose its buffer, which a non-daemon
+        thread would not have. Measured both ways: daemon alone lost those events, non-daemon
+        alone lost everything in the *live* sink instead, and this join is what takes neither
+        loss.
+
+        The order is the whole point. It runs after :meth:`_close_if_owed`, so the sink still
+        receiving events is drained and closed first and a hung swapped-out close can only ever
+        cost the grace, never the live sink. The wait is the smaller of ``DEFAULT_CLOSER_GRACE``
+        and what remains of ``shutdown``'s own budget: capped so a stuck close cannot hold a
+        process at exit for the whole shutdown budget, and carved from that budget so it cannot
+        extend it either.
+
+        Args:
+          timeout: Seconds remaining in ``shutdown``'s budget, further capped by
+            ``DEFAULT_CLOSER_GRACE`` and shared across every outstanding close. ``None`` takes
+            the cap rather than waiting indefinitely — an unbounded ``shutdown`` is a caller's
+            choice about draining events, not a licence for a stuck close to hold the exit.
+
+        Returns:
+          None.
+
+        Raises:
+          None. A join on a thread that has already finished is a no-op, and one that has not
+            is abandoned at the deadline — which is the daemon's contract, not a failure.
+        """
+        with self._lock:
+            closers = [closer for closer in self._closers if closer.is_alive()]
+            self._closers = closers
+        grace = DEFAULT_CLOSER_GRACE if timeout is None else min(timeout, DEFAULT_CLOSER_GRACE)
+        deadline = time.monotonic() + grace
+        for closer in closers:
+            closer.join(max(0.0, deadline - time.monotonic()))
 
     def _close_if_owed(self) -> None:
         """Closes the sink exactly once, and only once the drain thread has ended.

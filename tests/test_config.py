@@ -482,7 +482,71 @@ def test_the_swap_waits_for_a_close_that_fits_inside_the_budget() -> None:
     assert elapsed >= close_seconds, "and configure() waited for it rather than firing and forgetting"
 
 
-def test_an_expired_close_is_neither_abandoned_nor_reported() -> None:
+def test_shutdown_gives_an_outstanding_close_a_bounded_grace_to_finish() -> None:
+    """A slow-but-succeeding close must not be killed at exit just for being slow.
+
+    This is what makes the daemon closer safe rather than merely available, and it is the case
+    the daemon loses on its own: measured, a `KafkaSink`-shaped sink whose ``close()`` *is* its
+    delivery lost its buffer to the daemon and kept it under a non-daemon thread. The grace runs
+    after the live sink is drained and closed, so it can never cost the sink still receiving
+    events.
+    """
+    slow = SlowCloseSink()
+    worker = _worker_with(slow)
+    decorator._swap_sink(SwapSink(), timeout=0.3)
+    assert slow.in_close.wait(5.0), "the close is outstanding when shutdown begins"
+    assert slow.closed == 0
+
+    # Released *during* shutdown, not before it. Releasing first lets the daemon finish on its
+    # own and the assertion below then passes whether or not anything joined it — which is how
+    # the first version of this test passed against a shutdown that skipped the grace entirely.
+    threading.Timer(0.2, slow.release.set).start()
+    worker.shutdown(timeout=5.0)
+
+    assert slow.closed == 1, "shutdown waited for the outstanding close rather than abandoning it"
+
+
+def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkeypatch) -> None:
+    """A stuck close must not hold a process at exit for the full 30 s shutdown budget.
+
+    The cap is what distinguishes this from "join with whatever is left": the close already had
+    the swap's entire budget before ``shutdown`` was called, so one still running is far more
+    likely stuck than slow.
+    """
+    monkeypatch.setattr(worker_mod, "DEFAULT_CLOSER_GRACE", 0.3)
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        start = time.monotonic()
+        worker.shutdown(timeout=30.0)  # generous budget; the cap is what must bound the wait
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, f"the grace must be capped, not the whole budget — took {elapsed:.2f}s"
+        assert hung.closed == 0, "and the hung close is abandoned"
+    finally:
+        hung.release.set()
+
+
+def test_finished_closers_are_not_retained_between_swaps() -> None:
+    """``health()`` prunes the roster, but a process that never calls it must not accumulate.
+
+    A config-watcher reconfiguring on every file change is exactly the shape SPEC-030 exists
+    for, and nothing obliges it to poll ``health()``.
+    """
+    worker = _worker_with(SwapSink())
+
+    for _ in range(50):
+        decorator._swap_sink(SwapSink(), timeout=5.0)
+
+    assert len(worker._closers) <= 2, (
+        f"finished closers accumulated: {len(worker._closers)} retained across 50 swaps"
+    )
+
+
+def test_an_expired_close_is_neither_abandoned_nor_reported(capsys) -> None:
     """The join decides who waits and nothing else — no counter, no line, no abandoned close.
 
     This is what makes the threaded close safe here where SPEC-028 reverted it for
@@ -493,9 +557,11 @@ def test_an_expired_close_is_neither_abandoned_nor_reported() -> None:
     slow = SlowCloseSink()
     _worker_with(slow)
     try:
-        decorator._swap_sink(SwapSink(), timeout=0.1)
+        capsys.readouterr()
+        decorator._swap_sink(SwapSink(), timeout=0.3)
         assert slow.in_close.wait(5.0)
         assert log_foundry.health().incomplete_swaps == 0, "a slow close is not a failed swap"
+        assert capsys.readouterr().err == "", "and is not announced either — no line, no counter"
 
         slow.release.set()
         assert _eventually(lambda: slow.closed == 1), "the close ran to completion regardless"
@@ -515,7 +581,7 @@ def test_a_close_still_running_is_visible_in_health_while_it_runs() -> None:
     try:
         assert log_foundry.health().closing_sinks == 0, "nothing is closing yet"
 
-        decorator._swap_sink(SwapSink(), timeout=0.1)
+        decorator._swap_sink(SwapSink(), timeout=0.3)
         assert slow.in_close.wait(5.0)
         assert log_foundry.health().closing_sinks == 1, "the hung close is visible"
 

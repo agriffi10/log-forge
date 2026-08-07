@@ -1730,8 +1730,19 @@ def test_a_live_worker_pays_nothing_for_the_check(capsys) -> None:
 
 
 _HUNG_SWAP_CLOSE_PROGRAM = """
+import faulthandler
 import threading
 import log_foundry as lf
+from log_foundry import worker as _worker
+
+# A wedged child would otherwise fail as a bare 60s subprocess timeout with no stdout and no
+# clue where it stopped -- the exact symptom the non-daemon design produces, so the failure
+# would be indistinguishable from the regression this test exists to catch.
+faulthandler.dump_traceback_later(20, exit=True)
+
+# The swap budget is what this child spends waiting on the hung close, so shrink it: at the
+# 5s default this test costs 5s of every CI run to prove something about the millisecond after.
+_worker.DEFAULT_SWAP_TIMEOUT = 0.3
 
 class HangingCloseSink:
     '''The sink being swapped away from. Its close() never returns.'''

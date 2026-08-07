@@ -152,35 +152,51 @@ SPEC-028's two reasons for reverting a threaded close, only one reaches a swap.
   the closes running at the instant it is read, the ninth field and the only one that falls as well
   as rises. A live fact carries none of the ambiguity of an inference from a timeout, and without
   it a permanently hung close would be invisible where it used to be a visibly hung `configure()`.
-- **The closer is a daemon, and the first attempt here had it backwards.** A non-daemon thread was
-  built, shipped for review, and measured worse: CPython joins non-daemon threads *before* running
-  `atexit`, so one hung close stopped the exit drain from ever running — the **live** sink was
-  never drained or closed, its buffered events were lost, the application's own exit handlers never
-  ran, and the process hung until killed. A daemon inverts the ordering: `atexit` completes first,
-  the sink still receiving events is closed properly, and only the fenced-out sink is abandoned.
-- **The SPEC-028 reading that seemed to forbid this was the wrong one.** That spec refused to
-  abandon the sink the worker was *still delivering to*. This sink has been fenced out of the
-  delivery path by two confirmed drains, so a kill risks its own cleanup and whatever it chose to
-  buffer, never the events still arriving. Which object the thread is holding is the distinction,
-  not whether a thread is used at all.
+- **Neither thread flag is sufficient on its own, and both were built.** Non-daemon shipped for
+  the first review round and was measured worse: CPython joins non-daemon threads *before*
+  running `atexit`, so one hung close stopped the exit drain entirely — the **live** sink never
+  drained or closed, its buffered events lost, the application's own exit handlers never run, and
+  the process hung until killed. Daemon alone loses the opposite case, which the second review
+  measured: a close that is slow but *succeeding* is killed at exit, and for a sink whose
+  `close()` **is** its delivery (`KafkaSink.close()` flushes the producer) that is its whole
+  buffer — the same swap kept those events under a non-daemon thread and lost them under a daemon.
+- **So the flag is not the mechanism; the ordering is.** `shutdown()` drains and closes the live
+  sink, *then* joins any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE = 2.0`,
+  carved from its own budget). A slow close finishes, a hung one costs only the grace, and neither
+  can reach the live sink. The cap matters as much as the join: without it a stuck close holds the
+  process at exit for the whole 30 s shutdown budget, and a close still running at this point
+  already had the swap's entire budget, so it is far more likely stuck than slow.
+- **The SPEC-028 reading that seemed to forbid a thread here was the wrong one, but its
+  interpreter-exit objection does reach this site once the close outlives `configure()`.** That
+  spec refused to abandon the sink the worker was *still delivering to*, and this one is fenced out
+  by two confirmed drains — but an abandoned close is killed wherever it has reached, which for
+  `SQLiteSink` can be inside `commit()`: the partial write SPEC-027 FR-004 ranks worse than a
+  leaked handle. The grace makes it unlikely rather than impossible, and §13 says so rather than
+  claiming the objection does not apply.
 - `shutdown()`'s close is **unchanged** and stays inline. Its constraint in §13 stands; only the
   swap's half is struck through as closed.
-- Residual cost, recorded in §13: a `close()` that never returns is abandoned at exit, losing that
-  sink's own tail, with `closing_sinks` as the only warning. The smaller of the two losses on offer.
+- Two residual costs in §13: a close still running after the grace is abandoned, losing that
+  sink's own tail with `closing_sinks` as the only warning; and that abandonment can land inside a
+  `commit()`.
 
-Eight mutants across the two rounds, restored from a scratchpad copy rather than `git checkout --`
-(which would have reverted the fix under test): close run inline; closer made non-daemon; an
-`incomplete_swaps` bump on expiry; `_close_detached`'s guard removed; an inline close as the
-thread-start fallback; the close given a *fresh* full budget rather than the remainder; the join
-given ten times the budget; and the join dropped entirely for fire-and-forget. Each is killed by
-the test that advertises it.
+Fourteen mutants across the three rounds, restored from a scratchpad copy rather than
+`git checkout --` (which would have reverted the fix under test): close run inline; closer made
+non-daemon; an `incomplete_swaps` bump on expiry; `_close_detached`'s guard removed; an inline
+close as the thread-start fallback; the close given a *fresh* full budget rather than the
+remainder; the join given ten times the budget; the join dropped entirely; the grace join removed
+from `shutdown`; the grace uncapped; the closer roster left unpruned; and three on `closing_sinks`
+(prune removed, gauge hardcoded to zero, append removed). Each is killed by the test that
+advertises it.
 
-**Three of those mutants were the review's finding, not mine.** `fresh`, `tenx` and `forget` all
-survived the entire 1036-test suite on the first attempt — the headline bound had no test, because
-`assert elapsed < 5.0` against a 0.3 s budget only distinguishes "not *totally* unbounded", and a
-fast close completes before the assertion runs whether or not anything joined it. The bound is now
-asserted against the budget, the shared deadline is pinned structurally by recording what each of
-the three stages is handed, and the wait-for-a-fast-close test uses a close slow enough to measure.
+**Six of those mutants were a review's finding, not mine, and two rounds of my own new tests were
+vacuous.** Round two: `fresh`, `tenx` and `forget` all survived the entire 1036-test suite, because
+`assert elapsed < 5.0` against a 0.3 s budget only says "not *totally* unbounded" and a fast close
+completes before the assertion runs whether or not anything joined it. Round three: my three grace
+tests survived their own mutants for the same class of reason — the first released the hung close
+*before* calling `shutdown()`, so the daemon finished on its own and the assertion passed against a
+`shutdown` that skipped the grace entirely. The bound is now asserted against the budget, the
+shared deadline is pinned structurally by recording what each of the three stages is handed, and
+the grace is released by a timer *during* `shutdown` so only a real join can satisfy it.
 
 ## Verification
 
