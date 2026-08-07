@@ -10,7 +10,8 @@ Shipped in two PRs, as the spec's Phase 4 asks: FR-001..FR-005 (#121), FR-006 al
   backups are numbered, never timestamped, so no filename derives from a clock.
 - **FR-002 — UDP reaches IPv6.** `_make_udp` gained a `host` parameter and resolves the address
   family via `getaddrinfo`, once per socket creation. 14 test seam sites updated; no default was
-  given to the parameter, which would have hidden it from every real reader.
+  given to the parameter, which would have hidden it from every real reader. **IPv4 wins wherever
+  the host offers it** — see the review round below for why the obvious `[0][0]` was a regression.
 - **FR-003 — three false doc claims corrected.** `architecture.md` §12 and §6.1 both said console
   echo goes to stdout (it has been stderr since SPEC-002); the construction-time stream binding is
   now documented on `ConsoleWriter` and `StdoutSink`. **A fourth was corrected alongside them**:
@@ -50,6 +51,58 @@ spec.
 - `architecture.md` §13's "a process that only ever used the orphan path never closes its sink"
   is struck through and marked closed (SPEC-021's rule).
 - `api` now imports `decorator`. New edge, no cycle — `decorator` does not import `api`.
+
+## Review rounds
+
+Both PRs were reviewed in a fresh context before merge. Both reviews found real defects; neither
+was caught by CI, which was green throughout.
+
+**PR #121 — one HIGH.** FR-002's first cut took `getaddrinfo(host)[0][0]`. RFC 6724 sorts AAAA
+first, so a **dual-stack hostname moved from IPv4 to IPv6** — and against a collector bound to
+`0.0.0.0:514`, the common rsyslog/logstash deployment, the datagram is discarded with no signal:
+UDP is unconnected, so `sendto` succeeds locally, `emit` returns, and `losses()` stays at zero.
+Measured. A spec written to remove one instance of silent loss had introduced another, and FR-002's
+own AC-2 ("delivery to a hostname is unchanged") forbids it. IPv4 now wins where offered, so AC-1
+and AC-2 hold together — which taking `[0]` cannot do. This is a fixed preference, not the
+happy-eyeballs / caching / preference-*setting* redesign Out of Scope bars.
+
+The AC-2 test **could not have caught it**: it bound its receiver with the same
+`getaddrinfo(...)[0][0]` expression production used, so a family mismatch was unrepresentable. The
+tell is that it went *red* when `_make_udp` was reverted to pre-PR `AF_INET` — a failure caused by
+the regression, readable as evidence of the fix. Deleted, not patched; three tests replace it, one
+binding an IPv4-only receiver so the sink must come to it.
+
+Also: the FR-005 test was racy (`_stop.set()` does not wake the drain thread out of
+`get(timeout=flush_interval)`, so it consumed queued items; flaked as `deque mutated during
+iteration` under a tightened switch interval), §6.1 still called the echo format a "default", the
+new §13 entry mis-enumerated `Queue`'s public API, and `StderrSink.__init__` had missed FR-003's
+binding note.
+
+**PR #122 — one HIGH, plus three smaller.** An orphan-only `shutdown()` leaves `_worker` unset, so
+a later `@trace` builds a **fresh, non-retired worker** and `health().retired` reverted to `False`
+— contradicting what `health()` reported one call earlier, and making three shipped documents
+false. Fixed by making the synthesis an `or` rather than a fallback.
+
+The reviewer rated it as silent total loss on the strength of `KafkaSink`/`GooglePubSubSink` being
+unguarded; **measured, that part does not hold** — SPEC-032 made exactly those three sinks refuse,
+so the loss surfaces as `failed_batches=1` plus a `_diag` line, and a sink with no guard
+(`StdoutSink`) releases nothing on `close()` and genuinely still delivers. So the residual is a
+*signal shape*, recorded here: after an orphan-only shutdown, a later span's loss is detected by
+`failed_batches`, not by SPEC-030's `retired` + `submitted_after_shutdown` pair. That pair keeps its
+narrower meaning, per AC-5.
+
+Smaller, all fixed: `_close_orphan_sink` read `_worker` outside the lock that `_get_worker`
+publishes it under (a `shutdown()` racing a first `@trace` could close the sink the new worker had
+just captured — reproduced with an injected preemption point); arming *after* the emit meant a sink
+that **raised** never armed the close, leaving the socket behind a dead destination open forever,
+which is the leak FR-006 exists to stop in the case most likely to be leaking (arming now precedes
+the emit); and the AC-6 assertion did not name `SinkDeliveryError`, so any unrelated fault in that
+branch satisfied it.
+
+**Two of FR-003's premises were already stale** when the branch was cut, and are recorded rather
+than presented as corrections: the `api.py:53` comment had been removed by SPEC-025's docstring
+pass, and `console.py`'s module docstring no longer carried the "Lambda's stdout → CloudWatch" text
+the spec quotes. The surviving false claims were in `architecture.md`.
 
 ## Verification
 

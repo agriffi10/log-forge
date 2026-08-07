@@ -38,10 +38,19 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     decision was made (SPEC-031 FR-003).
 
     Because no worker is built here, nothing else in the library knows the sink was ever
-    written to — so this branch records it, and only after the emit returns (SPEC-031 FR-006).
-    That is what arms the exit-time close for a process which only ever logs this way, and
-    keying it on a landed event rather than on a configured sink is deliberate: ``configure()``
-    materializes a ``StdoutSink`` whether or not anything is logged through it.
+    written to — so this branch records it (SPEC-031 FR-006). That is what arms the exit-time
+    close for a process which only ever logs this way, and keying it on a sink this call is
+    about to write to, rather than on a *configured* sink, is deliberate: ``configure()``
+    materializes a ``StdoutSink`` whether or not anything is logged through it, and closing one
+    nothing was ever written to is cost with no benefit.
+
+    It is armed **before** the emit rather than after it, which matters for the sinks most
+    likely to need the close. SPEC-026 FR-001 makes a total failure raise, so an orphan-only
+    process against a dead syslog or HTTP destination raises on every call — and arming
+    afterwards would leave the socket that failure came from open forever, which is the leak
+    this FR exists to stop, in exactly the case that is leaking. A sink that raised is still a
+    sink that was written to. ``_ensure_sink`` is resolved first, so a sink that fails to
+    *construct* arms nothing: there is nothing to close.
 
     The orphan branch is the one that reaches the sink on the caller's own thread, with no
     worker between them to absorb a failure, so the whole branch is guarded (SPEC-025
@@ -79,8 +88,9 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
                 start_ts=0.0,
             )
             event = build_event(orphan, level, message, fields=fields, baggage=baggage)
-            _ensure_sink().emit([event])
+            sink = _ensure_sink()
             _note_orphan_emit()
+            sink.emit([event])
         except Exception as exc:
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")
     if echo and event is not None:

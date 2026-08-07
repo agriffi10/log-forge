@@ -614,8 +614,9 @@ def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys)
     contextvars.copy_context().run(body)
 
     err = capsys.readouterr().err
-    assert err.count("absorbed a failure while emitting an orphan log") == 1, (
-        "refused at the closed sink and announced once, not silently buffered"
+    assert err.count("absorbed a failure while emitting an orphan log (SinkDeliveryError)") == 1, (
+        "refused at the closed sink and announced once, not silently buffered — and named, so "
+        "an unrelated fault in this branch cannot satisfy the assertion"
     )
 
 
@@ -856,3 +857,152 @@ def test_a_mixed_process_at_interpreter_exit_closes_once_and_still_drains(
     )
     assert "orphan" in result.stdout
     assert "span.end" in result.stdout, "the whole span, not just the level call inside it"
+
+
+# -- SPEC-031 FR-006: the guards a first review found untested ------------------------------
+
+
+def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() -> None:
+    """The `_worker is not None` guard, exercised in isolation.
+
+    A first review found it dead under test: removing it alone left the whole suite green,
+    because `_shutdown_worker` returns before reaching here whenever a worker exists. It is
+    still the guard that keeps a `shutdown()` racing a first `@trace` from closing the sink the
+    new worker just captured, so it is asserted directly rather than only through that caller.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("arms the close")
+
+    @lf.trace
+    def traced() -> None:
+        return None
+
+    traced()
+    assert decorator._worker is not None
+
+    decorator._close_orphan_sink()
+
+    assert sink.closes == 0, "the worker owns this sink; the orphan close must stand down"
+
+
+def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> None:
+    """A shutdown() racing a first @trace must not close the sink the worker just captured.
+
+    The race needs an injected preemption point — the repo's own SPEC-028 precedent. The lock
+    wrapper creates the worker inside `__enter__`, i.e. exactly while a thread is blocked
+    acquiring `_worker_lock`, which is the interleaving a bare unlocked read admits.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("arms the close")
+
+    real_lock = decorator._worker_lock
+
+    class _PreemptingLock:
+        """Publishes a worker while a caller is mid-acquire, as a real thread could."""
+
+        def __init__(self) -> None:
+            self.fired = False
+
+        def __enter__(self):
+            real_lock.acquire()
+            if not self.fired:
+                self.fired = True
+                decorator._worker = decorator.Worker(sink)
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            real_lock.release()
+
+    decorator._worker_lock = _PreemptingLock()  # type: ignore[assignment]
+    try:
+        decorator._close_orphan_sink()
+    finally:
+        decorator._worker_lock = real_lock
+
+    assert sink.closes == 0, (
+        "the worker was published under the lock, so the close must observe it and stand down"
+    )
+
+
+def test_a_sink_that_raises_on_emit_is_still_closed() -> None:
+    """SPEC-026 FR-001 makes total failure raise, so this is the case most likely to leak.
+
+    An orphan-only process against a dead destination raises on every call. Arming after the
+    emit would leave the socket that failure came from open forever — the exact leak FR-006
+    exists to stop. A sink that raised is still a sink that was written to.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry.sinks.base import SinkDeliveryError
+
+    class _DeadDestination(_CountingSink):
+        def emit(self, batch: list[dict]) -> None:
+            raise SinkDeliveryError("delivered none of 1 event(s)")
+
+    sink = _DeadDestination()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+
+    def body() -> None:
+        lf.info("never lands")
+
+    contextvars.copy_context().run(body)
+    lf.shutdown()
+
+    assert sink.closes == 1, "the resource behind the failure is released, not leaked"
+
+
+def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
+    """The other side of it: there is no sink, so there is nothing to close."""
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    lf.configure(service="t")
+    original = api._ensure_sink
+
+    def _explode():
+        raise RuntimeError("cannot build a sink")
+
+    api._ensure_sink = _explode  # type: ignore[assignment]
+    try:
+
+        def body() -> None:
+            lf.info("no sink to write to")
+
+        contextvars.copy_context().run(body)
+    finally:
+        api._ensure_sink = original  # type: ignore[assignment]
+
+    assert decorator._orphan_close_owed is False
+
+
+def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:
+    """A first review's finding: `retired` reverted to False and contradicted this API.
+
+    An orphan-only `shutdown()` leaves `_worker` unset, so a later `@trace` builds a fresh
+    worker whose own `retired` is False. Reading that alone says the process was never shut
+    down — false, and it contradicts what `health()` reported one call earlier.
+    """
+    lf = pytest.importorskip("log_foundry")
+    from log_foundry import decorator
+
+    sink = _CountingSink()
+    lf.configure(service="t", version="0", env="t", sink=sink)
+    lf.info("orphan")
+    lf.shutdown()
+    assert lf.health().retired is True
+
+    @lf.trace
+    def traced() -> None:
+        return None
+
+    traced()
+    assert decorator._worker is not None, "a fresh worker really was built"
+
+    assert lf.health().retired is True, "shutdown() happened; a new worker cannot un-happen it"

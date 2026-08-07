@@ -283,6 +283,12 @@ def _close_orphan_sink() -> None:
     *not* closing: an expired :meth:`Worker.shutdown` leaves the sink open because the drain
     thread may still be inside ``emit``.
 
+    That check is read **under** ``_worker_lock``, not ahead of it, because :func:`_get_worker`
+    assigns ``_worker`` while holding that same lock. Unlocked, a ``shutdown()`` racing a first
+    ``@trace`` could read ``None``, block behind the worker's construction, and then close the
+    sink underneath the worker that had just captured it — reproduced with an injected
+    preemption point, the way SPEC-028 demonstrates the races that need one.
+
     The once-only flag is set ahead of the close, as ``Worker.shutdown``'s is: a second
     ``close()`` on a sink that partially released its resources is worse than an unclosed one.
 
@@ -298,10 +304,8 @@ def _close_orphan_sink() -> None:
         itself. ``Exception``, never ``BaseException`` (SPEC-025 FR-004).
     """
     global _orphan_sink_closed
-    if _worker is not None:
-        return
     with _worker_lock:
-        if not _orphan_close_owed or _orphan_sink_closed:
+        if _worker is not None or not _orphan_close_owed or _orphan_sink_closed:
             return
         _orphan_sink_closed = True
     try:
@@ -416,6 +420,16 @@ def _worker_health() -> Health:
     defines that count as submissions queued where nothing will drain them, and a later orphan
     log is refused at the closed sink and announced instead. The two are not the same claim.
 
+    The synthesis also survives a worker built *after* that shutdown, which is why it is an
+    ``or`` rather than a fallback. An orphan-only ``shutdown()`` leaves ``_worker`` unset, so a
+    later ``@trace`` constructs a fresh worker whose own ``retired`` is ``False`` — and reading
+    that alone would say the process was never shut down, contradicting this function's own
+    guarantee one call earlier. The events that worker carries are not lost silently: against a
+    sink that guards its post-close state they raise and land in ``failed_batches`` (measured),
+    and against one that releases nothing on ``close()`` they genuinely still deliver. So the
+    detection is ``failed_batches`` there rather than SPEC-030's ``retired`` +
+    ``submitted_after_shutdown`` pair, which stays the signal for the path it was built for.
+
     Args:
       None.
 
@@ -428,7 +442,10 @@ def _worker_health() -> Health:
     worker = _worker
     if worker is None:
         return Health(queued=0, dropped=0, failed_batches=0, retired=_orphan_retired)
-    return worker.health()
+    health = worker.health()
+    if _orphan_retired and not health.retired:
+        return health._replace(retired=True)
+    return health
 
 
 def _flush(span: Span) -> None:
