@@ -71,7 +71,12 @@ def _loopback_receiver(family: int):
 
 
 def test_make_udp_picks_the_family_the_host_resolves_to() -> None:
-    """The defect itself: an unconditional AF_INET made every IPv6 send fail."""
+    """The defect itself: an unconditional AF_INET made every IPv6 send fail.
+
+    This is the one piece of AC-1 evidence that cannot skip — it needs no listener, only a
+    resolvable literal — so an IPv6-less runner still fails here rather than going green on
+    skips.
+    """
     import socket as socket_lib
 
     v6 = socket_mod._make_udp("::1")
@@ -82,6 +87,70 @@ def test_make_udp_picks_the_family_the_host_resolves_to() -> None:
     finally:
         v6.close()
         v4.close()
+
+
+def test_a_dual_stack_hostname_still_goes_to_ipv4() -> None:
+    """AC-2. ``getaddrinfo`` sorts AAAA first, so the obvious ``[0]`` moves the destination.
+
+    Every deployment of this library has sent UDP over IPv4, and a collector bound to
+    ``0.0.0.0:514`` is the common one. Taking the first result would route a dual-stack name to
+    IPv6 and that collector would never see the datagram — silently, since UDP is unconnected:
+    ``sendto`` succeeds locally, ``emit`` returns, and no counter moves.
+    """
+    import socket as socket_lib
+
+    families = {entry[0] for entry in socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)}
+    if socket_lib.AF_INET not in families:  # pragma: no cover - depends on the host's stack
+        pytest.skip("localhost does not resolve to IPv4 here")
+
+    sock = socket_mod._make_udp("localhost")
+    try:
+        assert sock.family == socket_lib.AF_INET, "IPv4 wins wherever the host offers it"
+    finally:
+        sock.close()
+
+
+def test_a_dual_stack_hostname_reaches_an_ipv4_only_collector() -> None:
+    """The same criterion end to end, against a receiver bound to IPv4 alone.
+
+    Deliberately *not* written as "bind wherever the code decided to send" — that expression
+    mirrors ``_make_udp``'s own, so a family mismatch would be unrepresentable and the test
+    would assert self-consistency rather than AC-2. The receiver's family is fixed here and the
+    sink must come to it.
+    """
+    import socket as socket_lib
+
+    families = {entry[0] for entry in socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)}
+    if socket_lib.AF_INET not in families:  # pragma: no cover - depends on the host's stack
+        pytest.skip("localhost does not resolve to IPv4 here")
+
+    receiver, port = _loopback_receiver(socket_lib.AF_INET)
+    try:
+        SyslogSink("localhost", port, transport="udp").emit(
+            [{"level": "INFO", "message": "to-the-v4-collector"}]
+        )
+        assert b"to-the-v4-collector" in receiver.recv(4096)
+    finally:
+        receiver.close()
+
+
+def test_an_ipv6_only_host_still_selects_ipv6() -> None:
+    """The IPv4 preference must not become the old unconditional AF_INET."""
+    import socket as socket_lib
+
+    def only_v6(*args: object, **kwargs: object) -> list:
+        return [(socket_lib.AF_INET6, socket_lib.SOCK_DGRAM, 0, "", ("::1", 0, 0, 0))]
+
+    original = socket_lib.getaddrinfo
+    socket_lib.getaddrinfo = only_v6  # type: ignore[assignment]
+    try:
+        sock = socket_mod._make_udp("v6-only.example")
+    finally:
+        socket_lib.getaddrinfo = original  # type: ignore[assignment]
+    try:
+        assert sock.family == socket_lib.AF_INET6
+    finally:
+        sock.close()
 
 
 def test_udp_syslog_delivers_to_an_ipv6_destination() -> None:
@@ -119,21 +188,6 @@ def test_udp_delivery_to_ipv4_is_unchanged() -> None:
             [{"level": "INFO", "message": "over-v4"}]
         )
         assert b"over-v4" in receiver.recv(4096)
-    finally:
-        receiver.close()
-
-
-def test_udp_delivery_to_a_hostname_is_unchanged() -> None:
-    """``localhost`` may resolve to either family; whichever it is, the datagram arrives."""
-    import socket as socket_lib
-
-    family = socket_lib.getaddrinfo("localhost", None, type=socket_lib.SOCK_DGRAM)[0][0]
-    receiver, port = _loopback_receiver(family)
-    try:
-        SyslogSink("localhost", port, transport="udp").emit(
-            [{"level": "INFO", "message": "by-name"}]
-        )
-        assert b"by-name" in receiver.recv(4096)
     finally:
         receiver.close()
 

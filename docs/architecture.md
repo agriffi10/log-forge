@@ -235,8 +235,10 @@ Console echo characteristics:
 
 - **Synchronous & immediate** — written at call time, independent of the background
   worker and sink. Bypasses buffering entirely.
-- **Human-readable, not JSON** — emits a plain line (default `LEVEL  message`) meant for
-  a person or a log scraper, distinct from the structured record sent to the sink.
+- **Human-readable, not JSON** — emits a plain line, fixed as `f"{level:<7} {message}"`, meant
+  for a person or a log scraper, distinct from the structured record sent to the sink. It is
+  not a default in the sense of something overridable; there is no format setting (SPEC-031
+  FR-003, as the struck-through bullet below records).
 - **Additive, not a redirect** — an echoed event *still* goes into the span queue and on
   to the sink. Echo just gives it a second, instant audience.
 - ~~**Configurable** — global defaults set the destination (stdout/stderr), the line
@@ -616,8 +618,10 @@ constraint — never by being deleted quietly.
   produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than changing it**,
   per SPEC-021's rule that an open item is closed by being fixed, settled, or recorded.
 
-  Why no alternative: the markers must be *read* and not *consumed*. `Queue` publishes only
-  `get`/`put`/`qsize` — nothing that inspects without removing — and the draining alternative
+  Why no alternative: the markers must be *read* and not *consumed*. `Queue`'s public surface is
+  `put`/`get` and their `_nowait` forms, `qsize`/`empty`/`full`, and `task_done`/`join` — every
+  one of which either removes an item or reports only a count, and none of which inspects
+  without removing — and the draining alternative
   (get everything, answer the markers, put the rest back) would destroy the queued event-lists
   that `health().queued` and SPEC-019's terminal-failure line report as the evidence of what was
   lost. Snapshotting under the queue's own mutex is also what makes it impossible to miss a

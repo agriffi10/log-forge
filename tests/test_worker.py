@@ -1816,42 +1816,47 @@ def test_release_waiters_answers_markers_among_queued_event_lists() -> None:
     picked out of real submissions, and those submissions must survive the sweep because
     ``health().queued`` and the terminal-failure line report them as the evidence of what was
     lost (architecture.md §13).
+
+    The worker is shut down *before* the queue is seeded, which is both the real scenario — this
+    method exists for a drain thread that is gone — and the only way to make the test
+    deterministic. Setting ``_stop`` is not enough and looks like it is: the thread is parked in
+    ``queue.get(timeout=flush_interval)`` and only re-reads the flag after that returns, so it
+    is still on the queue and consumes the first item put there. The earlier shape passed only
+    because the puts fit inside one switch interval, and failed as ``deque mutated during
+    iteration`` under a tightened one.
     """
     sink = RecordingSink()
     worker = Worker(sink, batch_size=1000, flush_interval=60.0)
-    try:
-        worker._stop.set()  # keep the drain thread out of the queue for the duration
-        time.sleep(0.05)
+    worker.shutdown()
+    assert not worker._thread.is_alive(), "nothing may consume what this test puts on the queue"
 
-        first = worker_mod._FlushMarker(seen_failures=0)
-        second = worker_mod._FlushMarker(seen_failures=0)
-        worker._queue.put_nowait(_span("a"))
-        worker._queue.put_nowait(first)
-        worker._queue.put_nowait(_span("b"))
-        worker._queue.put_nowait(second)
-        worker._queue.put_nowait(_span("c"))
-        depth = worker._queue.qsize()
+    first = worker_mod._FlushMarker(seen_failures=0)
+    second = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(_span("a"))
+    worker._queue.put_nowait(first)
+    worker._queue.put_nowait(_span("b"))
+    worker._queue.put_nowait(second)
+    worker._queue.put_nowait(_span("c"))
+    depth = worker._queue.qsize()
 
-        worker._release_waiters()
+    worker._release_waiters()
 
-        assert first.event.is_set(), "a marker mid-queue was not answered"
-        assert second.event.is_set(), "a second marker mid-queue was not answered"
-        assert first.delivered is False, "each keeps its pessimistic verdict, which is the truth"
-        assert second.delivered is False
-        assert worker._queue.qsize() == depth, (
-            "the markers were read, not consumed — the queued event-lists are the evidence"
-        )
-        remaining = [item for item in worker._queue.queue if isinstance(item, list)]
-        assert remaining == [_span("a"), _span("b"), _span("c")]
-    finally:
-        worker.shutdown()
+    assert first.event.is_set(), "a marker mid-queue was not answered"
+    assert second.event.is_set(), "a second marker mid-queue was not answered"
+    assert first.delivered is False, "each keeps its pessimistic verdict, which is the truth"
+    assert second.delivered is False
+    assert worker._queue.qsize() == depth, (
+        "the markers were read, not consumed — the queued event-lists are the evidence"
+    )
+    remaining = [item for item in worker._queue.queue if isinstance(item, list)]
+    assert remaining == [_span("a"), _span("b"), _span("c")]
 
 
 def test_release_waiters_is_a_no_op_on_an_empty_queue() -> None:
     sink = RecordingSink()
     worker = Worker(sink)
-    try:
-        worker._release_waiters()  # must not raise
-        assert worker._queue.qsize() == 0
-    finally:
-        worker.shutdown()
+    worker.shutdown()
+
+    worker._release_waiters()  # must not raise
+
+    assert worker._queue.qsize() == 0

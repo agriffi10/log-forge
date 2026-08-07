@@ -34,13 +34,20 @@ def _make_tcp(host: str, port: int, timeout: float) -> socket.socket:
 
 
 def _make_udp(host: str) -> socket.socket:
-    """Opens an unconnected UDP socket in the address family the host resolves to (SPEC-031).
+    """Opens an unconnected UDP socket in an address family the host resolves to (SPEC-031).
 
     The family is resolved rather than assumed: a hardcoded ``AF_INET`` made every ``sendto``
     to an IPv6 destination fail, silently, until the retry bound abandoned the message. TCP
-    never had the defect because ``socket.create_connection`` resolves for itself. Only the
-    first result is taken — FR-002 makes both families reachable and deliberately stops short
-    of happy-eyeballs or a preference setting.
+    never had the defect because ``socket.create_connection`` resolves for itself.
+
+    **IPv4 wins when the host offers it**, and taking the first result instead was measured
+    losing logs. ``getaddrinfo`` sorts by RFC 6724, which puts AAAA first, so a dual-stack
+    name like ``localhost`` would move from IPv4 — where every deployment of this library has
+    sent — to IPv6, and a collector bound to ``0.0.0.0:514`` would never see the datagram. UDP
+    is unconnected, so that failure is *silent*: ``sendto`` succeeds locally, ``emit`` returns,
+    and no counter moves. FR-002 AC-2 requires delivery to a hostname to be unchanged, and
+    this is what makes it so while AC-1 still holds. It is a fixed preference, not
+    happy-eyeballs, address caching, or a setting — none of which this FR builds.
 
     This is a module-level seam so tests can substitute a fake socket without network access.
 
@@ -56,7 +63,9 @@ def _make_udp(host: str) -> socket.socket:
         ``gaierror`` is an ``OSError``, so an unresolvable host fails exactly as an
         unreachable one already did.
     """
-    family = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)[0][0]
+    resolved = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+    families = [entry[0] for entry in resolved]
+    family = socket.AF_INET if socket.AF_INET in families else families[0]
     return socket.socket(family, socket.SOCK_DGRAM)
 
 
