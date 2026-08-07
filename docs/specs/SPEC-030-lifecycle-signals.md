@@ -1,8 +1,8 @@
 # Spec: Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration
 
 **ID:** SPEC-030  
-**Status:** Draft  
-**Last Updated:** 2026-08-05  
+**Status:** Completed  
+**Last Updated:** 2026-08-07  
 **Depends On:** SPEC-013, SPEC-019
 
 ## Overview
@@ -73,15 +73,15 @@ failure in every process that shuts down properly.
 
 #### Acceptance Criteria:
 
-- [ ] After `shutdown()` with no further logging, `health()` reports the retired state and a
+- [x] After `shutdown()` with no further logging, `health()` reports the retired state and a
       submitted-after-shutdown count of zero.
-- [ ] After `shutdown()` followed by N decorated calls, the count reflects the submissions that were
+- [x] After `shutdown()` followed by N decorated calls, the count reflects the submissions that were
       accepted and cannot be delivered.
-- [ ] `stopped_reason` remains `None` after a clean shutdown (SPEC-019 FR-003 unchanged).
-- [ ] A worker that was never shut down reports the count as zero and the retired state as false.
-- [ ] A process that never logged still gets the zeroed snapshot with no worker created.
-- [ ] The existing fields keep their positions and meanings; the new ones are appended.
-- [ ] The README's alert idiom covers the new state, with one line on the remedy (use `flush()`, not
+- [x] `stopped_reason` remains `None` after a clean shutdown (SPEC-019 FR-003 unchanged).
+- [x] A worker that was never shut down reports the count as zero and the retired state as false.
+- [x] A process that never logged still gets the zeroed snapshot with no worker created.
+- [x] The existing fields keep their positions and meanings; the new ones are appended.
+- [x] The README's alert idiom covers the new state, with one line on the remedy (use `flush()`, not
       `shutdown()`, in a process that will log again).
 
 ### FR-002: The first post-shutdown submission warns
@@ -98,12 +98,12 @@ boolean read, on a flag that is only ever set once.
 
 #### Acceptance Criteria:
 
-- [ ] The first submission after `shutdown()` writes exactly one line, naming what happened and what
+- [x] The first submission after `shutdown()` writes exactly one line, naming what happened and what
       to use instead.
-- [ ] Subsequent submissions are throttled, following `_DROP_WARN_EVERY`'s existing convention.
-- [ ] A process that shuts down and logs nothing further writes no line.
-- [ ] The write is guarded and never reaches the caller (SPEC-029 FR-003).
-- [ ] Normal submission is not measurably slowed.
+- [x] Subsequent submissions are throttled, following `_DROP_WARN_EVERY`'s existing convention.
+- [x] A process that shuts down and logs nothing further writes no line.
+- [x] The write is guarded and never reaches the caller (SPEC-029 FR-003).
+- [x] Normal submission is not measurably slowed.
 
 ### FR-003: A late `configure(sink=...)` takes effect or reports that it cannot
 
@@ -126,16 +126,16 @@ The drain is bounded and its outcome reported, so a hung old sink cannot make `c
 
 #### Acceptance Criteria:
 
-- [ ] `configure(sink=B)` after events have gone to sink A causes subsequent events to reach B.
-- [ ] Events submitted before the call are drained to A before the swap, not lost and not sent to B.
-- [ ] Sink A is closed exactly once; sink B is not closed.
-- [ ] The swap is bounded in time; if the drain does not complete, `configure()` still returns and
+- [x] `configure(sink=B)` after events have gone to sink A causes subsequent events to reach B.
+- [x] Events submitted before the call are drained to A before the swap, not lost and not sent to B.
+- [x] Sink A is closed exactly once; sink B is not closed.
+- [x] The swap is bounded in time; if the drain does not complete, `configure()` still returns and
       the failure is recorded in `health()` and on stderr.
-- [ ] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
-- [ ] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
-- [ ] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;
+- [x] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
+- [x] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
+- [x] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;
       nothing to drain).
-- [ ] `configure(sink=...)` after `shutdown()` does not resurrect the worker; it updates the config
+- [x] `configure(sink=...)` after `shutdown()` does not resurrect the worker; it updates the config
       and the FR-001/FR-002 signals continue to apply.
 
 ### FR-004: Both lifecycles are documented where the mistake is made
@@ -147,15 +147,15 @@ README section a reader arrives at afterwards.
 
 #### Acceptance Criteria:
 
-- [ ] `configure()`'s docstring states what happens to a late `sink=` — that it swaps the live
+- [x] `configure()`'s docstring states what happens to a late `sink=` — that it swaps the live
       target, drains and closes the previous sink, and is bounded — qualifying "repeated calls
       compose rather than reset".
-- [ ] `shutdown()`'s docstring states that later logging is accepted, undeliverable, and reported
+- [x] `shutdown()`'s docstring states that later logging is accepted, undeliverable, and reported
       through the FR-001 field.
-- [ ] `health()`'s docstring documents the new fields.
-- [ ] The README's serverless guidance names the `health()` reading that catches the
+- [x] `health()`'s docstring documents the new fields.
+- [x] The README's serverless guidance names the `health()` reading that catches the
       `shutdown()`-per-invocation mistake.
-- [ ] `architecture.md` §7 (configuration) records the sink-swap semantics.
+- [x] `architecture.md` §7 (configuration) records the sink-swap semantics.
 
 ---
 
