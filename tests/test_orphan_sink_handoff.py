@@ -823,8 +823,14 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
 
 def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> None:
     """`Worker.shutdown` already joins closers; joining again charges a second full grace."""
-    monkeypatch.setattr(lifecycle, "DEFAULT_CLOSER_GRACE", 0.4)
+    monkeypatch.setattr(lifecycle, "DEFAULT_CLOSER_GRACE", 0.2)
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.1)
+    grants: list[float | None] = []
+    real_join = lifecycle.join_closers
+    monkeypatch.setattr(
+        lifecycle, "join_closers", lambda t: (grants.append(t), real_join(t))[1]
+    )
+
     hung, live = SlowCloseSink("hung"), CountingSink("live")
     worker = worker_mod.Worker(hung, batch_size=1000, flush_interval=100.0)
     decorator._worker = worker
@@ -832,12 +838,13 @@ def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> No
         log_foundry.configure(service="t", sink=live)  # worker swap; the close hangs
         assert hung.in_close.wait(5.0)
 
-        start = time.monotonic()
         decorator._shutdown_worker(timeout=30.0)
-        elapsed = time.monotonic() - start
 
-        assert elapsed < 0.8, (
-            f"one grace of 0.4s, not two — took {elapsed:.2f}s (a second join charges it again)"
+        # The count is the property. Timing it would need a budget between one grace and two,
+        # which on a loaded runner is a coin flip — and the grace is deliberately short.
+        assert len(grants) == 1, (
+            f"the grace is granted once per exit, by whoever owns the call — got {len(grants)} "
+            f"grants ({grants}); `Worker.shutdown` already joins"
         )
     finally:
         hung.release.set()
@@ -898,25 +905,104 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
     source = pathlib.Path(lifecycle.__file__).read_text()
     tree = ast.parse(source)
 
-    def package_imports(body) -> set[str]:
-        return {
-            node.module
-            for node in body
-            if isinstance(node, ast.ImportFrom)
-            and node.module
-            and node.module.startswith("log_foundry")
-        }
+    def package_modules(body) -> set[str]:
+        """Every `log_foundry.*` module a body imports, by any of the three syntaxes.
 
-    runtime = package_imports(tree.body)
-    guarded = {
-        m
+        `node.module` alone is not enough: `import log_foundry.worker` is an `ast.Import` and
+        never appears there at all, and `from log_foundry import worker` puts the module in the
+        *alias* — both forms a real regression would take, since that is the style `decorator`
+        and `worker` themselves use for `_lifecycle`.
+        """
+        found: set[str] = set()
+        for node in body:
+            if isinstance(node, ast.Import):
+                found |= {a.name for a in node.names if a.name.startswith("log_foundry")}
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("log_foundry"):
+                found |= {f"{node.module}.{a.name}" for a in node.names}
+        return found
+
+    type_checking = [
+        node
         for node in tree.body
         if isinstance(node, ast.If)
-        for m in package_imports(node.body)
-    }
+        and ast.unparse(node.test) == "TYPE_CHECKING"
+        and not node.orelse
+    ]
 
-    assert runtime == {"log_foundry"}, f"at runtime it may import only `_diag`, got {runtime}"
-    assert "from log_foundry import _diag" in source, "and that import is `_diag`"
-    assert guarded == {"log_foundry.sinks.base"}, (
-        f"`Sink` is TYPE_CHECKING-only, and nothing else is guarded — got {guarded}"
+    assert package_modules(tree.body) == {"log_foundry._diag"}, (
+        f"at runtime it may import only `_diag`, got {package_modules(tree.body)}"
     )
+    assert len(type_checking) == 1, "one TYPE_CHECKING block, with no else"
+    assert package_modules(type_checking[0].body) == {"log_foundry.sinks.base.Sink"}, (
+        "`Sink` is the only TYPE_CHECKING-guarded package import"
+    )
+
+
+def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
+    """The record survives a shutdown that declined to close, so the swap must decline too.
+
+    `_close_orphan_sink` leaves `_orphan_sink` set when a worker owned it, so after any shutdown
+    the record still names the worker's sink. Deciding the *close* by liveness rather than
+    ownership then closes it a second time — measured `A.closed == 2`, which this spec's own
+    docstrings call worse than an unclosed sink.
+    """
+    a, b = CountingSink("a"), CountingSink("b")
+    log_foundry.configure(service="t", sink=a)
+
+    @log_foundry.trace
+    def work() -> None:
+        pass
+
+    work()
+    log_foundry.info("orphan, arming the record at a")
+    log_foundry.shutdown()
+    assert a.closed == 1
+    assert decorator._orphan_sink is a, "the record still names the worker's sink"
+
+    log_foundry.configure(sink=b)
+
+    assert a.closed == 1, "the worker already closed it; the swap must not close it again"
+    assert decorator._orphan_sink is b, "but the record is still re-pointed"
+
+
+def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
+    """The same guard, in the case that makes it matter rather than merely tidy.
+
+    An expired `Worker.shutdown` leaves the sink open *because the drain thread may still be
+    inside its `emit`* (SPEC-027 FR-004). Closing it from the swap is a close under a live
+    writer — the outcome `sinks/base.py` and SPEC-028 exist to prevent.
+    """
+
+    class Wedged(CountingSink):
+        def __init__(self) -> None:
+            super().__init__("wedged")
+            self.in_emit = threading.Event()
+            self.release = threading.Event()
+            self.closed_while_emitting = False
+
+        def emit(self, batch: list[dict]) -> None:
+            self.in_emit.set()
+            self.release.wait(30.0)
+
+        def close(self) -> None:
+            self.closed_while_emitting = self.in_emit.is_set() and not self.release.is_set()
+            super().close()
+
+    wedged, new = Wedged(), CountingSink("new")
+    log_foundry.configure(service="t", sink=wedged)
+    log_foundry.info("orphan, arming the record")
+
+    worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    try:
+        worker.submit([{"message": "wedges the drain thread"}])
+        assert wedged.in_emit.wait(5.0)
+        decorator._shutdown_worker(timeout=0.2)
+        assert wedged.closed == 0, "the expired shutdown left it open, as it must"
+
+        log_foundry.configure(sink=new)
+
+        assert wedged.closed == 0, "and the swap must not close it while the drain is inside emit"
+        assert not wedged.closed_while_emitting
+    finally:
+        wedged.release.set()

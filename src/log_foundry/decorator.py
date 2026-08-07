@@ -444,10 +444,10 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     thread at exit to prove there is nothing to drain is pure cost, the same refusal
     :func:`_swap_sink` and :func:`_flush_worker` already make.
 
-    The worker branch **falls through** rather than returning (SPEC-033 FR-002). A retired
-    worker owns nothing further, so a sink adopted after its shutdown is the orphan path's to
-    close; :func:`_close_orphan_sink`'s ownership guard is what keeps that from double-closing
-    the sink the worker just closed itself.
+    The worker branch runs :func:`_close_orphan_sink` before returning (SPEC-033 FR-002). A
+    retired worker owns nothing further, so a sink adopted after its shutdown is the orphan
+    path's to close; that function's ownership guard is what keeps this from double-closing the
+    sink the worker just closed itself.
 
     ``_orphan_stop`` is set **before** delegating, so a sink parked in a backoff is released
     while :meth:`Worker.shutdown` is still draining rather than after it has given up waiting.
@@ -506,6 +506,17 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     ``sinks/base.py`` requires ``close()`` to tolerate a concurrent ``emit`` (SPEC-028 FR-001).
     This inherits that contract rather than weakening it.
 
+    **Who performs the swap and who owns the old sink's close are two questions.** The first is
+    liveness — a retired worker performs nothing, since :meth:`Worker.swap_sink` returns early
+    once shut down, so routing the swap to it loses the handoff entirely. The second is
+    ownership, exactly as in :func:`_close_orphan_sink`: a worker that *holds* ``old`` has either
+    closed it already or deliberately left it open because its drain thread may still be inside
+    that sink's ``emit`` (SPEC-027 FR-004). Answering the second with liveness closes it a second
+    time on a clean shutdown, and closes it **under a live writer** on an expired one — both
+    measured, both introduced by the first version of this split, and the second is the outcome
+    ``sinks/base.py`` and SPEC-028 exist to prevent. So the record is re-pointed either way, and
+    the close is performed only when no worker holds it.
+
     ``_worker`` is read **under** ``_worker_lock``. Unlocked it was harmless, because the
     no-worker branch did nothing; once that branch closes a sink it is the race
     :func:`_close_orphan_sink` was built against — a first ``@trace`` on another thread can be
@@ -532,6 +543,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         cannot start.
     """
     global _orphan_sink, _orphan_closed_sink
+    closer = None
     with _worker_lock:
         worker = _live_worker()
         if worker is not None:
@@ -541,9 +553,10 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             if old is None or old is new_sink:
                 return
             _orphan_sink = new_sink
-            _orphan_closed_sink = old
             _offer_orphan_signal(new_sink)
-            closer = _lifecycle.close_detached(old)
+            if _worker is None or _worker.sink is not old:
+                _orphan_closed_sink = old
+                closer = _lifecycle.close_detached(old)
     if worker is not None:
         try:
             worker.swap_sink(new_sink, timeout)

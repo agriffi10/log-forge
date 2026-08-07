@@ -14,7 +14,7 @@
 - Two defects found by review of the spec and fixed here, not deferred: a sink configured **after**
   `shutdown()` was closed by nothing at all, and an orphan-only process never received a SPEC-027
   stop signal.
-- `tests/test_orphan_sink_handoff.py` — 41 tests. Suite 1106 → 1149, none removed.
+- `tests/test_orphan_sink_handoff.py` — 43 tests. Suite 1106 → 1151, none removed.
 
 **Deviation from the spec:** none in substance. `close_detached` returns the thread rather than
 joining (the spec's own final revision), so a caller can start it under `_worker_lock` and wait
@@ -31,13 +31,19 @@ after releasing.
   monkeypatch raises.
 - **The closer roster is process-global.** `tests/conftest.py` clears it; a new test that leaves a
   hung closer would otherwise leak a non-zero `closing_sinks` into the next test.
-- **Ownership, not existence — and it applies in three places, via `_live_worker()`.**
-  `Worker.swap_sink` returns early once `_shutdown_done`, so a retired worker holds its old sink
-  forever while events go elsewhere. `_swap_sink` and `_offer_orphan_signal` ask for a **live**
-  worker; `_close_orphan_sink` deliberately asks for *any* worker that owns the sink, because an
-  expired shutdown must still make it decline. Do not collapse the two — the review of PR #125
-  found the third call site still on `_worker is not None`, leaking a sink with every counter
-  clean, which is the same mistake this spec was written to fix.
+- **Two questions, not one: who *performs* a swap, and who *owns* a sink's close.** The first is
+  liveness — `Worker.swap_sink` returns early once `_shutdown_done`, so routing a swap to a
+  retired worker loses the handoff entirely and leaks the adopted sink with every counter clean.
+  The second is ownership — a worker that *holds* a sink has either closed it or deliberately
+  left it open because its drain thread may still be inside that sink's `emit` (SPEC-027 FR-004).
+  `_live_worker()` answers the first; `_worker.sink is X` answers the second, in **both**
+  `_close_orphan_sink` and `_swap_sink`'s orphan branch. Answering the second with liveness
+  double-closes on a clean shutdown and closes **under a live writer** on an expired one — both
+  measured, and the second is what SPEC-028 exists to prevent. Two review rounds of this PR each
+  found one half of this wrong; do not collapse them.
+- **`_close_orphan_sink` leaves `_orphan_sink` set when a worker owned it.** That is why the swap
+  needs its own ownership test rather than trusting the record: after any shutdown the record
+  still names the worker's sink.
 - **`Worker.shutdown` grants the closer grace; `_shutdown_worker` must not grant it again.**
   Doing both charges two full `DEFAULT_CLOSER_GRACE` against one exit (measured 4.01 s against a
   2 s grace). The orphan branch grants it where nothing else will.
@@ -69,13 +75,16 @@ it:
 | hanging `close()` on the swap | n/a (no close at all) | bounded by `DEFAULT_SWAP_TIMEOUT`, `closing_sinks=1` |
 | `_retry.wait(5.0)` on a set event | 0.000 s (vs 0.405 s unset) | fresh event armed; post-shutdown sinks still back off |
 
-Twelve mutants, all caught. Six from the build: swap returns early (13 failures), clear instead of
+Sixteen mutants, all caught. Six from the build: swap returns early (13 failures), clear instead of
 re-point (5), `_close_orphan_sink` guards on existence (1), `_shutdown_worker` returns early (1),
 never refresh a set event (2), skip the signal offer on existence (1). Six more added after the
 PR review found them escaping: `_swap_sink` guards on existence (1), remove both record clears (2 —
 green across the whole suite before), hold `_worker_lock` across the closer join (1), grant the
 grace twice (1), route the live close through `close_detached` (1), signal offer on existence in a
-mixed process (1).
+mixed process (1). Four more after the review of those fixes: decide the swap's close by
+liveness (2 — the double close and the close-under-a-live-writer), and two runtime-import forms
+the cycle test missed (`import log_foundry.worker`, `from log_foundry import worker as _w`) —
+the forms a regression would actually take, since that is the import style this package uses.
 
 Three of those six escaped because the **test** was wrong, not the code: the mixed-process test
 asserted before `shutdown()` so a close at exit was invisible; the lock test timed an emit that
