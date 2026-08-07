@@ -128,21 +128,29 @@ at startup but after an import-time log line, turning a silent wrong-sink into a
 case that is usually benign.
 
 The drain is bounded and its outcome reported, so a hung old sink cannot make `configure()` hang.
-(Amended after review: bounded for the *drain*. The old sink's `close()` is not — see the fourth
-criterion.)
+(Amended twice after review, and this paragraph was missed the first time: narrowed to the *drain*
+while the old sink's `close()` was unbounded, then restored when that close was bounded too. The
+whole call is bounded — see the fourth criterion for how, and the delivery doc for the two designs
+that were built and measured before the shipped one.)
 
 #### Acceptance Criteria:
 
 - [x] `configure(sink=B)` after events have gone to sink A causes subsequent events to reach B.
 - [x] Events submitted before the call are drained to A before the swap, not lost and not sent to B.
 - [x] Sink A is closed exactly once; sink B is not closed.
-- [x] The **drains** are bounded in time; if a drain does not complete, `configure()` still returns
-      and the failure is recorded in `health()` and on stderr. **Amended after review**: the
-      criterion said "the swap", and the swap is not bounded end to end — closing the previous
-      sink is not, because `Sink.close` takes no timeout. That is the gap `architecture.md` §13
-      already records for `shutdown()`, reached by a second route; bounding it needs an
-      interruptible close, which is a change to the sink contract, and SPEC-028 built and
-      reverted the daemon-thread alternative. Recorded in §13 and pinned by a test.
+- [x] The swap is bounded in time; if the drain does not complete, `configure()` still returns and
+      the failure is recorded in `health()` and on stderr. **Amended after review, then restored.**
+      The first amendment narrowed this to "the drains", because closing the previous sink was
+      unbounded — `Sink.close` takes no timeout — and recorded it as an `architecture.md` §13
+      constraint alongside `shutdown()`'s. On instruction it was then **bounded properly** and the
+      criterion restored as written: the close runs on a **daemon** thread joined for the
+      remainder of the budget, with `shutdown()` giving any outstanding close a capped grace after
+      the live sink is drained. What made that available is that SPEC-028's wrong-signal objection
+      is dissolved by deriving *no* signal from an expired join, and its interpreter-exit objection
+      is answered by the grace rather than by the thread flag. **A non-daemon thread was shipped
+      for review first and was wrong**: CPython joins non-daemon threads before `atexit`, so one
+      hung close stopped the exit drain and lost the live sink's buffered events. See the delivery
+      doc's follow-up for the measurements on both.
 - [x] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
 - [x] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
 - [x] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;
@@ -160,11 +168,10 @@ README section a reader arrives at afterwards.
 #### Acceptance Criteria:
 
 - [x] `configure()`'s docstring states what happens to a late `sink=` — that it swaps the live
-      target, drains and closes the previous sink, and ~~is bounded~~ **which part of that is
-      bounded** — qualifying "repeated calls compose rather than reset". **Amended after review**,
-      for the reason FR-003's fourth criterion was: the drains are bounded and the close is not,
-      so a docstring certified as saying "is bounded" would now be certifying a false claim. This
-      criterion was missed when its sibling was amended.
+      target, drains and closes the previous sink, and is bounded — qualifying "repeated calls
+      compose rather than reset". **Amended after review, then restored**, tracking FR-003's
+      fourth criterion exactly: narrowed while the close was unbounded (and missed at first when
+      its sibling was narrowed, which the second review caught), restored once it was bounded.
 - [x] `shutdown()`'s docstring states that later logging is accepted, undeliverable, and reported
       through the FR-001 field.
 - [x] `health()`'s docstring documents the new fields.
@@ -187,13 +194,23 @@ class Health(NamedTuple):
     sink: SinkLosses | None = None          # SPEC-026
     retired: bool = False                   # new — shutdown() has completed
     submitted_after_shutdown: int = 0       # new — accepted, undeliverable
-    incomplete_swaps: int = 0               # new — see the amendment below
+    incomplete_swaps: int = 0               # new — see the amendments below
+    closing_sinks: int = 0                  # new — a live gauge, not a counter
 
 
 # on Worker, guarded by the existing _lock:
 self.submitted_after_shutdown = 0
 self.incomplete_swaps = 0
+self._closers: list[threading.Thread] = []   # backs closing_sinks; pruned on append and read
 ```
+
+**Amended again — a fourth field, `closing_sinks`.** Bounding the swap's close (see the delivery
+doc's follow-up) moved it onto its own thread, which made a destination stuck in `close()`
+invisible: `health()` read all-clear, the alert-idiom failure this whole spec exists to end. It is
+a **live gauge** rather than a counter — the closes running at the instant it is read — because
+that is a fact, where a count of expired joins would be an inference, and SPEC-028 reverted a
+design that inferred. It is the only field here that falls as well as rises, and deliberately not
+a term in the documented alert idiom, since a healthy swap makes it briefly non-zero.
 
 **Amended during implementation — a third field.** FR-003's fourth acceptance criterion requires
 an unconfirmed drain to be "recorded in `health()`", and this outline provided nowhere to record

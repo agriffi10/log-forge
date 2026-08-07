@@ -162,6 +162,16 @@ class WedgedSink(SwapSink):
         super().emit(batch)
 
 
+def _eventually(predicate, timeout: float = 5.0) -> bool:
+    """Polls a predicate that another thread satisfies, rather than sleeping a fixed interval."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 def _worker_with(sink) -> "worker_mod.Worker":
     """Installs a process worker on ``sink`` whose batching triggers cannot fire unaided.
 
@@ -223,20 +233,27 @@ def test_the_swap_drains_the_old_sink_then_fences_before_closing_it() -> None:
     """
     old, new = SwapSink(), SwapSink()
     worker = _worker_with(old)
-    real_flush, drains = worker.flush, []
+    real_flush, real_close, drains, close_budget = worker.flush, worker._close_swapped_out, [], []
 
     def recording_flush(timeout=None):
         drains.append((worker.sink, timeout))
         return real_flush(timeout)
 
+    def recording_close(sink, timeout):
+        close_budget.append(timeout)
+        return real_close(sink, timeout)
+
     worker.flush = recording_flush
+    worker._close_swapped_out = recording_close
     config.configure(sink=new)
 
     assert [sink for sink, _ in drains] == [old, new], "drain to the old sink, then fence after"
     assert old.closed == 1, "and only then close it"
-    # One deadline covers both, so a hung sink cannot cost twice the budget. The first drain is a
-    # real queue round-trip, so the monotonic clock has moved by the time the fence is granted.
+    # One deadline covers all three waits, so a hung sink cannot cost a multiple of the budget.
+    # Each step is a real queue round-trip, so the monotonic clock has moved between them; a
+    # step handed a *fresh* budget would read equal to its predecessor rather than less.
     assert drains[1][1] < drains[0][1], "the fence gets what is left of the budget, not a fresh one"
+    assert close_budget and close_budget[0] < drains[1][1], "and the close gets what is left of that"
 
 
 def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
@@ -398,35 +415,385 @@ def test_a_swap_that_raises_does_not_fail_configure(monkeypatch, capsys) -> None
     assert "swapping the log sink" in capsys.readouterr().err
 
 
-def test_the_swap_budget_does_not_bound_the_previous_sinks_close() -> None:
-    """A known, recorded gap (arch §13) — pinned so it cannot be misread as a bounded call.
+class _WedgedEmitSink(SwapSink):
+    """Blocks the drain thread inside ``emit``, so a ``shutdown`` join can be made to expire."""
 
-    ``Sink.close`` takes no timeout, so the swap's deadline covers the two drains and nothing
-    after them. Bounding it needs an interruptible close, which is a change to the sink
-    contract; SPEC-028 built and reverted the daemon-thread alternative.
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self.release = release
+        self.in_emit = threading.Event()
 
-    The budget is generous and the close is longer still, deliberately. An unconfirmed drain
-    returns *before* the close, so a budget tight enough to race the scheduler would fail this
-    test on its first assertion under load rather than measuring anything — 10 ms failed 122
-    times in 200 on a loaded machine while passing 25 for 25 on an idle one. What must be tight
-    is the gap between the budget and the close, not the budget itself.
+    def emit(self, batch: list[dict]) -> None:
+        self.in_emit.set()
+        self.release.wait(10.0)
+        super().emit(batch)
+
+
+class SlowCloseSink(SwapSink):
+    """Blocks in ``close()`` until released, so a bounded close is observable both ways."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self) -> None:
+        self.in_close.set()
+        self.release.wait(10.0)
+        super().close()
+
+
+def test_the_swap_budget_bounds_the_previous_sinks_close() -> None:
+    """The whole call is bounded: a sink that hangs in ``close()`` must not hang ``configure()``.
+
+    The budget is generous and the close longer still, deliberately. An unconfirmed *drain*
+    returns before the close is even reached, so a budget tight enough to race the scheduler
+    would fail on setup rather than measuring anything — 10 ms failed 122 runs in 200 on a
+    loaded machine while passing 25 for 25 idle. What must be tight is the gap between the
+    budget and the close, not the budget.
     """
-    budget, close_seconds, closed_for = 0.3, 0.5, []
+    budget = 0.3
+    slow = SlowCloseSink()
+    _worker_with(slow)
+    try:
+        start = time.monotonic()
+        decorator._swap_sink(SwapSink(), timeout=budget)
+        elapsed = time.monotonic() - start
 
-    class SlowCloseSink(SwapSink):
-        def close(self) -> None:
-            time.sleep(close_seconds)
-            closed_for.append(True)
-            super().close()
+        assert slow.in_close.is_set(), "the close was started"
+        assert slow.closed == 0, "and configure() returned while it was still running"
+        # Against the budget, not against the 10 s close: a bare "did not take forever" passes
+        # for a fresh full budget, a 10x join, and a fire-and-forget that never waits at all.
+        assert elapsed < budget * 3, f"the wait must track the budget, took {elapsed:.2f}s"
+    finally:
+        slow.release.set()
 
-    _worker_with(SlowCloseSink())
+
+def test_the_swap_waits_for_a_close_that_fits_inside_the_budget() -> None:
+    """The other half of the bound: waiting is the default, and expiry is the exception.
+
+    The close must take *measurable* time, or a fire-and-forget swap passes on luck — an
+    instant close finishes before the assertion runs whether or not anything joined it. The
+    elapsed check is what actually distinguishes the two, and it is a floor rather than a
+    window, so load can only make it more true.
+    """
+    close_seconds = 0.2
+    old = SwapSink()
+    original_close = old.close
+
+    def unhurried_close() -> None:
+        time.sleep(close_seconds)
+        original_close()
+
+    old.close = unhurried_close  # type: ignore[method-assign]
+    _worker_with(old)
 
     start = time.monotonic()
-    decorator._swap_sink(SwapSink(), timeout=budget)
+    decorator._swap_sink(SwapSink(), timeout=5.0)
     elapsed = time.monotonic() - start
 
-    assert closed_for, "the drain was confirmed and the previous sink closed"
-    assert elapsed >= close_seconds, "the close ran to completion, past the swap's own budget"
+    assert old.closed == 1, "a close that fits in the budget has completed on return"
+    assert elapsed >= close_seconds, "and configure() waited for it rather than firing and forgetting"
+
+
+def test_shutdown_gives_an_outstanding_close_a_bounded_grace_to_finish() -> None:
+    """A slow-but-succeeding close must not be killed at exit just for being slow.
+
+    This is what makes the daemon closer safe rather than merely available, and it is the case
+    the daemon loses on its own: measured, a `KafkaSink`-shaped sink whose ``close()`` *is* its
+    delivery lost its buffer to the daemon and kept it under a non-daemon thread. The grace runs
+    after the live sink is drained and closed, so it can never cost the sink still receiving
+    events.
+    """
+    slow = SlowCloseSink()
+    worker = _worker_with(slow)
+    decorator._swap_sink(SwapSink(), timeout=0.3)
+    assert slow.in_close.wait(5.0), "the close is outstanding when shutdown begins"
+    assert slow.closed == 0
+
+    # Released *during* shutdown, not before it. Releasing first lets the daemon finish on its
+    # own and the assertion below then passes whether or not anything joined it — which is how
+    # the first version of this test passed against a shutdown that skipped the grace entirely.
+    threading.Timer(0.2, slow.release.set).start()
+    worker.shutdown(timeout=5.0)
+
+    assert slow.closed == 1, "shutdown waited for the outstanding close rather than abandoning it"
+
+
+def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkeypatch) -> None:
+    """A stuck close must not hold a process at exit for the full 30 s shutdown budget.
+
+    The cap is what distinguishes this from "join with whatever is left": the close already had
+    the swap's entire budget before ``shutdown`` was called, so one still running is far more
+    likely stuck than slow.
+    """
+    monkeypatch.setattr(worker_mod, "DEFAULT_CLOSER_GRACE", 0.3)
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        start = time.monotonic()
+        worker.shutdown(timeout=30.0)  # generous budget; the cap is what must bound the wait
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, f"the grace must be capped, not the whole budget — took {elapsed:.2f}s"
+        assert hung.closed == 0, "and the hung close is abandoned"
+    finally:
+        hung.release.set()
+
+
+def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> None:
+    """Defence in depth, pinned because measurement cannot distinguish it.
+
+    Both orders deliver the live sink identically — the grace cap returns control long before
+    anything is at risk, so swapping these two calls leaves the whole suite green. The order
+    still matters for the case measurement does not cover: an external deadline killing the
+    process *during* the grace, where the live sink would otherwise be the one left unclosed.
+    """
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        order: list[str] = []
+        real_close_if_owed, real_join = worker._close_if_owed, worker._join_closers
+        worker._close_if_owed = lambda: (order.append("live sink"), real_close_if_owed())[1]
+        worker._join_closers = lambda t: (order.append("swapped-out"), real_join(t))[1]
+
+        worker.shutdown(timeout=0.5)
+
+        assert order == ["live sink", "swapped-out"], "the live sink is never made to wait"
+    finally:
+        hung.release.set()
+
+
+def test_an_expired_first_shutdown_still_grants_the_grace_on_the_next_call() -> None:
+    """A wedged worker thread is no reason to abandon a healthy swapped-out close.
+
+    The first ``shutdown`` expires on the drain thread and returns before the grace; the
+    ``atexit`` call behind it took the idempotent path and used to return instantly, so a close
+    that was moments from finishing got no grace at all — the loss the grace exists to prevent,
+    reached through the one path that skipped it.
+    """
+    slow = SlowCloseSink()
+    # batch_size=1 here rather than the shared helper's 1000: this test needs one submission to
+    # reach the sink, because wedging the drain thread is how the first shutdown is made to expire.
+    worker = worker_mod.Worker(slow, batch_size=1, flush_interval=100.0)
+    decorator._worker = worker
+    wedge = threading.Event()
+    wedged = _WedgedEmitSink(wedge)
+    try:
+        # First leave a close outstanding, then wedge the drain thread — in the other order the
+        # swap's own drain either unwedges it or races the reassignment of ``worker.sink``.
+        decorator._swap_sink(wedged, timeout=0.3)
+        assert slow.in_close.wait(5.0), "slow's close is outstanding"
+        worker.submit([{"message": "stuck"}])
+        assert wedged.in_emit.wait(5.0), "and the drain thread is now wedged"
+
+        worker.shutdown(timeout=0.3)
+        assert worker.health().stopped_reason == "ShutdownTimeout", "the first call expired"
+        assert slow.closed == 0
+
+        threading.Timer(0.2, slow.release.set).start()
+        worker.shutdown(timeout=5.0)  # the atexit call behind it
+
+        assert slow.closed == 1, "the idempotent path grants the grace too"
+    finally:
+        wedge.set()
+        slow.release.set()
+
+
+def test_the_grace_is_shared_across_every_outstanding_close() -> None:
+    """N stuck closers must cost the grace once, not N times."""
+    grace = 0.4
+    hung = [SlowCloseSink() for _ in range(4)]
+    worker = _worker_with(hung[0])
+    try:
+        for nxt in hung[1:]:
+            decorator._swap_sink(nxt, timeout=0.05)
+        decorator._swap_sink(SwapSink(), timeout=0.05)
+        assert all(sink.in_close.wait(5.0) for sink in hung), "four closes are outstanding"
+
+        start = time.monotonic()
+        worker._join_closers(grace)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < grace * 2, f"one shared deadline, not one each — took {elapsed:.2f}s"
+    finally:
+        for sink in hung:
+            sink.release.set()
+
+
+def test_an_unbounded_shutdown_still_caps_the_grace() -> None:
+    """``shutdown(timeout=None)`` is a choice about draining events, not about a stuck close.
+
+    ``None`` is public and documented as available on request, and it is the one input where
+    "join with whatever is left of the budget" reads as "join forever". Both halves need
+    pinning: a stuck close must not hang the exit, and the grace must not be skipped either.
+    """
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    elapsed: list[float] = []
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        # On its own thread deliberately: a regression that joins forever here would otherwise
+        # hang this test rather than fail it, and the `finally` that releases the sink would
+        # never run. Off-thread, the bound below fails cleanly and teardown still happens.
+        def timed_join() -> None:
+            start = time.monotonic()
+            worker._join_closers(None)
+            elapsed.append(time.monotonic() - start)
+
+        joiner = threading.Thread(target=timed_join)
+        joiner.start()
+        joiner.join(worker_mod.DEFAULT_CLOSER_GRACE * 3)
+
+        assert elapsed, "an unbounded shutdown must still cap the grace, not join forever"
+        assert elapsed[0] >= worker_mod.DEFAULT_CLOSER_GRACE, "and must not skip it either"
+    finally:
+        hung.release.set()
+
+
+def test_health_does_not_block_behind_the_grace() -> None:
+    """``health()`` takes the same lock the roster does; it must not wait on a 2 s join.
+
+    SPEC-026 states ``health()`` is safe to call while delivery is in flight, and an operator
+    reads it exactly when things are going wrong — which is when a close is hung.
+    """
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        joining = threading.Thread(target=worker._join_closers, args=(2.0,))
+        joining.start()
+        try:
+            start = time.monotonic()
+            worker.health()
+            elapsed = time.monotonic() - start
+        finally:
+            hung.release.set()
+            joining.join(10.0)
+
+        assert elapsed < 1.0, f"health() waited on the grace for {elapsed:.2f}s"
+    finally:
+        hung.release.set()
+
+
+def test_finished_closers_are_not_retained_between_swaps() -> None:
+    """``health()`` prunes the roster, but a process that never calls it must not accumulate.
+
+    A config-watcher reconfiguring on every file change is exactly the shape SPEC-030 exists
+    for, and nothing obliges it to poll ``health()``.
+    """
+    worker = _worker_with(SwapSink())
+
+    for _ in range(50):
+        decorator._swap_sink(SwapSink(), timeout=5.0)
+
+    assert len(worker._closers) <= 2, (
+        f"finished closers accumulated: {len(worker._closers)} retained across 50 swaps"
+    )
+
+
+def test_an_expired_close_is_neither_abandoned_nor_reported(capsys) -> None:
+    """The join decides who waits and nothing else — no counter, no line, no abandoned close.
+
+    This is what makes the threaded close safe here where SPEC-028 reverted it for
+    ``shutdown()``: that revert was because an expired join could not tell a slow-but-successful
+    close from a stuck one and reported a loss for closes that had completed. Deriving no signal
+    from the expiry dissolves the objection rather than arguing with it.
+    """
+    slow = SlowCloseSink()
+    _worker_with(slow)
+    try:
+        capsys.readouterr()
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert slow.in_close.wait(5.0)
+        assert log_foundry.health().incomplete_swaps == 0, "a slow close is not a failed swap"
+        assert capsys.readouterr().err == "", "and is not announced either — no line, no counter"
+
+        slow.release.set()
+        assert _eventually(lambda: slow.closed == 1), "the close ran to completion regardless"
+    finally:
+        slow.release.set()
+
+
+def test_a_close_still_running_is_visible_in_health_while_it_runs() -> None:
+    """The observable that replaces a signal derived from the expiry (review finding F3).
+
+    A live gauge carries none of the ambiguity that made SPEC-028 revert a guessed one: read it
+    non-zero and a close *is* running now. Read it non-zero every time and the destination is
+    stuck, holding resources nothing will reclaim.
+    """
+    slow = SlowCloseSink()
+    _worker_with(slow)
+    try:
+        assert log_foundry.health().closing_sinks == 0, "nothing is closing yet"
+
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert slow.in_close.wait(5.0)
+        assert log_foundry.health().closing_sinks == 1, "the hung close is visible"
+
+        slow.release.set()
+        assert _eventually(lambda: log_foundry.health().closing_sinks == 0), (
+            "and the gauge falls again once it finishes — it is not a counter"
+        )
+    finally:
+        slow.release.set()
+
+
+def test_a_closer_thread_that_cannot_start_is_announced_not_run_inline(monkeypatch, capsys) -> None:
+    """A process that cannot spawn a thread must not get the unbounded close back instead.
+
+    Falling back to an inline close would reintroduce the wait this whole change removes, in
+    the one situation where the process is already under resource pressure.
+    """
+    sink = SlowCloseSink()
+    _worker_with(sink)
+
+    def refuse(self) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+
+    start = time.monotonic()
+    decorator._swap_sink(SwapSink(), timeout=0.3)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0, "the close must not have been run inline as a fallback"
+    assert not sink.in_close.is_set(), "and must not have been attempted at all"
+    assert "starting the thread that closes a swapped-out sink" in capsys.readouterr().err
+
+
+def test_the_closer_thread_is_a_daemon(monkeypatch) -> None:
+    """Structural, and load-bearing in the opposite direction to the first attempt here.
+
+    A non-daemon closer was tried and is worse: CPython joins non-daemon threads *before*
+    ``atexit``, so one hung close stops the exit drain from ever running. The subprocess test in
+    ``test_worker.py`` measures that consequence; this one pins the flag it turns on.
+    """
+    started: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    class RecordingThread(real_thread):  # type: ignore[misc, valid-type]
+        def start(self) -> None:
+            started.append(self)
+            super().start()
+
+    monkeypatch.setattr(threading, "Thread", RecordingThread)
+    _worker_with(SwapSink())
+    decorator._swap_sink(SwapSink())
+
+    closers = [t for t in started if t.name == "log-foundry-sink-close"]
+    assert closers, "the close ran on its own thread"
+    assert all(t.daemon for t in closers), "a non-daemon closer holds the whole exit path hostage"
 
 
 def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:

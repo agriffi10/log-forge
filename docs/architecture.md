@@ -284,10 +284,17 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
    old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
 4. closes the previous sink.
 
-Both drains share one deadline, so a hung sink cannot make `configure()` block for twice the
-budget — the deadline covers the drains only, not step 4 (§13). Both guards are re-taken after the
-first drain, since it blocks: a `shutdown()` landing mid-swap must abandon the swap, or it installs
-a sink nothing will ever close. A drain that cannot be confirmed does **not** cancel the swap — the caller asked for the
+One deadline covers all four steps, so a destination that hangs in any of them cannot make
+`configure()` block for a multiple of the budget. Step 4 gets what is left of it: `Sink.close()`
+takes no timeout, so it runs on its own **daemon** thread and is joined for the remainder — only
+the waiting is bounded. Nothing is derived from an expired join: no counter moves and no line is
+written, because a slow close and a stuck one are indistinguishable at that moment and a signal
+that cannot tell them apart is worse than none. What is published instead is a *live* fact,
+`health().closing_sinks` — the closes running at the instant it is read, which is unambiguous in a
+way an expired join is not. Both
+guards are re-taken after the first drain, since it blocks: a `shutdown()` landing mid-swap must
+abandon the swap, or it installs a sink nothing will ever close. A drain that cannot be confirmed
+does **not** cancel the swap — the caller asked for the
 new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
 left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
 leaked resource in a running process beats a close raced against a write. Passing the sink already
@@ -606,8 +613,10 @@ constraint — never by being deleted quietly.
 - **`shutdown()`'s timeout bounds the drain, not the sink's `close()`.** This narrows SPEC-027
   FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an
   application thread parked on the orphan path inside a driver call with no timeout of its own
-  delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and nothing
-  after it. Running the close on a joinable daemon thread was built and **reverted**: at
+  delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and, since
+  SPEC-030, the grace it grants a swapped-out sink's close — but not this close, the live sink's,
+  which stays inline and unbounded. Running *this* close on a joinable daemon thread was built and
+  **reverted**: at
   interpreter exit that daemon is killed wherever it has reached — and for `SQLiteSink` that can
   be *inside* `commit()`, which is the partial write FR-004 exists to avoid rather than the
   leaked handle it knowingly accepts — and it could not tell a slow-but-successful close from a
@@ -615,21 +624,48 @@ constraint — never by being deleted quietly.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.
 
-  **The same gap reaches `configure(sink=...)`** (SPEC-030). A late sink swap closes the previous
-  sink on the *caller's* thread, and its timeout bounds the two drains, not that close — so a
-  `KafkaSink` whose broker is unreachable blocks `configure()` inside `producer.flush()`, and any
-  SPEC-028 locking sink blocks behind an orphan-path writer holding the emit lock. It is the same
-  root cause with the same fix, and it is worse only in where it lands: at startup in a running
-  process rather than at exit. Not closing the previous sink at all would leak it on every swap.
+  ~~**The same gap reaches `configure(sink=...)`**~~ — **closed by SPEC-030's follow-up.** It did:
+  a late sink swap closed the previous sink inline on the caller's thread, so a `KafkaSink` whose
+  broker was unreachable blocked `configure()` inside `producer.flush()` (measured at 8.0 s against
+  a 5 s budget), and any SPEC-028 locking sink blocked behind an orphan-path writer holding the
+  emit lock. The swap's deadline now covers that close too (§7).
 
-  **Only one of the two reasons above carries over, and it is the second.** The daemon killed
-  mid-`commit()` is an *interpreter-exit* hazard and cannot happen at a swap, which runs in a
-  live process — so that leg does not apply here and must not be cited as though it did. What
-  does apply is that a bounded close still cannot tell a slow-but-successful close from a stuck
-  one: an expired join would report `incomplete_swaps` and "left open" for a close that completes
-  a moment later, latching a loss signal on a healthy swap. A wrong signal is worse than a slow
-  one, which is the same conclusion by the surviving half of the same argument. Configure the
-  sink before the first log where you can — that path has no worker and nothing to close.
+  **What made the fix available here** is that the wrong-signal objection is dissolved rather than
+  argued with: **nothing is derived from an expired join.** No counter moves and no line is
+  written, so a slow close can never latch a loss on a healthy swap — `incomplete_swaps` keeps its
+  narrower meaning, a *drain* that could not be confirmed. The operator is not left blind, though:
+  `health().closing_sinks` reports the closes running at the instant it is read, a live fact rather
+  than an inference from a timeout.
+
+  **The closer is a daemon, and neither thread flag is sufficient on its own** — both were built
+  and measured. Non-daemon: CPython joins non-daemon threads *before* running `atexit`, so a single
+  hung close stopped the exit drain from ever running — the **live** sink never drained or closed,
+  its buffered events lost, the application's own exit handlers never run, and the process hung
+  until killed. Daemon alone loses the opposite case: a close that is slow but *succeeding* is
+  killed at exit, and for a sink whose `close()` **is** its delivery (`KafkaSink.close()` flushes
+  the producer) that is its whole buffer — measured, the same swap kept those events under a
+  non-daemon thread and lost them under a daemon.
+
+  So the flag is not the mechanism; **the capped grace is.** `shutdown()` drains and closes the
+  live sink, then joins any outstanding closer for `DEFAULT_CLOSER_GRACE`, carved from its own
+  budget. A slow close finishes and a hung one costs only the grace. The cap is what does the
+  work: without it a stuck close would hold a process at exit for the whole 30 s shutdown budget,
+  and a close still running here already had the swap's entire budget, so it is far more likely
+  stuck than slow. Running *after* the live sink's close is defence in depth rather than the
+  guarantee — measured, both orders deliver the live sink identically, because the cap returns
+  control long before anything is at risk. It is still the right order, and pinned by a test: it
+  is what holds if an external deadline kills the process during the grace.
+
+  Two residual costs, recorded rather than hidden. First, a `close()` still running after the grace
+  is abandoned, losing that sink's own tail, with `closing_sinks` as the only warning. Second — and
+  this is `_close_if_owed`'s objection genuinely reaching a swap, where it did not while the close
+  ran inline — an abandoned close is killed *wherever it has reached*, which for `SQLiteSink` can
+  be inside `commit()`. That is the partial write SPEC-027 FR-004 ranks worse than a leaked handle,
+  now reachable here, and the grace is what makes it unlikely rather than impossible: the sink must
+  still be stuck after the swap's budget *and* the grace, which for a swapped-out SQLite connection
+  means an orphan-path writer has held its emit lock across both. Neither weakens `shutdown()`,
+  whose close stays inline. Configure the sink before the first log where you can — that path has
+  no worker and nothing to close.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

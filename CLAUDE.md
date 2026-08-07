@@ -456,10 +456,27 @@ where it starts.
   to the old sink, reassign (never rebuild: the queue, thread, counters and `atexit` registration
   survive), **fence with a second drain**, then close — because the first drain only proves the
   *pre-swap* events landed, and closing while the drain thread is inside `emit` is what SPEC-028
-  exists to prevent. Both drains share one deadline. A drain that cannot be confirmed does not
-  cancel the swap (the caller asked for that sink) but leaves the old one **open** and counts
-  `incomplete_swaps`, on SPEC-027 FR-004's reasoning that a leaked resource beats a close raced
-  against a write. (SPEC-030, arch §7, §9)
+  exists to prevent. A drain that cannot be confirmed does not cancel the swap (the caller asked
+  for that sink) but leaves the old one **open** and counts `incomplete_swaps`, on SPEC-027
+  FR-004's reasoning that a leaked resource beats a close raced against a write. **One deadline
+  covers all four steps**, the close included: `Sink.close` takes no timeout, so it runs on a
+  **daemon** thread joined for the remainder. The wrong-signal objection SPEC-028 reverted for is
+  **dissolved by deriving no signal from an expired join** — no counter, no line, so a slow close
+  can never latch a loss on a healthy swap — and the live fact is published instead, as
+  `Health.closing_sinks`, a gauge that falls as well as rises and is deliberately *not* a term in
+  the alert idiom. **Neither thread flag is sufficient alone and both were built:** non-daemon
+  stopped `atexit` from ever running (CPython joins non-daemon threads first), losing the *live*
+  sink; daemon alone kills a slow-but-succeeding close, losing the buffer of a sink whose
+  `close()` *is* its delivery. So the flag is not the mechanism — **the capped grace is**:
+  `shutdown()` closes the live sink, then joins any outstanding closer for
+  `DEFAULT_CLOSER_GRACE`, carved from its own budget so it neither extends shutdown nor lets a
+  stuck close hold the exit for the full 30 s, and granted on the idempotent path too (an expired
+  first call returns before reaching it). Running *after* the live sink's close is defence in
+  depth, not the guarantee — both orders measure identically, since the cap returns control first
+  — but it is the right order and is pinned by a test. What SPEC-028 refused to abandon was the sink still being delivered to; this one is
+  fenced out by two confirmed drains — but its interpreter-exit objection *does* reach here once
+  the close outlives `configure()`, so §13 records that an abandoned close can land inside a
+  `commit()`. `shutdown()`'s own close stays inline. (SPEC-030, arch §7, §9, §13)
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — the
   SPEC-026 rule applied to the sink's own lifecycle, where an absorbed batch is a batch the worker
   believes just the same. Both halves bind: three shipped sinks lost every post-`close()` event

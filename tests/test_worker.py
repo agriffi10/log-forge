@@ -858,11 +858,12 @@ def test_existing_health_fields_keep_their_positions() -> None:
     assert (h[0], h[1], h[2]) == (h.queued, h.dropped, h.failed_batches)
     assert h[3] is h.stopped_reason
     # SPEC-026 appended ``sink`` exactly as SPEC-019 appended ``stopped_reason``, and SPEC-030
-    # appended three more after it: every field that came before keeps its index, so positional
+    # appended four more after it: every field that came before keeps its index, so positional
     # reads written against any earlier shape hold.
-    assert len(h) == 8
+    assert len(h) == 9
     assert h[4] is h.sink
     assert (h[5], h[6], h[7]) == (h.retired, h.submitted_after_shutdown, h.incomplete_swaps)
+    assert h[8] == h.closing_sinks
 
 
 def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:
@@ -1723,3 +1724,81 @@ def test_a_live_worker_pays_nothing_for_the_check(capsys) -> None:
         assert capsys.readouterr().err == ""
     finally:
         w.shutdown()
+
+
+# -- SPEC-030 follow-up: a hung swapped-out close must not hijack interpreter shutdown ------
+
+
+_HUNG_SWAP_CLOSE_PROGRAM = """
+import faulthandler
+import threading
+import log_foundry as lf
+from log_foundry import worker as _worker
+
+# A wedged child would otherwise fail as a bare 60s subprocess timeout with no stdout and no
+# clue where it stopped -- the exact symptom the non-daemon design produces, so the failure
+# would be indistinguishable from the regression this test exists to catch.
+faulthandler.dump_traceback_later(20, exit=True)
+
+# The swap budget is what this child spends waiting on the hung close, so shrink it: at the
+# 5s default this test costs 5s of every CI run to prove something about the millisecond after.
+_worker.DEFAULT_SWAP_TIMEOUT = 0.3
+
+class HangingCloseSink:
+    '''The sink being swapped away from. Its close() never returns.'''
+    def emit(self, batch): pass
+    def close(self): threading.Event().wait()
+
+class BufferingSink:
+    '''The sink swapped *in* — the live one, whose events only land on close().'''
+    def __init__(self): self.buffered = 0
+    def emit(self, batch): self.buffered += len(batch)
+    def close(self): print(f"LIVE SINK CLOSED, delivered={self.buffered}", flush=True)
+
+live = BufferingSink()
+lf.configure(service="t", env="t", sink=HangingCloseSink())
+
+@lf.trace(name="work")
+def work(): return 1
+
+work()
+lf.flush()
+lf.configure(sink=live)   # swaps; the old sink's close() hangs forever on its own thread
+work()
+work()
+"""
+
+
+def test_a_hung_swapped_out_close_does_not_stop_the_exit_drain(tmp_path) -> None:
+    """The reason the closer is a daemon, measured rather than argued (review finding F1).
+
+    CPython joins non-daemon threads *before* running ``atexit``, so a non-daemon closer stuck
+    in a hung ``close()`` stops the exit drain from ever running: the live sink is never drained
+    or closed, every event buffered in it is lost, and the application's own ``atexit`` handlers
+    do not run either. Measured that way, the process hung until it was killed. A daemon lets
+    ``atexit`` finish first, so the sink still receiving events is closed properly and only the
+    fenced-out one is abandoned.
+
+    Four events, not two: each of the two calls after the swap emits ``span.start`` and
+    ``span.end``.
+    """
+    src = pathlib.Path(log_foundry_mod.__file__).resolve().parent.parent
+    script = tmp_path / "hung_swap_close.py"
+    script.write_text(_HUNG_SWAP_CLOSE_PROGRAM)
+
+    # See the sibling atexit test for why this is suppressed: this interpreter plus a script the
+    # test just wrote into pytest's own tmp_path, no shell and no caller-supplied input.
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(src)},
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, "the process must exit rather than hang on the closer"
+    assert "LIVE SINK CLOSED" in result.stdout, (
+        "atexit ran, so the sink still receiving events was drained and closed"
+    )
+    assert "delivered=4" in result.stdout, "and its buffered events reached it"
