@@ -659,6 +659,7 @@ class Worker:
             self._shutdown_done = True
         if not first:
             self._close_if_owed()
+            self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
             return
         self._stop.set()
         try:
@@ -692,12 +693,22 @@ class Worker:
         alone lost everything in the *live* sink instead, and this join is what takes neither
         loss.
 
-        The order is the whole point. It runs after :meth:`_close_if_owed`, so the sink still
-        receiving events is drained and closed first and a hung swapped-out close can only ever
-        cost the grace, never the live sink. The wait is the smaller of ``DEFAULT_CLOSER_GRACE``
-        and what remains of ``shutdown``'s own budget: capped so a stuck close cannot hold a
-        process at exit for the whole shutdown budget, and carved from that budget so it cannot
-        extend it either.
+        **The cap is the mechanism.** The wait is the smaller of ``DEFAULT_CLOSER_GRACE`` and
+        what remains of ``shutdown``'s own budget: capped so a stuck close cannot hold a process
+        at exit for the whole shutdown budget, and carved from that budget so it cannot extend it
+        either. Running after :meth:`_close_if_owed` rather than before it is defence in depth
+        rather than the guarantee — measured, the two orders deliver the live sink identically,
+        because the cap returns control long before anything is at risk. It is still the right
+        order, and pinned by a test: it is what holds if an external deadline kills the process
+        *during* the grace, where the live sink would otherwise be the one left unclosed.
+
+        It runs on the idempotent path too. A first ``shutdown`` that expired on a wedged drain
+        thread returns before ever reaching here, and the ``atexit`` call that follows would
+        otherwise return instantly — denying the grace to a swapped-out close that is healthy and
+        moments from finishing, which is exactly the loss the grace exists to prevent. The closer
+        is independent of the worker thread, so a wedged worker is no reason to abandon it. The
+        expired path itself still skips it, and that costs nothing: the thread join consumed the
+        budget, so the remainder is zero.
 
         Args:
           timeout: Seconds remaining in ``shutdown``'s budget, further capped by

@@ -644,12 +644,15 @@ constraint — never by being deleted quietly.
   the producer) that is its whole buffer — measured, the same swap kept those events under a
   non-daemon thread and lost them under a daemon.
 
-  So the flag is not the mechanism. `shutdown()` drains and closes the live sink, **then** joins
-  any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE`, carved from its own budget).
-  A slow close finishes, a hung one costs only the grace, and neither can reach the live sink. The
-  cap matters as much as the join: without it a stuck close would hold a process at exit for the
-  whole 30 s shutdown budget, and a close still running here already had the swap's entire budget,
-  so it is far more likely stuck than slow.
+  So the flag is not the mechanism; **the capped grace is.** `shutdown()` drains and closes the
+  live sink, then joins any outstanding closer for `DEFAULT_CLOSER_GRACE`, carved from its own
+  budget. A slow close finishes and a hung one costs only the grace. The cap is what does the
+  work: without it a stuck close would hold a process at exit for the whole 30 s shutdown budget,
+  and a close still running here already had the swap's entire budget, so it is far more likely
+  stuck than slow. Running *after* the live sink's close is defence in depth rather than the
+  guarantee — measured, both orders deliver the live sink identically, because the cap returns
+  control long before anything is at risk. It is still the right order, and pinned by a test: it
+  is what holds if an external deadline kills the process during the grace.
 
   Two residual costs, recorded rather than hidden. First, a `close()` still running after the grace
   is abandoned, losing that sink's own tail, with `closing_sinks` as the only warning. Second — and

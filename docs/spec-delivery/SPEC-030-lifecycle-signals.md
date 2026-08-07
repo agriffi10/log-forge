@@ -160,12 +160,21 @@ SPEC-028's two reasons for reverting a threaded close, only one reaches a swap.
   measured: a close that is slow but *succeeding* is killed at exit, and for a sink whose
   `close()` **is** its delivery (`KafkaSink.close()` flushes the producer) that is its whole
   buffer — the same swap kept those events under a non-daemon thread and lost them under a daemon.
-- **So the flag is not the mechanism; the ordering is.** `shutdown()` drains and closes the live
-  sink, *then* joins any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE = 2.0`,
-  carved from its own budget). A slow close finishes, a hung one costs only the grace, and neither
-  can reach the live sink. The cap matters as much as the join: without it a stuck close holds the
-  process at exit for the whole 30 s shutdown budget, and a close still running at this point
-  already had the swap's entire budget, so it is far more likely stuck than slow.
+- **So the flag is not the mechanism; the capped grace is.** `shutdown()` drains and closes the
+  live sink, then joins any outstanding closer for `DEFAULT_CLOSER_GRACE = 2.0`, carved from its
+  own budget. A slow close finishes and a hung one costs only the grace. The cap is what does the
+  work: without it a stuck close holds the process at exit for the whole 30 s shutdown budget, and
+  a close still running at this point already had the swap's entire budget, so it is far more
+  likely stuck than slow. The grace is granted on the idempotent path too — a first `shutdown()`
+  that expired on a wedged drain thread returns before reaching it, and the `atexit` call behind
+  it would otherwise return instantly, denying the grace to a close moments from finishing.
+- **The ordering is defence in depth, not the guarantee, and the third review caught me claiming
+  otherwise.** Swapping `_close_if_owed` and `_join_closers` leaves the whole suite green, and a
+  real process-exit measurement delivers the live sink identically either way, because the cap
+  returns control long before anything is at risk. It is still the right order — it is what holds
+  if an external deadline kills the process *during* the grace — so it is now pinned by a test
+  that records which ran first, and the prose says "defence in depth" rather than "the whole
+  point".
 - **The SPEC-028 reading that seemed to forbid a thread here was the wrong one, but its
   interpreter-exit objection does reach this site once the close outlives `configure()`.** That
   spec refused to abandon the sink the worker was *still delivering to*, and this one is fenced out
@@ -179,14 +188,12 @@ SPEC-028's two reasons for reverting a threaded close, only one reaches a swap.
   sink's own tail with `closing_sinks` as the only warning; and that abandonment can land inside a
   `commit()`.
 
-Fourteen mutants across the three rounds, restored from a scratchpad copy rather than
-`git checkout --` (which would have reverted the fix under test): close run inline; closer made
-non-daemon; an `incomplete_swaps` bump on expiry; `_close_detached`'s guard removed; an inline
-close as the thread-start fallback; the close given a *fresh* full budget rather than the
-remainder; the join given ten times the budget; the join dropped entirely; the grace join removed
-from `shutdown`; the grace uncapped; the closer roster left unpruned; and three on `closing_sinks`
-(prune removed, gauge hardcoded to zero, append removed). Each is killed by the test that
-advertises it.
+Nineteen mutants across the four rounds, restored from a scratchpad copy named by base SHA rather
+than `git checkout --` (which would have reverted the fix under test; a reviewer hit the adjacent
+trap of an unnamed copy from an earlier round and silently restored the wrong commit). Beyond the
+earlier fourteen: the two `shutdown` calls swapped in order; the grace skipped on the idempotent
+path; the roster lock held across the joins; and the grace given per closer rather than shared.
+Each is killed by the test that advertises it.
 
 **Six of those mutants were a review's finding, not mine, and two rounds of my own new tests were
 vacuous.** Round two: `fresh`, `tenx` and `forget` all survived the entire 1036-test suite, because
@@ -200,7 +207,7 @@ the grace is released by a timer *during* `shutdown` so only a real join can sat
 
 ## Verification
 
-- 1009 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
+- 1046 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
   thread-timing flakiness.
 - **Every new assertion was mutation-checked in place** (not in a repo copy — the editable install
   resolves back to the working tree, which is what makes the check meaningful). Eleven mutants, each

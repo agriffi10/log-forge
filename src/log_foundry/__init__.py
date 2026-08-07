@@ -123,7 +123,9 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     (SPEC-030). That pair is the reading that catches the mistake above.
 
     Args:
-      timeout: Seconds bounding the wait for the background thread (SPEC-027 FR-004). ``None``
+      timeout: Seconds bounding the wait for the background thread and, carved from the same
+        budget, a short grace for any sink still closing after a late ``configure(sink=...)``
+        (SPEC-027 FR-004, SPEC-030 FR-003). ``None``
         waits indefinitely, which is what this did unconditionally before and is still
         available on request, but is unsafe anywhere with an execution deadline — ``atexit`` is
         one such place, where a sink blocked in a network call would hold the process open. An

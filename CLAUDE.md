@@ -467,10 +467,13 @@ where it starts.
   the alert idiom. **Neither thread flag is sufficient alone and both were built:** non-daemon
   stopped `atexit` from ever running (CPython joins non-daemon threads first), losing the *live*
   sink; daemon alone kills a slow-but-succeeding close, losing the buffer of a sink whose
-  `close()` *is* its delivery. So the ordering is the mechanism — `shutdown()` closes the live
-  sink, **then** joins any outstanding closer for a capped grace (`DEFAULT_CLOSER_GRACE`), carved
-  from its own budget so it neither extends shutdown nor lets a stuck close hold the exit for the
-  full 30 s. What SPEC-028 refused to abandon was the sink still being delivered to; this one is
+  `close()` *is* its delivery. So the flag is not the mechanism — **the capped grace is**:
+  `shutdown()` closes the live sink, then joins any outstanding closer for
+  `DEFAULT_CLOSER_GRACE`, carved from its own budget so it neither extends shutdown nor lets a
+  stuck close hold the exit for the full 30 s, and granted on the idempotent path too (an expired
+  first call returns before reaching it). Running *after* the live sink's close is defence in
+  depth, not the guarantee — both orders measure identically, since the cap returns control first
+  — but it is the right order and is pinned by a test. What SPEC-028 refused to abandon was the sink still being delivered to; this one is
   fenced out by two confirmed drains — but its interpreter-exit objection *does* reach here once
   the close outlives `configure()`, so §13 records that an abandoned close can land inside a
   `commit()`. `shutdown()`'s own close stays inline. (SPEC-030, arch §7, §9, §13)

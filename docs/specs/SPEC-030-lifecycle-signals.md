@@ -128,8 +128,10 @@ at startup but after an import-time log line, turning a silent wrong-sink into a
 case that is usually benign.
 
 The drain is bounded and its outcome reported, so a hung old sink cannot make `configure()` hang.
-(Amended after review: bounded for the *drain*. The old sink's `close()` is not — see the fourth
-criterion.)
+(Amended twice after review, and this paragraph was missed the first time: narrowed to the *drain*
+while the old sink's `close()` was unbounded, then restored when that close was bounded too. The
+whole call is bounded — see the fourth criterion for how, and the delivery doc for the two designs
+that were built and measured before the shipped one.)
 
 #### Acceptance Criteria:
 
