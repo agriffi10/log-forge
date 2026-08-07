@@ -306,6 +306,34 @@ def _note_orphan_emit(sink: Sink) -> None:
         _orphan_sink = sink
 
 
+def _live_worker() -> Worker | None:
+    """Returns the process worker only while it is still delivering (SPEC-033 FR-002).
+
+    Three guards ask who owns a sink, and two of them mean a *live* owner. A retired worker holds
+    its sink forever — :meth:`Worker.swap_sink` returns early once shut down — so keying on a
+    worker merely existing hands the swap to something that will do nothing with it, and the sink
+    adopted afterwards is closed by no one: measured, ``configure(A)`` → ``@trace`` →
+    ``shutdown()`` → ``configure(B)`` → ``info()`` → ``configure(C)`` left B unclosed with its
+    event undelivered and every counter clean, which is the failure shape this spec exists to
+    close.
+
+    :func:`_close_orphan_sink` deliberately does **not** use this: there a retired worker's
+    ownership is exactly what must make it decline, since an expired shutdown leaves the drain
+    thread possibly still inside that sink's ``emit``.
+
+    Args:
+      None.
+
+    Returns:
+      The worker while it is still delivering, or ``None`` when there is none or it has retired.
+
+    Raises:
+      None.
+    """
+    worker = _worker
+    return None if worker is None or worker.retired else worker
+
+
 def _offer_orphan_signal(sink: Sink) -> None:
     """Gives a sink no live worker owns an unset stop signal (SPEC-033 FR-004).
 
@@ -340,7 +368,7 @@ def _offer_orphan_signal(sink: Sink) -> None:
       None.
     """
     global _orphan_stop
-    worker = _worker
+    worker = _live_worker()
     if worker is not None and worker.sink is sink:
         return
     if _orphan_stop.is_set():
@@ -423,9 +451,13 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
 
     ``_orphan_stop`` is set **before** delegating, so a sink parked in a backoff is released
     while :meth:`Worker.shutdown` is still draining rather than after it has given up waiting.
-    The closer grace runs last and on every path, including the one where nothing was armed and
-    the idempotent second call — a first ``shutdown`` that expired returns before reaching
-    :meth:`Worker._join_closers`, leaving the ``atexit`` call the only one able to grant it.
+
+    The closer grace is granted **once**, by whichever path owns this call.
+    :meth:`Worker.shutdown` already grants it — on its successful path and on its idempotent one,
+    which is what covers a first shutdown that expired before reaching it — so joining again here
+    would charge a second full ``DEFAULT_CLOSER_GRACE`` against the same exit: measured 4.01 s
+    against a 2 s grace. The orphan branch grants it instead, where nothing else will, and gets it
+    on every path including the one where nothing was armed and the idempotent second call.
 
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
@@ -442,6 +474,8 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     deadline = None if timeout is None else monotonic() + timeout
     if _worker is not None:
         _worker.shutdown(timeout)
+        _close_orphan_sink()
+        return
     _close_orphan_sink()
     _lifecycle.join_closers(None if deadline is None else max(0.0, deadline - monotonic()))
 
@@ -499,7 +533,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     """
     global _orphan_sink, _orphan_closed_sink
     with _worker_lock:
-        worker = _worker
+        worker = _live_worker()
         if worker is not None:
             _orphan_sink = None
         else:

@@ -327,6 +327,30 @@ class Worker:
                 "flush() in a process that logs again. Count is cumulative",
             )
 
+    @property
+    def retired(self) -> bool:
+        """Whether :meth:`shutdown` has begun, so this worker will deliver nothing further.
+
+        A retired worker still *holds* its sink — ``self.sink`` never changes again, because
+        :meth:`swap_sink` returns early once shut down — so "a worker exists" and "a worker is
+        still delivering" stop being the same question, and callers deciding who owns a sink's
+        close need the second one (SPEC-033 FR-002). Read without the lock, as ``submit``'s check
+        is: the flag is written once and never cleared, so a racing reader sees one of two
+        answers and both are momentarily true.
+
+        Args:
+          None.
+
+        Returns:
+          Whether shutdown has begun. ``True`` for an expired shutdown too, which is why
+          ``_close_orphan_sink`` deliberately does *not* use this — there the drain thread may
+          still be inside the sink's ``emit``.
+
+        Raises:
+          None.
+        """
+        return self._shutdown_done
+
     def health(self) -> Health:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
 

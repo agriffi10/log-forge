@@ -206,9 +206,14 @@ def test_a_mixed_process_closes_the_old_sink_exactly_once(orphan_first: bool) ->
         log_foundry.info("orphan")
 
     log_foundry.configure(sink=new)
+    assert old.closed == 1, f"exactly one close at the swap (orphan_first={orphan_first})"
 
-    assert old.closed == 1, f"exactly one close (orphan_first={orphan_first})"
-    assert new.closed == 0
+    # And still one after shutdown. Without this the second close — which happens at exit, via
+    # a record neither `_get_worker` nor `_swap_sink` cleared — is invisible: removing *both*
+    # clears leaves the whole suite green while measurably giving `old.closed == 2`.
+    log_foundry.shutdown()
+    assert old.closed == 1, f"and exactly one after shutdown (orphan_first={orphan_first})"
+    assert new.closed == 1, "the new sink is closed once, by whoever owns it"
 
 
 def test_a_close_that_raises_is_absorbed_and_the_swap_stands(capsys) -> None:
@@ -301,8 +306,11 @@ def test_a_concurrent_orphan_emit_is_not_blocked_for_the_swap_budget() -> None:
     try:
         assert hung.in_close.wait(5.0), "the close is running and will not return"
 
+        # `_note_orphan_emit` against a sink that is *not* the recorded one, which is the
+        # branch that takes `_worker_lock`. An emit to the recorded sink returns on the unlocked
+        # fast path without acquiring anything, so timing that would measure nothing at all.
         start = time.monotonic()
-        log_foundry.info("concurrent orphan emit")
+        decorator._note_orphan_emit(CountingSink("a different sink"))
         elapsed.append(time.monotonic() - start)
     finally:
         hung.release.set()
@@ -501,17 +509,31 @@ def test_the_grace_runs_after_the_live_sinks_own_close(monkeypatch) -> None:
 
 def test_the_live_orphan_sinks_close_stays_inline_and_unbounded() -> None:
     """AC-7. Unchanged from SPEC-031 FR-006, and asserted so a refactor cannot move it."""
-    slow = SlowCloseSink("live")
+    closed_on: list[str] = []
+
+    class RecordingClose(SlowCloseSink):
+        def close(self) -> None:
+            closed_on.append(threading.current_thread().name)
+            super().close()
+
+    slow = RecordingClose("live")
     log_foundry.configure(service="t", sink=slow)
     log_foundry.info("to it")
 
+    caller = threading.current_thread().name
     threading.Timer(0.4, slow.release.set).start()
     start = time.monotonic()
     log_foundry.shutdown(timeout=5.0)
     elapsed = time.monotonic() - start
 
     assert slow.closed == 1, "shutdown waited for it rather than detaching it"
-    assert elapsed >= 0.4, "inline: it did not return before the close finished"
+    assert elapsed >= 0.4, "it did not return before the close finished"
+    # The thread is the observable. Elapsed time is not: routed through `close_detached`, the
+    # exit grace joins a 0.4 s close and both assertions above still pass — measured.
+    assert closed_on == [caller], (
+        f"the live sink's close must run inline on the caller's thread, not detached — ran on "
+        f"{closed_on}"
+    )
 
 
 def test_a_closer_that_cannot_start_leaves_the_sink_open_and_says_so(capsys, monkeypatch) -> None:
@@ -734,4 +756,167 @@ def test_health_gains_no_field() -> None:
         "submitted_after_shutdown",
         "incomplete_swaps",
         "closing_sinks",
+    )
+
+
+# -- fresh-context review of PR #125: the ownership rule applies to the swap too --------------
+
+
+def test_a_swap_after_a_retired_worker_hands_off_on_the_orphan_path() -> None:
+    """A worker that has retired owns nothing further, so it cannot own the handoff either.
+
+    `Worker.swap_sink` returns early once `_shutdown_done`, so routing the swap to it because a
+    worker *exists* means nothing happens at all. Measured before the fix: B unclosed, its event
+    undelivered, `retired=True incomplete_swaps=0 closing_sinks=0 failed_batches=0` — the failure
+    shape this spec exists to close, reached by the spec's own fix.
+    """
+    a, b, c = CountingSink("a"), CountingSink("b"), CountingSink("c")
+    log_foundry.configure(service="t", sink=a)
+
+    @log_foundry.trace
+    def work() -> None:
+        pass
+
+    work()
+    log_foundry.shutdown()
+    assert a.closed == 1
+
+    log_foundry.configure(sink=b)
+    log_foundry.info("to b")
+    log_foundry.configure(sink=c)  # the swap a retired worker cannot perform
+    log_foundry.info("to c")
+    decorator._shutdown_worker()
+
+    assert (a.closed, b.closed, c.closed) == (1, 1, 1), "each closed exactly once"
+    assert b.delivered, "and b's held event was delivered by its close"
+
+
+def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
+    """The same rule, for the stop signal: a retired worker's `_stop` is set forever.
+
+    Skipping the offer because that worker *owns* the sink leaves a sink still being emitted to
+    holding a set event, so every backoff collapses to zero — the tight-retry-loop harm FR-004
+    exists to prevent, in a mixed process rather than an orphan-only one.
+    """
+    retry = pytest.importorskip("log_foundry.sinks._retry")
+    sink = CountingSink()
+    log_foundry.configure(service="t", sink=sink)
+
+    @log_foundry.trace
+    def work() -> None:
+        pass
+
+    work()
+    worker = decorator._worker
+    assert worker is not None and worker.sink is sink
+    log_foundry.shutdown()
+    assert worker._stop.is_set(), "the worker's own event is set and can never be cleared"
+
+    log_foundry.info("still logging, against the sink the retired worker holds")
+
+    signal = sink.stop_signal
+    assert signal is not None and not signal.is_set(), "a fresh, unset event"
+    start = time.monotonic()
+    retry.wait(0.3, signal)
+    assert time.monotonic() - start >= 0.25, "so the sink still backs off"
+
+
+def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> None:
+    """`Worker.shutdown` already joins closers; joining again charges a second full grace."""
+    monkeypatch.setattr(lifecycle, "DEFAULT_CLOSER_GRACE", 0.4)
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.1)
+    hung, live = SlowCloseSink("hung"), CountingSink("live")
+    worker = worker_mod.Worker(hung, batch_size=1000, flush_interval=100.0)
+    decorator._worker = worker
+    try:
+        log_foundry.configure(service="t", sink=live)  # worker swap; the close hangs
+        assert hung.in_close.wait(5.0)
+
+        start = time.monotonic()
+        decorator._shutdown_worker(timeout=30.0)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.8, (
+            f"one grace of 0.4s, not two — took {elapsed:.2f}s (a second join charges it again)"
+        )
+    finally:
+        hung.release.set()
+
+
+# -- FR-005: the roster is process-global, which is the whole point of the module -------------
+
+
+def test_a_closer_started_before_the_worker_is_still_counted_after_one_exists(monkeypatch) -> None:
+    """AC-1. A per-worker roster makes this closer invisible the moment a worker is built."""
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.2)
+    hung, new = SlowCloseSink("hung"), CountingSink("new")
+    log_foundry.configure(service="t", sink=hung)
+    log_foundry.info("to hung")
+
+    try:
+        log_foundry.configure(sink=new)  # closer starts with no worker in the process
+        assert log_foundry.health().closing_sinks == 1
+
+        @log_foundry.trace
+        def work() -> None:
+            pass
+
+        work()  # a worker now exists and health() comes from it
+
+        assert decorator._worker is not None
+        assert log_foundry.health().closing_sinks == 1, "still counted through the worker"
+    finally:
+        hung.release.set()
+
+
+def test_shutdown_joins_a_closer_started_before_the_worker_existed(monkeypatch) -> None:
+    """AC-2. One shared grace over both paths, or this close is killed at interpreter exit."""
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.1)
+    slow, new = SlowCloseSink("slow"), CountingSink("new")
+    log_foundry.configure(service="t", sink=slow)
+    log_foundry.info("to slow")
+    log_foundry.configure(sink=new)  # closer starts on the orphan path
+    assert slow.in_close.wait(5.0)
+
+    @log_foundry.trace
+    def work() -> None:
+        pass
+
+    work()  # ...and a worker takes over shutdown from here
+
+    threading.Timer(0.2, slow.release.set).start()
+    log_foundry.shutdown(timeout=5.0)
+
+    assert slow.closed == 1, "the worker's shutdown granted the orphan closer its grace"
+
+
+def test_lifecycle_imports_nothing_that_could_cycle() -> None:
+    """AC-3. It is imported by both `worker` and `decorator`, so it must stay a leaf."""
+    import ast
+    import pathlib
+
+    source = pathlib.Path(lifecycle.__file__).read_text()
+    tree = ast.parse(source)
+
+    def package_imports(body) -> set[str]:
+        return {
+            node.module
+            for node in body
+            if isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("log_foundry")
+        }
+
+    runtime = package_imports(tree.body)
+    guarded = {
+        m
+        for node in tree.body
+        if isinstance(node, ast.If)
+        for m in package_imports(node.body)
+    }
+
+    assert runtime == {"log_foundry"}, f"at runtime it may import only `_diag`, got {runtime}"
+    assert "from log_foundry import _diag" in source, "and that import is `_diag`"
+    assert guarded == {"log_foundry.sinks.base"}, (
+        f"`Sink` is TYPE_CHECKING-only, and nothing else is guarded — got {guarded}"
     )

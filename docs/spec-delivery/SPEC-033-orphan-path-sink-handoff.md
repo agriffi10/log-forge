@@ -31,10 +31,16 @@ after releasing.
   monkeypatch raises.
 - **The closer roster is process-global.** `tests/conftest.py` clears it; a new test that leaves a
   hung closer would otherwise leak a non-zero `closing_sinks` into the next test.
-- **Two guards are keyed on ownership (`_worker.sink is X`), not on a worker existing.**
-  `Worker.swap_sink` returns early once `_shutdown_done`, so a retired worker keeps its old sink
-  forever while events go elsewhere. The identity form still declines on an *expired* shutdown,
-  which is what the original guard existed for — do not simplify it back.
+- **Ownership, not existence — and it applies in three places, via `_live_worker()`.**
+  `Worker.swap_sink` returns early once `_shutdown_done`, so a retired worker holds its old sink
+  forever while events go elsewhere. `_swap_sink` and `_offer_orphan_signal` ask for a **live**
+  worker; `_close_orphan_sink` deliberately asks for *any* worker that owns the sink, because an
+  expired shutdown must still make it decline. Do not collapse the two — the review of PR #125
+  found the third call site still on `_worker is not None`, leaking a sink with every counter
+  clean, which is the same mistake this spec was written to fix.
+- **`Worker.shutdown` grants the closer grace; `_shutdown_worker` must not grant it again.**
+  Doing both charges two full `DEFAULT_CLOSER_GRACE` against one exit (measured 4.01 s against a
+  2 s grace). The orphan branch grants it where nothing else will.
 - **`_orphan_stop` is replaced, never cleared.** An `Event` cannot be un-set and `_retry.wait`
   returns instantly on a set one, so a sink still holding the shutdown's event backs off not at
   all.
@@ -63,6 +69,16 @@ it:
 | hanging `close()` on the swap | n/a (no close at all) | bounded by `DEFAULT_SWAP_TIMEOUT`, `closing_sinks=1` |
 | `_retry.wait(5.0)` on a set event | 0.000 s (vs 0.405 s unset) | fresh event armed; post-shutdown sinks still back off |
 
-Six mutants, all caught: swap returns early (13 failures), clear instead of re-point (5), guard on
-existence not ownership (1), `_shutdown_worker` returns early (1), never refresh a set event (2),
-skip the signal offer on existence (1).
+Twelve mutants, all caught. Six from the build: swap returns early (13 failures), clear instead of
+re-point (5), `_close_orphan_sink` guards on existence (1), `_shutdown_worker` returns early (1),
+never refresh a set event (2), skip the signal offer on existence (1). Six more added after the
+PR review found them escaping: `_swap_sink` guards on existence (1), remove both record clears (2 —
+green across the whole suite before), hold `_worker_lock` across the closer join (1), grant the
+grace twice (1), route the live close through `close_detached` (1), signal offer on existence in a
+mixed process (1).
+
+Three of those six escaped because the **test** was wrong, not the code: the mixed-process test
+asserted before `shutdown()` so a close at exit was invisible; the lock test timed an emit that
+takes the unlocked fast path and acquired nothing; and the inline-close test used elapsed time,
+which the exit grace satisfies for a detached close just as well. Time and counters were the wrong
+observables — the thread the close ran on is the right one.
