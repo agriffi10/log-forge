@@ -7,7 +7,60 @@ suite stays green and simply *skips* anything not built yet. As you complete eac
 the matching tests light up on their own.
 """
 
+import sys
+import threading
+
 import pytest
+
+
+def run_concurrently(work, threads: int, *, per_thread: int = 1) -> list[BaseException]:
+    """Run ``work`` on N threads that start together, and return whatever it raised.
+
+    The shared concurrent-emitter helper (SPEC-028 FR-004). Threads rendezvous on a
+    ``threading.Barrier`` so they enter ``work`` at the same instant — a barrier is a real
+    synchronization primitive, unlike the ``sleep`` FR-004 forbids, so the overlap does not
+    depend on how fast the machine is. The switch interval is tightened for the duration to
+    widen the window in which CPython preempts a read-modify-write; without it a lost increment
+    is real but rare enough that a race test would pass against the bug it exists to catch.
+
+    Args:
+      work: Called as ``work(thread_index, iteration)``. Exceptions are captured, not raised in
+        the worker thread where they would be discarded.
+      threads: How many threads to run.
+      per_thread: How many times each thread calls ``work``.
+
+    Returns:
+      Every exception raised across all threads, in completion order. Empty means all calls
+      returned normally. Assert on this rather than trusting the threads were silent.
+
+    Raises:
+      None.
+    """
+    barrier = threading.Barrier(threads)
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def runner(index: int) -> None:
+        barrier.wait()
+        for iteration in range(per_thread):
+            try:
+                work(index, iteration)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+
+    pool = [threading.Thread(target=runner, args=(i,)) for i in range(threads)]
+    original_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for thread in pool:
+            thread.start()
+        for thread in pool:
+            thread.join(timeout=30)
+    finally:
+        sys.setswitchinterval(original_interval)
+    assert not any(thread.is_alive() for thread in pool), "a worker thread did not finish"
+    return errors
 
 
 @pytest.fixture(autouse=True)

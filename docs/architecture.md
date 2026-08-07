@@ -339,6 +339,17 @@ decorated call ends
   configurable is **not built** and is a constraint rather than a wart — blocking would put sink
   latency back on the caller's thread, which is the one thing this section exists to prevent
   (§12, §13).
+- **One drain thread, but not one caller.** The worker drains on a single thread by design —
+  everything below about backoff and ordering follows from that. It is not, however, the only
+  thread that reaches the sink: a level call made with no active span emits synchronously on the
+  *caller's* thread (§12 Resolved), which may be any of the application's, and it does so against
+  the same sink object the worker is draining into. An audit probe measured one sink entered by
+  two application threads and `log-foundry-worker` at once, with overlapping calls. So `emit` and
+  `close` **may be called concurrently, and a sink must tolerate it** — a requirement on
+  implementations rather than something the library serializes on their behalf, since it does not
+  own the orphan path's thread. The shipped sinks that hold mutable transport state (a rebindable
+  stream, a reused socket, a connection with transaction scope) each take a lock; `sinks/base.py`
+  states the contract for third-party ones (SPEC-028).
 - **A sink's backoff pauses the single drain thread** (SPEC-027). There is one drain thread by
   design, so a sink sleeping between attempts is not making a local decision — it is a global
   pause on log delivery, and it spans `shutdown()`, which joins that thread from `atexit`. Every
@@ -490,6 +501,17 @@ constraint — never by being deleted quietly.
 - Log *routing* logic beyond a single configured sink per process.
 
 ### Known constraints
+
+- **An orphan log can wait on the sink lock.** A sink holding mutable transport state serializes
+  `emit` for the whole operation (§9, SPEC-028), so a level call made with no active span — which
+  emits on the caller's own thread — can block behind an in-flight emit, including its retry
+  backoff. This is a deliberate trade and the alternative is worse: unserialized, those same two
+  callers corrupt the sink's state, which for `SQLiteSink` was measured crashing the interpreter
+  outright rather than merely losing rows. It is bounded, not open-ended — every wait inside a
+  sink is interruptible and `shutdown()` takes a timeout (SPEC-027) — and it does not touch the
+  traced path, where events go to the worker queue and the decorated function returns without
+  waiting on anything. A caller who wants the orphan path off the critical path should open a
+  span; that is what the buffer-then-flush pipeline is for.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

@@ -23,8 +23,15 @@ the pre-rotation one. `SocketTransport` shares one TCP socket, and two interleav
 corrupt octet-counted syslog framing into a stream the receiver cannot resynchronize. `PostgresSink`
 shares one psycopg connection across a `cursor` / `commit` / `rollback` sequence that assumes it owns
 the transaction. `SQLiteSink` passes `check_same_thread=False` and then relies on `with self._conn`.
-Every sink's `self.failed += 1` is a non-atomic read-modify-write, so the counters SPEC-026 is about
-to surface can undercount.
+Every sink's `self.failed += 1` is a non-atomic read-modify-write, so the counters SPEC-026 surfaced
+can undercount.
+
+**Amended by evidence during the build:** `SQLiteSink` is worse than "loses rows". The concurrency
+test written for FR-004 kills the interpreter outright against the unlocked sink — a reproducible
+`Fatal Python error: Bus error` from concurrent use of one `sqlite3` connection, not an exception
+the caller could catch. That puts this defect in breach of the library's first promise (logging
+never breaks the application), not merely its loss-reporting one, and is recorded as a constraint
+in `architecture.md` §13 where the lock's cost is weighed against it.
 
 `sinks/base.py` — the entire interface definition — states no concurrency contract at all, so a
 third-party sink author has nothing to write against either.
@@ -122,11 +129,24 @@ children already require.
 #### Description:
 
 Every `self.failed += 1` and `self.dropped_oversized += 1` in `sinks/` is a read-modify-write that
-loses increments under concurrent emitters. SPEC-026 is about to make these the numbers an operator
-alerts on, so an undercount is a missed alert.
+loses increments under concurrent emitters. SPEC-026 made these the numbers an operator alerts on,
+so an undercount is a missed alert. The inventory is wider than those two names: 29 increment sites
+across 20 modules, including `dropped_unadjudicated` (SPEC-018) and `NullSink.dropped`. All of them
+are in scope — an operator who cannot tell which counters are trustworthy has none that are.
 
-They are made safe under the same lock FR-002 introduces where one exists, and under a small
-dedicated lock where the sink holds no other state worth guarding.
+They are made safe under a **dedicated counter lock, separate from the transport lock FR-002
+introduces**, held only across an increment or the two-field snapshot. Reusing the transport lock
+was the original intent here and is wrong: SPEC-026 states in both `base.py` and the README that
+`losses()` must be safe to call *while* `emit` is running, and `health()` is the call an operator
+makes when things are already going wrong. Under one lock, `health()` would block behind an
+in-flight insert and its retry backoff — seconds — which also contradicts this FR's own last
+criterion. Lock order is fixed transport → counter and never the reverse, so the pair cannot
+deadlock.
+
+The counters stay public, writable, plain `int` attributes. They are documented public surface and
+the suite assigns to one directly, so converting them to read-only properties would be a breaking
+change bought for nothing: a single-attribute read is already atomic in CPython, and only the
+*write* and the *pair read* need guarding.
 
 #### Acceptance Criteria:
 
@@ -166,20 +186,32 @@ No new public types. Per-sink internal state only:
 
 ```python
 # On each sink guarding transport state:
-self._lock = threading.Lock()
+self._lock = threading.Lock()          # transport state; held for the whole operation
+self._counter_lock = threading.Lock()  # counters only; never held across I/O
 
 # The shape, in outline:
 def emit(self, batch):
     with self._lock:
         ...  # rotation check, socket send, transaction — everything assuming exclusivity
+        with self._counter_lock:       # transport → counter, never the reverse
+            self.failed += len(batch)
 
 def losses(self):
-    with self._lock:
-        return SinkLosses(dropped=self._dropped, failed=self._failed)
+    with self._counter_lock:
+        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 ```
+
+A sink holding no transport state worth guarding — a thread-safe boto3 client, a driver that
+documents its own locking — carries the counter lock alone.
 
 `threading.Lock`, not `RLock`: a sink whose `emit` re-enters its own `emit` is a bug, and an `RLock`
 would hide it.
+
+Locking `emit` for its full duration has one caller-visible consequence, accepted deliberately: an
+application thread on the orphan path can now *block* behind an in-flight emit where today it
+corrupts shared state instead. It is bounded by SPEC-027 — every wait inside is interruptible and
+`shutdown()` takes a timeout — and it is recorded in `architecture.md` §13 rather than left for a
+reader to discover.
 
 ---
 

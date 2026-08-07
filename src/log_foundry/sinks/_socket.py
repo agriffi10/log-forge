@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import socket
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import threading
+import threading
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
@@ -64,6 +61,14 @@ class SocketTransport:
     100-message batch against a dead destination is roughly 70 s of backoff on the single drain
     thread at the defaults. The wait is interruptible, so ``shutdown()`` cuts it short.
 
+    Sends are serialized on a lock (SPEC-028 FR-002). One TCP connection is shared by every
+    caller, and ``sendall`` gives no atomicity against a concurrent one: two interleaved calls
+    splice their bytes into the stream, which turns octet-counted syslog framing into a sequence
+    the receiver cannot resynchronize — it reads the next frame's length from the middle of the
+    previous frame's payload and is lost for the life of the connection. That the lock is held
+    across the backoff waits is deliberate; they are interruptible, so a ``shutdown()`` releases
+    it promptly.
+
     Attributes:
       failed: Messages abandoned past the reconnect-retry bound.
     """
@@ -104,9 +109,14 @@ class SocketTransport:
         self._sock: socket.socket | None = None
         self.failed = 0
         self.stop_signal: threading.Event | None = None
+        self._lock = threading.Lock()
 
     def send_all(self, messages: list[bytes]) -> None:
         """Sends each pre-framed message, reconnecting on error (FR-005, FR-006).
+
+        The lock spans the whole call, not each message: it also guards ``_sock``, which a
+        reconnect rebinds, so releasing between messages would let another thread send on a
+        socket this one is about to reset (SPEC-028 FR-002).
 
         Args:
           messages: The exact bytes to put on the wire, one call per message.
@@ -121,10 +131,11 @@ class SocketTransport:
             would re-send the messages that already landed, and an empty call is a no-op rather
             than a total failure.
         """
-        delivered = 0
-        for message in messages:
-            if self._send_one(message):
-                delivered += 1
+        with self._lock:
+            delivered = 0
+            for message in messages:
+                if self._send_one(message):
+                    delivered += 1
         if messages and delivered == 0:
             raise SinkDeliveryError(
                 f"SocketTransport delivered none of {len(messages)} message(s)"
@@ -147,7 +158,10 @@ class SocketTransport:
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).
 
-        Idempotent.
+        Idempotent, and takes the send lock so it never closes the socket out from under an
+        in-flight ``send_all`` (SPEC-028 FR-002). ``_reset`` does not take the lock itself,
+        because ``_send_one`` calls it while ``send_all`` already holds one — the lock is
+        deliberately not re-entrant, so that path must stay the only unlocked caller.
 
         Args:
           None.
@@ -158,7 +172,8 @@ class SocketTransport:
         Raises:
           None.
         """
-        self._reset()
+        with self._lock:
+            self._reset()
 
     def _send_one(self, message: bytes) -> bool:
         """Sends one message within the retry bound.
