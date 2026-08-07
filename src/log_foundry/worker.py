@@ -76,8 +76,10 @@ class Health(NamedTuple):
 
     Attributes:
       queued: Submissions currently buffered. Approximate by nature: it is read without
-        stopping the world, and briefly counts the internal flush/shutdown markers alongside
-        real submissions.
+        stopping the world, and counts the internal flush/shutdown markers alongside real
+        submissions — normally only in passing, but a ``flush()`` marker stranded by racing
+        ``shutdown()`` is answered and then counted for the life of the process, since
+        ``Queue`` offers no way to remove one specific item.
       dropped: Submissions discarded because the queue was full (backpressure).
       failed_batches: Batches abandoned after the retry budget was spent.
       stopped_reason: The exception type name that terminated the drain thread, or ``None`` if
@@ -227,6 +229,7 @@ class Worker:
         self._closers: list[threading.Thread] = []
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
+        self._drain_finished = threading.Event()
         self._shutdown_done = False
         self._sink_closed = False
         self._lock = threading.Lock()
@@ -338,8 +341,11 @@ class Worker:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
 
         This stays valid after :meth:`shutdown`: the counters are plain integers that outlive
-        the thread, and the final drain consumes the queue, so ``queued`` reads 0 rather than a
-        stale marker. The same applies to ``stopped_reason``, since a caller finding a dead
+        the thread, and the final drain consumes the queue. ``queued`` therefore reads 0 for a
+        worker nothing logged to afterwards — but not always: submissions accepted after the
+        shutdown stay queued on purpose (SPEC-030), and a ``flush()`` marker stranded by
+        racing it is answered and then counted, as ``Health.queued`` records. The same applies
+        to ``stopped_reason``, since a caller finding a dead
         worker will usually call ``shutdown()`` next. Reading it after a shutdown is in fact
         the point of ``retired`` and ``submitted_after_shutdown`` (SPEC-030 FR-001), which
         report a state only a retired worker can be in.
@@ -408,6 +414,24 @@ class Worker:
         queue ``put_nowait`` would skip the flush and return as though it had succeeded, the
         one outcome a flush must never produce silently.
 
+        The drain's completion is re-checked **after** the put, and that second look is what
+        makes a ``timeout=None`` call safe. The checks above can both pass microseconds before
+        the drain finishes, leaving this marker queued behind something that will never read it
+        — a bounded caller then waits out its timeout, which SPEC-021 accepts as correct either
+        way, but an unbounded one waits forever.
+
+        It tests ``_drain_finished`` and not only ``is_alive()``, because the two are not the
+        same instant and the gap between them is where the hang survives: the terminal-failure
+        path sweeps for markers and *then* returns, so a marker queued after that sweep sits
+        behind a thread still reading as alive. The flag is set **before** the sweep, and a
+        ``put`` and the sweep's snapshot both take the queue's own mutex, so a marker either
+        lands before the snapshot and is answered, or lands after it and finds the flag set.
+
+        Reporting is by the **marker**, never by the check alone. A drain that answered this
+        marker and then exited has delivered, and saying otherwise would be a false failure —
+        one ``swap_sink`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
+        the previous sink open and writing a loss line for a swap that in fact completed.
+
         Args:
           timeout: Seconds bounding the whole call — one deadline shared by the put and the
             wait, so the two cannot add up to twice the timeout. ``None`` waits indefinitely.
@@ -433,6 +457,8 @@ class Worker:
             self._queue.put(marker, timeout=timeout)
         except queue.Full:
             return False
+        if self._drain_finished.is_set() or not self._thread.is_alive():
+            return marker.event.is_set() and marker.delivered
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
             return False
@@ -638,6 +664,36 @@ class Worker:
         ``close()`` twice on a sink that may have partially released its resources; what
         SPEC-025 FR-004 changed is that the failure is announced rather than swallowed.
 
+        **The sentinel is queued before ``_stop`` is set, and while the drain loop is running
+        that order is what makes it impossible to strand.** Both ways of leaving the loop —
+        taking the sentinel, or seeing ``_stop`` — can only happen once it is already in the
+        queue, so either that ``get`` consumes it or :meth:`_final_drain` does. The reverse
+        order left a window in which the loop read ``_stop``, exited, and finished its final
+        drain before the sentinel landed. It never lost an event, but left ``health().queued``
+        reading 1 for the life of the process. The rate is load-dependent and not worth
+        quoting as a property — rare when idle, and repeatedly reproduced between roughly one
+        shutdown in 14 and one in 50 with spinner threads and a tightened switch interval.
+
+        Paying for that order needs :meth:`_drain` to break on the sentinel rather than loop, or
+        a thread taking it before ``_stop`` was set would block for another ``flush_interval``
+        — measured stalling low single-digit percentages of shutdowns under load for the entire
+        budget, latching a ``stopped_reason`` of ``"ShutdownTimeout"``, which is far worse than
+        the cosmetic problem being fixed.
+
+        The premise is the loop, so the put is skipped once the drain has stopped reading. A
+        drain that died terminally (SPEC-019) is not coming back for a wake-up, and queueing one
+        for it would strand it permanently — reintroducing the symptom on the one path the
+        ordering cannot reach. The gate is ``_drain_finished`` rather than ``is_alive()``,
+        because they are not the same instant: the thread is still alive throughout
+        :meth:`_terminal_failure`, which writes to stderr and can block on a slow reader, and a
+        liveness test would queue a sentinel through that whole window. The flag is set before
+        that call, so this one does not.
+
+        :meth:`_release_waiters` runs on the way out for the sibling case the ordering cannot
+        reach: a ``flush()`` that passed its liveness check microseconds before the thread
+        finished can still queue a marker nothing will answer, and with ``timeout=None`` that
+        caller waits forever rather than merely too long.
+
         The worker does not come back, and :meth:`submit` keeps accepting afterwards — so a
         caller that logs again queues events nothing will drain. That is reported rather than
         prevented, through ``retired`` and ``submitted_after_shutdown`` (SPEC-030 FR-001) and
@@ -664,11 +720,12 @@ class Worker:
             self._close_if_owed()
             self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
             return
+        if not self._drain_finished.is_set():
+            try:
+                self._queue.put_nowait(_SHUTDOWN)
+            except queue.Full:
+                pass
         self._stop.set()
-        try:
-            self._queue.put_nowait(_SHUTDOWN)
-        except queue.Full:
-            pass
         self._thread.join(timeout)
         if self._thread.is_alive():
             queued = self._queued_or_unknown()
@@ -682,6 +739,7 @@ class Worker:
                 f"because the worker thread is still using it",
             )
             return
+        self._release_waiters()
         self._close_if_owed()
         self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
 
@@ -826,6 +884,18 @@ class Worker:
         ``BaseException``. It records and exits; looping onward past a ``KeyboardInterrupt``
         would be a worse failure than the one this prevents.
 
+        The two ``finally`` blocks are nested rather than merged, and the order they impose is
+        load-bearing twice over. ``_drain_finished`` is set the instant the loop stops reading
+        the queue — *before* :meth:`_terminal_failure`, which writes to stderr and can block on
+        a slow reader — so a ``shutdown()`` arriving during that window sees a drain that is
+        already finished and declines to queue a sentinel nothing would consume. And it is set
+        before :meth:`_release_waiters`, so a marker either lands ahead of that sweep's snapshot
+        and is answered by it, or lands behind it and finds the flag set; both take the queue's
+        own mutex, which is what leaves no gap between the two. Sweeping here rather than only
+        in :meth:`Worker.shutdown` is what covers the paths ``shutdown`` never reaches — a
+        terminal failure, and a bounded shutdown that expired while this thread was still
+        inside an emit.
+
         Args:
           None.
 
@@ -837,9 +907,13 @@ class Worker:
         """
         pending: list[list[dict[str, object]]] = []
         try:
-            self._drain(pending)
+            try:
+                self._drain(pending)
+            finally:
+                self._drain_finished.set()
         except BaseException as exc:
             self._terminal_failure(exc, len(pending))
+        finally:
             self._release_waiters()
 
     def _release_waiters(self) -> None:
@@ -852,10 +926,20 @@ class Worker:
         ``health().queued`` and the terminal line report; each keeps its pessimistic
         ``delivered``, which is the truth here.
 
+        It is called from two places. The terminal-failure path is the original one. The clean
+        :meth:`shutdown` path was added because that same enqueue-after-the-drain race happens
+        there too, and hurts more: measured stranding a marker in 13 of 400 shutdowns raced
+        against a ``flush()`` under load, where the caller sat out its whole timeout — and
+        ``flush(timeout=None)``, which the API documents as supported, waits forever rather
+        than too long. The marker keeps its pessimistic ``delivered``, which is the honest
+        answer: the drain that would have carried it is gone.
+
         One residual race, stated rather than papered over: a ``flush()`` that passed its
-        liveness check microseconds before the thread died can still enqueue a marker after
-        this sweep, and that one waits out its timeout — then returns False, which is correct
-        either way.
+        liveness check microseconds before *this* sweep can still enqueue a marker after it,
+        and that one waits out its timeout — then returns False, which is correct either way.
+        A marker left queued is also still counted by ``health().queued``, which describes
+        submissions; removing it would mean deleting a specific item, which ``Queue`` has no
+        public way to do, and the read above is the access ``architecture.md`` §13 sanctions.
 
         The reliance on ``queue.Queue``'s private ``mutex`` and ``queue`` is deliberate and is
         recorded in ``architecture.md`` §13 Known Constraints (SPEC-031 FR-005): there is no
@@ -928,6 +1012,13 @@ class Worker:
         advanced even when idle: otherwise the timeout collapses to zero and ``get`` busy-spins
         a core.
 
+        The shutdown sentinel **breaks** rather than falling through to the loop condition.
+        :meth:`shutdown` queues it before setting ``_stop``, so a thread that takes it may find
+        ``_stop`` still clear; continuing would re-enter ``get`` and block for another
+        ``flush_interval``, which is a slow shutdown rather than a prompt one. Leaving
+        immediately is safe because the only thing after the loop is :meth:`_final_drain`, which
+        collects whatever is still queued — the sentinel is a wake-up, never a fence.
+
         Args:
           pending: The accumulator owned by :meth:`_run`, which reports its size on a terminal
             failure. It is mutated in place rather than rebound, so that count is accurate.
@@ -953,7 +1044,9 @@ class Worker:
                     last_flush = time.monotonic()
                     item.event.set()
                 continue
-            if item is not None and item is not _SHUTDOWN:
+            if item is _SHUTDOWN:
+                break
+            if item is not None:
                 pending.append(cast("list[dict[str, object]]", item))
             now = time.monotonic()
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:

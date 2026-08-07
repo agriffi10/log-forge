@@ -18,6 +18,7 @@ import pytest
 log_foundry_mod = pytest.importorskip("log_foundry")
 worker_mod = pytest.importorskip("log_foundry.worker")
 Worker = worker_mod.Worker
+_SHUTDOWN_SENTINEL = worker_mod._SHUTDOWN
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> bool:
@@ -1868,3 +1869,373 @@ def test_release_waiters_is_a_no_op_with_no_markers_queued() -> None:
 
     assert [item for item in worker._queue.queue if isinstance(item, list)] == []
     assert not [item for item in worker._queue.queue if isinstance(item, worker_mod._FlushMarker)]
+
+
+# -- The shutdown sentinel cannot be stranded (flake from SPEC-025's dd10712) ----------------
+
+
+def test_the_sentinel_is_queued_before_stop_is_set() -> None:
+    """The ordering *is* the fix, so it is asserted directly rather than only by its effect.
+
+    Both ways out of the drain loop — taking the sentinel, or seeing ``_stop`` — can only
+    happen once the sentinel is already queued, so one of ``get`` or ``_final_drain`` must
+    consume it. The reverse order left a window in which the loop read ``_stop``, exited, and
+    finished its final drain first, stranding the sentinel in a queue nothing would read.
+    """
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=0.01)
+    order: list[str] = []
+    real_put, real_set = worker._queue.put_nowait, worker._stop.set
+
+    def recording_put(item: object) -> None:
+        if item is _SHUTDOWN_SENTINEL:
+            order.append("put")
+        real_put(item)
+
+    def recording_set() -> None:
+        order.append("set")
+        real_set()
+
+    worker._queue.put_nowait = recording_put  # type: ignore[method-assign]
+    worker._stop.set = recording_set  # type: ignore[method-assign]
+
+    worker.shutdown()
+
+    assert order == ["put", "set"], "the sentinel must be queued before _stop is set"
+
+
+def test_no_sentinel_is_queued_for_a_thread_that_is_already_gone() -> None:
+    """The ordering argument assumes a running loop; a dead drain will never read a wake-up.
+
+    Queueing one for a thread that died terminally (SPEC-019) would strand it permanently —
+    the very symptom this change removes, reappearing on the one path the ordering cannot
+    reach.
+    """
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=0.01)
+    worker._stop.set()
+    worker._thread.join(timeout=5)
+    assert not worker._thread.is_alive()
+
+    worker.shutdown()
+
+    assert _SHUTDOWN_SENTINEL not in list(worker._queue.queue)
+    assert worker.health().queued == 0
+
+
+def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
+    """The flake itself, at the load that made it visible rather than merely occasional.
+
+    The rate is load-dependent, which is why it read as a rare CI flake rather than a race:
+    rare when idle, and repeatedly between roughly 1 in 14 and 1 in 50 with contention. Spinner
+    threads are what make it reproducible, so the guard uses them too.
+    """
+    stop_spinning = threading.Event()
+
+    def burn() -> None:
+        while not stop_spinning.is_set():
+            pass
+
+    spinners = [threading.Thread(target=burn, daemon=True) for _ in range(4)]
+    original = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    for spinner in spinners:
+        spinner.start()
+    try:
+        stranded = 0
+        stalled = 0
+        for _ in range(300):
+            worker = Worker(RecordingSink(), batch_size=10, flush_interval=60.0)
+            worker.submit(_span("a"))
+            worker.shutdown(timeout=2.0)
+            if _SHUTDOWN_SENTINEL in list(worker._queue.queue):
+                stranded += 1
+            if worker.health().stopped_reason is not None:
+                stalled += 1
+    finally:
+        stop_spinning.set()
+        sys.setswitchinterval(original)
+        for spinner in spinners:
+            spinner.join(timeout=5)
+
+    assert stranded == 0, f"{stranded}/300 shutdowns stranded the sentinel"
+    assert stalled == 0, (
+        f"{stalled}/300 shutdowns expired: the drain loop did not break on the sentinel, so a "
+        f"thread that took it before _stop was set blocked for another flush_interval"
+    )
+
+
+def test_a_flush_marker_queued_after_the_final_drain_is_still_answered() -> None:
+    """The sibling race the ordering cannot reach — and the one that hangs a caller.
+
+    ``flush()`` can pass its liveness check microseconds before the thread finishes and queue a
+    marker nothing will answer. Measured stranding one in 13 of 400 raced shutdowns. The caller
+    then sits out its whole timeout, and ``flush(timeout=None)`` — documented as supported —
+    waits forever. ``shutdown()`` answers it on the way out.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker._stop.set()
+    worker._thread.join(timeout=5)
+    assert not worker._thread.is_alive()
+
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(marker)
+
+    worker.shutdown()
+
+    assert marker.event.is_set(), "a caller with timeout=None would otherwise wait forever"
+    assert marker.delivered is False, "the drain that would have carried it is gone"
+
+
+def test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread() -> None:
+    """A thread still running may yet consume it, so the sweep must not run on that path.
+
+    Both halves matter. The sentinel is the live thread's wake-up, and a marker is the live
+    thread's to *answer*: sweeping here would resolve it pessimistically as undelivered while
+    the drain that is about to carry it is still running, turning a ``flush()`` that was going
+    to succeed into one that reports failure.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set()), "the sink must be inside emit"
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(marker)
+
+    worker.shutdown(timeout=0.2)  # expires; the thread is still in emit
+
+    assert worker._thread.is_alive(), "the premise: the drain thread outlived the join"
+    assert worker.health().stopped_reason == "ShutdownTimeout"
+    assert _SHUTDOWN_SENTINEL in list(worker._queue.queue), (
+        "the sentinel is still the live thread's to consume"
+    )
+    assert not marker.event.is_set(), "answering it here would pre-empt a drain still running"
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    assert marker.event.is_set(), "and the live thread did answer it, as it was going to"
+
+
+def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
+    """SPEC-030's evidence must survive everything shutdown does on the way out."""
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.shutdown()
+
+    worker.submit(_span("late"))
+    worker.submit(_span("later"))
+
+    health = worker.health()
+    assert health.queued == 2
+    assert health.submitted_after_shutdown == 2
+    assert list(worker._queue.queue) == [_span("late"), _span("later")]
+
+
+def _flush_on_watchdog(worker, timeout: float | None) -> list[bool]:
+    """Run flush() on its own thread so a hang fails in five seconds instead of hanging pytest."""
+    result: list[bool] = []
+    caller = threading.Thread(
+        target=lambda: result.append(worker.flush(timeout=timeout)), daemon=True
+    )
+    caller.start()
+    caller.join(timeout=5)
+    assert not caller.is_alive(), "flush() hung on a marker nothing will answer"
+    return result
+
+
+def test_an_unbounded_flush_does_not_hang_on_a_marker_nothing_will_answer() -> None:
+    """The genuine strand: the pre-checks pass, then the drain finishes, then the put lands.
+
+    The marker is queued behind a thread that has already run its final drain, and no
+    `shutdown()` follows to sweep for it. A bounded caller sits out its timeout, which SPEC-021
+    accepts; an unbounded one waited forever. The drain is finished *before* the put here, so
+    the interleaving is exact rather than raced for.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    real_put = worker._queue.put
+
+    def die_then_put(item: object, timeout: float | None = None) -> None:
+        worker._stop.set()
+        worker._thread.join(timeout=5)
+        real_put(item, timeout=timeout)
+
+    worker._queue.put = die_then_put  # type: ignore[method-assign]
+
+    assert _flush_on_watchdog(worker, None) == [False], "nothing carried it, so it did not deliver"
+
+
+def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> None:
+    """The other half, and a regression this PR introduced before review caught it.
+
+    Here the marker *is* consumed — the drain's final pass answers it with `delivered=True` —
+    and only then does the thread exit. Reporting the liveness check instead of the marker made
+    that read as failure: measured 200 out of 200. It is not merely cosmetic, since `swap_sink`
+    reads a False as an unconfirmed drain, counts `incomplete_swaps`, leaves the previous sink
+    open and writes a loss line — for a swap that completed.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.submit(_span("a"))
+    real_put = worker._queue.put
+
+    def put_then_die(item: object, timeout: float | None = None) -> None:
+        real_put(item, timeout=timeout)
+        worker._stop.set()
+        worker._thread.join(timeout=5)
+
+    worker._queue.put = put_then_die  # type: ignore[method-assign]
+
+    assert _flush_on_watchdog(worker, None) == [True], "a drain carried it and said so"
+    assert sink.events == [{"message": "a"}]
+
+
+def test_an_unbounded_flush_does_not_hang_after_a_terminal_drain_failure(capsys) -> None:
+    """End to end: a real terminal failure, then a flush whose marker nothing will read."""
+    worker = Worker(TerminalSink(SystemExit("boom")), batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))  # the sink raises past _emit's guard and ends the thread
+    assert _wait_until(lambda: not worker._thread.is_alive(), timeout=5.0)
+
+    assert _flush_on_watchdog(worker, None) == [False]
+    capsys.readouterr()
+
+
+def test_the_drain_finished_flag_is_set_before_the_threads_own_sweep() -> None:
+    """The placement *is* the guarantee: a marker landing between them is answered by nobody.
+
+    A review found the previous version pre-set the flag by hand, so it exercised the check in
+    `flush()` and never the placement in `_run` — moving the `set()` after the sweep survived
+    the whole suite while reintroducing a permanent `flush(timeout=None)` hang. The first
+    observation is the load-bearing one: `shutdown()` sweeps a second time after the join, by
+    which point the flag is set either way, and asserting on the last reading would pass under
+    exactly the mutation this exists to catch.
+    """
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=0.01)
+    observations: list[bool] = []
+    real_sweep = worker._release_waiters
+
+    def recording_sweep() -> None:
+        observations.append(worker._drain_finished.is_set())
+        real_sweep()
+
+    worker._release_waiters = recording_sweep  # type: ignore[method-assign]
+
+    worker.shutdown()
+
+    assert observations, "the drain thread must sweep on its way out, not only shutdown()"
+    assert observations[0] is True, "the flag must already be set when the thread's sweep runs"
+
+
+def test_a_marker_landing_during_the_terminal_line_is_answered_by_the_threads_own_sweep(
+    capsys,
+) -> None:
+    """`shutdown()` never runs here, so only `_run`'s own sweep can answer it.
+
+    `_terminal_failure` writes to stderr between the drain stopping and the sweep, and a
+    `flush()` can land in that window. Without a sweep on this path the caller waits forever.
+    """
+    worker = Worker(TerminalSink(SystemExit("boom")), batch_size=1, flush_interval=0.01)
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    real_terminal = worker._terminal_failure
+
+    def terminal_then_queue_a_marker(exc: BaseException, undrained: int) -> None:
+        real_terminal(exc, undrained)
+        worker._queue.put_nowait(marker)
+
+    worker._terminal_failure = terminal_then_queue_a_marker  # type: ignore[method-assign]
+    worker.submit(_span("a"))
+
+    assert _wait_until(lambda: not worker._thread.is_alive(), timeout=5.0)
+    assert marker.event.is_set(), "nothing else will ever read it"
+    capsys.readouterr()
+
+
+def test_no_sentinel_is_queued_while_the_terminal_line_is_being_written(capsys) -> None:
+    """The thread is alive throughout `_terminal_failure`, so `is_alive()` is the wrong gate.
+
+    stderr can block on a slow reader, making that window arbitrarily long — and a sentinel
+    queued in it is read by nobody, which is the symptom this change exists to remove.
+    """
+    worker = Worker(TerminalSink(SystemExit("boom")), batch_size=1, flush_interval=0.01)
+    entered, proceed = threading.Event(), threading.Event()
+    real_terminal = worker._terminal_failure
+
+    def blocking_terminal(exc: BaseException, undrained: int) -> None:
+        entered.set()
+        proceed.wait(timeout=5)
+        real_terminal(exc, undrained)
+
+    worker._terminal_failure = blocking_terminal  # type: ignore[method-assign]
+    worker.submit(_span("a"))
+    assert entered.wait(timeout=5), "the drain must be inside the terminal line"
+    assert worker._thread.is_alive(), "the premise: is_alive() still reads True here"
+
+    closing = threading.Thread(target=lambda: worker.shutdown(timeout=1.0), daemon=True)
+    closing.start()
+    assert _wait_until(lambda: worker._stop.is_set(), timeout=5.0), "shutdown got past its put"
+
+    assert _SHUTDOWN_SENTINEL not in list(worker._queue.queue), (
+        "the drain has stopped reading, so a sentinel here would never be consumed"
+    )
+
+    proceed.set()
+    closing.join(timeout=10)
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+
+def test_an_unbounded_flush_does_not_hang_after_the_sweep_while_the_thread_lives(capsys) -> None:
+    """The gap between the sweep and the thread's exit — where `is_alive()` alone still lies.
+
+    A marker landing here is behind the only sweep that was ever going to read it, yet the
+    thread is still alive, so a liveness-only check would let the caller wait: forever with
+    `timeout=None`, because nothing sweeps again. `_drain_finished` is already set, which is
+    the whole reason `flush()` consults it and not just liveness. The thread is held past the
+    sweep so the window is exact rather than raced for.
+    """
+    worker = Worker(TerminalSink(SystemExit("boom")), batch_size=1, flush_interval=0.01)
+    swept, release = threading.Event(), threading.Event()
+    real_sweep = worker._release_waiters
+
+    def sweep_then_hold() -> None:
+        real_sweep()
+        swept.set()
+        release.wait(timeout=5)
+
+    worker._release_waiters = sweep_then_hold  # type: ignore[method-assign]
+    worker.submit(_span("a"))
+    assert swept.wait(timeout=5), "the drain must be past its sweep"
+    assert worker._thread.is_alive(), "the premise: liveness still reads True here"
+
+    try:
+        assert _flush_on_watchdog(worker, None) == [False]
+    finally:
+        release.set()
+        worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+
+def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
+    """SPEC-021's whole subject, reachable through the fast return this PR added.
+
+    `flush()` returning True for a drain that was abandoned is the false success SPEC-021
+    exists to prevent — "a false success exactly where flush() matters most". The fast return
+    must therefore report `delivered`, not merely that the marker was answered: a review found
+    that dropping the `and marker.delivered` conjunct survived all 1105 tests, because the
+    sibling test pins only the True direction.
+    """
+    worker = Worker(AlwaysFailSink(), batch_size=10, flush_interval=0.01, max_retries=0)
+    worker.submit(_span("a"))
+    real_put = worker._queue.put
+
+    def put_then_die(item: object, timeout: float | None = None) -> None:
+        real_put(item, timeout=timeout)
+        worker._stop.set()
+        worker._thread.join(timeout=5)
+
+    worker._queue.put = put_then_die  # type: ignore[method-assign]
+
+    result = _flush_on_watchdog(worker, None)
+
+    capsys.readouterr()
+    assert worker.health().failed_batches == 1, "the premise: the drain abandoned the batch"
+    assert result == [False], "answered is not delivered — the batch it carried was abandoned"

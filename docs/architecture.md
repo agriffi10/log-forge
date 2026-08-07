@@ -625,10 +625,31 @@ constraint — never by being deleted quietly.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
-  to find the `flush()` markers still queued when the drain thread has died terminally, so no
-  caller sits out its full timeout on a thread that is never coming back. The audit that
-  produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than changing it**,
-  per SPEC-021's rule that an open item is closed by being fixed, settled, or recorded.
+  to find the `flush()` markers still queued when nothing will ever read them again, so no
+  caller sits out its full timeout, and no caller who passed `timeout=None` waits forever. The
+  audit that produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than
+  changing it**, per SPEC-021's rule that an open item is closed by being fixed, settled, or
+  recorded. It is called on the terminal-failure path and, since the shutdown-sentinel fix, on
+  the clean shutdown path too — the same enqueue-after-the-drain race reaches both.
+
+  It stays a **read**. A write was built and reverted: the first fix for a stranded `_SHUTDOWN`
+  sentinel rebuilt the deque without it, and rested on the claim that "nothing in this module
+  ever blocks on `put`" — which is false, `flush()` uses a blocking `put` by design, so freeing
+  capacity without notifying `not_full` would leave that caller parked with space available.
+  Fixing the sentinel by **ordering** instead (queue it before setting `_stop`, and break the
+  drain loop on it) makes stranding impossible while the drain loop is running, rather than
+  repairable, and needs no write at all. The put is skipped for a thread that is already gone,
+  since a terminally dead drain will never read a wake-up and one queued for it would strand
+  permanently — the one path the ordering cannot reach, and not a silent one, because
+  `stopped_reason` is non-`None` there. The gate is `_drain_finished` rather than `is_alive()`,
+  because the thread stays alive throughout `_terminal_failure`, which writes to stderr and can
+  block on a slow reader; the flag is set before that call.
+
+  The residual is that a marker stranded by the sibling race is answered but left queued,
+  so `health().queued` counts it; removing it would mean deleting a *specific* item, which
+  `Queue` cannot do, and draining to reach it is not available either — post-shutdown
+  submissions must stay queued, since that is exactly what `submitted_after_shutdown` reports
+  (SPEC-030).
 
   Why no alternative: the markers must be *read* and not *consumed*, and **every public method
   `Queue` has either removes an item or reports only a count** — none of them inspects without
