@@ -86,10 +86,10 @@ def configure(
     is already live is a no-op: no drain, no close. The previous sink is closed and must not be
     handed back to a later call.
 
-    The *closing* of the previous sink is not bounded, because ``Sink.close`` takes no timeout —
-    a destination that blocks in ``close()`` blocks this call. It is the same gap
-    ``architecture.md`` §13 already records for ``shutdown()``, and it has the same fix, which
-    is a change to the sink contract rather than to this function.
+    The bound covers the whole call, the close included. ``Sink.close`` takes no timeout, so
+    that close runs on its own non-daemon thread and is joined for what is left of the budget:
+    a destination that hangs in ``close()`` delays this call by the budget and no more, and the
+    close still runs to completion rather than being abandoned.
 
     This is still a startup call. It is not thread-safe, and a span finishing on another thread
     during a swap may land on either sink.

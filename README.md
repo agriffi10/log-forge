@@ -218,10 +218,13 @@ drain thread may still be inside its `emit`, and `health().incomplete_swaps` rec
 the sink that is already live is a no-op: no drain, no close. The previous sink **is** closed, so
 do not hand it back to a later call.
 
-The 5 s covers the drain, **not** the previous sink's `close()`, which has no timeout of its own —
-a destination that blocks there blocks `configure()`. `KafkaSink.close()` flushes its producer, so
-an unreachable broker is the case to watch. Configure the sink before the first log where you can;
-that path has no worker to retarget and nothing to close.
+The 5 s covers the **whole** call — both drains and the previous sink's `close()`. `Sink.close()`
+takes no timeout of its own (`KafkaSink.close()` flushes its producer, so an unreachable broker
+blocks it), so that close runs on its own thread and is joined for whatever is left of the budget.
+A hung `close()` therefore costs you the budget, once, and the close still runs to completion in
+the background rather than being abandoned — the thread is deliberately **not** a daemon. Nothing
+is reported when the join expires: a slow close is not a failed swap, and a counter that could not
+tell the two apart would be worse than no counter.
 
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
 thread mid-swap may land on either sink.

@@ -284,10 +284,15 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
    old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
 4. closes the previous sink.
 
-Both drains share one deadline, so a hung sink cannot make `configure()` block for twice the
-budget — the deadline covers the drains only, not step 4 (§13). Both guards are re-taken after the
-first drain, since it blocks: a `shutdown()` landing mid-swap must abandon the swap, or it installs
-a sink nothing will ever close. A drain that cannot be confirmed does **not** cancel the swap — the caller asked for the
+One deadline covers all four steps, so a destination that hangs in any of them cannot make
+`configure()` block for a multiple of the budget. Step 4 gets what is left of it: `Sink.close()`
+takes no timeout, so it runs on its own **non-daemon** thread and is joined for the remainder —
+the close always completes, and only the waiting is bounded. Nothing is derived from an expired
+join: no counter moves and no line is written, because a slow close and a stuck one are
+indistinguishable at that moment and a signal that cannot tell them apart is worse than none. Both
+guards are re-taken after the first drain, since it blocks: a `shutdown()` landing mid-swap must
+abandon the swap, or it installs a sink nothing will ever close. A drain that cannot be confirmed
+does **not** cancel the swap — the caller asked for the
 new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
 left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
 leaked resource in a running process beats a close raced against a write. Passing the sink already
@@ -615,21 +620,25 @@ constraint — never by being deleted quietly.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.
 
-  **The same gap reaches `configure(sink=...)`** (SPEC-030). A late sink swap closes the previous
-  sink on the *caller's* thread, and its timeout bounds the two drains, not that close — so a
-  `KafkaSink` whose broker is unreachable blocks `configure()` inside `producer.flush()`, and any
-  SPEC-028 locking sink blocks behind an orphan-path writer holding the emit lock. It is the same
-  root cause with the same fix, and it is worse only in where it lands: at startup in a running
-  process rather than at exit. Not closing the previous sink at all would leak it on every swap.
+  ~~**The same gap reaches `configure(sink=...)`**~~ — **closed by SPEC-030's follow-up.** It did:
+  a late sink swap closed the previous sink inline on the caller's thread, so a `KafkaSink` whose
+  broker was unreachable blocked `configure()` inside `producer.flush()` (measured at 8.0 s against
+  a 5 s budget), and any SPEC-028 locking sink blocked behind an orphan-path writer holding the
+  emit lock. The swap's deadline now covers that close too (§7).
 
-  **Only one of the two reasons above carries over, and it is the second.** The daemon killed
-  mid-`commit()` is an *interpreter-exit* hazard and cannot happen at a swap, which runs in a
-  live process — so that leg does not apply here and must not be cited as though it did. What
-  does apply is that a bounded close still cannot tell a slow-but-successful close from a stuck
-  one: an expired join would report `incomplete_swaps` and "left open" for a close that completes
-  a moment later, latching a loss signal on a healthy swap. A wrong signal is worse than a slow
-  one, which is the same conclusion by the surviving half of the same argument. Configure the
-  sink before the first log where you can — that path has no worker and nothing to close.
+  **What made the fix available here and not above** is that the two objections are separable, and
+  a swap defeats both. The daemon killed mid-`commit()` is an *interpreter-exit* hazard, and a swap
+  runs in a live process — so the closer thread is **not** a daemon and always runs to completion.
+  The wrong-signal objection is dissolved rather than argued with: **nothing is derived from an
+  expired join.** No counter moves, no line is written, and the close is not abandoned; the join
+  decides who waits and nothing else. `incomplete_swaps` keeps its narrower meaning — a *drain*
+  that could not be confirmed — precisely so it cannot latch on a healthy swap.
+
+  The residual cost, recorded rather than hidden: a `close()` that never returns holds a non-daemon
+  thread and delays interpreter exit. That is strictly better than what it replaced, where the same
+  sink hung `configure()` and the application never started, and it does not weaken `shutdown()`,
+  whose close stays inline for the reasons above. Configure the sink before the first log where you
+  can — that path has no worker and nothing to close.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

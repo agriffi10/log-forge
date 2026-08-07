@@ -456,10 +456,16 @@ where it starts.
   to the old sink, reassign (never rebuild: the queue, thread, counters and `atexit` registration
   survive), **fence with a second drain**, then close — because the first drain only proves the
   *pre-swap* events landed, and closing while the drain thread is inside `emit` is what SPEC-028
-  exists to prevent. Both drains share one deadline. A drain that cannot be confirmed does not
-  cancel the swap (the caller asked for that sink) but leaves the old one **open** and counts
-  `incomplete_swaps`, on SPEC-027 FR-004's reasoning that a leaked resource beats a close raced
-  against a write. (SPEC-030, arch §7, §9)
+  exists to prevent. A drain that cannot be confirmed does not cancel the swap (the caller asked
+  for that sink) but leaves the old one **open** and counts `incomplete_swaps`, on SPEC-027
+  FR-004's reasoning that a leaked resource beats a close raced against a write. **One deadline
+  covers all four steps**, the close included: `Sink.close` takes no timeout, so it runs on a
+  **non-daemon** thread joined for the remainder. Both of SPEC-028's reasons for reverting a
+  threaded close are defeated by a swap running in a live process — the daemon killed
+  mid-`commit()` cannot happen, and the wrong-signal objection is **dissolved by deriving no
+  signal from an expired join**: no counter, no line, and the close is not abandoned, so a slow
+  close can never latch a loss on a healthy swap. `shutdown()`'s close stays inline; only the
+  swap's half of §13's constraint is closed. (SPEC-030, arch §7, §9, §13)
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — the
   SPEC-026 rule applied to the sink's own lifecycle, where an absorbed batch is a batch the worker
   believes just the same. Both halves bind: three shipped sinks lost every post-`close()` event

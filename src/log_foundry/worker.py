@@ -447,10 +447,9 @@ class Worker:
 
         Args:
           new_sink: The sink every subsequent batch is emitted to.
-          timeout: Seconds bounding both drains — one shared deadline, so a hung sink cannot
-            make ``configure()`` wait for twice the budget. It does **not** bound the closing of
-            the old sink, which has no timeout of its own; see :meth:`_close_swapped_out`.
-            ``None`` waits indefinitely.
+          timeout: Seconds bounding the **whole** call — one deadline shared by both drains and
+            the close of the old sink, so a destination that hangs in any of the three cannot
+            hold ``configure()`` for a multiple of the budget. ``None`` waits indefinitely.
 
         Returns:
           None. The outcome is reported through ``health().incomplete_swaps`` and one stderr
@@ -478,7 +477,8 @@ class Worker:
         if not (drained and self.flush(remaining)):
             self._record_incomplete_swap(timeout)
             return
-        self._close_swapped_out(old)
+        left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        self._close_swapped_out(old, left)
 
     def _record_incomplete_swap(self, timeout: float | None) -> None:
         """Counts a swap whose drain could not be confirmed, then announces it (FR-003).
@@ -507,8 +507,8 @@ class Worker:
             f"queued items may reach the new sink instead",
         )
 
-    def _close_swapped_out(self, sink: Sink) -> None:
-        """Closes a sink the worker no longer delivers to, absorbing a failure.
+    def _close_swapped_out(self, sink: Sink, timeout: float | None) -> None:
+        """Closes a sink the worker no longer delivers to, waiting only for the budget.
 
         This is reached only once both drains have been confirmed, so the *drain thread* is
         provably out of this sink's ``emit``. An orphan-path emitter on an application thread
@@ -517,14 +517,20 @@ class Worker:
         ``emit`` — which is why ``sinks/base.py`` requires ``close()`` to tolerate exactly that
         (SPEC-028 FR-001), and why the sinks holding transport state take their lock in both.
 
-        The close is **not** bounded by the swap's timeout: ``Sink.close`` has no timeout of its
-        own, so bounding it needs an interruptible close — a change to the sink contract, not to
-        this method. Of :meth:`_close_if_owed`'s two reasons for rejecting a threaded close, only
-        the second reaches this site: the daemon killed mid-``commit()`` is an interpreter-exit
-        hazard and a swap runs in a live process, but an expired join still cannot tell a
-        slow-but-successful close from a stuck one, and would report a loss for a swap that
-        completed. A destination whose ``close()`` blocks therefore blocks ``configure()``,
-        recorded in ``architecture.md`` §13 rather than papered over.
+        ``Sink.close`` takes no timeout, so the close is run on its own thread and joined for
+        what is left of the swap's budget. **The join decides who waits, and nothing else** —
+        an expired one reports nothing, moves no counter, and does not abandon the close. That
+        is what makes this safe where :meth:`_close_if_owed` is not: SPEC-028 reverted a threaded
+        close there because an expired join could not tell a slow-but-successful close from a
+        stuck one and reported a loss for closes that had in fact completed, and because at
+        interpreter exit its daemon was killed mid-``commit()``. Neither reaches this site — the
+        first because no signal is derived from the expiry, the second because the thread is
+        **not** a daemon, so the close always runs to completion in a process that is running.
+
+        The residual cost is that a ``close()`` which never returns holds a non-daemon thread and
+        delays interpreter exit (``architecture.md`` §13). That is strictly better than what it
+        replaces, where the same sink hung ``configure()`` itself and the application never
+        started.
 
         It is deliberately not :meth:`_close_sink`, which answers a different question — that
         one closes the sink the worker still holds, exactly once, and only after the thread has
@@ -532,6 +538,46 @@ class Worker:
 
         Args:
           sink: The sink that was swapped out.
+          timeout: Seconds to wait for the close before returning and letting it finish on its
+            own. ``None`` waits indefinitely.
+
+        Returns:
+          None.
+
+        Raises:
+          None. ``Thread.start`` raises when the platform will not give the process another
+            thread, and a swap that cannot spawn one must leave the sink open and say so rather
+            than fall back to an inline close — the fallback would reintroduce the unbounded
+            wait this method exists to remove, in the one situation where the process is
+            already under resource pressure.
+        """
+        closer = threading.Thread(
+            target=self._close_detached,
+            args=(sink,),
+            name="log-foundry-sink-close",
+            daemon=False,
+        )
+        try:
+            closer.start()
+        except Exception as exc:
+            _diag.absorbed(
+                "starting the thread that closes a swapped-out sink",
+                exc,
+                "it is left open and may still hold its resources",
+            )
+            return
+        closer.join(timeout)
+
+    def _close_detached(self, sink: Sink) -> None:
+        """Closes a swapped-out sink on its own thread, absorbing a failure.
+
+        The guard is what makes the thread safe to leave unattended: an exception escaping here
+        would reach CPython's thread bootstrap, which prints a full traceback carrying the
+        exception's message — the user data arch §6 keeps out of anything the library says about
+        itself, and the reason :meth:`shutdown` guards its own close.
+
+        Args:
+          sink: The sink to close.
 
         Returns:
           None.

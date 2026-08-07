@@ -136,6 +136,35 @@ findings, all taken.
 pre-existing conventions rather than regressions: the worker's counter increments are not pinned
 in-the-lock the way SPEC-028 pins the sinks', on `main` as well as here.
 
+## Follow-up: the close was bounded after all
+
+Both reviews accepted "record it, don't fix it" for the unbounded close. That was overturned on
+instruction, and the second review's own finding is what made the fix available: it observed that
+of SPEC-028's two reasons for reverting a threaded close, only one reaches a swap. Pursuing the
+other half showed the surviving objection was avoidable rather than binding.
+
+- The close now runs on its own **non-daemon** thread, joined for what is left of the swap's
+  budget, so one deadline covers all four steps and `configure()` cannot be held past it.
+- **Nothing is derived from an expired join** — no counter, no line, and the close is not
+  abandoned. That is what dissolves SPEC-028's surviving objection ("an expired join cannot tell a
+  slow-but-successful close from a stuck one, so it reports a loss for a swap that completed")
+  instead of arguing with it. `incomplete_swaps` keeps its narrower meaning, a *drain* that could
+  not be confirmed, so it cannot latch on a healthy swap.
+- Non-daemon is load-bearing and has its own structural test: a daemon closer is killed wherever it
+  has reached at exit, which for `SQLiteSink` is between `commit()` and `close()` — the partial
+  write SPEC-028 reverted to avoid. A swap runs in a live process, so the thread can finish.
+- `shutdown()`'s close is **unchanged** and stays inline. Its constraint in §13 stands; only the
+  swap's half is struck through as closed.
+- Residual cost, recorded in §13: a `close()` that never returns holds a non-daemon thread and
+  delays interpreter exit. Strictly better than the behaviour it replaces, where the same sink hung
+  `configure()` and the application never started.
+
+Four mutants, restored from a scratchpad copy rather than `git checkout --` (which would have
+reverted the fix being tested): close run inline, closer made a daemon, an `incomplete_swaps`
+bump added on expiry, and `_close_detached`'s guard removed. Each is killed by the test that
+advertises it. The swap tests pass 25/25 under the same eight-thread CPU load that exposed the
+earlier flake.
+
 ## Verification
 
 - 1009 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for

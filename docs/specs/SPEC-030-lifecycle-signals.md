@@ -136,13 +136,16 @@ criterion.)
 - [x] `configure(sink=B)` after events have gone to sink A causes subsequent events to reach B.
 - [x] Events submitted before the call are drained to A before the swap, not lost and not sent to B.
 - [x] Sink A is closed exactly once; sink B is not closed.
-- [x] The **drains** are bounded in time; if a drain does not complete, `configure()` still returns
-      and the failure is recorded in `health()` and on stderr. **Amended after review**: the
-      criterion said "the swap", and the swap is not bounded end to end — closing the previous
-      sink is not, because `Sink.close` takes no timeout. That is the gap `architecture.md` §13
-      already records for `shutdown()`, reached by a second route; bounding it needs an
-      interruptible close, which is a change to the sink contract, and SPEC-028 built and
-      reverted the daemon-thread alternative. Recorded in §13 and pinned by a test.
+- [x] The swap is bounded in time; if the drain does not complete, `configure()` still returns and
+      the failure is recorded in `health()` and on stderr. **Amended after review, then restored.**
+      The first amendment narrowed this to "the drains", because closing the previous sink was
+      unbounded — `Sink.close` takes no timeout — and recorded it as an `architecture.md` §13
+      constraint alongside `shutdown()`'s. On instruction it was then **bounded properly** and the
+      criterion restored as written: the close runs on a non-daemon thread joined for the
+      remainder of the budget. What made that available here and not at `shutdown()` is that both
+      of SPEC-028's objections are defeated by a swap running in a live process — the daemon killed
+      mid-`commit()` cannot happen, and the wrong-signal objection is dissolved by deriving *no*
+      signal from an expired join.
 - [x] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
 - [x] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
 - [x] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;
@@ -160,11 +163,10 @@ README section a reader arrives at afterwards.
 #### Acceptance Criteria:
 
 - [x] `configure()`'s docstring states what happens to a late `sink=` — that it swaps the live
-      target, drains and closes the previous sink, and ~~is bounded~~ **which part of that is
-      bounded** — qualifying "repeated calls compose rather than reset". **Amended after review**,
-      for the reason FR-003's fourth criterion was: the drains are bounded and the close is not,
-      so a docstring certified as saying "is bounded" would now be certifying a false claim. This
-      criterion was missed when its sibling was amended.
+      target, drains and closes the previous sink, and is bounded — qualifying "repeated calls
+      compose rather than reset". **Amended after review, then restored**, tracking FR-003's
+      fourth criterion exactly: narrowed while the close was unbounded (and missed at first when
+      its sibling was narrowed, which the second review caught), restored once it was bounded.
 - [x] `shutdown()`'s docstring states that later logging is accepted, undeliverable, and reported
       through the FR-001 field.
 - [x] `health()`'s docstring documents the new fields.
