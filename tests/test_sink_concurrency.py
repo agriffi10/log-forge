@@ -1074,12 +1074,16 @@ def test_every_locked_sink_has_a_post_close_case() -> None:
     assert not missing, f"locked sinks with no post-close test: {sorted(missing)}"
 
 
-def _build_closable(name: str, tmp_path: Path):
+def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Builds one locked sink with an injected driver double, or skips if unavailable.
 
     Args:
       name: Which sink to build.
       tmp_path: A scratch directory for the file-backed one.
+      monkeypatch: The test's own fixture. Passed in rather than constructed here: a
+        directly-built ``pytest.MonkeyPatch`` is never undone, so the socket seam stayed replaced
+        for the rest of the session and a later test asserting a dead destination would have
+        connected to this double and passed for the wrong reason.
 
     Returns:
       A tuple of the sink and a zero-argument probe returning how many driver connections or
@@ -1190,7 +1194,6 @@ def _build_closable(name: str, tmp_path: Path):
             opened.append("connect")
             return fake
 
-        monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(_socket, "_make_tcp", make)
         transport = _socket.SocketTransport("localhost", 5140)
         transport.send_all([b"warm up "])
@@ -1215,7 +1218,7 @@ def _build_closable(name: str, tmp_path: Path):
 
 @pytest.mark.parametrize("name", CLOSED_SINKS)
 def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
-    name: str, tmp_path: Path
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emitting after ``close()`` raises ``SinkDeliveryError`` and touches no driver.
 
@@ -1226,7 +1229,7 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     connection nothing would ever reap. Asserting only that a ``SinkDeliveryError`` came back
     would have passed against that leak.
     """
-    sink, driver_calls = _build_closable(name, tmp_path)
+    sink, driver_calls = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
     before = driver_calls()
 
@@ -1241,10 +1244,10 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
 
 @pytest.mark.parametrize("name", CLOSED_SINKS)
 def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
-    name: str, tmp_path: Path
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver."""
-    sink, _ = _build_closable(name, tmp_path)
+    sink, _ = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
     if name == "socket":
         sink.send_all([])

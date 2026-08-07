@@ -150,7 +150,7 @@ class SocketTransport:
             for message in messages:
                 if self._send_one(message):
                     delivered += 1
-        if messages and delivered == 0:
+        if delivered == 0:
             raise SinkDeliveryError(
                 f"SocketTransport delivered none of {len(messages)} message(s)"
             )
