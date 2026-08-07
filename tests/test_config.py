@@ -120,6 +120,7 @@ import time  # noqa: E402
 log_foundry = pytest.importorskip("log_foundry")
 decorator = pytest.importorskip("log_foundry.decorator")
 worker_mod = pytest.importorskip("log_foundry.worker")
+lifecycle = pytest.importorskip("log_foundry._lifecycle")
 
 
 def _span(msg) -> list[dict]:
@@ -527,7 +528,7 @@ def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkey
     the swap's entire budget before ``shutdown`` was called, so one still running is far more
     likely stuck than slow.
     """
-    monkeypatch.setattr(worker_mod, "DEFAULT_CLOSER_GRACE", 0.3)
+    monkeypatch.setattr(lifecycle, "DEFAULT_CLOSER_GRACE", 0.3)
     hung = SlowCloseSink()
     worker = _worker_with(hung)
     try:
@@ -538,6 +539,14 @@ def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkey
         worker.shutdown(timeout=30.0)  # generous budget; the cap is what must bound the wait
         elapsed = time.monotonic() - start
 
+        # The patched cap must be the one that bound the wait, not the shipped 2.0 (SPEC-033
+        # FR-005 AC-5). Pointed at a stale module this assertion is what fails: the test would
+        # otherwise pass against the real grace under an unchanged name, which is invisible to a
+        # `--collect-only` name diff.
+        assert elapsed < 1.0, (
+            f"the patched 0.3 s grace must be the bound, not the shipped "
+            f"{worker_mod.DEFAULT_SHUTDOWN_TIMEOUT}s budget — took {elapsed:.2f}s"
+        )
         assert elapsed < 5.0, f"the grace must be capped, not the whole budget — took {elapsed:.2f}s"
         assert hung.closed == 0, "and the hung close is abandoned"
     finally:
@@ -651,10 +660,10 @@ def test_an_unbounded_shutdown_still_caps_the_grace() -> None:
 
         joiner = threading.Thread(target=timed_join)
         joiner.start()
-        joiner.join(worker_mod.DEFAULT_CLOSER_GRACE * 3)
+        joiner.join(lifecycle.DEFAULT_CLOSER_GRACE * 3)
 
         assert elapsed, "an unbounded shutdown must still cap the grace, not join forever"
-        assert elapsed[0] >= worker_mod.DEFAULT_CLOSER_GRACE, "and must not skip it either"
+        assert elapsed[0] >= lifecycle.DEFAULT_CLOSER_GRACE, "and must not skip it either"
     finally:
         hung.release.set()
 
@@ -692,13 +701,13 @@ def test_finished_closers_are_not_retained_between_swaps() -> None:
     A config-watcher reconfiguring on every file change is exactly the shape SPEC-030 exists
     for, and nothing obliges it to poll ``health()``.
     """
-    worker = _worker_with(SwapSink())
+    _worker_with(SwapSink())  # the roster is process-global now, not this worker's (SPEC-033)
 
     for _ in range(50):
         decorator._swap_sink(SwapSink(), timeout=5.0)
 
-    assert len(worker._closers) <= 2, (
-        f"finished closers accumulated: {len(worker._closers)} retained across 50 swaps"
+    assert len(lifecycle._closers) <= 2, (
+        f"finished closers accumulated: {len(lifecycle._closers)} retained across 50 swaps"
     )
 
 
