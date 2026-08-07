@@ -413,9 +413,14 @@ where it starts.
   and its backoff, contradicting SPEC-026's "safe to call during an emit". The accepted cost is that
   an orphan log can now wait on the lock (arch §13) — bounded by SPEC-027, and the alternative is
   measured: unlocked `SQLiteSink` does not lose rows, it kills the interpreter with a bus error.
-  The counter race itself is **not reproducible under the GIL** (1.6M concurrent increments, zero
-  lost), so the tests assert the increment happens *inside* the lock rather than reproducing a loss
-  — the property that survives free-threading. (SPEC-028, arch §9, §13)
+  The counter race is **not reproducible without injecting a preemption point** — a bare `+=` lost
+  zero across 1.6M concurrent increments, though a property on the counter's storage does reproduce
+  real loss — so the tests assert the increment happens *inside* the lock, the property that
+  survives free-threading. **Which sinks lock is decided per driver and recorded in each sink's
+  docstring, enforced by a lint**, because the first pass worked from the spec's hand-written file
+  list and missed three sinks — `NATSSink` re-entering its own event loop could hang an application
+  thread permanently. That is SPEC-027's roster lesson repeated; a roster in prose is not a roster
+  the tests check. (SPEC-028, arch §9, §13)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
@@ -438,7 +443,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 
 **Review:** code review and verification run in a **fresh context** (new session or subagent), never the session that wrote the code — check the diff against the spec's acceptance criteria, not just "looks fine."
 
-**PRs & main:** before opening a PR, get the formatter, linter, and unit tests green locally. Watch every PR to completion and merge it as soon as CI is green — never open-and-abandon. `main` is always watched: after any merge confirm it went green, and if `main` fails, diagnose immediately and fix it with a new PR before anything else.
+**PRs & main:** before opening a PR, get the formatter, linter, and unit tests green locally. Watch every PR to completion — never open-and-abandon. **Green CI is not a review, and does not authorize a merge.** Every PR gets an independent fresh-context review (subagent or new session) *before* it merges: push → CI green → review → address findings → merge. CI cannot see a test that passes against the bug it claims to catch, a lock taken in the wrong order, or an acceptance criterion ticked with no evidence — SPEC-028 merged green and a review then found a sink that could hang an application thread forever. `main` is always watched: after any merge confirm it went green, and if `main` fails, diagnose immediately and fix it with a new PR before anything else.
 
 **On spec completion — keep the always-loaded files lean:**
 1. Set the spec file's `Status: Completed`.

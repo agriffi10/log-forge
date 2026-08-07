@@ -21,6 +21,13 @@ class _RedisSink:
     The module is named ``redis`` to match the extra and imports the driver lazily, so it never
     shadows or requires the real package at import time. The worst-case delay (SPEC-027 FR-005)
     is ``max_retries`` interruptible waits per batch, 0.7 s at the defaults.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. ``redis-py`` documents that a client may be shared between threads — a
+    connection is taken from its pool only for the duration of a command, and command
+    execution never mutates the client. Its documented exceptions are ``PubSub`` and
+    ``Pipeline`` objects, which must not be passed between threads — which is why the pipeline
+    here is built and executed inside a single ``emit`` call and never stored on the instance.
     """
 
     def __init__(self, *, client: Any, url: str | None, max_retries: int) -> None:

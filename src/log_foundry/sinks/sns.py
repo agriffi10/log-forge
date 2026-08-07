@@ -25,6 +25,10 @@ class SNSSink:
 
     The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per chunk, 0.7 s at the
     defaults. The waits are interruptible, so ``shutdown()`` cuts one short.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. ``boto3`` clients are documented thread-safe, this one is built once in
+    ``__init__``, and the sink rebinds nothing after construction.
     """
 
     MAX_BATCH = 10

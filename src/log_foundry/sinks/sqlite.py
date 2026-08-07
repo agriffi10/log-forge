@@ -7,6 +7,7 @@ import sqlite3
 import threading
 
 from log_foundry.sinks._chunk import valid_identifier
+from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["SQLiteSink"]
 
@@ -78,8 +79,9 @@ class SQLiteSink:
 
         ``with connection`` opens a transaction and commits on success or rolls back on error,
         so the whole batch lands atomically. The lock holds that transaction to one thread
-        (SPEC-028 FR-002); the row-building above it needs no protection, but sits inside for
-        simplicity and costs nothing an uncontended lock does not.
+        (SPEC-028 FR-002). Row-building is deliberately *outside* it: those lines touch nothing
+        shared, so serializing the ``json.dumps`` of a whole batch would lengthen the critical
+        section for no gain.
 
         Args:
           batch: The events to insert.
@@ -89,13 +91,44 @@ class SQLiteSink:
 
         Raises:
           sqlite3.Error: If the insert fails.
+          SinkDeliveryError: If the sink is closed — whether the close landed while this call
+            was building its rows, or long before it. Either way the batch would otherwise reach
+            the driver as "Cannot operate on a closed database", and the library has a word of
+            its own for "none of this was delivered" (SPEC-026 FR-001). What the library should
+            *signal* about logging after a completed shutdown is a separate question, and
+            SPEC-030's; this only keeps driver internals out of the answer.
         """
+        if not batch:
+            return
         rows = [
             (*(event.get(col) for col in _COLUMNS), json.dumps(event)) for event in batch
         ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
-        with self._lock, self._conn:
+        with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"SQLiteSink inserted none of {len(batch)} event(s): the sink is closed"
+                )
+            self._insert(rows, columns, placeholders)
+
+    def _insert(
+        self, rows: list[tuple[object, ...]], columns: str, placeholders: str
+    ) -> None:
+        """Runs the insert transaction, with the emit lock already held.
+
+        Args:
+          rows: The prepared row tuples.
+          columns: The comma-separated column list.
+          placeholders: The matching parameter placeholders.
+
+        Returns:
+          None.
+
+        Raises:
+          sqlite3.Error: If the insert fails.
+        """
+        with self._conn:
             self._conn.executemany(
                 f'INSERT INTO "{self._table}" ({columns}) VALUES ({placeholders})', rows
             )
@@ -118,10 +151,10 @@ class SQLiteSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             self._conn.commit()
             if self._owns_connection:
                 self._conn.close()
-            self._closed = True
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

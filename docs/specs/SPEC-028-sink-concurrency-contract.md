@@ -150,14 +150,24 @@ change bought for nothing: a single-attribute read is already atomic in CPython,
 
 #### Acceptance Criteria:
 
-**Amended by evidence during the build:** the race is not reproducible on the interpreters CI runs.
-A bare `+=` on an instance attribute was measured losing **nothing** across 1.6M concurrent
-increments on CPython 3.13 (8–32 threads, switch interval down to 1 ns, with and without work
-between increments). Python promises no atomicity here and the free-threaded build removes the GIL
-that is currently covering for it, so the guard is still correct and still cheap — but the original
-criterion below, "a test that reliably reproduces the race today", asks for something that cannot be
-written. It is replaced by a deterministic assertion that the increment happens *inside* the
-critical section, which is the property that survives the GIL going away.
+**Amended by evidence during the build, and the amendment corrected by review.** A bare `+=` on an
+instance attribute was measured losing **nothing** across 1.6M concurrent increments on CPython 3.13
+(8–32 threads, switch interval down to 1 ns, with and without work between increments), so the
+criterion cannot be met by running the shipped code and counting.
+
+The first version of this amendment concluded that such a test "cannot be written". That was too
+strong, and review disproved it: injecting a preemption point *into the counter's storage* — a
+property, the same class of injection the accepted `CountingLock` already uses — reproduces genuine
+lost increments in the **unmodified pre-SPEC-028 `MultiSink`** (6400 expected, 6350 observed; zero
+lost after the fix). The accurate statement is that the race is not reproducible **without injecting
+a preemption point**, because CPython's eval breaker does not fall inside a bare attribute
+read-modify-write — not that it is unobservable. With injection it demonstrates real loss, which is
+a better argument for the lock than the original criterion asked for.
+
+The criterion is still replaced rather than met literally: both available tests inject, so neither
+observes the shipped code losing an increment. The chosen assertion — that the increment happens
+*inside* the critical section — is the one that keeps holding when the free-threaded build removes
+the GIL that is currently covering for this.
 
 - [x] Concurrent emitters against a permanently-failing sink produce a `failed` count exactly equal
       to the number of failures. ~~over a test that reliably reproduces the race today~~ — the

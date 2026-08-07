@@ -33,6 +33,11 @@ class SentrySink:
       skipped: Events below the minimum level, or without a usable level, that were not sent.
       transport_errors: Events whose send raised something other than an already-counted
         abandonment — an SDK fault, or a response error ``HTTPSink`` does not retry.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. This sink owns no transport: it delegates to a ``sentry_sdk`` built for capture from any
+    thread, or to an ``HTTPSink`` that builds a fresh request per call and rebinds nothing.
+    Its counters take the counter lock like every other sink's.
     """
 
     def __init__(

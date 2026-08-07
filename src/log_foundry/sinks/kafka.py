@@ -24,6 +24,10 @@ class KafkaSink:
       failed: Messages whose delivery callback reported an error.
       rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
         — which never reached the producer's batch at all.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. ``confluent-kafka`` documents its ``Producer`` as thread-safe, and this sink adds no state
+    of its own to guard — ``produce()`` is a local hand-off into the client's internal queue.
     """
 
     def __init__(

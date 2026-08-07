@@ -76,6 +76,7 @@ class MongoDBSink:
         self.dropped_oversized = 0
         self._closed = False
         self._counter_lock = threading.Lock()
+        self._close_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and documents the server rejected or never took (FR-002).
@@ -109,12 +110,20 @@ class MongoDBSink:
           None.
 
         Raises:
-          SinkDeliveryError: When nothing was inserted (SPEC-026 FR-001) — a connection error
+          SinkDeliveryError: When the sink is already closed, since ``pymongo`` raises
+            ``InvalidOperation`` on any use of a closed client and the library has its own word
+            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001) — a connection error
             past the retry bound, or a bulk write every one of whose documents the server
             rejected. A bulk write that stored some is partial and never raises. A batch of
             nothing but oversized documents does not raise either: they can never fit, so there
             is nothing to retry, and they are reported through :meth:`losses`.
         """
+        if not batch:
+            return
+        if self._closed:
+            raise SinkDeliveryError(
+                f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
+            )
         documents = self._documents(batch)
         if not documents:
             return
@@ -157,7 +166,18 @@ class MongoDBSink:
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
 
-        Idempotent.
+        Idempotent, with the flag set under a lock so two concurrent ``close()`` calls cannot
+        both reach ``client.close()`` — ``atexit`` racing user code is the documented case.
+
+        The lock does **not** make a close wait for an in-flight ``insert_many``, and saying so
+        plainly matters: ``emit`` takes no lock here because ``pymongo``'s client is thread-safe,
+        and a close that waited would have to serialize against every insert, which is the
+        parallelism SPEC-028 FR-002 declines to remove. What covers the overlap instead is
+        :meth:`emit`'s own ``_closed`` check, which refuses the batch in the library's
+        vocabulary rather than letting it reach a closed client — pymongo raises
+        ``InvalidOperation`` on any use after close. An insert that passes the check and is
+        still in flight when the close lands can still see that error; it is counted as a failed
+        batch like any other, which is a reported loss at process exit rather than a silent one.
 
         Args:
           None.
@@ -168,11 +188,12 @@ class MongoDBSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        if self._closed:
-            return
-        if self._owns_client:
-            self._client.close()
-        self._closed = True
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owns_client:
+                self._client.close()
 
     def _documents(self, batch: list[dict[str, object]]) -> list[dict[str, object]]:
         """Copies each event and drops any document too large to ever fit.

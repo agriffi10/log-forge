@@ -41,10 +41,11 @@ class ClickHouseSink:
     sink is write-only, and the worst-case delay (SPEC-027 FR-005) is ``max_retries``
     interruptible waits per chunk, 0.7 s at the defaults.
 
-    The driver requirement satisfied (SPEC-028 FR-002): a ``clickhouse-connect`` client holds
-    per-session state across an insert and the project does not publish it as safe to share
-    between threads, so this sink serializes its use rather than assuming otherwise. A lock is
-    the conservative reading — one client per thread would be the alternative, and that is the
+    The driver requirement satisfied (SPEC-028 FR-002): ``clickhouse-connect`` states that a
+    client is **not** thread-safe when using session ids, and that concurrent queries in one
+    session raise ``ProgrammingError``. This sink calls ``get_client(dsn=...)``, which takes the
+    default auto-generated session, so it is squarely in that case and the lock is required
+    rather than merely prudent. One client per thread would be the alternative, and that is the
     connection-pool design FR-002 puts out of scope.
     """
 
@@ -133,6 +134,10 @@ class ClickHouseSink:
             return
         chunks = inserted = 0
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
+                )
             for chunk in chunk_list(batch, self._chunk_size):
                 chunks += 1
                 inserted += self._insert([self._row(event) for event in chunk])
@@ -157,9 +162,9 @@ class ClickHouseSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             if self._owns_client:
                 self.client.close()
-            self._closed = True
 
     def _row(self, event: dict[str, object]) -> list[object]:
         """Builds one row: the extracted columns, then the whole event as JSON.

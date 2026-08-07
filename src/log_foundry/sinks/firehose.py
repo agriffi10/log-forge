@@ -32,6 +32,10 @@ class FirehoseSink:
         the chunk sent, so none could be paired to an outcome. A non-zero count means those
         records were abandoned without the stream ever confirming them — treat it as loss, and
         as a sign the client is not AWS-shaped.
+
+    The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
+    lock. ``boto3`` clients are documented thread-safe, this one is built once in
+    ``__init__``, and the sink rebinds nothing after construction.
     """
 
     MAX_RECORDS = 500

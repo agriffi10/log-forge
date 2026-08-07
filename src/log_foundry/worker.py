@@ -395,9 +395,22 @@ class Worker:
         it, and ``atexit`` plus user code calling it at once is documented as normal.
 
         ``is_alive()`` is the safety condition rather than a heuristic: it reads ``False`` only
-        after ``_run`` has returned, so the sink is provably out of use. The close itself runs
-        outside the lock, because it can reach ``_diag`` and a wedged console must not stall a
-        lock :meth:`submit` also takes.
+        after ``_run`` has returned, so the sink is provably out of use *by the worker*.
+
+        The close runs to completion, inline, and is deliberately **not** bounded — which leaves
+        one honest gap. SPEC-028 made ``close()`` take the sink's emit lock, so an application
+        thread on the orphan path can hold that lock inside a driver call with no timeout of its
+        own and delay this past ``shutdown``'s budget. Running the close on a joinable daemon
+        thread was tried and reverted: at interpreter exit the daemon is killed wherever it has
+        reached, which for ``SQLiteSink`` is between ``commit()`` and ``close()`` — turning the
+        leaked handle SPEC-027 FR-004 accepts into the partial write it was avoiding. It also
+        could not tell a slow-but-successful close from a stuck one, so it reported
+        ``ShutdownTimeout`` and "left open" for closes that had in fact completed, latching
+        SPEC-019's alert term on a healthy shutdown. A wrong signal is worse than a slow one.
+        The residual delay is recorded in ``architecture.md`` §13 rather than papered over.
+
+        The close runs outside the lock, because it can reach ``_diag`` and a wedged console must
+        not stall a lock :meth:`submit` also takes.
 
         Args:
           None.
@@ -406,7 +419,9 @@ class Worker:
           None.
 
         Raises:
-          None.
+          BaseException: Whatever the sink's ``close`` raised that is not an ``Exception``.
+            ``_close_sink`` absorbs ``Exception`` but lets a ``KeyboardInterrupt`` or
+            ``SystemExit`` through to the caller (SPEC-025 FR-004).
         """
         with self._lock:
             if self._sink_closed or self._thread.is_alive():

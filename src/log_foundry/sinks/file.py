@@ -8,6 +8,8 @@ import threading
 import time
 from typing import TextIO
 
+from log_foundry.sinks.base import SinkDeliveryError
+
 __all__ = ["FileSink", "RotatingFileSink"]
 
 _WHEN_SECONDS = {
@@ -71,7 +73,13 @@ class FileSink:
         Raises:
           OSError: If the write or flush fails (FR-001).
         """
+        if not batch:
+            return
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
+                )
             for event in batch:
                 self._stream.write(json.dumps(event) + "\n")
             self._stream.flush()
@@ -94,9 +102,9 @@ class FileSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             self._stream.flush()
             self._stream.close()
-            self._closed = True
 
 
 class RotatingFileSink:
@@ -176,7 +184,13 @@ class RotatingFileSink:
         Raises:
           OSError: If a write, flush or rotation fails.
         """
+        if not batch:
+            return
         with self._lock:
+            if self._closed:
+                raise SinkDeliveryError(
+                    f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is closed"
+                )
             for event in batch:
                 line = json.dumps(event) + "\n"
                 data = len(line.encode(self._encoding))
@@ -205,9 +219,9 @@ class RotatingFileSink:
         with self._lock:
             if self._closed:
                 return
+            self._closed = True
             self._stream.flush()
             self._stream.close()
-            self._closed = True
 
     @staticmethod
     def _rollover_seconds(when: str | None, interval: int) -> float | None:
