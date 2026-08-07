@@ -1,21 +1,4 @@
-"""Background flush worker — non-blocking span delivery (arch §9, guide Phase 9).
-
-A finished span used to flush inline, blocking the decorated function on ``sink.emit``. The
-``Worker`` moves that off the hot path: :meth:`submit` is a fast, in-process handoff to a
-bounded queue drained by a daemon thread that batches events (by count *and* time) into a
-single ``sink.emit`` call. A slow or down sink can never back-pressure the app — the queue is
-bounded and overflow is dropped-newest with a counter (arch §9). Emit failures are retried
-with backoff; a graceful :meth:`shutdown` drains the queue, emits the tail, and closes the
-sink so buffered events survive process exit.
-
-Two drains, deliberately distinct (SPEC-013): :meth:`shutdown` is terminal — it stops the thread
-and closes the sink, and the worker never comes back — while :meth:`flush` drains on demand and
-leaves everything running. A process that is frozen rather than exited (a serverless handler
-between invocations) needs the second, because it will be asked to log again.
-
-This module owns *delivery mechanics only*; it receives already-built event dicts and knows
-nothing about spans or context (the same dumbness that makes sinks swappable).
-"""
+"""Background flush worker — non-blocking span delivery (arch §9, guide Phase 9)."""
 
 from __future__ import annotations
 
@@ -31,30 +14,34 @@ if TYPE_CHECKING:
 
 __all__ = ["Health", "Worker"]
 
-# Sentinel enqueued by shutdown() to wake a worker blocked in queue.get() so it stops promptly
-# instead of waiting out the flush_interval. It is never emitted.
 _SHUTDOWN = object()
 
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 """Seconds :meth:`Worker.shutdown` will wait for the drain thread (SPEC-027 FR-004).
 
-Generous, because the ordinary case is a fast drain and expiring early would abandon events that
-were about to be delivered. Bounded at all, because ``shutdown()`` runs from ``atexit`` and an
-unbounded join there is a hung process — a sink blocked in a network call with a generous socket
-timeout can still hold the thread even after FR-002 removed the common cause.
+Generous, because the ordinary case is a fast drain and expiring early would abandon events
+that were about to be delivered. Bounded at all, because ``shutdown()`` runs from ``atexit``
+and an unbounded join there is a hung process.
 """
 
-# Queue overflow is a high-rate condition by nature: a line per dropped submission would be its
-# own outage. Warn on the first drop, then every this-many-th (SPEC-017 FR-005).
 _DROP_WARN_EVERY = 1000
 
 
 def _bounded_seconds(timeout: float | None) -> str:
-    """Render a shutdown timeout for a diagnostic without trusting its ``__str__``.
+    """Renders a shutdown timeout for a diagnostic without trusting its ``__str__``.
 
-    ``timeout`` is the caller's, so it is a value the library does not control — the rule
+    The timeout is the caller's, so it is a value the library does not control — the rule
     ``_diag.errno_of`` follows for an ``errno``. A non-number renders as ``"?"`` rather than
     whatever its ``__repr__`` chose to say (SPEC-029 FR-002).
+
+    Args:
+      timeout: The caller's timeout, or ``None`` for an unbounded wait.
+
+    Returns:
+      The rendered seconds, ``"no timeout"``, or ``"?"``.
+
+    Raises:
+      None.
     """
     try:
         return f"{float(timeout):g}s" if timeout is not None else "no timeout"
@@ -65,88 +52,88 @@ def _bounded_seconds(timeout: float | None) -> str:
 class Health(NamedTuple):
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
+    ``stopped_reason`` and ``sink`` are defaulted and appended in that order, so the zeroed
+    snapshot in ``decorator._worker_health`` — and any third-party construction — keeps
+    working, and attribute and index access to every earlier field stays as it was.
+
     Attributes:
-        queued: Submissions currently buffered. Approximate by nature — it is read without
-            stopping the world, and briefly counts the internal flush/shutdown markers
-            alongside real submissions.
-        dropped: Submissions discarded because the queue was full (backpressure).
-        failed_batches: Batches abandoned after the retry budget was spent.
-        stopped_reason: The exception type name that terminated the drain thread, or ``None``
-            if it never died — which is also what a live worker and a process that never
-            logged report. Non-``None`` is categorically worse than the two counters above:
-            they measure loss the worker absorbed and kept running through, this one means
-            the worker is gone and nothing further will be delivered (SPEC-019 FR-003). Also
-            ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown` expired before the
-            drain finished (SPEC-027 FR-004) — the same thing to a reader, which is why it
-            extends this vocabulary rather than adding a field.
-        sink: The configured sink's own loss counters, or ``None`` when there is no worker or
-            the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the two
-            integers above because they count different things: ``dropped`` here is backpressure
-            at *this* queue, ``dropped`` on the sink is an event that never reached the wire,
-            and one number would make the remedies indistinguishable.
+      queued: Submissions currently buffered. Approximate by nature: it is read without
+        stopping the world, and briefly counts the internal flush/shutdown markers alongside
+        real submissions.
+      dropped: Submissions discarded because the queue was full (backpressure).
+      failed_batches: Batches abandoned after the retry budget was spent.
+      stopped_reason: The exception type name that terminated the drain thread, or ``None`` if
+        it never died — which is also what a live worker and a process that never logged
+        report. Non-``None`` is categorically worse than the two counters above: they measure
+        loss the worker absorbed and kept running through, this one means the worker is gone
+        (SPEC-019 FR-003). Also ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown`
+        expired before the drain finished (SPEC-027 FR-004), the same thing to a reader.
+      sink: The configured sink's own loss counters, or ``None`` when there is no worker or
+        the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the
+        integers above because they count different things: ``dropped`` here is backpressure
+        at this queue, ``dropped`` on the sink is an event that never reached the wire.
     """
 
     queued: int
     dropped: int
     failed_batches: int
-    # Defaulted so the zeroed snapshot in `decorator._worker_health` — and any third-party
-    # construction — keeps working unchanged.
     stopped_reason: str | None = None
-    # Appended for the same reason `stopped_reason` was: attribute and index access to every
-    # field that came before stay exactly as they were.
     sink: SinkLosses | None = None
 
 
 class _FlushMarker:
     """A drain request travelling the queue in FIFO order (SPEC-013 FR-002).
 
-    The mechanism follows from the queue being FIFO: everything submitted *before* ``flush()``
+    The mechanism follows from the queue being FIFO: everything submitted before ``flush()``
     was called is necessarily ahead of the marker, so by the time the worker dequeues it those
-    events are either already emitted or sitting in ``pending``. The worker emits ``pending``,
-    then sets ``event``. No lock, no inspection of queue internals, and no coordination with the
-    batching triggers.
+    events are either already emitted or sitting in ``pending``. Like ``_SHUTDOWN`` it is never
+    emitted, but unlike ``_SHUTDOWN`` it carries state, so it is a class rather than a bare
+    sentinel.
 
-    Like ``_SHUTDOWN`` it is never emitted — but unlike ``_SHUTDOWN`` it carries state, so it is
-    a class rather than a bare sentinel object.
-
-    ``delivered`` carries the drain's *outcome* back to the waiter, not merely the fact that the
-    marker was reached (SPEC-021 FR-001). It is written by the drain thread before ``event.set()``
-    and read by the waiter after ``event.wait()`` returns, so the ``Event`` supplies the ordering
-    and no further lock is needed.
+    ``delivered`` carries the drain's outcome back to the waiter, not merely the fact that the
+    marker was reached (SPEC-021 FR-001). It is written by the drain thread before
+    ``event.set()`` and read by the waiter after ``event.wait()`` returns, so the ``Event``
+    supplies the ordering and no further lock is needed. It starts ``False`` because every path
+    that answers a marker assigns it explicitly, leaving the default to be read only when the
+    drain thread died without computing an answer.
 
     The outcome is computed from ``seen_failures`` — ``Worker.failed_batches`` as it stood when
-    this marker was created, on the *caller's* thread — against the same counter when the marker is
-    answered. Equal means nothing was abandoned while this flush was outstanding, which covers both
-    the batch the marker forces and any batch another flush or a batching trigger emitted in the
-    meantime. So every flush *outstanding* when a batch is abandoned reports it, including the ones
-    whose own emit found nothing left to do because another marker's emit had just cleared and lost
-    it — that case was the original false success.
-
-    Two limits, both deliberate. A batch abandoned *before* the call is not in scope: that loss is
-    already in ``failed_batches`` and on stderr, and folding it in would make every later empty
-    flush report a failure it did not incur. It follows that two *concurrent* flushes need not
-    agree — one stamped before the abandonment and one after are the outstanding case and the
-    already-lost case respectively, and the race between them decides which is which. Reporting a
-    past loss and not letting a past loss stick are the same property read in opposite directions;
-    FR-001's "an empty drain is a successful one" chooses. ``health().failed_batches`` is what
-    reports a loss regardless of when anyone asked.
-
-    ``delivered`` starts ``False``: every path that answers a marker assigns it explicitly, so the
-    default is read only when the drain thread died without computing an answer, where "I could not
-    establish that this was delivered" is the honest reading. (The spec's Data Model sketched the
-    default as ``True``, before the concurrent-flush case moved the empty-drain answer off it.)
+    the marker was created — against the same counter when the marker is answered, so every
+    flush outstanding when a batch is abandoned reports it. A batch abandoned before the call
+    is deliberately not in scope: that loss is already in ``failed_batches`` and on stderr, and
+    folding it in would make every later empty flush report a failure it did not incur.
     """
 
     __slots__ = ("delivered", "event", "seen_failures")
 
     def __init__(self, seen_failures: int) -> None:
+        """Stamps a marker with the failure count it will be judged against.
+
+        Args:
+          seen_failures: ``Worker.failed_batches`` as read on the caller's thread, before the
+            marker joins the queue.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self.event = threading.Event()
         self.delivered = False
         self.seen_failures = seen_failures
 
 
 class Worker:
-    """Owns a bounded queue + daemon thread that batches and flushes events to ``sink``."""
+    """Owns a bounded queue and daemon thread that batch and flush events to a sink.
+
+    :meth:`submit` is a fast, in-process handoff, so a slow or down sink can never
+    back-pressure the app: the queue is bounded and overflow is dropped-newest with a counter
+    (arch §9). Two drains are deliberately distinct (SPEC-013) — :meth:`shutdown` is terminal
+    and the worker never comes back, while :meth:`flush` drains on demand and leaves everything
+    running, which a process that is frozen rather than exited needs. This class owns delivery
+    mechanics only, and knows nothing about spans or context.
+    """
 
     def __init__(
         self,
@@ -157,19 +144,36 @@ class Worker:
         max_queue: int = 10_000,
         max_retries: int = 3,
     ) -> None:
+        """Starts the drain thread and offers the sink this worker's stop signal.
+
+        The lock guards the ``dropped`` counter, incremented from any caller thread, and the
+        shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
+        and user code.
+
+        Args:
+          sink: The destination every batch is emitted to.
+          batch_size: How many submissions accumulate before an emit is triggered.
+          flush_interval: Seconds before a partial batch is emitted anyway.
+          max_queue: Ceiling on buffered submissions, past which the newest is dropped.
+          max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self.sink = sink
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_retries = max_retries
-        self.dropped = 0  # submissions dropped because the queue was full (backpressure)
-        self.failed_batches = 0  # batches abandoned after exhausting retries (worker-thread only)
-        self.stopped_reason: str | None = None  # set once if the drain loop dies (SPEC-019)
+        self.dropped = 0
+        self.failed_batches = 0
+        self.stopped_reason: str | None = None
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._shutdown_done = False
-        self._sink_closed = False  # a shutdown that expired still owes the close (SPEC-027)
-        # Guards the `dropped` counter (incremented from any caller thread) and the shutdown
-        # once-only flag (shutdown may be called concurrently by atexit and user code).
+        self._sink_closed = False
         self._lock = threading.Lock()
         self._offer_stop_signal()
         self._thread = threading.Thread(
@@ -178,15 +182,23 @@ class Worker:
         self._thread.start()
 
     def _offer_stop_signal(self) -> None:
-        """Give the sink this worker's shutdown event, if it advertises somewhere to put it.
+        """Gives the sink this worker's shutdown event, if it advertises somewhere to put it.
 
-        The dependency stays one-way (SPEC-027 FR-002): ``sinks`` must not import ``worker``, so
-        the worker pushes rather than the sink pulling. Probed with ``hasattr``, the same
-        optional-protocol shape SPEC-026 uses for ``losses()`` — a sink without the attribute
-        simply never gets one and backs off uninterruptibly, exactly as before this spec.
+        The dependency stays one-way (SPEC-027 FR-002): ``sinks`` must not import ``worker``,
+        so the worker pushes rather than the sink pulling. It is probed with ``hasattr``, the
+        same optional-protocol shape SPEC-026 uses for ``losses()`` — a sink without the
+        attribute simply never gets one and backs off uninterruptibly, exactly as before.
 
-        Total: a sink whose ``stop_signal`` is a read-only property, or whose ``__setattr__``
-        objects, loses interruptibility rather than preventing the worker from starting.
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. A sink whose ``stop_signal`` is a read-only property, or whose
+            ``__setattr__`` objects, loses interruptibility rather than preventing the worker
+            from starting.
         """
         try:
             if hasattr(self.sink, "stop_signal"):
@@ -197,33 +209,52 @@ class Worker:
             )
 
     def submit(self, events: list[dict[str, object]]) -> None:
-        """Hand a finished span's events to the worker. Non-blocking.
+        """Hands a finished span's events to the worker, without blocking.
 
-        Enqueues via ``put_nowait`` and returns immediately without touching the sink. When the
-        queue is full, drops this submission (drop-newest) and counts it in ``dropped`` rather
-        than blocking the caller (FR-001, FR-004), warning on a throttle (SPEC-017 FR-005).
+        This enqueues via ``put_nowait`` and returns immediately without touching the sink.
+        When the queue is full it drops this submission and counts it in ``dropped`` rather
+        than blocking the caller (FR-001, FR-004), warning on a throttle since overflow is a
+        high-rate condition and a line per drop would be its own outage (SPEC-017 FR-005).
+
+        The warning is written outside the lock deliberately: stderr can block on a slow
+        reader, and the lock also guards the once-only shutdown flag, so holding it across a
+        blocking write would let a wedged console stall the drain path. Lines may therefore
+        interleave out of order under concurrency, but the counts they carry are exact.
+
+        Args:
+          events: The span's buffered events, submitted as one item.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
         """
         try:
             self._queue.put_nowait(events)
         except queue.Full:
             with self._lock:
                 self.dropped += 1
-                total = self.dropped  # read under the lock: every value is produced exactly once
-            # Written outside the lock deliberately. stderr can block on a slow reader, and
-            # ``_lock`` also guards flush()/shutdown()'s once-only flag — holding it across a
-            # blocking write would let a wedged console stall the drain path, not just other
-            # submitters. Lines may therefore interleave out of order under concurrency; the
-            # counts they carry are still exact.
+                total = self.dropped
             if total == 1 or total % _DROP_WARN_EVERY == 0:
                 _diag.lost("submission", total, "log queue full; count is cumulative")
 
     def health(self) -> Health:
-        """Snapshot the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003). Never raises.
+        """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
 
-        Valid after :meth:`shutdown` — the counters are plain integers that outlive the thread,
-        and the final drain consumes the queue, so ``queued`` reads 0 rather than a stale marker.
-        The same applies to ``stopped_reason``: a terminal failure stays readable afterwards,
-        since a caller finding a dead worker will usually call ``shutdown()`` next.
+        This stays valid after :meth:`shutdown`: the counters are plain integers that outlive
+        the thread, and the final drain consumes the queue, so ``queued`` reads 0 rather than a
+        stale marker. The same applies to ``stopped_reason``, since a caller finding a dead
+        worker will usually call ``shutdown()`` next.
+
+        Args:
+          None.
+
+        Returns:
+          The snapshot, including the sink's own losses when it reports any.
+
+        Raises:
+          None.
         """
         with self._lock:
             dropped, failed_batches = self.dropped, self.failed_batches
@@ -237,127 +268,115 @@ class Worker:
         )
 
     def _sink_losses(self) -> SinkLosses | None:
-        """Read the configured sink's optional ``losses()``; ``None`` when it has none (FR-003).
+        """Reads the configured sink's optional ``losses()`` (FR-003).
 
-        The probe and its guarantees live in ``sinks.base.read_losses`` — imported here rather
-        than at module scope, keeping ``worker`` free of a runtime dependency on ``sinks`` the
-        same way ``config`` does (the ``Sink`` Protocol itself is ``TYPE_CHECKING``-only).
+        The probe and its guarantees live in ``sinks.base.read_losses``, imported here rather
+        than at module scope, which keeps ``worker`` free of a runtime dependency on ``sinks``
+        the same way ``config`` does.
+
+        Args:
+          None.
+
+        Returns:
+          The sink's losses, or ``None`` when it reports none.
+
+        Raises:
+          None.
         """
         from log_foundry.sinks.base import read_losses
 
         return read_losses(self.sink)
 
     def flush(self, timeout: float | None = 5.0) -> bool:
-        """Drain everything submitted before this call through the sink, without stopping.
+        """Drains everything submitted before this call through the sink, without stopping.
 
-        Returns ``True`` once the worker has *delivered* them — ``False`` on timeout, on a worker
-        already shut down or dead, on a queue too full to accept the marker, and when the drain
-        carrying those events was abandoned after exhausting retries (SPEC-021 FR-001). That last
-        case used to return ``True``: the drain had run, so the marker was answered regardless of
-        what came of the emit. It is a false success exactly where ``flush()`` matters most — a
-        serverless handler draining before the environment freezes has the return value as its
-        only evidence the tail of the queue survived.
+        The precise claim is that nothing was abandoned while this call was outstanding: the
+        batch this flush forces, and any batch another flush or a batching trigger emitted
+        while its marker waited its turn. A batch abandoned before the call is not in scope —
+        that loss is already in ``failed_batches`` and on stderr, and counting it here would
+        make every later empty flush report a failure it did not incur.
 
-        The precise claim is *nothing was abandoned while this call was outstanding*: the batch
-        this flush forces, and any batch another flush or a batching trigger emitted while its
-        marker waited its turn. A batch abandoned **before** the call is not in scope — that loss
-        is already in ``failed_batches`` and on stderr, and counting it here would make every
-        later empty flush report a failure it did not incur. ``health()`` is the cumulative
-        record; this is a verdict on one drain.
-
-        Unlike :meth:`shutdown` the thread keeps running, the sink is **not** closed, and the
+        Unlike :meth:`shutdown` the thread keeps running, the sink is not closed, and the
         once-only shutdown flag is untouched, so logging continues normally afterwards
-        (SPEC-013 FR-002).
+        (SPEC-013 FR-002). The put is blocking rather than ``put_nowait``, because on a full
+        queue ``put_nowait`` would skip the flush and return as though it had succeeded, the
+        one outcome a flush must never produce silently.
+
+        Args:
+          timeout: Seconds bounding the whole call — one deadline shared by the put and the
+            wait, so the two cannot add up to twice the timeout. ``None`` waits indefinitely.
+
+        Returns:
+          True once the worker has delivered them. False on timeout, on a worker already shut
+          down or dead, on a queue too full to accept the marker, and when the drain carrying
+          those events was abandoned after exhausting retries (SPEC-021 FR-001). That last
+          case used to return True, a false success exactly where ``flush()`` matters most.
+
+        Raises:
+          None.
         """
         with self._lock:
             if self._shutdown_done:
-                # Nothing will ever consume a marker now, so report the failure immediately
-                # rather than make the caller wait out `timeout` for a drain that cannot happen.
-                # A caller with an execution deadline would pay that wait for nothing (FR-003).
                 return False
         if not self._thread.is_alive():
             return False
         with self._lock:
-            # Stamped here, on the caller's thread, *before* the marker joins the queue: it is the
-            # baseline the drain thread compares against, so anything abandoned from this moment
-            # on is attributed to this flush. Reading it after the put would race the very emit
-            # the flush is about to force.
             marker = _FlushMarker(self.failed_batches)
-        # One deadline shared by the put and the wait: a caller asked for a bound on the whole
-        # call, not on each half of it, so the two cannot add up to 2 * timeout.
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            # A *blocking* put, never put_nowait: on a full queue put_nowait would skip the
-            # flush and return as though it had succeeded, which is the one outcome a flush must
-            # never produce silently. A put that times out is reported as False.
             self._queue.put(marker, timeout=timeout)
         except queue.Full:
             return False
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
-            return False  # timed out: the drain never happened, so it delivered nothing.
+            return False
         return marker.delivered
 
     def shutdown(self, timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
-        """Stop the thread, drain + emit everything queued, then ``close()`` the sink.
+        """Stops the thread, drains and emits everything queued, then closes the sink.
 
-        **Bounded** (SPEC-027 FR-004). ``timeout`` caps how long the join may take; ``None``
-        waits indefinitely, which is what this did unconditionally and is still available on
-        request. On expiry it returns having stopped what it could, records
-        ``stopped_reason="ShutdownTimeout"`` and writes one line — it does not kill the thread,
-        which Python cannot do and which would leave a sink mid-write if it could.
+        This is bounded (SPEC-027 FR-004). On expiry it returns having stopped what it could,
+        records a ``stopped_reason`` of ``"ShutdownTimeout"`` and writes one line; it does not
+        kill the thread, which Python cannot do and which would leave a sink mid-write if it
+        could. An expired shutdown does not close the sink either, because the drain thread may
+        still be inside ``emit`` — the cost is a leaked resource in a process that is exiting
+        anyway, which is the cheaper of the two. That close is deferred rather than abandoned:
+        a later call finds the thread finished and closes the sink then.
 
-        An expired shutdown does **not** close the sink. The drain thread may still be inside
-        ``emit``, and closing a transport out from under it would turn a slow shutdown into a
-        corrupt one. The cost is a leaked resource in a process that is exiting anyway, which is
-        the cheaper of the two.
+        The once-only flag deliberately stays ahead of the close. Re-running a drain is not
+        safe, and a second ``shutdown()`` retrying a close that already failed would call
+        ``close()`` twice on a sink that may have partially released its resources; what
+        SPEC-025 FR-004 changed is that the failure is announced rather than swallowed.
 
-        That close is *deferred*, not abandoned: the once-only flag still short-circuits a second
-        drain, but a later call finds the thread finished and closes the sink then. Without that,
-        one expiry meant the sink was never closed for the life of the process — a caller who
-        waited and tried again had no way to complete what they started.
+        Args:
+          timeout: Seconds the join may take. ``None`` waits indefinitely, which is what this
+            did unconditionally before and is still available on request.
 
-        Idempotent: a second call is a no-op (FR-005). Registered via ``atexit`` by the
-        decorator's lazy worker so a program that logs and exits immediately still flushes.
+        Returns:
+          None.
 
-        **Total** (SPEC-025 FR-004). The close was unguarded, so a sink whose ``close()`` failed
-        raised out of ``shutdown()`` — and out of the ``atexit`` handler, where CPython printed
-        "Exception ignored in atexit callback" with a full traceback carrying the exception's
-        message, which arch §6 keeps out of anything the library says about itself.
-
-        The once-only flag deliberately stays *ahead* of the close rather than moving after it.
-        (The close it guards is now owned by :meth:`_close_if_owed`, which is what makes the
-        deferred case safe without weakening this.)
-        Re-running a drain is not safe, and a second ``shutdown()`` retrying a close that already
-        failed would call ``close()`` twice on a sink that may have partially released its
-        resources. Idempotence is preserved; what changes is that the failure is announced rather
-        than swallowed by the flag.
+        Raises:
+          None. An unguarded close raised out of the ``atexit`` handler, where CPython printed
+            a full traceback carrying the exception's message, which arch §6 keeps out of
+            anything the library says about itself.
         """
         with self._lock:
             first = not self._shutdown_done
             self._shutdown_done = True
         if not first:
-            # A previous call already drained; nothing here re-runs it. But if that call expired
-            # before it could close the sink, the close is still owed.
             self._close_if_owed()
             return
         self._stop.set()
         try:
-            self._queue.put_nowait(_SHUTDOWN)  # wake a blocked get() for a prompt stop
+            self._queue.put_nowait(_SHUTDOWN)
         except queue.Full:
             pass
         self._thread.join(timeout)
         if self._thread.is_alive():
             queued = self._queued_or_unknown()
-            # Recorded before the line, as SPEC-019's terminal failure is: stderr may be wedged,
-            # and this is written exactly once.
             with self._lock:
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
-            # "item", not "event", and for ``_terminal_failure``'s reason: the queue holds
-            # event-*lists* plus any internal marker, so this counts submissions and sentinels,
-            # not events. It is also a floor rather than a total — what the wedged thread still
-            # holds in hand is not in the queue, and it may yet deliver some of it.
             _diag.lost(
                 "item",
                 queued,
@@ -368,21 +387,26 @@ class Worker:
         self._close_if_owed()
 
     def _close_if_owed(self) -> None:
-        """Close the sink exactly once, and only once the drain thread has ended.
+        """Closes the sink exactly once, and only once the drain thread has ended.
 
-        Every exit from :meth:`shutdown` that *may* close comes through here — the expired one
-        deliberately does not, since the thread is still using the sink — so the decision is made
-        in one place under one lock. Two concurrent ``shutdown()`` calls are what needs it: the
-        docstring above names a double ``close()`` on a partially-released sink as the thing this
-        design avoids, and ``atexit`` plus user code calling it at once is documented as normal.
-        A success path that closed unconditionally could race a deferred call that had just
-        observed the thread end.
+        Every exit from :meth:`shutdown` that may close comes through here — the expired one
+        deliberately does not, since the thread is still using the sink — so the decision is
+        made in one place under one lock. Two concurrent ``shutdown()`` calls are what needs
+        it, and ``atexit`` plus user code calling it at once is documented as normal.
 
-        ``is_alive()`` is the safety condition, not a heuristic: it reads ``False`` only after
-        ``_run`` has returned, so the sink is provably out of use.
+        ``is_alive()`` is the safety condition rather than a heuristic: it reads ``False`` only
+        after ``_run`` has returned, so the sink is provably out of use. The close itself runs
+        outside the lock, because it can reach ``_diag`` and a wedged console must not stall a
+        lock :meth:`submit` also takes.
 
-        The close itself runs **outside** the lock, because it can reach ``_diag`` and a wedged
-        console must not stall a lock ``submit()`` also takes.
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
         """
         with self._lock:
             if self._sink_closed or self._thread.is_alive():
@@ -391,94 +415,130 @@ class Worker:
         self._close_sink()
 
     def _close_sink(self) -> None:
-        """Close the sink, absorbing a failure. Called once, after the thread has ended."""
+        """Closes the sink, absorbing a failure.
+
+        This runs after the join, so everything queued has already been drained and emitted:
+        what is lost here is the sink's own cleanup, not events.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         try:
             self.sink.close()
         except Exception as exc:
-            # After the join, so everything queued has already been drained and emitted: what is
-            # lost here is the sink's own cleanup, not events.
             _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
     def _queued_or_unknown(self) -> int:
-        """Queued **items**, or ``0`` where the platform does not implement ``qsize``.
+        """Returns queued items, or zero where the platform does not implement ``qsize``.
 
-        Items, not events: the queue holds one entry per submitted span plus any flush/shutdown
-        marker. Never raises — a diagnostic must not be the reason the diagnosis is lost.
+        Items, not events: the queue holds one entry per submitted span plus any
+        flush/shutdown marker.
+
+        Args:
+          None.
+
+        Returns:
+          The queue size, or 0 when it cannot be read.
+
+        Raises:
+          None. A diagnostic must not be the reason the diagnosis is lost.
         """
         try:
             return self._queue.qsize()
         except Exception:
             return 0
 
-    # -- worker thread ------------------------------------------------------------------
-
     def _run(self) -> None:
-        """Drain loop: accumulate event-lists and emit a batch on the count/time trigger.
+        """Runs the drain loop, recording whatever terminates it (SPEC-019 FR-001).
 
-        Guarded end to end (SPEC-019 FR-001). ``_emit`` already absorbs an ``Exception`` from
-        the sink, so anything reaching this handler has ended the only thread that delivers —
-        and CPython's thread bootstrap discards a ``SystemExit`` without even a traceback, which
-        is why the catch is ``BaseException`` rather than ``Exception``. It records and exits;
-        looping onward past a ``KeyboardInterrupt`` would be a worse failure than the one this
-        prevents.
+        :meth:`_emit` already absorbs an ``Exception`` from the sink, so anything reaching this
+        handler has ended the only thread that delivers — and CPython's thread bootstrap
+        discards a ``SystemExit`` without even a traceback, which is why the catch is
+        ``BaseException``. It records and exits; looping onward past a ``KeyboardInterrupt``
+        would be a worse failure than the one this prevents.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
         """
         pending: list[list[dict[str, object]]] = []
         try:
             self._drain(pending)
-        except BaseException as exc:  # deliberately broad — see the docstring
+        except BaseException as exc:
             self._terminal_failure(exc, len(pending))
             self._release_waiters()
 
     def _release_waiters(self) -> None:
-        """Answer every ``flush()`` marker still queued, so no caller waits out its timeout.
+        """Answers every ``flush()`` marker still queued, so no caller waits out its timeout.
 
-        A ``BaseException`` from the main loop skips ``_final_drain`` entirely, which is where
-        queued markers are normally answered — leaving a waiter to sit for its full ``timeout``
-        on a thread that is never coming back. FR-001 requires the waiter to be released on every
-        path, and this is the last one.
+        A ``BaseException`` from the main loop skips :meth:`_final_drain` entirely, which is
+        where queued markers are normally answered, leaving a waiter to sit for its full
+        timeout on a thread that is never coming back. The markers are read out of the queue
+        rather than consumed, because the queued event-lists are the evidence
+        ``health().queued`` and the terminal line report; each keeps its pessimistic
+        ``delivered``, which is the truth here.
 
-        The markers are *read* out of the queue rather than consumed: the queued event-lists are
-        the evidence ``health().queued`` and the terminal line report, and answering a waiter must
-        not erase it. Each keeps its pessimistic ``delivered``, which is the truth here.
+        One residual race, stated rather than papered over: a ``flush()`` that passed its
+        liveness check microseconds before the thread died can still enqueue a marker after
+        this sweep, and that one waits out its timeout — then returns False, which is correct
+        either way.
 
-        Residual race, stated rather than papered over: a ``flush()`` that passed its liveness
-        check microseconds before the thread died can still enqueue a marker after this sweep, and
-        that one waits out its timeout — and then returns ``False``, which is correct either way.
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. This runs after the record and the stderr line, neither of which may be lost.
         """
         try:
-            with self._queue.mutex:  # a snapshot, so a marker cannot be missed mid-iteration
+            with self._queue.mutex:
                 markers = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
             for marker in markers:
                 marker.event.set()
-        except Exception:  # this runs *after* the record and the stderr line; neither may be lost
+        except Exception:
             pass
 
     def _terminal_failure(self, exc: BaseException, undrained: int) -> None:
-        """Record the drain loop's terminal exit, then announce it (FR-001, FR-002).
+        """Records the drain loop's terminal exit, then announces it (FR-001, FR-002).
 
         Recording precedes announcing: stderr may be closed or wedged, and unlike the overflow
-        warning this line is written exactly once and cannot be re-emitted later, so the record
-        must not be able to ride on it. The exception's *type* is reported and its message is not
-        — the rule ``_diag`` now applies to every line the library writes (SPEC-029), and the
-        reason this site had it first.
+        warning this line is written exactly once and cannot be re-emitted later. The
+        exception's type is reported and its message is not — the rule ``_diag`` now applies to
+        every line the library writes (SPEC-029), and the reason this site had it first.
 
-        The announcement is an :func:`~log_foundry._diag.absorbed`, not a fourth kind of line: the
-        thread's death *is* an exception this method caught and did not propagate, and what it
-        cost belongs in the detail. The count reports what was *in hand* and what was still
-        *queued behind it* (SPEC-021 FR-002). Held alone under-reads the loss: nothing will drain
-        the queue either, so an operator reading "1 undrained event-list(s)" could conclude far
-        less was lost than was.
+        The announcement is an :func:`~log_foundry._diag.absorbed` rather than a fourth kind of
+        line, since the thread's death is an exception this method caught and did not
+        propagate. The count reports what was in hand and what was queued behind it (SPEC-021
+        FR-002), because held alone under-reads the loss: nothing will drain the queue either.
+        The queued figure is items rather than event-lists and says so, making it a floor on
+        what was lost, which is the useful direction.
 
-        The queued figure is "items", not "event-lists", and says so: like ``Health.queued`` it is
-        read without stopping the world, so it counts any internal flush/shutdown marker sitting
-        alongside real submissions, and a producer thread can add to the queue between the death
-        and the read. It is a floor on what was lost, which is the useful direction.
+        Args:
+          exc: The exception that ended the drain thread.
+          undrained: How many event-lists the loop still held in hand.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
         """
         with self._lock:
             self.stopped_reason = type(exc).__name__
         try:
-            # In its own guard, and after the record: ``qsize()`` is not guaranteed on every
-            # platform's queue, and a diagnostic must not be the reason the diagnosis is lost.
             queued: object = self._queue.qsize()
         except Exception:
             queued = "?"
@@ -490,10 +550,24 @@ class Worker:
         )
 
     def _drain(self, pending: list[list[dict[str, object]]]) -> None:
-        """The drain loop proper. ``pending`` is owned by :meth:`_run`, which reports its size.
+        """Accumulates event-lists and emits a batch on the count or time trigger.
 
-        It is mutated in place rather than rebound so the terminal handler sees what was still
-        in hand; a local ``pending = []`` here would leave that count reading zero.
+        A flush marker emits immediately, ignoring both triggers, because a caller who asked
+        for a flush is not interested in the batching policy — and that branch returns to the
+        top of the loop, since a marker falling through to the append below would be treated as
+        a list of events and handed to ``sink.emit``, killing this thread. The window is
+        advanced even when idle: otherwise the timeout collapses to zero and ``get`` busy-spins
+        a core.
+
+        Args:
+          pending: The accumulator owned by :meth:`_run`, which reports its size on a terminal
+            failure. It is mutated in place rather than rebound, so that count is accurate.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the queue or a final drain raises; :meth:`_run` is the guard.
         """
         last_flush = time.monotonic()
         while not self._stop.is_set():
@@ -503,19 +577,10 @@ class Worker:
             except queue.Empty:
                 item = None
             if isinstance(item, _FlushMarker):
-                # Drain on demand: emit immediately, ignoring both the batch_size and the
-                # flush_interval trigger — a caller who asked for a flush is not interested in
-                # the batching policy. Note this branch *returns to the top of the loop*: the
-                # marker must never fall through to the append below, where it would be treated
-                # as a list of events and handed to sink.emit, killing this thread.
                 try:
                     self._emit_pending(pending)
                     item.delivered = self._nothing_lost_since(item)
                 finally:
-                    # Signal even if the emit died, so a waiter is released rather than left to
-                    # wait out its timeout on a thread that is no longer running. A failing flush
-                    # therefore returns False promptly rather than at the caller's timeout, and
-                    # an emit that died leaves the marker's pessimistic default standing.
                     last_flush = time.monotonic()
                     item.event.set()
                 continue
@@ -524,39 +589,67 @@ class Worker:
             now = time.monotonic()
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
                 self._emit_pending(pending)
-                # Advance the window even when idle (pending empty). Otherwise last_flush never
-                # moves while the queue is empty, timeout collapses to 0.0, and get(timeout=0.0)
-                # busy-spins a core. Resetting it lets the next get() block a full interval.
                 last_flush = now
         self._final_drain(pending)
 
     def _emit_pending(self, pending: list[list[dict[str, object]]]) -> None:
-        """Emit ``pending`` if there is any, then clear it. The two always go together."""
+        """Emits the pending event-lists if there are any, then clears them.
+
+        The two always go together.
+
+        Args:
+          pending: The accumulated event-lists, cleared in place.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever :meth:`_emit` does not absorb.
+        """
         if pending:
             self._emit(pending)
             pending.clear()
 
     def _nothing_lost_since(self, marker: _FlushMarker) -> bool:
-        """Whether any batch was abandoned while ``marker`` was outstanding (SPEC-021 FR-001).
+        """Reports whether any batch was abandoned while a marker was outstanding (FR-001).
 
         ``failed_batches`` moves exactly once per abandoned batch, so comparing it against the
-        marker's stamp answers "was anything lost while this flush was in flight" — which is the
-        question ``flush()`` asks, and a stronger one than "did *my* emit succeed". A marker whose
-        own emit found nothing pending still reports the loss if another flush's emit, or a
-        batching trigger's, abandoned a batch while it waited its turn.
+        marker's stamp answers "was anything lost while this flush was in flight", which is a
+        stronger question than "did my emit succeed": a marker whose own emit found nothing
+        pending still reports a loss another emit incurred while it waited its turn. It is
+        deliberately not a running "has anything ever failed" flag, which would make every
+        empty flush after a single bad batch report a failure it did not incur.
 
-        Deliberately *not* a running "has anything ever failed" flag. That would make every empty
-        flush after a single bad batch report a failure it did not incur, contradicting the rule
-        that an empty drain is a successful one.
+        Args:
+          marker: The marker being answered.
 
-        Called on the drain thread; the lock is for the counter's other readers, and is held only
-        for the read (``shutdown()`` releases it before ``join()``, so it cannot deadlock).
+        Returns:
+          True when nothing was abandoned since the marker was stamped.
+
+        Raises:
+          None.
         """
         with self._lock:
             return self.failed_batches == marker.seen_failures
 
     def _final_drain(self, pending: list[list[dict[str, object]]]) -> None:
-        """On stop, pull anything still queued and emit the tail as one final batch."""
+        """Pulls anything still queued on stop and emits the tail as one final batch.
+
+        The marker guard is a second copy of :meth:`_drain`'s and needs the same exclusion.
+        Markers are answered after the final emit, so a ``flush()`` that raced ``shutdown()``
+        is answered by the drain that carried its events, with that drain's outcome. They are
+        set in a ``finally`` so a ``BaseException`` from the final emit cannot strand a waiter
+        for its whole timeout.
+
+        Args:
+          pending: The accumulated event-lists, extended with whatever the queue still holds.
+
+        Returns:
+          None.
+
+        Raises:
+          BaseException: Whatever the final emit raises; :meth:`_run` is the guard.
+        """
         markers: list[_FlushMarker] = []
         while True:
             try:
@@ -564,9 +657,6 @@ class Worker:
             except queue.Empty:
                 break
             if isinstance(item, _FlushMarker):
-                # This guard is a second copy of _drain's and needs the same exclusion. Markers
-                # are answered *after* the final emit below, so a flush() that raced shutdown()
-                # is answered by the drain that carried its events — with that drain's outcome.
                 markers.append(item)
                 continue
             if item is not None and item is not _SHUTDOWN:
@@ -576,27 +666,34 @@ class Worker:
             for marker in markers:
                 marker.delivered = self._nothing_lost_since(marker)
         finally:
-            # In a ``finally`` so a ``BaseException`` from the final emit cannot strand a waiter
-            # for its whole timeout — the markers are released carrying their pessimistic
-            # default, which is the truth about a batch that died with this thread.
             for marker in markers:
                 marker.event.set()
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
-        """Flatten queued per-span event-lists into one batch and emit, retrying with backoff.
+        """Flattens queued per-span event-lists into one batch and emits it, retrying.
 
         A failing ``sink.emit`` is retried up to ``max_retries`` times; past that the batch is
         abandoned with a counted warning and draining continues, so a broken sink never crashes
-        the worker thread or the app (FR-002, FR-003).
+        the worker thread or the app (FR-002, FR-003). The backoff waits on the stop event, so
+        a failing sink cannot stall the drain past a few quick tries during shutdown, and the
+        warning goes through ``_diag`` so a broken stderr cannot kill the thread and cost every
+        batch after it (SPEC-029 FR-003).
 
-        The outcome is not returned: ``failed_batches`` already moves exactly once per abandoned
-        batch, and that counter is what a waiting ``flush()`` is compared against (SPEC-021
-        FR-001), so a second channel for the same fact could only disagree with it.
-
-        ``max_retries`` is floored at zero so the loop always makes at least one attempt. A
+        ``max_retries`` is floored at zero so the loop always makes at least one attempt: a
         negative value otherwise skipped the emit entirely and discarded the batch with no
-        attempt, no counter and nothing on stderr — a silent loss of exactly the kind this arc of
-        specs exists to remove, reachable only by misconfiguration but reachable.
+        attempt, no counter and nothing on stderr — reachable only by misconfiguration, but
+        reachable.
+
+        Args:
+          event_lists: The accumulated per-span event-lists to flatten and emit.
+
+        Returns:
+          None. The outcome is not returned because ``failed_batches`` already moves exactly
+          once per abandoned batch, and a second channel for the same fact could only disagree
+          with the counter a waiting ``flush()`` is compared against (SPEC-021 FR-001).
+
+        Raises:
+          None.
         """
         batch = [event for events in event_lists for event in events]
         if not batch:
@@ -606,20 +703,12 @@ class Worker:
             try:
                 self.sink.emit(batch)
                 return
-            except Exception:  # any sink failure must not kill the worker thread
+            except Exception:
                 if attempt >= retries:
-                    # Under the lock so a concurrent health() sees a coherent snapshot rather
-                    # than a half-updated pair. No deadlock: shutdown() releases before join().
                     with self._lock:
                         self.failed_batches += 1
-                    # Through ``_diag`` so the write is guarded: unguarded, a broken stderr raised
-                    # out of here, through ``_drain``, into ``_run``'s handler, and the drain
-                    # thread died for good — a diagnostic about one lost batch costing every batch
-                    # after it (SPEC-029 FR-003).
                     _diag.lost(
                         "event", len(batch), f"batch abandoned after {retries + 1} emit attempts"
                     )
                     return
-                # Backoff between attempts; _stop.wait returns at once during shutdown, so a
-                # failing sink can't stall the drain past max_retries quick tries.
                 self._stop.wait(min(0.01 * (2**attempt), 0.5))

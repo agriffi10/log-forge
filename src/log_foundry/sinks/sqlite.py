@@ -1,14 +1,4 @@
-"""SQLiteSink — persist events as queryable rows in an embedded SQLite database (arch §8, SPEC-008).
-
-For local dev, debugging, air-gapped hosts, or simple archival, an embedded SQLite file is a durable
-sink you can open later and query with plain SQL. Each event is stored as its full JSON plus a few
-extracted columns (identity + level + function) projected out for cheap filtering. Like every sink it
-receives *already-built* event dicts and knows nothing about spans or context.
-
-Standard library only (``sqlite3``) — no runtime dependency. A single-process, single-worker-thread
-writer is assumed (arch §9); concurrent/cross-process writers and external databases (Postgres,
-ClickHouse, …) are out of scope here (the latter is SPEC-011).
-"""
+"""SQLiteSink — persist events as queryable rows in embedded SQLite (arch §8, SPEC-008)."""
 
 from __future__ import annotations
 
@@ -19,23 +9,17 @@ from log_foundry.sinks._chunk import valid_identifier
 
 __all__ = ["SQLiteSink"]
 
-# Columns projected out of each event for cheap SQL filtering. ``event`` (full JSON) is stored
-# alongside these and is the source of truth; these are convenience projections (NULL if absent).
 _COLUMNS = ("log_id", "trace_id", "span_id", "timestamp", "level", "function")
 
 
 class SQLiteSink:
     """A :class:`~log_foundry.sinks.base.Sink` that batch-inserts events into a SQLite table.
 
-    By default (``create_table=True``) the sink owns its schema: it runs an idempotent
-    ``CREATE TABLE IF NOT EXISTS`` so it works out of the box against a fresh database file. Pass
-    ``create_table=False`` when the caller provisions the table themselves (e.g. via migrations); the
-    sink then runs no DDL and a missing/incompatible table surfaces as a normal ``sqlite3`` error at
-    insert time.
-
-    A ``connection`` may be injected (e.g. ``sqlite3.connect(":memory:")``) so tests never touch
-    disk. An injected connection is borrowed — committed but never closed by this sink; a connection
-    the sink opens itself is owned and closed on ``close()``.
+    For local dev, debugging, air-gapped hosts or simple archival, an embedded SQLite file is a
+    durable sink you can open later and query with plain SQL. Each event is stored as its full
+    JSON — the source of truth — plus a few columns projected out for cheap filtering, which are
+    ``NULL`` when absent. Standard library only, and a single-process, single-worker-thread
+    writer is assumed (arch §9).
     """
 
     def __init__(
@@ -46,11 +30,31 @@ class SQLiteSink:
         connection: sqlite3.Connection | None = None,
         create_table: bool = True,
     ) -> None:
+        """Connects to the database and, by default, provisions the schema.
+
+        The connection is opened with ``check_same_thread=False``: the background worker is a
+        different thread from the one that ran ``configure()`` and is the sole writer, so
+        SQLite's same-thread guard would only get in the way.
+
+        Args:
+          database: The database file to open, ignored when a connection is injected.
+          table: The target table, validated as a plain SQL identifier.
+          connection: A connection to borrow, such as an in-memory one for tests. A borrowed
+            connection is committed but never closed by this sink, while one the sink opens
+            itself is owned and closed on :meth:`close`.
+          create_table: Whether the sink owns its schema. Pass ``False`` when the caller
+            provisions the table via migrations; the sink then runs no DDL and a missing or
+            incompatible table surfaces as a normal ``sqlite3`` error at insert time.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: If the table name is not a plain SQL identifier.
+          sqlite3.Error: If the database cannot be opened or the schema cannot be created.
+        """
         self._table = valid_identifier(table)
         self._owns_connection = connection is None
-        # check_same_thread=False: the background worker (a different thread than the one that ran
-        # configure()) is the sole writer, so SQLite's same-thread guard would only get in the way
-        # (arch §9 single-writer assumption; concurrent writers are out of scope, SPEC-008).
         self._conn = (
             connection
             if connection is not None
@@ -61,21 +65,44 @@ class SQLiteSink:
             self._ensure_schema()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Insert every event in one transaction; extracted columns default to NULL (FR-003)."""
+        """Inserts every event in one transaction (FR-003).
+
+        ``with connection`` opens a transaction and commits on success or rolls back on error,
+        so the whole batch lands atomically.
+
+        Args:
+          batch: The events to insert.
+
+        Returns:
+          None.
+
+        Raises:
+          sqlite3.Error: If the insert fails.
+        """
         rows = [
             (*(event.get(col) for col in _COLUMNS), json.dumps(event)) for event in batch
         ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
-        # ``with connection`` opens a transaction and commits on success / rolls back on error, so
-        # the whole batch lands atomically.
         with self._conn:
             self._conn.executemany(
                 f'INSERT INTO "{self._table}" ({columns}) VALUES ({placeholders})', rows
             )
 
     def close(self) -> None:
-        """Commit pending work; close only a connection the sink owns. Idempotent (FR-003)."""
+        """Commits pending work and closes only a connection the sink owns (FR-003).
+
+        Idempotent.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          sqlite3.Error: If the commit or close fails.
+        """
         if self._closed:
             return
         self._conn.commit()
@@ -83,10 +110,18 @@ class SQLiteSink:
             self._conn.close()
         self._closed = True
 
-    # -- internals ----------------------------------------------------------------------
-
     def _ensure_schema(self) -> None:
-        """Idempotently create the target table (``CREATE TABLE IF NOT EXISTS``)."""
+        """Idempotently creates the target table.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          sqlite3.Error: If the DDL fails.
+        """
         columns = ", ".join(f"{col} TEXT" for col in _COLUMNS)
         with self._conn:
             self._conn.execute(

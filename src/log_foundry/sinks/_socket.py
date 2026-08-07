@@ -1,13 +1,4 @@
-"""Shared raw-socket transport for LogstashSink (socket mode) and SyslogSink (SPEC-009).
-
-Sends pre-framed byte messages over TCP or UDP with bounded reconnect retry. For TCP a single
-connection is opened and reused (reconnecting on error); for UDP each message is an independent
-datagram. The transport is framing-agnostic — callers hand it the exact bytes to put on the wire
-(newline-terminated JSON for Logstash, RFC 5424 / octet-counted frames for Syslog).
-
-Socket creation goes through the module-level ``_make_tcp`` / ``_make_udp`` seams so tests can
-substitute a fake socket without any network access.
-"""
+"""Shared raw-socket transport for LogstashSink (socket mode) and SyslogSink (SPEC-009)."""
 
 from __future__ import annotations
 
@@ -23,29 +14,58 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
 
-_BACKOFF_BASE = 0.1  # seconds; delay for retry attempt n is _BACKOFF_BASE * 2**n
+_BACKOFF_BASE = 0.1
 
 
 def _make_tcp(host: str, port: int, timeout: float) -> socket.socket:
-    """Open a connected TCP socket (indirection seam for tests)."""
+    """Opens a connected TCP socket.
+
+    This is a module-level seam so tests can substitute a fake socket without network access.
+
+    Args:
+      host: The destination host.
+      port: The destination port.
+      timeout: Seconds allowed for the connection.
+
+    Returns:
+      The connected socket.
+
+    Raises:
+      OSError: If the connection cannot be established.
+    """
     return socket.create_connection((host, port), timeout=timeout)
 
 
 def _make_udp() -> socket.socket:
-    """Open an unconnected UDP socket (indirection seam for tests)."""
+    """Opens an unconnected UDP socket.
+
+    This is a module-level seam so tests can substitute a fake socket without network access.
+
+    Args:
+      None.
+
+    Returns:
+      The socket.
+
+    Raises:
+      OSError: If the socket cannot be created.
+    """
     return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
 class SocketTransport:
-    """Send pre-framed messages over a TCP or UDP socket, reconnecting on error within a bound.
+    """Sends pre-framed messages over a TCP or UDP socket, reconnecting within a bound.
 
-    **Worst-case delay** (SPEC-027 FR-005): ``max_retries`` waits of ``0.1 * 2**n`` *per
-    message* — 0.7 s per message at the default 3, so a 100-message batch against a dead
-    destination is ~70 s of backoff on the single drain thread. The wait is interruptible, so
-    ``shutdown()`` cuts it short.
+    The transport is framing-agnostic — callers hand it the exact bytes to put on the wire. For
+    TCP a single connection is opened and reused, reconnecting on error; for UDP each message is
+    an independent datagram.
+
+    The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per message, so a
+    100-message batch against a dead destination is roughly 70 s of backoff on the single drain
+    thread at the defaults. The wait is interruptible, so ``shutdown()`` cuts it short.
 
     Attributes:
-        failed: Messages abandoned past the reconnect-retry bound.
+      failed: Messages abandoned past the reconnect-retry bound.
     """
 
     def __init__(
@@ -57,30 +77,49 @@ class SocketTransport:
         timeout: float = 5.0,
         max_retries: int = 3,
     ) -> None:
+        """Configures the destination and retry bound without opening a socket yet.
+
+        Args:
+          host: The destination host.
+          port: The destination port.
+          transport: ``"tcp"`` or ``"udp"``.
+          timeout: Seconds allowed for a TCP connection.
+          max_retries: Reconnect retries per message, floored at zero for the reason
+            ``Worker._emit`` floors its own (SPEC-021) — a negative value made no attempt at all
+            and abandoned the message without moving ``failed``.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: If the transport is neither TCP nor UDP.
+        """
         if transport not in ("tcp", "udp"):
             raise ValueError(f"invalid transport {transport!r}; expected 'tcp' or 'udp'")
         self._host = host
         self._port = port
         self._transport = transport
         self._timeout = timeout
-        # Floored for the reason ``Worker._emit`` floors its own (SPEC-021): a negative value
-        # made no attempt at all and abandoned the message without moving ``failed``.
         self._max_retries = max(max_retries, 0)
         self._sock: socket.socket | None = None
         self.failed = 0
-        # Set by the worker through the owning sink (SPEC-027 FR-002).
         self.stop_signal: threading.Event | None = None
 
     def send_all(self, messages: list[bytes]) -> None:
-        """Send each pre-framed message, reconnecting on error (FR-005, FR-006).
+        """Sends each pre-framed message, reconnecting on error (FR-005, FR-006).
 
-        Raises :class:`~log_foundry.sinks.base.SinkDeliveryError` when **none** of the messages
-        reached the socket, so the sinks built on this transport propagate a dead destination to
-        the worker instead of reporting success (SPEC-026 FR-001). A partial send does not raise:
-        the worker's retry would re-send the messages that already landed.
+        Args:
+          messages: The exact bytes to put on the wire, one call per message.
 
-        An empty call is a no-op, not a total failure — ``delivered == 0`` there means there was
-        nothing to deliver.
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When none of the messages reached the socket, so the sinks built on
+            this transport propagate a dead destination to the worker instead of reporting
+            success (SPEC-026 FR-001). A partial send does not raise, because the worker's retry
+            would re-send the messages that already landed, and an empty call is a no-op rather
+            than a total failure.
         """
         delivered = 0
         for message in messages:
@@ -92,17 +131,53 @@ class SocketTransport:
             )
 
     def losses(self) -> SinkLosses:
-        """Messages abandoned past the reconnect-retry bound (SPEC-026 FR-002). Never raises."""
+        """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
+
+        Args:
+          None.
+
+        Returns:
+          The counters.
+
+        Raises:
+          None.
+        """
         return SinkLosses(dropped=0, failed=self.failed)
 
     def close(self) -> None:
-        """Close the held socket, if any; idempotent (FR-005, FR-012)."""
+        """Closes the held socket, if any (FR-005, FR-012).
+
+        Idempotent.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         self._reset()
 
-    # -- internals ----------------------------------------------------------------------
-
     def _send_one(self, message: bytes) -> bool:
-        """Send one message within the retry bound; ``False`` once it is abandoned."""
+        """Sends one message within the retry bound.
+
+        The abandonment line is written through ``_diag`` (SPEC-029 FR-003): this runs on the
+        worker thread, and the bare ``sys.stderr.write`` it replaced could end delivery for good.
+        It carries an ``errno`` because an ``OSError`` type name alone does not tell "connection
+        refused" from "host unknown", and the code is an integer from the OS rather than caller
+        data.
+
+        Args:
+          message: The exact bytes to put on the wire.
+
+        Returns:
+          True when the message reached the socket, False once it is abandoned.
+
+        Raises:
+          None.
+        """
         for attempt in range(self._max_retries + 1):
             try:
                 if self._transport == "udp":
@@ -111,15 +186,11 @@ class SocketTransport:
                     self._socket().sendall(message)
                 return True
             except OSError as err:
-                self._reset()  # force a fresh connection on the next attempt
+                self._reset()
                 if attempt < self._max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
                 self.failed += 1
-                # Guarded now (SPEC-029 FR-003): this runs on the worker thread, and the bare
-                # ``sys.stderr.write`` this replaced could end delivery for good. ``errno``
-                # because an ``OSError`` type name alone does not tell "connection refused" from
-                # "host unknown", and the code is an integer from the OS — not caller data.
                 _diag.lost(
                     "message",
                     1,
@@ -127,9 +198,20 @@ class SocketTransport:
                     f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                 )
                 return False
-        return False  # unreachable: the loop returns on every path (mypy needs the exit)
+        return False
 
     def _socket(self) -> socket.socket:
+        """Returns the held socket, opening one if none is held.
+
+        Args:
+          None.
+
+        Returns:
+          The socket.
+
+        Raises:
+          OSError: If the socket cannot be created or connected.
+        """
         if self._sock is None:
             self._sock = (
                 _make_udp() if self._transport == "udp" else _make_tcp(
@@ -139,6 +221,17 @@ class SocketTransport:
         return self._sock
 
     def _reset(self) -> None:
+        """Closes and forgets the held socket, forcing a fresh one on the next attempt.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         if self._sock is not None:
             try:
                 self._sock.close()
