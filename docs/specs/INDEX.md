@@ -38,6 +38,7 @@ to status only — no prose.
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Completed | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
+| [SPEC-034](SPEC-034-pre-1-0-corrections.md) | Pre-1.0 Corrections | Draft | SPEC-026, SPEC-030, SPEC-031, SPEC-033 |
 
 ## Arcs (build order)
 
