@@ -519,6 +519,30 @@ where it starts.
   deadline is defeated by any step larger than the interval. The *label* stays wall-clock
   wherever one exists; here none does, since backups are numbered rather than timestamped.
   (SPEC-031 FR-001)
+- **A sink handoff is owned by whoever is delivering, and "a worker exists" is not "a worker owns
+  this sink"** — `_swap_sink` returned early on a null worker, so a late `configure(sink=...)` in a
+  process that only logs outside a span left the previous sink open with `incomplete_swaps` at
+  zero. The orphan path now records the sink **object** an emit reached, because `configure()`
+  assigns `_config.sink` *before* the swap runs and a boolean cannot say which sink is owed; the
+  record is **re-pointed** at the new sink rather than cleared, since clearing leaks the new one in
+  a process that swaps and exits without logging again — a case the boolean got right. No drain and
+  no fence: orphan emits are synchronous and have returned, and the one writer a fence could not
+  exclude is the one `Worker._close_swapped_out` already documents itself as not covering.
+  `incomplete_swaps` stays **worker-only** — it means an unconfirmed *drain*, and widening it would
+  stop telling an operator whether events were misrouted or a close was merely slow. Two guards key
+  on **ownership** (`_worker.sink is X`), because `Worker.swap_sink` returns early once
+  `_shutdown_done`, so a retired worker keeps its old sink forever while events go to a newly
+  configured one — the identity form still declines on an *expired* shutdown, which is what the
+  original guard existed for. Review of the spec found two more instances of the same boolean:
+  the once-only close was per **process**, so a sink configured after `shutdown()` was closed by
+  nothing (measured losing a buffering sink's whole batch while `health()` read `retired=True`,
+  `submitted_after_shutdown=0` — SPEC-030's pair needs a worker to count a submission), and
+  `Worker._offer_stop_signal` was SPEC-027's only caller, so this path's backoffs were never
+  interruptible. The stop event is **replaced, never cleared**: an `Event` cannot be un-set and
+  `_retry.wait` returns instantly on a set one, so a live sink holding the shutdown's event backs
+  off not at all. The closer machinery moved to `_lifecycle.py` because the state must be
+  process-global — a closer started before any worker existed must still be counted by
+  `closing_sinks` and still granted the exit grace. (SPEC-033, arch §7, §9, §13)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

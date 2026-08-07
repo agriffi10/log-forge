@@ -105,6 +105,12 @@ class Health(NamedTuple):
         call may have been carried to the new sink instead of the old one, and the old sink was
         left **open** rather than closed, because the drain thread may still be inside its
         ``emit`` — the reasoning SPEC-027 FR-004 applies to an expired ``shutdown()``.
+        It describes the **worker's drain** and nothing else. A swap on the orphan path has no
+        queue and no drain, so there is nothing to confirm and this stays zero there (SPEC-033
+        FR-006); an expired *close* join reports nothing on either path, by the decision that
+        made the bounded close available at all. A non-zero value therefore always means events
+        may have been misrouted, never merely that a close was slow — ``closing_sinks`` is the
+        field for that.
       closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
         gauge, not a counter, and the only field here that can fall as well as rise. A close is
         bounded only in how long ``configure()`` waits for it, so this is how a destination
