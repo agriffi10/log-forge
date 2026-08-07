@@ -14,7 +14,7 @@
 - Two defects found by review of the spec and fixed here, not deferred: a sink configured **after**
   `shutdown()` was closed by nothing at all, and an orphan-only process never received a SPEC-027
   stop signal.
-- `tests/test_orphan_sink_handoff.py` — 35 tests. Suite 1106 → 1143.
+- `tests/test_orphan_sink_handoff.py` — 41 tests. Suite 1106 → 1149, none removed.
 
 **Deviation from the spec:** none in substance. `close_detached` returns the thread rather than
 joining (the spec's own final revision), so a caller can start it under `_worker_lock` and wait
