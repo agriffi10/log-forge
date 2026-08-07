@@ -637,8 +637,11 @@ constraint — never by being deleted quietly.
   ever blocks on `put`" — which is false, `flush()` uses a blocking `put` by design, so freeing
   capacity without notifying `not_full` would leave that caller parked with space available.
   Fixing the sentinel by **ordering** instead (queue it before setting `_stop`, and break the
-  drain loop on it) makes stranding impossible rather than repairable, and needs no write at
-  all. The residual is that a marker stranded by the sibling race is answered but left queued,
+  drain loop on it) makes stranding impossible while the drain loop is running, rather than
+  repairable, and needs no write at all. The put is skipped for a thread that is already gone,
+  since a terminally dead drain will never read a wake-up and one queued for it would strand
+  permanently — the one path the ordering cannot reach, and not a silent one, because
+  `stopped_reason` is non-`None` there. The residual is that a marker stranded by the sibling race is answered but left queued,
   so `health().queued` counts it; removing it would mean deleting a *specific* item, which
   `Queue` cannot do, and draining to reach it is not available either — post-shutdown
   submissions must stay queued, since that is exactly what `submitted_after_shutdown` reports

@@ -1882,44 +1882,43 @@ def test_the_sentinel_is_queued_before_stop_is_set() -> None:
     consume it. The reverse order left a window in which the loop read ``_stop``, exited, and
     finished its final drain first, stranding the sentinel in a queue nothing would read.
     """
-    sink = RecordingSink()
-    worker = Worker(sink, batch_size=10, flush_interval=0.01)
-    worker._stop.set()
-    worker._thread.join(timeout=5)
-    assert not worker._thread.is_alive(), "no consumer, so what shutdown queues stays visible"
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=0.01)
+    order: list[str] = []
+    real_put, real_set = worker._queue.put_nowait, worker._stop.set
 
-    observed: list[bool] = []
-    real_set = worker._stop.set
+    def recording_put(item: object) -> None:
+        if item is _SHUTDOWN_SENTINEL:
+            order.append("put")
+        real_put(item)
 
     def recording_set() -> None:
-        observed.append(_SHUTDOWN_SENTINEL in list(worker._queue.queue))
+        order.append("set")
         real_set()
 
+    worker._queue.put_nowait = recording_put  # type: ignore[method-assign]
     worker._stop.set = recording_set  # type: ignore[method-assign]
+
     worker.shutdown()
 
-    assert observed == [True], "the sentinel must already be queued when _stop is set"
+    assert order == ["put", "set"], "the sentinel must be queued before _stop is set"
 
 
-def test_a_thread_that_takes_the_sentinel_early_leaves_immediately() -> None:
-    """The cost of the safe order, paid for by breaking rather than looping.
+def test_no_sentinel_is_queued_for_a_thread_that_is_already_gone() -> None:
+    """The ordering argument assumes a running loop; a dead drain will never read a wake-up.
 
-    With the sentinel queued first, a thread can take it while ``_stop`` is still clear. Were
-    the loop to continue, it would re-enter ``queue.get`` and block for another
-    ``flush_interval`` — a slow shutdown traded for a cosmetic fix.
+    Queueing one for a thread that died terminally (SPEC-019) would strand it permanently —
+    the very symptom this change removes, reappearing on the one path the ordering cannot
+    reach.
     """
-    sink = RecordingSink()
-    worker = Worker(sink, batch_size=10, flush_interval=30.0)
-    worker.submit(_span("a"))
-    assert _wait_until(lambda: worker._queue.qsize() == 0), "the thread is parked in get()"
-
-    started = time.monotonic()
-    worker.shutdown(timeout=10.0)
-    elapsed = time.monotonic() - started
-
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=0.01)
+    worker._stop.set()
+    worker._thread.join(timeout=5)
     assert not worker._thread.is_alive()
-    assert elapsed < 5.0, f"shutdown took {elapsed:.2f}s; the loop did not break on the sentinel"
-    assert sink.events == [{"message": "a"}]
+
+    worker.shutdown()
+
+    assert _SHUTDOWN_SENTINEL not in list(worker._queue.queue)
+    assert worker.health().queued == 0
 
 
 def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
@@ -1941,12 +1940,15 @@ def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
         spinner.start()
     try:
         stranded = 0
+        stalled = 0
         for _ in range(300):
             worker = Worker(RecordingSink(), batch_size=10, flush_interval=60.0)
             worker.submit(_span("a"))
-            worker.shutdown()
+            worker.shutdown(timeout=2.0)
             if _SHUTDOWN_SENTINEL in list(worker._queue.queue):
                 stranded += 1
+            if worker.health().stopped_reason is not None:
+                stalled += 1
     finally:
         stop_spinning.set()
         sys.setswitchinterval(original)
@@ -1954,6 +1956,10 @@ def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
             spinner.join(timeout=5)
 
     assert stranded == 0, f"{stranded}/300 shutdowns stranded the sentinel"
+    assert stalled == 0, (
+        f"{stalled}/300 shutdowns expired: the drain loop did not break on the sentinel, so a "
+        f"thread that took it before _stop was set blocked for another flush_interval"
+    )
 
 
 def test_a_flush_marker_queued_after_the_final_drain_is_still_answered() -> None:
@@ -2023,20 +2029,52 @@ def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
     assert list(worker._queue.queue) == [_span("late"), _span("later")]
 
 
-def test_an_unbounded_flush_cannot_hang_when_the_thread_dies_mid_call() -> None:
-    """The pre-checks can both pass microseconds before the drain thread finishes.
+def _flush_on_watchdog(worker, timeout: float | None) -> list[bool]:
+    """Run flush() on its own thread so a hang fails in five seconds instead of hanging pytest."""
+    result: list[bool] = []
+    caller = threading.Thread(
+        target=lambda: result.append(worker.flush(timeout=timeout)), daemon=True
+    )
+    caller.start()
+    caller.join(timeout=5)
+    assert not caller.is_alive(), "flush() hung on a marker nothing will answer"
+    return result
 
-    The marker is then queued behind a thread that will never read it, and past the sweep
-    `shutdown()` runs on the way out. A bounded caller sits out its timeout, which SPEC-021
-    accepts; an unbounded one waits forever. Measured 3 in 400 raced shutdowns before the
-    post-put liveness check.
 
-    The thread is killed inside `put` so the interleaving is exact rather than waited for, and
-    the call runs on a watchdog thread so a regression fails in five seconds instead of hanging
-    the suite.
+def test_an_unbounded_flush_does_not_hang_on_a_marker_nothing_will_answer() -> None:
+    """The genuine strand: the pre-checks pass, then the drain finishes, then the put lands.
+
+    The marker is queued behind a thread that has already run its final drain, and no
+    `shutdown()` follows to sweep for it. A bounded caller sits out its timeout, which SPEC-021
+    accepts; an unbounded one waited forever. The drain is finished *before* the put here, so
+    the interleaving is exact rather than raced for.
     """
     sink = RecordingSink()
     worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    real_put = worker._queue.put
+
+    def die_then_put(item: object, timeout: float | None = None) -> None:
+        worker._stop.set()
+        worker._thread.join(timeout=5)
+        real_put(item, timeout=timeout)
+
+    worker._queue.put = die_then_put  # type: ignore[method-assign]
+
+    assert _flush_on_watchdog(worker, None) == [False], "nothing carried it, so it did not deliver"
+
+
+def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> None:
+    """The other half, and a regression this PR introduced before review caught it.
+
+    Here the marker *is* consumed — the drain's final pass answers it with `delivered=True` —
+    and only then does the thread exit. Reporting the liveness check instead of the marker made
+    that read as failure: measured 200 out of 200. It is not merely cosmetic, since `swap_sink`
+    reads a False as an unconfirmed drain, counts `incomplete_swaps`, leaves the previous sink
+    open and writes a loss line — for a swap that completed.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker.submit(_span("a"))
     real_put = worker._queue.put
 
     def put_then_die(item: object, timeout: float | None = None) -> None:
@@ -2046,10 +2084,20 @@ def test_an_unbounded_flush_cannot_hang_when_the_thread_dies_mid_call() -> None:
 
     worker._queue.put = put_then_die  # type: ignore[method-assign]
 
-    result: list[bool] = []
-    caller = threading.Thread(target=lambda: result.append(worker.flush(timeout=None)), daemon=True)
-    caller.start()
-    caller.join(timeout=5)
+    assert _flush_on_watchdog(worker, None) == [True], "a drain carried it and said so"
+    assert sink.events == [{"message": "a"}]
 
-    assert not caller.is_alive(), "flush(timeout=None) hung on a marker nothing will answer"
-    assert result == [False], "no drain carried it, so it did not deliver"
+
+def test_an_unbounded_flush_does_not_hang_after_a_terminal_drain_failure() -> None:
+    """`_run` sweeps for markers and *then* returns, so `is_alive()` alone is not enough.
+
+    A marker queued in that gap is answered by nobody while the thread still reads as alive.
+    The `_drain_finished` flag is set before the sweep, and a put and the sweep's snapshot both
+    take the queue's mutex — so the marker either lands before the snapshot and is answered, or
+    lands after it and finds the flag already set.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=0.01)
+    worker._drain_finished.set()  # the state that gap leaves behind, without racing for it
+
+    assert _flush_on_watchdog(worker, None) == [False]
