@@ -1922,7 +1922,7 @@ def test_no_sentinel_is_queued_for_a_thread_that_is_already_gone() -> None:
 
 
 def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
-    """The flake itself, at the rate that made it visible: ~1 in 52 shutdowns under load.
+    """The flake itself, at the load that made it visible rather than merely occasional.
 
     The rate is load-dependent, which is why it read as a rare CI flake rather than a race:
     rare when idle, and repeatedly between roughly 1 in 14 and 1 in 50 with contention. Spinner
@@ -2212,3 +2212,30 @@ def test_an_unbounded_flush_does_not_hang_after_the_sweep_while_the_thread_lives
         release.set()
         worker._thread.join(timeout=5)
     capsys.readouterr()
+
+
+def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
+    """SPEC-021's whole subject, reachable through the fast return this PR added.
+
+    `flush()` returning True for a drain that was abandoned is the false success SPEC-021
+    exists to prevent — "a false success exactly where flush() matters most". The fast return
+    must therefore report `delivered`, not merely that the marker was answered: a review found
+    that dropping the `and marker.delivered` conjunct survived all 1105 tests, because the
+    sibling test pins only the True direction.
+    """
+    worker = Worker(AlwaysFailSink(), batch_size=10, flush_interval=0.01, max_retries=0)
+    worker.submit(_span("a"))
+    real_put = worker._queue.put
+
+    def put_then_die(item: object, timeout: float | None = None) -> None:
+        real_put(item, timeout=timeout)
+        worker._stop.set()
+        worker._thread.join(timeout=5)
+
+    worker._queue.put = put_then_die  # type: ignore[method-assign]
+
+    result = _flush_on_watchdog(worker, None)
+
+    capsys.readouterr()
+    assert worker.health().failed_batches == 1, "the premise: the drain abandoned the batch"
+    assert result == [False], "answered is not delivered — the batch it carried was abandoned"

@@ -341,8 +341,11 @@ class Worker:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
 
         This stays valid after :meth:`shutdown`: the counters are plain integers that outlive
-        the thread, and the final drain consumes the queue, so ``queued`` reads 0 rather than a
-        stale marker. The same applies to ``stopped_reason``, since a caller finding a dead
+        the thread, and the final drain consumes the queue. ``queued`` therefore reads 0 for a
+        worker nothing logged to afterwards — but not always: submissions accepted after the
+        shutdown stay queued on purpose (SPEC-030), and a ``flush()`` marker stranded by
+        racing it is answered and then counted, as ``Health.queued`` records. The same applies
+        to ``stopped_reason``, since a caller finding a dead
         worker will usually call ``shutdown()`` next. Reading it after a shutdown is in fact
         the point of ``retired`` and ``submitted_after_shutdown`` (SPEC-030 FR-001), which
         report a state only a retired worker can be in.
