@@ -204,11 +204,21 @@ continued to the sink the worker captured (measured: A got 4, B got 0, the confi
 `Health` gained `retired`/`submitted_after_shutdown`/`incomplete_swaps`, and a late `sink=` now
 swaps the live target.
 
+**SPEC-032 (post-close sink behaviour) is Completed** — the item SPEC-028 found, could not fix
+inside its own roster, and handed to SPEC-030, which established it was sink-level loss rather than
+lifecycle signalling and handed it on again. A closed sink still accepted work: `KafkaSink` produced
+into a batch nothing would flush again, `GooglePubSubSink` appended a future nothing would resolve,
+and the Redis sinks *succeeded* by reconnecting a client they had just disconnected — measured, one
+`info()` after `shutdown()` lost the event with every counter reading zero. All three now refuse.
+It also took SPEC-028's recorded lint-scope gap off SPEC-031, because the post-close roster derives
+from that gate: scope is now every sink class with an `emit`, and each records its post-close
+decision or has a double proving it refuses.
+
 **SPEC-031 is Draft** — the last of the 2026-08-05 full-codebase audit arc, validated in a second
 fresh context and unbuilt. Nothing in it is caught by CI (the suite was green throughout). Build
 order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-031** is
-next, and one item has no home yet: post-`close()` loss in `GooglePubSubSink`/`KafkaSink`, handed
-on by SPEC-028 and named in SPEC-030's delivery doc.
+next, and it is now the only unbuilt spec — its FR-002 (IPv6 UDP) is the one item SPEC-032's sweep
+of `sinks/` deliberately did not touch.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
@@ -446,6 +456,20 @@ where it starts.
   cancel the swap (the caller asked for that sink) but leaves the old one **open** and counts
   `incomplete_swaps`, on SPEC-027 FR-004's reasoning that a leaked resource beats a close raced
   against a write. (SPEC-030, arch §7, §9)
+- **A sink that released its transport refuses; one that released nothing keeps accepting** — the
+  SPEC-026 rule applied to the sink's own lifecycle, where an absorbed batch is a batch the worker
+  believes just the same. Both halves bind: three shipped sinks lost every post-`close()` event
+  (and Redis *succeeded*, leaking a reconnect nothing reaps), while making the stateless sinks
+  refuse would invent loss where a batch would have delivered — so which applies is a property of
+  the sink, recorded per class and enforced. Refusing moves no `losses()` counter: it is a failure
+  **reported** to the worker, not one absorbed, and counting both would report one loss twice. A
+  close landing *mid*-batch does not raise even when it catches everything — `publish()` already
+  happened, so the total-failure test is on **refusals**, not on successes (SPEC-018's rule that
+  only provable non-delivery may be retried). The guard is keyed on the *sink* being released, never
+  on client ownership, or every injected-client sink would keep accepting after `shutdown()`. The
+  lint's scope gate stopped guessing at the same time — every class in `sinks/` with an `emit`,
+  because a roster whose completeness is the point cannot rest on a heuristic, which is exactly how
+  two of the three sinks stayed invisible for four specs. (SPEC-032, arch §8, §13)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

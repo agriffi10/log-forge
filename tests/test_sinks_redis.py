@@ -1,4 +1,4 @@
-"""SPEC-010 — RedisStreamsSink/RedisListSink: pipelined XADD/RPUSH, retry, ownership (fake client)."""
+"""SPEC-010/032 — Redis sinks: pipelined XADD/RPUSH, retry, ownership, post-close refusal."""
 
 from __future__ import annotations
 
@@ -108,3 +108,52 @@ def test_owned_client_is_closed(monkeypatch) -> None:
     sink = RedisStreamsSink("s")  # no client -> owned, imports the (faked) redis module
     sink.close()
     assert client.closed is True
+
+
+def test_a_closed_sink_refuses_a_batch_without_moving_a_counter() -> None:
+    """Refusing is a reported failure, not absorbed loss (SPEC-032 FR-001)."""
+    client = FakeRedis()
+    sink = RedisListSink("logs", client=client)
+    sink._owns_client = True
+    sink.close()
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+
+    assert sink.losses() == (0, 0), "a refusal moved a loss counter"
+    assert client.pipelines == [], "the sink asked a closed client for a pipeline"
+
+
+def test_a_borrowed_client_surviving_its_sink_is_not_permission_to_keep_writing() -> None:
+    """A closed sink refuses whether or not it owned the connection (SPEC-032 FR-001).
+
+    ``close()`` leaves an injected client open — that is the caller's to release — so the client
+    would happily take the write. The flag marks *this sink* as released, and a guard keyed on
+    ownership instead would leave every borrowed-client sink accepting after ``shutdown()``,
+    which is the majority configuration in tests and in any app that manages its own pool.
+    """
+    client = FakeRedis()
+    sink = RedisStreamsSink("s", client=client)
+    sink.close()
+
+    assert client.closed is False, "an injected client must not be closed"
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert client.pipelines == []
+
+
+def test_close_is_idempotent() -> None:
+    """A second ``close()`` reaches the client no further than the first."""
+    closes: list[int] = []
+
+    class CountingRedis(FakeRedis):
+        def close(self) -> None:
+            closes.append(1)
+            super().close()
+
+    client = CountingRedis()
+    sink = RedisListSink("logs", client=client)
+    sink._owns_client = True
+    sink.close()
+    sink.close()
+    assert closes == [1]

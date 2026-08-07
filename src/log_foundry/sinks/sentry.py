@@ -38,6 +38,9 @@ class SentrySink:
     lock. This sink owns no transport: it delegates to a ``sentry_sdk`` built for capture from any
     thread, or to an ``HTTPSink`` that builds a fresh request per call and rebinds nothing.
     Its counters take the counter lock like every other sink's.
+
+    It also **adds no post-close guard** (SPEC-032 FR-003), for the same reason: neither backend
+    holds anything ``close()`` releases, so a batch emitted afterwards still reaches Sentry.
     """
 
     def __init__(
@@ -120,9 +123,12 @@ class SentrySink:
             )
 
     def close(self) -> None:
-        """Releases the HTTP fallback resource, if any (FR-012).
+        """Forwards to the HTTP fallback, whose own close releases nothing (FR-012).
 
-        Idempotent.
+        Idempotent, and it releases nothing — which is why the class docstring's post-close claim
+        holds despite this method calling a ``close()``. ``HTTPSink.close`` is a documented no-op,
+        since ``urllib`` builds a fresh connection per request; the forward exists so a future
+        ``HTTPSink`` that *did* hold a pool would be released here rather than leaked.
 
         Args:
           None.

@@ -28,6 +28,12 @@ class _RedisSink:
     execution never mutates the client. Its documented exceptions are ``PubSub`` and
     ``Pipeline`` objects, which must not be passed between threads — which is why the pipeline
     here is built and executed inside a single ``emit`` call and never stored on the instance.
+
+    It refuses an emit after :meth:`close` (SPEC-032 FR-001). Left unguarded this sink did not
+    fail after close, it *succeeded*: ``redis-py``'s pool reconnects transparently on the next
+    command, so a batch emitted after ``shutdown()`` opened a connection nothing would ever
+    reap — the same leak SPEC-028's review found in ``RabbitMQSink``, whose ``_active_channel``
+    reopened whatever ``close()`` had released.
     """
 
     def __init__(self, *, client: Any, url: str | None, max_retries: int) -> None:
@@ -56,6 +62,8 @@ class _RedisSink:
         self.stop_signal: threading.Event | None = None
         self.failed = 0
         self._counter_lock = threading.Lock()
+        self._closed = False
+        self._close_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports events abandoned past the retry bound (SPEC-026 FR-002).
@@ -75,6 +83,13 @@ class _RedisSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Pipelines the whole batch into one round trip, retrying on error (FR-005).
 
+        A closed sink refuses the batch before asking for a pipeline (SPEC-032 FR-001), since
+        asking would silently reopen the connection ``close()`` released. The refusal does not
+        depend on whether the sink owned the client: a borrowed client surviving its sink is the
+        caller's business, and is not permission to keep writing through a sink that has been
+        released. Refusing moves no counter here — it is a failure reported to the worker, which
+        records it in ``health().failed_batches``, not loss this sink absorbed.
+
         Args:
           batch: The events to buffer. An empty batch is a no-op.
 
@@ -82,13 +97,18 @@ class _RedisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent. The batch travels as one pipeline,
-            so such a failure delivered nothing: it is counted and then raised, giving the worker
-            its retry and ``health()`` the loss (SPEC-026 FR-001). There is no partial case to
-            protect, because the pipeline is all or nothing.
+          SinkDeliveryError: When the sink is closed. Also when the retry bound is spent: the
+            batch travels as one pipeline, so such a failure delivered nothing: it is counted and
+            then raised, giving the worker its retry and ``health()`` the loss (SPEC-026 FR-001).
+            There is no partial case to protect, because the pipeline is all or nothing.
         """
         if not batch:
             return
+        if self._closed:
+            raise SinkDeliveryError(
+                f"{type(self).__name__} delivered none of {len(batch)} event(s): "
+                "the sink is closed"
+            )
         for attempt in range(self.max_retries + 1):
             try:
                 pipe = self.client.pipeline()
@@ -114,6 +134,11 @@ class _RedisSink:
     def close(self) -> None:
         """Closes the connection only if the sink owns it (FR-005).
 
+        Idempotent, with the flag set under a lock so two concurrent calls cannot both reach
+        ``client.close()`` — ``atexit`` racing user code is the documented case. The flag is set
+        whether or not the client is owned, because it marks *this sink* as released rather than
+        the connection (SPEC-032 FR-001).
+
         Args:
           None.
 
@@ -123,8 +148,12 @@ class _RedisSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        if self._owns_client:
-            self.client.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owns_client:
+                self.client.close()
 
     def _stage(self, pipe: Any, event: dict[str, object]) -> None:
         """Stages one event onto the pipeline, in whatever form the subclass writes.

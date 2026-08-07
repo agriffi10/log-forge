@@ -25,6 +25,10 @@ class ElasticsearchSink(HTTPSink):
       dropped_unadjudicated: Events whose outcome a ``_bulk`` response did not describe, because
         its ``items`` array did not line up with the batch sent. Abandoned rather than retried,
         for SPEC-018's reason: the request succeeded, so re-sending would duplicate what landed.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
+    (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
+    is no transport held and ``close()`` releases nothing.
     """
 
     def __init__(self, url: str, *, index: str, auth: str | tuple[str, str] | None = None,

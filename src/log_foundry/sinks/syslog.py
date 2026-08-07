@@ -33,6 +33,12 @@ class SyslogSink:
     Each event becomes an RFC 5424 message whose ``PRI`` is derived from a configurable facility
     and a severity mapped from the event's level. UDP sends one datagram per event, TCP uses
     octet-counted framing (RFC 6587), and the whole sink is dependency-free.
+
+    It takes **no** transport lock (SPEC-028 FR-002) of its own: the socket it holds is a
+    :class:`~log_foundry.sinks._socket.SocketTransport`, which locks its own sends. Its
+    post-close refusal comes from there too (SPEC-032 FR-004) — a batch emitted after
+    ``close()`` reaches ``send_all`` and is refused with ``SinkDeliveryError`` without the
+    socket being reopened, so a guard here would only duplicate one that already holds.
     """
 
     def __init__(

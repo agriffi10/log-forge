@@ -333,6 +333,14 @@ retry risks duplicating), an **SQS sender fault** (SPEC-016 FR-006 — provably 
 byte-identical re-send can only fail the same way), and an **oversized** event (it can never fit,
 so there is nothing to retry). All three are reported through `losses()` instead.
 
+**The same rule reaches the sink's own lifecycle** (SPEC-032): a sink whose `close()` released or
+invalidated a transport must **raise** on a later non-empty `emit` rather than absorb it — a
+produce into a batch nothing will flush again, or a future nothing will resolve, is total failure
+by a different route. A sink holding nothing to release keeps **accepting**, because refusing a
+batch that would have delivered is loss the library invented. Which applies is a property of the
+sink, so each records its answer in its class docstring and a lint holds every sink to one.
+`emit([])` remains a no-op either way.
+
 Planned implementations:
 
 - **`StdoutSink`** — JSON lines to stdout. The **default**; zero-dependency, great for
@@ -565,6 +573,32 @@ constraint — never by being deleted quietly.
   the worker queue and the decorated function returns without waiting on anything. A caller who
   wants the orphan path off the critical path should open a span; that is what the
   buffer-then-flush pipeline is for.
+
+- **A process that only ever used the orphan path never closes its sink.** `shutdown()` is a no-op
+  when no worker was created (`_shutdown_worker` returns early), and the `atexit` registration
+  happens *inside* `_get_worker`, so neither runs for a process that only made level calls with no
+  active span — those emit synchronously on the caller's thread and build no worker. Measured: with
+  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open,
+  so **every** event is lost, not only the one after `shutdown()`. Found reviewing SPEC-032, whose
+  post-close guard is invisible here precisely because `close()` never happens. A process that opens
+  even one span is unaffected.
+
+  What makes it worth a spec rather than an accepted limit: **`health()` reads all-clear**
+  — `retired=False`, `submitted_after_shutdown=0`, `stopped_reason=None`, `sink=None` — because
+  every one of those describes a worker, and there is no worker. So SPEC-030's alert idiom is
+  structurally blind to it, which is the silent-loss shape SPEC-030 exists to end. It is a worker
+  lifecycle defect rather than a sink one, so SPEC-032 did not fix it; it is recorded here so the
+  post-close guarantee is not read as covering it, and it is **awaiting a spec**, not settled.
+
+- **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
+  sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
+  `MongoDBSink(client=…)`) does **not** close that client: it is the caller's to release, and
+  reaping a connection pool an application still uses elsewhere would be the library reaching
+  outside its own lifetime. The consequence is that a closed sink's client will happily take a
+  write, which is why the post-close refusal is keyed on the *sink* being released rather than on
+  ownership (SPEC-032 FR-001). A guard keyed on ownership would leave every injected-client sink
+  accepting after `shutdown()` — the majority configuration in tests and in any application that
+  manages its own pool.
 
 - **`shutdown()`'s timeout bounds the drain, not the sink's `close()`.** This narrows SPEC-027
   FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an

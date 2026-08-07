@@ -602,16 +602,31 @@ def _takes_the_transport_lock(
     return False
 
 
-def _sink_classes_holding_a_driver() -> list[tuple[str, ast.ClassDef]]:
-    """Returns every sink class that owns something a concurrent caller could corrupt.
+def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
+    """Returns every class in ``sinks/`` defining ``emit``, ``send_all`` or ``close``.
 
-    In scope: a class with an ``emit`` (or ``send_all``) whose module lazily imports a
-    third-party driver — the repo's optional-extra idiom — or which opens a socket, an event
-    loop, a database connection or a file handle of its own. ``AsyncFunctionDef`` is walked
-    alongside ``FunctionDef`` so a future async sink cannot drop out of scope silently.
+    This gate used to guess, admitting a *module* that imported something inside a function or
+    whose source contained one of six hardcoded handle tokens. SPEC-028's delivery doc recorded
+    what that costs — a lock added to ``HTTPSink.emit`` would have been invisible to the lint,
+    and so is anything else the guess does not happen to reach. A roster whose completeness is
+    the point cannot rest on a heuristic, so scope is now every implementation and the decision
+    is what varies (SPEC-032 FR-003).
+
+    ``close`` is in the trigger set as well as ``emit``, because the post-close decision is a
+    property of what ``close`` releases: a subclass overriding only ``close`` to release
+    something, while inheriting its parent's ``emit`` and its parent's recorded decision, would
+    otherwise be judged by nobody. No shipped class does that today; the gate is what keeps it
+    that way. A subclass overriding *neither* stays out of scope deliberately — it inherits both
+    the guard and the answer, and a duplicated claim would be noise.
+
+    ``base.Sink`` is excluded by name: it is the Protocol stating the contract, not a sink that
+    can satisfy it. ``AsyncFunctionDef`` is walked alongside ``FunctionDef`` so a future async
+    sink cannot drop out of scope silently.
 
     Args:
-      None.
+      root: The directory to scan, defaulting to the installed ``sinks/``. A test passes a
+        temporary directory to exercise the lints end to end against a real module, which is
+        what FR-003 asks for and what a synthetic AST node cannot demonstrate.
 
     Returns:
       One ``(module_stem, class node)`` pair per in-scope class.
@@ -623,33 +638,19 @@ def _sink_classes_holding_a_driver() -> list[tuple[str, ast.ClassDef]]:
 
     import log_foundry
 
-    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    if root is None:
+        root = pathlib.Path(log_foundry.__file__).parent / "sinks"
     found: list[tuple[str, ast.ClassDef]] = []
     for path in sorted(root.glob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        lazily_imported = any(
-            isinstance(inner, ast.Import | ast.ImportFrom)
-            for fn in ast.walk(tree)
-            if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
-            for inner in ast.walk(fn)
-        )
-        owns_a_handle = any(
-            token in source
-            for token in (
-                "socket.socket", "create_connection", "new_event_loop",
-                "sqlite3.connect", 'open(path, "a"', "open(self._path",
-            )
-        )
-        if not (lazily_imported or owns_a_handle):
-            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         found.extend(
             (path.stem, node)
             for node in tree.body
             if isinstance(node, ast.ClassDef)
+            and not (path.stem == "base" and node.name == "Sink")
             and any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-                and m.name in ("emit", "send_all")
+                and m.name in ("emit", "send_all", "close")
                 for m in node.body
             )
         )
@@ -673,9 +674,14 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
     one; the next accepted any class docstring citing the spec, so a sink documenting *why it
     locks* stayed exempt after its lock was deleted. The exemption is therefore the specific
     claim ``**no** transport lock`` — a sink may only opt out by asserting it needs none.
+
+    Scope widened in SPEC-032 FR-003 from the classes a heuristic believed held a driver to
+    every sink class, which brought in sixteen more. None of them needs a lock — they are
+    wrappers, ``urllib`` subclasses and in-memory sinks — but a class silently outside the lint
+    has recorded no decision at all, which is the state the three sinks SPEC-032 fixes were in.
     """
     undecided: list[str] = []
-    for stem, cls in _sink_classes_holding_a_driver():
+    for stem, cls in _sink_classes_with_an_emit():
         helpers = {
             m.name: m
             for m in cls.body
@@ -1009,73 +1015,208 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     assert all(isinstance(err, Exception) for err in errors)
 
 
-def _classes_taking_a_transport_lock() -> set[str]:
-    """Returns ``module.Class`` for every sink whose ``emit`` enters ``self._lock``.
+# The claim a sink makes to opt out of the post-close rule (SPEC-032 FR-003). Like SPEC-028's
+# lock exemption it is a specific assertion about behaviour rather than a mention of the topic,
+# so a docstring that merely discusses close() cannot satisfy it.
+ACCEPTS_AFTER_CLOSE = "**adds no post-close guard**"
 
-    Derived from the same AST walk the contract lint uses, so the post-close roster below cannot
-    drift away from the code the way a written list does.
+# Every sink proved to refuse a post-close emit, mapped to the key its driver double is built
+# under. Hand-written only because each needs its own double; what is *not* hand-written is which
+# sinks belong here — a class absent from both this map and the exemption claim fails the lint
+# below, which is the check the old CLOSED_SINKS roster could not make.
+POST_CLOSE_BUILDERS = {
+    "sqlite.SQLiteSink": "sqlite",
+    "rabbitmq.RabbitMQSink": "rabbitmq",
+    "mongodb.MongoDBSink": "mongodb",
+    "clickhouse.ClickHouseSink": "clickhouse",
+    "eventhubs.AzureEventHubsSink": "eventhubs",
+    "nats.NATSSink": "nats",
+    "_socket.SocketTransport": "socket",
+    "file.FileSink": "file",
+    "file.RotatingFileSink": "rotating",
+    "postgres.PostgresSink": "postgres",
+    "kafka.KafkaSink": "kafka",
+    "pubsub.GooglePubSubSink": "pubsub",
+    "redis._RedisSink": "redis",
+    # These two refuse through the transport they hold rather than a guard of their own, which is
+    # a claim worth testing rather than assuming (SPEC-032 FR-004).
+    "syslog.SyslogSink": "syslog",
+    "logstash.LogstashSink": "logstash",
+}
+
+
+def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
+    """Returns why a class is barred from the exemption claim, or ``None`` if it may make it.
+
+    The exemption is a docstring assertion, and an assertion is only as good as what it cannot
+    override. Review found it could override everything: removing ``SQLiteSink`` from the builder
+    map and adding the claim to its docstring turned a sink that commits and closes a connection
+    into an exempt one, and the suite went **green** while quietly losing two cases (1029 → 1027,
+    no red — the silent-test-deletion shape, reached through prose).
+
+    So three code-derived facts outrank the claim. Taking a transport lock in ``emit`` is the
+    strongest and restores the floor the pre-SPEC-032 roster had: that roster was derived from
+    exactly this property, and no docstring could exempt a locked sink from it. Carrying a
+    ``self._closed`` flag is the second — a class maintaining one is a class that refuses, so
+    claiming it accepts contradicts its own code. Nulling a ``self`` attribute in ``close`` is
+    the third: releasing a handle by dropping the reference to it is the one release shape that
+    cannot be confused with delegation.
+
+    **What this does not catch, stated rather than implied.** A second review defeated the first
+    two facts with a real module whose ``close`` called ``self._conn.close()`` and took no lock —
+    it walked through with the claim in its docstring. The third fact closes that particular
+    shape but not the general one, and the general one is deliberately left open: a rule reading
+    "calls ``.close()`` on a ``self`` attribute" also fires on ``FilteringSink``, ``TransformSink``
+    and ``SentrySink``, which release nothing of their own and correctly forward to an inner
+    sink. Telling ownership from delegation by syntax is the guesswork this spec removed from the
+    scope gate, so it is not reintroduced here. Two shipped sinks are outside all three facts for
+    the same reason — ``SyslogSink`` and ``LogstashSink`` refuse *through* the ``SocketTransport``
+    they hold — and both are on the roster with behavioural tests, which is what actually covers
+    them. The floor moved from "any sink may claim" to "any sink that neither locks, nor flags,
+    nor nulls a handle may claim"; a reviewer still has to read a new claim.
 
     Args:
-      None.
+      cls: The class to judge.
 
     Returns:
-      The qualified names.
+      A short reason the claim is refused, or ``None``.
 
     Raises:
       None.
     """
-    locked = set()
-    for stem, cls in _sink_classes_holding_a_driver():
-        helpers = {
-            m.name: m
-            for m in cls.body
-            if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-        }
-        entry = helpers.get("emit") or helpers.get("send_all")
-        if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
-            locked.add(f"{stem}.{cls.name}")
-    return locked
+    helpers = {
+        m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    entry = helpers.get("emit") or helpers.get("send_all")
+    if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
+        return "it takes a transport lock in emit, so it holds state a close releases"
+    for node in ast.walk(cls):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "_closed"
+            and isinstance(node.ctx, ast.Store)
+        ):
+            return "it maintains a _closed flag, which is what a refusing sink does"
+    close = helpers.get("close")
+    if close is not None:
+        for node in ast.walk(close):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is None
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    for target in node.targets
+                )
+            ):
+                return "its close() drops a handle it holds, so a later emit has nothing to use"
+    return None
 
 
-# Hand-written only because each sink needs its own driver double; the *coverage* of this map is
-# asserted against the AST by test_every_locked_sink_has_a_post_close_case below.
-CLOSED_SINKS = [
-    "sqlite", "rabbitmq", "mongodb", "clickhouse", "eventhubs", "nats",
-    "socket", "file", "rotating", "postgres",
-]
+def _undecided_post_close(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
+    """Returns the classes that neither have a post-close case nor validly claim they accept.
 
-_BUILDER_CLASSES = {
-    "sqlite": "sqlite.SQLiteSink",
-    "rabbitmq": "rabbitmq.RabbitMQSink",
-    "clickhouse": "clickhouse.ClickHouseSink",
-    "eventhubs": "eventhubs.AzureEventHubsSink",
-    "nats": "nats.NATSSink",
-    "socket": "_socket.SocketTransport",
-    "file": "file.FileSink",
-    "rotating": "file.RotatingFileSink",
-    "postgres": "postgres.PostgresSink",
-    # MongoDBSink takes no transport lock by design, but still needs the post-close rule.
-    "mongodb": "mongodb.MongoDBSink",
-}
+    Written as a function over its input rather than over the package so the failure path can be
+    exercised directly (see the synthetic-class tests below). A lint whose red path never runs is
+    a lint a refactor can defeat silently.
 
+    Args:
+      entries: ``(module_stem, class node)`` pairs to judge.
 
-def test_every_locked_sink_has_a_post_close_case() -> None:
-    """The post-close roster is derived from the code, not written alongside it.
+    Returns:
+      The qualified names of the undecided classes, sorted, each carrying why a claim it made
+      was refused.
 
-    This PR missed the roster three times before this test existed: FR-002's own list of seven
-    sinks, then the lint's module scan, then ``CLOSED_SINKS`` itself — which named six sinks
-    while nine classes took a transport lock, leaving ``SocketTransport`` reopening and leaking a
-    live TCP connection on the orphan path after ``shutdown()``. A list maintained by hand next
-    to a rule is a list that drifts; this makes a new locked sink fail until someone gives it a
-    double.
+    Raises:
+      None.
     """
-    covered = {_BUILDER_CLASSES[name] for name in CLOSED_SINKS}
-    missing = _classes_taking_a_transport_lock() - covered
-    assert not missing, f"locked sinks with no post-close test: {sorted(missing)}"
+    undecided = []
+    for stem, cls in entries:
+        name = f"{stem}.{cls.name}"
+        if name in POST_CLOSE_BUILDERS:
+            continue
+        documented = " ".join((ast.get_docstring(cls) or "").split())
+        claimed = ACCEPTS_AFTER_CLOSE in documented and "SPEC-032 FR-003" in documented
+        barred = _may_not_claim_it_accepts(cls)
+        if claimed and barred is None:
+            continue
+        undecided.append(f"{name} ({barred})" if claimed else name)
+    return sorted(undecided)
+
+
+def test_every_sink_class_records_a_post_close_decision() -> None:
+    """Every sink either refuses a post-close emit or asserts that it accepts one.
+
+    The roster this replaces was written by hand and checked afterwards against the sinks taking
+    a *transport lock* — which is how ``KafkaSink`` and ``GooglePubSubSink`` stayed outside it
+    for four specs while losing every event emitted after ``close()``. Neither takes a lock, so
+    neither was ever a candidate.
+
+    Refusal is established behaviourally, by :func:`test_a_closed_sink_refuses_a_batch_instead_of
+    _reaching_its_driver` below, not by finding a ``_closed`` token in the source: a flag checked
+    after the driver call would satisfy a source scan and lose the batch anyway. So a sink is
+    covered here only by having a driver double, and the alternative is the explicit claim — a
+    sink may opt out by asserting it accepts, never by being unreachable by a heuristic.
+    """
+    in_scope = _sink_classes_with_an_emit()
+    undecided = _undecided_post_close(in_scope)
+    assert not undecided, (
+        "these sinks neither have a post-close case proving they refuse, nor claim in the class "
+        f"docstring that they accept: {undecided}"
+    )
+    # The map must not outlive the code either: a renamed or deleted sink leaves a builder key
+    # nothing parametrizes, and the case it used to cover disappears without a failure.
+    stale = set(POST_CLOSE_BUILDERS) - {f"{stem}.{cls.name}" for stem, cls in in_scope}
+    assert not stale, f"post-close builders naming no sink class: {sorted(stale)}"
+
+
+def _synthetic_class(docstring: str) -> tuple[str, ast.ClassDef]:
+    """Parses a one-off sink class with the given docstring, for the lint's red path.
+
+    Args:
+      docstring: The class docstring to give it.
+
+    Returns:
+      A ``(module_stem, class node)`` pair shaped like the package scan's.
+
+    Raises:
+      None.
+    """
+    module = ast.parse(f'class BrandNewSink:\n    """{docstring}"""\n    def emit(self, b): ...\n')
+    cls = module.body[0]
+    assert isinstance(cls, ast.ClassDef)
+    return ("brandnew", cls)
+
+
+def test_a_sink_recording_no_post_close_decision_is_reported() -> None:
+    """The lint's red path runs, against the exact state ``KafkaSink`` was in for four specs.
+
+    FR-003 asks for a demonstration rather than a prose claim, because a lint whose failure path
+    is never exercised is one a refactor of its own matching can defeat silently. Three cases:
+    a docstring that says nothing, one that discusses ``close()`` without asserting anything, and
+    one making the claim but citing no spec — each must still be reported, and the third is the
+    mutant SPEC-028's review actually found (an exemption satisfied by topic rather than claim).
+    """
+    silent = _synthetic_class("A sink that records nothing at all.")
+    chatty = _synthetic_class("Its close() releases the connection and emit() ships a batch.")
+    uncited = _synthetic_class(f"This sink {ACCEPTS_AFTER_CLOSE}, but names no spec.")
+
+    assert _undecided_post_close([silent]) == ["brandnew.BrandNewSink"]
+    assert _undecided_post_close([chatty]) == ["brandnew.BrandNewSink"]
+    assert _undecided_post_close([uncited]) == ["brandnew.BrandNewSink"]
+
+    claimed = _synthetic_class(f"This sink {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003): nothing held.")
+    assert _undecided_post_close([claimed]) == []
 
 
 def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Builds one locked sink with an injected driver double, or skips if unavailable.
+    """Builds one roster sink with an injected driver double, or skips if unavailable.
+
+    Every double keeps *working* after ``close()`` on purpose. A double that started failing then
+    would let a deleted guard still produce an exception, and the test would pass against the
+    bug it exists to catch.
 
     Args:
       name: Which sink to build.
@@ -1213,21 +1354,99 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
         return nats_mod.NATSSink("events", client=FakeClient()), lambda: len(opened)
 
+    if name == "kafka":
+        from log_foundry.sinks.kafka import KafkaSink
+
+        class Producer:
+            # Deliberately still working after flush(), as confluent-kafka's is: produce()
+            # accepts into the local batch whether or not anything will ever drain it again.
+            # A double that broke after close would pass with the guard deleted.
+            def produce(self, topic: str, **kwargs: object) -> None:
+                opened.append("produce")
+
+            def poll(self, timeout: float) -> int:
+                return 0
+
+            def flush(self) -> None:
+                pass
+
+        return KafkaSink("logs", producer=Producer()), lambda: len(opened)
+
+    if name == "pubsub":
+        from log_foundry.sinks.pubsub import GooglePubSubSink
+
+        class Future:
+            def result(self) -> None:
+                pass
+
+        class Publisher:
+            def publish(self, topic: str, data: bytes | None = None) -> Future:
+                opened.append("publish")
+                return Future()
+
+        return GooglePubSubSink("projects/p/topics/t", client=Publisher()), lambda: len(opened)
+
+    if name == "redis":
+        from log_foundry.sinks.redis import RedisListSink
+
+        class Pipeline:
+            def rpush(self, key: str, value: str) -> None:
+                pass
+
+            def execute(self) -> None:
+                pass
+
+        class Client:
+            # close() disconnects redis-py's pool and the next command transparently reopens, so
+            # a post-close emit *succeeds* against a real client — leaking a connection nothing
+            # will reap rather than raising. That is what the counter here records.
+            def pipeline(self) -> Pipeline:
+                opened.append("pipeline")
+                return Pipeline()
+
+            def close(self) -> None:
+                pass
+
+        sink = RedisListSink("logs", client=Client())
+        sink._owns_client = True
+        return sink, lambda: len(opened)
+
+    if name in ("syslog", "logstash"):
+        # Neither holds a guard of its own: both delegate to SocketTransport, and the point of
+        # the case is that the delegation actually carries the refusal (FR-004).
+        fake = SplittingSocket()
+
+        def make_tcp(host: str, port: int, timeout: float):
+            opened.append("connect")
+            return fake
+
+        monkeypatch.setattr(_socket, "_make_tcp", make_tcp)
+        if name == "syslog":
+            sink = SyslogSink(host="localhost", port=5140, transport="tcp")
+        else:
+            from log_foundry.sinks.logstash import LogstashSink
+
+            sink = LogstashSink(host="localhost", port=5140, transport="tcp")
+        sink.emit([event(0, 0)])
+        return sink, lambda: len(opened)
+
     raise AssertionError(f"no double for {name!r}")
 
 
-@pytest.mark.parametrize("name", CLOSED_SINKS)
+@pytest.mark.parametrize("name", sorted(POST_CLOSE_BUILDERS.values()))
 def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emitting after ``close()`` raises ``SinkDeliveryError`` and touches no driver.
 
-    Every locked sink gets the same rule, because three of them had three different answers. The
-    driver-contact assertion is the load-bearing half: ``RabbitMQSink`` had a ``_closed`` flag
-    that ``close()`` honoured and ``emit`` did not, and ``_active_channel`` reopens a connection
-    whenever it finds none — so one ``log_foundry.info()`` after ``shutdown()`` opened an AMQP
-    connection nothing would ever reap. Asserting only that a ``SinkDeliveryError`` came back
-    would have passed against that leak.
+    Every sink on the roster gets the same rule, because they kept arriving at different answers
+    on their own. The driver-contact assertion is the load-bearing half: ``RabbitMQSink`` had a
+    ``_closed`` flag that ``close()`` honoured and ``emit`` did not, and ``_active_channel``
+    reopens a connection whenever it finds none — so one ``log_foundry.info()`` after
+    ``shutdown()`` opened an AMQP connection nothing would ever reap. ``RedisListSink`` did the
+    same through ``redis-py``'s reconnecting pool. Asserting only that a ``SinkDeliveryError``
+    came back would have passed against both leaks, and against ``KafkaSink`` accepting a produce
+    into a batch nothing would flush again.
     """
     sink, driver_calls = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
@@ -1242,7 +1461,7 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     assert driver_calls() == before, f"{name} reached its driver after close()"
 
 
-@pytest.mark.parametrize("name", CLOSED_SINKS)
+@pytest.mark.parametrize("name", sorted(POST_CLOSE_BUILDERS.values()))
 def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1323,3 +1542,210 @@ def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
     assert errors == []
     assert producer.overlaps == 0, f"{producer.overlaps} interleaved producer sequences"
     assert producer.sent == THREADS * PER_THREAD * per_batch
+
+
+def test_pubsub_sets_its_closed_flag_before_it_releases_the_futures_lock() -> None:
+    """When ``close()`` releases the futures lock, the flag it guards is already set.
+
+    This is the ordering :meth:`GooglePubSubSink.close`'s docstring claims, and review found it
+    tested by nothing: moving ``self._closed = True`` to *after* the swap left the whole suite
+    green while restoring the orphaned-future loss the flag exists to prevent. The existing
+    mid-batch test cannot see it — it calls ``close()`` synchronously from inside ``publish()``,
+    so the swap and the flag set are atomic with respect to the append.
+
+    Nor can a two-thread race see it reliably, and the first version of this test proved that by
+    passing against the mutant: parking an emitter and running the close to completion before
+    releasing it means the flag *is* set by the time the emitter looks, whichever order the
+    close used. The window is real but a few instructions wide. So this observes the invariant
+    directly rather than trying to land inside it — at the instant the closing thread leaves the
+    critical section, is the flag set? Correct code: yes. Flag moved after the swap: no. That is
+    deterministic, needs no timing, and is exactly the claim it is named for.
+
+    It is named for the flag and not for the swap because that is all it checks: moving the
+    *swap* out of the lock while leaving the flag in leaves this green. A second review found
+    that, and it was a fair reading of the old name. The swap's placement is SPEC-028's decision
+    rather than this spec's, and with the flag set first an append cannot be orphaned either
+    way — the cost of moving it is two concurrent closes resolving one list, not loss.
+    """
+    from log_foundry.sinks.pubsub import GooglePubSubSink
+
+    class ObservingLock:
+        """A real lock that records the sink's closed flag as each holder leaves."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.flag_on_exit: list[bool] = []
+
+        def __enter__(self) -> Self:
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            self.flag_on_exit.append(sink._closed)
+            self._lock.release()
+            return False
+
+    class Future:
+        def result(self) -> None:
+            pass
+
+    class Publisher:
+        def publish(self, topic: str, data: bytes | None = None) -> Future:
+            return Future()
+
+    sink = GooglePubSubSink("projects/p/topics/t", client=Publisher())
+    observer = ObservingLock()
+    sink._futures_lock = observer  # type: ignore[assignment]
+
+    sink.emit([{"a": 1}])
+    assert observer.flag_on_exit == [False], "the emit's append saw a closed sink"
+
+    sink.close()
+    assert observer.flag_on_exit[-1] is True, (
+        "close() left the futures lock with _closed still False: an append winning the lock "
+        "between the swap and the flag lands on a list nothing will ever resolve"
+    )
+
+
+def test_kafka_sets_its_closed_flag_before_flushing() -> None:
+    """An emit arriving during the flush is refused, not produced into a drained batch.
+
+    ``close()``'s docstring claims the flag is set *before* ``flush()`` for exactly this reason,
+    and review found the claim untested: moving the assignment after the flush left the suite
+    green. The producer double parks inside ``flush()``, which is the only window in which the
+    two orderings differ.
+    """
+    from log_foundry.sinks.kafka import KafkaSink
+
+    flushing = threading.Event()
+    may_finish = threading.Event()
+    produced: list[object] = []
+
+    class ParkingProducer:
+        def produce(self, topic: str, **kwargs: object) -> None:
+            produced.append(topic)
+
+        def poll(self, timeout: float) -> int:
+            return 0
+
+        def flush(self) -> None:
+            flushing.set()
+            may_finish.wait(timeout=10)
+
+    sink = KafkaSink("logs", producer=ParkingProducer())
+    closer = threading.Thread(target=sink.close)
+    closer.start()
+    assert flushing.wait(timeout=10), "the closing thread never reached flush()"
+
+    refused: list[BaseException] = []
+    try:
+        sink.emit([{"a": 1}])
+    except BaseException as exc:
+        refused.append(exc)
+
+    may_finish.set()
+    closer.join(timeout=10)
+
+    assert produced == [], "a message was produced into a batch the flush had walked past"
+    assert refused and isinstance(refused[0], SinkDeliveryError), (
+        f"an emit during the flush was not refused: {refused}"
+    )
+
+
+def test_the_lints_reject_a_real_new_sink_module_that_records_nothing(tmp_path: Path) -> None:
+    """The end-to-end path, against a real module rather than a synthetic AST node.
+
+    FR-003 asks that adding a sink with a releasing ``close()`` and no guard fails the suite, and
+    asks for it *demonstrated in the run*. The synthetic-class test above exercises the judging
+    function; this exercises the scan that feeds it — file discovery, the ``base.Sink``
+    exclusion, and the trigger set — which is the half a refactor of the glob or the method names
+    would silently break.
+
+    The second class is the hole review found: it overrides only ``close()`` and inherits its
+    ``emit``, so under the old ``emit``-only trigger set it was judged by nobody.
+    """
+    (tmp_path / "newsink.py").write_text(
+        '"""A brand-new sink module."""\n'
+        "\n"
+        "class BrandNewSink:\n"
+        '    """Holds a connection and releases it, and records no decision."""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): self._conn = None\n"
+        "\n"
+        "class SubclassOverridingOnlyClose(BrandNewSink):\n"
+        '    """Inherits emit, overrides close to release a pool."""\n'
+        "    def close(self): self._pool = None\n",
+        encoding="utf-8",
+    )
+
+    found = {f"{stem}.{cls.name}" for stem, cls in _sink_classes_with_an_emit(tmp_path)}
+    assert found == {"newsink.BrandNewSink", "newsink.SubclassOverridingOnlyClose"}, (
+        f"the scan missed a class: {found}"
+    )
+    assert _undecided_post_close(_sink_classes_with_an_emit(tmp_path)) == [
+        "newsink.BrandNewSink",
+        "newsink.SubclassOverridingOnlyClose",
+    ], "a new sink recording no post-close decision was not reported"
+
+
+def test_three_code_derived_facts_outrank_the_exemption_claim(tmp_path: Path) -> None:
+    """A docstring cannot exempt a sink that locks, flags, or drops a handle (SPEC-032 FR-003).
+
+    Review defeated the first version of this lint by deleting ``SQLiteSink`` from the builder
+    map and adding the exemption claim to its docstring: the suite went green and quietly lost
+    two cases (1029 → 1027, no red). The claim is a docstring assertion, and an assertion is only
+    as good as what it cannot override.
+
+    A second review then defeated the first two facts with ``DelegatingLiar``'s shape below, so
+    the third was added. It is deliberately *not* general — see
+    :func:`_may_not_claim_it_accepts` for why "calls ``.close()`` on a ``self`` attribute" is not
+    a rule this lint can carry, and which sinks are consequently covered by their behavioural
+    tests rather than by this floor. ``DelegatingLiar`` is asserted as **not caught** so that
+    limit is pinned rather than forgotten: it fails here the day someone widens the rule, which
+    is the prompt to check the wrappers for false positives.
+    """
+    claim = f"It {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003): nothing is held."
+    (tmp_path / "liar.py").write_text(
+        '"""Sinks whose code contradicts their docstring."""\n'
+        "\n"
+        "class LockedLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch):\n"
+        "        with self._lock:\n"
+        "            self._conn.write(batch)\n"
+        "    def close(self): ...\n"
+        "\n"
+        "class FlaggedLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): self._closed = True\n"
+        "\n"
+        "class NullingLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): self._conn.write(batch)\n"
+        "    def close(self):\n"
+        "        self._conn.close()\n"
+        "        self._conn = None\n"
+        "\n"
+        "class DelegatingLiar:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): self._conn.write(batch)\n"
+        "    def close(self): self._conn.close()\n"
+        "\n"
+        "class HonestSink:\n"
+        f'    """{claim}"""\n'
+        "    def emit(self, batch): ...\n"
+        "    def close(self): ...\n",
+        encoding="utf-8",
+    )
+
+    reported = _undecided_post_close(_sink_classes_with_an_emit(tmp_path))
+    caught = {name.split(" ", 1)[0] for name in reported}
+    assert "liar.LockedLiar" in caught, f"a sink locking its transport claimed it accepts: {reported}"
+    assert "liar.FlaggedLiar" in caught, f"a sink carrying a _closed flag claimed it accepts: {reported}"
+    assert "liar.NullingLiar" in caught, f"a sink dropping its handle claimed it accepts: {reported}"
+    assert "liar.HonestSink" not in caught, f"a stateless sink was refused its claim: {reported}"
+    assert "liar.DelegatingLiar" not in caught, (
+        "the recorded limit has moved: a rule now catches the delegation shape. Check "
+        "FilteringSink, TransformSink and SentrySink for false positives before widening it."
+    )

@@ -61,14 +61,19 @@ field means — SPEC-026 defines it as *the configured sink's own* counters, and
 that no longer exist is a different claim. Documented in `health()`'s docstring; the stderr lines
 those losses produced remain the durable record.
 
-**Post-close sink loss is still unowned, and this spec is not its home.** SPEC-028's delivery doc
+~~**Post-close sink loss is still unowned, and this spec is not its home.** SPEC-028's delivery doc
 asked that it be named here explicitly: `GooglePubSubSink.emit` after `close()` appends futures
 nothing will resolve, and `KafkaSink` accepts produces past close. That is the SPEC-026 silent-loss
 shape one call later, at the *sink* level. SPEC-030's signals do not reach it — `retired` describes
 the worker, and a sink accepting writes after its own `close()` is invisible to it — and neither
 sink takes a transport lock, so neither is in SPEC-028's enforced roster. SPEC-031 does not cover it
 either. It needs a fix of its own, alongside the two sinks that already refuse (`SQLiteSink`,
-`MongoDBSink`) and the lint-scope gap SPEC-028 recorded.
+`MongoDBSink`) and the lint-scope gap SPEC-028 recorded.~~ — **closed by SPEC-032**, which is that
+fix. The reasoning above was confirmed by measurement rather than merely inherited: an
+`info()` after `shutdown()` into a `KafkaSink` lost the event with `submitted_after_shutdown`
+reading `0`, because the orphan path emits on the caller's thread and never passes through
+`submit`. SPEC-032 took the lint-scope gap with it, since the post-close roster derives from that
+gate.
 
 **The end-to-end swap budget is resolved at call time, not bound as a default argument.**
 `_swap_live_sink` passes `worker.DEFAULT_SWAP_TIMEOUT` explicitly. A default argument is bound at

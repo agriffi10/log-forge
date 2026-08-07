@@ -18,6 +18,10 @@ class LokiSink(HTTPSink):
     Events are grouped into streams by a configurable set of label keys, each stream carrying
     values of ``[<nanosecond_timestamp_str>, <log_line>]``. Timestamps are derived by parsing the
     event's ISO-8601 ``timestamp``, falling back to emit-time now.
+
+    It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
+    (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
+    is no transport held and ``close()`` releases nothing.
     """
 
     def __init__(self, url: str, *, labels: tuple[str, ...] = ("service", "env", "level"),

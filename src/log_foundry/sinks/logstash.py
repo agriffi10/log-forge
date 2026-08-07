@@ -23,6 +23,14 @@ class LogstashSink:
     one newline-terminated line over a raw TCP or UDP socket, reusing
     :class:`~log_foundry.sinks._socket.SocketTransport`. Either backend handles its own bounded
     retry and raises on total failure of its own accord, so ``emit`` needs no rule of its own.
+
+    It takes **no** transport lock (SPEC-028 FR-002) of its own: whichever backend it built owns
+    that decision — ``SocketTransport`` locks its sends, ``HTTPSink`` holds no transport to
+    guard. The post-close rule follows the same split (SPEC-032 FR-004), and the two modes
+    genuinely differ: in socket mode a batch after ``close()`` is refused with
+    ``SinkDeliveryError`` and reopens nothing, while in HTTP mode ``close()`` released nothing
+    and the batch still ships. Both are the backend's answer, correctly, rather than one this
+    class invents on top.
     """
 
     def __init__(

@@ -91,6 +91,10 @@ class SQSSink:
     ``emit`` — which is what keeps it clear of the documented caveat that calling
     ``boto3.client()`` concurrently can produce response-ordering faults. Nothing else here is
     rebound after construction.
+
+    It also **adds no post-close guard** (SPEC-032 FR-003): ``close()`` is a documented no-op,
+    because the client is the caller's to release or the SDK's to reap, so a batch emitted
+    afterwards still reaches the queue.
     """
 
     MAX_BATCH = 10
