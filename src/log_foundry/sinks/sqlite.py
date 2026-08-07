@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 
 from log_foundry.sinks._chunk import valid_identifier
 
@@ -18,8 +19,14 @@ class SQLiteSink:
     For local dev, debugging, air-gapped hosts or simple archival, an embedded SQLite file is a
     durable sink you can open later and query with plain SQL. Each event is stored as its full
     JSON — the source of truth — plus a few columns projected out for cheap filtering, which are
-    ``NULL`` when absent. Standard library only, and a single-process, single-worker-thread
-    writer is assumed (arch §9).
+    ``NULL`` when absent. Standard library only.
+
+    The driver requirement satisfied (SPEC-028 FR-002): ``check_same_thread=False`` switches off
+    ``sqlite3``'s own same-thread guard, and ``with connection`` is a transaction scope on the
+    shared connection rather than a per-caller one — two threads inside it at once share a single
+    implicit transaction, so one thread's rollback discards rows the other had already inserted.
+    A lock restores the one-writer-at-a-time the guard used to enforce. Cross-*process* writers
+    to one database file remain out of scope.
     """
 
     def __init__(
@@ -33,8 +40,9 @@ class SQLiteSink:
         """Connects to the database and, by default, provisions the schema.
 
         The connection is opened with ``check_same_thread=False``: the background worker is a
-        different thread from the one that ran ``configure()`` and is the sole writer, so
-        SQLite's same-thread guard would only get in the way.
+        different thread from the one that ran ``configure()``, so SQLite's same-thread guard
+        would reject every insert. It is not the sole writer — the orphan path emits on the
+        caller's thread (SPEC-028) — which is why the lock below replaces what the guard gave up.
 
         Args:
           database: The database file to open, ignored when a connection is injected.
@@ -61,6 +69,7 @@ class SQLiteSink:
             else sqlite3.connect(database, check_same_thread=False)
         )
         self._closed = False
+        self._lock = threading.Lock()
         if create_table:
             self._ensure_schema()
 
@@ -68,7 +77,9 @@ class SQLiteSink:
         """Inserts every event in one transaction (FR-003).
 
         ``with connection`` opens a transaction and commits on success or rolls back on error,
-        so the whole batch lands atomically.
+        so the whole batch lands atomically. The lock holds that transaction to one thread
+        (SPEC-028 FR-002); the row-building above it needs no protection, but sits inside for
+        simplicity and costs nothing an uncontended lock does not.
 
         Args:
           batch: The events to insert.
@@ -84,7 +95,7 @@ class SQLiteSink:
         ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.executemany(
                 f'INSERT INTO "{self._table}" ({columns}) VALUES ({placeholders})', rows
             )
@@ -92,7 +103,8 @@ class SQLiteSink:
     def close(self) -> None:
         """Commits pending work and closes only a connection the sink owns (FR-003).
 
-        Idempotent.
+        Idempotent, and takes the emit lock so it never closes the connection out from under an
+        in-flight transaction (SPEC-028 FR-002).
 
         Args:
           None.
@@ -103,12 +115,13 @@ class SQLiteSink:
         Raises:
           sqlite3.Error: If the commit or close fails.
         """
-        if self._closed:
-            return
-        self._conn.commit()
-        if self._owns_connection:
-            self._conn.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._conn.commit()
+            if self._owns_connection:
+                self._conn.close()
+            self._closed = True
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

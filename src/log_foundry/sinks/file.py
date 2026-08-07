@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import TextIO
 
@@ -22,8 +23,12 @@ class FileSink:
 
     Not every deployment ships to a cloud queue; local dev, debugging, air-gapped hosts and
     simple archival just want events on the local disk. Writes are synchronous stdlib calls
-    only, and a single-process, single-worker-thread writer is assumed (arch §9) — cross-process
-    coordination is out of scope.
+    only.
+
+    Writers within the process are serialized on a lock, because ``emit`` may be called
+    concurrently (SPEC-028 FR-002) — this module claimed a single worker thread until that spec
+    measured the orphan path emitting on application threads at the same time. Cross-*process*
+    coordination remains out of scope: two processes appending to one path are on their own.
     """
 
     def __init__(self, path: str, *, encoding: str = "utf-8") -> None:
@@ -47,9 +52,15 @@ class FileSink:
         self._encoding = encoding
         self._stream: TextIO = open(path, "a", encoding=encoding)
         self._closed = False
+        self._lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Writes every event as one newline-terminated ``json.dumps`` line, then flushes.
+
+        The lock covers the whole batch rather than each line (SPEC-028 FR-002). A text stream
+        does not promise that one ``write`` is atomic against another, so per-line locking could
+        still interleave two events' bytes; batch-wide locking also keeps a batch contiguous in
+        the file, which is what makes the output readable.
 
         Args:
           batch: The events to write.
@@ -60,12 +71,16 @@ class FileSink:
         Raises:
           OSError: If the write or flush fails (FR-001).
         """
-        for event in batch:
-            self._stream.write(json.dumps(event) + "\n")
-        self._stream.flush()
+        with self._lock:
+            for event in batch:
+                self._stream.write(json.dumps(event) + "\n")
+            self._stream.flush()
 
     def close(self) -> None:
         """Flushes and closes the file handle, with a second call a no-op (FR-001).
+
+        Taking the same lock ``emit`` takes means a close waits for an in-flight write rather
+        than pulling the stream out from under it (SPEC-028 FR-002).
 
         Args:
           None.
@@ -76,11 +91,12 @@ class FileSink:
         Raises:
           OSError: If the flush or close fails.
         """
-        if self._closed:
-            return
-        self._stream.flush()
-        self._stream.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._stream.flush()
+            self._stream.close()
+            self._closed = True
 
 
 class RotatingFileSink:
@@ -95,6 +111,11 @@ class RotatingFileSink:
     count, and opens a fresh active file — a backup count of zero keeps none, simply replacing
     the active file. No event is lost across a rotation, because the rotate happens before the
     pending event is written and the event lands in the fresh file.
+
+    A rotation rebinds the active stream, so it is the sink where concurrent writers did real
+    damage: a second thread mid-``emit`` could write to the handle rotation had just closed, or
+    to the pre-rotation file it had already renamed away. Both are serialized on a lock
+    (SPEC-028 FR-002).
     """
 
     def __init__(
@@ -136,9 +157,15 @@ class RotatingFileSink:
         self._size = os.path.getsize(path) if os.path.exists(path) else 0
         self._next_rollover = self._schedule_next()
         self._closed = False
+        self._lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Appends each event, rotating first whenever a size or time trigger fires (FR-002).
+
+        The lock spans the whole batch, so the decide-rotate-write-account sequence is
+        indivisible (SPEC-028 FR-002). Guarding only ``_rotate`` would not be enough: the
+        ``_should_rotate`` check and the write that follows it must see the same stream, or a
+        rotation between them sends the line to a closed handle.
 
         Args:
           batch: The events to write.
@@ -149,17 +176,22 @@ class RotatingFileSink:
         Raises:
           OSError: If a write, flush or rotation fails.
         """
-        for event in batch:
-            line = json.dumps(event) + "\n"
-            data = len(line.encode(self._encoding))
-            if self._should_rotate(data):
-                self._rotate()
-            self._stream.write(line)
-            self._size += data
-        self._stream.flush()
+        with self._lock:
+            for event in batch:
+                line = json.dumps(event) + "\n"
+                data = len(line.encode(self._encoding))
+                if self._should_rotate(data):
+                    self._rotate()
+                self._stream.write(line)
+                self._size += data
+            self._stream.flush()
 
     def close(self) -> None:
         """Flushes and closes the active handle, with a second call a no-op (FR-002).
+
+        Taking the same lock ``emit`` takes means a close waits for an in-flight write, and in
+        particular never lands between a rotation and the write it was making room for
+        (SPEC-028 FR-002).
 
         Args:
           None.
@@ -170,11 +202,12 @@ class RotatingFileSink:
         Raises:
           OSError: If the flush or close fails.
         """
-        if self._closed:
-            return
-        self._stream.flush()
-        self._stream.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._stream.flush()
+            self._stream.close()
+            self._closed = True
 
     @staticmethod
     def _rollover_seconds(when: str | None, interval: int) -> float | None:

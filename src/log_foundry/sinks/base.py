@@ -62,6 +62,18 @@ class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Ships a batch of serialized event dicts.
 
+        **May be called concurrently from more than one thread, and must tolerate it**
+        (SPEC-028 FR-001). The background worker drains on its own thread, and a level call
+        made with no active span emits synchronously on the *caller's* thread (arch §12), which
+        may be any of the application's — an audit observed one sink object entered by two
+        application threads and the worker at once. An implementation holding mutable transport
+        state, such as a stream it rebinds, a reused socket or a connection with transaction
+        scope, must serialize access to it for the whole span of the operation that assumes
+        exclusivity. One that holds no such state need do nothing.
+
+        This is a requirement on implementations, not a promise the library serializes on their
+        behalf. It cannot: the orphan path runs on a thread the library does not own.
+
         Raise when the batch delivered nothing and it was non-empty — the worker's bounded
         retry and ``health().failed_batches`` depend on that signal, and a retry there cannot
         duplicate anything (SPEC-026 FR-001). Raise after the sink's own retries are spent, so
@@ -87,6 +99,13 @@ class Sink(Protocol):
 
     def close(self) -> None:
         """Flushes and releases any resources.
+
+        **May be called while an ``emit`` is in flight on another thread** (SPEC-028 FR-001).
+        It must therefore either wait for that emit or become a no-op, and must never release a
+        resource a concurrent ``emit`` is about to use — a half-released transport is worse than
+        an unreleased one, because the emit then fails against a closed handle instead of
+        succeeding. Taking the same lock ``emit`` takes satisfies this; so does an idempotent
+        guard checked under that lock.
 
         Args:
           None.
