@@ -214,11 +214,15 @@ It also took SPEC-028's recorded lint-scope gap off SPEC-031, because the post-c
 from that gate: scope is now every sink class with an `emit`, and each records its post-close
 decision or has a double proving it refuses.
 
-**SPEC-031 is Draft** — the last of the 2026-08-05 full-codebase audit arc, validated in a second
-fresh context and unbuilt. Nothing in it is caught by CI (the suite was green throughout). Build
-order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-031** is
-next, and it is now the only unbuilt spec — its FR-002 (IPv6 UDP) is the one item SPEC-032's sweep
-of `sinks/` deliberately did not touch.
+**SPEC-031 is Draft and is the only unbuilt spec** — the last of the 2026-08-05 audit arc, validated
+in a second fresh context. Nothing in it is caught by CI (the suite was green throughout). Build
+order and the grouping's reasoning are in `@docs/specs/INDEX.md` → Arcs. It gained **FR-006** on
+2026-08-07, which is *not* residue and should be built last and reviewed on its own: a process that
+only ever logs outside a span creates no worker, so `atexit` is never registered (it is registered
+*inside* `_get_worker`) and `shutdown()` returns early — the sink is never closed (every event lost
+on a locally-buffering sink; the flush and the resource on a synchronous one) and `health()` reads
+all-clear, because every field describes a worker that does not exist.
+Found reviewing SPEC-032, whose post-close guard is invisible there because `close()` never happens.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing

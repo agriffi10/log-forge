@@ -35,7 +35,7 @@ to status only — no prose.
 | [SPEC-028](SPEC-028-sink-concurrency-contract.md) | The Sink Concurrency Contract | Completed | SPEC-002, SPEC-004, SPEC-008 |
 | [SPEC-029](SPEC-029-diagnostic-output-safety.md) | Diagnostic Output Safety | Completed | SPEC-017, SPEC-019 |
 | [SPEC-030](SPEC-030-lifecycle-signals.md) | Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration | Completed | SPEC-013, SPEC-019 |
-| [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-008, SPEC-009, SPEC-020 |
+| [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Draft | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 
 ## Arcs (build order)
@@ -132,8 +132,9 @@ Group related specs and record the order to build them in. Delete this section i
   generalizes, SPEC-028 for the lint and roster it widens, and SPEC-030 for the finding that its own
   signals cannot reach this. Also absorbs the lint-scope item SPEC-028 had provisionally left to
   SPEC-031, since the post-close roster derives from that gate. Build after 030; nothing depends
-  on it. **It hands one item on, unowned:** a process that only ever uses the orphan path builds
-  no worker, so `shutdown()` is a no-op, `atexit` is never registered, the sink is never closed
-  and every event is lost — with `health()` reading all-clear, because each field describes a
-  worker that does not exist. Found in SPEC-032's review, recorded in `architecture.md` §13, and
-  out of its scope: it is `decorator.py` lifecycle, not sink behaviour. Needs a spec.
+  on it. **It handed one item on:** a process that only ever uses the orphan path builds no worker,
+  so `shutdown()` is a no-op, `atexit` is never registered and the sink is never closed — losing
+  every event on a locally-buffering sink, the flush and the resource on a synchronous one — with
+  `health()` reading all-clear, because each field describes a worker that does not exist. Found in SPEC-032's review and out of its scope (it is `decorator.py` lifecycle, not sink
+  behaviour); now **SPEC-031 FR-006**, which is why that spec's dependency list gained SPEC-004 and
+  SPEC-030 and why it is no longer purely residue.

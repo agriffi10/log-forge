@@ -578,8 +578,9 @@ constraint — never by being deleted quietly.
   when no worker was created (`_shutdown_worker` returns early), and the `atexit` registration
   happens *inside* `_get_worker`, so neither runs for a process that only made level calls with no
   active span — those emit synchronously on the caller's thread and build no worker. Measured: with
-  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open,
-  so **every** event is lost, not only the one after `shutdown()`. Found reviewing SPEC-032, whose
+  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open, so
+  every event is lost — the cost is sink-dependent, and against a *synchronous* sink the events land
+  and what is lost is the flush and the released resource. Found reviewing SPEC-032, whose
   post-close guard is invisible here precisely because `close()` never happens. A process that opens
   even one span is unaffected.
 
@@ -588,7 +589,9 @@ constraint — never by being deleted quietly.
   every one of those describes a worker, and there is no worker. So SPEC-030's alert idiom is
   structurally blind to it, which is the silent-loss shape SPEC-030 exists to end. It is a worker
   lifecycle defect rather than a sink one, so SPEC-032 did not fix it; it is recorded here so the
-  post-close guarantee is not read as covering it, and it is **awaiting a spec**, not settled.
+  post-close guarantee is not read as covering it. **Owned by SPEC-031 FR-006** (added 2026-08-07),
+  which strikes this entry through when it lands: it is a defect awaiting a fix, not a constraint
+  this project accepts, and it sits in §13 only until then.
 
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
