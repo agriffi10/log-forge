@@ -239,6 +239,33 @@ def test_the_swap_drains_the_old_sink_then_fences_before_closing_it() -> None:
     assert drains[1][1] < drains[0][1], "the fence gets what is left of the budget, not a fresh one"
 
 
+def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
+    """The retirement check must be re-taken after the drain, not only before it.
+
+    ``shutdown()`` closes whatever ``self.sink`` is at that moment and latches its once-only
+    flag. A swap that reassigns afterwards installs a sink **nothing will ever close** — a second
+    ``shutdown()`` returns early — and then reports an ``incomplete_swaps`` whose stderr line
+    says the old sink was left open, when it was in fact closed. The race is injected rather
+    than run, on the same principle as the fence test above.
+    """
+    old, new = SwapSink(), SwapSink()
+    worker = _worker_with(old)
+    real_flush = worker.flush
+
+    def flush_then_retire(timeout=None):
+        result = real_flush(timeout)
+        worker.shutdown()  # atexit, or another thread, lands here
+        return result
+
+    worker.flush = flush_then_retire
+    worker.swap_sink(new)
+
+    assert worker.sink is old, "a retired worker must not be retargeted"
+    assert old.closed == 1, "shutdown closed the live sink"
+    assert new.closed == 0, "and the sink that was never installed is not orphaned"
+    assert log_foundry.health().incomplete_swaps == 0, "nothing was swapped, so nothing to report"
+
+
 def test_the_new_sink_is_given_the_workers_stop_signal() -> None:
     """SPEC-027 FR-002: a sink that cannot see the stop event backs off uninterruptibly."""
 
@@ -348,6 +375,53 @@ def test_the_swap_budget_is_the_documented_default(monkeypatch) -> None:
     config.configure(sink=SwapSink())
 
     assert seen == [1.25]
+
+
+def test_a_swap_that_raises_does_not_fail_configure(monkeypatch, capsys) -> None:
+    """SPEC-025: a sink swap must never be the reason an application cannot start.
+
+    This guards the whole ``swap_sink`` call, not the close inside it — a third-party sink can
+    raise from ``emit`` during the drain, or from a ``stop_signal`` setter, and ``configure()``
+    has never raised for anything but a rejected ceiling.
+    """
+    worker = _worker_with(SwapSink())
+
+    def exploding_swap(new_sink, timeout=None):
+        raise RuntimeError("swap failed")
+
+    monkeypatch.setattr(worker, "swap_sink", exploding_swap)
+    new = SwapSink()
+
+    config.configure(sink=new)  # must not raise
+
+    assert config.get_config().sink is new
+    assert "swapping the log sink" in capsys.readouterr().err
+
+
+def test_the_swap_budget_does_not_bound_the_previous_sinks_close() -> None:
+    """A known, recorded gap (arch §13) — pinned so it cannot be misread as a bounded call.
+
+    ``Sink.close`` takes no timeout, so the swap's deadline covers the two drains and nothing
+    after them. Bounding it needs an interruptible close, which is a change to the sink
+    contract; SPEC-028 built and reverted the daemon-thread alternative.
+    """
+    closed_for = []
+
+    class SlowCloseSink(SwapSink):
+        def close(self) -> None:
+            start = time.monotonic()
+            time.sleep(0.3)
+            closed_for.append(time.monotonic() - start)
+            super().close()
+
+    _worker_with(SlowCloseSink())
+
+    start = time.monotonic()
+    decorator._swap_sink(SwapSink(), timeout=0.01)
+    elapsed = time.monotonic() - start
+
+    assert closed_for, "the previous sink was closed"
+    assert elapsed >= 0.3, "the close ran to completion, past a 0.01s swap budget"
 
 
 def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:

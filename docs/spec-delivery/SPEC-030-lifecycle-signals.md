@@ -54,6 +54,13 @@ boolean, so the swap cannot tell the two apart, and it treats both conservativel
 old sink open, announce. That double-signals with `failed_batches` in the abandoned case. Accepted —
 the alternative is a false claim that the old sink is idle.
 
+**A swap discards the previous sink's absorbed losses from `Health.sink`, and that is intended.**
+`Health.sink` is a live read of whichever sink is current, so at the moment of a swap the old
+sink's `dropped`/`failed` leave the snapshot for good. Carrying them forward would change what the
+field means — SPEC-026 defines it as *the configured sink's own* counters, and a sum across sinks
+that no longer exist is a different claim. Documented in `health()`'s docstring; the stderr lines
+those losses produced remain the durable record.
+
 **Post-close sink loss is still unowned, and this spec is not its home.** SPEC-028's delivery doc
 asked that it be named here explicitly: `GooglePubSubSink.emit` after `close()` appends futures
 nothing will resolve, and `KafkaSink` accepts produces past close. That is the SPEC-026 silent-loss
@@ -67,9 +74,44 @@ either. It needs a fix of its own, alongside the two sinks that already refuse (
 `_swap_live_sink` passes `worker.DEFAULT_SWAP_TIMEOUT` explicitly. A default argument is bound at
 definition, which would have left the bounded-swap test pinning a number nothing reads.
 
+## Review round (pre-merge, PR #117)
+
+Returned MERGE WITH CHANGES on green CI, with two confirmed defects the suite could not see.
+
+- **A `shutdown()` landing mid-swap leaked the live sink forever.** `swap_sink` re-took only half
+  its guard after the first drain: it re-checked `old is new_sink` but not `_shutdown_done`. A
+  blocking call cannot be trusted to return into the state it left — `shutdown()` closes whatever
+  `self.sink` was at that moment and latches its once-only flag, so the swap then installed a sink
+  **nothing would ever close**, and announced that the previous sink was "left open" when it had
+  just been closed. Both a leak and a false diagnostic. Fixed with the missing re-check, and pinned
+  by a test that injects the race rather than running it.
+- **`configure()` is not bounded end to end.** The shared deadline covers the two drains; closing
+  the previous sink is outside it, because `Sink.close` takes no timeout — measured at 8.0 s
+  against a 5 s budget. Four places claimed otherwise, including a ticked acceptance criterion.
+  This is `architecture.md` §13's existing `shutdown()` constraint reached by a second route, with
+  the same fix (an interruptible close, i.e. a sink-contract change) and the same rejected
+  alternative (SPEC-028 built and reverted the daemon-thread close). Not closing the old sink at
+  all would leak it on every swap. So: recorded rather than fixed, the four claims corrected, the
+  criterion amended in place, and a test pins the behaviour so a later reader cannot mistake it for
+  a bounded call.
+- **`decorator._swap_sink`'s exception guard was untested** — deleting the whole `try/except` left
+  all 1006 tests green. A SPEC-025 guarantee at a new call site, pinned by nothing. Now tested.
+- **FR-002's "Normal submission is not measurably slowed" was ticked with no measurement.** The
+  criterion overstated what a test can show at that scale; amended in place to the claim the test
+  actually establishes.
+- **`_close_swapped_out`'s docstring overstated its own guarantee** — the fence proves the *drain
+  thread* is out of the old sink's `emit`, but an orphan-path emitter that resolved the sink before
+  `configure()` reassigned it can still be inside one. Corrected, pointing at the `close()`
+  tolerance `sinks/base.py` already requires.
+
+The reviewer independently reproduced all eleven claimed mutant kills and added ten more, finding
+no vacuous tests among the new ones. Two of its own mutants survived and were correctly judged
+pre-existing conventions rather than regressions: the worker's counter increments are not pinned
+in-the-lock the way SPEC-028 pins the sinks', on `main` as well as here.
+
 ## Verification
 
-- 1006 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
+- 1009 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
   thread-timing flakiness.
 - **Every new assertion was mutation-checked in place** (not in a repo copy — the editable install
   resolves back to the working tree, which is what makes the check meaningful). Eleven mutants, each

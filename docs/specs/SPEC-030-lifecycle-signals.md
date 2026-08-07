@@ -103,7 +103,12 @@ boolean read, on a flag that is only ever set once.
 - [x] Subsequent submissions are throttled, following `_DROP_WARN_EVERY`'s existing convention.
 - [x] A process that shuts down and logs nothing further writes no line.
 - [x] The write is guarded and never reaches the caller (SPEC-029 FR-003).
-- [x] Normal submission is not measurably slowed.
+- [x] ~~Normal submission is not measurably slowed.~~ **Amended after review**: satisfied by
+      construction, not by measurement, and the criterion overstated what a test could show. The
+      normal path adds one unlocked read of a write-once boolean already in the instance dict —
+      no lock, no allocation, no call. A wall-clock assertion at that scale measures the
+      machine, so `test_a_live_worker_pays_nothing_for_the_check` asserts the observable claim
+      instead: 50 ordinary submissions touch neither the counter nor stderr.
 
 ### FR-003: A late `configure(sink=...)` takes effect or reports that it cannot
 
@@ -123,14 +128,21 @@ at startup but after an import-time log line, turning a silent wrong-sink into a
 case that is usually benign.
 
 The drain is bounded and its outcome reported, so a hung old sink cannot make `configure()` hang.
+(Amended after review: bounded for the *drain*. The old sink's `close()` is not — see the fourth
+criterion.)
 
 #### Acceptance Criteria:
 
 - [x] `configure(sink=B)` after events have gone to sink A causes subsequent events to reach B.
 - [x] Events submitted before the call are drained to A before the swap, not lost and not sent to B.
 - [x] Sink A is closed exactly once; sink B is not closed.
-- [x] The swap is bounded in time; if the drain does not complete, `configure()` still returns and
-      the failure is recorded in `health()` and on stderr.
+- [x] The **drains** are bounded in time; if a drain does not complete, `configure()` still returns
+      and the failure is recorded in `health()` and on stderr. **Amended after review**: the
+      criterion said "the swap", and the swap is not bounded end to end — closing the previous
+      sink is not, because `Sink.close` takes no timeout. That is the gap `architecture.md` §13
+      already records for `shutdown()`, reached by a second route; bounding it needs an
+      interruptible close, which is a change to the sink contract, and SPEC-028 built and
+      reverted the daemon-thread alternative. Recorded in §13 and pinned by a test.
 - [x] `configure(sink=A)` where A is already the active sink is a no-op — no drain, no close.
 - [x] `configure()` with no `sink=` argument never rebuilds anything, whatever else it changes.
 - [x] Calling `configure(sink=...)` before any logging behaves exactly as today (no worker exists;

@@ -435,15 +435,22 @@ class Worker:
         the drain thread may still be using it, and SPEC-027 FR-004 already settled that a
         leaked resource beats a close raced against a write.
 
+        Both guards are re-taken after the first drain, which blocks and therefore cannot be
+        trusted to return into the state it left. Retirement is the one that bites: ``shutdown``
+        closes whatever ``self.sink`` was at that moment and latches its once-only flag, so a
+        swap reassigning afterwards would install a sink nothing will ever close, and then
+        report that the *old* one was left open when it had in fact just been closed.
+
         ``configure()`` remains a startup call and this does not make it thread-safe. A span
         finishing on another thread during the swap may land on either sink; what is guaranteed
         is that everything submitted before the call was drained to the old one.
 
         Args:
           new_sink: The sink every subsequent batch is emitted to.
-          timeout: Seconds bounding the whole call — one deadline shared by both drains, so a
-            hung sink cannot make ``configure()`` hang for twice the budget. ``None`` waits
-            indefinitely.
+          timeout: Seconds bounding both drains — one shared deadline, so a hung sink cannot
+            make ``configure()`` wait for twice the budget. It does **not** bound the closing of
+            the old sink, which has no timeout of its own; see :meth:`_close_swapped_out`.
+            ``None`` waits indefinitely.
 
         Returns:
           None. The outcome is reported through ``health().incomplete_swaps`` and one stderr
@@ -460,6 +467,8 @@ class Worker:
         deadline = None if timeout is None else time.monotonic() + timeout
         drained = self.flush(timeout)
         with self._lock:
+            if self._shutdown_done:
+                return
             old = self.sink
             if old is new_sink:
                 return
@@ -501,10 +510,22 @@ class Worker:
     def _close_swapped_out(self, sink: Sink) -> None:
         """Closes a sink the worker no longer delivers to, absorbing a failure.
 
-        This is reached only once both drains have been confirmed, so the drain thread is
-        provably out of this sink's ``emit`` and nothing further will be routed to it. It is
-        deliberately not :meth:`_close_sink`, which answers a different question — that one
-        closes the sink the worker still holds, exactly once, and only after the thread has
+        This is reached only once both drains have been confirmed, so the *drain thread* is
+        provably out of this sink's ``emit``. An orphan-path emitter on an application thread
+        is not covered: it resolves the sink through ``_ensure_sink`` before emitting, so one
+        that read the old sink before ``configure()`` reassigned it can still be inside its
+        ``emit`` — which is why ``sinks/base.py`` requires ``close()`` to tolerate exactly that
+        (SPEC-028 FR-001), and why the sinks holding transport state take their lock in both.
+
+        The close is **not** bounded by the swap's timeout, for the reason
+        :meth:`_close_if_owed` gives at the other close site: ``Sink.close`` has no timeout of
+        its own, so bounding it needs an interruptible close — a change to the sink contract,
+        not to this method — and SPEC-028 measured what running it on a daemon thread costs
+        instead. A destination whose ``close()`` blocks therefore blocks ``configure()``.
+        Recorded in ``architecture.md`` §13 rather than papered over.
+
+        It is deliberately not :meth:`_close_sink`, which answers a different question — that
+        one closes the sink the worker still holds, exactly once, and only after the thread has
         ended.
 
         Args:

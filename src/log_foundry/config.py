@@ -79,12 +79,17 @@ def configure(
     A ``sink=`` passed after logging has already started is the one argument that needs more
     than an assignment, because the background worker captured its sink when it was built
     (arch §7). It **swaps the live delivery target**: everything submitted so far is drained to
-    the previous sink, that sink is closed, and subsequent events go to the new one. The drain
-    is bounded, and a swap whose drain could not be confirmed leaves the previous sink open and
+    the previous sink, that sink is closed, and subsequent events go to the new one. The drains
+    are bounded, and a swap whose drain could not be confirmed leaves the previous sink open and
     records ``health().incomplete_swaps`` (SPEC-030 FR-003) — so "repeated calls compose rather
     than reset" holds for the sink too, at the cost of one bounded wait. Passing the sink that
     is already live is a no-op: no drain, no close. The previous sink is closed and must not be
     handed back to a later call.
+
+    The *closing* of the previous sink is not bounded, because ``Sink.close`` takes no timeout —
+    a destination that blocks in ``close()`` blocks this call. It is the same gap
+    ``architecture.md`` §13 already records for ``shutdown()``, and it has the same fix, which
+    is a change to the sink contract rather than to this function.
 
     This is still a startup call. It is not thread-safe, and a span finishing on another thread
     during a swap may land on either sink.

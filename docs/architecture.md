@@ -285,7 +285,9 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
 4. closes the previous sink.
 
 Both drains share one deadline, so a hung sink cannot make `configure()` block for twice the
-budget. A drain that cannot be confirmed does **not** cancel the swap — the caller asked for the
+budget — the deadline covers the drains only, not step 4 (§13). Both guards are re-taken after the
+first drain, since it blocks: a `shutdown()` landing mid-swap must abandon the swap, or it installs
+a sink nothing will ever close. A drain that cannot be confirmed does **not** cancel the swap — the caller asked for the
 new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
 left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
 leaked resource in a running process beats a close raced against a write. Passing the sink already
@@ -575,6 +577,15 @@ constraint — never by being deleted quietly.
   stuck one, so it reported `ShutdownTimeout` and "left open" for closes that had completed.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.
+
+  **The same gap reaches `configure(sink=...)`** (SPEC-030). A late sink swap closes the previous
+  sink on the *caller's* thread, and its timeout bounds the two drains, not that close — so a
+  `KafkaSink` whose broker is unreachable blocks `configure()` inside `producer.flush()`, and any
+  SPEC-028 locking sink blocks behind an orphan-path writer holding the emit lock. It is the same
+  root cause with the same fix, and it is worse only in where it lands: at startup in a running
+  process rather than at exit. Not closing the previous sink at all would leak it on every swap,
+  and the daemon-thread close was already built and reverted above. Configure the sink before the
+  first log where you can — that path has no worker and nothing to close.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no

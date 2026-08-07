@@ -219,3 +219,6 @@ __marimo__/
 
 # Claude Code personal/project-local settings (not for the public repo)
 .claude/settings.local.json
+# Scratch git worktrees created for fresh-context reviews; `git add -A` otherwise stages them
+# as embedded repositories.
+.claude/worktrees/
