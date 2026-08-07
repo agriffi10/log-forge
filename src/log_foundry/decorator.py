@@ -20,10 +20,12 @@ from log_foundry.ids import (
     parse_traceparent,
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
-from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health, Worker
+from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health, Worker
 
 if TYPE_CHECKING:
     import contextvars
+
+    from log_foundry.sinks.base import Sink
 
 __all__ = ["continue_trace", "trace"]
 
@@ -229,6 +231,37 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """
     if _worker is not None:
         _worker.shutdown(timeout)
+
+
+def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
+    """Retargets the process worker at a new sink, backing a late ``configure(sink=...)``.
+
+    Like :func:`_flush_worker` this deliberately does not call :func:`_get_worker`: a process
+    that has not logged has captured no sink, so there is nothing to swap and building a thread
+    to prove it would be pure cost — that is also the case where the old behaviour was already
+    correct (SPEC-030 FR-003).
+
+    Args:
+      new_sink: The sink already written to the config, to be made the live delivery target.
+      timeout: Seconds bounding the drain of the previous sink.
+
+    Returns:
+      None.
+
+    Raises:
+      None. This runs inside ``configure()``, which has never raised for anything but a
+        rejected ceiling, and a sink swap that fails must not become the reason an application
+        cannot start.
+    """
+    worker = _worker
+    if worker is None:
+        return
+    try:
+        worker.swap_sink(new_sink, timeout)
+    except Exception as exc:
+        _diag.absorbed(
+            "swapping the log sink", exc, "events may still be delivered to the previous sink"
+        )
 
 
 def _flush_worker(timeout: float | None = 5.0) -> bool:

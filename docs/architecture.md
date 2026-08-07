@@ -266,6 +266,38 @@ log_foundry.configure(
 )
 ```
 
+**Everything but the sink is read per event; the sink is captured.** `service`, `version`, `env`,
+`defaults` and the payload ceilings are looked up through `get_config()` as each event is built, so
+a later `configure()` changes them immediately. The sink is different: the background worker (§9)
+takes it once, when it is lazily built on the first flush. A later `configure(sink=...)` therefore
+has to retarget the worker, or the config and the behaviour disagree — which is what it did until
+SPEC-030, updating `get_config().sink` while every event continued to the sink captured first.
+
+**Sink-swap semantics** (SPEC-030 FR-003). A `sink=` passed once a worker exists:
+
+1. drains everything submitted so far to the **previous** sink — those events were submitted for
+   that destination and are not carried over;
+2. reassigns the worker's sink, which keeps the queue, the drain thread, the counters and the
+   `atexit` registration intact (rebuilding the worker would drop what was queued and register a
+   second drain), and hands the new sink the worker's stop signal (§9, SPEC-027);
+3. drains once more — a fence, not a delivery: it proves the drain thread is not still inside the
+   old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
+4. closes the previous sink.
+
+Both drains share one deadline, so a hung sink cannot make `configure()` block for twice the
+budget — the deadline covers the drains only, not step 4 (§13). Both guards are re-taken after the
+first drain, since it blocks: a `shutdown()` landing mid-swap must abandon the swap, or it installs
+a sink nothing will ever close. A drain that cannot be confirmed does **not** cancel the swap — the caller asked for the
+new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
+left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
+leaked resource in a running process beats a close raced against a write. Passing the sink already
+live is a no-op. After `shutdown()` nothing is swapped: the worker is retired, so the config is
+updated and the retirement signals (§9) continue to apply.
+
+`configure()` remains a startup call and is not thread-safe. A span finishing on another thread
+during a swap may land on either sink; what is guaranteed is that everything submitted *before* the
+call reached the old one.
+
 ---
 
 ## 8. Output sinks (pluggable)
@@ -383,6 +415,15 @@ decorated call ends
   different things. The sink's is what never reached the wire — usually an event that can never
   fit, but for the sinks whose client owns a local buffer (`KafkaSink`, `GooglePubSubSink`) also
   what that buffer refused, which is backpressure one layer further out.
+- **A retired worker still receiving submissions is a reported state, not a prevented one**
+  (SPEC-030). `shutdown()` is terminal and the worker never comes back, but `submit()` keeps
+  accepting — so a process that logs again queues events nothing will drain. `health().retired`
+  and `submitted_after_shutdown` name that pair, and the first such submission writes one
+  throttled stderr line. It is a *pair* because `retired` alone is correct usage, and it is not
+  `stopped_reason`, which stays `None` for a clean shutdown by SPEC-019's design and would
+  otherwise make every well-behaved process read as failed. Neither refusing the submission nor
+  restarting the thread was chosen: the second fights a process trying to exit, and the first
+  would hide the mistake rather than surface it.
 
 ### 9.1 The sink is a durable buffer, not the final store
 
@@ -537,6 +578,22 @@ constraint — never by being deleted quietly.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.
 
+  **The same gap reaches `configure(sink=...)`** (SPEC-030). A late sink swap closes the previous
+  sink on the *caller's* thread, and its timeout bounds the two drains, not that close — so a
+  `KafkaSink` whose broker is unreachable blocks `configure()` inside `producer.flush()`, and any
+  SPEC-028 locking sink blocks behind an orphan-path writer holding the emit lock. It is the same
+  root cause with the same fix, and it is worse only in where it lands: at startup in a running
+  process rather than at exit. Not closing the previous sink at all would leak it on every swap.
+
+  **Only one of the two reasons above carries over, and it is the second.** The daemon killed
+  mid-`commit()` is an *interpreter-exit* hazard and cannot happen at a swap, which runs in a
+  live process — so that leg does not apply here and must not be cited as though it did. What
+  does apply is that a bounded close still cannot tell a slow-but-successful close from a stuck
+  one: an expired join would report `incomplete_swaps` and "left open" for a close that completes
+  a moment later, latching a loss signal on a healthy swap. A wrong signal is worse than a slow
+  one, which is the same conclusion by the surviving half of the same argument. Configure the
+  sink before the first log where you can — that path has no worker and nothing to close.
+
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no
   span is open, so *by default* N processes produce N unrelated traces; the difference is that
@@ -592,7 +649,8 @@ constraint — never by being deleted quietly.
   no point at which that drain is guaranteed to run. `flush()` (SPEC-013) is the only guaranteed
   drain there, and is the first thing to check when tail events go missing in a serverless
   deployment. `shutdown()` is the wrong tool per-invocation: it is terminal, so only the first
-  invocation on a warm container would log.
+  invocation on a warm container would log. That mistake is no longer silent — `health().retired`
+  with a non-zero `submitted_after_shutdown` is its signature (§9, SPEC-030).
 
 ---
 

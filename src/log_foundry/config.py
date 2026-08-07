@@ -76,11 +76,31 @@ def configure(
     the zero-dependency dev default (arch §8). Every ceiling is validated before anything is
     assigned, so a rejected call leaves the config exactly as it found it.
 
+    A ``sink=`` passed after logging has already started is the one argument that needs more
+    than an assignment, because the background worker captured its sink when it was built
+    (arch §7). It **swaps the live delivery target**: everything submitted so far is drained to
+    the previous sink, that sink is closed, and subsequent events go to the new one. The drains
+    are bounded, and a swap whose drain could not be confirmed leaves the previous sink open and
+    records ``health().incomplete_swaps`` (SPEC-030 FR-003) — so "repeated calls compose rather
+    than reset" holds for the sink too, at the cost of one bounded wait. Passing the sink that
+    is already live is a no-op: no drain, no close. The previous sink is closed and must not be
+    handed back to a later call.
+
+    The *closing* of the previous sink is not bounded, because ``Sink.close`` takes no timeout —
+    a destination that blocks in ``close()`` blocks this call. It is the same gap
+    ``architecture.md`` §13 already records for ``shutdown()``, and it has the same fix, which
+    is a change to the sink contract rather than to this function.
+
+    This is still a startup call. It is not thread-safe, and a span finishing on another thread
+    during a swap may land on either sink.
+
     Args:
       service: The service name stamped onto every event.
       version: The service version stamped onto every event.
       env: The deployment environment stamped onto every event.
-      sink: The destination every event is delivered to.
+      sink: The destination every event is delivered to. Passed after the first log, it swaps
+        the live target as described above rather than only updating what ``get_config()``
+        reports.
       defaults: Fields merged into every event at the lowest precedence.
       max_value_bytes: Per-value ceiling, in UTF-8 bytes or rendered digits.
       max_stack_bytes: Ceiling for ``error.stack`` alone.
@@ -118,6 +138,37 @@ def configure(
         _config.max_depth = max_depth
 
     _ensure_sink()
+
+    if sink is not None:
+        _swap_live_sink(sink)
+
+
+def _swap_live_sink(sink: Sink) -> None:
+    """Points an already-running worker at a newly configured sink (SPEC-030 FR-003).
+
+    The import is local for the reason ``_ensure_sink``'s is: ``decorator`` imports this module
+    at module scope, so reaching back the other way at import time would be a cycle. It also
+    keeps the dependency to the one call that needs it — ``configure()`` without a ``sink=``
+    never touches the worker at all.
+
+    The budget is passed explicitly rather than left to the parameter default, so that the
+    bound this call actually applies is resolved when it runs. A default argument is bound at
+    definition time, which would leave the end-to-end bound untestable without reaching past
+    the function under test.
+
+    Args:
+      sink: The sink just written to the config.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry.decorator import _swap_sink
+    from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
+
+    _swap_sink(sink, DEFAULT_SWAP_TIMEOUT)
 
 
 def get_config() -> Config:

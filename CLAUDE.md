@@ -195,10 +195,20 @@ SPEC-002, against the sink the worker is draining into, and `base.py` stated no 
 every loss counter takes a second one. Unlocked `SQLiteSink` turned out to kill the interpreter
 (bus error), not lose rows.
 
-**SPEC-030, 031 are Draft** — the rest of the 2026-08-05 full-codebase audit arc,
-validated in a second fresh context and unbuilt. Nothing here is caught by CI (the suite was green
-throughout). Build order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` →
-Arcs; **SPEC-030** is next.
+**SPEC-030 (lifecycle signals) is Completed** — two documented user errors produced total,
+permanent, *silent* loss. Logging after `shutdown()` kept submitting to the retired worker, and
+`health()` read `queued=3, dropped=0, failed_batches=0, stopped_reason=None` — the alert idiom
+could not fire, because `stopped_reason` is `None` for a clean shutdown by SPEC-019's design. And
+`configure(sink=...)` after the first log updated what `get_config()` reports while every event
+continued to the sink the worker captured (measured: A got 4, B got 0, the config claimed B).
+`Health` gained `retired`/`submitted_after_shutdown`/`incomplete_swaps`, and a late `sink=` now
+swaps the live target.
+
+**SPEC-031 is Draft** — the last of the 2026-08-05 full-codebase audit arc, validated in a second
+fresh context and unbuilt. Nothing in it is caught by CI (the suite was green throughout). Build
+order and the reasoning behind the grouping are in `@docs/specs/INDEX.md` → Arcs; **SPEC-031** is
+next, and one item has no home yet: post-`close()` loss in `GooglePubSubSink`/`KafkaSink`, handed
+on by SPEC-028 and named in SPEC-030's delivery doc.
 
 **SPEC-029 (diagnostic output safety) is Completed** — twelve of the twenty-eight stderr sites
 printed `repr(exception)` against the arch §6 rule `Worker._terminal_failure` cites for not doing
@@ -421,6 +431,21 @@ where it starts.
   list and missed three sinks — `NATSSink` re-entering its own event loop could hang an application
   thread permanently. That is SPEC-027's roster lesson repeated; a roster in prose is not a roster
   the tests check. (SPEC-028, arch §9, §13)
+- **A terminal `shutdown()` and a captured sink are both reported, not prevented** — the two
+  lifecycle mistakes the library documented and then stayed silent about. Logging after
+  `shutdown()` is still *accepted*: refusing it would hide the mistake and restarting the worker
+  would fight a process trying to exit, so `Health` reports the **pair** `retired` +
+  `submitted_after_shutdown` — a pair because `retired` alone is correct usage, and a new pair
+  because `stopped_reason` is `None` after a clean shutdown and must stay that way (SPEC-019). The
+  check in `submit` is one unlocked read of a write-once flag, which is not the *liveness* check
+  SPEC-019 excluded from the hot path. A late `configure(sink=...)` swaps the live target — drain
+  to the old sink, reassign (never rebuild: the queue, thread, counters and `atexit` registration
+  survive), **fence with a second drain**, then close — because the first drain only proves the
+  *pre-swap* events landed, and closing while the drain thread is inside `emit` is what SPEC-028
+  exists to prevent. Both drains share one deadline. A drain that cannot be confirmed does not
+  cancel the swap (the caller asked for that sink) but leaves the old one **open** and counts
+  `incomplete_swaps`, on SPEC-027 FR-004's reasoning that a leaked resource beats a close raced
+  against a write. (SPEC-030, arch §7, §9)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
