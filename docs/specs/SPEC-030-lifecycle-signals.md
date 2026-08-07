@@ -172,11 +172,22 @@ class Health(NamedTuple):
     sink: SinkLosses | None = None          # SPEC-026
     retired: bool = False                   # new — shutdown() has completed
     submitted_after_shutdown: int = 0       # new — accepted, undeliverable
+    incomplete_swaps: int = 0               # new — see the amendment below
 
 
 # on Worker, guarded by the existing _lock:
 self.submitted_after_shutdown = 0
+self.incomplete_swaps = 0
 ```
+
+**Amended during implementation — a third field.** FR-003's fourth acceptance criterion requires
+an unconfirmed drain to be "recorded in `health()`", and this outline provided nowhere to record
+it. Neither existing field can carry it: `stopped_reason` means the drain thread is *gone*, and it
+is alive here, while `failed_batches` counts batches abandoned after the retry budget, a different
+fact that an operator acts on differently. `incomplete_swaps` counts late `configure(sink=...)`
+calls whose drain of the previous sink could not be confirmed — the swap still took effect, but
+events submitted before it may have been carried to the new sink, and the old sink was left open.
+It appends after the two above, so the ordering rule below is unaffected.
 
 `retired` is a boolean where `stopped_reason` is a string, and deliberately so: SPEC-019 rejected an
 `alive` flag because it would read `False` for a process that never logged. That objection does not

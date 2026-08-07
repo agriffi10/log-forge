@@ -198,6 +198,29 @@ lf.configure(
 If you never set a `sink`, the first decorated call falls back to `StdoutSink()`, so `@trace`
 works with zero configuration.
 
+**Passing `sink=` after logging has started swaps the live destination.** The background worker
+captures its sink when it is built, so a later `configure(sink=...)` has to do more than update
+what `get_config()` reports — otherwise the config and the behaviour disagree silently, which is
+what it used to do. The swap drains everything submitted so far to the **previous** sink, closes
+it, and points the worker at the new one:
+
+```python
+lf.configure(sink=StdoutSink())
+do_some_work()                       # these events go to stdout
+
+lf.configure(sink=SQSSink(queue_url=QUEUE_URL))
+do_some_more_work()                  # these go to SQS; the earlier ones were drained to stdout
+```
+
+The drain is bounded at 5 s. If it cannot be confirmed in that time the swap still takes effect —
+you asked for that sink — but the previous sink is left **open** rather than closed, because the
+drain thread may still be inside its `emit`, and `health().incomplete_swaps` records it. Passing
+the sink that is already live is a no-op: no drain, no close. The previous sink **is** closed, so
+do not hand it back to a later call.
+
+`configure()` is still a startup call. It is not thread-safe, and a span finishing on another
+thread mid-swap may land on either sink.
+
 ### `@trace`
 
 Decorate any **synchronous** function. Usable bare or with arguments:
@@ -710,7 +733,11 @@ returns a snapshot of the worker's counters:
 
 ```python
 h = log_foundry.health()
-if h.dropped or h.failed_batches or h.stopped_reason or (h.sink and (h.sink.dropped or h.sink.failed)):
+if (
+    h.dropped or h.failed_batches or h.stopped_reason or h.incomplete_swaps
+    or (h.sink and (h.sink.dropped or h.sink.failed))
+    or (h.retired and h.submitted_after_shutdown)
+):
     ...  # logs were silently lost — worth an alert
 ```
 
@@ -723,6 +750,8 @@ They tell you different things, and they want different responses:
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
+| `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
+| `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
 the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
@@ -744,8 +773,14 @@ logged, and after a clean `shutdown()`, so a plain truthiness check is safe. Wit
 thread showed up only indirectly, as `dropped` climbing once the queue filled — the wrong signal,
 pointing at the wrong fix.
 
+`retired` is deliberately **not** alerted on by itself. A process that shuts down and then stops
+logging is doing the right thing; it is the *pair* — retired, and still being handed events — that
+means every log line since the shutdown has gone nowhere. That state used to read as perfectly
+healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
+
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0` and a fifth (`sink`) not yet in a tagged
+fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus a sixth,
+seventh and eighth (`retired`, `submitted_after_shutdown`, `incomplete_swaps`) not yet in a tagged
 release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
 field keeps its position when a new one is appended, so attribute and index access stay stable.
 
@@ -823,6 +858,13 @@ getting them wrong is silent:
   the first invocation on a warm container would log and every later one would silently log
   nothing. That failure reads as "works locally, broken in production".
 
+  It is no longer silent. Logging after `shutdown()` is accepted and undeliverable, and
+  `health()` says so: **`retired` is `True` and `submitted_after_shutdown` is non-zero** — that
+  pair, and only that pair, is this mistake. The first such submission also writes one stderr
+  line naming `flush()` as the remedy, throttled to the first and every thousandth after it.
+  `stopped_reason` stays `None` throughout, because nothing failed; someone used the terminal
+  drain where the repeatable one belonged.
+
 ```python
 import log_foundry as lf
 from log_foundry.sinks.sqs import SQSSink
@@ -840,9 +882,11 @@ def handler(event, context):
         # would log nothing.
         drained = lf.flush()
         h = lf.health()
-        if not drained or h.failed_batches or h.dropped or h.stopped_reason:
+        if not drained or h.failed_batches or h.dropped or h.stopped_reason or h.retired:
             # `drained` covers this invocation's tail; the counters cover anything the worker
             # lost earlier — a batch its own interval trigger already gave up on, for instance.
+            # `h.retired` catches the mistake above: inside a handler it can only mean something
+            # called shutdown(), and from here on this container logs nothing.
             # Emitting this through your platform's own logger keeps it outside the pipeline
             # that just failed.
             print(f"log-foundry: undelivered logs ({drained=}, {h=})")
