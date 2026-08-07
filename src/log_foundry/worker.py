@@ -90,12 +90,15 @@ class Health(NamedTuple):
         the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the
         integers above because they count different things: ``dropped`` here is backpressure
         at this queue, ``dropped`` on the sink is an event that never reached the wire.
-      retired: Whether :meth:`Worker.shutdown` has been called. It describes an action the
+      retired: Whether ``shutdown()`` has been called. It describes an action the
         caller took, not a failure the library detected, which is why it is a boolean where
         ``stopped_reason`` is a string — SPEC-019 rejected an ``alive`` flag because it would
         read ``False`` for a process that never logged, and that objection does not apply to a
         field which is simply ``False`` until someone calls ``shutdown()`` (SPEC-030 FR-001).
         On its own it is not a fault: a process that shuts down and stops logging is correct.
+        It is the one field ``decorator._worker_health`` synthesizes rather than zeroing, so
+        that a process which only ever logged outside a span — and therefore has no worker at
+        all — still reports its own shutdown truthfully (SPEC-031 FR-006).
       submitted_after_shutdown: Submissions accepted after ``shutdown()`` and queued where
         nothing will drain them. Non-zero alongside ``retired`` is the signature of the
         serverless mistake — ``shutdown()`` called per invocation on a warm container, so the

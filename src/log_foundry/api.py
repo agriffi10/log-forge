@@ -6,6 +6,7 @@ from log_foundry import _diag, context
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
 from log_foundry.context import set_baggage
+from log_foundry.decorator import _note_orphan_emit
 from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
 
@@ -35,6 +36,12 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     never silently dropped for want of a worker (``architecture.md`` §12 Resolved, "Orphan
     logs"). It carried a comment saying the worker "will later" own it long after the
     decision was made (SPEC-031 FR-003).
+
+    Because no worker is built here, nothing else in the library knows the sink was ever
+    written to — so this branch records it, and only after the emit returns (SPEC-031 FR-006).
+    That is what arms the exit-time close for a process which only ever logs this way, and
+    keying it on a landed event rather than on a configured sink is deliberate: ``configure()``
+    materializes a ``StdoutSink`` whether or not anything is logged through it.
 
     The orphan branch is the one that reaches the sink on the caller's own thread, with no
     worker between them to absorb a failure, so the whole branch is guarded (SPEC-025
@@ -73,6 +80,7 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             )
             event = build_event(orphan, level, message, fields=fields, baggage=baggage)
             _ensure_sink().emit([event])
+            _note_orphan_emit()
         except Exception as exc:
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")
     if echo and event is not None:

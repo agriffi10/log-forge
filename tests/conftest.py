@@ -88,6 +88,14 @@ def _reset_worker() -> None:
 
     Without this the first test's sink/thread would leak into later tests through the
     module-global ``decorator._worker``. No-ops until the worker module exists.
+
+    SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
+    ``_orphan_retired`` is what ``health()`` synthesizes when there is no worker, so a test
+    that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
+    ``_orphan_close_owed`` would make "nothing was ever logged, so nothing is closed"
+    untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
+    handler really is registered for the life of the interpreter, and re-arming the flag would
+    have the next worker register a second one.
     """
     try:
         from log_foundry import decorator
@@ -97,6 +105,9 @@ def _reset_worker() -> None:
     if worker is not None:
         worker.shutdown()
         decorator._worker = None
+    for flag in ("_orphan_close_owed", "_orphan_sink_closed", "_orphan_retired"):
+        if hasattr(decorator, flag):
+            setattr(decorator, flag, False)
 
 
 class FakeSink:

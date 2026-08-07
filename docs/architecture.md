@@ -592,24 +592,36 @@ constraint — never by being deleted quietly.
   wants the orphan path off the critical path should open a span; that is what the
   buffer-then-flush pipeline is for.
 
-- **A process that only ever used the orphan path never closes its sink.** `shutdown()` is a no-op
-  when no worker was created (`_shutdown_worker` returns early), and the `atexit` registration
-  happens *inside* `_get_worker`, so neither runs for a process that only made level calls with no
-  active span — those emit synchronously on the caller's thread and build no worker. Measured: with
-  a `KafkaSink`, `configure` → `info` → `shutdown` → `info` leaves `flushes=0` and the sink open, so
-  every event is lost — the cost is sink-dependent, and against a *synchronous* sink the events land
-  and what is lost is the flush and the released resource. Found reviewing SPEC-032, whose
-  post-close guard is invisible here precisely because `close()` never happens. A process that opens
-  even one span is unaffected.
+- ~~**A process that only ever used the orphan path never closes its sink.**~~ — **fixed by
+  SPEC-031 FR-006.** It was a defect awaiting a fix rather than a constraint this project accepts,
+  and it sat here only until then. What it was: `shutdown()` was a no-op when no worker had been
+  created (`_shutdown_worker` returned early), and the `atexit` registration happened *inside*
+  `_get_worker`, so neither ran for a process that only made level calls with no active span —
+  those emit synchronously on the caller's thread and build no worker. Measured: with a
+  `KafkaSink`, `configure` → `info` → `shutdown` → `info` left `flushes=0` and the sink open, so
+  every event was lost; against a *synchronous* sink the events landed and what was lost was the
+  flush and the released resource. And **`health()` read all-clear** — `retired=False`,
+  `submitted_after_shutdown=0`, `stopped_reason=None`, `sink=None` — because every one of those
+  describes a worker, so SPEC-030's alert idiom was structurally blind to it. Found reviewing
+  SPEC-032, whose post-close guard is invisible here precisely because `close()` never happened.
 
-  What makes it worth a spec rather than an accepted limit: **`health()` reads all-clear**
-  — `retired=False`, `submitted_after_shutdown=0`, `stopped_reason=None`, `sink=None` — because
-  every one of those describes a worker, and there is no worker. So SPEC-030's alert idiom is
-  structurally blind to it, which is the silent-loss shape SPEC-030 exists to end. It is a worker
-  lifecycle defect rather than a sink one, so SPEC-032 did not fix it; it is recorded here so the
-  post-close guarantee is not read as covering it. **Owned by SPEC-031 FR-006** (added 2026-08-07),
-  which strikes this entry through when it lands: it is a defect awaiting a fix, not a constraint
-  this project accepts, and it sits in §13 only until then.
+  What the fix is, and what it deliberately is not: the orphan branch in `api._log` records that
+  an event *reached* the sink — not that a sink is configured, since `configure()` runs
+  `_ensure_sink()` unconditionally and would arm a close over a `StdoutSink` nothing was ever
+  written to. A single `atexit` handler covers both paths, so the close is once-only across them
+  rather than the *registration* being once-only: a second handler would double-close (`atexit`
+  runs LIFO) and reusing the worker's registration flag would cost a mixed process its exit drain.
+  A live worker still owns the close and this defers to it. `health().retired` is synthesized from
+  a module flag, with **no worker created** to answer it — the same refusal `_swap_sink` and
+  `_flush_worker` already make. `submitted_after_shutdown` is deliberately *not* incremented on
+  this path: SPEC-030 defines it as a submission queued where nothing will drain it, and a later
+  orphan log is refused at a closed sink and announced, which is not the same claim.
+
+  **One variant is not fixed and needs its own home:** `configure(sink=A)` → `info()` →
+  `configure(sink=B)` → `info()` leaves **A** unclosed with `incomplete_swaps` at zero, because
+  `_swap_sink` returns early on a null worker. That early return is correct on its own terms — a
+  process with no worker has captured no sink to swap — but it means the orphan path's sink
+  handoff is unmanaged. Measured; recorded by SPEC-031 as explicitly out of its scope.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

@@ -826,6 +826,15 @@ logging is doing the right thing; it is the *pair* — retired, and still being 
 means every log line since the shutdown has gone nowhere. That state used to read as perfectly
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
+`retired` is also the one field reported for a process that has **no worker at all**. A program
+that only ever calls `info()`/`error()` outside a span emits synchronously and builds no background
+worker, so every other field describes something that does not exist and reads zero. Its
+`shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
+`True` afterwards rather than staying vacuously `False`. `submitted_after_shutdown` stays `0` there
+by design: a later level call is *refused* at the closed sink and announced on stderr — if the sink
+guards its own post-close state — rather than queued where nothing will drain it, and those are not
+the same claim. A stateless sink such as the default `StdoutSink` still accepts it.
+
 Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
 fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus four more
 (`retired`, `submitted_after_shutdown`, `incomplete_swaps`, `closing_sinks`) not yet in a tagged
