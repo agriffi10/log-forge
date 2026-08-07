@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
@@ -27,6 +25,13 @@ class PostgresSink:
     indexing. ``psycopg`` v3 is the optional ``postgres`` extra, imported lazily. The sink is
     write-only, and the worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits
     per batch, 0.7 s at the defaults.
+
+    The driver requirement satisfied (SPEC-028 FR-002): a ``psycopg`` connection carries one
+    transaction, and this sink's unit of work is a ``cursor`` / ``commit`` / ``rollback`` sequence
+    that assumes it owns it. Two unserialized emits share that transaction — one thread's
+    ``commit`` publishes the other's half-written batch, and its ``rollback`` on a failure
+    discards rows the other had already inserted and is about to report as delivered. A lock
+    gives the sequence the exclusivity it was written for.
     """
 
     def __init__(
@@ -65,6 +70,8 @@ class PostgresSink:
         self.stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False
+        self._lock = threading.Lock()
+        self._counter_lock = threading.Lock()
         self._owns_connection = connection is None
         if connection is None:
             import psycopg  # type: ignore[import-not-found]
@@ -80,6 +87,9 @@ class PostgresSink:
     def losses(self) -> SinkLosses:
         """Reports events abandoned past the retry bound (SPEC-026 FR-002).
 
+        Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
+        never waits on an in-flight insert and its backoff.
+
         Args:
           None.
 
@@ -89,7 +99,8 @@ class PostgresSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts the whole batch in one transaction, rolling back and retrying (FR-004).
@@ -113,6 +124,24 @@ class PostgresSink:
         """
         if not batch:
             return
+        with self._lock:
+            self._insert_batch(batch)
+
+    def _insert_batch(self, batch: list[dict[str, object]]) -> None:
+        """Runs the transaction sequence, with the emit lock already held.
+
+        Split out so the lock's extent is one line in :meth:`emit` rather than an extra
+        indentation level over the whole retry loop.
+
+        Args:
+          batch: The events to insert, known non-empty.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When the retry bound is spent.
+        """
         for attempt in range(self.max_retries + 1):
             try:
                 with self._conn.cursor() as cur:
@@ -125,7 +154,8 @@ class PostgresSink:
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += len(batch)
+                with self._counter_lock:
+                    self.failed += len(batch)
                 _diag.lost(
                     "event",
                     len(batch),
@@ -138,7 +168,8 @@ class PostgresSink:
     def close(self) -> None:
         """Commits pending work and closes only an owned connection (FR-005).
 
-        Idempotent.
+        Idempotent, and takes the emit lock so the final commit never lands in the middle of
+        another thread's transaction (SPEC-028 FR-002).
 
         Args:
           None.
@@ -149,12 +180,13 @@ class PostgresSink:
         Raises:
           Exception: Whatever the driver raises on commit or close.
         """
-        if self._closed:
-            return
-        self._conn.commit()
-        if self._owns_connection:
-            self._conn.close()
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._conn.commit()
+            if self._owns_connection:
+                self._conn.close()
+            self._closed = True
 
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the extracted columns, then the whole event as JSON.

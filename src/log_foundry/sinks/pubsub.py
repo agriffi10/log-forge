@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from log_foundry import _diag
@@ -40,6 +41,7 @@ class GooglePubSubSink:
         self.client = client
         self.failed = 0
         self.rejected = 0
+        self._counter_lock = threading.Lock()
         self._futures: list[Any] = []
 
     def losses(self) -> SinkLosses:
@@ -56,7 +58,8 @@ class GooglePubSubSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.rejected, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.rejected, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Publishes one message per event, retaining each future for flush on close (FR-008).
@@ -81,7 +84,8 @@ class GooglePubSubSink:
             try:
                 future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
             except Exception as err:
-                self.rejected += 1
+                with self._counter_lock:
+                    self.rejected += 1
                 _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
                 continue
             self._futures.append(future)
@@ -110,7 +114,8 @@ class GooglePubSubSink:
             try:
                 future.result()
             except Exception as err:
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 _diag.lost(
                     "event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}"
                 )

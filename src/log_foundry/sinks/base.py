@@ -57,6 +57,15 @@ class Sink(Protocol):
     ``None`` is the same answer as having no method at all, which is what keeps a third-party
     sink written against the pre-SPEC-026 interface satisfying this one. :func:`read_losses` is
     the probe.
+
+    "Safe to call during an emit" is a concurrency requirement once :meth:`emit` is (SPEC-028
+    FR-003). The shipped sinks keep their loss counters under a **dedicated** lock, separate
+    from whatever guards their transport: an increment is a read-modify-write that Python does
+    not promise is atomic, and the pair read must come from one instant rather than straddling
+    another thread's increments. It is deliberately not the transport lock — ``health()`` is
+    the call an operator makes when a destination is already hanging, and sharing one lock
+    would make that poll wait for an in-flight emit and its retry backoff. Where a sink holds
+    both, the order is always transport then counter, never the reverse.
     """
 
     def emit(self, batch: list[dict[str, object]]) -> None:

@@ -1,8 +1,8 @@
 # Spec: The Sink Concurrency Contract
 
 **ID:** SPEC-028  
-**Status:** Draft  
-**Last Updated:** 2026-08-05  
+**Status:** Completed  
+**Last Updated:** 2026-08-07  
 **Depends On:** SPEC-002, SPEC-004, SPEC-008
 
 ## Overview
@@ -86,14 +86,14 @@ own.
 
 #### Acceptance Criteria:
 
-- [ ] `Sink.emit`'s docstring states that concurrent calls from multiple threads are possible and
+- [x] `Sink.emit`'s docstring states that concurrent calls from multiple threads are possible and
       must be tolerated, and names the orphan path as the reason.
-- [ ] `Sink.close`'s docstring states it may be called while an `emit` is in flight, and that it
+- [x] `Sink.close`'s docstring states it may be called while an `emit` is in flight, and that it
       must not leave a half-released resource that a concurrent `emit` will use.
-- [ ] `architecture.md` §9's single-drain-thread statement is qualified with the orphan path.
-- [ ] `file.py`'s "a single-process, single-worker-thread writer is assumed" is corrected to the
+- [x] `architecture.md` §9's single-drain-thread statement is qualified with the orphan path.
+- [x] `file.py`'s "a single-process, single-worker-thread writer is assumed" is corrected to the
       delivered behaviour.
-- [ ] The README's sink-author guidance states the requirement.
+- [x] The README's sink-author guidance states the requirement.
 
 ### FR-002: Sinks holding mutable transport state serialize their use of it
 
@@ -109,20 +109,20 @@ children already require.
 
 #### Acceptance Criteria:
 
-- [ ] `RotatingFileSink` performs a rotation without a concurrent writer observing a closed or
+- [x] `RotatingFileSink` performs a rotation without a concurrent writer observing a closed or
       pre-rotation stream; concurrent emits from several threads produce a file whose lines are all
       intact and individually well-formed JSON.
-- [ ] `FileSink` likewise.
-- [ ] `SocketTransport` sends each framed message without interleaving another thread's bytes; a
+- [x] `FileSink` likewise.
+- [x] `SocketTransport` sends each framed message without interleaving another thread's bytes; a
       concurrent syslog test yields frames a receiver can parse in full.
-- [ ] `PostgresSink` completes a `cursor`/`commit`/`rollback` sequence without another thread's emit
+- [x] `PostgresSink` completes a `cursor`/`commit`/`rollback` sequence without another thread's emit
       interleaving on the same connection.
-- [ ] `SQLiteSink`, `MongoSink` and `ClickHouseSink` likewise for their driver's stated threading
+- [x] `SQLiteSink`, `MongoSink` and `ClickHouseSink` likewise for their driver's stated threading
       requirements, with a docstring line stating which requirement each is satisfying.
-- [ ] `close()` on each of these does not race an in-flight `emit`: it either waits or is a no-op,
+- [x] `close()` on each of these does not race an in-flight `emit`: it either waits or is a no-op,
       never a release under an active writer.
-- [ ] `MultiSink` does not hold a lock across a child's `emit`.
-- [ ] Throughput of the single-threaded path is not materially changed (an uncontended lock).
+- [x] `MultiSink` does not hold a lock across a child's `emit`.
+- [x] Throughput of the single-threaded path is not materially changed (an uncontended lock).
 
 ### FR-003: Loss counters are safe under concurrency
 
@@ -150,14 +150,26 @@ change bought for nothing: a single-attribute read is already atomic in CPython,
 
 #### Acceptance Criteria:
 
-- [ ] Concurrent emitters against a permanently-failing sink produce a `failed` count exactly equal
-      to the number of failures, with no lost increments, over a test that reliably reproduces the
-      race today.
-- [ ] The same for `dropped_oversized` and `dropped_unadjudicated`.
-- [ ] `Sink.losses()` (SPEC-026 FR-002) reads a coherent snapshot — both fields from the same
+**Amended by evidence during the build:** the race is not reproducible on the interpreters CI runs.
+A bare `+=` on an instance attribute was measured losing **nothing** across 1.6M concurrent
+increments on CPython 3.13 (8–32 threads, switch interval down to 1 ns, with and without work
+between increments). Python promises no atomicity here and the free-threaded build removes the GIL
+that is currently covering for it, so the guard is still correct and still cheap — but the original
+criterion below, "a test that reliably reproduces the race today", asks for something that cannot be
+written. It is replaced by a deterministic assertion that the increment happens *inside* the
+critical section, which is the property that survives the GIL going away.
+
+- [x] Concurrent emitters against a permanently-failing sink produce a `failed` count exactly equal
+      to the number of failures. ~~over a test that reliably reproduces the race today~~ — the
+      count is exact on a GIL build either way, so this is a regression guard; the guarding itself
+      is asserted by acquisition count, not by a lost increment.
+- [x] The same for `dropped_oversized` and `dropped_unadjudicated`.
+- [x] `Sink.losses()` (SPEC-026 FR-002) reads a coherent snapshot — both fields from the same
       instant, never a half-updated pair.
-- [ ] `MultiSink.failed` is safe while children are emitting concurrently.
-- [ ] Reading a counter never blocks an emit for longer than the read itself.
+- [x] `MultiSink.failed` is safe while children are emitting concurrently.
+- [x] Reading a counter never blocks an emit for longer than the read itself. Tested against the
+      **one-lock** design rather than against pre-SPEC-028 code: unguarded counters trivially do
+      not block, so that is the only baseline the criterion can be measured from.
 
 ### FR-004: The concurrency is covered by tests
 
@@ -168,14 +180,14 @@ gets a test that fails against the current code.
 
 #### Acceptance Criteria:
 
-- [ ] A shared test helper runs N threads emitting against one sink and joins them, usable by each
+- [x] A shared test helper runs N threads emitting against one sink and joins them, usable by each
       sink's module.
-- [ ] Each FR-002 guarantee has a test that fails before the fix and passes after.
-- [ ] The counter test in FR-003 fails before the fix (demonstrably, not merely by luck) and passes
+- [x] Each FR-002 guarantee has a test that fails before the fix and passes after.
+- [x] The counter test in FR-003 fails before the fix (demonstrably, not merely by luck) and passes
       after.
-- [ ] A test asserts the orphan path and the worker can emit into one sink concurrently without
+- [x] A test asserts the orphan path and the worker can emit into one sink concurrently without
       corruption — the scenario that motivates the spec.
-- [ ] The tests are deterministic enough for CI: no sleeps used as synchronization, and no
+- [x] The tests are deterministic enough for CI: no sleeps used as synchronization, and no
       dependence on thread scheduling for the assertion to hold.
 
 ---

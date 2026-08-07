@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import wait
@@ -74,6 +72,7 @@ class RabbitMQSink:
         self._channel: Any = None
         self._properties: Any = None
         self.failed = 0
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
@@ -87,7 +86,8 @@ class RabbitMQSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Publishes one persistent message per event, reconnecting on error (FR-006).
@@ -160,7 +160,8 @@ class RabbitMQSink:
                 if attempt < self._max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
                     continue
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 _diag.lost(
                     "message",
                     1,

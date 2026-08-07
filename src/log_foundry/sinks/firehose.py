@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+import threading
+from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
@@ -67,6 +65,7 @@ class FirehoseSink:
         self.failed = 0
         self.dropped_oversized = 0
         self.dropped_unadjudicated = 0
+        self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks to the request limits and sends each chunk, retrying failures (FR-004).
@@ -126,10 +125,11 @@ class FirehoseSink:
         Raises:
           None.
         """
-        return SinkLosses(
-            dropped=self.dropped_oversized,
-            failed=self.failed + self.dropped_unadjudicated,
-        )
+        with self._counter_lock:
+            return SinkLosses(
+                dropped=self.dropped_oversized,
+                failed=self.failed + self.dropped_unadjudicated,
+            )
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-001).
@@ -160,7 +160,8 @@ class FirehoseSink:
         for event in batch:
             data = json.dumps(event).encode("utf-8")
             if len(data) > self.MAX_RECORD_BYTES:
-                self.dropped_oversized += 1
+                with self._counter_lock:
+                    self.dropped_oversized += 1
                 _diag.lost(
                     "event",
                     1,
@@ -201,7 +202,8 @@ class FirehoseSink:
             results = usable_results(response.get("RequestResponses"))
             verdict = adjudicate_positional(records, results)
             if verdict.unadjudicated:
-                self.dropped_unadjudicated += verdict.unadjudicated
+                with self._counter_lock:
+                    self.dropped_unadjudicated += verdict.unadjudicated
                 _diag.lost(
                     "record",
                     verdict.unadjudicated,
@@ -216,7 +218,8 @@ class FirehoseSink:
             if attempt < self.max_retries:
                 wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
             if attempt >= self.max_retries:
-                self.failed += len(records)
+                with self._counter_lock:
+                    self.failed += len(records)
                 _diag.lost(
                     "record",
                     len(records),

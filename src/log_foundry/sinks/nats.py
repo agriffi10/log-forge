@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 from log_foundry import _diag
@@ -49,6 +50,7 @@ class NATSSink:
         self._jetstream = jetstream
         self._loop = asyncio.new_event_loop()
         self.failed = 0
+        self._counter_lock = threading.Lock()
         if client is None:
             import nats  # type: ignore[import-not-found]
 
@@ -85,7 +87,8 @@ class NATSSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed)
 
     def close(self) -> None:
         """Drains and closes the connection, then closes the managed loop (FR-007).
@@ -127,7 +130,8 @@ class NATSSink:
             try:
                 await target.publish(self._subject, json.dumps(event).encode("utf-8"))
             except Exception as err:
-                self.failed += 1
+                with self._counter_lock:
+                    self.failed += 1
                 _diag.lost("event", 1, f"NATSSink publish, {type(err).__name__}")
             else:
                 published += 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from log_foundry import _diag
@@ -61,6 +62,7 @@ class KafkaSink:
         self.key_field = key_field
         self.failed = 0
         self.rejected = 0
+        self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports refused and undelivered messages (SPEC-026 FR-002).
@@ -82,7 +84,8 @@ class KafkaSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.rejected, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.rejected, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Produces one message per event and serves delivery callbacks without blocking.
@@ -108,7 +111,8 @@ class KafkaSink:
             try:
                 self.producer.produce(self.topic, value=body, key=key, callback=self._on_delivery)
             except Exception as err:
-                self.rejected += 1
+                with self._counter_lock:
+                    self.rejected += 1
                 _diag.lost("message", 1, f"KafkaSink produce, {type(err).__name__}")
                 continue
             accepted += 1
@@ -167,7 +171,8 @@ class KafkaSink:
           None.
         """
         if err is not None:
-            self.failed += 1
+            with self._counter_lock:
+                self.failed += 1
             _diag.lost("message", 1, f"KafkaSink delivery, {type(err).__name__}{_code(err)}")
 
 

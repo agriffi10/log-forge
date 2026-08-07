@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip as _gzip
 import json
+import threading
 import urllib.error
 import urllib.request
 from base64 import b64encode
@@ -14,7 +15,6 @@ from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
 __all__ = ["HTTPSink", "merge_headers"]
@@ -129,6 +129,7 @@ class HTTPSink:
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0
+        self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Serializes the batch per the configured body format and POSTs it (FR-001).
@@ -161,7 +162,8 @@ class HTTPSink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+        with self._counter_lock:
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 
     def close(self) -> None:
         """Does nothing, since ``urllib`` opens a fresh connection per request (FR-012).
@@ -377,7 +379,8 @@ class HTTPSink:
         Raises:
           SinkDeliveryError: Always.
         """
-        self.failed += 1
+        with self._counter_lock:
+            self.failed += 1
         detail = f"{type(self).__name__}, {self.max_retries + 1} attempt(s), {reason}"
         _diag.lost("request", 1, detail)
         raise SinkDeliveryError(detail)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from typing import TextIO
 
 from log_foundry.sinks.stdout import StdoutSink
@@ -57,6 +58,7 @@ class NullSink:
           None.
         """
         self.dropped = 0
+        self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Discards the batch, counting the events dropped (FR-005).
@@ -70,7 +72,8 @@ class NullSink:
         Raises:
           None.
         """
-        self.dropped += len(batch)
+        with self._counter_lock:
+            self.dropped += len(batch)
 
     def close(self) -> None:
         """Does nothing, since nothing is held (FR-005).

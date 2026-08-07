@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import threading
+from typing import Any
 from urllib.parse import urlparse
 
 from log_foundry import _diag
@@ -67,6 +65,7 @@ class SentrySink:
         self.sent = 0
         self.skipped = 0
         self.transport_errors = 0
+        self._counter_lock = threading.Lock()
         self._sdk = sdk if sdk is not None else _import_sdk()
         self._http: HTTPSink | None = None
         self._auth_header = ""
@@ -101,12 +100,14 @@ class SentrySink:
         attempted = delivered = 0
         for event in batch:
             if not self._qualifies(event):
-                self.skipped += 1
+                with self._counter_lock:
+                    self.skipped += 1
                 continue
             attempted += 1
             if not self._capture(event):
                 continue
-            self.sent += 1
+            with self._counter_lock:
+                self.sent += 1
             delivered += 1
         if attempted and not delivered:
             raise SinkDeliveryError(
@@ -198,7 +199,8 @@ class SentrySink:
         Raises:
           None.
         """
-        return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
+        with self._counter_lock:
+            return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
 
     def _capture(self, event: dict[str, object]) -> bool:
         """Sends one event by whichever transport is configured.
@@ -230,7 +232,8 @@ class SentrySink:
         except SinkDeliveryError:
             return False
         except Exception as err:
-            self.transport_errors += 1
+            with self._counter_lock:
+                self.transport_errors += 1
             _diag.lost("event", 1, f"SentrySink, {type(err).__name__}")
             return False
         return True
