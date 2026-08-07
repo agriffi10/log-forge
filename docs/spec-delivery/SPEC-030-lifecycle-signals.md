@@ -105,7 +105,29 @@ Returned MERGE WITH CHANGES on green CI, with two confirmed defects the suite co
   tolerance `sinks/base.py` already requires.
 
 The reviewer independently reproduced all eleven claimed mutant kills and added ten more, finding
-no vacuous tests among the new ones. Two of its own mutants survived and were correctly judged
+no vacuous tests among the new ones.
+
+## Second review round (pre-merge, PR #117)
+
+Verified both code fixes as real — 3000 randomized three-thread interleavings across the blocking
+drain found no further TOCTOU window, no double close and no orphaned sink — and returned three
+findings, all taken.
+
+- **The unbounded-close test was flaky, and would have reddened CI rather than caught anything.**
+  It gave the drains a 10 ms budget, and an unconfirmed drain returns *before* the close, so under
+  load the test failed on its first assertion: 122 of 200 runs on a loaded machine, 0 of 25 idle.
+  The budget must be generous and the *gap* between budget and close tight, not the reverse. Now
+  0.3 s against a 0.5 s close: 40 of 40 under the same eight-thread load, and it still kills a
+  daemon-thread-bounded close.
+- **The §13 constraint cited a precedent whose main leg does not reach this site.**
+  `_close_if_owed` rejects a threaded close for two reasons, and the first — the daemon killed
+  mid-`commit()` — is an *interpreter-exit* hazard that cannot occur at a swap in a live process.
+  Only the second survives: an expired join still cannot tell a slow-but-successful close from a
+  stuck one, so it would report a loss for a swap that completed. Same conclusion, half the
+  argument, now said explicitly in §13 and in `_close_swapped_out`.
+- **FR-004's first criterion still certified `configure()`'s docstring as saying the swap "is
+  bounded"** — the sibling of the criterion amended in the first round, missed when that one was
+  fixed, and by then certifying a docstring that says the opposite. Amended in place. Two of its own mutants survived and were correctly judged
 pre-existing conventions rather than regressions: the worker's counter increments are not pinned
 in-the-lock the way SPEC-028 pins the sinks', on `main` as well as here.
 

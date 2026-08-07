@@ -404,24 +404,29 @@ def test_the_swap_budget_does_not_bound_the_previous_sinks_close() -> None:
     ``Sink.close`` takes no timeout, so the swap's deadline covers the two drains and nothing
     after them. Bounding it needs an interruptible close, which is a change to the sink
     contract; SPEC-028 built and reverted the daemon-thread alternative.
+
+    The budget is generous and the close is longer still, deliberately. An unconfirmed drain
+    returns *before* the close, so a budget tight enough to race the scheduler would fail this
+    test on its first assertion under load rather than measuring anything — 10 ms failed 122
+    times in 200 on a loaded machine while passing 25 for 25 on an idle one. What must be tight
+    is the gap between the budget and the close, not the budget itself.
     """
-    closed_for = []
+    budget, close_seconds, closed_for = 0.3, 0.5, []
 
     class SlowCloseSink(SwapSink):
         def close(self) -> None:
-            start = time.monotonic()
-            time.sleep(0.3)
-            closed_for.append(time.monotonic() - start)
+            time.sleep(close_seconds)
+            closed_for.append(True)
             super().close()
 
     _worker_with(SlowCloseSink())
 
     start = time.monotonic()
-    decorator._swap_sink(SwapSink(), timeout=0.01)
+    decorator._swap_sink(SwapSink(), timeout=budget)
     elapsed = time.monotonic() - start
 
-    assert closed_for, "the previous sink was closed"
-    assert elapsed >= 0.3, "the close ran to completion, past a 0.01s swap budget"
+    assert closed_for, "the drain was confirmed and the previous sink closed"
+    assert elapsed >= close_seconds, "the close ran to completion, past the swap's own budget"
 
 
 def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:

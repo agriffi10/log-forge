@@ -160,8 +160,11 @@ README section a reader arrives at afterwards.
 #### Acceptance Criteria:
 
 - [x] `configure()`'s docstring states what happens to a late `sink=` — that it swaps the live
-      target, drains and closes the previous sink, and is bounded — qualifying "repeated calls
-      compose rather than reset".
+      target, drains and closes the previous sink, and ~~is bounded~~ **which part of that is
+      bounded** — qualifying "repeated calls compose rather than reset". **Amended after review**,
+      for the reason FR-003's fourth criterion was: the drains are bounded and the close is not,
+      so a docstring certified as saying "is bounded" would now be certifying a false claim. This
+      criterion was missed when its sibling was amended.
 - [x] `shutdown()`'s docstring states that later logging is accepted, undeliverable, and reported
       through the FR-001 field.
 - [x] `health()`'s docstring documents the new fields.

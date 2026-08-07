@@ -517,12 +517,14 @@ class Worker:
         ``emit`` — which is why ``sinks/base.py`` requires ``close()`` to tolerate exactly that
         (SPEC-028 FR-001), and why the sinks holding transport state take their lock in both.
 
-        The close is **not** bounded by the swap's timeout, for the reason
-        :meth:`_close_if_owed` gives at the other close site: ``Sink.close`` has no timeout of
-        its own, so bounding it needs an interruptible close — a change to the sink contract,
-        not to this method — and SPEC-028 measured what running it on a daemon thread costs
-        instead. A destination whose ``close()`` blocks therefore blocks ``configure()``.
-        Recorded in ``architecture.md`` §13 rather than papered over.
+        The close is **not** bounded by the swap's timeout: ``Sink.close`` has no timeout of its
+        own, so bounding it needs an interruptible close — a change to the sink contract, not to
+        this method. Of :meth:`_close_if_owed`'s two reasons for rejecting a threaded close, only
+        the second reaches this site: the daemon killed mid-``commit()`` is an interpreter-exit
+        hazard and a swap runs in a live process, but an expired join still cannot tell a
+        slow-but-successful close from a stuck one, and would report a loss for a swap that
+        completed. A destination whose ``close()`` blocks therefore blocks ``configure()``,
+        recorded in ``architecture.md`` §13 rather than papered over.
 
         It is deliberately not :meth:`_close_sink`, which answers a different question — that
         one closes the sink the worker still holds, exactly once, and only after the thread has

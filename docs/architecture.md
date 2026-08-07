@@ -583,9 +583,16 @@ constraint — never by being deleted quietly.
   `KafkaSink` whose broker is unreachable blocks `configure()` inside `producer.flush()`, and any
   SPEC-028 locking sink blocks behind an orphan-path writer holding the emit lock. It is the same
   root cause with the same fix, and it is worse only in where it lands: at startup in a running
-  process rather than at exit. Not closing the previous sink at all would leak it on every swap,
-  and the daemon-thread close was already built and reverted above. Configure the sink before the
-  first log where you can — that path has no worker and nothing to close.
+  process rather than at exit. Not closing the previous sink at all would leak it on every swap.
+
+  **Only one of the two reasons above carries over, and it is the second.** The daemon killed
+  mid-`commit()` is an *interpreter-exit* hazard and cannot happen at a swap, which runs in a
+  live process — so that leg does not apply here and must not be cited as though it did. What
+  does apply is that a bounded close still cannot tell a slow-but-successful close from a stuck
+  one: an expired join would report `incomplete_swaps` and "left open" for a close that completes
+  a moment later, latching a loss signal on a healthy swap. A wrong signal is worse than a slow
+  one, which is the same conclusion by the surviving half of the same argument. Configure the
+  sink before the first log where you can — that path has no worker and nothing to close.
 
 - **Trace context crosses a process boundary only when the caller carries it.** ~~A trace is
   per-process~~ — **closed by SPEC-014.** `@trace` still mints a fresh `trace_id` whenever no
