@@ -188,12 +188,14 @@ SPEC-028's two reasons for reverting a threaded close, only one reaches a swap.
   sink's own tail with `closing_sinks` as the only warning; and that abandonment can land inside a
   `commit()`.
 
-Nineteen mutants across the four rounds, restored from a scratchpad copy named by base SHA rather
+Twenty mutants across the four rounds, restored from a scratchpad copy named by base SHA rather
 than `git checkout --` (which would have reverted the fix under test; a reviewer hit the adjacent
 trap of an unnamed copy from an earlier round and silently restored the wrong commit). Beyond the
 earlier fourteen: the two `shutdown` calls swapped in order; the grace skipped on the idempotent
-path; the roster lock held across the joins; and the grace given per closer rather than shared.
-Each is killed by the test that advertises it.
+path; the roster lock held across the joins; the grace given per closer rather than shared; and
+two on the `timeout=None` path (grace skipped, and joined forever). Each is killed by the test
+that advertises it — the last of them off-thread, so a regression that joins forever fails the
+bound instead of hanging the suite.
 
 **Six of those mutants were a review's finding, not mine, and two rounds of my own new tests were
 vacuous.** Round two: `fresh`, `tenx` and `forget` all survived the entire 1036-test suite, because
@@ -207,7 +209,7 @@ the grace is released by a timer *during* `shutdown` so only a real join can sat
 
 ## Verification
 
-- 1046 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
+- 1047 tests pass; `ruff`, `mypy --strict` and `spec-lint` clean. Full suite run three times for
   thread-timing flakiness.
 - **Every new assertion was mutation-checked in place** (not in a repo copy — the editable install
   resolves back to the working tree, which is what makes the check meaningful). Eleven mutants, each

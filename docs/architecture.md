@@ -613,8 +613,10 @@ constraint — never by being deleted quietly.
 - **`shutdown()`'s timeout bounds the drain, not the sink's `close()`.** This narrows SPEC-027
   FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an
   application thread parked on the orphan path inside a driver call with no timeout of its own
-  delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and nothing
-  after it. Running the close on a joinable daemon thread was built and **reverted**: at
+  delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and, since
+  SPEC-030, the grace it grants a swapped-out sink's close — but not this close, the live sink's,
+  which stays inline and unbounded. Running *this* close on a joinable daemon thread was built and
+  **reverted**: at
   interpreter exit that daemon is killed wherever it has reached — and for `SQLiteSink` that can
   be *inside* `commit()`, which is the partial write FR-004 exists to avoid rather than the
   leaked handle it knowingly accepts — and it could not tell a slow-but-successful close from a

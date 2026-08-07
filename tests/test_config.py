@@ -627,6 +627,38 @@ def test_the_grace_is_shared_across_every_outstanding_close() -> None:
             sink.release.set()
 
 
+def test_an_unbounded_shutdown_still_caps_the_grace() -> None:
+    """``shutdown(timeout=None)`` is a choice about draining events, not about a stuck close.
+
+    ``None`` is public and documented as available on request, and it is the one input where
+    "join with whatever is left of the budget" reads as "join forever". Both halves need
+    pinning: a stuck close must not hang the exit, and the grace must not be skipped either.
+    """
+    hung = SlowCloseSink()
+    worker = _worker_with(hung)
+    elapsed: list[float] = []
+    try:
+        decorator._swap_sink(SwapSink(), timeout=0.3)
+        assert hung.in_close.wait(5.0)
+
+        # On its own thread deliberately: a regression that joins forever here would otherwise
+        # hang this test rather than fail it, and the `finally` that releases the sink would
+        # never run. Off-thread, the bound below fails cleanly and teardown still happens.
+        def timed_join() -> None:
+            start = time.monotonic()
+            worker._join_closers(None)
+            elapsed.append(time.monotonic() - start)
+
+        joiner = threading.Thread(target=timed_join)
+        joiner.start()
+        joiner.join(worker_mod.DEFAULT_CLOSER_GRACE * 3)
+
+        assert elapsed, "an unbounded shutdown must still cap the grace, not join forever"
+        assert elapsed[0] >= worker_mod.DEFAULT_CLOSER_GRACE, "and must not skip it either"
+    finally:
+        hung.release.set()
+
+
 def test_health_does_not_block_behind_the_grace() -> None:
     """``health()`` takes the same lock the roster does; it must not wait on a 2 s join.
 

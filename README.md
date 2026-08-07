@@ -232,10 +232,11 @@ is not coming back, still holding its resources.
 
 **What happens to that background close when the process exits.** `shutdown()` (which `atexit`
 runs for you) drains and closes the live sink first, then gives any still-running swapped-out close
-a short grace — 2 s — to finish. A close that was merely slow completes. One that is genuinely
-stuck is abandoned there, and **its own buffered data is lost**: for a sink whose `close()` *is*
-its delivery, like `KafkaSink.close()` flushing the producer, that is everything it had not yet
-sent. `health().closing_sinks` is the only warning you get, which is why it is worth watching.
+a short grace — 2 s, per `shutdown()` call, carved from that call's own timeout — to finish. A
+close that was merely slow completes. One that is genuinely stuck is abandoned there, and **its
+own buffered data is lost**: for a sink whose `close()` *is* its delivery, like
+`KafkaSink.close()` flushing the producer, that is everything it had not yet sent.
+`health().closing_sinks` is the only warning you get, which is why it is worth watching.
 
 The closer runs as a daemon thread deliberately. A non-daemon one is worse: CPython joins
 non-daemon threads **before** running `atexit`, so a single stuck `close()` would stop the exit
