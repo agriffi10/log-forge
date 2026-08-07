@@ -28,6 +28,12 @@ class KafkaSink:
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``confluent-kafka`` documents its ``Producer`` as thread-safe, and this sink adds no state
     of its own to guard — ``produce()`` is a local hand-off into the client's internal queue.
+
+    It refuses an emit after :meth:`close` (SPEC-032 FR-001), which is not the housekeeping it
+    looks like: ``flush()`` is the only thing that drains the producer's local batch and services
+    its delivery callbacks, so a message produced after it dies with the process — accepted,
+    uncounted, and never the subject of a callback. ``emit`` returning normally is what made that
+    silent, since the worker then never retried and ``flush()`` reported success.
     """
 
     def __init__(
@@ -67,6 +73,8 @@ class KafkaSink:
         self.failed = 0
         self.rejected = 0
         self._counter_lock = threading.Lock()
+        self._closed = False
+        self._close_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports refused and undelivered messages (SPEC-026 FR-002).
@@ -98,6 +106,15 @@ class KafkaSink:
         observe (FR-002). A partial refusal is counted and left alone, since the messages that
         were accepted are already on their way.
 
+        A closed sink refuses the batch before touching the producer (SPEC-032 FR-001). Refusing
+        is not a loss this sink absorbed, so it moves no counter here: it is a failure reported
+        to the worker, which records it in ``health().failed_batches``. The check is an unlocked
+        read of a write-once flag rather than a lock held across the produce loop, which would
+        serialize a client ``confluent-kafka`` documents as thread-safe. A close landing between
+        the check and the produce therefore still loses that message, exactly as ``MongoDBSink``
+        documents for its own check; what the flag ends is the far larger case of a sink closed
+        long before, which is every log written after ``shutdown()``.
+
         Args:
           batch: The events to produce.
 
@@ -105,9 +122,16 @@ class KafkaSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every message was refused, so the batch reached nothing —
-            the total failure the worker's retry exists for (SPEC-026 FR-001).
+          SinkDeliveryError: When the sink is closed, or when every message was refused so the
+            batch reached nothing — the total failure the worker's retry exists for
+            (SPEC-026 FR-001).
         """
+        if not batch:
+            return
+        if self._closed:
+            raise SinkDeliveryError(
+                f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
+            )
         accepted = 0
         for event in batch:
             body = json.dumps(event).encode("utf-8")
@@ -127,6 +151,11 @@ class KafkaSink:
     def close(self) -> None:
         """Flushes the producer so buffered messages are delivered before exit (FR-002).
 
+        Idempotent, with the flag set under a lock so two concurrent calls cannot both reach
+        ``flush()`` — ``atexit`` racing user code is the documented case (SPEC-032 FR-001). The
+        flag is set *before* the flush rather than after, so an emit arriving during a flush is
+        refused rather than producing into a batch the flush has already walked past.
+
         Args:
           None.
 
@@ -136,6 +165,10 @@ class KafkaSink:
         Raises:
           Exception: Whatever the producer raises on flush.
         """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         self.producer.flush()
 
     def _key(self, event: dict[str, object]) -> bytes | None:

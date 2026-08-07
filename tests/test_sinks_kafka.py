@@ -1,4 +1,4 @@
-"""SPEC-010 — KafkaSink: produce-per-event, keying, close flush, delivery errors (fake producer)."""
+"""SPEC-010/032 — KafkaSink: produce-per-event, keying, close flush, delivery errors, post-close."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from log_foundry.sinks.base import Sink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.kafka import KafkaSink
 
 
@@ -138,3 +138,36 @@ def test_a_hostile_code_cannot_reach_the_caller(capsys) -> None:
     assert "lost 1 message(s)" in err, "the loss is still announced"
     assert "code=" not in err, "the unusable code contributes nothing rather than failing"
     assert sink.failed == 1
+
+
+def test_a_closed_sink_refuses_a_produce_without_moving_a_counter() -> None:
+    """Refusing is a reported failure, not absorbed loss (SPEC-032 FR-001).
+
+    The distinction matters to an operator reading ``health()``: a refused batch raises, so it
+    reaches ``failed_batches`` through the worker. Counting it in ``losses()`` as well would
+    report one lost batch twice, in two places meaning different things.
+    """
+    producer = FakeProducer()
+    sink = KafkaSink("logs", producer=producer)
+    sink.close()
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}, {"a": 2}])
+
+    assert sink.losses() == (0, 0), "a refusal moved a loss counter"
+    assert producer.produced == []
+
+
+def test_close_is_idempotent_and_flushes_once() -> None:
+    """A second ``close()`` reaches the producer no further than the first.
+
+    ``atexit`` racing user code is the documented case: ``shutdown()`` closes the sink and a
+    caller with their own ``close()`` makes the second call. Flushing twice is not harmful in
+    itself, but the flag guarding it is the same one ``emit`` reads, so a close that skipped it
+    would leave the sink accepting after the first call.
+    """
+    producer = FakeProducer()
+    sink = KafkaSink("logs", producer=producer)
+    sink.close()
+    sink.close()
+    assert producer.flushes == 1
