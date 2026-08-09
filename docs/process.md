@@ -94,6 +94,45 @@ This is the operating loop, start to finish. CLAUDE.md's *Session Workflow* is t
   the spec's acceptance criteria **and the relevant `best-practices/` rules** (route via its INDEX),
   not just "does it look fine."
 
+**Rotating the frame — why round count is the wrong exit criterion**
+
+Review rounds converge on the frame they are given, not on correctness. Measured on SPEC-033
+(2026-08-07): **eight** rounds of independent review — two on the spec, three on its revisions,
+three on the code — after which the merged result still carried two defects, one of which was a
+regression of a guarantee an earlier spec had shipped. Rounds 1–3 found design defects; rounds
+4–8 increasingly found wording. The *first* differently-framed pass afterwards found ~25 defects,
+several of them years old.
+
+So the loop rotates the frame instead of adding rounds:
+
+- **Cap same-frame review at two rounds.** After the second, switch frame rather than iterate:
+  adversarial *execution*, whole-module fresh eyes (not the diff), or concurrency.
+- **Exit on a new frame finding nothing**, not on the current frame converging. "The reviewer
+  found nothing" means "nothing within the frame I gave it."
+- **At least one pass must start from the library, not the diff.** Every diff-scoped review is
+  structurally blind to a defect that predates the diff — which is how `flush()` came to be blind
+  to an open span, breaking the documented serverless recipe, through ten specs of review.
+- **Reasoning finds wording; execution finds defects.** Every finding that mattered in the
+  2026-08-07 audit was *run*: 5,980 events in one emit, 19 of 60 forked children hung, 0 of 9
+  events delivered. Require a reproduction, not an argument.
+- **A spec touching lifecycle or concurrency gets an execution harness, not a review.**
+  `tests/conftest.py::run_concurrently` and injected preemption points exist for this; a race is
+  not findable by reading.
+
+**When a review changes a rule, re-audit the rule — not the line**
+
+A review finding is usually reported as an instance ("this call site uses the wrong predicate").
+Fixing the cited line and moving on is how the same defect survives repeated review: three
+separate reviewers told SPEC-033 "ownership, not liveness", each naming a different call site,
+each was fixed, and a fourth site shipped broken.
+
+- When a finding is an instance of a **rule**, the fix is a test that enumerates **every** site of
+  that rule and asserts each one's category — the same discipline the sink rosters already use,
+  and for the same reason: a hand-maintained list rots and a derived one does not.
+- **Scope added mid-review restarts the clock.** Widening a spec in response to a finding is often
+  right, but the widening arrives late, gets the least scrutiny, and inherits confidence it has
+  not earned. Two of SPEC-033's regressions were in scope added during its own review.
+
 **Landing the spec — watch PRs and watch `main`**
 - **Every PR is watched to completion and merged as soon as CI is green** — never open a PR and walk
   away. A spec's PR merges only on green.
