@@ -1,8 +1,8 @@
 """SPEC-035 FR-002 — every guard that asks about the worker declares which question it asks.
 
-Three reviewers told SPEC-033 "ownership, not liveness", each naming a different call site;
-each was fixed, and a fourth site shipped broken. SPEC-035 FR-001 was that fourth one, and its own first
-draft prescribed a predicate that would have re-broken SPEC-033 in the other direction. The fix
+Three reviewers told SPEC-033 "ownership, not liveness", each naming a different call site; each
+was fixed, and a fourth site shipped broken. SPEC-035 FR-001 was that fourth one, and its own
+first draft prescribed a predicate that would have re-broken SPEC-033 the other way. The fix
 for a defect that recurs at *sites* is not another site-by-site correction: it is a roster the
 tests derive, so a new or changed site must be classified before it can pass.
 
@@ -39,19 +39,20 @@ OWNERSHIP_AND_MOMENT = "ownership ∧ moment — whose stop event the sink shoul
 # Keyed by (function, expression, occurrence index within that function): two textually
 # identical guards in one function ask two questions and get two rows.
 ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
+    ("_get_worker", "_worker is None", 0): (
+        EXISTENCE,
+        (
+            "the double-checked build. Neither liveness nor ownership: a retired worker is still "
+            "the"
+            "process worker, and rebuilding one would fight a process trying to exit (SPEC-019)."
+        ),
+    ),
     ("_get_worker", "_worker is None", 1): (
         EXISTENCE,
         (
             "the second half of the double-check, re-read under the lock. Two rows for one "
             "idiom is the honest count: each is a separate decision the compiler will not "
             "merge, and collapsing them hides that the outer one is deliberately unlocked."
-        ),
-    ),
-    ("_get_worker", "_worker is None", 0): (
-        EXISTENCE,
-        (
-            "the double-checked build. Neither liveness nor ownership: a retired worker is still the "
-            "process worker, and rebuilding one would fight a process trying to exit (SPEC-019)."
         ),
     ),
     ("_live_worker", "worker is None or worker.retired", 0): (
@@ -61,8 +62,10 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_offer_orphan_signal", "worker is not None and worker.sink is sink and worker.draining", 0): (
         OWNERSHIP_AND_MOMENT,
         (
-            "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, leaving "
-            "a sink still being written to holding a set event - SPEC-033 FR-004's tight retry loop. "
+            "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
+            "leaving"
+            "a sink still being written to holding a set event - SPEC-033 FR-004's tight retry "
+            "loop."
             "Liveness alone un-skips for the whole drain, handing the drain thread a fresh event "
             "nobody will set. Both were measured; only the conjunction is right."
         ),
@@ -84,8 +87,10 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_swap_sink", "_live_worker()", 0): (
         LIVENESS,
         (
-            "the call that answers who performs. Kept as its own row rather than folded into the test "
-            "below, because the two are separable: reverting FR-001 moves a _live_worker() call into "
+            "the call that answers who performs. Kept as its own row rather than folded into the "
+            "test"
+            "below, because the two are separable: reverting FR-001 moves a _live_worker() call "
+            "into"
             "_offer_orphan_signal, and a roster counting only predicates would not notice."
         ),
     ),
@@ -109,14 +114,16 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_swap_sink", "_worker is None or _worker.sink is not old", 0): (
         OWNERSHIP,
         (
-            "who owns the *old* sink's close. Answering this one with liveness closes it twice on a "
+            "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
+            "a"
             "clean shutdown and under a live writer on an expired one - both measured."
         ),
     ),
     ("_swap_sink", "not worker_holds_sink", 0): (
         OWNERSHIP,
         (
-            "who owns the *new* sink when the worker declined mid-swap (SPEC-035 FR-003). Carried by "
+            "who owns the *new* sink when the worker declined mid-swap (SPEC-035 FR-003). Carried "
+            "by"
             "a return value because only the worker knows whether it got as far as reassigning."
         ),
     ),
@@ -134,12 +141,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_worker_health", "_orphan_retired and (not health.retired)", 0): (
         LIVENESS,
         (
-            "reporting, not deciding: health.retired is the worker's own retirement read off its "
-            "snapshot, so this is a liveness question even though the other operand is a module "
-            "flag. A draft filed it under a fifth category, not-a-worker-question, which was an "
-            "unbounded escape hatch - a site nobody wanted to think about could be filed there "
-            "and pass. Four categories, matching architecture.md 9.2, and no escape hatch. - "
-            "synthesizing retired for a process with no worker (SPEC-031 FR-006)."
+            "reporting rather than deciding: this synthesizes `retired` for a process that shut "
+            "down without ever building a worker (SPEC-031 FR-006). It is a liveness question "
+            "even though one operand is a module flag, because `health.retired` is the worker's "
+            "own retirement read off its snapshot. A draft filed it under a fifth category, "
+            "not-a-worker-question, which was an unbounded escape hatch: a site nobody wanted "
+            "to think about could be filed there and pass both tests."
         ),
     ),
 }
