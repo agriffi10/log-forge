@@ -122,6 +122,22 @@ change and must be stated — or keep a reference to already-swept boundary even
 merge still finds them. FR-001 picks the **first**: the second means an event is mutated after the
 worker owns it, which SPEC-028's concurrency contract forbids.
 
+**A sweep makes a later `continue_trace()` unable to re-parent what it swept.** `_adopt_trace`
+re-parents the events still *buffered* on the open root span, which is SPEC-014's mechanism for
+adopting a context on the entry point's first line. Swept events have left the buffer, so they
+keep the pre-adoption trace while everything after it joins the inbound one. Measured with the
+detach in place:
+
+```
+control: span.start 4bf92f35 · before-adopt 4bf92f35 · after-adopt 4bf92f35 · span.end 4bf92f35
+swept:   span.start 47726b1a · before-adopt 47726b1a · after-adopt 4bf92f35 · span.end 4bf92f35
+```
+
+One span, two trace ids. That is exactly what `_adopt_trace`'s docstring calls "worse than no
+continuation at all because it looks like data rather than a bug", and it is the SPEC-024
+category — wrong data rather than lost data. A `continue_trace()` after a sweep on the same span
+must therefore be **refused and reported**, not half-applied.
+
 **A sweep reaches only the calling context's spans**, which is the honest bound: `contextvars`
 gives no way to enumerate other threads' or tasks' contexts. That must be stated rather than
 implied, since a `flush()` in a handler that fanned out to tasks will not reach them.
@@ -139,7 +155,7 @@ implied, since a `flush()` in a handler that fanned out to tasks will not reach 
       likely to catch a wrong implementation: `span.events.clear()` empties the *same list object*
       `Worker.submit` was handed, so the natural reading of "clear the buffer" destroys the swept
       events while `flush()` still returns `True`. Measured on a nested span: 4 of 6 events gone,
-      with AC-6 and the old AC-4 both passing. **FR-004's detach-at-submit must land first**, and
+      with the pre-revision AC-4 and AC-6 both passing. **FR-004's detach-at-submit must land first**, and
       the phases below are ordered accordingly.
 - [ ] AC-5: A swept `span.start` carries the same baggage it would have carried had the span
       closed normally at that moment. A test asserts the backfill survives the sweep, since this
@@ -160,7 +176,11 @@ implied, since a `flush()` in a handler that fanned out to tasks will not reach 
 - [ ] AC-10: Two tasks sweeping the same shared `Span` concurrently deliver each event once and
       destroy none — `contextvars` copies the same object into both, so this is reachable without
       the caller doing anything unusual.
-- [ ] AC-11: `tests/test_promises.py`'s loss-visibility cells for `traced` and `async` still pass,
+- [ ] AC-11: `continue_trace()` on a span that has been swept is refused and reported rather
+      than re-parenting only what is left. The documented placement — `continue_trace()` on the
+      entry point's first line — is unaffected, since nothing has been swept yet. A test asserts
+      one trace id across the whole span in both orders.
+- [ ] AC-12: `tests/test_promises.py`'s loss-visibility cells for `traced` and `async` still pass,
       and any cell this closes has its `xfail` marker removed — `strict=True` makes that
       mandatory rather than optional.
 
@@ -194,10 +214,13 @@ satisfies the protocol.
       call concurrently with `emit` (SPEC-028) and that it is *not* a close.
 - [ ] AC-6: A lint asserts every sink that buffers in a client implements it, derived from the
       sink roster rather than a hand-written list.
-- [ ] AC-7: **A process with no worker still calls `sink.flush()`.** `_flush_worker` returns
-      `True` on a null worker without touching the sink, so an orphan-only process with a
-      `KafkaSink` would never reach its client buffer — the same shape SPEC-031 FR-006 and
-      SPEC-033 each found on the close path.
+- [ ] AC-7: **A process with no worker that has already resolved a sink still calls
+      `sink.flush()`.** `_flush_worker` returns `True` on a null worker without touching the sink,
+      so an orphan-only process with a `KafkaSink` would never reach its client buffer — the same
+      shape SPEC-031 FR-006 and SPEC-033 each found on the close path. Scoped to a *resolved*
+      sink deliberately: a bare `flush()` in a process that has never logged must not materialise
+      a `StdoutSink` through `_ensure_sink()`, which FR-001 AC-6 requires to behave exactly as
+      today.
 
 ### FR-003: The synchronous path reports its loss
 
@@ -223,6 +246,10 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
       `Health._fields[:9]` is unchanged.
 - [ ] AC-4: A mixed process reports orphan losses in `orphan_lost` and worker losses in
       `failed_batches`, separately — a test asserts both, and that neither absorbs the other.
+- [ ] AC-5b: The new lock is covered by SPEC-035 FR-005 AC-2's fork roster. That roster is
+      derived rather than listed precisely so a lock added later is picked up; this AC is the
+      catcher on *this* side of the handoff, since 036 is built after 035 and nothing in 035 can
+      know about a lock that did not exist yet.
 - [ ] AC-5: The counter is incremented under its **own** lock, not `_worker_lock` — SPEC-028's
       dedicated-counter-lock rule, because the orphan path runs on arbitrary application threads.
       The reason is *not* that `_worker_lock` is held across a blocking close: it is released
@@ -332,12 +359,17 @@ child to report itself.
       `len(batch)` per failing **silent** child, matching `SinkLosses.failed`'s unit. This needs
       per-child accounting that `MultiSink` does not have today; the existing `self.failed` counts
       child *calls* across all children and stays out of the sum.
-- [ ] AC-5: Which children are silent is decided by `read_losses(child) is None`, the same probe
+- [ ] AC-3: Which children are silent is decided by `read_losses(child) is None`, the same probe
       the aggregate already uses, so a child that gains a `losses()` later moves categories
       automatically.
-- [ ] AC-6: Which child is failing is discoverable. If the aggregate cannot say, the stderr line
+- [ ] AC-4: `tests/test_sink_losses.py::test_multisink_excludes_its_own_call_counter` asserts the
+      **superseded** behaviour — with one silent and one reporting child it expects `failed=6`
+      where this FR gives `failed=7`. It is rewritten, not deleted, and `MultiSink.losses()`'s
+      docstring has its "adding it to a per-event sum has no unit" reasoning struck through in
+      place and marked with this spec, per SPEC-021's rule.
+- [ ] AC-5: Which child is failing is discoverable. If the aggregate cannot say, the stderr line
       must name the child's class, and the docstring must say the aggregate is a total.
-- [ ] AC-7: A healthy `MultiSink` still reports zero.
+- [ ] AC-6: A healthy `MultiSink` still reports zero.
 
 ---
 
@@ -372,4 +404,8 @@ first — those are the three a wrong implementation passes the rest of the ACs 
 
 ### Phase 3: FR-002 — the `Sink` flush hook
 
-### Phase 4: FR-005
+### Phase 4: FR-005, and FR-004's closed-span detection
+
+FR-004 is split across the plan on purpose — its detach is Phase 1 because FR-001 is unsafe
+without it, but its append-time closed-span routing (AC-2) and the `architecture.md` §5 entry
+(AC-5) belong here, with the rest of the reporting work.

@@ -3,8 +3,9 @@
 **ID:** SPEC-037  
 **Status:** Draft  
 **Last Updated:** 2026-08-07  
-**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-036 — FR-001 AC-5 routes an absorbed in-span
-failure into the counter SPEC-036 FR-003 adds, so it cannot be built before it
+**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-036 — FR-001 AC-5 routes an absorbed
+**orphan** failure into the `orphan_lost` counter SPEC-036 FR-003 adds, so it cannot be built
+before it. The in-span half needs its own destination, which AC-5 names.
 
 ## Overview
 
@@ -87,10 +88,12 @@ same stated reason.
 - [ ] AC-3: `KeyboardInterrupt` and `SystemExit` still propagate from inside a span.
 - [ ] AC-4: The decorated function still returns its value normally, and the span still closes
       with `status=ok`.
-- [ ] AC-5: The event that could not be built is lost and counted, not silently dropped — it
-      goes to the same counter SPEC-036 FR-003 adds for the orphan path if the call was an orphan,
-      and to the span's own path otherwise. The two must not double-count; a test asserts the
-      total.
+- [ ] AC-5: The event that could not be built is lost and counted, not silently dropped. An
+      orphan call goes to SPEC-036 FR-003's `orphan_lost`. **An in-span call has no counter in the
+      arc**, and this AC must name its destination concretely rather than saying "the span's own
+      path": either `orphan_lost` is widened to mean *events lost before reaching the worker* on
+      both paths (renaming it, which SPEC-036 must then agree to), or a second field is appended.
+      Whichever, it is decided here and the two must not double-count; a test asserts the total.
 - [ ] AC-6: The stale reasoning in `api._log`'s docstring is replaced with what is actually true:
       the branch calls `build_event`, and `build_event` can raise.
 - [ ] AC-7: Mutation-tested — removing the guard fails AC-1 on all three paths.

@@ -292,7 +292,9 @@ a pure move with no design content and this spec is already in the sink package.
 - [ ] AC-1: `MemorySink` and `NullSink` get their own modules; `StderrSink` sits with
       `StdoutSink`, which is what it is a variant of.
 - [ ] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated.
-- [ ] AC-3: No compatibility alias is left behind in `sinks.util` — an alias would have to live
+- [ ] AC-3: `sinks/util.py`'s `__all__` is exactly these three classes, so the module is left
+      **empty and deleted** rather than kept as a shell.
+- [ ] AC-4: No compatibility alias is left behind in `sinks.util` — an alias would have to live
       for all of `1.x`, which is the cost the move is being made to avoid.
 
 ### FR-014: Three queue sinks have no bounded retry, and the docs said they did
@@ -308,7 +310,9 @@ That may be the right answer: each of the three has a client with its own retry 
 delivery timeout, and layering a second retry on top of `librdkafka`'s can multiply the worst-case
 delay rather than bound it. But it has to be a decision, not a documentation edit.
 
-- [ ] AC-1: For each of the three, the FR states whether the client's own retry satisfies
+- [ ] AC-1: Closed only against a **green** run of FR-011's integration job, as FR-003 AC-4 and
+      FR-010 AC-1 are — Phase 5 already sequences it there. For each of the three, the FR states
+      whether the client's own retry satisfies
       SPEC-027's guarantee — bounded, and cut short by a shutdown — with the setting that makes it
       so.
 - [ ] AC-2: Where it does, the class docstring states the worst-case total delay as every other

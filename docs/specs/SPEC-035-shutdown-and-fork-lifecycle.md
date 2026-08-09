@@ -220,9 +220,15 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
       lock while the drain thread is mid-`emit` blocked the fork for 1.20 s, and with `HTTPSink`'s
       documented 90 s worst case it would block gunicorn's master thread for that long — with no
       shutdown in progress, so the stop signal cannot cut it. The handler try-acquires with a
-      short deadline and proceeds **without** the lock when it expires; the FR states the
-      consequence for child consistency, which is that the child may inherit a half-written sink
-      buffer and must therefore not reuse it (AC-7).
+      short deadline and proceeds **without** the lock when it expires. The consequence is that the
+      child may inherit a partially-written sink buffer — a hazard belonging to the caller-shared
+      sink AC-7 documents, **not** a requirement that the child stop using the sink, which would
+      contradict this FR's chosen design and AC-3.
+- [ ] AC-0a: **The FR states whether a `before` handler is built at all.** After AC-2
+      (re-initialise every lock in the child) and AC-0b (never depend on it), no criterion here
+      fails if it is omitted — while it costs the parent's fork path a measured 1.20 s, up to
+      ~90 s with `HTTPSink`. The default answer is therefore **no `before` handler**; if one is
+      built, this AC names the criterion it exists for.
 - [ ] AC-0b: The design does not *depend* on `before` running. `os.register_at_fork(before=)` is
       not invoked for a C-level fork — uWSGI calls `PyOS_AfterFork_Child` only — so a design that
       needs `before` degrades silently on one of the three deployments this spec names. The child
@@ -231,9 +237,12 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
       (≥50 iterations) with the drain thread actively emitting into a locking sink, and every
       child completes within a timeout. The pre-fix version of this test hangs, which is
       demonstrated.
-- [ ] AC-2: Every lock the library owns is re-initialised in the child — `decorator._worker_lock`,
-      `_lifecycle._closers_lock`, `Worker._lock`, the counter locks, and each locking sink's
-      pair. Derived from a roster, not hand-listed (FR-002's lesson).
+- [ ] AC-2: Every lock the library owns is re-initialised in the child. **The roster is derived,
+      and the derivation rule is stated** — every `threading.Lock`/`RLock` attribute reachable
+      from the package's own objects — rather than the illustrative list
+      (`decorator._worker_lock`, `_lifecycle._closers_lock`, `Worker._lock`, the counter locks,
+      each locking sink's pair) being the roster. A hand-list is what FR-002 exists to stop, and
+      SPEC-036 FR-003 adds a lock after this spec is built that must be picked up automatically.
 - [ ] AC-3: A child that logs after forking delivers those events.
 - [ ] AC-4: The parent is unaffected: its worker, queue and counters are unchanged across the
       fork, and a test asserts the parent's delivery continues.
