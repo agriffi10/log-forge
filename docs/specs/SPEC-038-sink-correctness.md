@@ -2,7 +2,7 @@
 
 **ID:** SPEC-038  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
+**Last Updated:** 2026-08-09  
 **Depends On:** SPEC-018, SPEC-026, SPEC-027, SPEC-032
 
 ## Overview
@@ -291,7 +291,13 @@ a pure move with no design content and this spec is already in the sink package.
 
 - [ ] AC-1: `MemorySink` and `NullSink` get their own modules; `StderrSink` sits with
       `StdoutSink`, which is what it is a variant of.
-- [ ] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated.
+- [ ] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated,
+      **and the one live reference that is not an import**:
+      `tests/test_diag.py::test_only_diag_writes_to_stderr`'s docstring names `sinks/util.py` as a
+      module that legitimately writes to `sys.stderr` as a destination for the user's events. The
+      lint itself is `rglob`-derived and so needs no edit, which is precisely why the stale
+      sentence would survive a grep for imports. Historical records — SPEC-008 and its delivery
+      doc, the audit — are left alone; they describe what shipped then.
 - [ ] AC-3: `sinks/util.py`'s `__all__` is exactly these three classes, so the module is left
       **empty and deleted** rather than kept as a shell.
 - [ ] AC-4: No compatibility alias is left behind in `sinks.util` — an alias would have to live

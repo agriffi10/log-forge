@@ -2,7 +2,7 @@
 
 **ID:** SPEC-036  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
+**Last Updated:** 2026-08-09  
 **Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030  
 **Sequenced after:** SPEC-035 — ordering only. Nothing here needs any of 035's FRs; the one real
 coupling runs the other way, since 035 FR-005's fork lock roster must pick up the counter lock
@@ -122,21 +122,31 @@ change and must be stated — or keep a reference to already-swept boundary even
 merge still finds them. FR-001 picks the **first**: the second means an event is mutated after the
 worker owns it, which SPEC-028's concurrency contract forbids.
 
-**A sweep makes a later `continue_trace()` unable to re-parent what it swept.** `_adopt_trace`
-re-parents the events still *buffered* on the open root span, which is SPEC-014's mechanism for
-adopting a context on the entry point's first line. Swept events have left the buffer, so they
-keep the pre-adoption trace while everything after it joins the inbound one. Measured with the
-detach in place:
+**A sweep makes a later `continue_trace()` unable to re-parent what it swept.**
+`decorator._reparent_current_span` re-parents the events still *buffered* on the open root span,
+by iterating `span.events` — SPEC-014's mechanism for adopting a context on the entry point's
+first line. Swept events have left the buffer, so they keep the pre-adoption trace while
+everything after it joins the inbound one. Measured with the detach in place:
 
 ```
 control: span.start 4bf92f35 · before-adopt 4bf92f35 · after-adopt 4bf92f35 · span.end 4bf92f35
 swept:   span.start 47726b1a · before-adopt 47726b1a · after-adopt 4bf92f35 · span.end 4bf92f35
 ```
 
-One span, two trace ids. That is exactly what `_adopt_trace`'s docstring calls "worse than no
-continuation at all because it looks like data rather than a bug", and it is the SPEC-024
-category — wrong data rather than lost data. A `continue_trace()` after a sweep on the same span
-must therefore be **refused and reported**, not half-applied.
+One span, two trace ids. That is exactly what `_reparent_current_span`'s docstring calls "worse
+than no continuation at all because it looks like data rather than a bug", and it is the SPEC-024
+category — wrong data rather than lost data. Reproduced a second time, independently, against
+`5ad6699`, with the sweep modelled as FR-001 + FR-004 specify it — detach, not `.clear()`. The
+local trace id differs run to run (`4b50b273` the second time), which is the point: what
+reproduces is the **shape**, two distinct ids across one span, not the ids above.
+
+**What is refused is the trace context, not the call.** `continue_trace()` does two separable
+things, and `decorator.py` separates them deliberately: it adopts a trace context, and it merges
+a `baggage` header, the second "independently of the trace context, because losing correlating
+fields is bad and losing the trace join because one field was malformed is worse". Refusing the
+whole call would therefore drop a baggage merge SPEC-014 decided must survive a trace-context
+failure — trading wrong data for lost data. The refusal covers `set_adopted_context` and the
+re-parent; the baggage merge runs as it does today.
 
 **A sweep reaches only the calling context's spans**, which is the honest bound: `contextvars`
 gives no way to enumerate other threads' or tasks' contexts. That must be stated rather than
@@ -176,10 +186,19 @@ implied, since a `flush()` in a handler that fanned out to tasks will not reach 
 - [ ] AC-10: Two tasks sweeping the same shared `Span` concurrently deliver each event once and
       destroy none — `contextvars` copies the same object into both, so this is reachable without
       the caller doing anything unusual.
-- [ ] AC-11: `continue_trace()` on a span that has been swept is refused and reported rather
-      than re-parenting only what is left. The documented placement — `continue_trace()` on the
-      entry point's first line — is unaffected, since nothing has been swept yet. A test asserts
-      one trace id across the whole span in both orders.
+- [ ] AC-11: **The sweep records that it swept**, on the `Span`, and that record is what AC-11a
+      keys on. It is stated as its own criterion because nothing in AC-1..AC-10 needs it: an
+      implementation that satisfies every one of them still leaves `continue_trace()` no way to
+      tell a swept span from an untouched one, which is how this handoff would arrive with no
+      catcher.
+- [ ] AC-11a: `continue_trace()` on a span that has been swept refuses the **trace context** —
+      neither adopting it nor re-parenting what is left — and reports the refusal through
+      `_diag.rejected`, the channel SPEC-014's other refusals already use. The `baggage` merge
+      still runs, per the split above, and the call returns `False`, which already means "no
+      context was adopted". The documented placement — `continue_trace()` on the entry point's
+      first line — is unaffected, since nothing has been swept yet. Tests assert one trace id
+      across the whole span in both orders, **and** that a `baggage=` passed to the refused call
+      still reaches the events that follow it.
 - [ ] AC-12: `tests/test_promises.py`'s loss-visibility cells for `traced` and `async` still pass,
       and any cell this closes has its `xfail` marker removed — `strict=True` makes that
       mandatory rather than optional.
@@ -214,13 +233,17 @@ satisfies the protocol.
       call concurrently with `emit` (SPEC-028) and that it is *not* a close.
 - [ ] AC-6: A lint asserts every sink that buffers in a client implements it, derived from the
       sink roster rather than a hand-written list.
-- [ ] AC-7: **A process with no worker that has already resolved a sink still calls
+- [ ] AC-7: **A process with no worker whose orphan path has reached a sink still calls
       `sink.flush()`.** `_flush_worker` returns `True` on a null worker without touching the sink,
       so an orphan-only process with a `KafkaSink` would never reach its client buffer — the same
-      shape SPEC-031 FR-006 and SPEC-033 each found on the close path. Scoped to a *resolved*
-      sink deliberately: a bare `flush()` in a process that has never logged must not materialise
-      a `StdoutSink` through `_ensure_sink()`, which FR-001 AC-6 requires to behave exactly as
-      today.
+      shape SPEC-031 FR-006 and SPEC-033 each found on the close path. The gate is
+      `decorator._orphan_sink`, the sink an orphan emit actually reached, **not** "a sink has been
+      resolved": `configure()` runs `_ensure_sink()` unconditionally, so a bare
+      `configure(service=…)` has already built a `StdoutSink`, and `_note_orphan_emit`'s docstring
+      records that keying on a sink *existing* is the wrong predicate for exactly this reason.
+      That is SPEC-031 FR-006's decision, and this AC reuses it rather than inventing a weaker
+      one. A `flush()` in a process that has never logged therefore touches no sink and
+      materialises none, which is what FR-001 AC-6 requires to behave exactly as today.
 
 ### FR-003: The synchronous path reports its loss
 
@@ -243,13 +266,13 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
 - [ ] AC-2: `flush()` is unchanged — it still returns `True` in that process, and a test pins
       that, with a comment naming SPEC-021 so a later reader does not "fix" it.
 - [ ] AC-3: The new field is **appended** to `Health`, so every existing field keeps its index;
-      `Health._fields[:9]` is unchanged.
+      `Health._fields[:9]` is unchanged. The name is **path-scoped and stays that way**: SPEC-037
+      FR-001 AC-5 needs the same kind of counter for the in-span path and appends its own
+      (`in_span_lost`) rather than widening this one, because 037 builds after this spec and a
+      rename would re-title a field already published and re-edit every surface AC-12 corrects
+      here. Deciding it now is the point — a name settled after it ships is settled too late.
 - [ ] AC-4: A mixed process reports orphan losses in `orphan_lost` and worker losses in
       `failed_batches`, separately — a test asserts both, and that neither absorbs the other.
-- [ ] AC-5b: The new lock is covered by SPEC-035 FR-005 AC-2's fork roster. That roster is
-      derived rather than listed precisely so a lock added later is picked up; this AC is the
-      catcher on *this* side of the handoff, since 036 is built after 035 and nothing in 035 can
-      know about a lock that did not exist yet.
 - [ ] AC-5: The counter is incremented under its **own** lock, not `_worker_lock` — SPEC-028's
       dedicated-counter-lock rule, because the orphan path runs on arbitrary application threads.
       The reason is *not* that `_worker_lock` is held across a blocking close: it is released
@@ -257,6 +280,10 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
       matters is `_get_worker` across `Worker(_ensure_sink())`. A dedicated lock also cannot
       deadlock here: the increment sits in `api._log`'s `except`, where `_note_orphan_emit` has
       already released `_worker_lock` and the propagating exception has released any sink lock.
+- [ ] AC-5a: That lock is covered by SPEC-035 FR-005 AC-2's fork roster. That roster is derived
+      rather than listed precisely so a lock added later is picked up; this AC is the catcher on
+      *this* side of the handoff, since 036 is built after 035 and nothing in 035 can know about a
+      lock that did not exist yet.
 - [ ] AC-6: A loss anywhere inside the orphan guard counts — a sink that fails to *construct* or
       an event that fails to build, not only a failing `emit` — since `api._log` wraps all three
       and the event is lost either way. A test covers the construction failure specifically,
@@ -363,10 +390,13 @@ child to report itself.
       the aggregate already uses, so a child that gains a `losses()` later moves categories
       automatically.
 - [ ] AC-4: `tests/test_sink_losses.py::test_multisink_excludes_its_own_call_counter` asserts the
-      **superseded** behaviour — with one silent and one reporting child it expects `failed=6`
-      where this FR gives `failed=7`. It is rewritten, not deleted, and `MultiSink.losses()`'s
-      docstring has its "adding it to a per-event sum has no unit" reasoning struck through in
-      place and marked with this spec, per SPEC-021's rule.
+      **superseded** behaviour — with one silent child (`DeadSink`) and one reporting child it
+      expects `failed=6` where this FR gives `failed=7`, the batch being one event. It is
+      rewritten, not deleted. The superseded reasoning is written in **two** places and both are
+      struck through in place and marked with this spec, per SPEC-021's rule: that test's own
+      docstring ("adding it to a per-event sum has no unit") and `MultiSink.losses()`'s docstring
+      ("adding it to a per-event figure would produce a number with no unit"). Striking only the
+      one the AC happens to quote leaves the other reading as live design.
 - [ ] AC-5: Which child is failing is discoverable. If the aggregate cannot say, the stderr line
       must name the child's class, and the docstring must say the aggregate is a total.
 - [ ] AC-6: A healthy `MultiSink` still reports zero.

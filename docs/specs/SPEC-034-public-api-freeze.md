@@ -2,7 +2,7 @@
 
 **ID:** SPEC-034  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
+**Last Updated:** 2026-08-09  
 **Depends On:** SPEC-026, SPEC-030, SPEC-033, SPEC-036 — FR-008 converts `Health` to a dataclass
 and SPEC-036 FR-003 appends a field to it as a `NamedTuple`; building this first would make that
 spec's criteria unsatisfiable
@@ -314,10 +314,12 @@ effectively is, and it has not stopped anything: the shape is still real, still 
 - [ ] AC-1: Attribute access is unchanged everywhere — `h.dropped`, `h.sink.failed`.
 - [ ] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
       breaking.
-- [ ] AC-2b: The tests SPEC-036 FR-003 mandates are updated here — `test_health_gains_no_field`
-      (which pins `Health._fields[:9]` and the tenth index) and the relocated `len(h) == 9`
-      assertion both become impossible under a dataclass. This is the catcher on this side of the
-      handoff; without it 036 leaves two tests that 034 silently breaks.
+- [ ] AC-2b: The tests SPEC-036 FR-003 AC-10 and SPEC-037 FR-001 AC-5a mandate are updated here —
+      `test_health_gains_no_field` (which by then pins `Health._fields[:9]` plus the tenth and
+      eleventh indices) and the `len(h)` assertion relocated alongside it both become impossible
+      under a dataclass. This is the catcher on this side of the handoff; without it 036 and 037
+      each leave tests that 034 silently breaks. **Both** appended fields are in scope because the
+      build order is 035 → 036 → 037 → 034: this spec is the last to see `Health` as a tuple.
 - [ ] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
       positional sites exist today (`tests/test_sink_losses.py:213`, `:228`), so a draft claiming
       this was already true was wrong. Verified by grep before the type changes.
