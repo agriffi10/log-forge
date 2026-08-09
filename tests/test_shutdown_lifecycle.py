@@ -292,7 +292,7 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait() -> None:
         sink.release.set()
 
 
-def test_the_closer_grace_is_granted_exactly_once_across_both_calls(monkeypatch) -> None:
+def test_the_closer_grace_is_granted_exactly_once_per_call(monkeypatch) -> None:
     """AC-4. Asserted by counting the joins, not by timing them — a gauge that has already
     unwound, or an elapsed time, is the observable that fails to hold here."""
     lifecycle = pytest.importorskip("log_foundry._lifecycle")
@@ -445,7 +445,7 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
 def test_an_abandoning_first_shutdown_releases_the_second_callers_wait() -> None:
     """FR-004 AC-5 in the **concurrent** ordering, which the serial test cannot reach.
 
-    `_drain_abandoned` is set by the first caller *after* its join expires, so a second caller
+    The abandonment is recorded by the first caller *after* its join expires, so a second caller
     that evaluated `draining` on entry has already committed to the wait. Measured before the
     fix: a second `shutdown(timeout=20)` returned after 20.01 s, and with `timeout=None` the
     process never exited.

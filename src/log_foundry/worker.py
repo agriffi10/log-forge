@@ -227,7 +227,6 @@ class Worker:
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
-        self._drain_abandoned = False
         self._shutdown_done = False
         self._sink_closed = False
         self._lock = threading.Lock()
@@ -382,7 +381,10 @@ class Worker:
 
         ``_drain_finished`` is deliberately left alone rather than widened: :meth:`flush` and
         :meth:`shutdown`'s sentinel gate both read it as "the loop stopped reading the queue",
-        which an abandoned — and still running — drain has not done.
+        which an abandoned — and still running — drain has not done. The two events stay
+        distinguishable without a third flag, which is why no ``_drain_abandoned`` is kept:
+        abandoned is ``_drain_settled`` set with ``_drain_finished`` unset, and the operator-facing
+        form of the same fact is ``stopped_reason == "ShutdownTimeout"``.
 
         Read without the lock, as ``retired`` is: the event is set once and never cleared, so a
         racing reader sees one of two answers and both are momentarily true.
@@ -724,12 +726,12 @@ class Worker:
         two user calls: it is a ``shutdown()`` on one thread and ``atexit`` on the main thread,
         and measured with a 2 s-emit sink and three traced calls it delivered **nothing**, never
         closed the sink, and left the process gone in 0.39 s with nothing on stderr. The
-        wait is on ``_drain_finished`` and bounded by *this* call's own budget, so
+        wait is on ``_drain_settled`` and bounded by *this* call's own budget, so
         ``shutdown(timeout=0)`` still returns promptly and a caller never inherits the other
-        call's deadline. It is skipped once :attr:`draining` is false — a finished drain makes it
-        a no-op, and an **abandoned** one must not be waited on at all, since that thread is
-        wedged and nothing will release it, which would spend the whole second budget in front of
-        an exit that has to happen.
+        call's deadline. It is skipped where :attr:`draining` is already false, and **released**
+        where the drain is abandoned after the wait began — the first caller sets the same event
+        when its join expires, which is what stops a wedged thread costing the second caller its
+        whole budget in front of an exit that has to happen.
 
         :meth:`_release_waiters` runs on the way out for the sibling case the ordering cannot
         reach: a ``flush()`` that passed its liveness check microseconds before the thread
@@ -776,7 +778,6 @@ class Worker:
         if self._thread.is_alive():
             queued = self._queued_or_unknown()
             with self._lock:
-                self._drain_abandoned = True
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
             self._drain_settled.set()

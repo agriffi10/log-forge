@@ -356,11 +356,14 @@ def _offer_orphan_signal(sink: Sink) -> None:
     the skip stopped applying and an orphan log handed the sink a fresh unset event — precisely
     the one the drain thread was about to wait on. Measured, a 20 s backoff against
     ``shutdown(timeout=3)`` was then still outstanding when the shutdown expired at 3.01 s with
-    the sink left open — the wait was never cut, not merely slow. But bare ``_worker.sink is sink`` is wrong in the opposite direction: it skips for
-    a worker whose shutdown has **finished**, leaving a sink still being written to holding a set
-    event that can never clear, which is SPEC-033 FR-004's tight retry loop and is covered by a
-    test that spec shipped. The predicate is therefore ``Worker.draining`` — the moment, not the
-    identity — and its docstring carries the reasoning.
+    the sink left open — the wait was never cut, not merely slow. But bare ``_worker.sink is
+    sink`` is wrong in the opposite direction: it skips for a worker whose shutdown has
+    **finished**, leaving a sink still being written to holding a set event that can never clear,
+    which is SPEC-033 FR-004's tight retry loop and is covered by a test that spec shipped. The
+    predicate is therefore the ownership term **conjoined with** ``Worker.draining`` — the
+    moment as well as the identity, since without the identity an orphan log to sink Y would be
+    skipped merely because a live worker is draining into sink X. That property's docstring
+    carries the rest of the reasoning.
 
     A fresh event replaces one that is already set, because an ``Event`` never clears and
     ``sinks/_retry.wait`` returns immediately on a set one — a sink handed the shutdown's event

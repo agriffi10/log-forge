@@ -84,11 +84,13 @@ one-line correction — it is FR-002's enumeration.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `_offer_orphan_signal` skips on the **moment**, not on either category — a new
-      `Worker.draining`, true while the drain loop is running and has not been abandoned.
+- [ ] AC-1: `_offer_orphan_signal` skips on ownership **conjoined with the moment** —
+      `_worker.sink is sink and _worker.draining`, the second a new property true while the drain
+      loop is running and has not been abandoned. The ownership term stays and must: without it an
+      orphan log to sink Y is skipped merely because a live worker is draining into sink X.
       `_live_worker()` is not consulted. **A draft of this AC prescribed bare ownership
-      (`_worker is not None and _worker.sink is sink`, the guard `_close_orphan_sink` uses) and
-      that is measurably wrong**: it skips for a worker whose shutdown has *finished*, leaving a
+      (`_worker is not None and _worker.sink is sink`, the guard `_close_orphan_sink` uses) with
+      no second term, and that is measurably wrong**: it skips for a worker whose shutdown has *finished*, leaving a
       sink still being written to holding a `_stop` that is set forever and can never clear, so
       every later backoff collapses to zero. That is SPEC-033 FR-004's tight retry loop, and
       `test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal` fails against it — this
@@ -186,8 +188,13 @@ three of them are six, re-measured 2026-08-09, and the harness's other three wer
 The shape reproduces; the figure does not. The control — no concurrent
 `shutdown` — delivered all 9 and closed the sink in 2.09 s.
 
-The fix is to wait on `_drain_finished`, bounded by *this* call's own timeout, before
-`_close_if_owed()`. That preserves every existing property: a first shutdown that expired still
+The fix is to wait, bounded by *this* call's own timeout, before `_close_if_owed()` — on a
+`_drain_settled` event set both where the drain loop stops **and** where a shutdown gives up
+on it. ~~`_drain_finished`~~ is struck: waiting on it alone lets a first caller that abandons
+*after* the second has committed to the wait hang the exit, measured at 20.01 s against a
+20 s budget and indefinitely with `timeout=None`. Only an event already being waited on can
+release a waiter that has committed, and `_drain_finished` cannot be widened — `flush()` and
+the sentinel gate read it as "the loop stopped reading the queue". That preserves every existing property: a first shutdown that expired still
 returns early, and the grace still runs once (SPEC-033).
 
 #### Acceptance Criteria:
