@@ -13,6 +13,7 @@ completeness.
 
 import ast
 import inspect
+import itertools
 import pathlib
 import re
 import textwrap
@@ -45,7 +46,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         EXISTENCE,
         (
             "the double-checked build. Neither liveness nor ownership: a retired worker is still "
-            "the"
+            "the "
             "process worker, and rebuilding one would fight a process trying to exit (SPEC-019)."
         ),
     ),
@@ -67,7 +68,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
             "leaving "
             "a sink still being written to holding a set event - SPEC-033 FR-004's tight retry "
-            "loop."
+            "loop. "
             "Liveness alone un-skips for the whole drain, handing the drain thread a fresh event "
             "nobody will set. Both were measured; only the conjunction is right."
         ),
@@ -116,16 +117,15 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         OWNERSHIP,
         (
             "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
-            "a"
+            "a "
             "clean shutdown and under a live writer on an expired one - both measured."
         ),
     ),
     ("_swap_sink", "not worker_holds_sink", 0): (
         OWNERSHIP,
         (
-            "who owns the *new* sink when the worker declined mid-swap (SPEC-035 FR-003). Carried "
-            "by"
-            "a return value because only the worker knows whether it got as far as reassigning."
+            "who owns the *new* sink when the worker declined mid-swap (SPEC-035 FR-003). "
+            "Carried by a return value because only the worker knows whether it reassigned."
         ),
     ),
     ("_flush_worker", "worker is None", 0): (
@@ -153,23 +153,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
 }
 
 
-_KNOWN_LONG_WORDS = frozenset(
-    {
-        "architecture",
-        "classification",
-        "deliberately",
-        "distinguishable",
-        "identically",
-        "implementation",
-        "occurrence",
-        "reclassification",
-        "relinquishes",
-        "retirement",
-        "synthesizing",
-        "unambiguously",
-        "unclassified",
-    }
-)
+_SOURCE = pathlib.Path(__file__).read_text(encoding="utf-8")
 
 _BOOL_ATTRS = ("retired", "draining")
 
@@ -285,10 +269,17 @@ def _named_scopes(node: ast.AST, path: tuple[str, ...]) -> list[tuple[str, ast.A
       None.
     """
     scopes: list[tuple[str, ast.AST]] = []
+    used: dict[str, int] = {}
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
-            here = (*path, child.name)
-            scopes.append((".".join(here), child))
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            used[child.name] = used.get(child.name, -1) + 1
+            # A same-named sibling — two `def f()` in the arms of an `if`, or two classes with
+            # the same method — is a second scope, and a bare name would collapse both onto one
+            # roster row: the defect the occurrence index exists to prevent, one level up.
+            suffix = "" if used[child.name] == 0 else f"#{used[child.name]}"
+            here = (*path, f"{child.name}{suffix}")
+            if not isinstance(child, ast.ClassDef):
+                scopes.append((".".join(here), child))
             scopes.extend(_named_scopes(child, here))
         else:
             scopes.extend(_named_scopes(child, path))
@@ -314,9 +305,14 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     hoisted one this walker had just added, so the note was over-optimistic in the direction that
     costs a contributor a green suite.
 
-    1. **The subject is recognised by name** (`_SENTINELS`), so a guard whose local is called
-       `owner` rather than `worker` is invisible — though *rewriting* an existing site that way
-       trips the stale-row check, so the exposure is net-new sites only.
+    1. **The subject is recognised by name** (`_SENTINELS`), matched as a substring of the
+       rendered text. So `if owner is None:` is invisible where `if _worker is None:` is not —
+       though `if owner.retired:` **is** caught, because `retired` is itself a token, and
+       *rewriting* an existing site trips the stale-row check either way, leaving only net-new
+       pure-existence guards exposed. The substring model also over-matches: `if networker:`
+       and `if ticket.retired:` are filed as sites. That direction is the safe one — it demands
+       a classification rather than skipping one — but it means the failure mode is not purely
+       "a missed site", and a draft of this note claimed it was.
     2. **A hoisted question is only followed through a bare boolean operator.**
        `alive = _worker is not None` is caught; `alive = bool(_worker)`,
        `alive = getattr(_worker, "retired", False)`, `alive, _ = _worker is not None, 1`,
@@ -512,25 +508,50 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
     assert not found, f"these are actions on the worker, not questions about it: {found}"
 
 
-def test_no_reason_has_fused_words() -> None:
-    """AC-2's deliverable is the reasons, and three rounds of scripted rewrapping fused words.
+def test_no_reason_fuses_words_at_a_string_seam() -> None:
+    """AC-2's deliverable is the reasons, and scripted rewrapping fused words three times.
 
-    Implicit concatenation drops the seam silently — `"...into the " "test"` reads fine in the
-    source and renders as `theprocess`, `testbelow`, `into_offer_orphan_signal`. Nothing else in
-    the suite reads these strings, so only a human would ever have noticed, which is exactly the
-    kind of rot a lint is for.
+    Detected at the **seam**, not in the result. A first version scored the rendered text —
+    long words checked against the vocabulary of the code — and could not see `theprocess` (ten
+    characters), which was simultaneously one of its own cited examples and live in the file; it
+    also rejected any long English word the source happened not to use. Both failures come from
+    guessing at the output. The seam itself is exact: in an implicitly concatenated literal,
+    every part but the last must end with whitespace, or the next must begin with one.
     """
-    # Built from the *code*, never from the reasons: a first version seeded the vocabulary with
-    # the reasons' own words, so every fused word validated itself and the lint passed against
-    # the exact defect it was written for.
-    vocabulary = set()
-    for path in ("src/log_foundry/decorator.py", "src/log_foundry/worker.py"):
-        vocabulary.update(re.findall(r"[A-Za-z_]+", pathlib.Path(path).read_text()))
+    tree = ast.parse(pathlib.Path(__file__).read_text(encoding="utf-8"))
+    roster = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "ROSTER"
+    )
+    fused: list[str] = []
+    for node in ast.walk(roster):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        siblings = _concatenated_with(roster, node)
+        for left, right in itertools.pairwise(siblings):
+            if not left.endswith((" ", "\n")) and not right.startswith((" ", "\n")):
+                fused.append(f"...{left[-24:]}|{right[:24]}...")
+    assert not fused, "these string seams fuse two words together:\n  " + "\n  ".join(fused)
 
-    suspect: list[tuple[str, str]] = []
-    for site, (_, reason) in ROSTER.items():
-        for word in re.findall(r"[A-Za-z_]{11,}", reason):
-            if word in vocabulary or word.lower() in _KNOWN_LONG_WORDS:
-                continue
-            suspect.append((site[0], word))
-    assert not suspect, f"these read as two words fused at a string seam: {suspect}"
+
+def _concatenated_with(root: ast.AST, node: ast.Constant) -> list[str]:
+    """Returns the run of implicitly concatenated parts `node` belongs to, once.
+
+    Python folds adjacent literals before the AST exists, so the parts are recovered from the
+    source segment rather than from sibling nodes.
+
+    Args:
+      root: The subtree being searched.
+      node: The constant whose run is wanted.
+
+    Returns:
+      The literal parts in order, or an empty list when this is not a multi-part literal.
+
+    Raises:
+      None.
+    """
+    del root
+    segment = ast.get_source_segment(_SOURCE, node) or ""
+    parts = re.findall(r'"((?:[^"\\]|\\.)*)"', segment)
+    return parts if len(parts) > 1 else []
