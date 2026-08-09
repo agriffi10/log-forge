@@ -213,17 +213,25 @@ def test_a_second_shutdown_waits_for_the_drain_already_running() -> None:
     for _ in range(3):
         _trace_once()
 
+    worker = decorator._worker
+    assert worker is not None
     first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
     first.start()
     assert sink.in_emit.wait(5.0), "the first shutdown's drain never reached the sink"
 
     log_foundry.shutdown(timeout=30.0)  # the second caller: must not overtake the drain
+    emitted_on_return = len(sink.held) + len(sink.delivered)  # close() moves held into delivered
 
-    assert sink.closed == 1, "the sink must be closed exactly once"
-    assert sink.delivered, (
-        "the second shutdown returned before the drain it found had delivered anything"
+    assert worker._drain_finished.is_set(), (
+        "the second shutdown returned while the drain it found was still running"
+    )
+    assert emitted_on_return, (
+        "and the sink's in-flight emit had not completed either — an observable independent of "
+        "the flag the fix waits on, so this cannot pass by mirroring the implementation"
     )
     first.join(30.0)
+    assert sink.closed == 1, "the sink must be closed exactly once"
+    assert sink.delivered, "and everything submitted before the shutdown must have landed"
 
 
 def test_a_second_shutdown_is_still_bounded_by_its_own_budget() -> None:
