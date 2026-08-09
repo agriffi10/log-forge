@@ -531,7 +531,9 @@ _closers_lock: threading.Lock
 | orphan emit to `S` | `S is _orphan_sink` | unchanged | unchanged | none |
 | orphan emit to `S` | `S is _orphan_closed_sink` | unchanged | unchanged | none (FR-001 AC-5) |
 | orphan emit to `S` | otherwise | `S` | unchanged | none |
-| `_swap_sink(N)` | worker exists | `None` | unchanged | `Worker.swap_sink` owns it |
+| `_swap_sink(N)` | worker exists, adopts | `None` | unchanged | `Worker.swap_sink` owns it |
+| `_swap_sink(N)` | worker exists, **declines** | `N` | unchanged | orphan path, at exit (SPEC-035 FR-003) |
+| `_swap_sink(N)` | declines, `N is _orphan_closed_sink` | unchanged | unchanged | none — no re-arm (SPEC-035 FR-003) |
 | `_swap_sink(N)` | `_orphan_sink is None` | `None` | unchanged | none (FR-001 AC-3) |
 | `_swap_sink(N)` | `_orphan_sink is N` | unchanged | unchanged | none (FR-002 AC-5) |
 | `_swap_sink(N)` | otherwise | `N` | old | old, detached + bounded |

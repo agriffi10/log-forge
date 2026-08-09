@@ -355,8 +355,8 @@ def _offer_orphan_signal(sink: Sink) -> None:
     wrong: ``retired`` latches on **entry** to ``Worker.shutdown``, so for the whole of the drain
     the skip stopped applying and an orphan log handed the sink a fresh unset event — precisely
     the one the drain thread was about to wait on. Measured, a 20 s backoff against
-    ``shutdown(timeout=3)`` then ran to its full length and the shutdown expired with the sink
-    left open. But bare ``_worker.sink is sink`` is wrong in the opposite direction: it skips for
+    ``shutdown(timeout=3)`` was then still outstanding when the shutdown expired at 3.01 s with
+    the sink left open — the wait was never cut, not merely slow. But bare ``_worker.sink is sink`` is wrong in the opposite direction: it skips for
     a worker whose shutdown has **finished**, leaving a sink still being written to holding a set
     event that can never clear, which is SPEC-033 FR-004's tight retry loop and is covered by a
     test that spec shipped. The predicate is therefore ``Worker.draining`` — the moment, not the
@@ -518,7 +518,10 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     ``sinks/base.py`` requires ``close()`` to tolerate a concurrent ``emit`` (SPEC-028 FR-001).
     This inherits that contract rather than weakening it.
 
-    **Who performs the swap and who owns the old sink's close are two questions.** The first is
+    **Who performs the swap, who owns the old sink's close, and who owns the new one when the
+    swap is declined are three questions** — the third added by SPEC-035 FR-003 and answered by
+    :func:`_adopt_declined_swap`, off ``Worker.swap_sink``'s return value rather than a predicate
+    here, because only the worker knows whether it got as far as reassigning. The first is
     liveness — a retired worker performs nothing, since :meth:`Worker.swap_sink` returns early
     once shut down, so routing the swap to it loses the handoff entirely. The second is
     ownership, exactly as in :func:`_close_orphan_sink`: a worker that *holds* ``old`` has either
@@ -594,9 +597,19 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
     ``B`` was never closed, and ``health()`` read entirely clean — for a sink whose ``close()``
     *is* its delivery, a ``KafkaSink`` flushing its producer, a silently lost buffer.
 
-    Only the new sink is re-homed. The old one is still ``worker.sink``, because the declined
-    swap never reassigned it, so the worker closes it through its own ``_close_if_owed`` and
-    closing it here would be the double-close :func:`_close_orphan_sink` exists to avoid.
+    Only the new sink is re-homed. ``Worker.swap_sink`` declines before reassigning anything, so
+    whatever the worker held it still holds, and the worker closes it through its own
+    ``_close_if_owed``; closing it here would be the double-close :func:`_close_orphan_sink`
+    exists to avoid. The one case with no "old" sink at all is a retired worker that already
+    holds ``new_sink`` — the entry check tests ``_shutdown_done`` before identity, so it declines
+    a swap that was already satisfied — and there the same ownership guard makes the worker
+    perform the single close.
+
+    **A sink already recorded as closed is refused re-arming**, the guard
+    :func:`_note_orphan_emit` carries and for its reason. Without it, an orphan log arming
+    ``_orphan_sink`` while this thread is inside ``swap_sink``'s first drain, followed by a
+    ``shutdown()`` that closes it, lets this re-arm a closed sink for a second ``close()`` at
+    exit — reproduced, and ``Sink.close`` promises no idempotency.
 
     ``incomplete_swaps`` is deliberately not moved. It counts an unconfirmed *drain*, and this
     swap had no drain to confirm — the worker declined before reassigning anything — so counting
@@ -613,9 +626,11 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
     """
     global _orphan_sink
     with _worker_lock:
-        _orphan_sink = new_sink
         _offer_orphan_signal(new_sink)
+        if new_sink is _orphan_sink or new_sink is _orphan_closed_sink:
+            return
         _register_exit_handler()
+        _orphan_sink = new_sink
 
 
 def _flush_worker(timeout: float | None = 5.0) -> bool:

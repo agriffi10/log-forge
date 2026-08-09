@@ -364,9 +364,9 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     shutting_down.join(60.0)
 
     assert worker.sink is old, "the swap really was declined, or this test proves nothing"
-
-    decorator._close_orphan_sink()  # the exit path, and a no-op if the shutdown got there first
-    assert new.closed == 1, f"B was closed {new.closed} times, not once"
+    assert decorator._orphan_sink is new or new.closed == 1, (
+        "the declined sink is neither closed nor armed for the exit handler — owned by nobody"
+    )
 
 
 def test_the_old_sink_is_not_closed_by_both_paths() -> None:
@@ -405,3 +405,125 @@ def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> N
     assert worker.swap_sink(new, 1.0) is True, "an unconfirmed drain is still an adopted swap"
     assert worker.sink is new
     assert worker.health().incomplete_swaps == 1
+
+
+# --- found by independent review of this PR --------------------------------------------------
+
+
+def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
+    """The re-arm guard `_note_orphan_emit` carries, which `_adopt_declined_swap` first omitted.
+
+    All three actors are ordinary and the window is a whole drain, not the few instructions
+    FR-003 AC-3 needs a preemption point for: an orphan log arms the sink while a `configure()`
+    is inside `swap_sink`'s first `flush()`, a `shutdown()` closes it, and the declining swap
+    then re-arms a closed sink for a second `close()` at exit.
+    """
+    old = CountingSink("A")
+    log_foundry.configure(service="t", sink=old)
+    _trace_once()
+    worker = decorator._worker
+    assert worker is not None
+
+    new = CountingSink("B")
+    real_flush = worker.flush
+
+    def flush_then_arm_and_shut_down(timeout=None):
+        result = real_flush(timeout)
+        worker.flush = real_flush
+        log_foundry.info("an orphan log that arms B while the swap is in flight")
+        assert decorator._orphan_sink is new, "the orphan log must have armed B"
+        log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
+        return result
+
+    worker.flush = flush_then_arm_and_shut_down
+    log_foundry.configure(service="t", sink=new)  # declines, then must not re-arm B
+
+    decorator._close_orphan_sink()
+    assert new.closed == 1, f"B was closed {new.closed} times, not once"
+
+
+def test_an_abandoning_first_shutdown_releases_the_second_callers_wait() -> None:
+    """FR-004 AC-5 in the **concurrent** ordering, which the serial test cannot reach.
+
+    `_drain_abandoned` is set by the first caller *after* its join expires, so a second caller
+    that evaluated `draining` on entry has already committed to the wait. Measured before the
+    fix: a second `shutdown(timeout=20)` returned after 20.01 s, and with `timeout=None` the
+    process never exited.
+    """
+    sink = WedgedSink()
+    log_foundry.configure(service="t", sink=sink)
+    _trace_once()
+
+    try:
+        assert sink.in_emit.wait(5.0)
+        first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=1.0))
+        first.start()
+
+        start = time.monotonic()
+        log_foundry.shutdown(timeout=20.0)  # entered while the first is still joining
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"the second shutdown waited {elapsed:.2f}s on a drain the first one abandoned "
+            f"while it was already inside the wait"
+        )
+        first.join(30.0)
+    finally:
+        sink.release.set()
+
+
+def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None:
+    """FR-003 AC-1's actual wording, which only a real interpreter exit can demonstrate.
+
+    The in-process tests can show the sink is armed, but the arming and the close both run
+    through functions the test could call itself. Here nothing is invoked by hand: the child
+    exits normally and the library's own ``atexit`` handler is the only thing that could close B.
+    """
+    import subprocess
+    import sys
+
+    program = textwrap.dedent(
+        """
+        import sys, threading
+        sys.path.insert(0, "src")
+        import log_foundry
+        from log_foundry import decorator
+
+        class S:
+            def __init__(self, n): self.n = n; self.closed = 0; self.stop_signal = None
+            def emit(self, b): pass
+            def close(self): self.closed += 1; print(f"CLOSED {self.n}", flush=True)
+
+        A, B = S("A"), S("B")
+        log_foundry.configure(service="t", sink=A)
+
+        @log_foundry.trace
+        def w(): pass
+        w()
+
+        worker = decorator._worker
+        real = worker.flush
+        def flush_then_shut_down(timeout=None):
+            r = real(timeout)
+            worker.flush = real
+            t = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
+            t.start()
+            while not worker.retired:
+                pass
+            t.join(30.0)
+            return r
+        worker.flush = flush_then_shut_down
+
+        log_foundry.configure(service="t", sink=B)   # declines mid-shutdown
+        print("EXITING", flush=True)
+        """
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=120
+    )
+    assert "EXITING" in result.stdout, f"the child never got there: {result.stderr[-800:]}"
+    assert result.stdout.count("CLOSED B") == 1, (
+        f"B was closed {result.stdout.count('CLOSED B')} times at exit, not once:\n"
+        f"{result.stdout}\n{result.stderr[-800:]}"
+    )
+    assert result.stdout.count("CLOSED A") == 1, f"and A exactly once:\n{result.stdout}"

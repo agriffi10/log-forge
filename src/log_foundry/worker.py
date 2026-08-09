@@ -226,6 +226,7 @@ class Worker:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
+        self._drain_settled = threading.Event()
         self._drain_abandoned = False
         self._shutdown_done = False
         self._sink_closed = False
@@ -370,8 +371,21 @@ class Worker:
         for that reason), so nothing further will cut its backoff — where SPEC-033's tight retry
         loop would go on costing the still-running application every emit.
 
-        Read without the lock, as ``retired`` is: both flags are written once and never cleared,
-        so a racing reader sees one of two answers and both are momentarily true.
+        It reads **one** event, ``_drain_settled``, set both where the loop stops and where a
+        shutdown gives up on it — not a conjunction of the two facts. A reader that tested them
+        separately would be correct only at the instant it looked: :meth:`shutdown`'s idempotent
+        path evaluates this and *then* waits, so an abandonment landing in between has to release
+        that wait, and only an event already being waited on can do that. Measured before the
+        change, with the first caller expiring while the second was inside its wait: a second
+        ``shutdown(timeout=20)`` returned after 20.01 s, and with ``timeout=None`` the process
+        never exited at all.
+
+        ``_drain_finished`` is deliberately left alone rather than widened: :meth:`flush` and
+        :meth:`shutdown`'s sentinel gate both read it as "the loop stopped reading the queue",
+        which an abandoned — and still running — drain has not done.
+
+        Read without the lock, as ``retired`` is: the event is set once and never cleared, so a
+        racing reader sees one of two answers and both are momentarily true.
 
         Args:
           None.
@@ -382,7 +396,7 @@ class Worker:
         Raises:
           None.
         """
-        return not self._drain_finished.is_set() and not self._drain_abandoned
+        return not self._drain_settled.is_set()
 
     def health(self) -> Health:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
@@ -708,8 +722,8 @@ class Worker:
         ``_shutdown_done`` latches on *entry*, so a second caller used to take that branch and
         return in under a millisecond over a drain that had barely started. The shape is rarely
         two user calls: it is a ``shutdown()`` on one thread and ``atexit`` on the main thread,
-        and measured with a 2 s-emit sink and three traced calls it delivered **0 of 9 events**,
-        never closed the sink, and left the process gone in 0.39 s with nothing on stderr. The
+        and measured with a 2 s-emit sink and three traced calls it delivered **nothing**, never
+        closed the sink, and left the process gone in 0.39 s with nothing on stderr. The
         wait is on ``_drain_finished`` and bounded by *this* call's own budget, so
         ``shutdown(timeout=0)`` still returns promptly and a caller never inherits the other
         call's deadline. It is skipped once :attr:`draining` is false — a finished drain makes it
@@ -746,7 +760,7 @@ class Worker:
             self._shutdown_done = True
         if not first:
             if self.draining:
-                self._drain_finished.wait(
+                self._drain_settled.wait(
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
             self._close_if_owed()
@@ -765,6 +779,7 @@ class Worker:
                 self._drain_abandoned = True
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
+            self._drain_settled.set()
             _diag.lost(
                 "item",
                 queued,
@@ -938,6 +953,7 @@ class Worker:
                 self._drain(pending)
             finally:
                 self._drain_finished.set()
+                self._drain_settled.set()
         except BaseException as exc:
             self._terminal_failure(exc, len(pending))
         finally:
