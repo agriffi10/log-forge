@@ -2,10 +2,11 @@
 
 **ID:** SPEC-034  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-026, SPEC-030, SPEC-033, SPEC-036 — FR-008 converts `Health` to a dataclass
-and SPEC-036 FR-003 appends a field to it as a `NamedTuple`; building this first would make that
-spec's criteria unsatisfiable
+**Last Updated:** 2026-08-09  
+**Depends On:** SPEC-026, SPEC-030, SPEC-033, SPEC-036, SPEC-037 — FR-008 converts `Health` to a
+dataclass, and both 036 (FR-003, `orphan_lost`) and 037 (FR-001 AC-5, `in_span_lost`) append a
+field to it as a `NamedTuple` first; building this before either would make that spec's criteria
+unsatisfiable, and AC-2b's "tenth and eleventh indices" needs both to have landed
 
 ## Overview
 
@@ -279,15 +280,20 @@ working and leaves room to add reasons later — but only if the return type cha
 - [ ] AC-1: `if flush():` keeps working. `assert flush() is True` **cannot** — an object with
       `__bool__` is never `True` — and a draft of this AC claimed both would, which is the
       contradiction to avoid. Counted on this branch: **26** identity assertions on `flush()` and
-      **18** on `continue_trace()` across the test suite. All are converted, the count is stated
-      in the PR, and the conversion is mechanical rather than discovered mid-build.
+      **18** on `continue_trace()` across the test suite. All are converted and the count is
+      stated in the PR. Those figures are a **floor, recounted at build time**: SPEC-036 and
+      SPEC-037 both add call sites before this spec builds, so a count taken on this branch and
+      trusted at build time is the kind of stale roster FR-002's lesson is about.
 - [ ] AC-1b: The FR states whether `Worker.flush` changes type too, or only the public
       `log_foundry.flush` — they are different call sites with different callers.
 - [ ] AC-2: `flush().reason` distinguishes at least retired-worker, timed-out and
       batch-abandoned — **plus the two SPEC-036 adds**, a failed span sweep and a failed
       `sink.flush()`, since this lands after it.
 - [ ] AC-3: The same treatment for `continue_trace()`, distinguishing "nothing supplied" from
-      "supplied and rejected".
+      "supplied and rejected" — **plus the third reason SPEC-036 FR-001 AC-11a adds**, supplied
+      and well-formed but refused because the span had been swept, since this lands after it.
+      Stated explicitly for the reason AC-2 states its two: a reason invented in 036 with nothing
+      on this side to carry it is a reason that quietly does not survive the freeze.
 - [ ] AC-4: `mypy --strict` is clean, and the return types are exported so a caller can annotate.
 - [ ] AC-5: Adding a new reason later is additive — the type is documented as growing by new
       `reason` values, never by changing `__bool__`.
@@ -297,7 +303,8 @@ working and leaves room to add reasons later — but only if the return type cha
 #### Description:
 
 Both are `NamedTuple`s, so length and positional unpacking are part of the contract at 1.0.
-`Health` has grown in six consecutive specs and grows again in SPEC-036; `d, f = sink.losses()`
+`Health` has grown in six consecutive specs and grows twice more in this arc — `orphan_lost`
+(SPEC-036 FR-003) and `in_span_lost` (SPEC-037 FR-001 AC-5); `d, f = sink.losses()`
 works today and breaks the moment `SinkLosses` gains a third counter, which SPEC-018's
 `dropped_unadjudicated` vocabulary makes likely.
 
@@ -314,10 +321,21 @@ effectively is, and it has not stopped anything: the shape is still real, still 
 - [ ] AC-1: Attribute access is unchanged everywhere — `h.dropped`, `h.sink.failed`.
 - [ ] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
       breaking.
-- [ ] AC-2b: The tests SPEC-036 FR-003 mandates are updated here — `test_health_gains_no_field`
-      (which pins `Health._fields[:9]` and the tenth index) and the relocated `len(h) == 9`
-      assertion both become impossible under a dataclass. This is the catcher on this side of the
-      handoff; without it 036 leaves two tests that 034 silently breaks.
+- [ ] AC-2b: **Two** tests become impossible under a dataclass and both are updated here —
+      `tests/test_orphan_sink_handoff.py::test_health_gains_no_field`, which by then pins
+      `Health._fields[:9]` plus the tenth and eleventh names and carries the `len(h)` assertion
+      relocated into it by SPEC-036 FR-003 AC-10; and
+      `tests/test_worker.py::test_existing_health_fields_keep_their_positions`, whose **whole
+      body** is positional (`h[0]`, `h[3]`, `h[4]`, `h[5..7]`, `h[8]`, plus `h[10]` after
+      SPEC-037 AC-5a) and which 036 and 037 both leave in place. A draft of this AC named only
+      the first and called itself the catcher, which is how the second would have arrived as a
+      red build rather than a criterion. **Both** appended fields are in scope because the build
+      order is 035 → 036 → 037 → 034: this spec is the last to see `Health` as a tuple.
+- [ ] AC-2c: The `Health` field set is reviewed **as a whole**, once, before the type freezes —
+      eleven fields arrived across nine specs, each appended on its own merits and none of them
+      ever looked at together. The freeze is the last moment that review is free. It is a review
+      with a recorded outcome, not a licence to rename: anything it does change is a change made
+      here rather than in `1.x`.
 - [ ] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
       positional sites exist today (`tests/test_sink_losses.py:213`, `:228`), so a draft claiming
       this was already true was wrong. Verified by grep before the type changes.

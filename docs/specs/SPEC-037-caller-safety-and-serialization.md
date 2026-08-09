@@ -2,10 +2,11 @@
 
 **ID:** SPEC-037  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
+**Last Updated:** 2026-08-09  
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-036 — FR-001 AC-5 routes an absorbed
 **orphan** failure into the `orphan_lost` counter SPEC-036 FR-003 adds, so it cannot be built
-before it. The in-span half needs its own destination, which AC-5 names.
+before it. The in-span half gets its own appended field, `in_span_lost`, decided in AC-5 rather
+than by widening 036's name after it has shipped
 
 ## Overview
 
@@ -89,11 +90,34 @@ same stated reason.
 - [ ] AC-4: The decorated function still returns its value normally, and the span still closes
       with `status=ok`.
 - [ ] AC-5: The event that could not be built is lost and counted, not silently dropped. An
-      orphan call goes to SPEC-036 FR-003's `orphan_lost`. **An in-span call has no counter in the
-      arc**, and this AC must name its destination concretely rather than saying "the span's own
-      path": either `orphan_lost` is widened to mean *events lost before reaching the worker* on
-      both paths (renaming it, which SPEC-036 must then agree to), or a second field is appended.
-      Whichever, it is decided here and the two must not double-count; a test asserts the total.
+      orphan call goes to SPEC-036 FR-003's `orphan_lost`; an in-span call goes to a **second,
+      appended** field, `in_span_lost`. The alternative is widening `orphan_lost` to mean *events
+      lost before reaching the worker* on both paths, and it is rejected on SPEC-026's own test —
+      **whether one number would hide which fix applies.** It would: the two counters aggregate
+      different failure populations. `orphan_lost` covers everything inside the orphan guard,
+      construction and build failures **and a failing `sink.emit`** (036 FR-003 AC-6), because
+      that path emits synchronously. The in-span path cannot lose an event at `emit` — that is
+      `failed_batches` — so this counter can only ever be an assembly failure. `orphan_lost`
+      climbing means *the destination or the data*; `in_span_lost` climbing means *the data*,
+      always. Different remediation, so two fields, which is also why SPEC-019, SPEC-026 and
+      SPEC-030 each appended rather than overloading a neighbour. **Neither an ordering argument
+      nor "a field already published" is offered here**: both drafts are unbuilt, and a name is
+      cheap to change until it ships — a justification resting on that would be circular with
+      036 FR-003 AC-3, which cites this AC in turn.
+- [ ] AC-5a: The new field carries the same obligations 036 FR-003 discharged for `orphan_lost`,
+      and this AC is the catcher for each: it is **appended**, so indices 0..9 are unchanged and
+      `tests/test_worker.py::test_existing_health_fields_keep_their_positions` needs no edit
+      beyond gaining `h[10] is h.in_span_lost` — its `len(h)` line having already moved to
+      `tests/test_orphan_sink_handoff.py::test_health_gains_no_field` under 036 FR-003 AC-10,
+      which is the test that must pin an eleventh name. `Health`'s `Attributes:` block documents
+      it; `tests/conftest.py`'s reset fixture clears it; and if the counter takes its own lock,
+      SPEC-035 FR-005 AC-2's derived fork roster picks it up — derived precisely so a lock added
+      two specs later needs no edit there.
+- [ ] AC-5b: The two are asserted **separately, and neither absorbs the other** — the phrasing
+      036 FR-003 AC-4 already uses for `orphan_lost` against `failed_batches`. Deliberately *not*
+      a criterion on their sum: with different failure populations the total is a number nobody
+      can act on, and pinning it would teach a later reader they are two halves of one counter,
+      which is the reading AC-5 just rejected.
 - [ ] AC-6: The stale reasoning in `api._log`'s docstring is replaced with what is actually true:
       the branch calls `build_event`, and `build_event` can raise.
 - [ ] AC-7: Mutation-tested — removing the guard fails AC-1 on all three paths.
@@ -171,21 +195,32 @@ non-JSON sinks too.
 
 ## Data Model
 
-No new state and no `Health` field. FR-001's counter is SPEC-036 FR-003's `orphan_lost` where the
-call was an orphan; the in-span case needs its own decision recorded in that FR's AC-5.
+FR-001's counter is SPEC-036 FR-003's `orphan_lost` where the call was an orphan, and one
+appended `Health` field where it was in a span (AC-5):
+
+```python
+# src/log_foundry/worker.py
+class Health(NamedTuple):     # still a NamedTuple here; SPEC-034 FR-008 converts it after this
+    ...                       #   spec, which is why 034 depends on this one as well as on 036
+    orphan_lost: int = 0      # appended by SPEC-036 FR-003
+    in_span_lost: int = 0     # appended here (AC-5) — eleventh field, indices 0..9 unchanged
+```
 
 ## API / Interface Contract
 
-No public signature changes. Two behaviour changes a caller can observe:
+No public signature changes. Three behaviour changes a caller can observe:
 
 ```python
 lf.info(ValueError("x"))              # in a span: was AttributeError, now absorbed
 lf.info("m", ratio=float("nan"))      # fields: {"ratio": "<float: nan>"}, truncated: True
+len(lf.health())                      # 10 -> 11 while Health is still a NamedTuple
 ```
 
-Both are corrections of documented promises rather than new behaviour, so neither is breaking in
-the semver sense — but the second changes what lands in the event stream, and belongs in the
-release notes.
+The first two are corrections of documented promises rather than new behaviour, so neither is
+breaking in the semver sense — but the second changes what lands in the event stream, and belongs
+in the release notes. The third is observable only in the window before SPEC-034 FR-008 removes
+`len()` and unpacking altogether, and it is the reason 034's AC-2b has to account for **two**
+appended fields rather than one.
 
 ## Implementation Phases
 

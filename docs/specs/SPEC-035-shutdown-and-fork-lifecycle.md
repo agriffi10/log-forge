@@ -2,7 +2,7 @@
 
 **ID:** SPEC-035  
 **Status:** Draft  
-**Last Updated:** 2026-08-07  
+**Last Updated:** 2026-08-09  
 **Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033
 
 ## Overview
@@ -216,23 +216,44 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
 
 #### Acceptance Criteria:
 
-- [ ] AC-0: **The `before` handler is bounded.** Measured: acquiring a sink's SPEC-028 transport
-      lock while the drain thread is mid-`emit` blocked the fork for 1.20 s, and with `HTTPSink`'s
-      documented 90 s worst case it would block gunicorn's master thread for that long — with no
-      shutdown in progress, so the stop signal cannot cut it. The handler try-acquires with a
-      short deadline and proceeds **without** the lock when it expires. The consequence is that the
-      child may inherit a partially-written sink buffer — a hazard belonging to the caller-shared
-      sink AC-7 documents, **not** a requirement that the child stop using the sink, which would
-      contradict this FR's chosen design and AC-3.
-- [ ] AC-0a: **The FR states whether a `before` handler is built at all.** After AC-2
-      (re-initialise every lock in the child) and AC-0b (never depend on it), no criterion here
-      fails if it is omitted — while it costs the parent's fork path a measured 1.20 s, up to
-      ~90 s with `HTTPSink`. The default answer is therefore **no `before` handler**; if one is
-      built, this AC names the criterion it exists for.
-- [ ] AC-0b: The design does not *depend* on `before` running. `os.register_at_fork(before=)` is
-      not invoked for a C-level fork — uWSGI calls `PyOS_AfterFork_Child` only — so a design that
-      needs `before` degrades silently on one of the three deployments this spec names. The child
-      handler alone must be sufficient for AC-1.
+- [ ] AC-0: **No `before` handler is built, and no `after_in_parent` with it.** The question was
+      left open by an earlier draft; it is settled here on two grounds, and the cost is the weaker
+      of them. Cost first: acquiring a sink's SPEC-028 transport lock while the drain thread is
+      mid-`emit` blocked the fork for a measured 1.20 s, and with `HTTPSink`'s documented 90 s
+      worst case it would block gunicorn's master thread for that long, with no shutdown in
+      progress, so the stop signal cannot cut it. The load-bearing ground is AC-0b's: `before` does
+      not run for a C-level fork at all, so every hazard it would close has to be closed in the
+      child regardless — which makes a parent-side handler a partial fix bought at that price,
+      not a fix. AC-2 and AC-0b together are what the child needs; the `Data Model` block below
+      registers `after_in_child` only.
+- [ ] AC-0a: **The hazard the omission accepts is duplication, it reaches the library's own file
+      sinks, and the child is what has to close it.** Without `before`, a fork landing *inside*
+      `emit` — after the write loop, before the flush — leaves the child holding the parent's
+      unflushed bytes, which both processes then write. `FileSink` opens a **buffered** stream
+      (`file.py:55`) and flushes once at the end of the batch (`:80-84`), so the window is the
+      whole batch. Measured against `5ad6699`, forking mid-batch with the child re-initialising
+      the lock per AC-2 and continuing to log per AC-3 — identical for `RotatingFileSink`:
+
+      ```
+      {"seq": 0, "msg": "a"}   {"seq": 1, "msg": "b"}   {"seq": 0, "msg": "a"}   {"seq": 99, …}
+      seq-0 appears 2x
+      ```
+
+      **An earlier draft of this AC claimed the file sinks were immune, on a measurement that
+      forked *after* `emit` returned** — when the buffer is empty by construction, so it exercised
+      the non-hazard. Recorded rather than deleted (SPEC-021's rule) because "it writes and
+      flushes inside `emit`" is true, reads like immunity, and will be re-derived otherwise. It is
+      also why the omission is *not* settled by AC-7 — that criterion names a shared handle, which
+      is the caller's sink to share, where this is the library's own sink duplicating its own
+      bytes.
+- [ ] AC-0b: **The child, not the parent, discards inherited buffered writes**, and this is what
+      makes AC-0's settlement sound rather than a waiver. `os.register_at_fork(before=)` is not
+      invoked for a C-level fork — uWSGI calls `PyOS_AfterFork_Child` only — so on one of the
+      three deployments this spec names, a `before` handler would not run and the duplication
+      would happen anyway. A parent-side fix is therefore not available in general, which settles
+      AC-0 on a stronger ground than cost alone: the child handler must be sufficient, for AC-1
+      **and** for this. A test forks mid-`emit`, as the measurement above does, and asserts the
+      child re-emits none of the parent's buffered bytes.
 - [ ] AC-1: After a fork, the child's first log call does not block. A test forks repeatedly
       (≥50 iterations) with the drain thread actively emitting into a locking sink, and every
       child completes within a timeout. The pre-fix version of this test hangs, which is
@@ -253,6 +274,12 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
       preload needs to be able to find it.
 - [ ] AC-7: A sink shared across a fork is documented as the caller's responsibility, with the
       concrete hazard named (one socket or one SQLite handle, two processes).
+- [ ] AC-8: **Whatever AC-0b does not reach is recorded in `architecture.md` §13**, not left in
+      an AC. AC-0b covers the library's own buffered writes; a third-party client that buffers
+      across `emit` (`KafkaSink`'s producer, `GooglePubSubSink`'s futures — SPEC-036 FR-002's
+      roster) holds state the library cannot reach into, so a fork mid-batch there can still
+      duplicate or strand it. SPEC-021's rule is that an accepted item is *recorded*; AC-7's
+      shared-handle sentence is a different hazard and does not cover this one.
 
 ### FR-006: The accepted constraint is written down
 
@@ -276,15 +303,17 @@ record a reader of `architecture.md` will ever find.
 
 ## Data Model
 
-No new state, no `Health` field. FR-005 adds fork handlers registered at import:
+No new state, no `Health` field. FR-005 adds one fork handler, registered at import:
 
 ```python
 # src/log_foundry/_lifecycle.py — or a new _fork.py if the roster grows
 os.register_at_fork(
-    before=_acquire_library_locks,        # ordered as §9 requires, so the child is consistent
-    after_in_parent=_release_library_locks,
-    after_in_child=_reinit_after_fork,    # fresh locks, fresh queue + thread, sink untouched
-)
+    after_in_child=_reinit_after_fork,    # fresh locks, fresh queue + thread; the sink object
+)                                         #   is kept (AC-3), its inherited buffered writes
+                                          #   are discarded (AC-0b)
+# No `before` / `after_in_parent`: AC-0. `before` does not run for a C-level fork, so the child
+# has to close these hazards regardless; pre-acquiring the library's locks would buy a partial
+# fix for a measured 1.20 s on the parent's fork path, ~90 s worst case with HTTPSink.
 ```
 
 ## Implementation Phases
