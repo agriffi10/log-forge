@@ -226,6 +226,7 @@ class Worker:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
+        self._drain_settled = threading.Event()
         self._shutdown_done = False
         self._sink_closed = False
         self._lock = threading.Lock()
@@ -350,6 +351,54 @@ class Worker:
           None.
         """
         return self._shutdown_done
+
+    @property
+    def draining(self) -> bool:
+        """Whether this worker's own ``_stop`` is still the sink's route to a cut-short backoff.
+
+        Neither ``retired`` nor a bare ``_worker is not None`` answers this, and the two specs
+        that got it wrong disagreed in opposite directions (SPEC-035 FR-001). SPEC-033 requires a
+        sink still being written to *after* a shutdown to be handed a **fresh** event, because
+        ``_stop`` is set forever and an ``Event`` never clears, so every later backoff would
+        collapse to zero. SPEC-035 requires a sink whose drain is **in flight** to keep the event
+        that drain is about to wait on, or the shutdown serves a full backoff and expires. Both
+        are the same sink held by the same worker; only the moment differs, so the predicate has
+        to be the moment.
+
+        An abandoned drain counts as not draining. The thread is wedged and the shutdown has
+        already given up on it (``_close_orphan_sink`` and SPEC-027 FR-004 leave the sink open
+        for that reason), so nothing further will cut its backoff — where SPEC-033's tight retry
+        loop would go on costing the still-running application every emit.
+
+        It reads **one** event, ``_drain_settled``, set both where the loop stops and where a
+        shutdown gives up on it — not a conjunction of the two facts. A reader that tested them
+        separately would be correct only at the instant it looked: :meth:`shutdown`'s idempotent
+        path evaluates this and *then* waits, so an abandonment landing in between has to release
+        that wait, and only an event already being waited on can do that. Measured before the
+        change, with the first caller expiring while the second was inside its wait: a second
+        ``shutdown(timeout=20)`` returned after 20.01 s, and with ``timeout=None`` the process
+        never exited at all.
+
+        ``_drain_finished`` is deliberately left alone rather than widened: :meth:`flush` and
+        :meth:`shutdown`'s sentinel gate both read it as "the loop stopped reading the queue",
+        which an abandoned — and still running — drain has not done. The two events stay
+        distinguishable without a third flag, which is why no ``_drain_abandoned`` is kept:
+        abandoned is ``_drain_settled`` set with ``_drain_finished`` unset, and the operator-facing
+        form of the same fact is ``stopped_reason == "ShutdownTimeout"``.
+
+        Read without the lock, as ``retired`` is: the event is set once and never cleared, so a
+        racing reader sees one of two answers and both are momentarily true.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the drain loop is still running and has not been abandoned.
+
+        Raises:
+          None.
+        """
+        return not self._drain_settled.is_set()
 
     def health(self) -> Health:
         """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
@@ -476,7 +525,7 @@ class Worker:
             return False
         return marker.delivered
 
-    def swap_sink(self, new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
+    def swap_sink(self, new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> bool:
         """Retargets delivery at a new sink, draining and closing the previous one (FR-003).
 
         This is what makes a late ``configure(sink=...)`` mean what it says. The sink was
@@ -515,33 +564,41 @@ class Worker:
             hold ``configure()`` for a multiple of the budget. ``None`` waits indefinitely.
 
         Returns:
-          None. The outcome is reported through ``health().incomplete_swaps`` and one stderr
-          line rather than a return value, because the caller is ``configure()``, which has
-          never had one and whose callers do not check.
+          Whether this worker now holds ``new_sink``, and therefore owns its close. ``False``
+          means **declined**, which happens only when ``_shutdown_done`` latched — and the
+          caller must then own the handoff itself, because a declined swap leaves the new sink
+          installed nowhere (SPEC-035 FR-003). ``True`` covers the sink already being this
+          worker's, which owes nothing further. The *quality* of the swap is still reported
+          through ``health().incomplete_swaps`` and one stderr line rather than here: an
+          unconfirmed drain is a swap that happened, so it returns ``True``, and conflating the
+          two would make ``_swap_sink`` re-home a sink this worker is delivering to.
 
         Raises:
           None on a sink fault. A close that fails is announced, as everywhere else
           (SPEC-025 FR-004).
         """
         with self._lock:
-            if self._shutdown_done or self.sink is new_sink:
-                return
+            if self._shutdown_done:
+                return False
+            if self.sink is new_sink:
+                return True
         deadline = None if timeout is None else time.monotonic() + timeout
         drained = self.flush(timeout)
         with self._lock:
             if self._shutdown_done:
-                return
+                return False
             old = self.sink
             if old is new_sink:
-                return
+                return True
             self.sink = new_sink
         self._offer_stop_signal()
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not (drained and self.flush(remaining)):
             self._record_incomplete_swap(timeout)
-            return
+            return True
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
         self._close_swapped_out(old, left)
+        return True
 
     def _record_incomplete_swap(self, timeout: float | None) -> None:
         """Counts a swap whose drain could not be confirmed, then announces it (FR-003).
@@ -663,6 +720,19 @@ class Worker:
         liveness test would queue a sentinel through that whole window. The flag is set before
         that call, so this one does not.
 
+        **The idempotent path waits for the drain it found running** (SPEC-035 FR-004).
+        ``_shutdown_done`` latches on *entry*, so a second caller used to take that branch and
+        return in under a millisecond over a drain that had barely started. The shape is rarely
+        two user calls: it is a ``shutdown()`` on one thread and ``atexit`` on the main thread,
+        and measured with a 2 s-emit sink and three traced calls it delivered **nothing**, never
+        closed the sink, and left the process gone in 0.39 s with nothing on stderr. The
+        wait is on ``_drain_settled`` and bounded by *this* call's own budget, so
+        ``shutdown(timeout=0)`` still returns promptly and a caller never inherits the other
+        call's deadline. It is skipped where :attr:`draining` is already false, and **released**
+        where the drain is abandoned after the wait began — the first caller sets the same event
+        when its join expires, which is what stops a wedged thread costing the second caller its
+        whole budget in front of an exit that has to happen.
+
         :meth:`_release_waiters` runs on the way out for the sibling case the ordering cannot
         reach: a ``flush()`` that passed its liveness check microseconds before the thread
         finished can still queue a marker nothing will answer, and with ``timeout=None`` that
@@ -691,6 +761,10 @@ class Worker:
             first = not self._shutdown_done
             self._shutdown_done = True
         if not first:
+            if self.draining:
+                self._drain_settled.wait(
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
             self._close_if_owed()
             self._join_closers(None if deadline is None else max(0.0, deadline - time.monotonic()))
             return
@@ -706,6 +780,7 @@ class Worker:
             with self._lock:
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
+            self._drain_settled.set()
             _diag.lost(
                 "item",
                 queued,
@@ -879,6 +954,7 @@ class Worker:
                 self._drain(pending)
             finally:
                 self._drain_finished.set()
+                self._drain_settled.set()
         except BaseException as exc:
             self._terminal_failure(exc, len(pending))
         finally:

@@ -1,7 +1,7 @@
 # Spec: Shutdown and Fork Lifecycle
 
 **ID:** SPEC-035  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033
 
@@ -13,7 +13,7 @@ introduced and are on `main` now**, which is why this spec is first in the arc: 
 has a worse shutdown story than it did before that spec landed.
 
 The other two are older and larger. `atexit` can return through `shutdown()`'s idempotent path
-and abandon a drain that is still running — measured, **0 of 9 events delivered and the process
+and abandon a drain that is still running — measured, **nothing delivered and the process
 gone in 0.39 s**. And `os.fork()` is unhandled anywhere in the tree: the child inherits a worker
 whose thread does not exist, and — worse — sink locks held by a thread that no longer exists.
 **19 of 60 forked children hung permanently** inside `FileSink.emit`. Prefork servers
@@ -84,9 +84,26 @@ one-line correction — it is FR-002's enumeration.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `_offer_orphan_signal` skips only for the sink a worker **holds** —
-      `_worker is not None and _worker.sink is sink` — the guard `_close_orphan_sink` already
-      uses. `_live_worker()` is not consulted.
+- [ ] AC-1: `_offer_orphan_signal` skips on ownership **conjoined with the moment** —
+      `_worker.sink is sink and _worker.draining`, the second a new property true while the drain
+      loop is running and has not been abandoned. The ownership term stays and must: without it an
+      orphan log to sink Y is skipped merely because a live worker is draining into sink X.
+      `_live_worker()` is not consulted. **A draft of this AC prescribed bare ownership
+      (`_worker is not None and _worker.sink is sink`, the guard `_close_orphan_sink` uses) with
+      no second term, and that is measurably wrong**: it skips for a worker whose shutdown has *finished*, leaving a
+      sink still being written to holding a `_stop` that is set forever and can never clear, so
+      every later backoff collapses to zero. That is SPEC-033 FR-004's tight retry loop, and
+      `test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal` fails against it — this
+      spec's own fix would have re-broken the guarantee it cites in AC-4. Struck rather than
+      silently replaced (SPEC-021), because "ownership, not liveness" is the rule the whole arc
+      has been repeating and this is the one site where it is not the answer. Both wrong
+      predicates are pinned by mutation: liveness fails the three tests below, bare ownership
+      fails SPEC-033's.
+- [ ] AC-1a: The two directions are covered by different tests, and neither alone is sufficient —
+      one holds the shutdown's drain window, the other holds the post-shutdown window. An
+      abandoned drain (`ShutdownTimeout`) counts as **not** draining: the thread is wedged, the
+      shutdown has already given up on it and left the sink open by SPEC-027 FR-004, so nothing
+      will cut its backoff, where the retry loop goes on costing the running application.
 - [ ] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`.
 - [ ] AC-3: End to end: with a sink whose backoff is far longer than the shutdown budget, one
       concurrent orphan log does not change the outcome — the backoff is still cut short, and
@@ -109,15 +126,20 @@ sink rosters do. A new call site must either match a declared category or fail t
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A test walks `decorator.py`'s AST and finds every call to `_live_worker()`, every
-      `_worker.sink is …` comparison, **and every bare `_worker is not None`** — that third form
-      exists today at `decorator.py:475` and an AST walk looking only for the first two would
-      never see it, making AC-3's guarantee false for exactly the phrasing SPEC-033's docstrings
-      warn about.
-- [ ] AC-1b: The categories are **three**, not two: performs-a-swap (liveness), owns-a-close
-      (ownership), and **offers-a-signal** (ownership) — FR-001 turns `_offer_orphan_signal` into
-      a site that is neither of the first two, so a two-category table could not classify the very
-      site this spec creates.
+- [ ] AC-1: A test walks `decorator.py`'s AST and finds every form: `_live_worker()`, every
+      `_worker.sink is …` comparison, every bare `_worker is not None`, **and the two FR-001 and
+      FR-003 added — `worker.draining` and `_swap_sink`'s `if not adopted:`, which carries the
+      answer in a return value rather than a predicate.** A walk looking only for the first two
+      would miss the bare form, which is the phrasing SPEC-033's docstrings warn about; one
+      looking only for the first three would ship missing both forms this spec itself
+      introduced, which is SPEC-032's roster lesson repeated inside a single spec. Line numbers
+      are not cited — an earlier draft named `decorator.py:475` and Phase 1 moved it.
+- [ ] AC-1b: The categories are **four**, not two: exists-at-all (existence — `_get_worker`,
+      `_shutdown_worker`, `_flush_worker`, `_worker_health`), performs-a-swap (liveness),
+      owns-a-close (ownership), and **offers-a-signal**, which FR-001 as built makes
+      *ownership conjoined with a moment* (`_worker.sink is sink and worker.draining`) rather
+      than ownership alone. ~~three~~ — struck: the draft was written before FR-001 discovered
+      that neither existing category classifies that site.
 - [ ] AC-2: The category table is **in the test**, one line per site with the reason, so adding a
       site forces a decision rather than defaulting silently.
 - [ ] AC-3: The test fails when FR-001's fix is reverted, and fails when a new call site is added
@@ -146,7 +168,9 @@ flushing its producer — that is a silently lost buffer, the shape SPEC-033 exi
 - [ ] AC-3: The test uses an injected preemption point inside `Worker.swap_sink`'s first
       `flush()`, since the window is a few instructions wide.
 - [ ] AC-4: The uncontended swap paths of SPEC-033 are unchanged — its whole test file still
-      passes, and the transition table in that spec is amended rather than contradicted.
+      passes, and the transition table in that spec is amended rather than contradicted. Its
+      `_swap_sink(N)` / worker-exists row reads "`Worker.swap_sink` owns it", which the declined
+      branch makes false, so the table gains a declined row.
 
 ### FR-004: `shutdown()`'s idempotent path waits for the drain it found running
 
@@ -157,12 +181,20 @@ first:` branch, calls `_close_if_owed()` (which declines, the thread being alive
 and returns — typically in under a millisecond. It never waits for the first shutdown.
 
 The common shape is not two user calls: it is a `shutdown()` on one thread and `atexit` on the
-main thread. Measured with a 2 s-emit sink and 3 traced calls: **0 of 9 events delivered, the
-sink never closed, the process gone in 0.39 s, and no `_diag` line.** The control — no concurrent
+main thread. Measured with a 2 s-emit sink and 3 traced calls: **nothing delivered, the
+sink never closed, the process gone in 0.39 s, and no `_diag` line.** ~~0 of 9 events~~ — the
+count is struck rather than deleted (SPEC-021): a traced call buffers exactly two events, so
+three of them are six, re-measured 2026-08-09, and the harness's other three were not recorded.
+The shape reproduces; the figure does not. The control — no concurrent
 `shutdown` — delivered all 9 and closed the sink in 2.09 s.
 
-The fix is to wait on `_drain_finished`, bounded by *this* call's own timeout, before
-`_close_if_owed()`. That preserves every existing property: a first shutdown that expired still
+The fix is to wait, bounded by *this* call's own timeout, before `_close_if_owed()` — on a
+`_drain_settled` event set both where the drain loop stops **and** where a shutdown gives up
+on it. ~~`_drain_finished`~~ is struck: waiting on it alone lets a first caller that abandons
+*after* the second has committed to the wait hang the exit, measured at 20.01 s against a
+20 s budget and indefinitely with `timeout=None`. Only an event already being waited on can
+release a waiter that has committed, and `_drain_finished` cannot be widened — `flush()` and
+the sentinel gate read it as "the loop stopped reading the queue". That preserves every existing property: a first shutdown that expired still
 returns early, and the grace still runs once (SPEC-033).
 
 #### Acceptance Criteria:
@@ -173,8 +205,10 @@ returns early, and the grace still runs once (SPEC-033).
       by the caller's budget, not by the drain.
 - [ ] AC-3: A second `shutdown()` after the first **completed** still returns immediately;
       idempotency is not traded for correctness here.
-- [ ] AC-4: The closer grace is still granted exactly once across both calls (SPEC-033), and a
-      test asserts the count rather than timing it.
+- [ ] AC-4: The closer grace is granted exactly once **per call**, so twice across two calls,
+      and a test asserts the count rather than timing it. ~~exactly once across both calls~~ —
+      struck because SPEC-033's invariant is once per `shutdown()`, not once per process, and an
+      AC whose test had to be read the other way is an AC to amend rather than reinterpret.
 - [ ] AC-5: A first shutdown that **expired** still returns early from the second call, since the
       drain thread is wedged and waiting on it would hang the exit — the case
       `Worker._join_closers`'s docstring already reasons about.

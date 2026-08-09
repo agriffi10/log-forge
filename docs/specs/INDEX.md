@@ -39,7 +39,7 @@ to status only — no prose.
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
 | [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Draft | SPEC-026, SPEC-030, SPEC-033, SPEC-036, SPEC-037 |
-| [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown and Fork Lifecycle | Draft | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
+| [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown and Fork Lifecycle | In Progress | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
 | [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030 |
 | [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-036 |
 | [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Draft | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
