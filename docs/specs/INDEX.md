@@ -38,6 +38,11 @@ to status only — no prose.
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Completed | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
+| [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Draft | SPEC-026, SPEC-030, SPEC-033 |
+| [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown and Fork Lifecycle | Draft | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
+| [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-035 |
+| [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025 |
+| [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Draft | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
 
 ## Arcs (build order)
 
@@ -151,3 +156,14 @@ Group related specs and record the order to build them in. Delete this section i
   a sink configured after `shutdown()` is never closed, and an orphan-only process never hands its
   sink a stop signal — so SPEC-027's "a shutdown cuts a backoff short" is false on this path. Build
   after 031; nothing depends on it.
+- **The 2026-08-07 pre-1.0 audit:** SPEC-034..038, recorded in
+  [`docs/audits/2026-08-07-pre-1.0.md`](../audits/2026-08-07-pre-1.0.md). Four surfaces were
+  audited in parallel while preparing the `v1.0.0` tag — public API, silent data loss,
+  concurrency, and the sink family — and the tag was held. Build order is **035 → 036 → 037 →
+  034 → 038**, and it is not the numbering: SPEC-035's first two FRs are regressions SPEC-033 put
+  on `main`, so they go first and ship as their own PR. 036 and 037 close the promises the
+  README makes, and each clears `xfail` cells in `tests/test_promises.py` — `strict=True` means a
+  spec cannot land without removing the markers it fixes, which is how the audit stays honest.
+  034 is last of the behaviour work because a freeze should happen once everything else has
+  settled, and 038 is last overall because FR-011 (running the extras-backed sinks in CI) is what
+  makes two of its own FRs verifiable.
