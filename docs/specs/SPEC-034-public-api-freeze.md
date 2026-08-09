@@ -3,7 +3,9 @@
 **ID:** SPEC-034  
 **Status:** Draft  
 **Last Updated:** 2026-08-07  
-**Depends On:** SPEC-026, SPEC-030, SPEC-033
+**Depends On:** SPEC-026, SPEC-030, SPEC-033, SPEC-036 — FR-008 converts `Health` to a dataclass
+and SPEC-036 FR-003 appends a field to it as a `NamedTuple`; building this first would make that
+spec's criteria unsatisfiable
 
 ## Overview
 
@@ -57,11 +59,25 @@ swap machinery advisory for the whole of `1.x`.
 - **Making the worker's tunables configurable** (audit P8). Real — a user watching
   `health().dropped` climb has no remedy but to log less — but it is a *feature*, additive, and
   therefore free to add in `1.x`. Only things that cost a major version belong here.
-- **Re-homing `MemorySink`/`NullSink`/`StderrSink` out of `sinks.util`** (audit P10). Also a
+- **Re-homing `MemorySink`/`NullSink`/`StderrSink` out of `sinks.util`** (audit P9). Also a
   major-version cost, and genuinely worth doing — but it is a pure move with no design content,
-  and it can ride with SPEC-038, which is already touching the sink package.
-- **`**http_kwargs: object` → `Unpack[HTTPOptions]`** (audit P10). Type-level only; it changes no
+  so it rides with SPEC-038, which is already touching the sink package. **SPEC-038 FR-013 is
+  that item**; a first draft of this bullet handed it over without anything on the other side to
+  catch it.
+- **`**http_kwargs: object` → `Unpack[HTTPOptions]`** (audit P9). Type-level only; it changes no
   runtime behaviour and can land any time.
+- **A public way to redirect or disable the console echo** (audit P7). `ConsoleWriter` is not
+  exported and `configure()` has no `echo` argument, so the only route is assigning
+  `log_foundry.api._console`. Genuinely missing — but adding `configure(echo_stream=…)` or
+  exporting `ConsoleWriter` is **additive**, and therefore free in `1.x`. Only things that cost a
+  major version belong in this spec.
+- **The destination-name positional policy** (audit P9). `PostgresSink(table)` and
+  `KafkaSink(topic)` take theirs positionally where `ElasticsearchSink(*, index)` and
+  `MongoDBSink(*, database, collection)` require a keyword. This *does* freeze, and it is
+  deliberately left: FR-001's rule governs injected transports, where a wrong answer causes a
+  double-close or a leaked client, whereas this is ergonomics with no correctness content. A
+  reader will trip over it; nothing will break. Recorded so the next audit does not re-find it as
+  new.
 
 ---
 
@@ -97,7 +113,9 @@ README uses the positional form.
       remembering. It is a **blacklist of five names, not a rule derived from syntax**, and says
       so: role is not inferable from a name alone — `stream` is a positional *transport* in
       `StdoutSink` and a positional *destination* in `RedisStreamsSink`. Verified today: across
-      all 39 sink classes with an `emit`, exactly one such parameter is positional.
+      all sink classes **that define an `emit`** — 34 of them, which is SPEC-032's lint scope and
+      not the 39 classes merely named `*Sink` — exactly one such parameter is positional. The two
+      rosters differ and the test states which it uses.
 - [ ] AC-3: No call site in `src/`, `tests/` or `README.md` passes it positionally.
 
 ### FR-002: `SentrySink` injects through `client=`
@@ -131,8 +149,15 @@ SPEC-030's defect, reachable publicly — and assigning a ceiling bypasses `_req
 **The design decision is what `get_config()` returns instead.** A frozen copy is the
 straightforward answer: `Config` becomes `frozen=True` and `get_config()` returns
 `dataclasses.replace(_config)`, so reads keep working unchanged and writes raise
-`FrozenInstanceError`. The cost is one object per call, on a function that is not on the hot path
-— the library reads `_config` directly internally.
+`FrozenInstanceError`. The cost is **not** free, and an earlier draft of this FR claimed it was: `model.build_event`
+calls `get_config()` at `model.py:96`, and again at `:239` and `:272` — one to three calls **per
+event**, on the hot path. A copy per call, plus AC-5's `dict(defaults)`, would allocate per event.
+So the internal call sites must read `_config` directly (they are inside the package and the
+freeze is a guarantee to *callers*, not to the library itself), and AC-6 is what proves it.
+
+`configure()` also mutates `_config` in place, so `frozen=True` means rebinding the module global
+instead — safe only because no module does `from config import _config`, which is verified today
+and worth a test.
 
 The alternative, returning the singleton and documenting "do not mutate", is what exists today
 and is what this FR exists to end.
@@ -150,7 +175,10 @@ and is what this FR exists to end.
 - [ ] AC-5: `defaults` — a mutable `dict` on the dataclass — is copied too, or the freeze is
       cosmetic. A test mutates the returned `defaults` and asserts the library's is unchanged.
 - [ ] AC-6: The library's own internals do not go through `get_config()` on any hot path, so this
-      adds no per-event allocation. A test or a benchmark shows the event path is unchanged.
+      adds no per-event allocation. `model.build_event`'s three call sites are converted, and a
+      benchmark shows the per-event path is unchanged rather than an assertion that it is.
+- [ ] AC-7: No module imports `_config` by value (`from config import _config`), so rebinding it
+      in `configure()` is safe. A test asserts it, since the freeze depends on it.
 
 ### FR-004: `echo` and `message` stop being reserved words
 
@@ -226,7 +254,9 @@ and a sink that already owns an attribute of that name has it silently overwritt
       that honouring it is how a retrying sink stays interruptible.
 - [ ] AC-2: The attribute is namespaced so it cannot collide with a name a third-party object
       already uses. A rename is breaking for the shipped sinks and free now.
-- [ ] AC-3: Every shipped retrying sink is updated, derived from the roster.
+- [ ] AC-3: Every shipped retrying sink is updated, derived from the roster. This lands **after**
+      SPEC-035, whose new tests assert `sink.stop_signal is worker._stop`; the rename sweeps them
+      too, and a grep for the old name across `tests/` is part of the AC.
 - [ ] AC-4: The README's custom-sink section shows it.
 
 ### FR-007: `flush()` and `continue_trace()` can grow a reason
@@ -246,11 +276,16 @@ working and leaves room to add reasons later — but only if the return type cha
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `if flush():` and `assert flush() is True`-style checks keep working. The second is
-      the risk: `is True` breaks on an object. A test covers both idioms and the README/docs are
-      updated wherever they use identity.
-- [ ] AC-2: `flush().reason` distinguishes at least retired-worker from timed-out from
-      batch-abandoned.
+- [ ] AC-1: `if flush():` keeps working. `assert flush() is True` **cannot** — an object with
+      `__bool__` is never `True` — and a draft of this AC claimed both would, which is the
+      contradiction to avoid. Counted on this branch: **26** identity assertions on `flush()` and
+      **18** on `continue_trace()` across the test suite. All are converted, the count is stated
+      in the PR, and the conversion is mechanical rather than discovered mid-build.
+- [ ] AC-1b: The FR states whether `Worker.flush` changes type too, or only the public
+      `log_foundry.flush` — they are different call sites with different callers.
+- [ ] AC-2: `flush().reason` distinguishes at least retired-worker, timed-out and
+      batch-abandoned — **plus the two SPEC-036 adds**, a failed span sweep and a failed
+      `sink.flush()`, since this lands after it.
 - [ ] AC-3: The same treatment for `continue_trace()`, distinguishing "nothing supplied" from
       "supplied and rejected".
 - [ ] AC-4: `mypy --strict` is clean, and the return types are exported so a caller can annotate.
@@ -279,12 +314,16 @@ effectively is, and it has not stopped anything: the shape is still real, still 
 - [ ] AC-1: Attribute access is unchanged everywhere — `h.dropped`, `h.sink.failed`.
 - [ ] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
       breaking.
-- [ ] AC-3: Every construction site in `src/` and `tests/` uses keywords, so the conversion is
-      mechanical. Verified before the change rather than discovered during it.
+- [ ] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
+      positional sites exist today (`tests/test_sink_losses.py:213`, `:228`), so a draft claiming
+      this was already true was wrong. Verified by grep before the type changes.
 - [ ] AC-4: `_replace`-style updates keep working, or their call sites are converted with the
       type.
-- [ ] AC-5: `SinkLosses` converts with it — a third-party sink returning a plain object with the
-      right attributes still aggregates.
+- [ ] AC-5: `SinkLosses` converts with it. It does **not** start accepting a plain object with
+      the right attributes: `read_losses` gates on `isinstance(losses, SinkLosses)`, which
+      SPEC-026 FR-002 settled deliberately, and a draft of this AC would have re-opened that
+      decision by accident. Duck-typed loss reporting is out of scope; if it is wanted it is its
+      own FR against SPEC-026's reasoning.
 
 ---
 

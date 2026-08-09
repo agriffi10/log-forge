@@ -3,7 +3,8 @@
 **ID:** SPEC-037  
 **Status:** Draft  
 **Last Updated:** 2026-08-07  
-**Depends On:** SPEC-017, SPEC-020, SPEC-025
+**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-036 — FR-001 AC-5 routes an absorbed in-span
+failure into the counter SPEC-036 FR-003 adds, so it cannot be built before it
 
 ## Overview
 
@@ -98,24 +99,32 @@ same stated reason.
 
 #### Description:
 
-With FR-001 in place the caller no longer sees the `AttributeError`, but the second half of A2
-stands on its own: when a library-internal failure escapes into the decorator's handler, the span
-is recorded `status=error` with an `error.type` that names a library exception rather than
-anything the user's code did.
+With FR-001 in place the caller no longer sees the `AttributeError` — and that closes the *only
+known* route to this, which is why this FR is scoped down to an assertion rather than a mechanism.
 
-That is the `error` field lying about the traced function. An operator reading
-`error.type=AttributeError` on `charge()` will look in `charge()`.
+The decorator's wrapper catches `BaseException` from `fn(...)` and **cannot distinguish** a
+library-internal exception from a user one; it has no marker to key on. Inventing one — tagging
+library exceptions so the wrapper can re-classify them — would be a real mechanism with real cost,
+and it would guard against a case that, after FR-001, has no reachable path.
+
+So this FR asserts the property and does not build for it. If a later audit finds a second route
+into the wrapper from library code, this FR is where the mechanism gets specified, and the ACs
+below are what will already be in place to catch it.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A span whose function returned normally is recorded `status=ok`, even when a
-      library-internal failure occurred during it.
+- [ ] AC-1: A span whose function returned normally is recorded `status=ok` even though a
+      library-internal failure occurred during it — asserted through FR-001's own case
+      (`info(ValueError(...))` in a span), which after FR-001 is absorbed. This is the assertion
+      that FR-001 fixed both halves of A2, not a second mechanism.
 - [ ] AC-2: A span whose function genuinely raised is unchanged — `status=error` and the caller's
       own exception type, which is SPEC-001's contract and must not regress.
 - [ ] AC-3: The library-internal failure is still visible, through `_diag` and the FR-001
       counter — this FR moves it out of the `error` field, it does not hide it.
 - [ ] AC-4: A test asserts the two cases side by side, since the risk is a fix that makes every
       span read `ok`.
+- [ ] AC-5: The FR records that no other route from library code into the wrapper is known, and
+      that finding one reopens this FR with a mechanism rather than an assertion.
 
 ### FR-003: `NaN` and `Infinity` are replaced, not passed through
 

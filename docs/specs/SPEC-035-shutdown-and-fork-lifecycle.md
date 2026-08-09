@@ -40,10 +40,13 @@ Lock ordering, counter synchronisation and `contextvars` were audited alongside 
   which is a different event: the process is new, and nothing is trying to exit.
 - **`shutdown()`'s unbounded close of the live sink.** Recorded in §13, and narrowing it needs
   the sink contract to change (SPEC-027 FR-004).
-- **The stderr write under `_worker_lock`** (audit C5). An error path only; it is recorded in
-  §13 by FR-005 rather than fixed, because the fix — returning a flag and writing after the
-  release — spreads a diagnostic decision across two functions to save a write that happens when
-  a sink's `stop_signal` setter objects.
+- **The stderr write under `_worker_lock`** (audit C5). An error path only, and the fix —
+  returning a flag and writing after the release — spreads a diagnostic decision across two
+  functions to save a write that happens only when a sink's `stop_signal` setter objects. It is
+  **recorded as a constraint** rather than fixed, and FR-006 is the AC that makes that recording
+  happen: a first draft of this bullet said "recorded in §13 by FR-005", and FR-005 is the fork
+  FR whose criteria are all fork — so the item would have been downgraded to a constraint that
+  nothing actually wrote down.
 
 ---
 
@@ -106,9 +109,15 @@ sink rosters do. A new call site must either match a declared category or fail t
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A test walks `decorator.py`'s AST, finds every call to `_live_worker()` and every
-      `_worker.sink is …` comparison, and asserts the enclosing function is in the expected
-      category — performs-a-swap or owns-a-close.
+- [ ] AC-1: A test walks `decorator.py`'s AST and finds every call to `_live_worker()`, every
+      `_worker.sink is …` comparison, **and every bare `_worker is not None`** — that third form
+      exists today at `decorator.py:475` and an AST walk looking only for the first two would
+      never see it, making AC-3's guarantee false for exactly the phrasing SPEC-033's docstrings
+      warn about.
+- [ ] AC-1b: The categories are **three**, not two: performs-a-swap (liveness), owns-a-close
+      (ownership), and **offers-a-signal** (ownership) — FR-001 turns `_offer_orphan_signal` into
+      a site that is neither of the first two, so a two-category table could not classify the very
+      site this spec creates.
 - [ ] AC-2: The category table is **in the test**, one line per site with the reason, so adding a
       site forces a decision rather than defaulting silently.
 - [ ] AC-3: The test fails when FR-001's fix is reverted, and fails when a new call site is added
@@ -207,6 +216,17 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
 
 #### Acceptance Criteria:
 
+- [ ] AC-0: **The `before` handler is bounded.** Measured: acquiring a sink's SPEC-028 transport
+      lock while the drain thread is mid-`emit` blocked the fork for 1.20 s, and with `HTTPSink`'s
+      documented 90 s worst case it would block gunicorn's master thread for that long — with no
+      shutdown in progress, so the stop signal cannot cut it. The handler try-acquires with a
+      short deadline and proceeds **without** the lock when it expires; the FR states the
+      consequence for child consistency, which is that the child may inherit a half-written sink
+      buffer and must therefore not reuse it (AC-7).
+- [ ] AC-0b: The design does not *depend* on `before` running. `os.register_at_fork(before=)` is
+      not invoked for a C-level fork — uWSGI calls `PyOS_AfterFork_Child` only — so a design that
+      needs `before` degrades silently on one of the three deployments this spec names. The child
+      handler alone must be sufficient for AC-1.
 - [ ] AC-1: After a fork, the child's first log call does not block. A test forks repeatedly
       (≥50 iterations) with the drain thread actively emitting into a locking sink, and every
       child completes within a timeout. The pre-fix version of this test hangs, which is
@@ -224,6 +244,24 @@ A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
       preload needs to be able to find it.
 - [ ] AC-7: A sink shared across a fork is documented as the caller's responsibility, with the
       concrete hazard named (one socket or one SQLite handle, two processes).
+
+### FR-006: The accepted constraint is written down
+
+#### Description:
+
+Audit C5 is not fixed (see Out of Scope). SPEC-021's rule is that an open item is closed by being
+fixed, settled, or **recorded** — never dropped — and a bullet in a spec's Out of Scope is not a
+record a reader of `architecture.md` will ever find.
+
+#### Acceptance Criteria:
+
+- [ ] AC-1: `architecture.md` §13 records that `_note_orphan_emit` and `_swap_sink` can write a
+      `_diag` line while holding the process-wide `_worker_lock`, that this stalls every orphan
+      emit and every first `@trace` behind a wedged console, that it is an error path only, and
+      why the fix was judged worse than the trade.
+- [ ] AC-2: The entry names `Worker.submit` as the counter-example — it deliberately writes
+      *outside* its lock for exactly this reason — so a later reader can see the inconsistency is
+      known rather than accidental.
 
 ---
 

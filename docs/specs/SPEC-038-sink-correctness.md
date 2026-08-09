@@ -37,6 +37,8 @@ itself: a correctness spec for sinks nobody can execute is a spec that can only 
 - `LogstashSink`'s content type.
 - `RotatingFileSink`'s default.
 - Making the extras-backed sinks executable in CI.
+- Re-homing the utility sinks out of `sinks.util`, handed over by SPEC-034.
+- Three queue/stream sinks that have no bounded retry at all.
 
 ### Out of Scope
 
@@ -72,6 +74,9 @@ whatever batch it is handed. `Worker._final_drain` hands it the entire pending b
       retry — and if a single event exceeds the limit it is dropped and counted
       `dropped_oversized`, as the AWS sinks already do.
 - [ ] AC-5: The per-platform limits are cited to their documentation in each subclass docstring.
+- [ ] AC-6: `README.md`'s `HTTPSink` signature table gains `max_batch_count`/`max_batch_bytes`.
+      The README PR is adding `max_retry_after` and `opener` to that same table, so this AC exists
+      to stop the two passes leaving it half-right.
 
 ### FR-002: `PostgresSink`'s rollback cannot bypass the retry, the counter and the diagnostic
 
@@ -108,7 +113,8 @@ pymongo's pool.
       arch §13's borrowed-client constraint — and the sink says so rather than failing silently.
 - [ ] AC-3: Reconnection is bounded by the existing retry budget, not a new unbounded loop.
 - [ ] AC-4: Verified against a real Postgres (FR-011), since a fake connection cannot show that
-      psycopg's handle is unusable.
+      psycopg's handle is unusable. FR-011 AC-2 makes that job non-gating, so this AC is closed
+      only against a **green** run of it, not merely against its existence.
 
 ### FR-004: `GooglePubSubSink` reaps its futures
 
@@ -120,7 +126,11 @@ events logged, and `result()` is never called until `close()`, so `failed` stays
 
 - [ ] AC-1: `emit` drains already-completed futures and counts failures, so an outage is visible
       in `losses()` while it is happening.
-- [ ] AC-2: The pending list is bounded; the FR states the bound and what happens at it.
+- [ ] AC-2: The pending list is bounded at **1,000 outstanding futures** — roughly one drain
+      interval's worth at the default batch size, large enough not to serialize ordinary
+      publishing and small enough to bound memory. At the bound `emit` blocks on the oldest
+      future rather than dropping, since the event has already been handed to the client and
+      dropping it here would lose something the client may yet deliver.
 - [ ] AC-3: `close()` still resolves whatever remains.
 - [ ] AC-4: Memory does not grow with total events logged. A test asserts the list length under a
       sustained load rather than asserting the code shape.
@@ -165,8 +175,11 @@ never converging. Every other size-limited sink drops-and-counts before sending.
       `dropped_oversized`.
 - [ ] AC-2: The limit is configurable with a documented default (~64 KB for UDP), and TCP is
       unaffected.
-- [ ] AC-3: The retry loop no longer treats a permanent `errno` as transient. Which errnos are
-      permanent is stated, not inferred.
+- [ ] AC-3: The retry loop no longer treats a permanent `errno` as transient. The permanent set
+      is **`EMSGSIZE` only** — every other socket errno the transport can raise (`ECONNREFUSED`,
+      `EHOSTUNREACH`, `ENETDOWN`, `EPIPE`, `ETIMEDOUT`) describes a destination that may come
+      back, and treating any of those as permanent would turn a transient outage into silent
+      loss. Stated as a set in the code, not inferred at the call site.
 
 ### FR-008: The Redis sinks can bound their destination
 
@@ -188,15 +201,19 @@ the operator can set from this library.
 **Read-only analysis.** `sinks/firehose.py:47`, `kinesis.py:117-119`.
 
 Firehose's per-record limit is 1,000 KiB (1,024,000 bytes), not `1024*1024`; records between the
-two are passed through and rejected by the service. Both size requests with
-`size_of=lambda r: len(r["Data"])`, ignoring the up-to-256-byte `PartitionKey` per record — up to
-~128 KB per 500-record request — while `SQSSink` deliberately charges its FIFO ids and documents
-why.
+two are passed through and rejected by the service.
+
+Separately, **Kinesis** sizes its request with `size_of=lambda r: len(r["Data"])`, ignoring the
+up-to-256-byte `PartitionKey` per record — up to ~128 KB per 500-record request — while `SQSSink`
+deliberately charges its FIFO ids and documents why. This applies to Kinesis **only**: a Firehose
+record is `{"Data": data}` and the API has no partition key, so a draft AC requiring "both"
+`size_of` lambdas to include one was unimplementable for one of the two.
 
 - [ ] AC-1: `MAX_RECORD_BYTES = 1_024_000` in Firehose.
-- [ ] AC-2: Both `size_of` lambdas include the partition key's length.
+- [ ] AC-2: `KinesisSink`'s `size_of` includes `len(r["PartitionKey"])`. Firehose's is unchanged
+      except for FR-005's newline.
 - [ ] AC-3: A test at each boundary — one byte under and one byte over — for both the per-record
-      and per-request limits.
+      and per-request limits, per sink and against that sink's real budget.
 
 ### FR-010: `LogstashSink` sends a content type Logstash parses
 
@@ -207,7 +224,8 @@ JSON codec by default, falling back to `plain` — so the whole body arrives as 
 every line stuffed into `message`. It works only if the user has set `codec => json_lines`.
 
 - [ ] AC-1: Verified against a real Logstash (FR-011) before changing anything — this is the
-      one finding where the fix could be worse than the defect if the analysis is wrong.
+      one finding where the fix could be worse than the defect if the analysis is wrong. As with
+      FR-003 AC-4, closed against a green run of that job rather than its existence.
 - [ ] AC-2: Whichever way it resolves, the class docstring states the Logstash-side configuration
       the sink expects.
 
@@ -262,6 +280,43 @@ attempting delivery) nor `failed` fits an event that was written and flushed to 
 - [ ] AC-6: A test writes past `max_bytes` **twice** and asserts `path.1` holds the *second*
       generation and `path.2` does not exist.
 
+### FR-013: The utility sinks leave `sinks.util`
+
+#### Description:
+
+`MemorySink`, `NullSink` and `StderrSink` live in `log_foundry.sinks.util`. `MemorySink` is the
+sink every downstream test suite will import, and `util` is a poor permanent home — moving it
+after `1.0.0` costs a major version. SPEC-034 hands this over rather than doing it, because it is
+a pure move with no design content and this spec is already in the sink package.
+
+- [ ] AC-1: `MemorySink` and `NullSink` get their own modules; `StderrSink` sits with
+      `StdoutSink`, which is what it is a variant of.
+- [ ] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated.
+- [ ] AC-3: No compatibility alias is left behind in `sinks.util` — an alias would have to live
+      for all of `1.x`, which is the cost the move is being made to avoid.
+
+### FR-014: Three queue sinks have no bounded retry, and the docs said they did
+
+#### Description:
+
+`KafkaSink`, `NATSSink` and `GooglePubSubSink` neither import `sinks/_retry` nor accept
+`max_retries`. The README's "All publish + retry within a bound" was false for three of the seven
+queue/stream sinks, and the README PR narrows the prose — which fixes the *claim* and leaves the
+*gap*, so three sinks ship at 1.0 outside SPEC-027's guarantee.
+
+That may be the right answer: each of the three has a client with its own retry and its own
+delivery timeout, and layering a second retry on top of `librdkafka`'s can multiply the worst-case
+delay rather than bound it. But it has to be a decision, not a documentation edit.
+
+- [ ] AC-1: For each of the three, the FR states whether the client's own retry satisfies
+      SPEC-027's guarantee — bounded, and cut short by a shutdown — with the setting that makes it
+      so.
+- [ ] AC-2: Where it does, the class docstring states the worst-case total delay as every other
+      retrying sink does, and the stop signal is honoured (which is what "cut short by a shutdown"
+      requires and what SPEC-034 FR-006 is about to make a documented contract member).
+- [ ] AC-3: Where it does not, bounded retry is added.
+- [ ] AC-4: `README.md`'s claim matches the outcome, whichever way each resolves.
+
 ---
 
 ## Implementation Phases
@@ -276,6 +331,12 @@ Before Phase 3, because FR-003 and FR-010 depend on it.
 
 ### Phase 3: The service-verified fixes (FR-003, FR-010)
 
-### Phase 4: The rest (FR-005..FR-009, FR-012)
+### Phase 4: The rest (FR-005..FR-009, FR-012, FR-013)
 
-Independent of each other; reviewable in one pass.
+Independent of each other; reviewable in one pass. FR-013 is a pure move and should be its own
+commit inside it, so the diff stays readable.
+
+### Phase 5: FR-014
+
+Last, because AC-1 needs each client's retry behaviour verified against a real service — which is
+what FR-011 provides.
