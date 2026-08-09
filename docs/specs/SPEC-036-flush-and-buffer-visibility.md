@@ -34,8 +34,8 @@ wrapped in `@trace` — buffers indefinitely with every surface reading clean.
 
 The other two are the same shape one layer down: a sink that buffers in its *client*
 (`KafkaSink`, `GooglePubSubSink` both flush only in `close()`) is unreachable through `flush()`
-because `Sink` declares no flush hook; and the orphan path's own loss reports nowhere, which is
-SPEC-034 FR-004 and moves here where it belongs.
+because `Sink` declares no flush hook; and the orphan path's own loss reports nowhere, which was
+an FR of SPEC-034's earlier draft and moves here where it belongs (FR-003).
 
 ## Scope
 
@@ -43,7 +43,7 @@ SPEC-034 FR-004 and moves here where it belongs.
 
 - `flush()` reaching events buffered in an **open span**.
 - A flush hook on the `Sink` protocol, so a client-buffering sink can be drained without closing.
-- The orphan path's loss counter (moved from SPEC-034 FR-004).
+- The orphan path's loss counter (moved from SPEC-034's earlier draft; FR-003 here).
 - An `asyncio` task appending to a span buffer that has already been emitted.
 - A permanently dead `MultiSink` child being invisible to `health()`.
 
@@ -249,8 +249,10 @@ satisfies the protocol.
 
 #### Description:
 
-Moved verbatim from SPEC-034 FR-004, which was reviewed three times and is unchanged in
-substance. A level call with no active span emits on the caller's thread; SPEC-025 guards it so a
+Moved verbatim from the orphan-loss requirement that was SPEC-034's FR-004 in an earlier draft,
+reviewed three times there and unchanged in substance. The label no longer resolves — 034's
+FR-004 is now "`echo` and `message` stop being reserved words" — so it is described rather than
+cited. A level call with no active span emits on the caller's thread; SPEC-025 guards it so a
 broken destination cannot fail the caller; nothing records that the event was lost, because
 `health()` describes a worker and there is none.
 
@@ -266,11 +268,13 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
 - [ ] AC-2: `flush()` is unchanged — it still returns `True` in that process, and a test pins
       that, with a comment naming SPEC-021 so a later reader does not "fix" it.
 - [ ] AC-3: The new field is **appended** to `Health`, so every existing field keeps its index;
-      `Health._fields[:9]` is unchanged. The name is **path-scoped and stays that way**: SPEC-037
-      FR-001 AC-5 needs the same kind of counter for the in-span path and appends its own
-      (`in_span_lost`) rather than widening this one, because 037 builds after this spec and a
-      rename would re-title a field already published and re-edit every surface AC-12 corrects
-      here. Deciding it now is the point — a name settled after it ships is settled too late.
+      `Health._fields[:9]` is unchanged. The name is **path-scoped, and that is a decision, not a
+      default**: SPEC-037 FR-001 AC-5 needs a counter for the in-span path and appends its own
+      (`in_span_lost`) rather than widening this one, because the two aggregate different failure
+      populations and so fail SPEC-026's "would one number hide which fix applies" test. That
+      reasoning lives in 037 AC-5, which is where the second field is added; this AC records the
+      consequence for *this* spec — the name is settled here, before it ships, rather than
+      re-opened by a later spec in the arc.
 - [ ] AC-4: A mixed process reports orphan losses in `orphan_lost` and worker losses in
       `failed_batches`, separately — a test asserts both, and that neither absorbs the other.
 - [ ] AC-5: The counter is incremented under its **own** lock, not `_worker_lock` — SPEC-028's
@@ -346,6 +350,12 @@ already what a level call with no span does) or is counted.
 - [ ] AC-2: A late append is not silently dropped — it is either delivered or counted, decided in
       `api._log` at append time against a closed-span flag, and the test asserts which. A
       post-hoc check of the buffer cannot satisfy this: nothing reads a span after it closes.
+      **It adds no `Health` field.** A span that has closed is not a span, so the append takes the
+      orphan route and inherits its accounting: delivered on success, and on failure counted in
+      FR-003's `orphan_lost` by the guard that already wraps it. Stated because the alternative —
+      a third counter — would make `Health` twelve fields and falsify SPEC-034 AC-2b, which pins
+      the tenth and eleventh; and because leaving the destination unnamed is exactly what
+      SPEC-037 FR-001 AC-5 had to be re-opened to fix, one FR away in the same spec.
 - [ ] AC-3: An event emitted from a task **inside** the span's lifetime is unaffected and still
       lands in that span.
 - [ ] AC-4: No event is duplicated by the detach.
@@ -406,10 +416,17 @@ child to report itself.
 ## Data Model
 
 ```python
+# src/log_foundry/model.py — Span gains two flags, both read on the append/adopt hot paths
+@dataclass
+class Span:
+    ...
+    swept: bool = False       # FR-001 AC-11: set by the sweep, read by AC-11a's refusal
+    closed: bool = False      # FR-004 AC-2: set at close, read by api._log at append time
+
 # src/log_foundry/worker.py
 class Health(NamedTuple):     # still a NamedTuple *here*; SPEC-034 FR-008 converts it later,
     ...                       #   which is why SPEC-034 declares a dependency on this spec
-    orphan_lost: int = 0      # appended (FR-003)
+    orphan_lost: int = 0      # appended (FR-003); SPEC-037 appends in_span_lost after it
 
 # src/log_foundry/sinks/base.py — the optional protocol grows one member
 class Sink(Protocol):
