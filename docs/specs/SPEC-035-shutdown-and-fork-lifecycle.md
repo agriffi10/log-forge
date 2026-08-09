@@ -1,7 +1,7 @@
 # Spec: Shutdown and Fork Lifecycle
 
 **ID:** SPEC-035  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033
 
@@ -84,9 +84,24 @@ one-line correction — it is FR-002's enumeration.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `_offer_orphan_signal` skips only for the sink a worker **holds** —
-      `_worker is not None and _worker.sink is sink` — the guard `_close_orphan_sink` already
-      uses. `_live_worker()` is not consulted.
+- [ ] AC-1: `_offer_orphan_signal` skips on the **moment**, not on either category — a new
+      `Worker.draining`, true while the drain loop is running and has not been abandoned.
+      `_live_worker()` is not consulted. **A draft of this AC prescribed bare ownership
+      (`_worker is not None and _worker.sink is sink`, the guard `_close_orphan_sink` uses) and
+      that is measurably wrong**: it skips for a worker whose shutdown has *finished*, leaving a
+      sink still being written to holding a `_stop` that is set forever and can never clear, so
+      every later backoff collapses to zero. That is SPEC-033 FR-004's tight retry loop, and
+      `test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal` fails against it — this
+      spec's own fix would have re-broken the guarantee it cites in AC-4. Struck rather than
+      silently replaced (SPEC-021), because "ownership, not liveness" is the rule the whole arc
+      has been repeating and this is the one site where it is not the answer. Both wrong
+      predicates are pinned by mutation: liveness fails the three tests below, bare ownership
+      fails SPEC-033's.
+- [ ] AC-1a: The two directions are covered by different tests, and neither alone is sufficient —
+      one holds the shutdown's drain window, the other holds the post-shutdown window. An
+      abandoned drain (`ShutdownTimeout`) counts as **not** draining: the thread is wedged, the
+      shutdown has already given up on it and left the sink open by SPEC-027 FR-004, so nothing
+      will cut its backoff, where the retry loop goes on costing the running application.
 - [ ] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`.
 - [ ] AC-3: End to end: with a sink whose backoff is far longer than the shutdown budget, one
       concurrent orphan log does not change the outcome — the backoff is still cut short, and

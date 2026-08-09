@@ -350,6 +350,18 @@ def _offer_orphan_signal(sink: Sink) -> None:
     leave the drain thread serving a full backoff across ``Worker.shutdown``'s join, which is the
     global pause SPEC-027 exists to remove.
 
+    Ownership alone is not the whole predicate either, and this site is the one place in the
+    module where neither of the two categories fits (SPEC-035 FR-001). :func:`_live_worker` was
+    wrong: ``retired`` latches on **entry** to ``Worker.shutdown``, so for the whole of the drain
+    the skip stopped applying and an orphan log handed the sink a fresh unset event — precisely
+    the one the drain thread was about to wait on. Measured, a 20 s backoff against
+    ``shutdown(timeout=3)`` then ran to its full length and the shutdown expired with the sink
+    left open. But bare ``_worker.sink is sink`` is wrong in the opposite direction: it skips for
+    a worker whose shutdown has **finished**, leaving a sink still being written to holding a set
+    event that can never clear, which is SPEC-033 FR-004's tight retry loop and is covered by a
+    test that spec shipped. The predicate is therefore ``Worker.draining`` — the moment, not the
+    identity — and its docstring carries the reasoning.
+
     A fresh event replaces one that is already set, because an ``Event`` never clears and
     ``sinks/_retry.wait`` returns immediately on a set one — a sink handed the shutdown's event
     would have every subsequent backoff collapsed to zero, which against a rate-limited
@@ -368,8 +380,8 @@ def _offer_orphan_signal(sink: Sink) -> None:
       None.
     """
     global _orphan_stop
-    worker = _live_worker()
-    if worker is not None and worker.sink is sink:
+    worker = _worker
+    if worker is not None and worker.sink is sink and worker.draining:
         return
     if _orphan_stop.is_set():
         _orphan_stop = threading.Event()
@@ -559,14 +571,51 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 closer = _lifecycle.close_detached(old)
     if worker is not None:
         try:
-            worker.swap_sink(new_sink, timeout)
+            adopted = worker.swap_sink(new_sink, timeout)
         except Exception as exc:
             _diag.absorbed(
                 "swapping the log sink", exc, "events may still be delivered to the previous sink"
             )
+            return
+        if not adopted:
+            _adopt_declined_swap(new_sink)
         return
     if closer is not None:
         closer.join(timeout)
+
+
+def _adopt_declined_swap(new_sink: Sink) -> None:
+    """Takes ownership of a sink a worker refused mid-swap (SPEC-035 FR-003).
+
+    ``Worker.swap_sink`` re-checks retirement after its first ``flush()`` and returns early once
+    ``_shutdown_done`` latched, but :func:`_swap_sink` had already cleared ``_orphan_sink`` on the
+    strength of a worker being live a few instructions earlier. The new sink then sat in the
+    config, installed nowhere and recorded nowhere: measured, ``config.sink is B`` was ``True``,
+    ``B`` was never closed, and ``health()`` read entirely clean — for a sink whose ``close()``
+    *is* its delivery, a ``KafkaSink`` flushing its producer, a silently lost buffer.
+
+    Only the new sink is re-homed. The old one is still ``worker.sink``, because the declined
+    swap never reassigned it, so the worker closes it through its own ``_close_if_owed`` and
+    closing it here would be the double-close :func:`_close_orphan_sink` exists to avoid.
+
+    ``incomplete_swaps`` is deliberately not moved. It counts an unconfirmed *drain*, and this
+    swap had no drain to confirm — the worker declined before reassigning anything — so counting
+    it would stop telling an operator whether events were misrouted or a close was merely slow.
+
+    Args:
+      new_sink: The sink the worker refused to adopt.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    global _orphan_sink
+    with _worker_lock:
+        _orphan_sink = new_sink
+        _offer_orphan_signal(new_sink)
+        _register_exit_handler()
 
 
 def _flush_worker(timeout: float | None = 5.0) -> bool:
