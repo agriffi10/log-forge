@@ -13,6 +13,8 @@ completeness.
 
 import ast
 import inspect
+import pathlib
+import re
 import textwrap
 
 # A plain import, not `importorskip`: a roster whose value is that it cannot be bypassed must
@@ -63,7 +65,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         OWNERSHIP_AND_MOMENT,
         (
             "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
-            "leaving"
+            "leaving "
             "a sink still being written to holding a set event - SPEC-033 FR-004's tight retry "
             "loop."
             "Liveness alone un-skips for the whole drain, handing the drain thread a fresh event "
@@ -87,11 +89,10 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_swap_sink", "_live_worker()", 0): (
         LIVENESS,
         (
-            "the call that answers who performs. Kept as its own row rather than folded into the "
-            "test"
-            "below, because the two are separable: reverting FR-001 moves a _live_worker() call "
-            "into"
-            "_offer_orphan_signal, and a roster counting only predicates would not notice."
+            "the call that answers who performs. Kept as its own row rather than folded into "
+            "the test below, because the two are separable: reverting FR-001 moves a "
+            "_live_worker() call into _offer_orphan_signal, and a roster that counted only "
+            "predicates would not notice."
         ),
     ),
     ("_swap_sink", "worker is not None", 0): (
@@ -151,6 +152,24 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
 }
 
+
+_KNOWN_LONG_WORDS = frozenset(
+    {
+        "architecture",
+        "classification",
+        "deliberately",
+        "distinguishable",
+        "identically",
+        "implementation",
+        "occurrence",
+        "reclassification",
+        "relinquishes",
+        "retirement",
+        "synthesizing",
+        "unambiguously",
+        "unclassified",
+    }
+)
 
 _BOOL_ATTRS = ("retired", "draining")
 
@@ -248,6 +267,34 @@ def _own_nodes(scope: ast.AST) -> list[ast.AST]:
     return own
 
 
+def _named_scopes(node: ast.AST, path: tuple[str, ...]) -> list[tuple[str, ast.AST]]:
+    """Every function scope under `node`, named by its **path** rather than its bare name.
+
+    Two same-named nested functions — `decorate._inner` under two different decorators — are two
+    sites, and a bare-name key put both under one roster row, which is the "two sites, one row"
+    defect the occurrence index exists to prevent, one level up.
+
+    Args:
+      node: The node to search.
+      path: The enclosing scope names.
+
+    Returns:
+      (dotted path, scope node) for every function beneath `node`.
+
+    Raises:
+      None.
+    """
+    scopes: list[tuple[str, ast.AST]] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            here = (*path, child.name)
+            scopes.append((".".join(here), child))
+            scopes.extend(_named_scopes(child, here))
+        else:
+            scopes.extend(_named_scopes(child, path))
+    return scopes
+
+
 def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     """Every worker question in a parsed module, keyed by scope, text and source ordinal.
 
@@ -261,12 +308,28 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     Module level is walked as well as functions, since a guard does not stop being one for
     sitting outside a `def`.
 
-    One limitation is real and disclosed rather than papered over: the subject is recognised by
-    **name** (`_SENTINELS`), so a guard whose local is called `owner` rather than `worker` is
-    invisible — though *rewriting* an existing site that way trips the stale-row check, so the
-    exposure is net-new sites only. What is matched is the **position**, not the node shape, so
-    `getattr(_worker, "retired", False)` and `bool(_worker)` are both caught; `match` is the one
-    syntax not covered, and is not used in this module.
+    Three limitations are real, measured, and disclosed rather than papered over. A draft of this
+    paragraph claimed `bool(_worker)` and `getattr(_worker, "retired", False)` were "both caught"
+    and that `match` was the only gap; that is true in a **test** position and false in the
+    hoisted one this walker had just added, so the note was over-optimistic in the direction that
+    costs a contributor a green suite.
+
+    1. **The subject is recognised by name** (`_SENTINELS`), so a guard whose local is called
+       `owner` rather than `worker` is invisible — though *rewriting* an existing site that way
+       trips the stale-row check, so the exposure is net-new sites only.
+    2. **A hoisted question is only followed through a bare boolean operator.**
+       `alive = _worker is not None` is caught; `alive = bool(_worker)`,
+       `alive = getattr(_worker, "retired", False)`, `alive, _ = _worker is not None, 1`,
+       `flags = [_worker is not None]` and `alive |= _worker is not None` are not. In a test
+       position all of these are caught, because there the position alone settles it.
+    3. **A lambda body is searched only when it is itself boolean**, so
+       `lambda: [x for x in y if _worker.retired]` is missed even though the same comprehension
+       at statement level is caught.
+
+    Each is a scope decision rather than an oversight: the alternative is following every value
+    an arbitrary expression could carry, which is a walker nobody can reason about — and the
+    roster's failure mode is a *missed* site, which the next audit finds, not a wrong one.
+    `match` is likewise uncovered and unused here.
 
     Args:
       tree: The parsed module.
@@ -278,11 +341,7 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
       None.
     """
     scopes: list[tuple[str, ast.AST]] = [("<module>", tree)]
-    scopes.extend(
-        (node.name, node)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    )
+    scopes.extend(_named_scopes(tree, ()))
 
     found: list[tuple[str, str, int]] = []
     for name, scope in scopes:
@@ -451,3 +510,27 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
         """
     )
     assert not found, f"these are actions on the worker, not questions about it: {found}"
+
+
+def test_no_reason_has_fused_words() -> None:
+    """AC-2's deliverable is the reasons, and three rounds of scripted rewrapping fused words.
+
+    Implicit concatenation drops the seam silently — `"...into the " "test"` reads fine in the
+    source and renders as `theprocess`, `testbelow`, `into_offer_orphan_signal`. Nothing else in
+    the suite reads these strings, so only a human would ever have noticed, which is exactly the
+    kind of rot a lint is for.
+    """
+    # Built from the *code*, never from the reasons: a first version seeded the vocabulary with
+    # the reasons' own words, so every fused word validated itself and the lint passed against
+    # the exact defect it was written for.
+    vocabulary = set()
+    for path in ("src/log_foundry/decorator.py", "src/log_foundry/worker.py"):
+        vocabulary.update(re.findall(r"[A-Za-z_]+", pathlib.Path(path).read_text()))
+
+    suspect: list[tuple[str, str]] = []
+    for site, (_, reason) in ROSTER.items():
+        for word in re.findall(r"[A-Za-z_]{11,}", reason):
+            if word in vocabulary or word.lower() in _KNOWN_LONG_WORDS:
+                continue
+            suspect.append((site[0], word))
+    assert not suspect, f"these read as two words fused at a string seam: {suspect}"
