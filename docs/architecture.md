@@ -531,10 +531,10 @@ every expression **in boolean position** naming the worker from `decorator.py`'s
 unless each one is declared with a category and a reason. Position rather than node shape is
 load-bearing — `if _worker.retired:` asks exactly what `if not _worker.retired:` asks, and a
 draft that matched on shape recognised only the second, which let a real guard through with the
-whole suite green. Two limitations are disclosed in the test rather than hidden: the subject is
-recognised by name, so a guard whose local is called `owner` is invisible until it displaces an
-existing row; and call-shaped questions (`getattr(_worker, "retired", False)`, `bool(_worker)`,
-`match`) are not recognised, none being idiomatic here. A new call site cannot be added without deciding which
+whole suite green. One limitation is disclosed in the test rather than hidden: the subject is
+recognised by **name**, so a guard whose local is called `owner` rather than `worker` is
+invisible — though rewriting an existing site that way trips the stale-row check, so the exposure
+is net-new sites only. A `match` statement is the one syntax not covered, and is not used here. A new call site cannot be added without deciding which
 question it asks. That is deliberately a *derived* roster and not a hand-written list, for the
 reason the sink rosters are (SPEC-028, SPEC-032): the completeness is the point, and a
 hand-maintained list rots.

@@ -155,38 +155,48 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
 _BOOL_ATTRS = ("retired", "draining")
 
 
-def _record(expr: ast.AST, fn: str, found: list[tuple[str, str]]) -> None:
-    """Files one boolean-position expression, without descending into it.
+def _is_boolean_expr(node: ast.AST | None) -> bool:
+    """Whether this expression is unambiguously an answer rather than an object.
 
-    Not descending matters: `worker is not None and worker.sink is sink and worker.draining` is
-    one guard, not four, and splitting it would file the same decision under rows nobody could
-    keep in step with each other.
+    `return worker` hands back the object; `return worker.retired` hands back an answer. The
+    distinction is what lets assignments and returns be searched without filing every mention.
 
     Args:
-      expr: The expression in boolean position.
-      fn: The enclosing function's name.
-      found: The accumulating list, mutated in place.
+      node: The expression, or None.
 
     Returns:
-      None.
+      Whether it reads as a boolean.
 
     Raises:
       None.
     """
-    rendered = ast.unparse(expr)
-    if any(token in rendered for token in _SENTINELS):
-        found.append((fn, rendered))
+    if isinstance(node, ast.Compare | ast.BoolOp):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr in _BOOL_ATTRS:
+        return True
+    if isinstance(node, ast.IfExp):
+        return _is_boolean_expr(node.body) or _is_boolean_expr(node.orelse)
+    return isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_live_worker"
 
 
 def _boolean_positions(node: ast.AST) -> list[ast.AST]:
     """Returns the expressions this node evaluates for truth.
 
     A bare attribute or name **is** a question when it sits here — `if _worker.retired:` asks
-    exactly what `if not _worker.retired:` asks, and a first version of this walker recognised
-    only the second because it matched on node *shape* (`Compare`/`BoolOp`/`Not`) rather than on
-    position. That let a real, natural guard into `decorator.py` with the whole suite green, and
-    the walker's own self-test encoded the gap as expected behaviour. Position is the property
-    that holds; shape is not.
+    exactly what `if not _worker.retired:` asks, and a draft that matched on node *shape* rather
+    than position recognised only the second, letting a real guard into `decorator.py` with the
+    whole suite green.
+
+    Assignments and returns are searched too, but only for expressions that read as answers
+    (:func:`_is_boolean_expr`). Hoisting a condition into a named local — `alive = _worker is not
+    None` then `if alive:` — is an ordinary refactor, and a position model that only looked at
+    `if` tests lost the site entirely.
+
+    Neither a `BoolOp` nor a `not` is decomposed into its operand. It is filed whole wherever it appears, so
+    one guard is one row; an earlier version returned the operands here, which filed a hoisted
+    conjunction as two rows while the same conjunction in an `if` was one.
 
     Args:
       node: Any AST node.
@@ -199,87 +209,118 @@ def _boolean_positions(node: ast.AST) -> list[ast.AST]:
     """
     if isinstance(node, ast.If | ast.While | ast.IfExp | ast.Assert):
         return [node.test]
-    if isinstance(node, ast.BoolOp):
-        return list(node.values)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return [node.operand]
-    if isinstance(node, ast.Return) and node.value is not None:
-        # A return is a boolean position only when the expression is unambiguously one, or reads
-        # a known boolean attribute — `return worker` hands back the object, not an answer.
-        if isinstance(node.value, ast.Compare | ast.BoolOp) or (
-            isinstance(node.value, ast.UnaryOp) and isinstance(node.value.op, ast.Not)
-        ):
-            return [node.value]
-        if isinstance(node.value, ast.Attribute) and node.value.attr in _BOOL_ATTRS:
-            return [node.value]
+    if isinstance(node, ast.comprehension):
+        return list(node.ifs)
+    if isinstance(node, ast.Lambda) and _is_boolean_expr(node.body):
+        return [node.body]
+    if isinstance(node, ast.Return | ast.Assign | ast.AnnAssign) and _is_boolean_expr(node.value):
+        return [node.value]
     return []
 
 
-def _predicates() -> list[tuple[str, str]]:
-    """Derives every worker question in `decorator.py` from its AST, in source order.
+def _own_nodes(scope: ast.AST) -> list[ast.AST]:
+    """Yields the nodes belonging to one scope, without descending into nested ones.
 
-    A question is an expression **in boolean position** that names the worker, plus any call to
-    `_live_worker`, so `worker = _live_worker()` is seen even though the assignment is not itself
-    a test. Outermost only: a `BoolOp` naming the worker is filed whole rather than per operand.
-
-    Two limitations are real and disclosed rather than papered over. The subject is recognised by
-    **name** (`_SENTINELS`), so a guard whose local is called `owner` rather than `worker` is
-    invisible — though *rewriting* an existing site that way trips the stale-row check, so the
-    exposure is net-new sites. And call-shaped questions (`getattr(_worker, "retired", False)`,
-    `bool(_worker)`, `match _worker:`) are not recognised; none is idiomatic here, and the cost
-    of chasing every shape is a walker nobody can reason about.
+    A guard inside `@trace`'s wrapper belongs to that wrapper, not also to `decorate` and
+    `trace`. A draft that used a bare `ast.walk` filed one such guard three times and would have
+    demanded three identical roster rows. `Lambda` is not descended into either — its body is
+    filed at the `Lambda` node itself, so descending would file it twice.
 
     Args:
-      None.
+      scope: The module or function node whose own nodes are wanted.
 
     Returns:
-      Every (enclosing function, unparsed expression) pair, duplicates included and ordered.
+      Every node in the scope, excluding nested function and lambda bodies.
 
     Raises:
       None.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(decorator)))
-    found: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
+    own: list[ast.AST] = []
+    stack = [scope]
+    while stack:
+        node = stack.pop()
+        own.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                own.append(child)
+                continue
+            stack.append(child)
+    return own
+
+
+def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
+    """Every worker question in a parsed module, keyed by scope, text and source ordinal.
+
+    The ordinal is assigned in **source order**, which `ast.walk` does not give: it is
+    breadth-first, so a draft that numbered in walk order handed `_swap_sink`'s two identical
+    `worker is not None` guards indices that swapped the moment either one changed nesting depth
+    — and, on the commit that introduced it, filed each site under the other's reason. Ordering
+    by `lineno` means an index only moves when the guards themselves move, which is a
+    reclassification a human should be asked about.
+
+    Module level is walked as well as functions, since a guard does not stop being one for
+    sitting outside a `def`.
+
+    One limitation is real and disclosed rather than papered over: the subject is recognised by
+    **name** (`_SENTINELS`), so a guard whose local is called `owner` rather than `worker` is
+    invisible — though *rewriting* an existing site that way trips the stale-row check, so the
+    exposure is net-new sites only. What is matched is the **position**, not the node shape, so
+    `getattr(_worker, "retired", False)` and `bool(_worker)` are both caught; `match` is the one
+    syntax not covered, and is not used in this module.
+
+    Args:
+      tree: The parsed module.
+
+    Returns:
+      Every (scope, unparsed expression, source ordinal) triple.
+
+    Raises:
+      None.
+    """
+    scopes: list[tuple[str, ast.AST]] = [("<module>", tree)]
+    scopes.extend(
+        (node.name, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    )
+
+    found: list[tuple[str, str, int]] = []
+    for name, scope in scopes:
         filed: set[int] = set()
-        for inner in ast.walk(node):
+        hits: list[tuple[int, int, str]] = []
+        for inner in _own_nodes(scope):
             if isinstance(inner, ast.Call) and getattr(inner.func, "id", None) == "_live_worker":
-                _record(inner, node.name, found)
-            for expr in _boolean_positions(inner):
+                candidates = [inner]
+            else:
+                candidates = _boolean_positions(inner)
+            for expr in candidates:
                 if id(expr) in filed:
                     continue
                 for descendant in ast.walk(expr):
                     filed.add(id(descendant))
-                _record(expr, node.name, found)
+                rendered = ast.unparse(expr)
+                if any(token in rendered for token in _SENTINELS):
+                    hits.append((getattr(expr, "lineno", 0), getattr(expr, "col_offset", 0), rendered))
+        seen: dict[str, int] = {}
+        for _, _, rendered in sorted(hits):
+            seen[rendered] = seen.get(rendered, -1) + 1
+            found.append((name, rendered, seen[rendered]))
     return found
 
 
 def _numbered() -> set[tuple[str, str, int]]:
-    """Adds an occurrence index so two textually identical guards are two rows.
-
-    `_swap_sink` holds two `worker is not None` tests that ask different questions — one decides
-    whether the orphan path relinquishes its record, the other who performs the swap — and a key
-    of (function, text) collapsed them into a single row whose reason described only the second.
-    Line numbers are deliberately not used: they rot on every edit, which is what an earlier
-    draft of the spec's own AC-1 cited and then had to correct.
+    """The roster derived from the real `decorator.py`.
 
     Args:
       None.
 
     Returns:
-      Every site as (function, expression, occurrence index within that function).
+      Every site as (scope, expression, source ordinal within that scope).
 
     Raises:
       None.
     """
-    seen: dict[tuple[str, str], int] = {}
-    numbered = set()
-    for site in _predicates():
-        seen[site] = seen.get(site, -1) + 1
-        numbered.add((*site, seen[site]))
-    return numbered
+    return set(_sites(ast.parse(textwrap.dedent(inspect.getsource(decorator)))))
 
 
 def test_every_worker_predicate_is_classified() -> None:
@@ -325,23 +366,23 @@ def test_the_roster_finds_a_verdict_carried_by_a_return_value() -> None:
 
 
 def _walk_source(source: str) -> set[str]:
-    """Runs the real walker over a fixture, so the guards below cannot drift from it."""
-    tree = ast.parse(textwrap.dedent(source))
-    found: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        filed: set[int] = set()
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Call) and getattr(inner.func, "id", None) == "_live_worker":
-                _record(inner, node.name, found)
-            for expr in _boolean_positions(inner):
-                if id(expr) in filed:
-                    continue
-                for descendant in ast.walk(expr):
-                    filed.add(id(descendant))
-                _record(expr, node.name, found)
-    return {expr for _, expr in found}
+    """Runs **the real walker** over a fixture, so these guards cannot drift from it.
+
+    A draft duplicated `_sites`' loop here and the copy immediately diverged — it filtered
+    `FunctionDef` only, so an async fixture was missed by the self-test and caught by the real
+    walker. A self-test that can certify behaviour the walker does not have is the failure mode
+    this file exists to prevent, one level up.
+
+    Args:
+      source: Python source to walk.
+
+    Returns:
+      The set of unparsed expressions the walker filed.
+
+    Raises:
+      None.
+    """
+    return {expr for _, expr, _ in _sites(ast.parse(textwrap.dedent(source)))}
 
 
 def test_the_walker_matches_every_shape_it_claims_to() -> None:
