@@ -577,13 +577,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 closer = _lifecycle.close_detached(old)
     if worker is not None:
         try:
-            adopted = worker.swap_sink(new_sink, timeout)
+            worker_holds_sink = worker.swap_sink(new_sink, timeout)
         except Exception as exc:
             _diag.absorbed(
                 "swapping the log sink", exc, "events may still be delivered to the previous sink"
             )
             return
-        if not adopted:
+        if not worker_holds_sink:
             _adopt_declined_swap(new_sink)
         return
     if closer is not None:

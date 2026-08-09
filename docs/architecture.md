@@ -502,6 +502,38 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
   into sends of ≤ 10 messages and ≤ 256 KB apiece. This keeps the worker dumb and lets each
   sink own the limits only it knows about.
 
+
+### 9.2 Four questions a guard can ask about the worker
+
+Every guard in `decorator.py` that mentions the worker is asking exactly one of four questions,
+and answering with the wrong one is this codebase's most repeated defect: three reviewers told
+SPEC-033 "ownership, not liveness", each naming a different call site, each was fixed, and a
+fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a predicate that
+would have re-broken SPEC-033 in the opposite direction.
+
+| Question | Predicate | What it decides |
+|---|---|---|
+| **Existence** | `_worker is None` | is there anything to do, or a worker to build |
+| **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing |
+| **Ownership** | `_worker.sink is X` | who **owns** a close; a retired worker still owns its sink's |
+| **Moment** | `Worker.draining` | whether this worker's `_stop` is *still* the sink's route to a cut-short backoff |
+
+Liveness and ownership diverge the instant `retired` latches — which is **entry** to
+`shutdown()`, not its completion. The moment is a third axis rather than a refinement of either:
+`_offer_orphan_signal` needs ownership **and** the moment, because ownership alone hands a set
+event to a sink still being written to (every later backoff collapses to zero) while liveness
+alone strips the drain thread of the event it is about to wait on. One question is answered by a
+**return value** rather than a predicate — `Worker.swap_sink` reports whether it adopted the
+sink, because only the worker knows whether it got as far as reassigning.
+
+The rule is enforced, not just written down: `tests/test_worker_predicate_roster.py` derives every
+boolean expression naming the worker from `decorator.py`'s AST and fails unless each one is
+declared with a category and a reason. A new call site cannot be added without deciding which
+question it asks. That is deliberately a *derived* roster and not a hand-written list, for the
+reason the sink rosters are (SPEC-028, SPEC-032): the completeness is the point, and a
+hand-maintained list rots.
+
+
 ---
 
 ## 10. Sampling (deferred)
