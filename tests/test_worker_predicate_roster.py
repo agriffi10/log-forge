@@ -13,10 +13,11 @@ completeness.
 
 import ast
 import inspect
+import io
 import itertools
 import pathlib
-import re
 import textwrap
+import tokenize
 
 # A plain import, not `importorskip`: a roster whose value is that it cannot be bypassed must
 # not skip itself when the module it walks is renamed or fails to import.
@@ -251,7 +252,9 @@ def _own_nodes(scope: ast.AST) -> list[ast.AST]:
     return own
 
 
-def _named_scopes(node: ast.AST, path: tuple[str, ...]) -> list[tuple[str, ast.AST]]:
+def _named_scopes(
+    node: ast.AST, path: tuple[str, ...], seen: dict[object, int] | None = None
+) -> list[tuple[str, ast.AST]]:
     """Every function scope under `node`, named by its **path** rather than its bare name.
 
     Two same-named nested functions — `decorate._inner` under two different decorators — are two
@@ -261,6 +264,9 @@ def _named_scopes(node: ast.AST, path: tuple[str, ...]) -> list[tuple[str, ast.A
     Args:
       node: The node to search.
       path: The enclosing scope names.
+      seen: The name counter, threaded through the whole walk so two same-named functions
+        collide even when they are not siblings of one node — a `try:`/`except ImportError:`
+        fallback pair being the ordinary shape a per-call counter missed.
 
     Returns:
       (dotted path, scope node) for every function beneath `node`.
@@ -269,20 +275,21 @@ def _named_scopes(node: ast.AST, path: tuple[str, ...]) -> list[tuple[str, ast.A
       None.
     """
     scopes: list[tuple[str, ast.AST]] = []
-    used: dict[str, int] = {}
+    used = {} if seen is None else seen
     for child in ast.iter_child_nodes(node):
         if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            used[child.name] = used.get(child.name, -1) + 1
+            key = (path, child.name)
+            used[key] = used.get(key, -1) + 1
             # A same-named sibling — two `def f()` in the arms of an `if`, or two classes with
             # the same method — is a second scope, and a bare name would collapse both onto one
             # roster row: the defect the occurrence index exists to prevent, one level up.
-            suffix = "" if used[child.name] == 0 else f"#{used[child.name]}"
+            suffix = "" if used[key] == 0 else f"#{used[key]}"
             here = (*path, f"{child.name}{suffix}")
             if not isinstance(child, ast.ClassDef):
                 scopes.append((".".join(here), child))
-            scopes.extend(_named_scopes(child, here))
+            scopes.extend(_named_scopes(child, here, used))
         else:
-            scopes.extend(_named_scopes(child, path))
+            scopes.extend(_named_scopes(child, path, used))
     return scopes
 
 
@@ -323,9 +330,8 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
        at statement level is caught.
 
     Each is a scope decision rather than an oversight: the alternative is following every value
-    an arbitrary expression could carry, which is a walker nobody can reason about — and the
-    roster's failure mode is a *missed* site, which the next audit finds, not a wrong one.
-    `match` is likewise uncovered and unused here.
+    an arbitrary expression could carry, which is a walker nobody can reason about. `match` is
+    likewise uncovered and unused here.
 
     Args:
       tree: The parsed module.
@@ -528,30 +534,40 @@ def test_no_reason_fuses_words_at_a_string_seam() -> None:
     for node in ast.walk(roster):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
-        siblings = _concatenated_with(roster, node)
+        siblings = _literal_parts(node)
         for left, right in itertools.pairwise(siblings):
             if not left.endswith((" ", "\n")) and not right.startswith((" ", "\n")):
                 fused.append(f"...{left[-24:]}|{right[:24]}...")
     assert not fused, "these string seams fuse two words together:\n  " + "\n  ".join(fused)
 
 
-def _concatenated_with(root: ast.AST, node: ast.Constant) -> list[str]:
-    """Returns the run of implicitly concatenated parts `node` belongs to, once.
+def _literal_parts(node: ast.Constant) -> list[str]:
+    """Returns the **decoded** parts of an implicitly concatenated literal, in order.
 
-    Python folds adjacent literals before the AST exists, so the parts are recovered from the
-    source segment rather than from sibling nodes.
+    Tokenized rather than pattern-matched. A quote regex saw only double-quoted parts, so a
+    reason written with single quotes, mixed quotes or an f-string was skipped with no signal —
+    and `ruff format` is deliberately not run here and the `Q` rules are not selected, so nothing
+    else would have caught it. It also compared *source* text, where a trailing `\n` escape reads
+    as two characters and a triple-quoted part yields spurious empty pieces; decoding first makes
+    the whitespace test mean what the docstring says it means.
 
     Args:
-      root: The subtree being searched.
-      node: The constant whose run is wanted.
+      node: The string constant whose concatenation run is wanted.
 
     Returns:
-      The literal parts in order, or an empty list when this is not a multi-part literal.
+      The decoded parts, or an empty list when the literal has only one part.
 
     Raises:
       None.
     """
-    del root
     segment = ast.get_source_segment(_SOURCE, node) or ""
-    parts = re.findall(r'"((?:[^"\\]|\\.)*)"', segment)
+    readline = io.StringIO(f"({segment})").readline
+    try:
+        parts: list[str] = [
+            ast.literal_eval(token.string)
+            for token in tokenize.generate_tokens(readline)
+            if token.type == tokenize.STRING
+        ]
+    except (tokenize.TokenError, SyntaxError, ValueError):  # pragma: no cover - malformed source
+        return []
     return parts if len(parts) > 1 else []
