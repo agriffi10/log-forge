@@ -1021,12 +1021,18 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
 
     shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
     shutting_down.start()
+
+    def parent_ready() -> bool:
+        # `retired` latches before `_stop` is set, so polling on `retired` alone and asserting
+        # the signal afterwards has a window between the two where the precondition is false.
+        signal = sink.log_foundry_stop_signal
+        return worker.retired and signal is not None and signal.is_set()
+
     deadline = time.monotonic() + 5.0
-    while not worker.retired and time.monotonic() < deadline:
+    while not parent_ready() and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
-    assert sink.log_foundry_stop_signal is not None
-    assert sink.log_foundry_stop_signal.is_set(), "the parent's signal must be set to prove this"
+    assert parent_ready(), "the parent's signal must be set to prove this"
+    assert worker.draining, "the fork must land while the shutdown is joining"
 
     def report() -> str:
         log_foundry.info("an orphan log in a retired child")
@@ -1229,6 +1235,79 @@ def test_registering_the_same_handler_twice_is_a_no_op() -> None:
         assert _fork._child_handlers.count(fresh) == 1
     finally:
         _fork._child_handlers.remove(fresh)
+
+
+def test_a_registered_object_that_refuses_comparison_does_not_raise() -> None:
+    """The dedupe compares by **identity**, and only a hostile ``__eq__`` can show it.
+
+    ``list.__contains__`` short-circuits on identity, so registering plain functions cannot
+    distinguish ``in`` from ``any(h is fn)`` — the test above passes against either, which is
+    how the identity refinement shipped with a commit message claiming it was mutation-killed.
+    A registry compares objects it does not own, and ``in`` asks their ``__eq__``: here that
+    raises out of a function documented to raise nothing.
+    """
+
+    class _Hostile:
+        def __eq__(self, other: object) -> bool:
+            raise ValueError("its __eq__ is not this registry's to trust")
+
+        def __hash__(self) -> int:
+            return 1
+
+        def __call__(self) -> None:
+            pass
+
+    def plain() -> None:
+        pass
+
+    hostile = _Hostile()
+    _fork.register_child_handler(hostile)
+    try:
+        _fork.register_child_handler(plain)
+        assert sum(1 for handler in _fork._child_handlers if handler is plain) == 1
+    finally:
+        # `remove` would ask `__eq__` too, which is the very thing under test.
+        _fork._child_handlers[:] = [
+            handler
+            for handler in _fork._child_handlers
+            if handler is not hostile and handler is not plain
+        ]
+
+
+def test_a_child_that_cannot_start_a_thread_reports_it_rather_than_raising(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A rebuild that cannot get a thread must leave a worker a later ``shutdown()`` survives.
+
+    ``__init__`` never had to consider this: a constructor whose ``start`` raises lets no
+    ``Worker`` escape. Here the worker is already the process's, so assigning the unstarted
+    ``Thread`` first would leave it reading ``draining`` forever and hand the next
+    ``shutdown()`` a ``RuntimeError`` from ``join`` — out of a public call documented to raise
+    nothing, and through ``atexit``, where CPython prints the message arch §6 keeps out of
+    anything the library says about itself.
+    """
+    sink = FileSink(str(tmp_path / "nothreads.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    original_start = threading.Thread.start
+
+    def refusing(self: threading.Thread) -> None:
+        raise RuntimeError("no threads left")
+
+    def report() -> str:
+        health = log_foundry.health()
+        log_foundry.shutdown(timeout=5.0)
+        return f"{health.stopped_reason},{decorator._worker.draining}"
+
+    threading.Thread.start = refusing  # type: ignore[method-assign]
+    try:
+        child = run_in_child(report, timeout=6)
+    finally:
+        threading.Thread.start = original_start  # type: ignore[method-assign]
+
+    assert child.finished, f"the child's shutdown raised: {child.output!r}"
+    assert child.output == "RuntimeError,False", child.output
 
 
 def test_the_worker_rebuild_is_registered_rather_than_reached_for() -> None:

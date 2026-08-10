@@ -286,6 +286,15 @@ class Worker:
         boundary, so it would keep pointing at the pre-fork event while this worker sets a new
         one — SPEC-027's guarantee broken by the repair meant to preserve it.
 
+        **The new thread is only installed once it has started**, which ``__init__`` never had
+        to consider: a constructor whose ``start`` raises lets no ``Worker`` escape, while here
+        the worker is already the process's. Assigning first would leave an unstarted ``Thread``
+        on a live worker reading ``draining`` forever, and the next ``shutdown()`` would take a
+        ``RuntimeError`` from ``join`` straight out of a public call documented to raise nothing.
+        The inherited thread object is kept instead, which is safe because CPython repairs it
+        across the fork — it reports dead and joins instantly — and the failure is recorded as a
+        ``stopped_reason``, which is exactly SPEC-019's vocabulary for "nothing is delivering".
+
         Args:
           resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
             a retired child (AC-4): a fork does not undo a ``shutdown()``, and reviving a worker
@@ -310,8 +319,16 @@ class Worker:
         self._drain_finished.clear()
         self._drain_settled.clear()
         self._offer_stop_signal()
-        self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
+        try:
+            thread.start()
+        except Exception as exc:
+            self.stopped_reason = type(exc).__name__
+            self._drain_finished.set()
+            self._drain_settled.set()
+            _diag.absorbed("starting this child's drain thread", exc, "it will deliver nothing")
+            return
+        self._thread = thread
 
     def _offer_stop_signal(self) -> None:
         """Gives the sink this worker's shutdown event, if it advertises somewhere to put it.
