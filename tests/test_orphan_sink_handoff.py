@@ -20,7 +20,7 @@ class CountingSink:
         self.held: list[dict] = []
         self.delivered: list[dict] = []
         self.closed = 0
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict]) -> None:
         self.held.extend(batch)
@@ -567,8 +567,8 @@ def test_an_orphan_emit_gives_the_sink_a_stop_signal() -> None:
 
     log_foundry.info("to it")
 
-    assert isinstance(sink.stop_signal, threading.Event)
-    assert not sink.stop_signal.is_set()
+    assert isinstance(sink.log_foundry_stop_signal, threading.Event)
+    assert not sink.log_foundry_stop_signal.is_set()
 
 
 def test_shutdown_sets_the_orphan_stop_signal() -> None:
@@ -577,7 +577,7 @@ def test_shutdown_sets_the_orphan_stop_signal() -> None:
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("to it")
-    signal = sink.stop_signal
+    signal = sink.log_foundry_stop_signal
     assert signal is not None
 
     threading.Timer(0.1, log_foundry.shutdown).start()
@@ -606,7 +606,7 @@ def test_a_sink_without_the_attribute_is_unaffected() -> None:
 
     log_foundry.info("to it")
 
-    assert not hasattr(sink, "stop_signal"), "nothing was invented on it"
+    assert not hasattr(sink, "log_foundry_stop_signal"), "nothing was invented on it"
     assert len(sink.held) == 1, "and the emit went through"
 
 
@@ -614,13 +614,13 @@ def test_a_sink_that_rejects_the_signal_loses_interruptibility_not_the_emit(caps
     """AC-3's error path, matching `Worker._offer_stop_signal`."""
 
     class Hostile:
-        """A read-only ``stop_signal`` — the case `Worker._offer_stop_signal` also absorbs."""
+        """A read-only ``log_foundry_stop_signal`` — the case `Worker._offer_stop_signal` also absorbs."""
 
         def __init__(self) -> None:
             self.held: list[dict] = []
 
         @property
-        def stop_signal(self):
+        def log_foundry_stop_signal(self):
             return None
 
         def emit(self, batch: list[dict]) -> None:
@@ -653,7 +653,7 @@ def test_the_worker_keeps_its_own_signal_on_the_sink_it_owns() -> None:
 
     log_foundry.info("an orphan emit against the sink the worker owns")
 
-    assert sink.stop_signal is worker._stop, "the worker's event, not the orphan path's"
+    assert sink.log_foundry_stop_signal is worker._stop, "the worker's event, not the orphan path's"
 
 
 def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
@@ -672,8 +672,8 @@ def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
 
     worker = decorator._worker
     assert worker is not None and worker.sink is old, "the retired worker never swapped"
-    assert isinstance(new.stop_signal, threading.Event), "yet the live sink has a signal"
-    assert not new.stop_signal.is_set(), "and an unset one"
+    assert isinstance(new.log_foundry_stop_signal, threading.Event), "yet the live sink has a signal"
+    assert not new.log_foundry_stop_signal.is_set(), "and an unset one"
 
 
 def test_a_sink_emitted_to_after_shutdown_still_backs_off() -> None:
@@ -695,7 +695,7 @@ def test_a_sink_emitted_to_after_shutdown_still_backs_off() -> None:
     log_foundry.info("newly configured sink, after shutdown")
 
     for label, sink in (("the same sink", same), ("a newly configured sink", fresh)):
-        signal = sink.stop_signal
+        signal = sink.log_foundry_stop_signal
         assert isinstance(signal, threading.Event), f"{label} has a signal"
         assert not signal.is_set(), f"{label}'s signal is unset"
         start = time.monotonic()
@@ -711,7 +711,7 @@ def test_the_swapped_in_sink_is_offered_a_signal_without_waiting_for_an_emit() -
 
     log_foundry.configure(sink=new)
 
-    assert isinstance(new.stop_signal, threading.Event)
+    assert isinstance(new.log_foundry_stop_signal, threading.Event)
 
 
 # -- FR-006: incomplete_swaps keeps its worker-only meaning ----------------------------------
@@ -814,7 +814,7 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
 
     log_foundry.info("still logging, against the sink the retired worker holds")
 
-    signal = sink.stop_signal
+    signal = sink.log_foundry_stop_signal
     assert signal is not None and not signal.is_set(), "a fresh, unset event"
     start = time.monotonic()
     retry.wait(0.3, signal)

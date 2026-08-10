@@ -695,8 +695,7 @@ loss-reporting apparatus is built on them:
 - **Raise when you delivered none of the batch**, after your own retries are spent. That is the
   signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
   a retry cannot duplicate anything: nothing landed downstream. Raise `SinkDeliveryError` (from
-  `log_foundry.sinks.base`) or any exception of your own — the contract is that *something*
-  propagates.
+  `log_foundry`) or any exception of your own — the contract is that *something* propagates.
 - **Do not raise when you delivered some of it.** The worker retries whole batches, so raising on a
   partial success re-delivers the records that already arrived, and duplicates downstream are worse
   than a counted loss.
@@ -720,7 +719,7 @@ separate from the transport one so a poll never waits on an in-flight send:
 
 ```python
 import threading
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry import SinkDeliveryError, SinkLosses
 
 class MySink:
     def __init__(self) -> None:
@@ -728,6 +727,7 @@ class MySink:
         self._closed = False
         self._lock = threading.Lock()          # transport state
         self._counter_lock = threading.Lock()  # counters only, never held across I/O
+        self.log_foundry_stop_signal: threading.Event | None = None  # optional; see below
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         if not batch:
@@ -762,6 +762,26 @@ class MySink:
 `losses()` is optional and probed by name, so a sink written before it existed keeps working and
 simply contributes nothing to `health().sink`. `emit([])` must be a no-op: an empty batch has not
 failed to deliver.
+
+`log_foundry_stop_signal` is optional in the same way, and is an attribute rather than a method.
+Declare it as a plain `threading.Event | None` initialised to `None` and the library assigns the
+worker's shutdown event to it; leave it out and you are simply never offered one. **Honour it in
+your retry backoff** — pass it to `Event.wait(timeout)` instead of calling `time.sleep`:
+
+```python
+        if self.log_foundry_stop_signal is not None:
+            self.log_foundry_stop_signal.wait(delay)   # returns early when shutdown starts
+        else:
+            time.sleep(delay)
+```
+
+There is one drain thread, so your backoff pauses *all* log delivery, and it is held across
+`shutdown()` — which joins that thread. A sink that sleeps through a 30-second backoff holds
+process exit for 30 seconds. The name is prefixed because the library assigns this attribute onto
+an object it does not own: a bare `stop_signal` would silently overwrite one you already had.
+
+If you write a **wrapper** sink, forward it to whatever actually holds the retry loop. Set on the
+wrapper and stopped there, the signal reaches nothing.
 
 ### Flushing and shutdown
 

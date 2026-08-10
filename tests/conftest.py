@@ -70,17 +70,25 @@ def _reset_config():
     ``log_foundry.config._config`` is a process-wide singleton mutated by ``configure()``;
     without this, tests would leak identity/sink/defaults into one another and only pass by
     ordering. No-ops until the module exists.
+
+    It also clears the ``contextvars`` state, which is a *different* singleton and was leaking
+    the same way. Baggage set with no span open is a process-level default and nothing releases
+    it (SPEC-024, arch §5.1) — so one test's ``set_baggage`` reached later tests' events, and
+    two `test_trace_continuation` cases failed only when run after a new file that set baggage,
+    passing in isolation. That is SPEC-024's own finding, reproduced between two tests.
     """
     try:
-        from log_foundry import config
+        from log_foundry import config, context
     except ImportError:
         yield
         return
     config._config = config.Config()
+    context.reset_context()
     _reset_worker()
     yield
     # Tear down any process worker a test created so its daemon thread / sink don't leak.
     _reset_worker()
+    context.reset_context()
 
 
 def _reset_worker() -> None:

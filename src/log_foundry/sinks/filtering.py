@@ -105,7 +105,7 @@ class FilteringSink:
         return True
 
     @property
-    def stop_signal(self) -> threading.Event | None:
+    def log_foundry_stop_signal(self) -> threading.Event | None:
         """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
 
         The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
@@ -124,8 +124,8 @@ class FilteringSink:
         """
         return self._stop_signal
 
-    @stop_signal.setter
-    def stop_signal(self, signal: threading.Event | None) -> None:
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
         """Forwards the stop signal to the inner sink.
 
         Args:
@@ -139,7 +139,7 @@ class FilteringSink:
         """
         self._stop_signal = signal
         try:
-            self._inner.stop_signal = signal  # type: ignore[attr-defined]
+            self._inner.log_foundry_stop_signal = signal  # type: ignore[attr-defined]
         except Exception as err:
             _diag.absorbed(
                 "handing the inner sink its stop signal",

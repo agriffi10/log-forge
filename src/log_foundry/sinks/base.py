@@ -58,6 +58,24 @@ class Sink(Protocol):
     sink written against the pre-SPEC-026 interface satisfying this one. :func:`read_losses` is
     the probe.
 
+    A fourth is optional in the same way and is an attribute rather than a method:
+    ``log_foundry_stop_signal``. A sink that defines it — a plain
+    ``threading.Event | None``, initialised to ``None`` — is handed the worker's shutdown event
+    whenever the library takes ownership of it, and a sink that does not is simply never
+    offered one. **Honouring it is how a retrying sink stays interruptible** (SPEC-027): the
+    worker owns a single drain thread, so a sink's backoff is a global pause on log delivery
+    held across ``shutdown()``, which joins that thread. Pass it to ``sinks/_retry.wait`` — or
+    wait on it directly — rather than calling ``time.sleep``, or a shutdown cannot cut the
+    wait short and a slow destination holds process exit for the length of its own backoff.
+    A **wrapper** sink must forward it to whatever actually holds the retry loop; set on a
+    wrapper and stopped there, the signal reaches nothing.
+
+    The name is namespaced deliberately (SPEC-034 FR-006). The library assigns this attribute
+    onto an object it does not own, by ``hasattr`` probe, so a bare ``stop_signal`` — which is
+    what shipped before 1.0 — silently overwrote any attribute of that name a third-party sink
+    already used, with a ``threading.Event``. Reproduced. A prefixed name cannot collide by
+    accident, and the cost is one verbose attribute on the sinks that want interruptibility.
+
     "Safe to call during an emit" is a concurrency requirement once :meth:`emit` is (SPEC-028
     FR-003). The shipped sinks keep their loss counters under a **dedicated** lock, separate
     from whatever guards their transport: an increment is a read-modify-write that Python does

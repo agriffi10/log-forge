@@ -4,15 +4,16 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
 from log_foundry.api import critical, debug, error, info, set_baggage, warning
-from log_foundry.config import configure, get_config
+from log_foundry.config import Config, configure, get_config
 from log_foundry.context import (
     current_baggage_header,
     current_trace_context,
     current_traceparent,
+    get_baggage,
     reset_context,
 )
 from log_foundry.decorator import continue_trace, trace
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health
 
 try:
@@ -156,7 +157,9 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
 
 __all__ = [
     "DEFAULT_SHUTDOWN_TIMEOUT",
+    "Config",
     "Health",
+    "Sink",
     "SinkDeliveryError",
     "SinkLosses",
     "__version__",
@@ -169,9 +172,11 @@ __all__ = [
     "debug",
     "error",
     "flush",
+    "get_baggage",
     "get_config",
     "health",
     "info",
+    "read_losses",
     "reset_context",
     "set_baggage",
     "shutdown",

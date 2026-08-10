@@ -853,7 +853,7 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
         guard.
     """
     span.events.append(end_event(span, status, exc))
-    backfill_baggage(span, context.get_baggage())
+    backfill_baggage(span, context._live_baggage())
     _flush(span)
 
 

@@ -48,7 +48,7 @@ class SentrySink:
         dsn: str | None = None,
         *,
         min_level: str = "ERROR",
-        sdk: Any = None,
+        client: Any = None,
         opener: Any = None,
         max_retries: int = 3,
     ) -> None:
@@ -58,7 +58,7 @@ class SentrySink:
           dsn: The Sentry DSN. It is required for the fallback, which needs it to know where to
             POST.
           min_level: The lowest level worth sending.
-          sdk: A ``sentry_sdk``-shaped object to use instead of importing one.
+          client: A ``sentry_sdk``-shaped object to use instead of importing one.
           opener: A ``urlopen``-shaped callable for the fallback, for tests.
           max_retries: Retries the fallback's HTTP transport makes.
 
@@ -74,10 +74,10 @@ class SentrySink:
         self.skipped = 0
         self.transport_errors = 0
         self._counter_lock = threading.Lock()
-        self._sdk = sdk if sdk is not None else _import_sdk()
+        self.client = client if client is not None else _import_sdk()
         self._http: HTTPSink | None = None
         self._auth_header = ""
-        if self._sdk is None:
+        if self.client is None:
             if dsn is None:
                 raise ValueError(
                     "SentrySink without sentry-sdk requires a dsn for the HTTP-envelope fallback"
@@ -143,7 +143,7 @@ class SentrySink:
             self._http.close()
 
     @property
-    def stop_signal(self) -> threading.Event | None:
+    def log_foundry_stop_signal(self) -> threading.Event | None:
         """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
 
         The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
@@ -162,8 +162,8 @@ class SentrySink:
         """
         return self._stop_signal
 
-    @stop_signal.setter
-    def stop_signal(self, signal: threading.Event | None) -> None:
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
         """Forwards the stop signal to the HTTP fallback, which is what waits.
 
         Args:
@@ -177,7 +177,7 @@ class SentrySink:
         """
         self._stop_signal = signal
         if self._http is not None:
-            self._http.stop_signal = signal
+            self._http.log_foundry_stop_signal = signal
 
     @property
     def failed(self) -> int:
@@ -236,8 +236,8 @@ class SentrySink:
             Only the exception type is ever written (arch §6).
         """
         try:
-            if self._sdk is not None:
-                self._sdk.capture_event(self._sentry_event(event))
+            if self.client is not None:
+                self.client.capture_event(self._sentry_event(event))
             else:
                 self._post_envelope(event)
         except SinkDeliveryError:

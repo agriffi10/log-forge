@@ -72,7 +72,7 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
       None. A logging call must never hand the application an exception from a destination
         it never chose to talk to; absorbed faults are reported through ``_diag``.
     """
-    baggage = context.get_baggage()
+    baggage = context._live_baggage()
     span = context.current_span()
     event: dict[str, object] | None = None
     if span is not None:

@@ -130,7 +130,7 @@ class LogstashSink:
             self._socket.close()
 
     @property
-    def stop_signal(self) -> threading.Event | None:
+    def log_foundry_stop_signal(self) -> threading.Event | None:
         """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
 
         The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
@@ -149,8 +149,8 @@ class LogstashSink:
         """
         return self._stop_signal
 
-    @stop_signal.setter
-    def stop_signal(self, signal: threading.Event | None) -> None:
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
         """Forwards the stop signal to the active backend.
 
         Args:
@@ -164,9 +164,9 @@ class LogstashSink:
         """
         self._stop_signal = signal
         if self._http is not None:
-            self._http.stop_signal = signal
+            self._http.log_foundry_stop_signal = signal
         elif self._socket is not None:
-            self._socket.stop_signal = signal
+            self._socket.log_foundry_stop_signal = signal
 
     @property
     def failed(self) -> int:

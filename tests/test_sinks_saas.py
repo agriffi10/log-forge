@@ -109,8 +109,8 @@ class FakeSentrySDK:
 
 
 def test_sentry_sdk_path_with_level_gating() -> None:
-    sdk = FakeSentrySDK()
-    sink = SentrySink(sdk=sdk, min_level="ERROR")
+    fake = FakeSentrySDK()
+    sink = SentrySink(client=fake, min_level="ERROR")
     assert isinstance(sink, Sink)
     sink.emit(
         [
@@ -121,15 +121,15 @@ def test_sentry_sdk_path_with_level_gating() -> None:
     )
     assert sink.sent == 2
     assert sink.skipped == 1
-    assert [e["level"] for e in sdk.events] == ["error", "fatal"]
-    assert sdk.events[0]["extra"]["message"] == "boom"
+    assert [e["level"] for e in fake.events] == ["error", "fatal"]
+    assert fake.events[0]["extra"]["message"] == "boom"
 
 
 def test_sentry_http_envelope_fallback_when_sdk_absent(monkeypatch) -> None:
     monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
     opener = FakeOpener()
     sink = SentrySink(dsn="https://pubkey@o123.ingest.sentry.io/456", opener=opener)
-    assert sink._sdk is None
+    assert sink.client is None
     sink.emit([{"level": "ERROR", "message": "boom"}, {"level": "DEBUG", "message": "skip"}])
     assert sink.sent == 1
     assert sink.skipped == 1

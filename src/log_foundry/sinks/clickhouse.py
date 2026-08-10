@@ -83,7 +83,7 @@ class ClickHouseSink:
         self._table = valid_identifier(table)
         self._chunk_size = chunk_size
         self.max_retries = max(max_retries, 0)
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False
         self._lock = threading.Lock()
@@ -198,7 +198,7 @@ class ClickHouseSink:
                 return 1
             except Exception as err:
                 if attempt < self.max_retries:
-                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
                     self.failed += len(rows)

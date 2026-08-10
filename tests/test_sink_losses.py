@@ -501,12 +501,12 @@ def test_sentry_transport_errors_are_isolated_per_event() -> None:
             if self.calls == 1:
                 raise RuntimeError("transport down")
 
-    sdk = FlakySDK()
-    sink = SentrySink(sdk=sdk)
+    flaky = FlakySDK()
+    sink = SentrySink(client=flaky)
 
     sink.emit([{"level": "ERROR"}, {"level": "ERROR"}])  # the second lands: must not raise
 
-    assert (sdk.calls, sink.sent, sink.transport_errors) == (2, 1, 1)
+    assert (flaky.calls, sink.sent, sink.transport_errors) == (2, 1, 1)
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
 
 
@@ -518,7 +518,7 @@ def test_sentry_sdk_raises_when_every_capture_failed() -> None:
             raise RuntimeError("transport down")
 
     with pytest.raises(SinkDeliveryError):
-        SentrySink(sdk=DeadSDK()).emit([{"level": "ERROR"}, {"level": "ERROR"}])
+        SentrySink(client=DeadSDK()).emit([{"level": "ERROR"}, {"level": "ERROR"}])
 
 
 def _bulk(*errors: bool) -> bytes:
