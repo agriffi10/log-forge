@@ -305,7 +305,8 @@ def process_payment(user_id: int) -> str:
 
 - **`set_baggage(**kv)`** — attach trace-scoped context that is merged into the `fields` of
   every subsequent event in the same execution flow. Precedence, lowest to highest: config
-  `defaults` → span `defaults` → baggage → per-call `fields`. **Trace-scoped means it ends
+  `defaults` → span `defaults` → baggage → per-call fields (`fields=` first, then `**kwargs`
+  over it). **Trace-scoped means it ends
   with the trace:** when the outermost `@trace` call returns *or raises*, the baggage in effect
   before it is restored, so one request's keys do not reach the next request's events. Nested
   calls do not reset — baggage set three calls deep stays visible to its parent and to the

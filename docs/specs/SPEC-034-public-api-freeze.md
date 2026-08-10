@@ -267,6 +267,21 @@ this belongs here.
   puts a field called `fields` in the event. AC-1 named only `echo`, `message` and a
   non-identifier; `fields` is added to it. That self-hosting property is what makes reserving
   anything tolerable — every reserved name has exactly one route through.
+- **The merge runs *before* `api._log`, so it is outside that function's orphan guard**, and an
+  unguarded `{**fields, **kv}` therefore raised a `TypeError` into the application on all four
+  entry paths — including the orphan one, where SPEC-025's promise holds and
+  `tests/test_promises.py` does not xfail it. Inside a span the decorator then recorded
+  `status=error` with an `error.type` the caller never raised: the SPEC-025 shape verbatim, in a
+  new place, and a regression on `info("m", **payload)` where a dynamic payload carries a
+  `fields` key. It was also asymmetric in a way neither reading defends — `fields=[]` silently
+  ignored, `fields=["x"]` fatal. The library coerces rather than validates (SPEC-017), so the
+  merge absorbs and announces by type. Found by review; the promise matrix carries the case now.
+- **`dict[str, object]` is invariant, so the annotation rejected the callers it was for.**
+  `mypy --strict` refused `dict[str, str]` — a headers dict, a counter map — and refused
+  `Mapping[str, object]`, which is the natural type for "a mapping built somewhere else", the
+  exact use the docstring cites. The parameter is `Mapping[str, object] | None`; runtime already
+  accepted any mapping, so widening cost nothing. This one freezes at 1.0, which is why it is
+  here rather than noted.
 
 #### Acceptance Criteria:
 

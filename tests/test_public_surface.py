@@ -20,6 +20,7 @@ import time
 import pytest
 
 log_foundry = pytest.importorskip("log_foundry")
+api = pytest.importorskip("log_foundry.api")
 config = pytest.importorskip("log_foundry.config")
 model = pytest.importorskip("log_foundry.model")
 
@@ -30,6 +31,10 @@ _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
 # a name alone -- `stream` is a positional *transport* in StdoutSink and a positional
 # *destination* in RedisStreamsSink -- so a syntactic rule would have to guess, and this does not.
 _INJECTED = ("client", "sdk", "producer", "connection", "opener")
+
+# Public functions in `api.py` that are deliberately not emitters. A name here is a decision;
+# anything else public in that module must satisfy the emitter contract.
+_NOT_EMITTERS = frozenset({"set_baggage"})
 
 
 class _Recorder:
@@ -749,9 +754,14 @@ def _emitters() -> list[str]:
 
     AC-6 asks that the treatment reach all five "derived rather than hand-applied". The five
     functions stay hand-written — the repo's docstring convention wants each one readable, and
-    metaprogramming them would trade that for nothing — so what is derived is the *check*: any
-    module-level public function that routes through `_log` must conform, and a sixth emitter
-    fails this until it does.
+    metaprogramming them would trade that for nothing — so what is derived is the *check*.
+
+    It is a **classification, not a search**. A first version looked for a literal `_log(...)`
+    call in the body, which a sixth emitter delegating to `error(...)` does not have: added with
+    the old `**fields` signature and exported, it was invisible to the roster, and because the
+    roster test pins the set to exactly five it passed too. Every public function in this module
+    is now either an emitter or on `_NOT_EMITTERS`, so a new one of any shape fails until someone
+    decides which it is — the roster-completeness lesson SPEC-032 and SPEC-035 both paid for.
 
     Args:
       None.
@@ -767,11 +777,9 @@ def _emitters() -> list[str]:
     for node in ast.parse(source).body:
         if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
             continue
-        if any(
-            isinstance(inner, ast.Call) and getattr(inner.func, "id", None) == "_log"
-            for inner in ast.walk(node)
-        ):
-            found.append(node.name)
+        if node.name in _NOT_EMITTERS:
+            continue
+        found.append(node.name)
     return found
 
 
@@ -787,6 +795,9 @@ def test_every_emitter_takes_the_escape_hatch(name: str) -> None:
     assert params["fields"].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert params["fields"].default is None, name
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()), name
+    # AC-4 per emitter, not on `info` alone: flipping one default to True made every
+    # `lf.critical()` spew to stderr, with the whole suite green.
+    assert params["echo"].default is False, name
 
 
 @pytest.mark.parametrize("name", _emitters())
@@ -868,3 +879,28 @@ def test_the_callers_fields_mapping_is_not_mutated() -> None:
 
     assert shared == {"base": 1}, "the caller's mapping was mutated"
     assert recorder.events[-1]["fields"] == {"base": 1}
+    # Contents alone let `if not kv: return fields` through -- the caller's live object, handed
+    # onward. Latent today because build_event copies, but the docstring promises it outright.
+    assert api._merge(shared, {}) is not shared
+
+
+@pytest.mark.parametrize("name", _emitters())
+def test_every_emitter_documents_the_escape_hatch_and_its_precedence(name: str) -> None:
+    """FR-004 AC-3's second half and AC-5, which had no test.
+
+    AC-3 says "the docstring says which wins" and AC-5 says the reserved names are "documented as
+    reserved" — and replacing all five `fields:` entries with `fields: Some fields.` left the
+    whole suite green. A criterion about documentation needs a check on the documentation; the
+    repo already lints prose this way in `test_diag.py` and `test_sink_concurrency.py`.
+    """
+    doc = inspect.getdoc(getattr(log_foundry, name)) or ""
+    assert "fields:" in doc, f"{name} does not document the fields= parameter"
+    assert "reserved" in doc.lower(), f"{name} does not say the names are reserved"
+    assert "**kv" in doc or "keyword" in doc.lower(), f"{name} does not state the precedence"
+
+
+def test_the_readme_documents_the_reserved_names() -> None:
+    """AC-5's other half. The escape hatch is useless to someone who does not know it exists."""
+    readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "`fields={...}`" in readme, "the README does not introduce the escape hatch"
+    assert "**reserved**" in readme, "the README does not say the names are reserved"
