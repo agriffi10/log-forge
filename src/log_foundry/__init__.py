@@ -13,6 +13,7 @@ from log_foundry.context import (
     reset_context,
 )
 from log_foundry.decorator import continue_trace, trace
+from log_foundry.results import ContinueResult, FlushResult
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health
 
@@ -22,7 +23,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 
-def flush(timeout: float | None = 5.0) -> bool:
+def flush(timeout: float | None = 5.0) -> FlushResult:
     """Drains buffered events through the sink without closing it.
 
     This is the drain for a process that is frozen rather than exited — an AWS Lambda handler
@@ -37,10 +38,12 @@ def flush(timeout: float | None = 5.0) -> bool:
         "the invocation timed out".
 
     Returns:
-      True when the events submitted before this call reached the sink. False if the drain did
-      not complete within the timeout, if the worker has already been shut down or has died, or
-      if a batch was abandoned while this call was outstanding (SPEC-021 FR-001) — so True means
-      the events were delivered, not merely that a drain took place. Events submitted
+      A :class:`FlushResult`. Truthy when the events submitted before this call reached the
+      sink — so a truthy result means they were delivered, not merely that a drain took place.
+      Falsy carries a ``reason`` naming which outcome occurred: ``"timed-out"``, ``"retired"``,
+      ``"thread-died"``, ``"queue-full"`` or ``"abandoned"``. It is falsy rather than ``False``:
+      ``if flush():`` is unchanged, but ``flush() is True`` can no longer hold, which is why the
+      type had to change before ``1.0.0`` rather than after (SPEC-034 FR-007). Events submitted
       concurrently by another thread may or may not be included, since the caller cannot have
       meant those, and a batch lost before the call belongs to :func:`health`.
 
@@ -158,6 +161,8 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
 __all__ = [
     "DEFAULT_SHUTDOWN_TIMEOUT",
     "Config",
+    "ContinueResult",
+    "FlushResult",
     "Health",
     "Sink",
     "SinkDeliveryError",

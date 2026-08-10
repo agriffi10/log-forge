@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.results import FlushResult
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -465,7 +466,7 @@ class Worker:
 
         return read_losses(self.sink)
 
-    def flush(self, timeout: float | None = 5.0) -> bool:
+    def flush(self, timeout: float | None = 5.0) -> FlushResult:
         """Drains everything submitted before this call through the sink, without stopping.
 
         The precise claim is that nothing was abandoned while this call was outstanding: the
@@ -503,32 +504,39 @@ class Worker:
             wait, so the two cannot add up to twice the timeout. ``None`` waits indefinitely.
 
         Returns:
-          True once the worker has delivered them. False on timeout, on a worker already shut
-          down or dead, on a queue too full to accept the marker, and when the drain carrying
-          those events was abandoned after exhausting retries (SPEC-021 FR-001). That last
-          case used to return True, a false success exactly where ``flush()`` matters most.
+          A :class:`FlushResult`, truthy once the worker has delivered them and otherwise
+          falsy with a ``reason``: ``"timed-out"``, ``"retired"``, ``"thread-died"``,
+          ``"queue-full"``, or ``"abandoned"`` when the drain carrying those events gave up
+          after exhausting retries (SPEC-021 FR-001) — that last case used to return True, a
+          false success exactly where ``flush()`` matters most. **The inner call carries the
+          type too, not only the public ``log_foundry.flush``** (SPEC-034 FR-007 AC-1b): the
+          five outcomes are distinguishable only here, so a public wrapper over a bare ``bool``
+          could name none of them without guessing.
 
         Raises:
           None.
         """
         with self._lock:
             if self._shutdown_done:
-                return False
+                return FlushResult(ok=False, reason="retired")
         if not self._thread.is_alive():
-            return False
+            return FlushResult(ok=False, reason="thread-died")
         with self._lock:
             marker = _FlushMarker(self.failed_batches)
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
             self._queue.put(marker, timeout=timeout)
         except queue.Full:
-            return False
+            return FlushResult(ok=False, reason="queue-full")
         if self._drain_finished.is_set() or not self._thread.is_alive():
-            return marker.event.is_set() and marker.delivered
+            delivered = marker.event.is_set() and marker.delivered
+            return FlushResult(ok=delivered, reason=None if delivered else "thread-died")
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
-            return False
-        return marker.delivered
+            return FlushResult(ok=False, reason="timed-out")
+        if not marker.delivered:
+            return FlushResult(ok=False, reason="abandoned")
+        return FlushResult(ok=True)
 
     def swap_sink(self, new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> bool:
         """Retargets delivery at a new sink, draining and closing the previous one (FR-003).

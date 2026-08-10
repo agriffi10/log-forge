@@ -164,7 +164,7 @@ def test_a_total_failure_reaches_failed_batches_and_flush() -> None:
     worker = Worker(DeadSink(), batch_size=1, max_retries=0)
     try:
         worker.submit(_span("a"))
-        assert worker.flush(timeout=2.0) is False
+        assert not worker.flush(timeout=2.0)
         assert worker.health().failed_batches == 1
         assert worker.health().stopped_reason is None, "the drain thread survived"
     finally:
@@ -189,7 +189,7 @@ def test_the_worker_keeps_draining_after_a_total_failure() -> None:
         worker.submit(_span("a"))
         worker.flush(timeout=2.0)
         worker.submit(_span("b"))
-        assert worker.flush(timeout=2.0) is True
+        assert worker.flush(timeout=2.0)
     finally:
         worker.shutdown()
     assert [e["event"] for batch in sink.batches for e in batch] == ["b"]
@@ -298,7 +298,7 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
     worker = Worker(sink, batch_size=1, max_retries=0)
     try:
         worker.submit(_span("a"))
-        assert worker.flush(timeout=2.0) is False
+        assert not worker.flush(timeout=2.0)
         health = worker.health()
     finally:
         worker.shutdown()
@@ -761,7 +761,7 @@ def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> Non
     for sink in sinks:
         failed_batches, delivered = _worker_sees(sink)
         assert failed_batches == 1, type(sink).__name__
-        assert delivered is False, type(sink).__name__
+        assert not delivered, type(sink).__name__
         losses = read_losses(sink)
         assert losses is not None and losses.failed >= 1, type(sink).__name__
 

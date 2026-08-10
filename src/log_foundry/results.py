@@ -1,0 +1,65 @@
+"""Result types for the two public calls that answered five questions with one bit (SPEC-034)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = ["ContinueResult", "FlushResult"]
+
+
+@dataclass(frozen=True)
+class _Result:
+    """A verdict that reads as a boolean and can say why (SPEC-034 FR-007).
+
+    ``flush()`` returned one bit for five distinct outcomes — timed out, worker retired, drain
+    thread died, queue too full for the marker, a batch abandoned — and a Lambda handler needs
+    "the worker is retired, my code is wrong" separated from "the sink is slow". A ``NamedTuple``
+    cannot be retrofitted here: a non-empty tuple is always truthy, so every ``if flush():``
+    would silently start passing.
+
+    The type exists now, before ``1.0.0``, precisely so that later reasons are additive. It grows
+    by new ``reason`` values and never by changing :meth:`__bool__`.
+
+    Attributes:
+      ok: Whether the operation succeeded, and what ``bool()`` reports.
+      reason: A short stable token naming *why* when it did not, or ``None`` when it did. New
+        tokens may appear in any release; code should branch on ``bool()`` and treat an unknown
+        reason as "some other failure" rather than matching exhaustively.
+    """
+
+    ok: bool
+    reason: str | None = None
+
+    def __bool__(self) -> bool:
+        """Reports the verdict, so every existing ``if flush():`` keeps its meaning.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the operation succeeded.
+
+        Raises:
+          None.
+        """
+        return self.ok
+
+
+@dataclass(frozen=True)
+class FlushResult(_Result):
+    """What :func:`log_foundry.flush` returns.
+
+    ``reason`` is ``None`` on success. The tokens it can carry today are ``"timed-out"``,
+    ``"retired"``, ``"thread-died"``, ``"queue-full"`` and ``"abandoned"``.
+    """
+
+
+@dataclass(frozen=True)
+class ContinueResult(_Result):
+    """What :func:`log_foundry.continue_trace` returns.
+
+    ``reason`` is ``None`` on success. Today it distinguishes ``"nothing-supplied"`` — no
+    argument carried a context — from ``"rejected"``, which means something *was* supplied and
+    was malformed. Those two read identically as ``False``, and the second is a caller bug where
+    the first is often a deliberate "continue if there is one to continue".
+    """

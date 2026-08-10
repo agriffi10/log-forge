@@ -102,7 +102,7 @@ def test_inbound_flags_are_not_round_tripped(lf, fake_sink) -> None:
 
 
 def test_adopts_a_traceparent_for_the_next_root_span(lf, fake_sink) -> None:
-    assert lf.continue_trace(TRACEPARENT) is True
+    assert lf.continue_trace(TRACEPARENT)
 
     @lf.trace
     def work() -> None:
@@ -115,7 +115,7 @@ def test_adopts_a_traceparent_for_the_next_root_span(lf, fake_sink) -> None:
 
 
 def test_adopts_explicit_ids(lf, fake_sink) -> None:
-    assert lf.continue_trace(trace_id=INBOUND_TRACE, parent_span_id=INBOUND_SPAN) is True
+    assert lf.continue_trace(trace_id=INBOUND_TRACE, parent_span_id=INBOUND_SPAN)
 
     @lf.trace
     def work() -> tuple[str, str] | None:
@@ -127,7 +127,7 @@ def test_adopts_explicit_ids(lf, fake_sink) -> None:
 
 def test_traceparent_wins_over_explicit_ids_and_warns(lf, capsys) -> None:
     other = "1" * 32
-    assert lf.continue_trace(TRACEPARENT, trace_id=other, parent_span_id="2" * 16) is True
+    assert lf.continue_trace(TRACEPARENT, trace_id=other, parent_span_id="2" * 16)
 
     @lf.trace
     def work() -> tuple[str, str] | None:
@@ -139,7 +139,7 @@ def test_traceparent_wins_over_explicit_ids_and_warns(lf, capsys) -> None:
 
 def test_trace_id_without_a_parent_joins_as_another_root(lf, fake_sink) -> None:
     """Legitimate: knowing the trace but not the parent span beats being in a fresh trace."""
-    assert lf.continue_trace(trace_id=INBOUND_TRACE) is True
+    assert lf.continue_trace(trace_id=INBOUND_TRACE)
 
     @lf.trace
     def work() -> None:
@@ -154,7 +154,7 @@ def test_trace_id_without_a_parent_joins_as_another_root(lf, fake_sink) -> None:
 
 
 def test_returns_false_when_nothing_was_supplied(lf) -> None:
-    assert lf.continue_trace() is False
+    assert not lf.continue_trace()
 
 
 def test_nested_span_inherits_its_in_process_parent_not_the_inbound_one(lf, fake_sink) -> None:
@@ -245,7 +245,7 @@ def test_reparenting_never_overwrites_span_id(lf, fake_sink) -> None:
 def test_a_non_root_span_is_not_reparented(lf, fake_sink) -> None:
     @lf.trace
     def inner() -> None:
-        assert lf.continue_trace(TRACEPARENT) is True, "adopted, for the next root span opened"
+        assert lf.continue_trace(TRACEPARENT), "adopted, for the next root span opened"
 
     @lf.trace
     def outer() -> None:
@@ -263,7 +263,7 @@ def test_a_non_root_span_is_not_reparented(lf, fake_sink) -> None:
 
 def test_with_no_span_open_nothing_is_reparented(lf, fake_sink) -> None:
     """The non-decorated-handler pattern: adopt first, open the span afterwards."""
-    assert lf.continue_trace(TRACEPARENT) is True
+    assert lf.continue_trace(TRACEPARENT)
 
     @lf.trace
     def later() -> None:
@@ -293,7 +293,7 @@ def test_with_no_span_open_nothing_is_reparented(lf, fake_sink) -> None:
 def test_invalid_input_is_never_fatal_and_still_emits_a_valid_trace(
     lf, fake_sink, hostile: object
 ) -> None:
-    assert lf.continue_trace(hostile) is False
+    assert not lf.continue_trace(hostile)
 
     @lf.trace
     def work() -> None:
@@ -313,7 +313,7 @@ def test_invalid_input_is_never_fatal_and_still_emits_a_valid_trace(
 
 def test_rejection_writes_one_bounded_warning(lf, capsys) -> None:
     hostile = "00-" + "q" * 4000 + "-x-01"
-    assert lf.continue_trace(hostile) is False
+    assert not lf.continue_trace(hostile)
 
     err = capsys.readouterr().err
     assert err.count("ignoring inbound trace context") == 1, "exactly one warning"
@@ -322,13 +322,13 @@ def test_rejection_writes_one_bounded_warning(lf, capsys) -> None:
 
 def test_rejection_warning_cannot_forge_a_log_line(lf, capsys) -> None:
     """`repr` escapes newlines, so a hostile value cannot inject a second line."""
-    assert lf.continue_trace("00-bad\nlog-foundry: everything is fine-01") is False
+    assert not lf.continue_trace("00-bad\nlog-foundry: everything is fine-01")
     assert capsys.readouterr().err.count("\n") == 1
 
 
 def test_a_silently_absent_traceparent_writes_no_warning(lf, capsys) -> None:
     """`event.get("traceparent")` yields None whenever the caller did not propagate one."""
-    assert lf.continue_trace(None) is False
+    assert not lf.continue_trace(None)
     assert capsys.readouterr().err == "", "an absent header is a no-op, not a rejection"
 
 
@@ -374,7 +374,7 @@ def test_invalid_baggage_is_skipped_but_the_trace_is_still_adopted(lf, fake_sink
     def handler() -> None:
         # They fail independently: losing correlating fields is bad, losing the trace join
         # because one field was malformed is worse.
-        assert lf.continue_trace(TRACEPARENT, baggage="this is not a baggage header") is True
+        assert lf.continue_trace(TRACEPARENT, baggage="this is not a baggage header")
 
     handler()
     batch = _span_batch(
@@ -415,7 +415,7 @@ def test_current_traceparent_round_trips_into_continue_trace(lf, fake_sink) -> N
         fake_sink, "test_current_traceparent_round_trips_into_continue_trace.<locals>.producer"
     )
 
-    assert lf.continue_trace(published["traceparent"]) is True, "our own output must be accepted"
+    assert lf.continue_trace(published["traceparent"]), "our own output must be accepted"
 
     @lf.trace
     def consumer() -> None:
@@ -526,11 +526,11 @@ def test_an_invalid_continue_trace_does_not_clear_a_context_adopted_in_the_same_
 ) -> None:
     @lf.trace(name="handler")
     def handler() -> None:
-        assert lf.continue_trace(TRACEPARENT) is True
+        assert lf.continue_trace(TRACEPARENT)
         capsys.readouterr()  # drop anything written so far; the next call must add nothing
-        assert lf.continue_trace(None) is False
+        assert not lf.continue_trace(None)
         assert capsys.readouterr().err == "", "nothing supplied at all is a *silent* no-op"
-        assert lf.continue_trace("garbage") is False
+        assert not lf.continue_trace("garbage")
         assert context_mod.get_adopted_context() == (INBOUND_TRACE, INBOUND_SPAN)
         lf.info("working")
 
@@ -648,9 +648,9 @@ def test_a_rejection_warning_cannot_reach_the_caller(lf, monkeypatch) -> None:
 
     monkeypatch.setattr(sys, "stderr", _RaisingStderr())
 
-    assert lf.continue_trace("00-bad-header-01") is False
+    assert not lf.continue_trace("00-bad-header-01")
     try:
-        assert lf.continue_trace(TRACEPARENT, baggage="\x00 not a header") is True
+        assert lf.continue_trace(TRACEPARENT, baggage="\x00 not a header")
     finally:
         # The second call adopts, and this test opens no root span to release it — so without
         # this the adoption outlives the test and the next one to open a root span silently

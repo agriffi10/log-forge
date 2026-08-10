@@ -80,7 +80,7 @@ def test_stdout_emits_a_previously_poisonous_batch_in_full(capsys) -> None:
     worker = Worker(stdout_sink.StdoutSink(), batch_size=10)
     try:
         worker.submit(events)
-        assert worker.flush(timeout=5.0) is True
+        assert worker.flush(timeout=5.0)
     finally:
         worker.shutdown()
 

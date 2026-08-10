@@ -320,7 +320,7 @@ def test_flush_drains_and_leaves_the_worker_running() -> None:
             w.submit(_span(i))
         assert sink.events == [], "still buffered before the flush"
 
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         assert [e["message"] for e in sink.events] == list(range(5))
 
         # The whole point: unlike shutdown(), everything is still alive afterwards.
@@ -328,7 +328,7 @@ def test_flush_drains_and_leaves_the_worker_running() -> None:
         assert w._thread.is_alive(), "flush must not retire the worker thread"
 
         w.submit(_span("after"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         assert sink.events[-1]["message"] == "after", "the worker still works after a flush"
     finally:
         w.shutdown()
@@ -342,7 +342,7 @@ def test_flush_does_not_merely_wait_out_the_flush_interval() -> None:
             w.submit(_span(i))
 
         start = time.monotonic()
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         elapsed = time.monotonic() - start
 
         assert [e["message"] for e in sink.events] == list(range(20)), "ordering holds"
@@ -360,7 +360,7 @@ def test_flush_marker_never_reaches_the_sink() -> None:
     try:
         w.submit(_span("a"))
         w.submit(_span("b"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
 
         for batch in sink.batches:
             for event in batch:
@@ -395,7 +395,7 @@ def test_shutdown_answers_a_marker_left_in_the_queue() -> None:
     stopper.join(5.0)
     flusher.join(5.0)
 
-    assert flushed == [True], "a flush racing shutdown is answered by the final drain"
+    assert [bool(r) for r in flushed] == [True], "a flush racing shutdown is answered by the final drain"
     assert {e["message"] for e in sink.events} == {"a", "b"}, "and its events really did land"
     for batch in sink.batches:
         assert all(isinstance(e, dict) for e in batch), "no marker leaked into the final batch"
@@ -406,9 +406,9 @@ def test_flush_is_repeatable_and_concurrent() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     try:
         w.submit(_span("first"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         w.submit(_span("second"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         assert [e["message"] for e in sink.events] == ["first", "second"]
 
         # Each concurrent call gets its own marker and its own event.
@@ -427,7 +427,7 @@ def test_flush_is_repeatable_and_concurrent() -> None:
         for t in threads:
             t.join(5.0)
 
-        assert results == [True] * 4, "every concurrent flush is answered"
+        assert [bool(r) for r in results] == [True] * 4, "every concurrent flush is answered"
         assert sink.events[-1]["message"] == "third"
     finally:
         w.shutdown()
@@ -437,8 +437,8 @@ def test_flush_does_not_consume_the_shutdown_flag() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     w.submit(_span("x"))
-    assert w.flush(timeout=5.0) is True
-    assert w.flush(timeout=5.0) is True
+    assert w.flush(timeout=5.0)
+    assert w.flush(timeout=5.0)
 
     w.submit(_span("tail"))
     w.shutdown()  # must still be a full, working shutdown
@@ -456,7 +456,7 @@ def test_flush_after_shutdown_returns_false_promptly() -> None:
     w.shutdown()
 
     start = time.monotonic()
-    assert w.flush(timeout=5.0) is False, "nothing will ever consume the marker now"
+    assert not w.flush(timeout=5.0), "nothing will ever consume the marker now"
     elapsed = time.monotonic() - start
     # The bug this guards: waiting out `timeout` here turns a logging problem into an
     # invocation that blows its execution deadline.
@@ -474,7 +474,7 @@ def test_flush_honours_its_timeout_on_a_wedged_sink() -> None:
         result = w.flush(timeout=0.1)  # must not raise
         elapsed = time.monotonic() - start
 
-        assert result is False, "a drain that could not complete reports False"
+        assert not result, "a drain that could not complete reports a falsy result"
         assert elapsed < 1.0, f"timeout not honoured, took {elapsed:.3f}s"
     finally:
         sink.release.set()
@@ -489,7 +489,7 @@ def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
         # The drain ran and the failure is reported through the return value and
         # failed_batches, not by raising at the caller (SPEC-021 FR-001 changed the first of
         # those from True; see test_flush_reports_false_when_the_batch_is_abandoned).
-        assert w.flush(timeout=5.0) is False
+        assert not w.flush(timeout=5.0)
         assert sink.events == [], "nothing was ever successfully emitted"
         assert w.failed_batches >= 1, "the failure is counted, not swallowed silently"
     finally:
@@ -501,7 +501,7 @@ def test_flush_with_timeout_none_returns_true_on_a_healthy_worker() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     try:
         w.submit(_span("n"))
-        assert w.flush(timeout=None) is True
+        assert w.flush(timeout=None)
         assert [e["message"] for e in sink.events] == ["n"]
     finally:
         w.shutdown()
@@ -516,7 +516,7 @@ def test_module_flush_is_a_no_op_when_nothing_was_ever_logged() -> None:
 
     decorator._worker = None
     start = time.monotonic()
-    assert log_foundry.flush() is True, "no worker means nothing to drain"
+    assert log_foundry.flush(), "no worker means nothing to drain"
     assert time.monotonic() - start < 1.0
     # Building a worker here would start a thread and register atexit purely to flush nothing.
     assert decorator._worker is None, "flush must not create a worker"
@@ -531,7 +531,7 @@ def test_module_flush_after_shutdown_returns_false_promptly() -> None:
     log_foundry.shutdown()
 
     start = time.monotonic()
-    assert log_foundry.flush(timeout=5.0) is False
+    assert not log_foundry.flush(timeout=5.0)
     assert time.monotonic() - start < 1.0, "must not block on a worker that is gone"
 
 
@@ -553,13 +553,13 @@ def test_module_flush_delivers_a_traced_call_and_logging_continues() -> None:
 
     try:
         handler()
-        assert log_foundry.flush(timeout=5.0) is True
+        assert log_foundry.flush(timeout=5.0)
         first = [e["message"] for e in sink.events]
         assert "invoked" in first, "the first invocation's events were drained"
         assert sink.closed == 0, "the sink is still open"
 
         handler()  # the failure mode this whole spec exists for: does the *second* one log?
-        assert log_foundry.flush(timeout=5.0) is True
+        assert log_foundry.flush(timeout=5.0)
         assert [e["message"] for e in sink.events].count("invoked") == 2
     finally:
         decorator._worker.shutdown()
@@ -796,7 +796,7 @@ def test_callers_are_unaffected_after_the_worker_dies() -> None:
     w.submit(_span("a"))
     assert _wait_until(lambda: _dead(w))
     w.submit(_span("b"))  # queued, never drained — must not raise
-    assert w.flush(timeout=0.2) is False, "flush reports failure rather than burning its timeout"
+    assert not w.flush(timeout=0.2), "flush reports failure rather than burning its timeout"
     w.shutdown()  # joins an already-dead thread and closes the sink
     w.shutdown()  # still idempotent
 
@@ -910,7 +910,7 @@ def test_flush_reports_true_when_the_events_reach_the_sink() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     try:
         w.submit(_span("landed"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         assert [e["message"] for e in sink.events] == ["landed"], "True means these landed"
         assert w.failed_batches == 0
     finally:
@@ -923,7 +923,7 @@ def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
     try:
         w.submit(_span("doomed"))
-        assert w.flush(timeout=5.0) is False, "a drain that delivered nothing is not a success"
+        assert not w.flush(timeout=5.0), "a drain that delivered nothing is not a success"
         assert w.failed_batches == 1, "and the failure it reports is the abandoned batch"
         assert sink.events == []
     finally:
@@ -939,7 +939,7 @@ def test_a_failing_flush_returns_promptly_rather_than_at_the_timeout() -> None:
     try:
         w.submit(_span("doomed"))
         start = time.monotonic()
-        assert w.flush(timeout=30.0) is False
+        assert not w.flush(timeout=30.0)
         elapsed = time.monotonic() - start
         assert sink.attempts == 3, "the retry budget really was spent inside the flush"
         assert elapsed < 5.0, f"the waiter was stranded, took {elapsed:.3f}s"
@@ -952,12 +952,12 @@ def test_flush_reports_true_when_there_was_nothing_pending() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     try:
-        assert w.flush(timeout=5.0) is True, "nothing to deliver is not a delivery failure"
+        assert w.flush(timeout=5.0), "nothing to deliver is not a delivery failure"
         assert sink.events == []
         # And again after a successful flush has already drained everything.
         w.submit(_span("a"))
-        assert w.flush(timeout=5.0) is True
-        assert w.flush(timeout=5.0) is True, "the second flush has nothing left to do"
+        assert w.flush(timeout=5.0)
+        assert w.flush(timeout=5.0), "the second flush has nothing left to do"
     finally:
         w.shutdown()
 
@@ -968,7 +968,7 @@ def test_flush_reports_true_when_the_sink_recovers_mid_retry() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=3)
     try:
         w.submit(_span("eventually"))
-        assert w.flush(timeout=5.0) is True
+        assert w.flush(timeout=5.0)
         assert [e["message"] for e in sink.events] == ["eventually"]
         assert sink.attempts == 3, "two failures then the delivery"
         assert w.failed_batches == 0, "a recovered batch is not an abandoned one"
@@ -982,7 +982,7 @@ def test_flush_reports_false_on_a_dead_worker() -> None:
     try:
         w.submit(_span("a"))
         assert _wait_until(lambda: not w._thread.is_alive())
-        assert w.flush(timeout=5.0) is False
+        assert not w.flush(timeout=5.0)
     finally:
         w.shutdown()
 
@@ -1021,7 +1021,7 @@ def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
     stopper.join(5.0)
     flusher.join(5.0)
 
-    assert flushed == [False], "the final drain's emit failed, so the flush it answered failed"
+    assert [bool(r) for r in flushed] == [False], "the final drain's emit failed, so the flush it answered failed"
     assert sink.events == []
 
 
@@ -1077,7 +1077,7 @@ def test_every_flush_outstanding_over_a_lost_batch_reports_the_loss() -> None:
         for t in threads:
             t.join(5.0)
 
-        assert results == [False] * 4, f"every flush must report the loss, got {results}"
+        assert [bool(r) for r in results] == [False] * 4, f"every flush must report the loss, got {results}"
         assert w.failed_batches == 1, "one batch, one abandonment — reported to all four"
         assert sink.events == []
     finally:
@@ -1102,7 +1102,7 @@ def test_a_flush_called_after_the_abandonment_reports_success() -> None:
         sink.release.set()
         assert _wait_until(lambda: w.failed_batches == 1), "the abandonment must complete first"
 
-        assert w.flush(timeout=5.0) is True, "nothing pending, and nothing lost since the call"
+        assert w.flush(timeout=5.0), "nothing pending, and nothing lost since the call"
         assert w.health().failed_batches == 1, "the loss is reported by health(), not by flush()"
     finally:
         w.shutdown()
@@ -1119,13 +1119,13 @@ def test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes() -> None
         w.submit(_span("lost"))
         assert _wait_until(lambda: w.failed_batches == 1), "the trigger should abandon it"
 
-        assert w.flush(timeout=5.0) is True, "nothing pending, and nothing lost since"
+        assert w.flush(timeout=5.0), "nothing pending, and nothing lost since"
         assert w.failed_batches == 1, "the loss is still on the record where it belongs"
 
         w.submit(_span("kept"))  # the sink has recovered by now
-        assert w.flush(timeout=5.0) is True, "a healthy drain must not inherit the old failure"
+        assert w.flush(timeout=5.0), "a healthy drain must not inherit the old failure"
         assert [e["message"] for e in sink.events] == ["kept"]
-        assert w.flush(timeout=5.0) is True, "and it does not come back on the next empty flush"
+        assert w.flush(timeout=5.0), "and it does not come back on the next empty flush"
     finally:
         w.shutdown()
 
@@ -1140,7 +1140,7 @@ def test_flush_reports_false_when_the_queue_is_too_full_for_the_marker() -> None
         w.submit(_span("b"))  # fills the queue (max_queue=1)
 
         start = time.monotonic()
-        assert w.flush(timeout=0.1) is False, "the marker never got in, so nothing was drained"
+        assert not w.flush(timeout=0.1), "the marker never got in, so nothing was drained"
         assert time.monotonic() - start < 1.0, "and the put timeout bounds the wait"
     finally:
         sink.release.set()
@@ -1188,7 +1188,7 @@ def test_a_flush_answered_by_a_dying_final_drain_is_not_stranded() -> None:
 
     assert len(flushed) == 1, "the waiter was never released"
     ok, elapsed = flushed[0]
-    assert ok is False, "the batch died with the thread; that is not a delivery"
+    assert not ok, "the batch died with the thread; that is not a delivery"
     assert elapsed < 5.0, f"released promptly, not at the timeout — took {elapsed:.3f}s"
 
 
@@ -1636,7 +1636,7 @@ def test_decorated_calls_after_a_module_shutdown_are_counted() -> None:
         return "ok"
 
     handler()
-    assert log_foundry.flush(timeout=5.0) is True
+    assert log_foundry.flush(timeout=5.0)
     delivered = len(sink.events)
     assert delivered > 0
 
@@ -2078,7 +2078,7 @@ def test_an_unbounded_flush_does_not_hang_on_a_marker_nothing_will_answer() -> N
 
     worker._queue.put = die_then_put  # type: ignore[method-assign]
 
-    assert _flush_on_watchdog(worker, None) == [False], "nothing carried it, so it did not deliver"
+    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [False], "nothing carried it, so it did not deliver"
 
 
 def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> None:
@@ -2102,7 +2102,7 @@ def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> N
 
     worker._queue.put = put_then_die  # type: ignore[method-assign]
 
-    assert _flush_on_watchdog(worker, None) == [True], "a drain carried it and said so"
+    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [True], "a drain carried it and said so"
     assert sink.events == [{"message": "a"}]
 
 
@@ -2112,7 +2112,7 @@ def test_an_unbounded_flush_does_not_hang_after_a_terminal_drain_failure(capsys)
     worker.submit(_span("a"))  # the sink raises past _emit's guard and ends the thread
     assert _wait_until(lambda: not worker._thread.is_alive(), timeout=5.0)
 
-    assert _flush_on_watchdog(worker, None) == [False]
+    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [False]
     capsys.readouterr()
 
 
@@ -2224,7 +2224,7 @@ def test_an_unbounded_flush_does_not_hang_after_the_sweep_while_the_thread_lives
     assert worker._thread.is_alive(), "the premise: liveness still reads True here"
 
     try:
-        assert _flush_on_watchdog(worker, None) == [False]
+        assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [False]
     finally:
         release.set()
         worker._thread.join(timeout=5)
@@ -2255,4 +2255,6 @@ def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
 
     capsys.readouterr()
     assert worker.health().failed_batches == 1, "the premise: the drain abandoned the batch"
-    assert result == [False], "answered is not delivered — the batch it carried was abandoned"
+    assert [bool(r) for r in result] == [False], (
+        "answered is not delivered — the batch it carried was abandoned"
+    )

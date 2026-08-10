@@ -194,7 +194,7 @@ def test_a_late_sink_swap_routes_subsequent_events_to_the_new_sink() -> None:
     config.configure(sink=new)
 
     worker.submit(_span("after"))
-    assert log_foundry.flush(timeout=5.0) is True
+    assert log_foundry.flush(timeout=5.0)
 
     assert new.messages == ["after"]
     assert config.get_config().sink is new

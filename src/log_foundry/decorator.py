@@ -21,6 +21,7 @@ from log_foundry.ids import (
     parse_traceparent,
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
+from log_foundry.results import ContinueResult, FlushResult
 from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health, Worker
 
 if TYPE_CHECKING:
@@ -105,7 +106,7 @@ def continue_trace(
     trace_id: str | None = None,
     parent_span_id: str | None = None,
     baggage: str | None = None,
-) -> bool:
+) -> ContinueResult:
     """Adopts an inbound trace context so this process's spans join the caller's trace.
 
     Call it on the first line of the entry point: if a span is already open and it is a root,
@@ -136,7 +137,11 @@ def continue_trace(
         losing the trace join because one field was malformed is worse.
 
     Returns:
-      True when a context was adopted, False when nothing valid was supplied and a fresh
+      A :class:`ContinueResult`. Truthy when a context was adopted; falsy with a ``reason`` of
+      ``"nothing-supplied"`` when no argument carried one, or ``"rejected"`` when something was
+      supplied and was malformed — two outcomes that read identically as ``False`` today, where
+      the second is a caller bug and the first is often a deliberate "continue if there is one".
+      Falsy also means a fresh
       trace is in use. Supplying nothing at all is a silent no-op rather than a rejection,
       since a caller who did not propagate a header would otherwise get a line per
       invocation.
@@ -173,7 +178,10 @@ def continue_trace(
         else:
             context.set_baggage(**parsed_baggage)
 
-    return adopted is not None
+    if adopted is not None:
+        return ContinueResult(ok=True)
+    supplied = traceparent is not None or trace_id is not None or parent_span_id is not None
+    return ContinueResult(ok=False, reason="rejected" if supplied else "nothing-supplied")
 
 
 def _reparent_current_span(trace_id: str, parent_span_id: str | None) -> None:
@@ -637,7 +645,7 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
         _orphan_sink = new_sink
 
 
-def _flush_worker(timeout: float | None = 5.0) -> bool:
+def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     """Drains the process worker without retiring it, backing ``flush()`` (SPEC-013 FR-003).
 
     This deliberately does not call :func:`_get_worker`: a process that never logged has
@@ -648,7 +656,9 @@ def _flush_worker(timeout: float | None = 5.0) -> bool:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
     Returns:
-      Whether everything outstanding was delivered, and True when no worker exists.
+      A :class:`FlushResult`, truthy when everything outstanding was delivered and when no
+      worker exists — a process that never logged has nothing to drain, so it has lost
+      nothing.
 
     Raises:
       None. A flush is the call most likely to be made in a ``finally``, so the library must
@@ -657,11 +667,11 @@ def _flush_worker(timeout: float | None = 5.0) -> bool:
     """
     worker = _worker
     if worker is None:
-        return True
+        return FlushResult(ok=True)
     try:
         return worker.flush(timeout)
     except Exception:
-        return False
+        return FlushResult(ok=False, reason="thread-died")
 
 
 def _worker_health() -> Health:
