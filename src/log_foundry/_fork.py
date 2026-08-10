@@ -146,9 +146,10 @@ def _container_children(container: Any) -> list[Any]:
     Raises:
       None. A container mutating under the walk would raise, and a child that cannot finish
         repairing itself must still repair what it reached. A foreign container subclass
-        reachable from an owned attribute runs its own ``__iter__`` here, which is absorbed if
-        it raises — but a *blocking* one is a child that never returns from ``fork``, and there
-        is nothing to catch that with.
+        reachable from an owned attribute runs its own code here — ``keys``/``values`` for a
+        mapping, ``__iter__`` for anything else — which is absorbed if it raises, but a
+        *blocking* one is a child that never returns from ``fork`` and there is nothing to catch
+        that with.
     """
     try:
         if isinstance(container, dict):

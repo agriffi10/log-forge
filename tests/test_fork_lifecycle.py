@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import faulthandler
 import os
 import pathlib
 import select
@@ -104,23 +105,32 @@ class _Child:
 
     @property
     def blocked(self) -> bool:
-        """Whether a signal ended the child, which is what a deadlock looks like here.
+        """Whether a **watchdog** ended the child, which is what a deadlock looks like here.
 
-        Either watchdog counts. ``SIGALRM`` is the child's own, and ``SIGKILL`` is the parent's
-        for the case the child's cannot fire — a repair that hangs *inside* the fork handler
-        leaves a child with no pending alarm, since ``fork`` clears one in the child and the
-        handler runs before any test code can arm another.
+        Either watchdog counts, and nothing else does. ``SIGALRM`` is the child's own, and
+        ``SIGKILL`` is the parent's for the case the child's cannot fire — a repair that hangs
+        *inside* the fork handler leaves a child with no pending alarm, since ``fork`` clears one
+        and the handler runs before any test code can arm another.
+
+        Any ``WIFSIGNALED`` is deliberately **not** the test. A child killed by ``SIGSEGV`` or
+        ``SIGBUS`` would read as blocked and write nothing, which passes both assertions of the
+        one test that reads this — the test whose whole job is to *demonstrate* the pre-fix hang.
+        SPEC-028 already measured a sink taking the interpreter down with a bus error, so a crash
+        reading as a deadlock is a live confusion here, not a hypothetical one.
 
         Args:
           None.
 
         Returns:
-          Whether a signal terminated it.
+          Whether a watchdog signal terminated it.
 
         Raises:
           None.
         """
-        return os.WIFSIGNALED(self.status)
+        return os.WIFSIGNALED(self.status) and os.WTERMSIG(self.status) in (
+            signal.SIGALRM,
+            signal.SIGKILL,
+        )
 
 
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
@@ -134,7 +144,9 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     the library's fork handler runs *before* any of this code — so a repair that hangs in the
     handler produces a child no alarm will ever kill, and a parent sitting in ``os.read`` would
     hang the whole suite rather than fail one test. The parent therefore waits on a deadline of
-    its own and sends ``SIGKILL``.
+    its own and sends ``SIGKILL``. The kill and the reap sit in the ``finally``, so a child is
+    dealt with even when ``select`` or ``read`` raises — an unreaped child of a test process is
+    a stray that outlives the run.
 
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
@@ -167,21 +179,26 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     os.close(write_fd)
     deadline = time.monotonic() + timeout + 2.0
     chunks: list[bytes] = []
+    gone = False
     try:
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                os.kill(pid, signal.SIGKILL)
+            if deadline - time.monotonic() <= 0:
                 break
-            if not select.select([read_fd], [], [], remaining)[0]:
+            if not select.select([read_fd], [], [], deadline - time.monotonic())[0]:
                 continue
             chunk = os.read(read_fd, 65536)
             if not chunk:
+                gone = True
                 break
             chunks.append(chunk)
     finally:
         os.close(read_fd)
-    _, status = os.waitpid(pid, 0)
+        if not gone:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _, status = os.waitpid(pid, 0)
     return _Child(status, b"".join(chunks).decode(errors="replace"))
 
 
@@ -388,6 +405,29 @@ def test_an_inherited_lock_is_dead_in_the_child() -> None:
     assert child.output == "dead", child.output
 
 
+def test_a_crashed_child_does_not_read_as_blocked() -> None:
+    """A crash and a deadlock are different findings, and one test turns on telling them apart.
+
+    ``blocked`` is read by the demonstration half of FR-003 AC-1, which asserts that an
+    un-repaired child hangs and writes nothing. A child killed by ``SIGSEGV`` satisfies both of
+    those, so a check of "any signal" would let the demonstration pass without demonstrating
+    anything — and SPEC-028 measured a shipped sink taking the interpreter down with a bus
+    error, so this is a crash mode the suite has already seen.
+
+    ``faulthandler`` is disabled in the child first. pytest enables it, and its ``SIGSEGV``
+    dump would print a full traceback into the run's output — a passing test that looks like a
+    catastrophe is its own kind of misleading.
+    """
+    def crash() -> str:
+        faulthandler.disable()
+        os.kill(os.getpid(), signal.SIGSEGV)
+        return "survived"
+
+    child = run_in_child(crash, timeout=4)
+    assert not child.finished
+    assert not child.blocked, "a crash must not read as a deadlock"
+
+
 def test_the_childs_first_log_call_does_not_block(tmp_path: pathlib.Path) -> None:
     """FR-003 AC-1. Fifty forks, each landing inside a locked ``emit``, and every child returns.
 
@@ -474,7 +514,6 @@ def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) 
         child = run_in_child(_log_in_child, timeout=4)
     finally:
         gate.release.set()
-        worker.shutdown()
 
     assert child.finished, f"a subclassed sink's child blocked: {child.output!r}"
 
@@ -617,8 +656,10 @@ def _threading_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
             for alias in node.names:
                 if alias.name != "threading" and not alias.name.startswith("threading."):
                     continue
-                # A dotted `import threading.x` binds `threading`, not the submodule, unless it
-                # is aliased — in which case the alias names the submodule and no primitive.
+                # A dotted `import threading.x` binds `threading`, not the submodule. An alias
+                # binds the submodule instead, which names no primitive — it is added anyway,
+                # because `threading` has no submodules and over-matching demands a decision
+                # where under-matching skips one.
                 modules.add(alias.asname or alias.name.split(".", 1)[0])
         elif isinstance(node, ast.ImportFrom) and node.module == "threading":
             for alias in node.names:
@@ -1015,17 +1056,40 @@ def test_an_owned_container_subclass_is_both_walked_and_repaired(tmp_path: pathl
     assert child.output == "True", child.output
 
 
-def test_a_container_the_walk_enters_is_not_one_exact_type(tmp_path: pathlib.Path) -> None:
+class _Fanout(list):  # type: ignore[type-arg]
+    """A container subclass, which is what pins ``isinstance`` rather than the type tuple.
+
+    A ``deque`` alone cannot: it is a *member* of ``_CONTAINER_TYPES``, so an exact-type test
+    enters one too and the mutant survives. Only a subclass separates the two rules — which is
+    the shape a caller's own fan-out would actually have.
+    """
+
+
+@pytest.mark.parametrize(
+    ("name", "wrap"),
+    [
+        ("deque", collections.deque),
+        ("list subclass", _Fanout),
+    ],
+)
+def test_a_container_the_walk_enters_is_not_one_exact_type(
+    tmp_path: pathlib.Path, name: str, wrap: type
+) -> None:
     """FR-003 AC-2. Which concrete container a sink holds its children in must not decide this.
 
-    An exact-type test entered a ``list`` and a ``tuple`` and walked past a ``deque``, a
-    ``defaultdict`` and every other ordinary subclass — so a future sink's children would be
-    unrepaired for no reason a reader could predict. ``MultiSink`` is the shipped shape; the
-    container under it is the variable.
+    An exact-type test walked past a ``defaultdict``, a caller's own list subclass and every
+    other ordinary subclass, so a future sink's children would be unrepaired for no reason a
+    reader could predict. ``MultiSink`` is the shipped shape; the container under it is the
+    variable.
+
+    Two rows because round 2 made two changes at once and only one of them was pinned. Adding
+    ``deque`` to the type tuple and switching to ``isinstance`` are separate rules: with the
+    ``deque`` row alone, reverting to an exact-type test left the whole file green, since a
+    ``deque`` is in the tuple. The subclass row is the one that fails on that revert.
     """
-    inner = FileSink(str(tmp_path / "deque.ndjson"))
+    inner = FileSink(str(tmp_path / "inner.ndjson"))
     wrapper = MultiSink(inner)
-    wrapper._sinks = collections.deque([inner])  # type: ignore[assignment]
+    wrapper._sinks = wrap([inner])  # type: ignore[assignment]
     log_foundry.configure(service="fork", version="0", env="test", sink=wrapper)
     before = id(inner._lock)
     try:
@@ -1033,7 +1097,46 @@ def test_a_container_the_walk_enters_is_not_one_exact_type(tmp_path: pathlib.Pat
     finally:
         inner.close()
 
-    assert child.output == "True", child.output
+    assert child.output == "True", f"{name}: {child.output}"
+
+
+def test_a_foreign_container_subclass_is_entered_but_never_rewritten(
+    tmp_path: pathlib.Path,
+) -> None:
+    """FR-003 AC-2 / FR-005. Entering a container is not permission to rewrite what holds it.
+
+    Matching containers by ``isinstance`` created a population that did not exist before: an
+    object the walk enters *as a container* while its class is a driver's, not this library's.
+    A connection registry or an LRU cache subclassing ``dict`` is an ordinary shape, and
+    swapping the lock inside one is the "fork fix that breaks a driver" the ownership test
+    exists to prevent.
+
+    ``test_third_party_state_is_left_alone`` does not reach this: its foreign sink is a plain
+    class, so it is refused a level earlier and the guard never runs. Measured — with the guard
+    removed, the foreign lock is replaced and the whole suite stays green.
+    """
+
+    class _ForeignCache(dict):  # type: ignore[type-arg]
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+
+    sink = FileSink(str(tmp_path / "foreign.ndjson"))
+    sink._client = _ForeignCache()  # type: ignore[attr-defined]
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    foreign_before = id(sink._client.lock)  # type: ignore[attr-defined]
+    own_before = id(sink._lock)
+
+    def compare() -> str:
+        foreign = id(sink._client.lock) == foreign_before  # type: ignore[attr-defined]
+        return f"{foreign},{id(sink._lock) != own_before}"
+
+    try:
+        child = run_in_child(compare, timeout=6)
+    finally:
+        sink.close()
+
+    assert child.output == "True,True", child.output
 
 
 # -- FR-001 / FR-006: what is registered, and where the mechanism lives ----------------------
@@ -1120,22 +1223,89 @@ def test_fork_imports_nothing_from_the_package_but_diag() -> None:
     name is. Both are needed: ``from log_foundry.sinks.base import Sink`` names a member of an
     allowed module, while ``from log_foundry.sinks import base`` names the module itself.
     """
-    allowed = {f"{_PACKAGE}._diag", f"{_PACKAGE}.sinks.base"}
-    for node in ast.walk(_fork_tree()):
+    forbidden = _forbidden_intra_package_imports(_fork_tree())
+    assert not forbidden, f"_fork.py may not import {forbidden}"
+
+
+_ALLOWED_IMPORTS = ("_diag", "sinks.base")
+
+
+def _forbidden_intra_package_imports(tree: ast.AST) -> list[str]:
+    """Every intra-package import in a module that FR-006 does not allow ``_fork.py`` to hold.
+
+    Args:
+      tree: The parsed module.
+
+    Returns:
+      One entry per offending imported name, sorted.
+
+    Raises:
+      None. A relative import is reported as an offence rather than asserted on, so one fixture
+        can drive every shape through the same reader.
+    """
+    allowed = {f"{_PACKAGE}.{name}" for name in _ALLOWED_IMPORTS}
+    found: set[str] = set()
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert not alias.name.startswith(_PACKAGE), alias.name
+            found.update(
+                alias.name
+                for alias in node.names
+                if alias.name == _PACKAGE or alias.name.startswith(f"{_PACKAGE}.")
+            )
         elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0, "a relative import is an intra-package import"
-            module = node.module or ""
-            if not module.startswith(_PACKAGE):
+            if node.level:
+                found.add("." * node.level + (node.module or ""))
                 continue
-            forbidden = sorted(
+            module = node.module or ""
+            if module != _PACKAGE and not module.startswith(f"{_PACKAGE}."):
+                continue
+            found.update(
                 f"{module}.{alias.name}"
                 for alias in node.names
                 if module not in allowed and f"{module}.{alias.name}" not in allowed
             )
-            assert not forbidden, f"_fork.py may not import {forbidden}"
+    return sorted(found)
+
+
+# (fixture source, whether the reader must report an offence). Round 2 found this guard broken
+# — it asked whether the imported names *intersected* the allowed set, so a second package
+# import on the same line passed — and round 3 fixed the logic with no fixture to hold it, so
+# emptying the reader's body passed too. `_fork.py` holds one allowed import, which is exactly
+# one of the fourteen shapes below.
+_IMPORT_SHAPES: list[tuple[str, bool]] = [
+    ("from log_foundry import _diag", False),
+    ("from log_foundry._diag import absorbed", False),
+    ("from log_foundry.sinks import base", False),
+    ("from log_foundry.sinks.base import Sink", False),
+    ("from log_foundry.sinks.base import Sink, SinkLosses", False),
+    ("import os, sys, threading", False),
+    ("from threading import Lock", False),
+    ("from log_foundry import _diag, decorator", True),
+    ("from log_foundry import decorator", True),
+    ("from log_foundry import worker as w", True),
+    ("from log_foundry import sinks", True),
+    ("from log_foundry.sinks import base, file", True),
+    ("from log_foundry.decorator import _worker", True),
+    ("import log_foundry", True),
+    ("import log_foundry.decorator", True),
+    ("import log_foundry.decorator as d", True),
+    ("from . import decorator", True),
+    ("from .sinks import file", True),
+]
+
+
+def test_the_import_guard_reads_every_shape_it_claims_to() -> None:
+    """Guards the guard: the reader that round 2 found broken had nothing holding it.
+
+    Both directions matter and each has a real failure. Accepting too much is the round-2
+    defect, where ``from log_foundry import _diag, decorator`` passed and Phase 2's worker
+    rebuild could have been written straight onto that line. Rejecting too much is round 3's,
+    where ``from log_foundry.sinks import base`` — an import FR-006 permits — was refused
+    because the reader reduced every alias to its module.
+    """
+    for source, offends in _IMPORT_SHAPES:
+        found = _forbidden_intra_package_imports(ast.parse(source))
+        assert bool(found) is offends, f"{source} -> {found}"
 
 
 def test_the_handler_is_registered_once_for_a_double_import() -> None:
