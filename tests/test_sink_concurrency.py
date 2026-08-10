@@ -14,9 +14,8 @@ from typing import Self
 
 import pytest
 
-from log_foundry import SinkLosses
-
 from conftest import run_concurrently
+from log_foundry import SinkLosses
 from log_foundry.sinks import _socket
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink

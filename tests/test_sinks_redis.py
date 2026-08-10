@@ -9,7 +9,6 @@ import types
 import pytest
 
 from log_foundry import SinkLosses
-
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
 

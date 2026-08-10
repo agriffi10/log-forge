@@ -6,8 +6,8 @@ import asyncio
 import atexit
 import functools
 import threading
-from dataclasses import replace
 from collections.abc import Callable
+from dataclasses import replace
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
