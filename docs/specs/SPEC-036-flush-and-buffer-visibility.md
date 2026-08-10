@@ -482,16 +482,20 @@ class Span:
     swept: bool = False       # FR-001 AC-11: set by the sweep, read by AC-11a's refusal
     closed: bool = False      # FR-004 AC-2: set at close, read by api._log at append time
 
-# src/log_foundry/worker.py
-class Health(NamedTuple):     # still a NamedTuple *here*; SPEC-034 FR-008 converts it later,
-    ...                       #   which is why SPEC-034 declares a dependency on this spec
-    orphan_lost: int = 0      # appended (FR-003); SPEC-037 appends in_span_lost after it
+# src/log_foundry/worker.py — already a frozen dataclass by SPEC-034 FR-008, which now
+# builds first, so both fields are plain appends with no index to prove
+@dataclass(frozen=True)
+class Health:
+    ...
+    orphan_lost: int = 0      # FR-003
+    in_span_lost: int = 0     # SPEC-037 AC-5c, deferred here so the pair is designed together
 
 # src/log_foundry/sinks/base.py — the optional protocol grows one member
 class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None: ...
     def close(self) -> None: ...
-    # optional, probed by name: losses(), stop_signal, and now flush()
+    # optional, probed by name: losses(), stop_signal, flush(), and
+    # discard_buffered_after_fork() (SPEC-039 FR-004)
 ```
 
 ## Implementation Phases
