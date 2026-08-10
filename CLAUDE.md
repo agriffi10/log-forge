@@ -262,6 +262,15 @@ enumeration that stops the first of those recurring: `tests/test_worker_predicat
 walks `decorator.py`'s AST and fails unless every worker question declares one of four categories
 and a reason. **Its fork FR became SPEC-039**, moved out once everything else had shipped.
 
+**SPEC-034 (the public API freeze) is Completed** — the arc's first, taken first rather than last
+so that `Health` is a frozen dataclass before two more specs append to it. Four phases: the
+signature fixes that freeze at 1.0 (`SQSSink(*, client)`, `SentrySink(client=)`, `Sink`/`Config`/
+`read_losses`/`get_baggage` exported, `stop_signal` → `log_foundry_stop_signal`); `get_config()`
+no longer handing out the live mutable singleton; `echo`/`message`/`fields` as documented reserved
+words with `fields=` as the escape hatch; and `FlushResult`/`ContinueResult` plus the
+`NamedTuple` → frozen-dataclass conversion. **Three of its four blocking findings were regressions
+it introduced and none was visible in its own diff** — see `docs/audits/HANDOFF-2026-08-10.md`.
+
 **The 2026-08-07 audit arc's build order was reversed** to `034 → 037 → 038 → 036 → 039 → 041 →
 040`, and most of it no longer blocks `v1.0.0`. Reasoning in `docs/specs/INDEX.md`; the short form
 is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later
