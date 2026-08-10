@@ -291,8 +291,8 @@ await fetch(4127)   # one trace_id; load's parent_span_id == fetch's span_id
 Emit your own structured events from inside a decorated call with the level functions
 `debug` / `info` / `warning` / `error` / `critical`. Each appends one event to the current
 span, so the whole call's logs flush together and share its `trace_id` / `span_id`. Keyword
-arguments land in the event's `fields`; the function name is captured, but arguments and
-return values never are.
+arguments land in the event's `fields` — except the three reserved names below; the function
+name is captured, but arguments and return values never are.
 
 ```python
 @lf.trace
@@ -316,6 +316,18 @@ def process_payment(user_id: int) -> str:
 - **`echo=True`** — *additionally* write a human-readable `LEVEL   message` line to the console
   (`sys.stderr` by default), synchronously, without waiting for the async flush. The event
   still rides the normal pipeline to the sink — echo never redirects.
+- **`fields={...}`** — the escape hatch. `message`, `echo` and `fields` are **reserved**: they
+  are parameters, so `info("x", echo="the payload we echoed back")` would switch on the console
+  line instead of recording a field. Pass them — and any key that is not a Python identifier —
+  through `fields=`:
+
+  ```python
+  lf.info("proxied", fields={"echo": "the payload we echoed back", "content-type": "text/json"})
+  ```
+
+  It reaches its own name too (`fields={"fields": ...}`), so every reserved word has exactly one
+  route through. A key given both ways takes the keyword's value, since `**kwargs` is what you
+  wrote at the call site and `fields=` is usually a mapping built elsewhere.
 - **Orphan logs** — a level call made with no active span is not dropped: it emits a standalone
   one-event span with a fresh `trace_id`, flushed straight to the sink.
 
