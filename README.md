@@ -505,9 +505,9 @@ A few conventions hold across every sink below:
 | Sink | Import from | Configure |
 |---|---|---|
 | `StdoutSink` | `log_foundry.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
-| `StderrSink` | `log_foundry.sinks.util` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
-| `NullSink` | `log_foundry.sinks.util` | `NullSink()` — discard everything; `.dropped` counts events |
-| `MemorySink` | `log_foundry.sinks.util` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
+| `StderrSink` | `log_foundry.sinks.stdout` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
+| `NullSink` | `log_foundry.sinks.null` | `NullSink()` — discard everything; `.dropped` counts events |
+| `MemorySink` | `log_foundry.sinks.memory` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
 
 ```python
 from log_foundry.sinks.stdout import StdoutSink

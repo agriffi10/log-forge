@@ -6,7 +6,7 @@ import json
 import sys
 from typing import TextIO
 
-__all__ = ["StdoutSink"]
+__all__ = ["StderrSink", "StdoutSink"]
 
 
 class StdoutSink:
@@ -76,3 +76,32 @@ class StdoutSink:
           Exception: Whatever the stream raises on flush.
         """
         self._stream.flush()
+
+
+class StderrSink(StdoutSink):
+    """The :class:`~log_foundry.sinks.stdout.StdoutSink` shape, defaulting to stderr (FR-004).
+
+    It writes each event as one ``json.dumps`` line and flushes, exactly like ``StdoutSink`` —
+    only the default stream differs, following the twelve-factor convention of logs on stderr
+    and app output on stdout.
+    """
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        """Binds the sink to an output stream, once, at construction.
+
+        The binding is resolved here and not re-read per write, so a later
+        ``contextlib.redirect_stderr`` is not honoured — the same property
+        :class:`~log_foundry.sinks.stdout.StdoutSink` documents (SPEC-031 FR-003), restated
+        because this override means none of that docstring is inherited.
+
+        Args:
+          stream: The stream to write to, defaulting to ``sys.stderr`` as resolved now. An
+            explicit one, such as a ``StringIO``, can be injected for capture.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        super().__init__(stream if stream is not None else sys.stderr)

@@ -1,4 +1,4 @@
-"""SPEC-008 — utility sinks: StderrSink formatting, NullSink drop-count, MemorySink ring buffer.
+"""SPEC-008/038 — utility sinks: StderrSink formatting, NullSink drop-count, MemorySink ring buffer.
 
 StderrSink is exercised through an injected ``StringIO`` (and once through ``capsys`` for the
 ``sys.stderr`` default); the other two hold no external resources, so they are tested directly.
@@ -10,7 +10,9 @@ import io
 import sys
 
 from log_foundry.sinks.base import Sink
-from log_foundry.sinks.util import MemorySink, NullSink, StderrSink
+from log_foundry.sinks.memory import MemorySink
+from log_foundry.sinks.null import NullSink
+from log_foundry.sinks.stdout import StderrSink
 
 
 class FlushCounter(io.StringIO):
