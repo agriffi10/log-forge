@@ -703,3 +703,38 @@ def test_no_config_copy_is_allocated_per_event(monkeypatch) -> None:
         model.build_event(span, "INFO", "m", fields={"i": i}, baggage={"team": "core"})
 
     assert copies == 0, f"{copies} Config copies allocated across 500 events"
+
+
+def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
+    """A new lock's real risk is what runs inside it, and that is what rots.
+
+    `_ensure_sink()` is called with `decorator._worker_lock` already held
+    (`decorator.py:235`), so the order is worker -> config and must stay one-way: anything under
+    `_config_lock` that reached back for `_worker_lock`, or blocked on I/O, would deadlock or
+    stall every configure and every zero-config log behind it. Today only `replace()` and
+    `StdoutSink()` run there, and `StdoutSink.__init__` is a single attribute assignment.
+
+    Asserted as a whitelist rather than a search for the bad case: the set of things that would
+    be unsafe is open, and the set that is currently safe is two.
+    """
+    under_lock: list[str] = []
+
+    def walk(node: ast.AST, held: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            here = held
+            if isinstance(child, ast.With) and "_config_lock" in ast.unparse(
+                child.items[0].context_expr
+            ):
+                here = True
+            if here and isinstance(child, ast.Call):
+                under_lock.append(ast.unparse(child.func))
+            walk(child, here)
+
+    source = (_ROOT / "src" / "log_foundry" / "config.py").read_text(encoding="utf-8")
+    walk(ast.parse(source), False)
+
+    assert set(under_lock) == {"replace", "StdoutSink"}, (
+        f"new work under _config_lock: {sorted(set(under_lock))}. "
+        "Anything that blocks, or that reaches for _worker_lock, deadlocks or stalls "
+        "every configure() and every zero-config log."
+    )
