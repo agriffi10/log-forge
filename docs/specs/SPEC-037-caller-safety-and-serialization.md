@@ -3,10 +3,23 @@
 **ID:** SPEC-037  
 **Status:** Draft  
 **Last Updated:** 2026-08-09  
-**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-036 — FR-001 AC-5 routes an absorbed
-**orphan** failure into the `orphan_lost` counter SPEC-036 FR-003 adds, so it cannot be built
-before it. The in-span half gets its own appended field, `in_span_lost`, decided in AC-5 rather
-than by widening 036's name after it has shipped
+**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-034 (FR-008 only)
+
+~~**Depends On:** … SPEC-036 — FR-001 AC-5 routes an absorbed **orphan** failure into the
+`orphan_lost` counter SPEC-036 FR-003 adds, so it cannot be built before it~~ — struck
+(SPEC-021). The coupling was real and it was **load-bearing on the wrong thing**: FR-001's guard
+and FR-003's `NaN` replacement are each correct with no counter at all, and neither needs a field
+on `Health` to be true. What needed 036 was the *accounting*, which is one AC out of twenty-one.
+
+So this spec builds **before** 036 and its counters follow: FR-001 AC-5 is split, and its second
+half (AC-5c) is deferred to 036, which is where `orphan_lost` is invented and where the pair can
+be designed together — the thing AC-5 argues for at length and could not have while it ran first.
+The dependency on SPEC-034 is FR-008 only, and is the reversed arc order: with `Health` a frozen
+dataclass, appending `in_span_lost` costs no index proof.
+
+This is the smallest spec in the arc, both of its fixes are local, and it clears six `xfail`
+cells — so it should be **built first of the behaviour work**, which is what decoupling it makes
+possible.
 
 ## Overview
 
@@ -89,9 +102,12 @@ same stated reason.
 - [ ] AC-3: `KeyboardInterrupt` and `SystemExit` still propagate from inside a span.
 - [ ] AC-4: The decorated function still returns its value normally, and the span still closes
       with `status=ok`.
-- [ ] AC-5: The event that could not be built is lost and counted, not silently dropped. An
-      orphan call goes to SPEC-036 FR-003's `orphan_lost`; an in-span call goes to a **second,
-      appended** field, `in_span_lost`. The alternative is widening `orphan_lost` to mean *events
+- [ ] AC-5: The event that could not be built is lost and **announced** — `_diag.absorbed`, per
+      AC-2 — not silently dropped. Counting it is AC-5c, and is deferred to SPEC-036 with the
+      counters: the guard is what makes the promise true, and it is true with or without a field
+      on `Health`. Splitting the two is what let this spec come off 036's critical path.
+- [ ] AC-5c: **Deferred to SPEC-036.** When the counters land, an orphan call goes to that spec's
+      `orphan_lost` and an in-span call to a **second, appended** field, `in_span_lost`. The alternative is widening `orphan_lost` to mean *events
       lost before reaching the worker* on both paths, and it is rejected on SPEC-026's own test —
       **whether one number would hide which fix applies.** It would: the two counters aggregate
       different failure populations. `orphan_lost` covers everything inside the orphan guard,
@@ -104,15 +120,16 @@ same stated reason.
       nor "a field already published" is offered here**: both drafts are unbuilt, and a name is
       cheap to change until it ships — a justification resting on that would be circular with
       036 FR-003 AC-3, which cites this AC in turn.
-- [ ] AC-5a: The new field carries the same obligations 036 FR-003 discharged for `orphan_lost`,
-      and this AC is the catcher for each: it is **appended**, so indices 0..9 are unchanged and
-      `tests/test_worker.py::test_existing_health_fields_keep_their_positions` needs no edit
-      beyond gaining `h[10] is h.in_span_lost` — its `len(h)` line having already moved to
-      `tests/test_orphan_sink_handoff.py::test_health_gains_no_field` under 036 FR-003 AC-10,
-      which is the test that must pin an eleventh name. `Health`'s `Attributes:` block documents
-      it; `tests/conftest.py`'s reset fixture clears it; and if the counter takes its own lock,
-      SPEC-035 FR-005 AC-2's derived fork roster picks it up — derived precisely so a lock added
-      two specs later needs no edit there.
+- [ ] AC-5a: **Moved to SPEC-036 with AC-5c.** ~~The new field carries the same obligations 036
+      FR-003 discharged for `orphan_lost`: appended, indices 0..9 unchanged,
+      `test_existing_health_fields_keep_their_positions` gaining `h[10]`, its `len(h)` line having
+      moved under 036 FR-003 AC-10…~~ — struck with the ordering (SPEC-021). Under the reversed
+      arc `Health` is already a frozen dataclass when either field lands, so there is no index to
+      prove, no `len(h)` line to relocate and no eleventh *position* to pin — only a name and a
+      docstring. What survives the move and must not be lost with it: `Health`'s `Attributes:`
+      block documents the field, `tests/conftest.py`'s reset fixture clears it, and if the counter
+      takes its own lock, SPEC-039's derived fork roster picks it up — derived precisely so a lock
+      added later needs no edit there.
 - [ ] AC-5b: The two are asserted **separately, and neither absorbs the other** — the phrasing
       036 FR-003 AC-4 already uses for `orphan_lost` against `failed_batches`. Deliberately *not*
       a criterion on their sum: with different failure populations the total is a number nobody
@@ -195,15 +212,16 @@ non-JSON sinks too.
 
 ## Data Model
 
-FR-001's counter is SPEC-036 FR-003's `orphan_lost` where the call was an orphan, and one
-appended `Health` field where it was in a span (AC-5):
+**No `Health` field is added here.** The counters are AC-5c and land with SPEC-036, against a
+`Health` that SPEC-034 FR-008 has already converted to a frozen dataclass:
 
 ```python
-# src/log_foundry/worker.py
-class Health(NamedTuple):     # still a NamedTuple here; SPEC-034 FR-008 converts it after this
-    ...                       #   spec, which is why 034 depends on this one as well as on 036
-    orphan_lost: int = 0      # appended by SPEC-036 FR-003
-    in_span_lost: int = 0     # appended here (AC-5) — eleventh field, indices 0..9 unchanged
+# src/log_foundry/worker.py — in SPEC-036, not here
+@dataclass(frozen=True)
+class Health:
+    ...
+    orphan_lost: int = 0      # SPEC-036 FR-003
+    in_span_lost: int = 0     # SPEC-037 AC-5c, added in the same spec so the pair is designed once
 ```
 
 ## API / Interface Contract
@@ -213,14 +231,12 @@ No public signature changes. Three behaviour changes a caller can observe:
 ```python
 lf.info(ValueError("x"))              # in a span: was AttributeError, now absorbed
 lf.info("m", ratio=float("nan"))      # fields: {"ratio": "<float: nan>"}, truncated: True
-len(lf.health())                      # 10 -> 11 while Health is still a NamedTuple
 ```
 
-The first two are corrections of documented promises rather than new behaviour, so neither is
-breaking in the semver sense — but the second changes what lands in the event stream, and belongs
-in the release notes. The third is observable only in the window before SPEC-034 FR-008 removes
-`len()` and unpacking altogether, and it is the reason 034's AC-2b has to account for **two**
-appended fields rather than one.
+~~`len(lf.health())` 10 -> 11~~ — struck: no field is added here, and by the time one is,
+`Health` is a dataclass with no `len()` at all. Both remaining changes are corrections of
+documented promises rather than new behaviour, so neither is breaking in the semver sense — but
+the second changes what lands in the event stream, and belongs in the release notes.
 
 ## Implementation Phases
 

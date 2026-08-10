@@ -250,6 +250,24 @@ process had exited. `@trace` now releases both at the **root** span, `reset_cont
 caller who opens no span, and `architecture.md` §5.1 states where the scope ends rather than only
 where it starts.
 
+**SPEC-035 (shutdown lifecycle) is Completed** — the two regressions SPEC-033 put on `main`, plus
+the older one under them. An orphan log concurrent with `shutdown()` replaced the sink's
+`stop_signal` with a fresh unset event — the one the drain thread was about to wait on — because
+the skip was keyed on liveness, which goes false at shutdown *entry*; a swap racing `shutdown()`
+left its new sink in the config, installed nowhere and recorded nowhere; and `shutdown()`'s
+idempotent path returned in under a millisecond without waiting for the drain it found running
+(measured: nothing delivered, sink never closed, process gone in 0.39 s). It also shipped the
+enumeration that stops the first of those recurring: `tests/test_worker_predicate_roster.py`
+walks `decorator.py`'s AST and fails unless every worker question declares one of four categories
+and a reason. **Its fork FR became SPEC-039**, moved out once everything else had shipped.
+
+**The 2026-08-07 audit arc's build order was reversed** to `034 → 037 → 038 → 036 → 039 → 041 →
+040`, and most of it no longer blocks `v1.0.0`. Reasoning in `docs/specs/INDEX.md`; the short form
+is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later
+specs to append fields as tuple members and prove indices, and then forced the freeze spec to undo
+both — and that converting first makes the arc's remaining counters, hooks and reasons additive,
+so they are free in `1.x`.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -543,6 +561,18 @@ where it starts.
   off not at all. The closer machinery moved to `_lifecycle.py` because the state must be
   process-global — a closer started before any worker existed must still be counted by
   `closing_sinks` and still granted the exit grace. (SPEC-033, arch §7, §9, §13)
+- **A worker guard asks one of four questions, and the set is enforced rather than remembered** —
+  existence, liveness, ownership, and ownership ∧ moment (`architecture.md` §9.2). The fourth is
+  new and is the one site where the arc's own "ownership, not liveness" slogan is wrong: bare
+  ownership skips the stop-signal offer for a worker whose shutdown has *finished*, leaving a live
+  sink holding a set event that can never clear, and liveness alone un-skips for the whole drain
+  and hands the drain thread an event nobody will set. Both measured. Three reviewers had each
+  named a different site, each was fixed, and a fourth shipped — so the fix is not a fifth
+  correction but `tests/test_worker_predicate_roster.py`, which derives every site from
+  `decorator.py`'s AST and fails on one that declares no category. Its subject vocabulary is
+  derived too, to a fixpoint: a function whose return value names the worker is itself a worker
+  name, or `worker = _snapshot()` rebinds a guard's category behind a neutral name with everything
+  green. A roster that hand-lists anything — sites or tokens — rots. (SPEC-035, arch §9.2)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

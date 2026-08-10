@@ -38,11 +38,14 @@ to status only — no prose.
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Completed | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
-| [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Draft | SPEC-026, SPEC-030, SPEC-033, SPEC-036, SPEC-037 |
-| [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown and Fork Lifecycle | In Progress | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
-| [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030 |
-| [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-036 |
+| [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Draft | SPEC-026, SPEC-030, SPEC-033 |
+| [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
+| [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037 |
+| [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-034 |
 | [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Draft | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
+| [SPEC-039](SPEC-039-fork-lifecycle.md) | Fork Lifecycle | Draft | SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035 |
+| [SPEC-040](SPEC-040-lifecycle-ownership.md) | Lifecycle Ownership — One Owner for the Worker and the Sink | Draft | SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039 |
+| [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | Draft | SPEC-026, SPEC-027, SPEC-038 |
 
 ## Arcs (build order)
 
@@ -156,14 +159,61 @@ Group related specs and record the order to build them in. Delete this section i
   a sink configured after `shutdown()` is never closed, and an orphan-only process never hands its
   sink a stop signal — so SPEC-027's "a shutdown cuts a backoff short" is false on this path. Build
   after 031; nothing depends on it.
-- **The 2026-08-07 pre-1.0 audit:** SPEC-034..038, recorded in
+- **The 2026-08-07 pre-1.0 audit:** SPEC-034..041, recorded in
   [`docs/audits/2026-08-07-pre-1.0.md`](../audits/2026-08-07-pre-1.0.md). Four surfaces were
   audited in parallel while preparing the `v1.0.0` tag — public API, silent data loss,
-  concurrency, and the sink family — and the tag was held. Build order is **035 → 036 → 037 →
-  034 → 038**, and it is not the numbering: SPEC-035's first two FRs are regressions SPEC-033 put
-  on `main`, so they go first and ship as their own PR. 036 and 037 close the promises the
-  README makes, and each clears `xfail` cells in `tests/test_promises.py` — `strict=True` means a
-  spec cannot land without removing the markers it fixes, which is how the audit stays honest.
-  034 is last of the behaviour work because a freeze should happen once everything else has
-  settled, and 038 is last overall because FR-011 (running the extras-backed sinks in CI) is what
-  makes two of its own FRs verifiable.
+  concurrency, and the sink family — and the tag was held. SPEC-035 shipped first and is done.
+
+  **Build order: 034 → 037 → 038 → 036 → 039 → 041 → 040.** It is not the numbering, and it is
+  **not** the order first recorded here (035 → 036 → 037 → 034 → 038). The reversal is deliberate
+  and its reasoning is in SPEC-034's header:
+
+  - **034 first, not last.** FR-008 converts `Health` from a `NamedTuple` to a frozen dataclass.
+    Scheduled last, that forced 036 and 037 each to append a field *as a tuple* and prove indices
+    0..8 unchanged, and then forced 034 to undo both — nine acceptance criteria and two test
+    rewrites that existed only to serve the ordering. Converted first, a `Health` field is a plain
+    append. FR-007's `FlushResult` moves with it for the same reason: 036 invents two new
+    `flush()` reasons and needs somewhere to put them.
+  - **037 next.** The smallest spec in the arc — a `try/except` around `api._log`'s in-span branch
+    and a `math.isfinite` check in `sanitize` — and it clears six `xfail` cells. It was third only
+    because of a counter it borrowed from 036; that borrowing is now split out (its AC-5c), so it
+    is buildable on its own.
+  - **038 before 036.** Independent of everything else here, ten one-file fixes, and FR-001 is a
+    measured 5,980-event `emit` that abandons the whole exit backlog. Nothing about it needs to
+    wait.
+  - **036 after 034 and 037**, from which it takes the dataclass, the result type and 037's
+    deferred counter. It is the largest and riskiest spec in the arc — FR-001's span sweep has
+    twelve criteria and three landmines the spec found itself — so it goes after the cheap work
+    rather than in front of it. Its FR-005 (a dead `MultiSink` child, invisible to `health()`) and
+    its AC-1a (the README recipe) are Phase 0 and shippable before any of that.
+  - **039 (fork) and 041 (sink integration)** are independent of the rest and of each other.
+  - **040 last, and not before `1.0.0`.** It is a behaviour-preserving refactor of the lifecycle
+    state, and the arc above is what happens when that state is edited.
+
+  **The 1.0 cut line.** Most of this arc does **not** have to precede the tag, and that follows
+  from taking 034 first: with `Health` a frozen dataclass and the `Sink` members probed by name,
+  every remaining counter, hook and reason is *additive* and free in `1.x`. What genuinely freezes
+  at 1.0 is **SPEC-034 entire**, plus **SPEC-038 FR-012** (`RotatingFileSink`'s default) and
+  **FR-013** (the utility sinks' module). Everything else is urgent because it is data loss, not
+  because of the tag — a distinction worth keeping, because treating the whole arc as
+  release-blocking is how a tag stays held indefinitely.
+
+  `tests/test_promises.py` remains the harness that keeps the audit honest: `strict=True` means a
+  spec cannot land without removing the `xfail` markers it fixes.
+
+- **Fork:** SPEC-039 — was SPEC-035 FR-005, moved to its own spec once that spec's other five FRs
+  had shipped. `os.fork()` is unhandled anywhere in the tree: the child inherits a worker whose
+  thread does not exist, and sink locks held by a thread that does not exist — **19 of 60 forked
+  children hung permanently** inside `FileSink.emit`, on the application's own thread. It is the
+  largest single piece of the audit arc and the only one needing a new module, which is why
+  holding SPEC-035 open for it was costing more than the split. Its four prepared measurements
+  moved with it and must not be re-derived.
+
+- **Lifecycle ownership:** SPEC-040 — the only spec here that fixes no bug. `decorator.py` owns
+  the process's delivery lifecycle in seven loose globals with no state machine over them, and
+  seven pieces of work have now come out of that one fact (SPEC-030, SPEC-031 FR-006, SPEC-033,
+  audit C1 and C2, SPEC-035 FR-001/003, and SPEC-035 FR-002's roster). The roster is the right
+  response to a defect that recurs at *sites* and it works — it caught a regression during its own
+  review — but it makes the absence of a state machine survivable rather than removing it. Built
+  after `1.0.0`: it is behaviour-preserving by construction, so it is the one thing here with no
+  reason to be rushed.

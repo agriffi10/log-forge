@@ -3,10 +3,16 @@
 **ID:** SPEC-036  
 **Status:** Draft  
 **Last Updated:** 2026-08-09  
-**Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030  
-**Sequenced after:** SPEC-035 — ordering only. Nothing here needs any of 035's FRs; the one real
-coupling runs the other way, since 035 FR-005's fork lock roster must pick up the counter lock
-FR-003 adds, which is why that roster is derived rather than listed.
+**Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034 (FR-007, FR-008), SPEC-037  
+**Sequenced after:** SPEC-034 and SPEC-037 under the reversed arc order. From 034 it needs
+`Health` already a frozen dataclass (FR-008), so FR-003's counter is a plain append, and
+`FlushResult` already in place (FR-007), so the two reasons FR-001 and FR-002 invent have
+somewhere to go. From 037 it inherits AC-5c — the `in_span_lost` counter that spec deferred here
+so the pair is designed once, in the spec that invents `orphan_lost`.
+
+~~Sequenced after SPEC-035 — ordering only… 035 FR-005's fork lock roster must pick up the
+counter lock FR-003 adds~~ — the roster moved to SPEC-039 with the fork FR; it is still derived,
+and still for this reason.
 
 ## Overview
 
@@ -31,6 +37,28 @@ submission into its private `pending`.
 
 This generalises well beyond Lambda. Any long-lived span — a consumer loop, a server `main`
 wrapped in `@trace` — buffers indefinitely with every surface reading clean.
+
+**The recipe itself is separable from the defect, and the two are deliberately not traded for
+each other.** `flush()` is inside the `@trace`d handler because that is where the README puts it;
+moving it *outside* the span — wrapping the traced function rather than decorating the handler —
+closes the published recipe in documentation, with no runtime change:
+
+```python
+def handler(event, context):          # not decorated
+    try:
+        return _handler(event, context)   # @lf.trace — the span closes here
+    finally:
+        drained = lf.flush()
+```
+
+That is worth doing **and is not a substitute for FR-001**, on two grounds. It fixes one published
+example while leaving every other long-lived span — a consumer loop, a server `main` — buffering
+with every surface reading clean, which is the general defect. And it makes the library's
+correctness depend on the caller having read a paragraph, which is the standard SPEC-025 and
+SPEC-030 both refused. So: the doc change is **FR-001 AC-1a**, taken first because it is free and
+because it stops the wrong example being copied while the rest is built; AC-1 still requires the
+in-span form to work, and after the doc change AC-1 tests a recipe the README no longer publishes,
+which AC-1a states so a later reader does not delete it as dead.
 
 The other two are the same shape one layer down: a sink that buffers in its *client*
 (`KafkaSink`, `GooglePubSubSink` both flush only in `close()`) is unreachable through `flush()`
@@ -148,6 +176,17 @@ whole call would therefore drop a baggage merge SPEC-014 decided must survive a 
 failure — trading wrong data for lost data. The refusal covers `set_adopted_context` and the
 re-parent; the baggage merge runs as it does today.
 
+**A third design was considered and not taken: splitting `Span.events` into a pending buffer and
+a full record.** Three of this FR's landmines exist because one list is simultaneously the queue's
+payload, SPEC-015's backfill target and SPEC-014's re-parent target, and a `pending`/`record`
+split would dissolve AC-4's outright — `pending` is what gets handed over and cleared, so nothing
+can destroy a list the worker holds. It is recorded rather than adopted because it does **not**
+reach the other two: both the backfill and the re-parent *mutate* events, and once an event has
+been submitted SPEC-028's contract forbids touching it, whichever list it is also in. So AC-5's
+backfill-at-sweep and AC-11a's refusal survive the split intact, and the change would buy one trap
+for a second copy of every event on the hot path. Worth re-opening only if a fourth consumer of
+`span.events` appears, which is what would tip it.
+
 **A sweep reaches only the calling context's spans**, which is the honest bound: `contextvars`
 gives no way to enumerate other threads' or tasks' contexts. That must be stated rather than
 implied, since a `flush()` in a handler that fanned out to tasks will not reach them.
@@ -155,7 +194,13 @@ implied, since a `flush()` in a handler that fanned out to tasks will not reach 
 #### Acceptance Criteria:
 
 - [ ] AC-1: The README's serverless recipe, run verbatim, delivers every event before the handler
-      returns. This is the headline case and is a test, not an example.
+      returns. This is the headline case and is a test, not an example. It keeps the **in-span**
+      form regardless of AC-1a, because that form is what a caller will write anyway.
+- [ ] AC-1a: The README's recipe moves `flush()` outside the traced span (see the Overview), as
+      its own commit, **first**. It is free, it stops the wrong shape being copied while the rest
+      of this spec is built, and it is explicitly *not* a substitute for AC-1 — the in-span case
+      stays a test after the example stops publishing it, which this AC records so it is not later
+      removed as dead.
 - [ ] AC-2: `flush()` inside a nested span drains **every** open span in the stack, not only the
       innermost.
 - [ ] AC-3: The span stays open and usable: events emitted after the flush still land, and the
@@ -261,15 +306,32 @@ worker abandoned after spending a retry budget, and delivery continues after it;
 batch, no retry and no worker. Not `SinkLosses` — the sink did not absorb anything, it raised,
 which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see Out of Scope).
 
+**It gains a second field with it: `in_span_lost`, SPEC-037's AC-5c.** That spec builds first
+under the reversed order and ships the *guard* — an unguarded `build_event` inside a span can fail
+the caller — while deferring the counting here, so the two are designed as a pair in the spec that
+invents the vocabulary rather than one per spec with a name negotiated across two drafts. The
+distinction they preserve is SPEC-026's test, *would one number hide which fix applies*:
+`orphan_lost` covers everything inside the orphan guard, including a failing `sink.emit`, so it
+climbing means **the destination or the data**; the in-span path cannot lose an event at `emit`
+(that is `failed_batches`), so `in_span_lost` climbing means **the data**, always. Different
+remediation, two fields.
+
 #### Acceptance Criteria:
 
 - [ ] AC-1: Five `info()` calls with no span against a sink whose `emit` raises leave
       `health().orphan_lost == 5`.
+- [ ] AC-1a: `in_span_lost` lands here too, discharging SPEC-037 AC-5c: five `info(ValueError(…))`
+      calls **inside** a span leave `health().in_span_lost == 5`, and the two counters are
+      asserted separately with neither absorbing the other (037 AC-5b). Deliberately not a
+      criterion on their sum — with different failure populations the total is a number nobody can
+      act on, and pinning it would teach a later reader they are two halves of one counter.
 - [ ] AC-2: `flush()` is unchanged — it still returns `True` in that process, and a test pins
       that, with a comment naming SPEC-021 so a later reader does not "fix" it.
-- [ ] AC-3: The new field is **appended** to `Health`, so every existing field keeps its index;
-      `Health._fields[:9]` is unchanged. The name is **path-scoped, and that is a decision, not a
-      default**: SPEC-037 FR-001 AC-5 needs a counter for the in-span path and appends its own
+- [ ] AC-3: The new field is **appended** to `Health`. ~~so every existing field keeps its index;
+      `Health._fields[:9]` is unchanged~~ — struck with the arc's reversed order (SPEC-021):
+      SPEC-034 FR-008 has converted `Health` to a frozen dataclass by the time this lands, so
+      there is no index to keep and the append is exactly a new attribute and a docstring line.
+      The name is **path-scoped, and that is a decision, not a default**: SPEC-037 FR-001 AC-5 needs a counter for the in-span path and appends its own
       (`in_span_lost`) rather than widening this one, because the two aggregate different failure
       populations and so fail SPEC-026's "would one number hide which fix applies" test. That
       reasoning lives in 037 AC-5, which is where the second field is added; this AC records the
@@ -284,10 +346,14 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
       matters is `_get_worker` across `Worker(_ensure_sink())`. A dedicated lock also cannot
       deadlock here: the increment sits in `api._log`'s `except`, where `_note_orphan_emit` has
       already released `_worker_lock` and the propagating exception has released any sink lock.
-- [ ] AC-5a: That lock is covered by SPEC-035 FR-005 AC-2's fork roster. That roster is derived
-      rather than listed precisely so a lock added later is picked up; this AC is the catcher on
-      *this* side of the handoff, since 036 is built after 035 and nothing in 035 can know about a
-      lock that did not exist yet.
+- [ ] AC-5a: That lock is covered by **SPEC-039 FR-003**'s fork roster (was SPEC-035 FR-005
+      AC-2, which moved with the fork FR). That roster is derived rather than listed precisely so
+      a lock added later is picked up, and SPEC-039 FR-003 AC-3 proves the derivation reaches
+      every lock shape in `src/`. This AC is the catcher on *this* side of the handoff — and it
+      now binds in **both** directions, since the two specs may be built in either order.
+
+      If this spec lands first, SPEC-039's completeness proof must cover the new lock with no edit
+      there. If SPEC-039 lands first, this AC is what makes someone check.
 - [ ] AC-6: A loss anywhere inside the orphan guard counts — a sink that fails to *construct* or
       an event that fails to build, not only a failing `emit` — since `api._log` wraps all three
       and the event is lost either way. A test covers the construction failure specifically,
@@ -300,8 +366,10 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
 - [ ] AC-10: **SPEC-033 FR-006 AC-5 ("No field is added to `Health`") is superseded**, struck
       through in place and marked with this spec per SPEC-021's rule, in the spec, in
       `architecture.md` §13, and in `tests/test_orphan_sink_handoff.py::test_health_gains_no_field`
-      — which is **rewritten** to pin the tenth field and the unchanged first nine indices, not
-      deleted. `tests/test_worker.py`'s `len(h) == 9` assertion moves with it.
+      — which is **rewritten** to pin the field set by name, not deleted. ~~to pin the tenth field
+      and the unchanged first nine indices … `tests/test_worker.py`'s `len(h) == 9` assertion
+      moves with it~~ — struck: SPEC-034 FR-008 has already rewritten both tests off positions and
+      `len()` by the time this builds, which is the whole reason it now builds first.
 - [ ] AC-11: `Health`'s own `Attributes:` block documents the field, as every appended field
       before it does.
 - [ ] AC-12: Every surface that currently states this loss is counted nowhere is corrected:
@@ -312,9 +380,15 @@ which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see 
 - [ ] AC-13: `tests/conftest.py`'s reset fixture clears the counter alongside the SPEC-031/033
       flags. Its docstring already names the failure this prevents: state leaking into every later
       test.
-- [ ] AC-14: **The README PR (`docs/readme-1.0`) merges before this spec is built.** All the README
-      criteria above target text that PR rewrites, and one of them ("silence is not success
-      anywhere") exists only there.
+- [ ] AC-14: The README criteria above are satisfied against **whatever `main`'s README says at
+      build time**. ~~The README PR (`docs/readme-1.0`) merges before this spec is built.~~ —
+      struck (SPEC-021). It was written when that PR was days old; it has now been a **draft since
+      2026-08-07**, and its own description records a fact-check that found three false claims in
+      it, so it is not a merge waiting to happen. A hard gate on an unmerged draft is a spec that
+      cannot start, which is what it became. If the PR has merged by then, the text it introduces
+      is what these criteria apply to — including "silence is not success anywhere", which exists
+      only there and is then in scope; if it has not, they apply to the current text and the
+      omission is recorded for that PR rather than blocking this one.
 - [ ] AC-15: Each assertion is mutation-tested.
 - [ ] AC-16: `tests/test_promises.py`'s `orphan` and `post_shutdown` loss-visibility cells lose
       their `xfail` markers, which `strict=True` forces.
@@ -423,26 +497,41 @@ class Span:
     swept: bool = False       # FR-001 AC-11: set by the sweep, read by AC-11a's refusal
     closed: bool = False      # FR-004 AC-2: set at close, read by api._log at append time
 
-# src/log_foundry/worker.py
-class Health(NamedTuple):     # still a NamedTuple *here*; SPEC-034 FR-008 converts it later,
-    ...                       #   which is why SPEC-034 declares a dependency on this spec
-    orphan_lost: int = 0      # appended (FR-003); SPEC-037 appends in_span_lost after it
+# src/log_foundry/worker.py — already a frozen dataclass by SPEC-034 FR-008, which now
+# builds first, so both fields are plain appends with no index to prove
+@dataclass(frozen=True)
+class Health:
+    ...
+    orphan_lost: int = 0      # FR-003
+    in_span_lost: int = 0     # SPEC-037 AC-5c, deferred here so the pair is designed together
 
 # src/log_foundry/sinks/base.py — the optional protocol grows one member
 class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None: ...
     def close(self) -> None: ...
-    # optional, probed by name: losses(), stop_signal, and now flush()
+    # optional, probed by name: losses(), stop_signal, flush(), and
+    # discard_buffered_after_fork() (SPEC-039 FR-004)
 ```
 
 ## Implementation Phases
 
+### Phase 0: FR-005 and FR-001 AC-1a — the two that need nothing else
+
+**FR-005 (the dead `MultiSink` child) depends on no other FR here and closes real, permanent,
+total loss to one destination.** It was Phase 4 because it is small, which is the wrong reason to
+schedule something last: a destination that has delivered nothing since the process started, with
+`flush()` returning `True` and `health()` reading all zeros, does not become less urgent for being
+cheap to fix. It is shippable as its own PR before any of the rest, and if the sweep work slips it
+has still landed. AC-1a rides with it for the same reason — a documentation commit that stops the
+wrong recipe being copied.
+
 ### Phase 1: FR-004's detach-at-submit, then FR-003
 
-The detach comes **first in the whole spec**, not fourth: FR-001's sweep is unsafe without it,
+The detach comes **first of the sweep work**, not fourth: FR-001's sweep is unsafe without it,
 because clearing a buffer the worker was handed by reference destroys the events. FR-003 (the
-orphan counter, carried from SPEC-034 and already reviewed) rides with it and clears two `xfail`
-cells, proving the harness's `strict=True` mechanism end to end.
+orphan counter, carried from SPEC-034 and already reviewed) rides with it, together with SPEC-037
+AC-5c's `in_span_lost` — the two are designed as a pair here rather than one per spec — and clears
+two `xfail` cells, proving the harness's `strict=True` mechanism end to end.
 
 ### Phase 2: FR-001 — the span sweep
 
@@ -451,8 +540,8 @@ first — those are the three a wrong implementation passes the rest of the ACs 
 
 ### Phase 3: FR-002 — the `Sink` flush hook
 
-### Phase 4: FR-005, and FR-004's closed-span detection
+### Phase 4: FR-004's closed-span detection
 
 FR-004 is split across the plan on purpose — its detach is Phase 1 because FR-001 is unsafe
 without it, but its append-time closed-span routing (AC-2) and the `architecture.md` §5 entry
-(AC-5) belong here, with the rest of the reporting work.
+(AC-5) belong here, with the rest of the reporting work. ~~FR-005~~ moved to Phase 0.
