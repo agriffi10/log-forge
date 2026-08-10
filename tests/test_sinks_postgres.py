@@ -204,3 +204,80 @@ def test_an_abandoned_insert_never_reprints_the_event(capsys) -> None:
     assert "lost 1 event(s)" in err, "and the count it cost"
     assert sink.failed == 1
     assert err.count("\n") == 1
+
+
+# --- SPEC-038 FR-002: a rollback that raises must not hijack the error path ---------------
+
+
+class RollbackRaisesConnection(FakeConnection):
+    """A connection whose session the server has closed: the insert fails, and so does the undo.
+
+    This is the common case, not a contrived one -- when the server closes the session, psycopg
+    raises from `rollback()` for the same reason it raised from the insert. AC-3 asks for exactly
+    this double, so the FR closes without a running Postgres.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(fail_times=-1)
+
+    def rollback(self) -> None:
+        # A *distinct* type from the insert's RuntimeError, so the assertions below can tell
+        # which exception the diagnostic and the raise actually describe. With both the same
+        # type the tests passed whichever one won, which is no test at all.
+        self.rollbacks += 1
+        raise TypeError("the server closed this session")
+
+
+def test_a_rollback_that_raises_does_not_consume_the_remaining_attempts() -> None:
+    """AC-1. Measured before the fix: attempts dropped from 4 to 1."""
+    conn = RollbackRaisesConnection()
+    sink = PostgresSink("logs", connection=conn, max_retries=3)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": 1}])
+    assert len(conn.executemany_calls) == 4, "one initial attempt plus three retries"
+    assert conn.rollbacks == 4, "each failed attempt still tries to undo its transaction"
+
+
+def test_a_total_failure_still_counts_announces_and_raises_the_sink_error(capsys) -> None:
+    """AC-2. Before the fix: `failed` stayed 0, no `lost` line, and a raw RuntimeError escaped."""
+    conn = RollbackRaisesConnection()
+    sink = PostgresSink("logs", connection=conn, max_retries=1)
+    with pytest.raises(SinkDeliveryError, match="inserted none of 3 event"):
+        sink.emit([{"i": i} for i in range(3)])
+    assert sink.failed == 3
+    assert sink.losses().failed == 3
+    err = capsys.readouterr().err
+    assert "lost 3 event(s)" in err
+    assert "RuntimeError" in err, "the diagnostic names the *insert's* failure"
+    assert "TypeError" not in err.split("lost 3 event(s)")[1], (
+        "the rollback's own failure must not displace the one being handled"
+    )
+    assert "the server closed this session" not in err, "the type, never the driver's message"
+
+
+def test_the_failing_rollback_is_announced_as_absorbed_by_type(capsys) -> None:
+    conn = RollbackRaisesConnection()
+    sink = PostgresSink("logs", connection=conn, max_retries=0)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": 1}])
+    err = capsys.readouterr().err
+    assert "PostgresSink.rollback" in err
+    assert "TypeError" in err, "named by the rollback's own type, distinct from the insert's"
+    assert "closed this session" not in err
+
+
+def test_the_original_insert_failure_is_what_the_diagnostic_names() -> None:
+    """The rollback's exception must not displace the failure actually being handled."""
+    conn = RollbackRaisesConnection()
+    sink = PostgresSink("logs", connection=conn, max_retries=0)
+    with pytest.raises(SinkDeliveryError) as caught:
+        sink.emit([{"i": 1}])
+    assert caught.value.__cause__ is None, "raised `from None`, as before"
+
+
+def test_a_healthy_rollback_path_is_unchanged() -> None:
+    """The guard must not change what happens when the rollback works, which is the normal case."""
+    conn = FakeConnection(fail_times=1)
+    sink = PostgresSink("logs", connection=conn, max_retries=2)
+    sink.emit([{"i": 1}])
+    assert conn.rollbacks == 1 and conn.commits == 1 and sink.failed == 0

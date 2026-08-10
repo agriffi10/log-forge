@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -115,3 +117,400 @@ def test_a_batch_every_event_of_which_was_refused_still_raises() -> None:
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"a": 2}])
     assert sink.losses() == SinkLosses(dropped=2, failed=0)
+
+
+# --- SPEC-038 FR-004: the futures are reaped, and the pending list is bounded -------------
+
+
+class PollableFuture(FakeFuture):
+    """A future that reports its own state, as a real Pub/Sub future does.
+
+    `FakeFuture` above deliberately has no `done()`, which is what pins the "cannot poll" branch
+    of `_has_settled`; this one exercises the branch a real client takes.
+    """
+
+    def __init__(self, error: Exception | None = None, *, settled: bool = True) -> None:
+        super().__init__(error)
+        self._settled = settled
+        self.resolved = 0
+
+    def done(self) -> bool:
+        return self._settled
+
+    def settle(self) -> None:
+        self._settled = True
+
+    def result(self, timeout=None) -> str:
+        self.resolved += 1
+        return super().result(timeout)
+
+
+class PollablePublisher:
+    """A publisher handing out futures a test controls the settlement of."""
+
+    def __init__(self, factory) -> None:
+        self.futures: list[PollableFuture] = []
+        self._factory = factory
+
+    def publish(self, topic, data=None, **attrs) -> PollableFuture:
+        future = self._factory(len(self.futures))
+        self.futures.append(future)
+        return future
+
+
+def test_a_settled_future_is_reaped_by_the_next_emit_not_held_until_close() -> None:
+    """AC-1. The list must not grow with events the client has already finished with."""
+    client = PollablePublisher(lambda _i: PollableFuture(settled=True))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink._futures == [], "a settled future is resolved and released during emit"
+    assert all(future.resolved == 1 for future in client.futures)
+
+
+def test_an_outage_is_visible_in_losses_while_it_is_happening() -> None:
+    """AC-1. Before FR-004 `failed` stayed 0 and `health()` read clean through a whole outage."""
+    client = PollablePublisher(lambda _i: PollableFuture(RuntimeError("unavailable")))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"a": i} for i in range(5)])
+    assert sink.losses() == SinkLosses(dropped=0, failed=5), (
+        "the failures are counted without waiting for close()"
+    )
+
+
+def test_an_unsettled_future_is_kept_and_resolved_once_it_settles() -> None:
+    client = PollablePublisher(lambda _i: PollableFuture(settled=False))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"a": 1}])
+    assert len(sink._futures) == 1, "an in-flight publish is not waited on"
+    assert client.futures[0].resolved == 0
+    client.futures[0].settle()
+    sink.emit([{"a": 2}])
+    assert client.futures[0].resolved == 1, "the next emit reaps what has since settled"
+
+
+def test_the_pending_list_does_not_grow_with_total_events_logged() -> None:
+    """AC-4. Asserts the list length under sustained load, not the shape of the code."""
+    client = PollablePublisher(lambda _i: PollableFuture(settled=False))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=50)
+    lengths = []
+    for _ in range(100):
+        sink.emit([{"a": 1}] * 10)
+        lengths.append(len(sink._futures))
+    assert len(client.futures) == 1000, "the load really was sustained"
+    assert max(lengths) <= 50, f"the pending list exceeded its bound: {max(lengths)}"
+    assert lengths[-1] == lengths[len(lengths) // 2], "and it is flat, not merely capped once"
+
+
+def test_at_the_bound_emit_waits_on_the_oldest_rather_than_dropping_it() -> None:
+    """AC-2. The event is already with the client, so discarding it here would invent a loss."""
+    client = PollablePublisher(lambda _i: PollableFuture(settled=False))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=3)
+    sink.emit([{"a": i} for i in range(5)])
+    assert [future.resolved for future in client.futures] == [1, 1, 0, 0, 0], (
+        "the two oldest were waited on; the newest three stay outstanding"
+    )
+    assert len(sink._futures) == 3
+    assert sink.failed == 0, "waiting on a future that succeeds is not a loss"
+
+
+def test_a_future_whose_done_raises_is_resolved_rather_than_held_forever() -> None:
+    class BrokenState(PollableFuture):
+        def done(self) -> bool:
+            raise RuntimeError("state unavailable")
+
+    client = PollablePublisher(lambda _i: BrokenState(settled=False))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"a": 1}])
+    assert sink._futures == [], "a future that cannot report its state does not occupy the bound"
+    assert client.futures[0].resolved == 1
+
+
+def test_close_still_resolves_whatever_is_left_outstanding() -> None:
+    """AC-3. The reap narrows what close has to do; it must not replace it."""
+    client = PollablePublisher(lambda _i: PollableFuture(RuntimeError("boom"), settled=False))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=100)
+    sink.emit([{"a": i} for i in range(4)])
+    assert sink.failed == 0 and len(sink._futures) == 4
+    sink.close()
+    assert sink.failed == 4
+    assert sink._futures == []
+
+
+class SettlingFuture(PollableFuture):
+    """A future that reports done() False once, then True — a real driver state transition.
+
+    `PollableFuture` above answers from a stable flag, so both halves of a two-pass partition
+    always agree and the race below is invisible to it. This one flips on query, which is what a
+    Pub/Sub client's commit thread does mid-scan.
+    """
+
+    def __init__(self, error: Exception | None = None, *, settle_after: int = 1) -> None:
+        super().__init__(error, settled=False)
+        self.queries = 0
+        self._settle_after = settle_after
+
+    def done(self) -> bool:
+        self.queries += 1
+        return self.queries > self._settle_after
+
+
+def test_a_future_that_settles_mid_scan_is_never_dropped() -> None:
+    """Every future is resolved or retained — never neither. FR-004's own defect, reintroduced.
+
+    Partitioning with two comprehensions queried `done()` twice per future, so one settling
+    between the queries landed in neither list: not resolved, and dropped by the reassignment.
+    Measured, five failed publishes vanished with `losses()` reading clean, and under a thread
+    race 41% of failures went uncounted — the silent loss this method exists to end.
+
+    The assertion is conservation rather than a count, because how many futures settle mid-scan
+    is a race. Conservation holds whichever way the race falls; a count would not.
+    """
+    client = PollablePublisher(lambda _i: SettlingFuture(RuntimeError("publish failed")))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"i": i} for i in range(5)])
+
+    resolved_now = sum(1 for future in client.futures if future.resolved)
+    assert resolved_now + len(sink._futures) == 5, (
+        f"{5 - resolved_now - len(sink._futures)} future(s) were neither resolved nor retained"
+    )
+    sink.close()
+    assert all(future.resolved == 1 for future in client.futures), (
+        "and close() reaches every one of them, exactly once"
+    )
+    assert sink.failed == 5
+
+
+def test_the_reap_asks_each_future_for_its_state_once() -> None:
+    """The property that makes the conservation above hold, pinned directly.
+
+    A second query is a second chance for the answer to change, and the partition cannot act on
+    two different answers about one future.
+    """
+    client = PollablePublisher(lambda _i: SettlingFuture(settle_after=99))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"i": 0}])
+    assert [future.queries for future in client.futures] == [1]
+
+
+def test_an_overflow_wait_that_expires_puts_the_publish_back_rather_than_losing_it() -> None:
+    """AC-2 + SPEC-027. The wait runs on the drain thread, so it is bounded — and a bound that
+    discarded the publish would invent the loss AC-2 chose waiting to avoid.
+    """
+
+    class NeverSettles(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.waits: list[float | None] = []
+
+        def result(self, timeout=None):
+            self.waits.append(timeout)
+            raise TimeoutError("still in flight")
+
+    client = PollablePublisher(lambda _i: NeverSettles())
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=2, overflow_timeout=0.01)
+    sink.emit([{"i": i} for i in range(5)])
+
+    assert all(
+        all(w is not None and w <= 0.01 for w in future.waits)
+        for future in client.futures
+        if future.waits
+    ), "every wait is bounded by what is left of the emit's deadline, never indefinite"
+    assert len(sink._futures) == 5, "an unfinished publish is retained, not dropped"
+    assert sink.failed == 0, "an expired wait is not a failure; the publish is unfinished"
+
+
+def test_a_shutdown_defers_the_overflow_wait_to_close_rather_than_blocking_the_drain() -> None:
+    """The stop signal skips the *wait*, not the work: close() still resolves everything.
+
+    This is the opposite of the mistake FR-001 made — skipping delivery during the exit drain
+    loses events, while deferring a wait to close() loses nothing, because close() is where an
+    exit-time wait belongs.
+    """
+    import threading
+
+    class NeverSettles(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.waits: list[float | None] = []
+
+        def result(self, timeout=None):
+            self.waits.append(timeout)
+            if timeout is not None:
+                raise TimeoutError("still in flight")
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: NeverSettles())
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=1)
+    signal = threading.Event()
+    signal.set()
+    sink.log_foundry_stop_signal = signal
+    sink.emit([{"i": i} for i in range(4)])
+    assert all(future.waits == [] for future in client.futures), "no waiting while stopping"
+    assert len(sink._futures) == 4, "everything is retained for close()"
+    sink.close()
+    assert all(future.waits == [None] for future in client.futures), "close waits unbounded"
+
+
+def test_a_bound_of_zero_is_floored_so_publishing_does_not_become_synchronous() -> None:
+    assert GooglePubSubSink("projects/p/topics/t", client=FakePublisher(), max_pending=0).max_pending == 1
+
+
+def test_the_reap_runs_even_when_every_publish_was_refused() -> None:
+    """The reap is before the total-failure raise, so a wholly-refused batch still trims."""
+
+    class Refusing:
+        def __init__(self, held): self._held = held
+        def publish(self, topic, data=None, **attrs):
+            raise RuntimeError("refused")
+
+    settled = PollableFuture(settled=True)
+    sink = GooglePubSubSink("projects/p/topics/t", client=Refusing(settled))
+    sink._futures.append(settled)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert settled.resolved == 1, "the earlier settled future was reaped despite the raise"
+    assert sink._futures == []
+
+
+class StalledFuture(PollableFuture):
+    """Never settles, and honours a timeout by sleeping it out — as a real future would."""
+
+    def __init__(self) -> None:
+        super().__init__(settled=False)
+        self.waits: list[float | None] = []
+
+    def result(self, timeout=None):
+        self.waits.append(timeout)
+        if timeout is None:
+            return "message-id"
+        time.sleep(timeout)
+        raise TimeoutError("still in flight")
+
+
+def test_the_overflow_wait_is_bounded_per_emit_not_per_future() -> None:
+    """SPEC-027. A per-future timeout is not a bound: it multiplies by the number over the limit.
+
+    Measured before the fix: 2.07 s for ten futures at a 0.2 s timeout, which at the shipped
+    30 s default is five minutes of the single drain thread inside one `emit`.
+
+    The budget is deliberately loose relative to the operation — the point is that ~10x the
+    per-future timeout must NOT be reachable, so a generous ceiling still fails the old code.
+    """
+    client = PollablePublisher(lambda _i: StalledFuture())
+    sink = GooglePubSubSink("t", client=client, max_pending=2, overflow_timeout=0.05)
+    start = time.monotonic()
+    sink.emit([{"i": i} for i in range(12)])
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.05 * 4, (
+        f"one deadline covers the whole overflow pass; blocked {elapsed:.2f}s for 10 over the "
+        f"limit at a 0.05s budget"
+    )
+
+
+def test_a_shutdown_landing_mid_wait_stops_the_remaining_waits() -> None:
+    """The stop signal is re-read each time round, not once before the loop.
+
+    Read once, a shutdown arriving after the first future was not noticed until every one had
+    been waited on — measured at 5.04 s for a signal set 0.3 s in.
+    """
+    client = PollablePublisher(lambda _i: StalledFuture())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=10.0)
+    signal = threading.Event()
+    sink.log_foundry_stop_signal = signal
+    threading.Timer(0.05, signal.set).start()
+    start = time.monotonic()
+    sink.emit([{"i": i} for i in range(6)])
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"the shutdown must cut the remaining waits short; blocked {elapsed:.2f}s"
+    assert len(sink._futures) == 6, "and everything is retained for close()"
+
+
+def test_a_future_whose_result_takes_no_timeout_is_not_counted_as_lost() -> None:
+    """`client=` is a frozen public parameter, so a future without a timeout kwarg is reachable.
+
+    Counting it invented loss on publishes that were going to succeed: three of four healthy
+    ones reported `failed` with a TypeError line. It is put back and resolved unbounded at
+    `close()` instead.
+    """
+
+    class NoTimeoutFuture:
+        def __init__(self) -> None:
+            self.resolved = 0
+
+        def done(self) -> bool:
+            return False
+
+        def result(self):  # no timeout parameter at all
+            self.resolved += 1
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: NoTimeoutFuture())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.01)
+    sink.emit([{"i": i} for i in range(4)])
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "no invented loss"
+    sink.close()
+    assert sink.failed == 0, "and they resolve cleanly once close() waits unbounded"
+    assert all(future.resolved == 1 for future in client.futures)
+
+
+def test_the_slice_loop_does_not_spin_when_a_bounded_wait_fails_instantly() -> None:
+    """SPEC-027 again. A slice the future does not consume must still be waited out.
+
+    Nothing obliges `result(timeout=)` to block for its timeout: a client that raises
+    `TimeoutError` immediately turned the slice loop into a hot spin — measured at 3.5 million
+    `result()` calls and a pegged core for one second, which is thirty at the shipped default,
+    on the worker's single drain thread with no delivery happening. The remainder of each slice
+    now goes through `_retry.wait`, which is where SPEC-027 says a sink's waiting belongs and
+    which the first version of this loop bypassed.
+
+    Asserted on **CPU** time, not wall time: the wall bound was already correct while the loop
+    was spinning, so a wall-clock assertion cannot see this at all.
+    """
+
+    class InstantlyExpiring(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.calls = 0
+
+        def result(self, timeout=None):
+            self.calls += 1
+            if timeout is None:
+                return "message-id"
+            raise TimeoutError("instant")
+
+    client = PollablePublisher(lambda _i: InstantlyExpiring())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.3)
+    cpu = time.process_time()
+    sink.emit([{"i": i} for i in range(4)])
+    burned = time.process_time() - cpu
+    calls = sum(future.calls for future in client.futures)
+    assert burned < 0.1, f"the slice loop spun: {burned:.3f}s of CPU for a 0.3s bounded wait"
+    assert calls < 100, f"and it made {calls} result() calls where a handful should do"
+
+
+def test_an_unboundable_future_is_put_back_at_once_rather_than_waited_out() -> None:
+    """A future whose `result()` takes no timeout cannot succeed under a bounded call.
+
+    Retrying it every slice until the deadline is a pointless wait on the drain thread, so it
+    breaks out immediately — distinct from "not settled yet", which must keep waiting.
+    """
+
+    class NoTimeout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def done(self) -> bool:
+            return False
+
+        def result(self):
+            self.calls += 1
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: NoTimeout())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=5.0)
+    start = time.monotonic()
+    sink.emit([{"i": i} for i in range(3)])
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"an unboundable future must not be waited out; took {elapsed:.2f}s"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "and it is not counted as lost"
+    assert len(sink._futures) == 3, "it is put back for close()"

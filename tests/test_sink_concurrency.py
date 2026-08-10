@@ -1752,7 +1752,10 @@ def test_pubsub_sets_its_closed_flag_before_it_releases_the_futures_lock() -> No
     sink._futures_lock = observer  # type: ignore[assignment]
 
     sink.emit([{"a": 1}])
-    assert observer.flag_on_exit == [False], "the emit's append saw a closed sink"
+    # Every exit, not a fixed number of them: SPEC-038 FR-004 added a second acquisition to
+    # `emit` (the reap), and pinning the count would make this fail for a reason it is not about.
+    assert observer.flag_on_exit, "the emit never took the futures lock"
+    assert not any(observer.flag_on_exit), "the emit's append saw a closed sink"
 
     sink.close()
     assert observer.flag_on_exit[-1] is True, (

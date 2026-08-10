@@ -154,7 +154,7 @@ class PostgresSink:
                 self._conn.commit()
                 return
             except Exception as err:
-                self._conn.rollback()
+                self._rollback()
                 if attempt < self.max_retries:
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
@@ -168,6 +168,36 @@ class PostgresSink:
                 raise SinkDeliveryError(
                     f"PostgresSink inserted none of {len(batch)} event(s)"
                 ) from None
+
+    def _rollback(self) -> None:
+        """Discards the failed transaction, absorbing a rollback that itself fails (FR-002).
+
+        The bare call this replaces was the most common failure compounding itself: when the
+        server has closed the session — the usual reason the insert failed — psycopg raises from
+        ``rollback()`` too, and that escaped mid-handler. Measured at ``max_retries=3``, attempts
+        dropped from 4 to 1, ``losses()`` reported ``failed=0`` after a totally lost batch, no
+        ``_diag.lost`` line was written, and the worker received a raw driver exception instead
+        of ``SinkDeliveryError``.
+
+        Absorbing is right rather than merely convenient: the rollback is *cleanup* for a failure
+        already being handled, so its own failure must not displace the original one, and a
+        connection too broken to roll back is a connection the remaining attempts will fail on
+        anyway — visibly, and through the counters.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. ``Exception`` only, never ``BaseException``: a ``KeyboardInterrupt`` here is the
+            operator's intent and must reach the caller (SPEC-025).
+        """
+        try:
+            self._conn.rollback()
+        except Exception as err:
+            _diag.absorbed("PostgresSink.rollback", err)
 
     def close(self) -> None:
         """Commits pending work and closes only an owned connection (FR-005).
