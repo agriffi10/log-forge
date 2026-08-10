@@ -81,7 +81,10 @@ class Health:
         report. Non-``None`` is categorically worse than the two counters above: they measure
         loss the worker absorbed and kept running through, this one means the worker is gone
         (SPEC-019 FR-003). Also ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown`
-        expired before the drain finished (SPEC-027 FR-004), the same thing to a reader.
+        expired before the drain finished (SPEC-027 FR-004), and the type name of whatever
+        stopped a forked child's rebuild from starting a thread at all (SPEC-039 FR-002) — a
+        case where the drain thread never ran rather than died. All three are the same thing to
+        a reader, which is why they share the field: nothing is delivering.
       sink: The configured sink's own loss counters, or ``None`` when there is no worker or
         the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the
         integers above because they count different things: ``dropped`` here is backpressure
@@ -229,6 +232,7 @@ class Worker:
         self.stopped_reason: str | None = None
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
+        self._max_queue = max_queue
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
@@ -241,6 +245,101 @@ class Worker:
             target=self._run, name="log-foundry-worker", daemon=True
         )
         self._thread.start()
+
+    def _reinit_after_fork(self, *, resume: bool) -> None:
+        """Rebuilds this worker **in place** for a child that has just forked (SPEC-039 FR-002).
+
+        The child inherits a ``Worker`` whose thread does not exist, so ``submit`` goes on
+        enqueueing and nothing drains: measured, six events never delivered, ``atexit`` closing
+        the sink without a drain, and ``health()`` reading ``queued=2`` with every other field
+        clean — the documented alert idiom blind. Rebuilding rather than retiring is the design:
+        a prefork server's child is a working process, and a child that silently stops logging
+        is the failure this arc exists to remove.
+
+        **In place, never a new object** (FR-002 AC-5). The ownership guards keyed on
+        ``_worker.sink is X`` and ``_lifecycle``'s registry are identity comparisons, so
+        replacing the worker would leave every one of them answering about something else.
+
+        **The queue is replaced, not drained.** Emptying it would keep ``queue.Queue``'s own
+        mutex and its three ``Condition``s, which the fork walk cannot reach — it enters no
+        standard-library container — and a fork landing inside that mutex leaves the child's
+        very next ``submit`` blocked on the application's thread. That is why the replacement
+        happens even when nothing is resumed: a retired worker still *accepts* submissions
+        (SPEC-030 FR-001), so a retired child would block on the same mutex. Starting empty is
+        also what stops the parent's undelivered backlog being sent twice (AC-2).
+
+        ``stopped_reason`` is cleared rather than set to ``"Forked"`` (AC-6). SPEC-019 defines
+        that field as "the drain thread died", and this child's drain thread is about to be
+        running — the alternative reads as the more honest one and is not.
+
+        The two drain events are **set or cleared to match what this child will actually do**,
+        never simply inherited. Resuming clears them, so ``draining`` and ``flush``'s gate
+        describe the thread starting here rather than the one that did not survive the fork;
+        retiring **sets** them, because no thread will ever set them and a child forked while a
+        ``shutdown()`` was mid-join otherwise inherits them unset with nothing to settle them.
+        Two consequences, both measured: that child paid the whole 30 s budget at exit and with
+        ``shutdown(timeout=None)`` would never exit at all, and — reaching further —
+        ``_offer_orphan_signal`` reads it as still draining and skips, leaving the sink holding
+        a **set** stop event, so every later backoff returns instantly against a destination
+        that is already refusing (SPEC-033 FR-004). ``_drain_finished`` has no reader on a
+        retired worker and is set for the invariant rather than for an observable: settled with
+        finished clear is what :attr:`draining` defines as an *abandoned* drain, and a child
+        reporting no ``stopped_reason`` must not read that way. The stop signal is re-offered for
+        the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
+        boundary, so it would keep pointing at the pre-fork event while this worker sets a new
+        one — SPEC-027's guarantee broken by the repair meant to preserve it.
+
+        **The new thread is only installed once it has started**, which ``__init__`` never had
+        to consider: a constructor whose ``start`` raises lets no ``Worker`` escape, while here
+        the worker is already the process's. Assigning first would leave an unstarted ``Thread``
+        on a live worker reading ``draining`` forever, and the next ``shutdown()`` would take a
+        ``RuntimeError`` from ``join`` straight out of a public call documented to raise nothing.
+        The inherited thread object is kept instead, which is safe because CPython repairs it
+        across the fork — measured, it reports dead and both a bounded and an unbounded ``join``
+        return in 0.0000 s — and the failure is recorded as a ``stopped_reason``, which is
+        exactly SPEC-019's vocabulary for "nothing is delivering". Setting both drain events is
+        what keeps :meth:`shutdown` from queueing a sentinel into a queue no thread will read.
+
+        The success path assigns ``self._thread`` *after* the start, so for an instant a live
+        drain thread coexists with the inherited dead one in that attribute. That is safe only
+        because the drain thread never reads it — ``_run``, ``_drain``, ``_terminal_failure``
+        and ``_release_waiters`` do not, and the three readers are all on caller threads — which
+        is an invariant this note states rather than one anything enforces.
+
+        Args:
+          resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
+            a retired child (AC-4): a fork does not undo a ``shutdown()``, and reviving a worker
+            the caller terminated would be the library overruling them.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._queue = queue.Queue(maxsize=self._max_queue)
+        self.dropped = 0
+        self.failed_batches = 0
+        self.submitted_after_shutdown = 0
+        self.incomplete_swaps = 0
+        self.stopped_reason = None
+        if not resume:
+            self._drain_finished.set()
+            self._drain_settled.set()
+            return
+        self._drain_finished.clear()
+        self._drain_settled.clear()
+        self._offer_stop_signal()
+        thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
+        try:
+            thread.start()
+        except Exception as exc:
+            self.stopped_reason = type(exc).__name__
+            self._drain_finished.set()
+            self._drain_settled.set()
+            _diag.absorbed("starting this child's drain thread", exc, "it will deliver nothing")
+            return
+        self._thread = thread
 
     def _offer_stop_signal(self) -> None:
         """Gives the sink this worker's shutdown event, if it advertises somewhere to put it.

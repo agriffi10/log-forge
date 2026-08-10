@@ -11,7 +11,7 @@ from dataclasses import replace
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
-from log_foundry import _diag, _lifecycle, context
+from log_foundry import _diag, _fork, _lifecycle, context
 from log_foundry.config import _ensure_sink
 from log_foundry.ids import (
     is_valid_span_id,
@@ -330,6 +330,43 @@ def _note_orphan_emit(sink: Sink) -> None:
             return
         _register_exit_handler()
         _orphan_sink = sink
+
+
+def _rebuild_worker_after_fork() -> None:
+    """Gives a forked child a drain thread of its own, or a retired worker (SPEC-039 FR-002).
+
+    Registered with ``_fork`` at import rather than reached for by it, which is what keeps that
+    module free of an import of this one (FR-006). It runs on the child's only thread, after the
+    locks are its own again, so it may take them.
+
+    The predicate is deliberately **not** ``_live_worker()``, even though the two agree today.
+    What is being asked is whether to start a thread, and the answer must survive a later
+    reading of ``retired`` — so it is hoisted into ``resume`` and passed, where the roster files
+    it as its own decision rather than as a call whose category a reader has to chase.
+
+    ``_worker_lock`` is deliberately **not** taken. There is one thread here by construction,
+    and the lock was re-initialised moments ago: a child that took it would be taking a lock no
+    other thread can contend for, at the one moment in the process's life when that is provably
+    true.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None. ``_fork`` absorbs and announces a handler's failure, so a child whose worker cannot
+        be rebuilt still has working locks.
+    """
+    worker = _worker
+    if worker is None:
+        return
+    resume = not worker.retired
+    worker._reinit_after_fork(resume=resume)
+
+
+_fork.register_child_handler(_rebuild_worker_after_fork)
 
 
 def _live_worker() -> Worker | None:

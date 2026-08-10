@@ -7,9 +7,12 @@ import os
 import sys
 import threading
 import types
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _PACKAGE = __name__.rpartition(".")[0]
 """This package's import name, derived rather than written.
@@ -24,6 +27,15 @@ _RLOCK_TYPE = type(threading.RLock())
 _LOCK_TYPES: tuple[type, ...] = (type(threading.Lock()), _RLOCK_TYPE)
 
 _CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict, collections.deque)
+
+_child_handlers: list[Callable[[], None]] = []
+"""What runs in the child once its locks are its own again, in registration order.
+
+**An inverted registry, and that is what keeps the dependency arrow pointing one way**
+(FR-006). The work a child needs done belongs to ``decorator``, ``_lifecycle`` and the sinks,
+and all three would have to import this module for it to reach them; instead they register with
+it, so this module imports nothing that imports it and there is no cycle to break later.
+"""
 
 _installed = False
 """Whether :func:`install` has already registered the child handler in this process.
@@ -367,12 +379,46 @@ def _reinit_primitives() -> None:
                 stack.append(value)
 
 
+def register_child_handler(fn: Callable[[], None]) -> None:
+    """Adds work to be done in a forked child, after its locks have been re-initialised.
+
+    A handler may take any of the library's locks, which is what the ordering in
+    :func:`_reinit_after_fork` buys it and why registering is the only way in. What it must not
+    assume is that it is alone: handlers run in registration order and an earlier one may have
+    started a thread — ``decorator``'s rebuild does exactly that — so only the *first* runs in a
+    genuinely single-threaded child. None of them may block, since nothing has returned from
+    ``fork`` yet.
+
+    Registering the same function twice is a no-op, compared by **identity**: ``in`` would ask
+    a registered object's ``__eq__``, which is not this function's to trust and would raise into
+    a caller documented as raising nothing. The exposure is the one :data:`_installed` records
+    for the fork registration itself: a reload of a module whose body registers here would
+    otherwise stack a second handler, and for the worker rebuild that means two drain threads,
+    the first bound to a queue nothing writes to.
+
+    Args:
+      fn: Called with no arguments in the child. A failure is absorbed and announced, and the
+        remaining handlers still run.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if not any(handler is fn for handler in _child_handlers):
+        _child_handlers.append(fn)
+
+
 def _reinit_after_fork() -> None:
     """Repairs the library in a child that has just returned from ``fork``.
 
-    **The order of work here is the contract** (FR-001 AC-2): locks and events first, because
-    anything running afterwards may take one, and a lock re-initialised after a handler that
-    takes it is a handler that hangs.
+    **The order of work here is the contract** (FR-001 AC-2): locks and events first, then the
+    registered handlers. A lock re-initialised *after* a handler that takes it is a handler
+    that hangs, and it hangs on the child's only thread with nothing to interrupt it. Work that
+    must happen before *any* handler belongs inline between the two steps rather than registered
+    — the buffer discard FR-004 adds is the case, and registering it would put it after
+    ``decorator``'s rebuild, which has started a live drain thread by then.
 
     Args:
       None.
@@ -383,12 +429,22 @@ def _reinit_after_fork() -> None:
     Raises:
       None. A fork handler that raises has its exception printed by CPython with a full
         traceback, carrying the message arch §6 keeps out of anything the library says about
-        itself — and it would leave the rest of the repair undone.
+        itself — and it would leave the rest of the repair undone. One handler's failure is
+        absorbed separately from the rest for the same reason: a child that cannot rebuild its
+        worker should still have working locks. The list is iterated live rather than copied,
+        which is safe because CPython's list iterator is index-based, so a handler that
+        registers another simply causes it to run — and :func:`register_child_handler` is the
+        only writer, appending only.
     """
     try:
         _reinit_primitives()
     except Exception as exc:
         _diag.absorbed("repairing the library after a fork", exc, "this child may block or lose")
+    for handler in _child_handlers:
+        try:
+            handler()
+        except Exception as exc:
+            _diag.absorbed("running a fork handler", exc, "this child may not deliver")
 
 
 def install() -> None:

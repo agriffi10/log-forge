@@ -36,6 +36,7 @@ import pytest
 
 import log_foundry
 from log_foundry import _fork, decorator
+from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.multi import MultiSink
@@ -315,7 +316,9 @@ class _GatingStream:
         return int(self._stream.fileno())
 
 
-def _gated_file_sink(tmp_path: pathlib.Path) -> tuple[FileSink, _GatingStream]:
+def _gated_file_sink(
+    tmp_path: pathlib.Path, *, name: str = "events.ndjson"
+) -> tuple[FileSink, _GatingStream]:
     """Builds a ``FileSink`` whose stream can be parked, and makes it the process sink.
 
     ``FileSink`` is used rather than a test double on purpose: the traversal descends only into
@@ -324,6 +327,7 @@ def _gated_file_sink(tmp_path: pathlib.Path) -> tuple[FileSink, _GatingStream]:
 
     Args:
       tmp_path: The directory to write into.
+      name: The file to append to, so a test asserting on its contents can name it.
 
     Returns:
       The sink and the stream wrapper that arms its window.
@@ -331,7 +335,7 @@ def _gated_file_sink(tmp_path: pathlib.Path) -> tuple[FileSink, _GatingStream]:
     Raises:
       None.
     """
-    sink = FileSink(str(tmp_path / "events.ndjson"))
+    sink = FileSink(str(tmp_path / name))
     stream = _GatingStream(sink._stream)
     sink._stream = stream  # type: ignore[assignment]
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
@@ -644,6 +648,679 @@ def test_third_party_state_is_left_alone(tmp_path: pathlib.Path) -> None:
     before = id(foreign.lock)
     child = run_in_child(lambda: str(id(foreign.lock) == before))
     assert child.output == "True", child.output
+
+
+# -- FR-002: the child's worker is rebuilt, not retired --------------------------------------
+
+
+def _idle_worker(sink: FileSink) -> Worker:
+    """Installs a worker that will not drain on its own, so submissions stay queued.
+
+    A long interval and a large batch are what make "the parent's backlog" a fact of the test
+    rather than a race against the drain loop — and the backlog is the subject of AC-2.
+
+    Args:
+      sink: The sink to deliver through.
+
+    Returns:
+      The installed worker.
+
+    Raises:
+      None.
+    """
+    worker = Worker(sink, batch_size=1000, flush_interval=100.0)
+    decorator._worker = worker
+    return worker
+
+
+def test_a_child_that_logs_after_forking_delivers(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-1. The child inherits a ``Worker`` whose thread does not exist.
+
+    ``submit`` went on enqueueing and nothing drained: measured, six events never delivered,
+    ``atexit`` closing the sink without a drain, and ``health()`` reading ``queued=2`` with
+    ``dropped``, ``failed_batches``, ``stopped_reason`` and ``retired`` all clean — the
+    documented alert idiom blind on every term.
+    """
+    path = tmp_path / "child.ndjson"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    def work_in_child() -> str:
+        @log_foundry.trace
+        def child_span() -> None:
+            pass
+
+        child_span()
+        return str(bool(log_foundry.flush(timeout=5.0)))
+
+    child = run_in_child(work_in_child, timeout=8)
+    assert child.output == "True", child.output
+    assert "child_span" in path.read_text(encoding="utf-8")
+
+
+def test_the_parents_backlog_is_not_delivered_twice(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-2. The child starts empty and the parent keeps what was in flight.
+
+    Both halves are asserted across the two processes, because either alone is satisfiable by
+    the wrong fix: a child that inherited the queue would deliver the parent's backlog a second
+    time, and a child that *drained* it would take those events away from the parent.
+
+    **The backlog has to be in the queue at the instant of the fork, and a quiet worker does
+    not put it there.** A long ``flush_interval`` stops the drain thread *emitting*; it does not
+    stop it *dequeuing*, and ``_drain``'s ``get`` pulls every submission into a local within
+    microseconds — measured, ``qsize`` 5 → 0 in 10 ms. A first version relied on that quiet
+    worker and killed the mutation 4 times in 10: when the drain thread won, the events sat in
+    its ``pending`` list, where a child inheriting the queue duplicates nothing. So the thread
+    is parked *inside* ``emit`` first, and ``qsize`` is asserted before the fork as a
+    sensitivity precondition rather than assumed.
+    """
+    path = tmp_path / "split.ndjson"
+    sink, stream = _gated_file_sink(tmp_path, name="split.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_the_drain_thread(stream, worker, 0)
+    for index in range(5):
+        worker.submit([{"msg": f"backlog-{index}"}])
+    assert worker._queue.qsize() == 5, "the backlog never reached the queue; this proves nothing"
+
+    def work_in_child() -> str:
+        queued = log_foundry.health().queued
+        decorator._worker.submit([{"msg": "child-0"}])
+        return f"{queued},{bool(log_foundry.flush(timeout=5.0))}"
+
+    try:
+        child = run_in_child(work_in_child, timeout=8)
+    finally:
+        gate.release.set()
+    assert child.output == "0,True", child.output
+
+    assert log_foundry.flush(timeout=5.0)
+    written = path.read_text(encoding="utf-8")
+    for index in range(5):
+        assert written.count(f"backlog-{index}") == 1, written
+    assert written.count("child-0") == 1, written
+
+
+class _FailingSink:
+    """A sink that refuses everything, so the worker's ``failed_batches`` moves for real.
+
+    Total failure is the signal SPEC-026 requires a sink to raise, which is what drives the
+    worker's retry and then its counter.
+    """
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Refuses the batch.
+
+        Args:
+          batch: Ignored.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: Always.
+        """
+        raise SinkDeliveryError("refusing everything on purpose")
+
+    def close(self) -> None:
+        """Releases nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+
+def test_the_childs_counters_describe_the_child(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-3. Inherited counters describe a drain thread that no longer exists.
+
+    Three of the four are driven for real rather than assigned — ``dropped`` by overflowing a
+    queue of one, ``failed_batches`` by a sink that refuses everything, and
+    ``submitted_after_shutdown`` by logging past a ``shutdown()``. A first version drove only
+    ``dropped`` and asserted the rest at zero, which is what the parent already read: three of
+    its four cells could not fail.
+
+    ``incomplete_swaps`` is the exception and is set directly, with the reason stated rather
+    than hidden. Driving it needs a swap whose drain cannot be confirmed, which is a second
+    sink, a parked drain thread and a timeout — machinery that would make this test about
+    SPEC-030's swap rather than about the fork. Arranging a *precondition* is not the vacuity
+    this suite guards against; arranging the expectation would be.
+    """
+    sink = _FailingSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=1, max_retries=0)
+    decorator._worker = worker
+    for index in range(200):
+        worker.submit([{"msg": f"overflow-{index}"}])
+    deadline = time.monotonic() + 5.0
+    while worker.failed_batches == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    worker.incomplete_swaps = 3
+    log_foundry.shutdown()
+    worker.submit([{"msg": "after-shutdown"}])
+
+    assert worker.dropped > 0, "the parent's dropped never moved, so zeroing proves nothing"
+    assert worker.failed_batches > 0, "the parent's failed_batches never moved"
+    assert worker.submitted_after_shutdown > 0, "the parent's post-shutdown counter never moved"
+
+    def report() -> str:
+        health = log_foundry.health()
+        return (
+            f"{health.dropped},{health.failed_batches},{health.queued},"
+            f"{health.submitted_after_shutdown},{health.incomplete_swaps}"
+        )
+
+    child = run_in_child(report, timeout=6)
+    assert child.output == "0,0,0,0,0", child.output
+    assert worker.dropped > 0, "the parent's counters were zeroed too"
+
+
+def test_a_child_of_a_dead_drain_thread_reports_its_own_health(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-3 and AC-6, against the state that makes both of them bite.
+
+    A parent whose drain thread ended terminally carries ``stopped_reason`` set and both drain
+    events set, with ``retired`` still ``False`` — so the child rebuilds. Inheriting any of that
+    leaves a **working** child reporting the parent's dead-thread reason forever, latching
+    SPEC-019's alert term, and reading ``draining`` as ``False`` while its own thread runs.
+
+    This is the state that covers the clearing statements at all: a parent forked while healthy
+    has ``stopped_reason`` at ``None`` and both events clear already, so every assertion about
+    them is satisfied by doing nothing.
+    """
+    path = tmp_path / "terminal.ndjson"
+    real = FileSink(str(path))
+
+    class _DiesOnce:
+        def __init__(self) -> None:
+            self.raised = False
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            if not self.raised:
+                self.raised = True
+                raise SystemExit("the drain thread ends here")
+            real.emit(batch)
+
+        def close(self) -> None:
+            real.close()
+
+    sink = _DiesOnce()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    worker.submit([{"msg": "kills-the-thread"}])
+    deadline = time.monotonic() + 5.0
+    while worker.stopped_reason is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.stopped_reason == "SystemExit", worker.stopped_reason
+    assert not worker.draining, "the parent's drain never settled, so this proves nothing"
+
+    def report() -> str:
+        live = decorator._worker
+        live.submit([{"msg": "child-lives"}])
+        delivered = bool(log_foundry.flush(timeout=5.0))
+        return f"{log_foundry.health().stopped_reason},{live.draining},{delivered}"
+
+    child = run_in_child(report, timeout=8)
+    assert child.output == "None,True,True", child.output
+    assert "child-lives" in path.read_text(encoding="utf-8")
+    assert worker.stopped_reason == "SystemExit", "the parent's reason was cleared too"
+
+
+def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-4. A fork does not undo a ``shutdown()``.
+
+    The alternative silently revives a worker the caller terminated, which is the library
+    overruling an explicit instruction. The child still gets a **fresh queue**, though: a
+    retired worker goes on accepting submissions (SPEC-030 FR-001), so an inherited
+    ``queue.Queue`` mutex would block the child's next ``submit`` on the application's thread.
+
+    **The thread has to be observed directly, and every indirect signal was tried first.** The
+    outcome cannot separate the two worlds: ``health().retired`` reads a flag the child inherits
+    either way, ``_thread.is_alive()`` reads ``False`` in both — a resumed thread whose ``_stop``
+    is already set leaves within microseconds — and the queue stays put in both, because that
+    thread has finished its one final drain before the child's code runs at all. Measured:
+    starting the thread regardless left an earlier version of this test green on every one of
+    those assertions. So ``Worker._run`` is instrumented to announce itself, which is the fact
+    ``resume`` actually governs.
+
+    The wait is a bounded negative, the one thing no synchronization primitive expresses: there
+    is no event for "nothing will ever happen". Its soundness is the gap — a started thread
+    announces itself in milliseconds, against a second of waiting.
+    """
+    path = tmp_path / "retired.ndjson"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = _idle_worker(sink)
+    log_foundry.shutdown()
+
+    started = threading.Event()
+    original_run = Worker._run
+
+    def announcing_run(self: Worker) -> None:
+        started.set()
+        original_run(self)
+
+    Worker._run = announcing_run  # type: ignore[method-assign]
+
+    def report() -> str:
+        live = decorator._worker
+        live.submit([{"msg": "after-the-fork"}])
+        health = log_foundry.health()
+        drained = started.wait(1.0)
+        return f"{health.retired},{health.queued},{drained}"
+
+    try:
+        child = run_in_child(report, timeout=8)
+    finally:
+        Worker._run = original_run  # type: ignore[method-assign]
+
+    assert child.output == "True,1,False", child.output
+    assert worker.retired
+    assert path.read_text(encoding="utf-8") == "", "the retired child delivered"
+
+
+def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-4's other half: a retired child must not wait for a drain that cannot happen.
+
+    ``Worker.shutdown``'s idempotent path waits on ``_drain_settled``, and a child forked while
+    a ``shutdown()`` is mid-join inherits it **unset** with no thread that will ever set it.
+    Measured before the fix: the child paid the whole 30 s budget at exit, and with
+    ``shutdown(timeout=None)`` — which the API documents as supported — it would never have
+    exited at all. Retiring therefore *sets* both drain events rather than leaving them.
+
+    The window is constructed: the drain thread is parked inside ``emit`` so the parent's
+    ``shutdown()`` is genuinely still joining when the fork happens.
+
+    **Both events are asserted, not just the one the elapsed time can see.** ``_drain_settled``
+    set with ``_drain_finished`` clear is what ``draining``'s own docstring defines as an
+    *abandoned* drain — a wedged thread the shutdown gave up on — and a child that reports
+    ``stopped_reason=None`` must not read that way to an operator. Nothing consumes
+    ``_drain_finished`` on a retired worker today, so the elapsed time cannot distinguish it and
+    a first version of this test left that statement unkillable while the commit claimed
+    otherwise; the state is asserted directly instead.
+    """
+    sink, stream = _gated_file_sink(tmp_path, name="mid-shutdown.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_the_drain_thread(stream, worker, 0)
+
+    shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
+    shutting_down.start()
+    deadline = time.monotonic() + 5.0
+    while not worker.retired and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
+
+    def report() -> str:
+        live = decorator._worker
+        started = time.monotonic()
+        log_foundry.shutdown(timeout=30.0)
+        prompt = time.monotonic() - started < 5.0
+        return f"{prompt},{live._drain_settled.is_set()},{live._drain_finished.is_set()}"
+
+    try:
+        child = run_in_child(report, timeout=12)
+    finally:
+        gate.release.set()
+        shutting_down.join(10.0)
+
+    assert child.output == "True,True,True", (
+        f"the retired child waited out a drain that cannot run, or reads as abandoned: {child}"
+    )
+
+
+def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib.Path) -> None:
+    """The retired path's drain events reach further than the exit budget they were added for.
+
+    ``_offer_orphan_signal`` skips handing a fresh signal when ``worker.sink is sink and
+    worker.draining`` (SPEC-035 FR-001). A retired child that inherited ``_drain_settled``
+    **unset** reads as draining, so the skip applies, and the sink keeps the parent's **set**
+    ``_stop`` — every ``sinks/_retry`` backoff then returns instantly, which against a
+    rate-limited destination is SPEC-033 FR-004's tight retry loop. Measured in both directions.
+
+    This is a second, independent consequence of the same statement, and a stronger one than the
+    exit budget: a wedged exit is slow, and a collapsed backoff hammers a destination that is
+    already refusing.
+
+    **The window is a shutdown still joining, not a shutdown that finished.** A completed
+    ``shutdown()`` leaves ``_drain_settled`` set in the parent, so the child inherits the right
+    answer and the statement under test does nothing — a first version of this test did exactly
+    that and passed in both worlds. The drain thread is parked inside ``emit`` and the shutdown
+    runs on its own thread, so the fork lands while ``_drain_settled`` is genuinely unset.
+    """
+
+    class _SignalGateSink:
+        def __init__(self) -> None:
+            self.log_foundry_stop_signal: threading.Event | None = None
+            self.gate: _Gate | None = None
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            gate = self.gate
+            if gate is not None:
+                self.gate = None
+                gate.entered.set()
+                gate.release.wait(CHILD_TIMEOUT)
+
+        def close(self) -> None:
+            pass
+
+    sink = _SignalGateSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _Gate()
+    sink.gate = gate
+    worker.submit([{"msg": "parks the drain thread"}])
+    assert gate.entered.wait(5.0), "the drain thread never parked, so the fork misses the window"
+
+    shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
+    shutting_down.start()
+
+    def parent_ready() -> bool:
+        # `retired` latches before `_stop` is set, so polling on `retired` alone and asserting
+        # the signal afterwards has a window between the two where the precondition is false.
+        signal = sink.log_foundry_stop_signal
+        return worker.retired and signal is not None and signal.is_set()
+
+    deadline = time.monotonic() + 5.0
+    while not parent_ready() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert parent_ready(), "the parent's signal must be set to prove this"
+    assert worker.draining, "the fork must land while the shutdown is joining"
+
+    def report() -> str:
+        log_foundry.info("an orphan log in a retired child")
+        live = sink.log_foundry_stop_signal
+        return f"{decorator._worker.draining},{live is not None and live.is_set()}"
+
+    try:
+        child = run_in_child(report, timeout=6)
+    finally:
+        gate.release.set()
+        shutting_down.join(10.0)
+
+    assert child.output == "False,False", child.output
+
+
+def test_a_third_party_sink_is_handed_the_childs_own_stop_signal() -> None:
+    """FR-002 with SPEC-027: the rebuild re-offers, because the walk cannot reach every holder.
+
+    A sink's ``log_foundry_stop_signal`` **is** the worker's ``_stop``, and FR-003's memo keeps
+    that pairing for a sink the traversal enters. A **third-party** sink is outside its
+    ownership boundary, so its attribute keeps pointing at the pre-fork event while the worker
+    gets a fresh one — the shutdown would then set an event nothing waits on, and the sink's
+    backoff would never be cut short. That is SPEC-027's guarantee broken by the repair meant to
+    preserve it, in the one sink shape the walk is deliberately blind to.
+    """
+
+    class _ForeignSink:
+        def __init__(self) -> None:
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    sink = _ForeignSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    assert sink.log_foundry_stop_signal is worker._stop
+
+    def report() -> str:
+        live = decorator._worker
+        signal_now = sink.log_foundry_stop_signal
+        return f"{signal_now is live._stop},{signal_now is not None and not signal_now.is_set()}"
+
+    child = run_in_child(report, timeout=6)
+    assert child.output == "True,True", child.output
+
+
+def test_the_rebuilt_worker_is_the_same_object(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-5. Rebuilding as a new object is the obvious implementation and breaks guards.
+
+    Every ownership guard SPEC-033 shipped is an identity comparison — ``_worker.sink is X``,
+    and ``_lifecycle``'s registry — so a replacement worker leaves each of them answering about
+    an object nothing else refers to. The queue is asserted to have moved in the same breath,
+    since "same object" must not be satisfied by rebuilding nothing at all.
+    """
+    sink = FileSink(str(tmp_path / "identity.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = _idle_worker(sink)
+    worker_id = id(worker)
+    queue_id = id(worker._queue)
+
+    def report() -> str:
+        live = decorator._worker
+        return f"{id(live) == worker_id},{id(live._queue) != queue_id},{live.sink is sink}"
+
+    child = run_in_child(report, timeout=6)
+    assert child.output == "True,True,True", child.output
+
+
+def test_the_rebuild_records_no_stopped_reason(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-6. ``"Forked"`` reads as the more honest answer and is not.
+
+    SPEC-019 defines ``stopped_reason`` as "the drain thread died", and the alert idiom built on
+    it treats a reason as a delivery outage. A child that is delivering must not report one.
+    """
+    sink = FileSink(str(tmp_path / "reason.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    child = run_in_child(lambda: str(log_foundry.health().stopped_reason), timeout=6)
+    assert child.output == "None", child.output
+
+
+# -- FR-001 AC-2 / FR-006: the order of work, and where it is registered from ----------------
+
+
+def test_a_handler_runs_after_the_locks_are_the_childs_own(tmp_path: pathlib.Path) -> None:
+    """FR-001 AC-2. The order is the contract: locks first, then the registered handlers.
+
+    A lock re-initialised *after* a handler that takes it is a handler that hangs — on the
+    child's only thread, with nothing left to interrupt it. The probe records what it saw rather
+    than asserting in the child, so a wrong order is a reported value rather than a deadlock the
+    test would have to survive to report.
+
+    It also **releases** what it takes. A handler is not alone once an earlier one has started a
+    thread, which ``decorator``'s rebuild does, so a probe holding a sink's transport lock past
+    its own return would park the drain thread at the first emit.
+    """
+    sink = FileSink(str(tmp_path / "order.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+    lock_before = id(sink._lock)
+    seen: list[str] = []
+
+    def probe() -> None:
+        taken = sink._lock.acquire(timeout=1.0)
+        if taken:
+            sink._lock.release()
+        seen.append(f"{id(sink._lock) != lock_before},{taken}")
+
+    _fork.register_child_handler(probe)
+    try:
+        child = run_in_child(lambda: ",".join(seen), timeout=6)
+    finally:
+        _fork._child_handlers.remove(probe)
+
+    assert child.output == "True,True", child.output
+
+
+def test_one_handler_failing_does_not_stop_the_others(tmp_path: pathlib.Path) -> None:
+    """SPEC-025 at the registry level: a child that cannot rebuild still has working locks.
+
+    Handlers are independent pieces of repair, so one raising must not take the rest with it —
+    and the failure is announced by type, never by message (arch §6).
+    """
+    sink = FileSink(str(tmp_path / "isolated.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    reached: list[str] = []
+
+    def boom() -> None:
+        raise RuntimeError("a-value-from-the-event-9876")
+
+    def after() -> None:
+        reached.append("ran")
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    _fork.register_child_handler(boom)
+    _fork.register_child_handler(after)
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: f"{reached},{buffer.getvalue()}", timeout=6)
+    finally:
+        sys.stderr = saved
+        _fork._child_handlers.remove(boom)
+        _fork._child_handlers.remove(after)
+
+    assert "['ran']" in child.output, child.output
+    assert "a-value-from-the-event-9876" not in child.output
+    assert "absorbed a failure while running a fork handler (RuntimeError)" in child.output
+
+
+def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.Path) -> None:
+    """FR-002. A process that only ever logged outside a span has nothing to rebuild.
+
+    The existence guard is what keeps that quiet. Without it the rebuild takes an
+    ``AttributeError`` on ``None.retired``, which ``_fork`` absorbs into a stderr line on
+    **every fork** — a library announcing a fault of its own invention, on a path where nothing
+    was wrong (SPEC-025).
+    """
+    sink = FileSink(str(tmp_path / "orphan.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    log_foundry.info("no span, so no worker")
+    assert decorator._worker is None, "this test needs a process that never built a worker"
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: buffer.getvalue(), timeout=6)
+    finally:
+        sys.stderr = saved
+
+    assert child.finished, child.output
+    assert child.output == "", f"the child announced something: {child.output!r}"
+
+
+def test_registering_the_same_handler_twice_is_a_no_op() -> None:
+    """FR-006 AC-2's exposure at the registry rather than at ``os.register_at_fork``.
+
+    A reload of a module whose body registers here would otherwise stack a second handler, and
+    for the worker rebuild that means two drain threads in the child — the first bound to a
+    queue nothing will ever write to. ``install()`` records the same exposure for the fork
+    registration itself; this closes it for the handlers.
+    """
+    before = list(_fork._child_handlers)
+    _fork.register_child_handler(decorator._rebuild_worker_after_fork)
+    assert _fork._child_handlers == before
+
+    def fresh() -> None:
+        pass
+
+    _fork.register_child_handler(fresh)
+    _fork.register_child_handler(fresh)
+    try:
+        assert _fork._child_handlers.count(fresh) == 1
+    finally:
+        _fork._child_handlers.remove(fresh)
+
+
+def test_a_registered_object_that_refuses_comparison_does_not_raise() -> None:
+    """The dedupe compares by **identity**, and only a hostile ``__eq__`` can show it.
+
+    ``list.__contains__`` short-circuits on identity, so registering plain functions cannot
+    distinguish ``in`` from ``any(h is fn)`` — the test above passes against either, which is
+    how the identity refinement shipped with a commit message claiming it was mutation-killed.
+    A registry compares objects it does not own, and ``in`` asks their ``__eq__``: here that
+    raises out of a function documented to raise nothing.
+    """
+
+    class _Hostile:
+        def __eq__(self, other: object) -> bool:
+            raise ValueError("its __eq__ is not this registry's to trust")
+
+        def __hash__(self) -> int:
+            return 1
+
+        def __call__(self) -> None:
+            pass
+
+    def plain() -> None:
+        pass
+
+    hostile = _Hostile()
+    _fork.register_child_handler(hostile)
+    try:
+        _fork.register_child_handler(plain)
+        assert sum(1 for handler in _fork._child_handlers if handler is plain) == 1
+    finally:
+        # `remove` would ask `__eq__` too, which is the very thing under test.
+        _fork._child_handlers[:] = [
+            handler
+            for handler in _fork._child_handlers
+            if handler is not hostile and handler is not plain
+        ]
+
+
+def test_a_child_that_cannot_start_a_thread_reports_it_rather_than_raising(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A rebuild that cannot get a thread must leave a worker a later ``shutdown()`` survives.
+
+    ``__init__`` never had to consider this: a constructor whose ``start`` raises lets no
+    ``Worker`` escape. Here the worker is already the process's, so assigning the unstarted
+    ``Thread`` first would leave it reading ``draining`` forever and hand the next
+    ``shutdown()`` a ``RuntimeError`` from ``join`` — out of a public call documented to raise
+    nothing, and through ``atexit``, where CPython prints the message arch §6 keeps out of
+    anything the library says about itself.
+    """
+    sink = FileSink(str(tmp_path / "nothreads.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    original_start = threading.Thread.start
+
+    def refusing(self: threading.Thread) -> None:
+        raise RuntimeError("no threads left")
+
+    def report() -> str:
+        health = log_foundry.health()
+        log_foundry.shutdown(timeout=5.0)
+        # `queued` after the shutdown is what covers the drain events being set here: with
+        # `_drain_finished` clear, `shutdown` queues its sentinel into a queue no thread will
+        # ever read, and it stays counted for the life of the process.
+        return f"{health.stopped_reason},{decorator._worker.draining},{log_foundry.health().queued}"
+
+    threading.Thread.start = refusing  # type: ignore[method-assign]
+    try:
+        child = run_in_child(report, timeout=6)
+    finally:
+        threading.Thread.start = original_start  # type: ignore[method-assign]
+
+    assert child.finished, f"the child's shutdown raised: {child.output!r}"
+    assert child.output == "RuntimeError,False,0", child.output
+
+
+def test_the_worker_rebuild_is_registered_rather_than_reached_for() -> None:
+    """FR-006. ``decorator`` registers with ``_fork``; ``_fork`` does not import ``decorator``.
+
+    The import test above states the rule; this states that the rule is being *used* rather
+    than satisfied by a module that simply does nothing yet. A registry with no registrations
+    would pass every import assertion ever written.
+    """
+    assert decorator._rebuild_worker_after_fork in _fork._child_handlers
 
 
 # -- FR-003 AC-3: completeness is proved, not asserted ---------------------------------------
