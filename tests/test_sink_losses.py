@@ -210,7 +210,7 @@ def test_multisink_skips_children_that_report_nothing_or_break() -> None:
 
 def test_multisink_aggregation_nests() -> None:
     inner = MultiSink(CountingSink(dropped=1, failed=1), CountingSink(dropped=2, failed=2))
-    assert MultiSink(inner, CountingSink(dropped=5, failed=0)).losses() == SinkLosses(8, 3)
+    assert MultiSink(inner, CountingSink(dropped=5, failed=0)).losses() == SinkLosses(dropped=8, failed=3)
 
 
 def test_multisink_excludes_its_own_call_counter() -> None:
@@ -225,7 +225,7 @@ def test_a_fan_out_whose_children_all_report_nothing_reports_nothing() -> None:
     """A tree of silent children has not given a clean bill of health (FR-003)."""
     assert MultiSink().losses() is None
     assert MultiSink(QuietSink(), QuietSink()).losses() is None
-    assert MultiSink(QuietSink(), CountingSink()).losses() == SinkLosses(0, 0), (
+    assert MultiSink(QuietSink(), CountingSink()).losses() == SinkLosses(dropped=0, failed=0), (
         "one reporting child makes the total meaningful"
     )
 
