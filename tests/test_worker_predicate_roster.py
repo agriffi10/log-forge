@@ -19,6 +19,15 @@ of them is filed here. That is scope, not oversight: the recurring defect this e
 that other family, as an assignment rather than a predicate, so a reader must not take a green
 roster as covering it. Recorded rather than quietly widened (SPEC-021), because widening the
 sentinels to reach it would also match every sink comparison in the module.
+
+**One cost is recorded rather than paid down here.** The seam lint below and its exclusive
+helpers are ~43% of this file, and four consecutive review rounds found a defect in them while
+finding none in the roster they sit beside — what they protect is prose in a data table. A
+line-oriented seam check over the same derived scope would need no source segment, no tokenizer
+and no shape refusal, collapsing roughly half of it. It is **not** done here: the current reader
+was just measured correct in both directions and pinned by six mutations, and replacing a
+verified implementation with an unverified one during the review that verified it is how scope
+added mid-review earns confidence it has not (`docs/process.md`). It belongs in its own change.
 """
 
 import ast
@@ -75,9 +84,25 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "merge, and collapsing them hides that the outer one is deliberately unlocked."
         ),
     ),
+    ("_live_worker", "_worker", 0): (
+        LIVENESS,
+        (
+            "the snapshot the helper's own test reads. A binding is classified by the question "
+            "it feeds, which is the only category a binding can have - and it is on the roster "
+            "because rebinding is how a guard changes category without its text changing."
+        ),
+    ),
     ("_live_worker", "worker is None or worker.retired", 0): (
         LIVENESS,
         "the definition of the liveness helper itself, rather than a consumer of it.",
+    ),
+    ("_offer_orphan_signal", "_worker", 0): (
+        OWNERSHIP_AND_MOMENT,
+        (
+            "the snapshot FR-001's conjunction below reads. Rebinding it to _live_worker() is "
+            "precisely the revert FR-001 exists to stop, and it changes this row's text as well "
+            "as the one below, so the stale-row check catches it from two directions."
+        ),
     ),
     ("_offer_orphan_signal", "worker is not None and worker.sink is sink and worker.draining", 0): (
         OWNERSHIP_AND_MOMENT,
@@ -169,11 +194,27 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "second reason to decline; today that is a design argument, not a measured one."
         ),
     ),
+    ("_flush_worker", "_worker", 0): (
+        EXISTENCE,
+        (
+            "the snapshot the existence test below reads. Deliberately the raw global rather "
+            "than _live_worker(): a retired worker still has a queue worth draining, and "
+            "flush() is the call a serverless process makes when it is not exiting."
+        ),
+    ),
     ("_flush_worker", "worker is None", 0): (
         EXISTENCE,
         (
             "a process that never logged has nothing to drain, and building a thread to prove it "
             "would be pure cost (SPEC-013)."
+        ),
+    ),
+    ("_worker_health", "_worker", 0): (
+        EXISTENCE,
+        (
+            "the snapshot the existence test below reads. The raw global again, and for the "
+            "same reason: a retired worker's counters are exactly what health() is asked for "
+            "(SPEC-030 FR-001), so resolving liveness here would report zeros instead."
         ),
     ),
     ("_worker_health", "worker is None", 0): (
@@ -238,6 +279,18 @@ def _boolean_positions(node: ast.AST) -> list[ast.AST]:
     None` then `if alive:` — is an ordinary refactor, and a position model that only looked at
     `if` tests lost the site entirely.
 
+    An assignment whose value is a bare name or attribute is filed as well, and that one is not
+    a question at all — it is a **binding**, filed because rebinding is how a guard changes
+    category while its text stays identical. One inserted `worker = _worker` above
+    `_swap_sink`'s existing `if worker is not None:` turned that guard from liveness into
+    existence with the roster, the suite, ruff and mypy all green, while the row below went on
+    declaring liveness; measured, `configure()` then stopped fencing the previous sink's close
+    (2.01 s → 0.00 s, `B.closed` 1 → 0). A binding is classified by the question it feeds,
+    which is the only category a binding can have. `Return` is deliberately excluded — `return
+    worker` hands the object to a caller who must ask their own question — and a `Call` value
+    is excluded too, so `worker = worker.health()` stays out while `worker = _live_worker()` is
+    caught by :func:`_is_boolean_expr` instead.
+
     Neither a `BoolOp` nor a `not` is decomposed into its operand. It is filed whole wherever it appears, so
     one guard is one row; an earlier version returned the operands here, which filed a hoisted
     conjunction as two rows while the same conjunction in an `if` was one.
@@ -258,6 +311,10 @@ def _boolean_positions(node: ast.AST) -> list[ast.AST]:
     if isinstance(node, ast.Lambda) and _is_boolean_expr(node.body):
         return [node.body]
     if isinstance(node, ast.Return | ast.Assign | ast.AnnAssign) and _is_boolean_expr(node.value):
+        return [node.value]
+    if isinstance(node, ast.Assign | ast.AnnAssign) and isinstance(
+        node.value, ast.Name | ast.Attribute
+    ):
         return [node.value]
     return []
 
@@ -358,24 +415,35 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
 
     1. **The subject is recognised by name** (`_SENTINELS`), matched as a substring of the
        rendered text. So `if owner is None:` is invisible where `if _worker is None:` is not —
-       though `if owner.retired:` **is** caught, because `retired` is itself a token, and
-       *rewriting* an existing site trips the stale-row check either way, leaving only net-new
-       pure-existence guards exposed. The substring model also over-matches: `if networker:`
-       and `if ticket.retired:` are filed as sites. That direction is the safe one — it demands
-       a classification rather than skipping one — but it means the failure mode is not purely
-       "a missed site", and a draft of this note claimed it was.
-    2. **A hoisted question is only followed through a bare boolean operator.**
-       `alive = _worker is not None` is caught; `alive = bool(_worker)`,
+       though `if owner.retired:` **is** caught, because `retired` is itself a token. What
+       *rewriting* an existing site cannot do is hide, since the stale-row check fires on the
+       text that disappeared regardless of what replaced it; so the exposure is **net-new sites
+       under a name of the author's choosing**, and it is not confined to existence guards. An
+       aliased ownership guard (`held = _worker` … `held.sink is owed` — with the alias filed,
+       but a second alias would not be) and an aliased `_live_worker` call are equally
+       unfilterable by name. Two drafts of this note claimed less: one that the failure mode was
+       purely a missed site, one that only pure-existence guards were exposed. Both measured
+       false, which is why the claim is now stated at its widest. The substring model also
+       over-matches — `if networker:` and `if ticket.retired:` are filed — and that direction is
+       the safe one, since it demands a classification rather than skipping one.
+    2. **A hoisted question is only followed through a bare boolean operator, or a bare name.**
+       `alive = _worker is not None` and `held = _worker` are caught; `alive = bool(_worker)`,
        `alive = getattr(_worker, "retired", False)`, `alive, _ = _worker is not None, 1`,
        `flags = [_worker is not None]` and `alive |= _worker is not None` are not. In a test
        position all of these are caught, because there the position alone settles it.
-    3. **A lambda body is searched only when it is itself boolean**, so
+    3. **The *use* of a filed expression is not followed.** `owns = _worker is not None and
+       _worker.sink is owed` is filed, and `if not owns:` below it carries no sentinel, so
+       inverting a guard by negating its hoisted local passes with the roster green. Filing the
+       binding is what makes the category reviewable; it does not make every later reference so.
+    4. **A lambda body is searched only when it is itself boolean**, so
        `lambda: [x for x in y if _worker.retired]` is missed even though the same comprehension
        at statement level is caught.
 
     Each is a scope decision rather than an oversight: the alternative is following every value
     an arbitrary expression could carry, which is a walker nobody can reason about. `match` is
-    likewise uncovered and unused here.
+    likewise uncovered and unused here. The backstop for all four is that the four historical
+    defects were mis-answered *existing* guards, which the stale-row check catches without
+    exception.
 
     Args:
       tree: The parsed module.
@@ -438,9 +506,17 @@ def test_every_worker_predicate_is_classified() -> None:
     declared = set(ROSTER)
 
     unclassified = found - declared
+    renumbered = (
+        "\n\nAt least one carries an index above 0, so this function already had rows for that "
+        "text and inserting a site renumbered them. Re-read every row sharing it: the reasons "
+        "are distinct per site and the check above cannot tell you they now name the wrong one."
+        if any(n for _, _, n in unclassified)
+        else ""
+    )
     assert not unclassified, (
         "these worker-question sites are not in the roster — classify each one:\n  "
         + "\n  ".join(f"{fn}[{n}]: {expr}" for fn, expr, n in sorted(unclassified))
+        + renumbered
     )
     stale = declared - found
     assert not stale, (
@@ -515,10 +591,12 @@ def test_the_walker_matches_every_shape_it_claims_to() -> None:
                 pass
             if _worker:
                 pass
+            held = _worker.sink
             return _worker is not None and _worker.sink is None
         """
     )
     assert found == {
+        "_worker.sink",
         "_worker is None",
         "worker.draining",
         "worker is None or worker.retired",
@@ -552,6 +630,7 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
             worker.shutdown(timeout)
             worker.flush(timeout)
             _worker.sink = new_sink
+            snapshot = worker.health()
             return worker
         """
     )
