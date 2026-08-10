@@ -353,3 +353,79 @@ def test_a_broken_stderr_does_not_reach_the_caller(monkeypatch) -> None:
 
     assert stream.calls == 1, "it tried, and the guard absorbed the fault"
     assert sink._socket.failed == 1, "the counter moved before the announcement"
+
+
+# --- SPEC-038 FR-007: an oversized datagram is permanent, not transient -------------------
+
+
+def test_an_oversized_datagram_is_dropped_before_the_send_and_counted(monkeypatch, capsys) -> None:
+    """AC-1. A 70 KB event produced EMSGSIZE, retried 4x with backoff, then sent the worker
+    round three more times: ~16 futile sends and seconds of backoff on the single drain thread,
+    never converging. The size is knowable before sending, as every other size-limited sink here
+    already knows it.
+    """
+    fake = FakeSocket()
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: fake)
+    sink = SyslogSink("loghost", transport="udp", max_datagram_bytes=1000)
+    sink.emit([{"level": "INFO", "message": "x" * 5000}, {"level": "INFO", "message": "ok"}])
+
+    assert len(fake.sent) == 1, "only the sendable frame reached the socket"
+    assert b"ok" in fake.sent[0][0]
+    losses = sink.losses()
+    assert losses.dropped == 1 and losses.failed == 0, (
+        "an unsendable datagram is a drop, not a delivery failure"
+    )
+    assert "over the 1000-byte datagram limit" in capsys.readouterr().err
+
+
+def test_a_batch_of_only_oversized_datagrams_does_not_report_a_delivery_failure(
+    monkeypatch,
+) -> None:
+    """Nothing was attempted, so there is nothing for the worker's retry to fix."""
+    fake = FakeSocket()
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: fake)
+    sink = SyslogSink("loghost", transport="udp", max_datagram_bytes=100)
+    sink.emit([{"level": "INFO", "message": "x" * 5000}])
+    assert fake.sent == []
+    assert sink.losses().dropped == 1
+
+
+def test_tcp_is_unaffected_by_the_datagram_limit(monkeypatch) -> None:
+    """AC-2. TCP is a stream; the limit bounds nothing there."""
+    fake = FakeSocket()
+    monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: fake)
+    sink = SyslogSink("loghost", transport="tcp", max_datagram_bytes=100)
+    sink.emit([{"level": "INFO", "message": "x" * 5000}])
+    assert len(fake.sent) == 1, "a large frame still goes out over TCP"
+    assert sink.losses().dropped == 0
+
+
+def test_emsgsize_is_not_retried_while_a_transient_errno_still_is(monkeypatch, capsys) -> None:
+    """AC-3. The permanent set is EMSGSIZE only.
+
+    Every other socket errno describes a destination that may come back, so treating one of them
+    as permanent would turn a transient outage into silent loss.
+    """
+    import errno as errno_mod
+
+    def failing(code):
+        class Failing(FakeSocket):
+            def sendto(self, data, addr):
+                self.sent.append((data, addr))
+                raise OSError(code, "nope")
+
+        return Failing()
+
+    permanent = failing(errno_mod.EMSGSIZE)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: permanent)
+    sink = SyslogSink("loghost", transport="udp", max_retries=3, max_datagram_bytes=10**6)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"level": "INFO", "message": "x"}])
+    assert len(permanent.sent) == 1, "EMSGSIZE is a verdict on the message: one attempt only"
+
+    transient = failing(errno_mod.ECONNREFUSED)
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: transient)
+    retrying = SyslogSink("loghost", transport="udp", max_retries=3, max_datagram_bytes=10**6)
+    with pytest.raises(SinkDeliveryError):
+        retrying.emit([{"level": "INFO", "message": "x"}])
+    assert len(transient.sent) == 4, "a destination that may come back is still retried"

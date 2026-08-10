@@ -116,7 +116,7 @@ class KinesisSink:
             records,
             max_count=self.MAX_RECORDS,
             max_bytes=self.MAX_REQUEST_BYTES,
-            size_of=lambda record: len(record["Data"]),
+            size_of=_record_size,
         ):
             chunks += 1
             outcome = self._send(chunk)
@@ -242,3 +242,26 @@ class KinesisSink:
                 )
                 return sent - len(records)
         return 0
+
+
+def _record_size(record: dict[str, Any]) -> int:
+    """Measures one request entry, partition key included (SPEC-038 FR-009).
+
+    ``PutRecords`` charges the partition key against the 5 MiB request limit, and a key may be up
+    to 256 bytes, so a 500-record request could understate itself by ~128 KB — enough to have the
+    service reject a chunk this sink believed was inside the budget. ``SQSSink`` charges its FIFO
+    ids for the same reason and records the same rationale.
+
+    This applies to Kinesis alone: a Firehose record is ``{"Data": data}`` and that API has no
+    partition key, so there is nothing there to charge.
+
+    Args:
+      record: One ``PutRecords`` entry.
+
+    Returns:
+      The bytes it contributes to the request.
+
+    Raises:
+      None.
+    """
+    return len(record["Data"]) + len(record["PartitionKey"])

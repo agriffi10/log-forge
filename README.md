@@ -238,9 +238,9 @@ the sink that is already live is a no-op: no drain, no close. The previous sink 
 do not hand it back to a later call.
 
 The 5 s covers the **whole** call — both drains and the previous sink's `close()`. `Sink.close()`
-takes no timeout of its own (`KafkaSink.close()` flushes its producer, so an unreachable broker
-blocks it), so that close runs on its own daemon thread and is joined for whatever is left of the
-budget. A hung `close()` therefore costs you the budget, once, and the close carries on in the
+takes no timeout of its own — though `KafkaSink` bounds its own flush at `flush_timeout=10.0`
+and counts whatever is still queued — so that close runs on its own daemon thread and is joined
+for whatever is left of the budget. A hung `close()` therefore costs you the budget, once, and the close carries on in the
 background afterwards.
 
 Nothing is *reported* when that join expires — a slow close is not a failed swap, and a counter
@@ -505,9 +505,9 @@ A few conventions hold across every sink below:
 | Sink | Import from | Configure |
 |---|---|---|
 | `StdoutSink` | `log_foundry.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
-| `StderrSink` | `log_foundry.sinks.util` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
-| `NullSink` | `log_foundry.sinks.util` | `NullSink()` — discard everything; `.dropped` counts events |
-| `MemorySink` | `log_foundry.sinks.util` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
+| `StderrSink` | `log_foundry.sinks.stdout` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
+| `NullSink` | `log_foundry.sinks.null` | `NullSink()` — discard everything; `.dropped` counts events |
+| `MemorySink` | `log_foundry.sinks.memory` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
 
 ```python
 from log_foundry.sinks.stdout import StdoutSink
@@ -556,7 +556,7 @@ attached to each record; the sink never configures or tears down logging itself.
 | Sink | Import from | Configure |
 |---|---|---|
 | `FileSink` | `log_foundry.sinks.file` | `FileSink(path, *, encoding="utf-8")` — append NDJSON to one file |
-| `RotatingFileSink` | `log_foundry.sinks.file` | `RotatingFileSink(path, *, max_bytes=0, backup_count=0, when=None, interval=1)` — rotate by size and/or time, keeping `backup_count` numbered backups |
+| `RotatingFileSink` | `log_foundry.sinks.file` | `RotatingFileSink(path, *, max_bytes=0, backup_count=1, when=None, interval=1)` — rotate by size and/or time, keeping `backup_count` numbered backups. **`backup_count=0` truncates**: every event since the last rotation is destroyed. The default keeps one generation, costing 2 × `max_bytes` on disk under a size trigger, or one full rollover period under a time-only one — and `max_bytes` defaults to `0`, which bounds nothing |
 | `SQLiteSink` | `log_foundry.sinks.sqlite` | `SQLiteSink(database, *, table="log_events", create_table=True)` — batch-insert into an embedded SQLite DB |
 
 `RotatingFileSink`'s time trigger uses a `when` unit code — `"S"`/`"M"`/`"H"`/`"D"` — times `interval`
@@ -611,7 +611,7 @@ completed, not that every chunk of it landed.
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
 | `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket |
-| `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry")` — RFC 5424 over UDP/TCP |
+| `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
 
 ```python
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
@@ -717,9 +717,9 @@ Each needs its own extra (lazy-imported). All publish + retry within a bound and
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, bootstrap_servers="…", key_field="trace_id")` |
-| `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None)` — `XADD` |
-| `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None)` — `RPUSH` |
+| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id")` |
+| `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
+| `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
 | `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
 | `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None)` |
 | `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |

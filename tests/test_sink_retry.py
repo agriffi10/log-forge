@@ -863,7 +863,7 @@ def test_the_three_aws_stream_sinks_back_off_between_attempts(monkeypatch) -> No
     from test_sinks_sns import FakeSNS
 
     kinesis_body = json.dumps({"trace_id": "t", "a": 1}).encode("utf-8")
-    firehose_body = json.dumps({"a": 1}).encode("utf-8")
+    firehose_body = json.dumps({"a": 1}).encode("utf-8") + b"\n"  # FR-005 delimiter
     cases = (
         (KinesisSink("s", client=FakeKinesis(always_fail={kinesis_body}), max_retries=3),
          [{"trace_id": "t", "a": 1}]),

@@ -7,7 +7,7 @@ import os
 import socket
 from typing import TYPE_CHECKING
 
-from log_foundry.sinks._socket import SocketTransport
+from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 
 if TYPE_CHECKING:
     import threading
@@ -63,6 +63,7 @@ class SyslogSink:
         app_name: str = "log-foundry",
         timeout: float = 5.0,
         max_retries: int = 3,
+        max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
     ) -> None:
         """Configures the destination, framing and message identity.
 
@@ -74,6 +75,9 @@ class SyslogSink:
           app_name: The ``APP-NAME`` field of every message.
           timeout: Seconds allowed for a TCP connection.
           max_retries: Reconnect retries per message.
+          max_datagram_bytes: The largest UDP datagram to attempt; a frame over it is dropped
+            and counted rather than sent, retried and abandoned (SPEC-038 FR-007). Ignored for
+            TCP, which is a stream.
 
         Returns:
           None.
@@ -89,7 +93,12 @@ class SyslogSink:
         self._hostname = socket.gethostname() or "-"
         self._procid = str(os.getpid())
         self._socket = SocketTransport(
-            host, port, transport=transport, timeout=timeout, max_retries=max_retries
+            host,
+            port,
+            transport=transport,
+            timeout=timeout,
+            max_retries=max_retries,
+            max_datagram_bytes=max_datagram_bytes,
         )
         self._stop_signal: threading.Event | None = None
 

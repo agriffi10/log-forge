@@ -742,6 +742,8 @@ def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> Non
         "log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body
     )
     body = json.dumps({"event": "a"}).encode("utf-8")
+    # A Firehose record carries FR-005's delimiter; a Kinesis one does not.
+    firehose_body = body + b"\n"
     sinks = [
         RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=0),
         PostgresSink("logs", connection=FakePG(fail_times=-1), max_retries=0),
@@ -756,7 +758,7 @@ def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> Non
         SQSSink("https://q/x", client=FaultingClient(sender_fault=False), max_retries=0),
         SNSSink("arn", client=FakeSNS(always_fail={"0"}), max_retries=0),
         KinesisSink("s", client=FakeKinesis(always_fail={body}), max_retries=0),
-        FirehoseSink("s", client=FakeFirehose(always_fail={body}), max_retries=0),
+        FirehoseSink("s", client=FakeFirehose(always_fail={firehose_body}), max_retries=0),
     ]
     for sink in sinks:
         failed_batches, delivered = _worker_sees(sink)

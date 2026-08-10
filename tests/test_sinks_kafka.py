@@ -8,7 +8,7 @@ import pytest
 
 from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.kafka import KafkaSink
+from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, KafkaSink
 
 
 class FakeProducer:
@@ -18,6 +18,8 @@ class FakeProducer:
         self.produced: list[tuple] = []
         self.polls = 0
         self.flushes = 0
+        self.flush_timeouts: list[object] = []
+        self.still_queued = 0
         self._deliver_error = deliver_error
 
     def produce(self, topic, value=None, key=None, callback=None) -> None:
@@ -28,8 +30,12 @@ class FakeProducer:
     def poll(self, timeout) -> None:
         self.polls += 1
 
-    def flush(self, *args) -> None:
+    def flush(self, *args) -> int:
+        # The real Producer.flush returns the number of messages still queued, and takes a
+        # timeout; the double records both so SPEC-038 FR-006 can be asserted on them.
         self.flushes += 1
+        self.flush_timeouts.append(args[0] if args else None)
+        return getattr(self, "still_queued", 0)
 
 
 def test_is_a_sink() -> None:
@@ -172,3 +178,125 @@ def test_close_is_idempotent_and_flushes_once() -> None:
     sink.close()
     sink.close()
     assert producer.flushes == 1
+
+
+# --- SPEC-038 FR-006: close() is bounded and counts what it lost --------------------------
+
+
+def test_close_passes_a_bounded_timeout_to_flush() -> None:
+    """AC-1. `flush()` with no timeout waits `message.timeout.ms` — five minutes by default.
+
+    `Worker.shutdown` closes the live sink inline and unbounded (arch §13), so an unreachable
+    broker held process exit for those five minutes despite `shutdown(timeout=30)`.
+    """
+    producer = FakeProducer()
+    KafkaSink("t", producer=producer, flush_timeout=7.5).close()
+    assert producer.flush_timeouts == [7.5], "the wait must be capped, not open-ended"
+
+
+def test_a_non_zero_remainder_is_counted_and_announced_once(capsys) -> None:
+    """AC-2. `flush()` returns what is still queued — exactly the count lost at exit.
+
+    The old call discarded that return value, so the loss was silent.
+    """
+    producer = FakeProducer()
+    producer.still_queued = 42
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 42
+    err = capsys.readouterr().err
+    assert "lost 42 message(s)" in err, "one line carrying the count, not 42 lines"
+    assert err.count("KafkaSink") == 1
+
+
+def test_a_clean_flush_counts_nothing() -> None:
+    producer = FakeProducer()
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 0
+
+
+def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown() -> None:
+    """AC-3, amended by evidence. The stop signal must NOT shorten this flush.
+
+    A revision cut the timeout to zero while a shutdown was in progress, on the reasoning that
+    the events were lost either way. They were not: `produce()` is a local hand-off and
+    `flush()` is the only thing that drains the producer's batch, so — since `Worker.shutdown`
+    sets the stop event *before* the join, making it always set by the time `close()` runs —
+    Kafka's exit delivery was switched off entirely. Measured: 9 buffered, `flush(0)`, zero
+    delivered, all 11 booked as failed — 9 `info()` calls plus the span's start and end.
+
+    This drives the real `log_foundry.shutdown()` rather than setting the flag by hand, because
+    the hand-set version is exactly what made the defect look correct.
+    """
+    import log_foundry as lf
+
+    class Draining:
+        """Drains its whole batch when given any time at all, and none when given none.
+
+        That is the contrast the defect turns on: `flush()` is the only thing that drains the
+        producer, so a zero timeout delivers nothing however healthy the broker.
+        """
+
+        def __init__(self) -> None:
+            self.buffered = 0
+            self.delivered = 0
+            self.saw_timeout: object = "never called"
+
+        def produce(self, topic, value=None, key=None, callback=None) -> None:
+            self.buffered += 1
+
+        def poll(self, timeout) -> None:
+            pass
+
+        def flush(self, timeout=None) -> int:
+            self.saw_timeout = timeout
+            if timeout is None or timeout > 0:
+                self.delivered += self.buffered
+                self.buffered = 0
+            return self.buffered
+
+    producer = Draining()
+    lf.configure(sink=KafkaSink("t", producer=producer, flush_timeout=10.0))
+
+    @lf.trace
+    def work() -> None:
+        for i in range(9):
+            lf.info("event", fields={"i": i})
+
+    work()
+    lf.shutdown()
+
+    assert producer.saw_timeout == 10.0, (
+        f"the exit flush must get its real bound, not a shutdown-shortened one; "
+        f"got {producer.saw_timeout!r}"
+    )
+    assert producer.delivered == 11, (
+        f"9 info() calls plus span.start and span.end; delivered {producer.delivered}"
+    )
+    assert producer.buffered == 0
+
+
+def test_a_producer_returning_a_bool_does_not_book_a_phantom_loss() -> None:
+    """`bool` is an `int`, so `isinstance(remaining, int)` accepted `True` as "one still queued".
+
+    Reverting to `isinstance` passed the whole suite, because no double returned a bool.
+    """
+    producer = FakeProducer()
+    producer.still_queued = True
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 0, "True is not a count of queued messages"
+
+
+def test_a_flush_timeout_that_bounds_nothing_falls_back_to_the_default() -> None:
+    """`0` reinstates the `flush(0)` that switched exit delivery off; `inf` the unbounded wait.
+
+    Floored for the reason `Worker._emit` floors its retries (SPEC-021): a value that disables
+    the guard must not arrive silently through the constructor.
+    """
+    producer = FakeProducer()
+    for bad in (0, -1.0, float("inf"), float("nan")):
+        sink = KafkaSink("t", producer=producer, flush_timeout=bad)
+        assert sink.flush_timeout == DEFAULT_FLUSH_TIMEOUT, f"{bad!r} bounds nothing"
+    assert KafkaSink("t", producer=producer, flush_timeout=2.5).flush_timeout == 2.5

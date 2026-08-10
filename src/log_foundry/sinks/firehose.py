@@ -44,7 +44,12 @@ class FirehoseSink:
 
     MAX_RECORDS = 500
     MAX_REQUEST_BYTES = 4 * 1024 * 1024
-    MAX_RECORD_BYTES = 1024 * 1024
+    MAX_RECORD_BYTES = 1_024_000
+    """Firehose's documented per-record ceiling: 1,000 KiB, which is **not** ``1024 * 1024``.
+
+    The 24,576-byte gap between the two is a band of records this sink used to pass through and
+    the service then rejected (SPEC-038 FR-009).
+    """
 
     def __init__(self, delivery_stream: str, *, client: Any = None, max_retries: int = 3) -> None:
         """Binds the sink to a delivery stream.
@@ -155,6 +160,13 @@ class FirehoseSink:
     def _records(self, batch: list[dict[str, object]]) -> list[dict[str, Any]]:
         """Builds the request entries, dropping any record too large to ever fit (FR-011).
 
+        Each record ends with a newline (SPEC-038 FR-005). Firehose concatenates record payloads
+        verbatim into the delivery buffer and the *producer* must supply the separator, so
+        without it the S3 objects read ``{"a":1}{"b":2}`` — unparseable by Athena, Glue and
+        OpenSearch ingest, and inconsistent with the NDJSON every other sink here emits. The
+        newline is part of ``Data``, so it is charged to both the per-record limit checked below
+        and the per-request budget :meth:`emit` chunks by.
+
         Args:
           batch: The events to convert.
 
@@ -166,7 +178,7 @@ class FirehoseSink:
         """
         records: list[dict[str, Any]] = []
         for event in batch:
-            data = json.dumps(event).encode("utf-8")
+            data = json.dumps(event).encode("utf-8") + b"\n"
             if len(data) > self.MAX_RECORD_BYTES:
                 with self._counter_lock:
                     self.dropped_oversized += 1

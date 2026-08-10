@@ -78,7 +78,7 @@ def test_oversized_record_is_dropped(capsys) -> None:
 
 
 def test_failed_entries_are_retried_then_succeed() -> None:
-    body = json.dumps({"a": 1}).encode("utf-8")
+    body = json.dumps({"a": 1}).encode("utf-8") + b"\n"   # FR-005 delimiter
     client = FakeFirehose(fail_once={body})
     sink = FirehoseSink("stream", client=client)
     sink.emit([{"a": 1}])
@@ -87,7 +87,7 @@ def test_failed_entries_are_retried_then_succeed() -> None:
 
 
 def test_persistent_failures_are_counted(capsys) -> None:
-    body = json.dumps({"a": 1}).encode("utf-8")
+    body = json.dumps({"a": 1}).encode("utf-8") + b"\n"   # FR-005 delimiter
     client = FakeFirehose(always_fail={body})
     sink = FirehoseSink("stream", client=client, max_retries=1)
     with pytest.raises(SinkDeliveryError):
@@ -190,8 +190,103 @@ def test_emit_does_not_raise_on_an_unadjudicated_chunk() -> None:
 def test_well_formed_responses_count_nothing_and_say_nothing(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    body = json.dumps({"a": 1}).encode("utf-8")
+    body = json.dumps({"a": 1}).encode("utf-8") + b"\n"   # FR-005 delimiter
     sink = FirehoseSink("stream", client=FakeFirehose(fail_once={body}))
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.dropped_unadjudicated == 0
     assert capsys.readouterr().err == ""
+
+
+# --- SPEC-038 FR-005 / FR-009: the delimiter and the real per-record ceiling --------------
+
+
+def test_every_record_ends_with_a_newline_so_the_object_parses_as_ndjson() -> None:
+    """AC-1 + AC-3. Firehose concatenates payloads verbatim; the producer supplies the separator.
+
+    Without it an S3 object reads `{"a":1}{"b":2}` — unparseable by Athena, Glue and OpenSearch
+    ingest, and unlike the NDJSON every other sink here emits.
+    """
+    client = FakeFirehose()
+    FirehoseSink("stream", client=client).emit([{"a": 1}, {"b": 2}, {"c": 3}])
+    chunk = client.calls[0]
+    assert all(record["Data"].endswith(b"\n") for record in chunk)
+
+    concatenated = b"".join(record["Data"] for record in chunk)
+    parsed = [json.loads(line) for line in concatenated.splitlines()]
+    assert parsed == [{"a": 1}, {"b": 2}, {"c": 3}], "the delivered object parses as NDJSON"
+
+
+def test_the_newline_is_charged_to_the_per_record_limit() -> None:
+    """AC-2. An event one byte under the ceiling is over it once delimited."""
+    sink = FirehoseSink("stream", client=FakeFirehose())
+    padding = FirehoseSink.MAX_RECORD_BYTES - len(json.dumps({"pad": ""}).encode("utf-8")) - 1
+    exactly_full = {"pad": "x" * padding}
+    assert len(json.dumps(exactly_full).encode("utf-8")) == FirehoseSink.MAX_RECORD_BYTES - 1
+
+    sink.emit([exactly_full])
+    assert sink.dropped_oversized == 0, "one byte of headroom is enough for the newline"
+
+    over = FirehoseSink("stream", client=FakeFirehose())
+    over.emit([{"pad": "x" * (padding + 1)}])
+    assert over.dropped_oversized == 1, "without headroom the delimiter pushes it over"
+
+
+def test_the_newline_is_charged_to_the_per_request_budget() -> None:
+    """AC-2, the per-request half — and the record size is what decides whether it can fail.
+
+    Two independent ways this test can be vacuous, and it has been both:
+
+    1. `MAX_RECORDS` (500) and `MAX_REQUEST_BYTES` (4 MiB) both bound a chunk, so with small
+       records the *count* binds first and the byte budget never engages. The first version used
+       ~1,012-byte records and passed with the delimiter removed entirely.
+    2. Above 4 MiB / 500 = 8,389 bytes the byte budget binds — but the chunk size is a *floor
+       division*, so one byte per record only changes it at the sizes where the division tips.
+       The second version used 9,000-byte records: 4194304 // 9012 == 4194304 // 9011 == 465, so
+       the delimiter still made no difference and un-charging it from `size_of` left the whole
+       file green.
+
+    8,989 is chosen so the record is 9,001 bytes: 465 per chunk with the delimiter charged, 466
+    without. Only 359 of the sizes between 8,400 and 30,000 are sensitive that way, which is why
+    picking a round number twice landed on an insensitive one.
+    """
+    client = FakeFirehose()
+    sink = FirehoseSink("stream", client=client)
+    payload = 8_989  # 9,001 bytes per record: see the docstring
+    count = 900
+    sink.emit([{"pad": "x" * payload} for _ in range(count)])
+
+    assert all(len(chunk) < FirehoseSink.MAX_RECORDS for chunk in client.calls), (
+        "the byte budget must be what bounds these chunks, or the delimiter never matters"
+    )
+    for chunk in client.calls:
+        assert sum(len(r["Data"]) for r in chunk) <= FirehoseSink.MAX_REQUEST_BYTES
+
+    # One record's true wire size, delimiter included, decides how many fit. Computed from the
+    # event rather than read back from the request, so an uncharged delimiter shifts the answer.
+    one = len(json.dumps({"pad": "x" * payload}).encode("utf-8")) + 1
+    assert FirehoseSink.MAX_REQUEST_BYTES // one != FirehoseSink.MAX_REQUEST_BYTES // (one - 1), (
+        "the fixture must sit where one byte per record moves the chunk boundary, or this "
+        "assertion cannot fail"
+    )
+    assert len(client.calls[0]) == FirehoseSink.MAX_REQUEST_BYTES // one, (
+        "the first chunk holds exactly as many delimited records as the budget allows"
+    )
+
+
+def test_the_per_record_ceiling_is_the_documented_1000_kib_not_1_mib() -> None:
+    """FR-009 AC-1. The 24,576-byte gap was a band the service rejected and this sink passed."""
+    assert FirehoseSink.MAX_RECORD_BYTES == 1_024_000
+    assert FirehoseSink.MAX_RECORD_BYTES != 1024 * 1024
+
+
+def test_a_record_between_the_two_ceilings_is_dropped_rather_than_sent_to_be_rejected() -> None:
+    """FR-009 AC-3, at the boundary that mattered: one byte under and one byte over."""
+    under = FirehoseSink("stream", client=(ok := FakeFirehose()))
+    pad = FirehoseSink.MAX_RECORD_BYTES - len(json.dumps({"pad": ""}).encode("utf-8")) - 1
+    under.emit([{"pad": "x" * pad}])
+    assert under.dropped_oversized == 0 and len(ok.calls) == 1
+
+    over = FirehoseSink("stream", client=(none := FakeFirehose()))
+    over.emit([{"pad": "x" * (pad + 1)}])
+    assert over.dropped_oversized == 1, "one byte over the real ceiling never reaches the wire"
+    assert none.calls == []

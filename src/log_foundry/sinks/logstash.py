@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import threading
 
-from log_foundry.sinks._socket import SocketTransport
+from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
@@ -54,6 +54,7 @@ class LogstashSink:
         transport: str = "tcp",
         timeout: float = 5.0,
         max_retries: int = 3,
+        max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
         **http_kwargs: object,
     ) -> None:
         """Selects and builds exactly one backend.
@@ -65,6 +66,9 @@ class LogstashSink:
           transport: ``"tcp"`` or ``"udp"``, in socket mode.
           timeout: Seconds allowed per request or connection.
           max_retries: Retries the chosen backend makes.
+          max_datagram_bytes: In UDP socket mode, the largest datagram to attempt; a frame over
+            it is dropped and counted rather than sent, retried and abandoned (SPEC-038 FR-007).
+            Ignored in HTTP mode and over TCP, which is a stream.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode.
 
         Returns:
@@ -82,7 +86,12 @@ class LogstashSink:
         elif host is not None and port is not None:
             self._http = None
             self._socket = SocketTransport(
-                host, port, transport=transport, timeout=timeout, max_retries=max_retries
+                host,
+                port,
+                transport=transport,
+                timeout=timeout,
+                max_retries=max_retries,
+                max_datagram_bytes=max_datagram_bytes,
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")

@@ -12,6 +12,39 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 __all__ = ["KafkaSink"]
 
 
+def _usable_timeout(value: float) -> float:
+    """Returns a flush timeout that is actually a bound, or the default.
+
+    ``0`` is the value that switched this sink's exit delivery off, and ``inf`` is the unbounded
+    wait FR-006 exists to remove, so neither is accepted from a caller. The test is
+    ``not (0 < value < inf)`` rather than a pair of comparisons, because ``NaN`` compares
+    ``False`` to everything and would otherwise slip through (SPEC-027 FR-001's reasoning for
+    ``Retry-After``).
+
+    Args:
+      value: The caller's timeout.
+
+    Returns:
+      The value if it bounds anything, else :data:`DEFAULT_FLUSH_TIMEOUT`.
+
+    Raises:
+      None.
+    """
+    return value if 0 < value < float("inf") else DEFAULT_FLUSH_TIMEOUT
+
+DEFAULT_FLUSH_TIMEOUT = 10.0
+"""Seconds :meth:`KafkaSink.close` waits for the producer to drain (SPEC-038 FR-006).
+
+Ten rather than ``message.timeout.ms``'s five minutes.
+
+It is spent **beside** ``shutdown()``'s budget, not from it: ``Worker.shutdown`` joins the drain
+thread against its deadline and *then* closes the sink inline, with no remaining-budget argument
+(arch §13, since ``Sink.close`` takes no timeout). Measured, ``shutdown(timeout=2.0)`` against a
+dead broker takes 10.01 s. Ten seconds is chosen to keep that overrun small rather than to fit
+inside a budget it cannot see — five minutes is what it replaces.
+"""
+
+
 class KafkaSink:
     """A :class:`~log_foundry.sinks.base.Sink` that produces events to a Kafka topic.
 
@@ -20,8 +53,17 @@ class KafkaSink:
     returns without blocking, while the delivery result arrives asynchronously on a callback
     serviced by ``poll()`` and ``flush()``.
 
+    The worst case (SPEC-027 FR-005) is not a retry loop — this sink has none — but its
+    ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent **beside**
+    ``shutdown()``'s budget rather than from it. ``Worker.shutdown`` joins the drain thread
+    against its deadline and *then* closes the sink inline with no remaining-budget argument
+    (arch §13), so the two add up: measured, ``shutdown(timeout=2.0)`` against a dead broker
+    takes 10.01 s.
+
     Attributes:
-      failed: Messages whose delivery callback reported an error.
+      flush_timeout: Seconds :meth:`close` waits for the producer to drain.
+      failed: Messages whose delivery callback reported an error, plus any still queued when
+        that close flush expired — the count ``flush()`` returns.
       rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
         — which never reached the producer's batch at all.
 
@@ -43,6 +85,7 @@ class KafkaSink:
         producer: Any = None,
         bootstrap_servers: str | None = None,
         key_field: str = "trace_id",
+        flush_timeout: float = DEFAULT_FLUSH_TIMEOUT,
     ) -> None:
         """Binds the sink to a topic and a producer.
 
@@ -51,6 +94,13 @@ class KafkaSink:
           producer: A ``confluent-kafka``-shaped producer, or ``None`` to build one.
           bootstrap_servers: The broker list, required when no producer is injected.
           key_field: The event key used as the message key, or empty for no key.
+          flush_timeout: Seconds :meth:`close` waits for the producer to drain before counting
+            what is left as lost (SPEC-038 FR-006). Unbounded, an unreachable broker held
+            process exit for ``message.timeout.ms`` — five minutes by default — despite
+            ``shutdown(timeout=30)``. Non-positive or non-finite values fall back to the
+            default, as ``Worker._emit`` floors its own retries (SPEC-021): ``0`` reinstates
+            exactly the ``flush(0)`` that switched this sink's exit delivery off, and ``inf``
+            reinstates the unbounded wait.
 
         Returns:
           None.
@@ -70,6 +120,7 @@ class KafkaSink:
         self.topic = topic
         self.producer = producer
         self.key_field = key_field
+        self.flush_timeout = _usable_timeout(flush_timeout)
         self.failed = 0
         self.rejected = 0
         self._counter_lock = threading.Lock()
@@ -175,7 +226,50 @@ class KafkaSink:
             if self._closed:
                 return
             self._closed = True
-            self.producer.flush()
+            self._flush_bounded()
+
+    def _flush_bounded(self) -> None:
+        """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
+
+        ``Producer.flush()`` with no timeout waits for ``message.timeout.ms`` — five minutes by
+        default — and ``Worker.shutdown`` closes the live sink **inline and unbounded** (arch
+        §13), so an unreachable broker held process exit for five minutes despite
+        ``shutdown(timeout=30)``. The wait is now capped by ``flush_timeout``.
+
+        **The stop signal is deliberately not consulted here.** A revision cut the timeout to
+        zero while a shutdown was in progress, reasoning that the events were lost either way.
+        They were not: ``produce()`` is a local hand-off and ``flush()`` is the only thing that
+        drains the producer's batch, so with the stop event set — which it always is by the time
+        ``close()`` runs, since ``Worker.shutdown`` sets it *before* the join — Kafka's exit
+        delivery was switched off entirely. Measured through a real ``shutdown()``: eleven buffered
+        messages — nine ``info()`` calls plus the span's start and end — ``flush(0)``, **zero
+        delivered**, all eleven booked as ``failed``. That is worse
+        than the hang this bound exists to fix, and it is the same mistake FR-001 AC-4a records
+        for ``HTTPSink`` — skipping *work* during the exit drain, rather than skipping a *wait*.
+
+        ``flush()`` *returns* the number of messages still queued, which is exactly the count
+        lost at exit — the old call discarded it, so the loss was silent. It is counted into
+        ``failed`` and announced once, with a count rather than one line per message.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the producer raises, which ``close``'s caller already handles.
+        """
+        remaining = self.producer.flush(self.flush_timeout)
+        if type(remaining) is not int or remaining <= 0:
+            return
+        with self._counter_lock:
+            self.failed += remaining
+        _diag.lost(
+            "message",
+            remaining,
+            f"KafkaSink, still queued when the {self.flush_timeout}s close flush expired",
+        )
 
     def _key(self, event: dict[str, object]) -> bytes | None:
         """Derives one message's partition key from the configured field.

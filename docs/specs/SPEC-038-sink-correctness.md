@@ -273,9 +273,9 @@ and OpenSearch ingest, and inconsistent with the NDJSON every other sink in this
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: Each record's `Data` ends with `\n`.
-- [ ] AC-2: The newline is charged to the per-record and per-request byte budgets.
-- [ ] AC-3: A test asserts the concatenation of a chunk's payloads parses as NDJSON.
+- [x] AC-1: Each record's `Data` ends with `\n`.
+- [x] AC-2: The newline is charged to the per-record and per-request byte budgets.
+- [x] AC-3: A test asserts the concatenation of a chunk's payloads parses as NDJSON.
 
 ### FR-006: `KafkaSink.close()` is bounded and counts what it lost
 
@@ -289,10 +289,20 @@ at exit, thrown away.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `close()` passes a bounded timeout, and the sink documents its worst case as the
+- [x] AC-1: `close()` passes a bounded timeout, and the sink documents its worst case as the
       other retrying sinks do.
-- [ ] AC-2: A non-zero remainder is counted into `failed` with one `_diag.lost` line.
-- [ ] AC-3: The bound interacts correctly with SPEC-027's stop signal — a shutdown cuts it short.
+- [x] AC-2: A non-zero remainder is counted into `failed` with one `_diag.lost` line.
+- [x] AC-3: ~~The bound interacts correctly with SPEC-027's stop signal — a shutdown cuts it
+      short.~~ **Amended by evidence** (2026-08-10), as FR-001 AC-4a was and on the same
+      reasoning. It was built as written and the result was total loss: `Worker.shutdown` sets
+      the stop event *before* the join, so it is always set when `close()` runs, and `produce()`
+      is a local hand-off while `flush()` is the only thing that drains the producer's batch —
+      so cutting the timeout short switched Kafka's exit delivery off entirely. Measured through
+      a real `shutdown()`: 11 buffered, `flush(0)`, **zero delivered**, all 11 booked as
+      `failed`, which is worse than the five-minute hang the bound exists to fix. The stop
+      signal is therefore **not consulted**, the sink no longer carries the attribute, and
+      `flush_timeout` is the whole bound. A shutdown shortens a *wait*; it must never skip
+      *work* on the exit drain.
 
 ### FR-007: `SyslogSink` drops an oversized datagram rather than retrying it
 
@@ -305,11 +315,19 @@ never converging. Every other size-limited sink drops-and-counts before sending.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: An event over the datagram limit is dropped before the send and counted
-      `dropped_oversized`.
-- [ ] AC-2: The limit is configurable with a documented default (~64 KB for UDP), and TCP is
+- [x] AC-1: An event over the datagram limit is dropped before the send and counted
+      `dropped_oversized` — **exactly once per emit, and that is not the same as once per
+      event.** If a batch holds an oversized frame *and* its sendable remainder then fails
+      totally, the emit raises, the worker retries the whole batch, and the filter re-frames and
+      re-drops the same event once per attempt — up to four times for one unsendable frame.
+      `dropped` is an exact count everywhere else in the library, so the departure is recorded
+      here rather than only at the drop site. Nothing in the sink can fix it: the worker owns the
+      retry and hands back the original events, so the sink cannot know it has seen them before.
+      `FirehoseSink._records` and `KinesisSink._records` have the same shape and predate this FR,
+      which is why a fix belongs one level up if it is ever taken.
+- [x] AC-2: The limit is configurable with a documented default (~64 KB for UDP), and TCP is
       unaffected.
-- [ ] AC-3: The retry loop no longer treats a permanent `errno` as transient. The permanent set
+- [x] AC-3: The retry loop no longer treats a permanent `errno` as transient. The permanent set
       is **`EMSGSIZE` only** — every other socket errno the transport can raise (`ECONNREFUSED`,
       `EHOSTUNREACH`, `ENETDOWN`, `EPIPE`, `ETIMEDOUT`) describes a destination that may come
       back, and treating any of those as permanent would turn a transient outage into silent
@@ -325,11 +343,11 @@ the operator can set from this library.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A `maxlen: int | None` constructor argument, passed as
+- [x] AC-1: A `maxlen: int | None` constructor argument, passed as
       `xadd(..., maxlen=n, approximate=True)` and an `ltrim` after `rpush`.
-- [ ] AC-2: The default is `None` — unbounded, today's behaviour — because silently discarding a
+- [x] AC-2: The default is `None` — unbounded, today's behaviour — because silently discarding a
       user's buffered logs is not a default this library may choose.
-- [ ] AC-3: The docstring states that trimming discards at the *destination*, outside anything
+- [x] AC-3: The docstring states that trimming discards at the *destination*, outside anything
       `losses()` can see.
 
 ### FR-009: Kinesis and Firehose size their requests correctly
@@ -347,10 +365,10 @@ record is `{"Data": data}` and the API has no partition key, so a draft AC requi
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `MAX_RECORD_BYTES = 1_024_000` in Firehose.
-- [ ] AC-2: `KinesisSink`'s `size_of` includes `len(r["PartitionKey"])`. Firehose's is unchanged
+- [x] AC-1: `MAX_RECORD_BYTES = 1_024_000` in Firehose.
+- [x] AC-2: `KinesisSink`'s `size_of` includes `len(r["PartitionKey"])`. Firehose's is unchanged
       except for FR-005's newline.
-- [ ] AC-3: A test at each boundary — one byte under and one byte over — for both the per-record
+- [x] AC-3: A test at each boundary — one byte under and one byte over — for both the per-record
       and per-request limits, per sink and against that sink's real budget.
 
 ### ~~FR-010: `LogstashSink` sends a content type Logstash parses~~ — moved to SPEC-041
@@ -384,16 +402,16 @@ attempting delivery) nor `failed` fits an event that was written and flushed to 
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: The default becomes `backup_count=1`; a rotation leaves `path` and `path.1`.
-- [ ] AC-2: `backup_count=0` still truncates, unchanged.
-- [ ] AC-3: No counter and no `losses()`; the docstring records the decision so its absence does
+- [x] AC-1: The default becomes `backup_count=1`; a rotation leaves `path` and `path.1`.
+- [x] AC-2: `backup_count=0` still truncates, unchanged.
+- [x] AC-3: No counter and no `losses()`; the docstring records the decision so its absence does
       not read as an oversight.
-- [ ] AC-4: The docstring and README state what `backup_count=0` discards, and what the new
+- [x] AC-4: The docstring and README state what `backup_count=0` discards, and what the new
       default costs on disk: **2 × `max_bytes` under a size trigger, one full rollover period
       under a time-only one**, where `max_bytes` defaults to `0` and bounds nothing.
-- [ ] AC-5: The docstring's existing claim "No event is lost across a rotation" is narrowed to
+- [x] AC-5: The docstring's existing claim "No event is lost across a rotation" is narrowed to
       the pending event it actually means.
-- [ ] AC-6: A test writes past `max_bytes` **twice** and asserts `path.1` holds the *second*
+- [x] AC-6: A test writes past `max_bytes` **twice** and asserts `path.1` holds the *second*
       generation and `path.2` does not exist.
 
 ### FR-013: The utility sinks leave `sinks.util`
@@ -407,18 +425,18 @@ a pure move with no design content and this spec is already in the sink package.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `MemorySink` and `NullSink` get their own modules; `StderrSink` sits with
+- [x] AC-1: `MemorySink` and `NullSink` get their own modules; `StderrSink` sits with
       `StdoutSink`, which is what it is a variant of.
-- [ ] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated,
+- [x] AC-2: Import paths in `README.md`, `docs/component-inventory.md` and every test are updated,
       **and the one live reference that is not an import**:
       `tests/test_diag.py::test_only_diag_writes_to_stderr`'s docstring names `sinks/util.py` as a
       module that legitimately writes to `sys.stderr` as a destination for the user's events. The
       lint itself is `rglob`-derived and so needs no edit, which is precisely why the stale
       sentence would survive a grep for imports. Historical records — SPEC-008 and its delivery
       doc, the audit — are left alone; they describe what shipped then.
-- [ ] AC-3: `sinks/util.py`'s `__all__` is exactly these three classes, so the module is left
+- [x] AC-3: `sinks/util.py`'s `__all__` is exactly these three classes, so the module is left
       **empty and deleted** rather than kept as a shell.
-- [ ] AC-4: No compatibility alias is left behind in `sinks.util` — an alias would have to live
+- [x] AC-4: No compatibility alias is left behind in `sinks.util` — an alias would have to live
       for all of `1.x`, which is the cost the move is being made to avoid.
 
 ### ~~FR-014: Three queue sinks have no bounded retry, and the docs said they did~~ — moved to SPEC-041

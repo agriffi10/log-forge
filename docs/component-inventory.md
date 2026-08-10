@@ -26,7 +26,9 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `LoggingSink` | `src/log_foundry/sinks/logging_sink.py` | Bridge events into stdlib `logging` — one `LogRecord`/event through a configurable logger; level-mapped, verbatim message, reserved-attr-safe fields (flat + nested). |
 | `FileSink` / `RotatingFileSink` | `src/log_foundry/sinks/file.py` | Append NDJSON to a file; rotating variant adds size/time triggers + numbered backup retention (rotate-before-exceed, no event lost). |
 | `SQLiteSink` | `src/log_foundry/sinks/sqlite.py` | Batch-insert events (full JSON + projected columns) into an embedded SQLite DB; injectable connection, `create_table` opt-out, owned-vs-borrowed close. |
-| `StderrSink` / `NullSink` / `MemorySink` | `src/log_foundry/sinks/util.py` | Utility sinks: NDJSON to stderr (twelve-factor); discard + `dropped` counter; in-process `.events` list with optional `maxlen` ring. |
+| `StderrSink` | `src/log_foundry/sinks/stdout.py` | NDJSON to stderr (twelve-factor); a variant of `StdoutSink`, which is why it sits beside it. |
+| `NullSink` | `src/log_foundry/sinks/null.py` | Discard everything; `.dropped` counts events. |
+| `MemorySink` | `src/log_foundry/sinks/memory.py` | In-process `.events` list with optional `maxlen` ring — the sink a downstream test suite imports. |
 | `HTTPSink` (+ `merge_headers`) | `src/log_foundry/sinks/http.py` | Dependency-free `urllib` POST core: ndjson/json_array, headers/auth, gzip, bounded 429/5xx retry (Retry-After); base for the platform sinks. |
 | Elasticsearch / Loki / Logstash / Syslog sinks | `src/log_foundry/sinks/{elasticsearch,loki,logstash,syslog}.py` | Self-hosted platform sinks: `_bulk`, Loki push, Logstash HTTP/socket, RFC 5424 syslog. |
 | SaaS sinks (Datadog/Splunk/NewRelic/Honeycomb/Sentry) | `src/log_foundry/sinks/{datadog,splunk,newrelic,honeycomb,sentry}.py` | SaaS logs intakes; `SentrySink` lazy-SDK (`sentry` extra) with HTTP-envelope fallback + level gating. |

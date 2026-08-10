@@ -510,7 +510,7 @@ def test_only_diag_writes_to_stderr(path: Path) -> None:
     was written from scratch; a new bare write would start the drift again — and would arrive
     unguarded, which on the worker thread ends delivery for good.
 
-    Referencing ``sys.stderr`` is still fine and deliberate: ``console.py`` and ``sinks/util.py``
+    Referencing ``sys.stderr`` is still fine and deliberate: ``console.py`` and ``sinks/stdout.py``
     use it as a *destination for the user's events*, which is the opposite direction from a
     diagnostic about the library itself.
     """
