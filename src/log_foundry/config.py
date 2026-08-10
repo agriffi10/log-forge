@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
     """Process-wide settings stamped onto every event and consulted by the pipeline.
 
@@ -22,6 +23,13 @@ class Config:
     string is measured in UTF-8 bytes, an integer in the decimal length it renders as, sign
     included. An integer is also bounded by ``sys.get_int_max_str_digits()`` whenever that
     is lower, since a longer one cannot be rendered at all.
+
+    It is **frozen** (SPEC-034 FR-003). :func:`get_config` handed out this object, so assigning
+    to it retargeted what the config *reported* while every event continued to the sink the
+    worker had already captured — SPEC-030's defect reachable with no underscore in sight — and
+    assigning a ceiling bypassed :func:`_require_positive`, so ``max_value_bytes = 0`` was
+    accepted and emptied every event it touched. Both measured. :func:`configure` is the only
+    supported route to a change, and it rebinds the module global rather than mutating.
     """
 
     service: str = "unknown"
@@ -36,6 +44,25 @@ class Config:
 
 
 _config = Config()
+
+_config_lock = threading.Lock()
+"""Serializes the read-modify-write that replacing a frozen config now is.
+
+Freezing :class:`Config` turned each field assignment into a whole-object
+``replace()`` — a read of every field followed by a write of every field — and one of the two
+call sites, :func:`_ensure_sink`, runs on the **orphan logging path**, on whatever application
+thread called ``info()``. A stale snapshot there puts back the pre-``configure()`` ``service``,
+``version``, ``env``, ``defaults`` *and* ``sink``, permanently. Measured on the unlocked version:
+268 of 2000 trials shipped every later event with ``service="unknown"`` after one concurrent
+``info()``, against 0 before the freeze — a regression, and the SPEC-024 category of wrong data
+rather than lost data.
+
+It does **not** cover reads. :func:`_live_config` is one atomic global read and stays lock-free,
+so the per-event path pays nothing (SPEC-034 FR-003 AC-6). Lock ordering is one-way and stays
+that way: ``_ensure_sink`` is called with ``decorator._worker_lock`` held, and ``configure()``
+releases this lock before ``_swap_live_sink`` takes that one, so nothing acquires
+``_worker_lock`` underneath this.
+"""
 
 
 def _require_positive(name: str, value: int | None) -> None:
@@ -127,24 +154,22 @@ def configure(
     _require_positive("max_keys", max_keys)
     _require_positive("max_depth", max_depth)
 
-    if service is not None:
-        _config.service = service
-    if version is not None:
-        _config.version = version
-    if env is not None:
-        _config.env = env
-    if sink is not None:
-        _config.sink = sink
-    if defaults is not None:
-        _config.defaults = dict(defaults)
-    if max_value_bytes is not None:
-        _config.max_value_bytes = max_value_bytes
-    if max_stack_bytes is not None:
-        _config.max_stack_bytes = max_stack_bytes
-    if max_keys is not None:
-        _config.max_keys = max_keys
-    if max_depth is not None:
-        _config.max_depth = max_depth
+    changed: dict[str, object] = {
+        name: value
+        for name, value in (
+            ("service", service),
+            ("version", version),
+            ("env", env),
+            ("sink", sink),
+            ("defaults", None if defaults is None else dict(defaults)),
+            ("max_value_bytes", max_value_bytes),
+            ("max_stack_bytes", max_stack_bytes),
+            ("max_keys", max_keys),
+            ("max_depth", max_depth),
+        )
+        if value is not None
+    }
+    _rebind(**changed)
 
     _ensure_sink()
 
@@ -183,18 +208,73 @@ def _swap_live_sink(sink: Sink) -> None:
 def get_config() -> Config:
     """Returns the current global config, for reading.
 
-    **Mutating what this returns is unsupported and will raise from 1.0** (SPEC-034 FR-003).
-    Today it hands back the live singleton, so assigning to it retargets what the config
-    *reports* while every event continues to the sink the worker already captured, and assigning
-    a ceiling bypasses the validation :func:`configure` performs — ``max_value_bytes = 0`` is
-    accepted and empties every event it touches. Both measured. :func:`configure` is the only
-    supported route to a change.
+    **Mutating what this returns raises** (SPEC-034 FR-003). It used to hand back the live
+    singleton, so assigning to it retargeted what the config *reported* while every event
+    continued to the sink the worker had already captured, and assigning a ceiling bypassed the
+    validation :func:`configure` performs — ``max_value_bytes = 0`` was accepted and emptied
+    every event it touched. Both measured. :func:`configure` is the only route to a change.
+
+    It is a **copy**, not the frozen original, and ``defaults`` is copied with it. A caller who
+    defeats the freeze — ``object.__setattr__`` reaches through any frozen dataclass — then
+    edits an object the library does not read, rather than the live config; and ``defaults`` is
+    a plain mutable ``dict``, so sharing it would leave the freeze cosmetic at the one field
+    that is not a scalar. ``dataclasses.replace`` alone does **not** do this: it shares the
+    dict, which was measured while building this.
 
     Args:
       None.
 
     Returns:
-      The process-wide :class:`Config`, to be treated as read-only.
+      A copy of the process-wide :class:`Config`, with its own ``defaults``.
+
+    Raises:
+      None.
+    """
+    return replace(_config, defaults=dict(_config.defaults))
+
+
+def _rebind(**changed: object) -> None:
+    """Replaces the module-global config with a copy carrying the changed fields.
+
+    :class:`Config` is frozen (SPEC-034 FR-003), so a change is a new object and a rebinding of
+    the global rather than an assignment to a field. It is **one** replacement for the whole
+    call, not one per field: nine rebindings would allocate nine configs and, worse, would leave
+    a window in which another thread reads a half-applied config — a `service` from the new call
+    beside a `sink` from the old one, stamped onto real events.
+
+    Rebinding is safe only because no module imports ``_config`` by value; a
+    ``from log_foundry.config import _config`` anywhere would hold the pre-rebind object forever,
+    which is why a test asserts the absence rather than a comment claiming it.
+
+    Args:
+      **changed: Field names and their new values. Fields not named keep their current value.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    global _config
+    with _config_lock:
+        _config = replace(_config, **changed)  # type: ignore[arg-type]
+
+
+def _live_config() -> Config:
+    """Returns the config object itself, for callers inside the package.
+
+    :func:`get_config` copies, because it is public and a caller must not be able to reach the
+    live object through it. ``model.build_event`` reads the config **one to three times per
+    event**, so routing that through the public accessor would allocate a ``Config`` and a
+    ``defaults`` dict per event. The freeze is a guarantee to the library's *users*, not one the
+    library needs against itself, so internal callers read the live object and treat it as
+    read-only — the same split :func:`context._live_baggage` makes for baggage.
+
+    Args:
+      None.
+
+    Returns:
+      The live process-wide :class:`Config`.
 
     Raises:
       None.
@@ -210,6 +290,14 @@ def _ensure_sink() -> Sink:
     user has not called ``configure()`` yet. The local import defers the ``sinks``
     dependency and avoids a top-level import cycle (arch §7).
 
+    It is called on the **orphan logging path**, on arbitrary application threads, so the
+    default is resolved under :data:`_config_lock` with a double check and the global is re-read
+    inside it (SPEC-034 FR-003). Returning a freshly built local instead handed two racing
+    threads two different ``StdoutSink`` objects — measured 996 of 3000 trials — one of which
+    then received events and was referenced by nothing, so nothing closed it (SPEC-031 FR-006).
+    The unlocked read above it is the fast path: once a sink is configured this is one atomic
+    global read and no lock at all.
+
     Args:
       None.
 
@@ -219,8 +307,17 @@ def _ensure_sink() -> Sink:
     Raises:
       None.
     """
-    if _config.sink is None:
-        from log_foundry.sinks.stdout import StdoutSink
+    global _config
+    sink_now = _config.sink
+    if sink_now is not None:
+        return sink_now
 
-        _config.sink = StdoutSink()
-    return _config.sink
+    from log_foundry.sinks.stdout import StdoutSink
+
+    with _config_lock:
+        if _config.sink is None:
+            _config = replace(_config, sink=StdoutSink())
+        resolved = _config.sink
+    if resolved is None:  # pragma: no cover - unreachable; the branch above just set it
+        raise RuntimeError("the default sink could not be resolved")
+    return resolved

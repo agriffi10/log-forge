@@ -214,7 +214,7 @@ def test_the_event_builders_carry_no_function_local_imports() -> None:
 def test_the_resolved_names_are_the_real_ones() -> None:
     from log_foundry import ids
 
-    assert model.get_config is config.get_config
+    assert model._live_config is config._live_config
     assert model.new_log_id is ids.new_log_id
 
 

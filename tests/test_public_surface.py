@@ -8,15 +8,19 @@ SPEC-032 and SPEC-035 both paid for.
 """
 
 import ast
+import dataclasses
 import inspect
 import pathlib
 import pkgutil
 import re
 import threading
+import time
 
 import pytest
 
 log_foundry = pytest.importorskip("log_foundry")
+config = pytest.importorskip("log_foundry.config")
+model = pytest.importorskip("log_foundry.model")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
@@ -25,6 +29,18 @@ _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
 # a name alone -- `stream` is a positional *transport* in StdoutSink and a positional
 # *destination* in RedisStreamsSink -- so a syntactic rule would have to guess, and this does not.
 _INJECTED = ("client", "sdk", "producer", "connection", "opener")
+
+
+class _Recorder:
+    """A minimal sink, so a test can configure one without touching the real destinations."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        self.events.extend(batch)
+
+    def close(self) -> None: ...
 
 
 def _sink_classes_with_emit() -> list[tuple[str, ast.ClassDef]]:
@@ -368,3 +384,357 @@ def test_every_shipped_sink_module_imports() -> None:
         except Exception as exc:
             failed.append(f"{info.name}: {type(exc).__name__}: {exc}")
     assert not failed, "sink modules failed to import:\n" + "\n".join(failed)
+
+
+# -- FR-003: get_config() cannot be used to mutate the live config --------------------------
+
+
+def test_the_returned_config_refuses_a_sink_reassignment() -> None:
+    """FR-003 AC-1. SPEC-030's defect, reachable publicly with no underscore in sight.
+
+    Assigning `.sink` retargeted what the config *reported* while every event continued to the
+    sink the worker had already captured: measured before the fix as A got 4, B got 0, the
+    config claiming B, `incomplete_swaps` at zero and A never closed.
+    """
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        log_foundry.get_config().sink = object()  # type: ignore[misc]
+
+
+def test_the_returned_config_refuses_a_ceiling_that_configure_would_reject() -> None:
+    """FR-003 AC-2. `max_value_bytes = 0` empties every event it touches."""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        log_foundry.get_config().max_value_bytes = 0  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        log_foundry.configure(max_value_bytes=0)
+
+
+def test_every_documented_read_still_works() -> None:
+    """FR-003 AC-3. The freeze must cost a reader nothing."""
+    log_foundry.configure(service="billing", version="2.1", env="prod", defaults={"team": "core"})
+    cfg = log_foundry.get_config()
+    assert (cfg.service, cfg.version, cfg.env) == ("billing", "2.1", "prod")
+    assert cfg.defaults == {"team": "core"}
+    assert cfg.sink is not None
+    assert (cfg.max_value_bytes, cfg.max_stack_bytes, cfg.max_keys, cfg.max_depth) == (
+        8192,
+        32768,
+        256,
+        8,
+    )
+
+
+def test_the_returned_config_is_a_copy_not_the_live_object() -> None:
+    """FR-003 AC-4. `object.__setattr__` reaches through any frozen dataclass.
+
+    So the freeze alone is not the guarantee — the guarantee is that what a caller can reach is
+    not the object the library reads.
+    """
+    cfg = log_foundry.get_config()
+    assert cfg is not config._live_config()
+    object.__setattr__(cfg, "service", "defeated")
+    assert config._live_config().service != "defeated"
+
+
+def test_the_returned_defaults_dict_is_copied_too() -> None:
+    """FR-003 AC-5, and the one the FR's own recipe would have failed.
+
+    The Description proposes `dataclasses.replace(_config)` as "the straightforward answer".
+    Measured while building this: `replace` **shares** the `defaults` dict, so that recipe hands
+    back a frozen shell around the live mapping and the freeze is cosmetic at the one field that
+    is not a scalar.
+    """
+    log_foundry.configure(service="t", defaults={"team": "core"})
+    returned = log_foundry.get_config().defaults
+    returned["team"] = "MUTATED"
+    returned["injected"] = True
+    assert config._live_config().defaults == {"team": "core"}
+
+
+def test_no_module_imports_the_config_singleton_by_value() -> None:
+    """FR-003 AC-7. The rebind is only safe because nothing holds the pre-rebind object.
+
+    `configure()` replaces the module global; a `from log_foundry.config import _config`
+    anywhere would keep the object it bound at import time forever, reading stale settings for
+    the life of the process and never failing a test that did not look for it.
+    """
+    offenders = []
+    for path in (_ROOT / "src").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            by_import = isinstance(node, ast.ImportFrom) and any(
+                a.name == "_config" for a in node.names
+            )
+            # `from log_foundry import config` then `_C = config._config` holds the same stale
+            # object by a route no ImportFrom scan sees. Review found the first version blind to
+            # it, so the check is on the binding, not on one syntax for it.
+            by_alias = (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "_config"
+            )
+            if by_import or by_alias:
+                offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
+    assert not offenders, f"these hold the pre-rebind config: {offenders}"
+
+
+def test_a_held_config_reference_does_not_track_later_calls() -> None:
+    """`get_config()` is a snapshot now, where it used to track. Pin the behaviour change.
+
+    Correct and intended — it is what makes the copy a copy — but a caller who held the result
+    across a `configure()` used to see the new values and now does not, and nothing said so.
+    """
+    log_foundry.configure(service="before", sink=_Recorder())
+    held = log_foundry.get_config()
+    log_foundry.configure(service="after")
+
+    assert held.service == "before", "a held reference is a snapshot"
+    assert log_foundry.get_config().service == "after", "a fresh read sees the change"
+
+
+def test_configure_distinguishes_an_empty_value_from_an_omitted_one() -> None:
+    """`configure()` filters on `is not None`, and a truthiness filter would be wrong.
+
+    `configure(defaults={})` must *clear* the defaults and `configure(service="")` must apply —
+    both are values the caller supplied. Untested before review; the mutant `if value` survived
+    the whole suite.
+    """
+    log_foundry.configure(service="svc", defaults={"team": "core"}, sink=_Recorder())
+    log_foundry.configure(defaults={})
+    assert log_foundry.get_config().defaults == {}, "an empty dict is a value, not an omission"
+
+    log_foundry.configure(service="")
+    assert log_foundry.get_config().service == "", "an empty string is a value, not an omission"
+
+
+def test_a_nested_default_is_shared_and_says_so() -> None:
+    """FR-003 AC-5's bound, pinned rather than left to the docstring.
+
+    `dict(defaults)` copies one level. A nested mutable stays live and reaches real events —
+    review reproduced it. Deep-copying arbitrary caller objects inside an accessor that must not
+    raise is the wider failure, so the bound is stated and asserted instead of closed.
+    """
+    log_foundry.configure(service="t", defaults={"team": {"name": "core"}}, sink=_Recorder())
+    returned = log_foundry.get_config().defaults
+
+    returned["added"] = True
+    assert "added" not in config._live_config().defaults, "the top level is copied"
+
+    returned["team"]["name"] = "MUTATED"  # type: ignore[index]
+    assert config._live_config().defaults["team"] == {"name": "MUTATED"}, (
+        "a nested value is shared -- documented, not fixed"
+    )
+
+
+def test_the_zero_config_path_still_resolves_a_sink() -> None:
+    """The gap the spec's design missed, found by reading `config.py` before writing any of it.
+
+    `_ensure_sink()` assigns `_config.sink = StdoutSink()` when nothing was configured — a
+    second in-place mutation the FR never names, on the path a process takes when it calls
+    `info()` without ever calling `configure(sink=...)`. Under `frozen=True` and without the
+    rebind it raises `FrozenInstanceError` into the orphan guard, and every zero-config log is
+    absorbed and lost.
+    """
+    config._rebind(sink=None)
+    resolved = config._ensure_sink()
+    assert resolved is not None
+    assert config._live_config().sink is resolved, "the resolved default is retained, not rebuilt"
+
+
+def test_configure_applies_every_field_in_one_rebind(monkeypatch) -> None:
+    """The second gap: nine rebindings would leave a window on a half-applied config.
+
+    Counted at **runtime**, not by shape. A first version counted `_rebind` call *nodes* in
+    `configure()`'s source and passed against the exact defect it names — one syntactic call
+    inside `for k, v in changed.items(): _rebind(**{k: v})` is nine executions and nine windows,
+    with the whole suite green. Found by review, with that mutant.
+    """
+    log_foundry.configure(service="pre", sink=_Recorder())  # so _ensure_sink cannot rebind below
+    calls = 0
+    real = config._rebind
+
+    def counting(**changed: object) -> None:
+        nonlocal calls
+        calls += 1
+        real(**changed)
+
+    monkeypatch.setattr(config, "_rebind", counting)
+    log_foundry.configure(
+        service="s",
+        version="v",
+        env="e",
+        defaults={"a": 1},
+        max_value_bytes=100,
+        max_stack_bytes=200,
+        max_keys=10,
+        max_depth=3,
+    )
+    assert calls == 1, f"configure() rebound {calls} times; a reader can see a partial config"
+
+
+def test_a_concurrent_orphan_log_cannot_revert_configure() -> None:
+    """The regression the freeze introduced, and the reason `_config_lock` exists.
+
+    Freezing turned each field assignment into a whole-config read-modify-write, and one of the
+    two writers — `_ensure_sink()` — runs on the orphan logging path, on whatever application
+    thread called `info()`. A stale snapshot there puts back the pre-`configure()` service,
+    version, env, defaults **and** sink, permanently. Measured on the unlocked version: 268 of
+    2000 trials, against 0 before the freeze. Wrong data in the log stream, silently, for the
+    life of the process — SPEC-024's category.
+
+    The window is widened deliberately rather than raced for. A first harness used a barrier and
+    a 1 microsecond switch interval and reported 0 reversions **with the defect present**, which
+    would have certified the fix against a measurement that never entered the window it claimed
+    to clear.
+    """
+    real_replace = config.replace
+    reached_the_window = threading.Event()
+
+    def slow_replace(obj: object, **kw: object) -> object:
+        if "sink" in kw and not isinstance(kw.get("sink"), _Recorder):
+            reached_the_window.set()
+            time.sleep(0.2)
+        return real_replace(obj, **kw)
+
+    chosen = _Recorder()
+    config._rebind(sink=None, service="unknown", version="0.0.0")
+    config.replace = slow_replace  # type: ignore[assignment]
+    try:
+        worker = threading.Thread(target=lambda: log_foundry.info("orphan resolves the default"))
+        worker.start()
+        assert reached_the_window.wait(5.0), "the harness never entered the window"
+        log_foundry.configure(service="billing", version="2.1", sink=chosen)
+        worker.join(10.0)
+    finally:
+        config.replace = real_replace  # type: ignore[assignment]
+
+    live = config._live_config()
+    assert (live.service, live.version) == ("billing", "2.1"), "configure() was reverted"
+    assert live.sink is chosen, "configure()'s sink was reverted"
+
+
+def test_two_threads_resolving_the_default_sink_get_the_same_object() -> None:
+    """`_ensure_sink` returning its own local handed racing threads two different sinks.
+
+    Measured 996 of 3000 trials before the double check. One of the two then received events and
+    was referenced by nothing, so nothing closed it — SPEC-031 FR-006's invariant, broken from
+    the other end.
+
+    The window is injected, not raced for. A first version started eight threads on a barrier and
+    **passed against the defect**: the unlocked form still re-read the global on its fast path, so
+    seven of the eight found the first thread's sink and only a hair-fine interleave produced two.
+    Holding the first resolver inside the replace makes every later thread arrive while the sink
+    is still `None`, which is the state the defect needs.
+    """
+    config._rebind(sink=None)
+    real_replace = config.replace
+    first_call = threading.Event()
+
+    def slow_replace(obj: object, **kw: object) -> object:
+        if not first_call.is_set():
+            first_call.set()
+            time.sleep(0.2)
+        return real_replace(obj, **kw)
+
+    resolved: list[object] = []
+    lock = threading.Lock()
+
+    def resolve() -> None:
+        sink = config._ensure_sink()
+        with lock:
+            resolved.append(sink)
+
+    config.replace = slow_replace  # type: ignore[assignment]
+    try:
+        threads = [threading.Thread(target=resolve) for _ in range(8)]
+        threads[0].start()
+        assert first_call.wait(5.0), "the harness never entered the window"
+        for t in threads[1:]:
+            t.start()
+        for t in threads:
+            t.join(10.0)
+    finally:
+        config.replace = real_replace  # type: ignore[assignment]
+
+    assert len(resolved) == 8, "a resolver did not finish"
+    assert len({id(sink) for sink in resolved}) == 1, "racing threads got different default sinks"
+    assert config._live_config().sink is resolved[0], "the global names the sink handed out"
+
+
+def test_the_per_event_path_does_not_pay_for_the_config_copy() -> None:
+    """FR-003 AC-6. `build_event` reads the config one to three times per event.
+
+    Routing those through `get_config()` would allocate a `Config` **and** a `defaults` dict per
+    event. Checked structurally for the same reason the baggage equivalent is: the behaviour is
+    identical and only the cost changes, which no behavioural test can see.
+    """
+    model_src = (_ROOT / "src" / "log_foundry" / "model.py").read_text(encoding="utf-8")
+    calls = {
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(model_src))
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith("config()")
+    }
+    assert calls == {"_live_config()"}, f"model.py's config reads are {sorted(calls)}"
+
+
+def test_no_config_copy_is_allocated_per_event(monkeypatch) -> None:
+    """FR-003 AC-6's benchmark, counted rather than timed.
+
+    The AC asks for a benchmark rather than an assertion. A wall-clock one would be a race
+    against the machine — this repo has been bitten by timing tests that failed on their own
+    setup — so what is measured is the thing the cost *is*: how many `Config` copies the
+    per-event path allocates. `get_config()` calls `replace`; `_live_config()` does not. Five
+    hundred events must allocate none.
+    """
+    copies = 0
+    real_replace = config.replace
+
+    def counting_replace(*args: object, **kwargs: object) -> object:
+        nonlocal copies
+        copies += 1
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(config, "replace", counting_replace)
+    log_foundry.configure(service="bench", defaults={"team": "core"})
+    copies = 0  # discard the configure() rebind; only the per-event path is under measurement
+
+    span = model.Span(
+        trace_id="0" * 32, span_id="0" * 16, parent_span_id=None, name="bench", start_ts=0.0
+    )
+    for i in range(500):
+        model.build_event(span, "INFO", "m", fields={"i": i}, baggage={"team": "core"})
+
+    assert copies == 0, f"{copies} Config copies allocated across 500 events"
+
+
+def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
+    """A new lock's real risk is what runs inside it, and that is what rots.
+
+    `_ensure_sink()` is called with `decorator._worker_lock` already held
+    (`decorator.py:235`), so the order is worker -> config and must stay one-way: anything under
+    `_config_lock` that reached back for `_worker_lock`, or blocked on I/O, would deadlock or
+    stall every configure and every zero-config log behind it. Today only `replace()` and
+    `StdoutSink()` run there, and `StdoutSink.__init__` is a single attribute assignment.
+
+    Asserted as a whitelist rather than a search for the bad case: the set of things that would
+    be unsafe is open, and the set that is currently safe is two.
+    """
+    under_lock: list[str] = []
+
+    def walk(node: ast.AST, held: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            here = held
+            if isinstance(child, ast.With) and "_config_lock" in ast.unparse(
+                child.items[0].context_expr
+            ):
+                here = True
+            if here and isinstance(child, ast.Call):
+                under_lock.append(ast.unparse(child.func))
+            walk(child, here)
+
+    source = (_ROOT / "src" / "log_foundry" / "config.py").read_text(encoding="utf-8")
+    walk(ast.parse(source), False)
+
+    assert set(under_lock) == {"replace", "StdoutSink"}, (
+        f"new work under _config_lock: {sorted(set(under_lock))}. "
+        "Anything that blocks, or that reaches for _worker_lock, deadlocks or stalls "
+        "every configure() and every zero-config log."
+    )

@@ -183,25 +183,57 @@ freeze is a guarantee to *callers*, not to the library itself), and AC-6 is what
 instead — safe only because no module does `from config import _config`, which is verified today
 and worth a test.
 
+**Three things this Description got wrong or left out, all found by reading `config.py` before
+writing any of it and then measured** (recorded here rather than fixed silently, per SPEC-021):
+
+1. ~~`get_config()` returns `dataclasses.replace(_config)`~~ — that **shares the `defaults`
+   dict**, so it hands back a frozen shell around the live mapping and fails this FR's own AC-5.
+   It must be `replace(_config, defaults=dict(_config.defaults))`. The Description proposed the
+   failing call as "the straightforward answer" while AC-5 separately forbade its consequence.
+2. **`_ensure_sink()` mutates too**, and is not named anywhere above. It assigns
+   `_config.sink = StdoutSink()` when nothing was configured — the zero-config path. Under
+   `frozen=True` without a rebind it raises `FrozenInstanceError` into `api._log`'s orphan guard,
+   so **every log in a process that never called `configure(sink=...)` is absorbed and lost**:
+   measured, `log-foundry: absorbed a failure while emitting an orphan log
+   (FrozenInstanceError); the event was lost`. A list of mutating call sites that names only
+   `configure()` is the kind of hand-roster this arc has repeatedly paid for.
+3. **`configure()` writes nine fields one at a time.** Rebinding per field would allocate nine
+   configs and, worse, leave a window in which another thread reads a half-applied one — a
+   `service` from this call beside a `sink` from the last, stamped onto real events. It is one
+   `replace(**changed)` and one rebind, counted at **runtime**: a first version counted call
+   *nodes* in the source and passed against `for k, v in changed.items(): _rebind(**{k: v})` —
+   one syntactic call, nine executions, nine windows, whole suite green.
+4. **Freezing turns every write into a read-modify-write, and one of the writers is on the
+   logging path.** The worst finding in this FR, and a regression it introduced rather than a
+   defect it inherited: `_ensure_sink()` runs on the orphan path on arbitrary application
+   threads, so a stale snapshot there puts back the pre-`configure()` `service`, `version`,
+   `env`, `defaults` **and** `sink`, permanently. Measured on the unlocked version: **268 of
+   2000** trials shipped every later event with `service="unknown"` after one concurrent
+   `info()`, against **0** before the freeze — wrong data in the log stream for the life of the
+   process, which is SPEC-024's category. `configure()` being documented "not thread-safe" does
+   not cover it: the racing party is `info()`. A dedicated `_config_lock` serializes the two
+   writers; `_live_config()` stays lock-free, so AC-6 is untouched. Lock ordering is one-way —
+   nothing takes `decorator._worker_lock` underneath it.
+
 The alternative, returning the singleton and documenting "do not mutate", is what exists today
 and is what this FR exists to end.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `get_config().sink = X` raises rather than silently retargeting the config.
-- [ ] AC-2: `get_config().max_value_bytes = 0` raises; the only route to a ceiling is
+- [x] AC-1: `get_config().sink = X` raises rather than silently retargeting the config.
+- [x] AC-2: `get_config().max_value_bytes = 0` raises; the only route to a ceiling is
       `configure()`, which validates.
-- [ ] AC-3: Every documented read still works — `get_config().service`, `.sink`, `.defaults` and
+- [x] AC-3: Every documented read still works — `get_config().service`, `.sink`, `.defaults` and
       the four ceilings — and the README's examples are unchanged.
-- [ ] AC-4: Mutating the returned object cannot affect the library's behaviour even if a caller
+- [x] AC-4: Mutating the returned object cannot affect the library's behaviour even if a caller
       defeats the freeze (e.g. `object.__setattr__`): the returned object is a **copy**, so the
       internal `_config` is unreachable through it. A test asserts identity is *not* shared.
-- [ ] AC-5: `defaults` — a mutable `dict` on the dataclass — is copied too, or the freeze is
+- [x] AC-5: `defaults` — a mutable `dict` on the dataclass — is copied too, or the freeze is
       cosmetic. A test mutates the returned `defaults` and asserts the library's is unchanged.
-- [ ] AC-6: The library's own internals do not go through `get_config()` on any hot path, so this
+- [x] AC-6: The library's own internals do not go through `get_config()` on any hot path, so this
       adds no per-event allocation. `model.build_event`'s three call sites are converted, and a
       benchmark shows the per-event path is unchanged rather than an assertion that it is.
-- [ ] AC-7: No module imports `_config` by value (`from config import _config`), so rebinding it
+- [x] AC-7: No module imports `_config` by value (`from config import _config`), so rebinding it
       in `configure()` is safe. A test asserts it, since the freeze depends on it.
 
 ### FR-004: `echo` and `message` stop being reserved words
