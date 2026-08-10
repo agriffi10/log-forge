@@ -251,7 +251,7 @@ class Worker:
           None.
 
         Raises:
-          None. A sink whose ``stop_signal`` is a read-only property, or whose
+          None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose
             ``__setattr__`` objects, loses interruptibility rather than preventing the worker
             from starting.
         """

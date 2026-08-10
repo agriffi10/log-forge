@@ -165,11 +165,12 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
       None.
 
     Raises:
-      None. A sink whose ``stop_signal`` is a read-only property, or whose ``__setattr__``
+      None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose
+      ``__setattr__``
         objects, loses interruptibility rather than preventing the caller from proceeding.
     """
     try:
-        if hasattr(sink, "stop_signal"):
-            sink.stop_signal = stop
+        if hasattr(sink, "log_foundry_stop_signal"):
+            sink.log_foundry_stop_signal = stop
     except Exception as exc:
         _diag.absorbed("handing the sink its stop signal", exc, "its backoff stays uninterruptible")

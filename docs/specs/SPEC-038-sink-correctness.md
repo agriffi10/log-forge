@@ -52,7 +52,7 @@ of `FR-001`'s 5,980-event silent loss made the urgent wait on the slow. Split, b
   `LogstashSink`'s content type, the three queue sinks with no bounded retry, and the CI job all
   four need. SPEC-041, split out of this spec for the reason in the Overview.
 - **Anything about the `Sink` protocol itself** — the flush hook is SPEC-036 FR-002, the
-  `stop_signal` contract is SPEC-034 FR-006.
+  `log_foundry_stop_signal` contract is SPEC-034 FR-006.
 - **Re-chunking inside the worker.** FR-001 fixes the sinks, not the drain: a batch size is the
   destination's constraint and the destination's business, and `chunk_items` already exists for
   exactly this. Bounding `_final_drain` instead would leave a sink that receives a large batch by

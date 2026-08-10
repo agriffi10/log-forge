@@ -132,7 +132,7 @@ class HTTPSink:
         self.gzip = gzip
         self.max_retries = max(max_retries, 0)
         self.max_retry_after = max_retry_after
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0
@@ -364,7 +364,7 @@ class HTTPSink:
         """
         server = clamp_server_delay(retry_after, self.max_retry_after)
         delay = server if server is not None else _BACKOFF_BASE * (2**attempt)
-        wait(delay, self.stop_signal)
+        wait(delay, self.log_foundry_stop_signal)
 
     def _abandon(self, reason: str) -> NoReturn:
         """Counts and logs a request abandoned past the retry bound, then raises (FR-012).

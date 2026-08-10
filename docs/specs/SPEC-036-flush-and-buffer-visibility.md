@@ -259,7 +259,8 @@ against a stand-in with that shape: `flush() → True`, on the wire 0, in the cl
 `health()` all zeros.
 
 `Sink` declares `emit` and `close`. It gains an **optional** `flush()`, probed by name exactly as
-`losses()` and `stop_signal` are (SPEC-026, SPEC-027), so every existing third-party sink still
+`losses()` and `log_foundry_stop_signal` are (SPEC-026, SPEC-027), so every existing third-party
+sink still
 satisfies the protocol.
 
 #### Acceptance Criteria:
@@ -509,7 +510,7 @@ class Health:
 class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None: ...
     def close(self) -> None: ...
-    # optional, probed by name: losses(), stop_signal, flush(), and
+    # optional, probed by name: losses(), log_foundry_stop_signal, flush(), and
     # discard_buffered_after_fork() (SPEC-039 FR-004)
 ```
 

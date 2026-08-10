@@ -222,13 +222,20 @@ def test_reset_context_replaces_the_baggage_dict_rather_than_emptying_it() -> No
 
 
 def test_reset_context_does_not_hand_back_the_shared_contextvar_default() -> None:
-    """The other half: with nothing ever set, `.clear()` would be a no-op on the shared default."""
+    """The other half: with nothing ever set, `.clear()` would be a no-op on the shared default.
+
+    Reads through ``_live_baggage`` rather than ``get_baggage``. This is an **identity**
+    assertion, and SPEC-034 FR-005 made the public accessor return a copy — so against
+    ``get_baggage`` it became trivially true and stopped catching anything: with the
+    ``reset_context`` bug reinstated (``_baggage.get().clear()``) it passed. Found by review, by
+    running that exact mutant against both branches.
+    """
     context = pytest.importorskip("log_foundry.context")
-    shared_default = contextvars.Context().run(context.get_baggage)
+    shared_default = contextvars.Context().run(context._live_baggage)
 
     def body() -> None:
         context.reset_context()
-        assert context.get_baggage() is not shared_default
+        assert context._live_baggage() is not shared_default
 
     contextvars.copy_context().run(body)
     assert shared_default == {}, "the shared default must never have been mutated"

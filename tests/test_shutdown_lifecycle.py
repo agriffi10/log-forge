@@ -21,7 +21,7 @@ class CountingSink:
         self.held: list[dict] = []
         self.delivered: list[dict] = []
         self.closed = 0
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict]) -> None:
         self.held.extend(batch)
@@ -33,9 +33,11 @@ class CountingSink:
 
 
 class BackoffSink(CountingSink):
-    """Backs off inside ``emit``, re-reading ``stop_signal`` the way a retrying sink does.
+    """Backs off inside ``emit``, re-reading ``log_foundry_stop_signal`` the way a retrying sink
+    does.
 
-    The re-read is the whole point. ``sinks/_retry.wait`` consults ``self.stop_signal`` once per
+    The re-read is the whole point. ``sinks/_retry.wait`` consults ``self.log_foundry_stop_signal``
+    once per
     attempt, so a signal swapped out *during* a backoff is the one the next attempt waits on — a
     sink that captured the event at entry could not observe FR-001 at all.
     """
@@ -56,7 +58,7 @@ class BackoffSink(CountingSink):
         self._backing_off = True
         self.in_emit.set()
         self.may_wait.wait(5.0)
-        signal = self.stop_signal
+        signal = self.log_foundry_stop_signal
         self.signal_when_waiting = signal
         self.cut_short = bool(signal is not None and signal.wait(self.backoff))
 
@@ -97,7 +99,7 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
     _trace_once()
     worker = decorator._worker
     assert worker is not None
-    assert sink.stop_signal is worker._stop, "the worker owns this sink's signal to begin with"
+    assert sink.log_foundry_stop_signal is worker._stop, "the worker owns this sink's signal to begin with"
 
     shutting_down = threading.Thread(target=lambda: log_foundry.shutdown(timeout=3.0))
     try:
@@ -108,7 +110,7 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
 
         log_foundry.info("an orphan log while the drain is in flight")
 
-        assert sink.stop_signal is worker._stop, (
+        assert sink.log_foundry_stop_signal is worker._stop, (
             "an orphan log replaced the signal the drain thread is about to wait on"
         )
     finally:
@@ -164,10 +166,10 @@ def test_a_sink_adopted_after_a_retired_worker_still_receives_a_signal() -> None
     log_foundry.configure(service="t", sink=second)
     log_foundry.info("an orphan log against a sink no live worker owns")
 
-    assert second.stop_signal is not None, (
+    assert second.log_foundry_stop_signal is not None, (
         "a sink adopted after shutdown got no stop signal, so SPEC-027's guarantee is false here"
     )
-    assert second.stop_signal is not first.stop_signal, "it must not inherit the retired signal"
+    assert second.log_foundry_stop_signal is not first.log_foundry_stop_signal, "it must not inherit the retired signal"
 
 
 # --- FR-004: the idempotent shutdown waits for the drain it found ----------------------------
@@ -490,7 +492,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
         from log_foundry import decorator
 
         class S:
-            def __init__(self, n): self.n = n; self.closed = 0; self.stop_signal = None
+            def __init__(self, n): self.n = n; self.closed = 0; self.log_foundry_stop_signal = None
             def emit(self, b): pass
             def close(self): self.closed += 1; print(f"CLOSED {self.n}", flush=True)
 

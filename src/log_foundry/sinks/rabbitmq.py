@@ -66,7 +66,7 @@ class RabbitMQSink:
         self._routing_key = routing_key
         self._url = url
         self._max_retries = max(max_retries, 0)
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
         self._channel: Any = None
@@ -181,7 +181,7 @@ class RabbitMQSink:
             except Exception as err:
                 self._reset()
                 if attempt < self._max_retries:
-                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
                     self.failed += 1

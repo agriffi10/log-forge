@@ -103,8 +103,8 @@ class SQSSink:
     def __init__(
         self,
         queue_url: str,
-        client: Any = None,
         *,
+        client: Any = None,
         max_retries: int = 3,
         fifo: bool | None = None,
         message_group_id: GroupIdSource = None,
@@ -144,7 +144,7 @@ class SQSSink:
         self.queue_url = queue_url
         self.client = client
         self.max_retries = max(max_retries, 0)
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
         self.message_group_id = message_group_id
         self.message_deduplication_id = message_deduplication_id
@@ -376,7 +376,7 @@ class SQSSink:
                 return accepted, False
             entries = [entry for entry in entries if entry["Id"] in retryable_ids]
             if attempt < self.max_retries:
-                wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
+                wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
             if attempt >= self.max_retries:
                 with self._counter_lock:
                     self.failed += len(entries)

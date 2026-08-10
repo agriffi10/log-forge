@@ -1,7 +1,7 @@
 # Spec: The Public API Freeze
 
 **ID:** SPEC-034  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-026, SPEC-030, SPEC-033
 
@@ -126,8 +126,8 @@ README uses the positional form.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `SQSSink(url, client=fake)` works; `SQSSink(url, fake)` raises `TypeError`.
-- [ ] AC-2: A test asserts that **no sink class in `sinks/` takes a parameter named `client`,
+- [x] AC-1: `SQSSink(url, client=fake)` works; `SQSSink(url, fake)` raises `TypeError`.
+- [x] AC-2: A test asserts that **no sink class in `sinks/` takes a parameter named `client`,
       `sdk`, `producer`, `connection` or `opener` positionally**, derived from parameter names
       across the package rather than a sink list, so a later sink is covered without anyone
       remembering. It is a **blacklist of five names, not a rule derived from syntax**, and says
@@ -136,7 +136,7 @@ README uses the positional form.
       all sink classes **that define an `emit`** — 34 of them, which is SPEC-032's lint scope and
       not the 39 classes merely named `*Sink` — exactly one such parameter is positional. The two
       rosters differ and the test states which it uses.
-- [ ] AC-3: No call site in `src/`, `tests/` or `README.md` passes it positionally.
+- [x] AC-3: No call site in `src/`, `tests/` or `README.md` passes it positionally.
 
 ### FR-002: `SentrySink` injects through `client=`
 
@@ -148,13 +148,17 @@ right.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `SentrySink(client=fake_sdk)` works and `sdk=` raises `TypeError` — no alias. An
+- [x] AC-1: `SentrySink(client=fake_sdk)` works and `sdk=` raises `TypeError` — no alias. An
       alias would have to live for the whole of `1.x`, which is the cost this spec exists to
       avoid.
-- [ ] AC-2: `sdk` appears nowhere in `src/`, `tests/` or `README.md`. FR-001's roster test cannot
-      observe this rename — `SentrySink.sdk` is *already* keyword-only — which is why this is a
-      grep rather than a reuse.
-- [ ] AC-3: The attribute is renamed with the parameter, so `sink.client` reads as it does on the
+- [x] AC-2: `sdk` appears nowhere in `src/`, `tests/` or `README.md`, **narrowed at build time to
+      the injection name**: no `sdk=` keyword argument and no `.sdk` attribute access. Taken
+      literally it also forbids `sentry_sdk`, `_import_sdk` and a local holding a fake SDK, none
+      of which is the rename and one of which is a third-party module name. The two test locals
+      that *were* called `sdk` are renamed anyway, so the check stays strict rather than
+      tolerant. FR-001's roster test cannot observe this rename — `SentrySink.sdk` is *already*
+      keyword-only — which is why this is a grep rather than a reuse.
+- [x] AC-3: The attribute is renamed with the parameter, so `sink.client` reads as it does on the
       other ten.
 
 ### FR-003: `get_config()` cannot be used to mutate the live config
@@ -247,15 +251,38 @@ deliberate once `1.0.0` freezes: a name absent from `__all__` at 1.0 says "not p
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `from log_foundry import Sink` works, and `Sink` is in `__all__`.
-- [ ] AC-2: `Config`, `read_losses` and `get_baggage` likewise.
-- [ ] AC-3: `get_baggage()` returns the current baggage as a `dict`, and a test asserts it
+- [x] AC-1: `from log_foundry import Sink` works, and `Sink` is in `__all__`.
+- [x] AC-2: `Config`, `read_losses` and `get_baggage` likewise.
+- [x] AC-3: `get_baggage()` returns the current baggage as a `dict`, and a test asserts it
       round-trips with `set_baggage`.
-- [ ] AC-4: The README's "writing your own sink" section imports `Sink` from the top level, and
+- [x] AC-3b: **The name is `get_baggage`, not `current_baggage`, and that was a decision.**
+      Review raised it: the context readers are `current_traceparent()`,
+      `current_trace_context()` and `current_baggage_header()`, so the new name sits beside a
+      family it does not join, and a rename costs a major version after 1.0. It pairs with
+      `set_baggage()` instead, which is the right pairing — the `current_*` family reads the
+      **trace context**, which the caller never sets directly, while baggage is the one piece of
+      context a caller does set, and a getter whose name does not mirror its setter is the worse
+      surprise. Recorded rather than renamed.
+- [x] AC-3a: **It returns a copy, and the library's own hot path does not pay for it.** Added at
+      build time: `context.get_baggage()` returned the live mapping with a docstring saying "must
+      not be mutated in place", and *exporting* that is FR-003's defect under another name — a
+      public accessor handing out live internal state, where the caller's slip is silent and
+      edits the context every later event reads. It is the same rule FR-003 applies to
+      `get_config()`, so it is applied here rather than left because this FR is what makes the
+      accessor public. The cost is the same too: `api._log` reads baggage **once per event**, so
+      the copy would allocate per event — `context._live_baggage()` is the internal read, and the
+      three internal call sites use it, exactly as AC-6 requires of `_config`.
+- [x] AC-4: The README's "writing your own sink" section imports `Sink` from the top level, and
       its `SinkDeliveryError`/`SinkLosses` example uses the public path rather than
       `log_foundry.sinks.base`.
-- [ ] AC-5: A test asserts every name in `__all__` is importable and every name the README
+- [x] AC-5: A test asserts every name in `__all__` is importable and every name the README
       documents as public is in `__all__` — derived from the README, so the two cannot drift.
+      **Both halves are built.** The first build shipped only the first and ticked the AC;
+      review caught it, and the anti-drift half then caught two of that review's own findings.
+      "Documents as public" is read as the `from log_foundry import ...` form only: `import
+      log_foundry as lf` then `lf.info(...)` says the *module* is public and says nothing about
+      `__all__`, so treating every attribute reached that way as a claim would let the README's
+      prose examples define the API surface.
 
 ### FR-006: `stop_signal` is a declared, namespaced part of the sink contract
 
@@ -270,14 +297,14 @@ and a sink that already owns an attribute of that name has it silently overwritt
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `sinks/base.py` documents it beside `losses()` — what it is, when it is assigned, and
+- [x] AC-1: `sinks/base.py` documents it beside `losses()` — what it is, when it is assigned, and
       that honouring it is how a retrying sink stays interruptible.
-- [ ] AC-2: The attribute is namespaced so it cannot collide with a name a third-party object
+- [x] AC-2: The attribute is namespaced so it cannot collide with a name a third-party object
       already uses. A rename is breaking for the shipped sinks and free now.
-- [ ] AC-3: Every shipped retrying sink is updated, derived from the roster. This lands **after**
+- [x] AC-3: Every shipped retrying sink is updated, derived from the roster. This lands **after**
       SPEC-035, whose new tests assert `sink.stop_signal is worker._stop`; the rename sweeps them
       too, and a grep for the old name across `tests/` is part of the AC.
-- [ ] AC-4: The README's custom-sink section shows it.
+- [x] AC-4: The README's custom-sink section shows it.
 
 ### FR-007: `flush()` and `continue_trace()` can grow a reason
 

@@ -36,7 +36,7 @@ class Recorder:
     def __init__(self, *, fail: bool = False) -> None:
         self.events: list[dict] = []
         self.fail = fail
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict]) -> None:
         if self.fail:

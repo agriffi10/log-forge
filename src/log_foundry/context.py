@@ -96,18 +96,48 @@ def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
 
 
 def get_baggage() -> dict[str, object]:
-    """Returns the current trace's baggage, which must not be mutated in place.
+    """Returns a copy of the current trace's baggage.
 
     The trace's own keys are discarded when the enclosing root span closes, restoring the
     baggage in effect before it, so a later trace sees only a process-level default set
     before any span opened. With no span open at all nothing releases them and they
     accumulate for the life of the context; :func:`reset_context` is the release there.
 
+    It is a **shallow** copy (SPEC-034 FR-005). This became public at 1.0, and a public accessor
+    that hands out the live mapping documented as "do not mutate" is FR-003's ``get_config()``
+    defect under another name. Shallow rather than deep because :func:`set_baggage` accepts
+    arbitrary values: a deep copy would run user objects through ``copy.deepcopy`` inside a
+    getter that must never raise, which trades a narrow sharing bound for a wide new failure —
+    and the library never mutates a baggage value either, so the sharing is only reachable
+    through the caller's own object. The library's own hot path does not pay even for the
+    shallow copy: :func:`_live_baggage` is the internal read, for the reason FR-003 AC-6 gives.
+
     Args:
       None.
 
     Returns:
-      The baggage mapping, to be treated as read-only.
+      A shallow copy of the baggage mapping. Rebinding a key does not affect the library; a
+        nested mutable value is shared, and mutating one *does* reach every later event.
+
+    Raises:
+      None.
+    """
+    return dict(_baggage.get())
+
+
+def _live_baggage() -> dict[str, object]:
+    """Returns the baggage mapping itself, for callers inside the package.
+
+    :func:`api._log` reads baggage once per event, so a copy here would allocate per event —
+    the cost FR-003 AC-6 measures and refuses on the config's own hot path. Callers must treat
+    the result as read-only; the freeze is a guarantee to the library's *users*, not one the
+    library needs against itself.
+
+    Args:
+      None.
+
+    Returns:
+      The live baggage mapping.
 
     Raises:
       None.
@@ -300,7 +330,7 @@ def current_baggage_header() -> str:
     Raises:
       None.
     """
-    return format_baggage_header(get_baggage())
+    return format_baggage_header(_live_baggage())
 
 
 def format_baggage_header(baggage: dict[str, object]) -> str:

@@ -71,7 +71,7 @@ class MongoDBSink:
         self._client = client
         self._collection = client[database][collection]
         self.max_retries = max(max_retries, 0)
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
         self._closed = False
@@ -150,7 +150,7 @@ class MongoDBSink:
                         ) from None
                     return
                 if attempt < self.max_retries:
-                    wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
                     self.failed += len(documents)

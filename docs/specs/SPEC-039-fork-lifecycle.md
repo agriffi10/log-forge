@@ -169,7 +169,8 @@ locking sink's pair) *being* the roster. A hand-list is what SPEC-035 FR-002 exi
 SPEC-036 FR-003 adds a counter lock after this spec ships that must be picked up with no edit
 here.
 
-**An identity memo is load-bearing, not tidiness.** A sink's `stop_signal` *is* the worker's
+**An identity memo is load-bearing, not tidiness.** A sink's `log_foundry_stop_signal` *is* the
+worker's
 `_stop` (SPEC-027); replacing them with two fresh events would leave the worker setting one and
 the sink waiting on the other. The memo is also what makes re-initialising `threading.Event`s safe
 at all, and they must carry their set state across.
@@ -190,7 +191,8 @@ at all, and they must carry their set state across.
       container would be unreachable, so the test forbids that shape. This is what picks up
       SPEC-036 FR-003's lock with no edit here.
 - [ ] AC-4: Two objects sharing one lock or one `Event` still share it afterwards, asserted by
-      identity. The `stop_signal`/`_stop` pair is the case that matters and is named in the test.
+      identity. The `log_foundry_stop_signal`/`_stop` pair is the case that matters and is named
+      in the test.
 - [ ] AC-5: A re-initialised `Event` carries its set state across the fork.
 - [ ] AC-6: A lock that was **not** held at fork time is still replaced. Re-initialising only the
       held ones needs a way to ask whether a lock is held, and `threading.Lock` has none that is
@@ -308,7 +310,7 @@ def register_child_handler(fn: Callable[[], None]) -> None: ...
     # that imports it.
 
 # src/log_foundry/sinks/base.py — one more optional member, probed by name
-#   optional: losses(), stop_signal, flush() (SPEC-036), discard_buffered_after_fork() (FR-004)
+#   optional: losses(), log_foundry_stop_signal, flush() (SPEC-036), discard_buffered_after_fork() (FR-004)
 ```
 
 ## Implementation Phases

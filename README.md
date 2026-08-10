@@ -360,6 +360,7 @@ def handler(event, context):
 | `current_traceparent()` | This span as a W3C `traceparent` string, or `None` if no span is active. |
 | `current_trace_context()` | `(trace_id, span_id)`, for when moving two fields beats moving a string. |
 | `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). |
+| `get_baggage()` | Current baggage as a `dict`. A shallow copy — rebinding a key does not reach the library, but a nested mutable value is shared. |
 | `reset_context()` | Clear baggage and any adopted context. `@trace` users do not need it. Never raises. |
 
 Details worth knowing:
@@ -429,14 +430,20 @@ undoing the erasure. It never raises.
 A **sink** is the swappable output transport — any object satisfying the `Sink` protocol. It
 receives already-built, batched event dicts and knows nothing about spans or context:
 
-```python
-class Sink(Protocol):
-    def emit(self, batch: list[dict[str, object]]) -> None: ...
-    def close(self) -> None: ...
+```
+emit(batch: list[dict[str, object]]) -> None
+close() -> None
 ```
 
+Satisfy it **structurally** — any object with those two methods is a sink, and every sink shipped
+here is one. You do not need to inherit. If you prefer to, `from log_foundry import Sink` gives you
+the protocol to annotate against or subclass; both methods are abstract, so a subclass that
+misspells `emit` fails at construction rather than silently accepting every batch and delivering
+nothing.
+
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
-call falls back to `StdoutSink()`. Sinks are **not** re-exported at the top level — import each
+call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
+`SinkDeliveryError`, `SinkLosses` and `read_losses`; the **concrete sinks** are not, so import each
 from its own module, e.g. `from log_foundry.sinks.sqs import SQSSink`.
 
 A few conventions hold across every sink below:
@@ -692,11 +699,14 @@ loss-reporting apparatus is built on them:
   whole operation that assumes exclusivity. If it holds none, you need do nothing. The library
   cannot serialize this for you: it does not own the calling thread.
 
+- **The batch is borrowed, not given.** The list and the dicts in it may go to other sinks after
+  you — `MultiSink` hands the same objects to every child in turn — so copy before you redact or
+  reshape. A child that cleared the list in place left the next child with nothing, and no error
+  anywhere.
 - **Raise when you delivered none of the batch**, after your own retries are spent. That is the
   signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
   a retry cannot duplicate anything: nothing landed downstream. Raise `SinkDeliveryError` (from
-  `log_foundry.sinks.base`) or any exception of your own — the contract is that *something*
-  propagates.
+  `log_foundry`) or any exception of your own — the contract is that *something* propagates.
 - **Do not raise when you delivered some of it.** The worker retries whole batches, so raising on a
   partial success re-delivers the records that already arrived, and duplicates downstream are worse
   than a counted loss.
@@ -720,7 +730,7 @@ separate from the transport one so a poll never waits on an in-flight send:
 
 ```python
 import threading
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry import SinkDeliveryError, SinkLosses
 
 class MySink:
     def __init__(self) -> None:
@@ -728,6 +738,7 @@ class MySink:
         self._closed = False
         self._lock = threading.Lock()          # transport state
         self._counter_lock = threading.Lock()  # counters only, never held across I/O
+        self.log_foundry_stop_signal: threading.Event | None = None  # optional; see below
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         if not batch:
@@ -762,6 +773,48 @@ class MySink:
 `losses()` is optional and probed by name, so a sink written before it existed keeps working and
 simply contributes nothing to `health().sink`. `emit([])` must be a no-op: an empty batch has not
 failed to deliver.
+
+`log_foundry_stop_signal` is optional in the same way, and is an attribute rather than a method.
+Declare it as a plain `threading.Event | None` initialised to `None` and the library assigns the
+worker's shutdown event to it; leave it out and you are simply never offered one. **Honour it in
+your retry backoff** — pass it to `Event.wait(timeout)` instead of calling `time.sleep`:
+
+```python
+        if self.log_foundry_stop_signal is not None:
+            self.log_foundry_stop_signal.wait(delay)   # returns early when shutdown starts
+        else:
+            time.sleep(delay)
+```
+
+There is one drain thread, so your backoff pauses *all* log delivery, and it is held across
+`shutdown()` — which joins that thread. A sink that sleeps through a 30-second backoff holds
+process exit for 30 seconds. The name is prefixed because the library assigns this attribute onto
+an object it does not own: a bare `stop_signal` would silently overwrite one you already had.
+
+If you write a **wrapper** sink, forward it to whatever actually holds the retry loop — a plain
+attribute on the wrapper is assigned, stops there, and the inner sink never sees it. Measured: a
+wrapper built from the leaf template above left an inner sink's 4-second backoff uninterrupted,
+`shutdown(timeout=30)` ran the full 30 seconds, `stopped_reason` read `"ShutdownTimeout"` and the
+sink was left open — against 0.00 s for the same sink configured directly. Use a property:
+
+```python
+class MyWrapper:
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._stop_signal: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        return self._stop_signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
+        self._stop_signal = signal
+        self._inner.log_foundry_stop_signal = signal   # the one line that matters
+```
+
+Every wrapper shipped here — `MultiSink`, `FilteringSink`, `TransformSink`, `SyslogSink`,
+`LogstashSink`, `SentrySink` — does exactly this.
 
 ### Flushing and shutdown
 

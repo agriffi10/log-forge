@@ -61,7 +61,7 @@ class SNSSink:
         self.topic_arn = topic_arn
         self.client = client
         self.max_retries = max(max_retries, 0)
-        self.stop_signal: threading.Event | None = None
+        self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
         self._counter_lock = threading.Lock()
@@ -171,7 +171,7 @@ class SNSSink:
             failed_ids = {entry["Id"] for entry in failed}
             entries = [entry for entry in entries if entry["Id"] in failed_ids]
             if attempt < self.max_retries:
-                wait(_BACKOFF_BASE * (2**attempt), self.stop_signal)
+                wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
             if attempt >= self.max_retries:
                 with self._counter_lock:
                     self.failed += len(entries)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import NamedTuple, Protocol, runtime_checkable
 
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "read_losses"]
@@ -58,6 +59,34 @@ class Sink(Protocol):
     sink written against the pre-SPEC-026 interface satisfying this one. :func:`read_losses` is
     the probe.
 
+    :meth:`emit` and :meth:`close` are ``@abstractmethod`` (SPEC-034 FR-005). A ``Protocol`` is
+    normally satisfied *structurally* and that is still how every shipped sink satisfies this
+    one — but making it a public export invites inheritance, and an incomplete subclass of a
+    protocol whose members have empty bodies instantiates happily and returns ``None`` from the
+    method it failed to define. Reproduced before the decorators were added: one typo
+    (``def emmit``) and three events were gone with ``flush()`` reporting ``True`` and every
+    counter at zero — the "sink the worker believes" failure this file exists to prevent.
+    ``mypy`` already refused it; only the runtime did not. Inheriting is still not required, and
+    ``isinstance`` remains structural.
+
+    A fourth is optional in the same way and is an attribute rather than a method:
+    ``log_foundry_stop_signal``. A sink that defines it — a plain
+    ``threading.Event | None``, initialised to ``None`` — is handed the worker's shutdown event
+    whenever the library takes ownership of it, and a sink that does not is simply never
+    offered one. **Honouring it is how a retrying sink stays interruptible** (SPEC-027): the
+    worker owns a single drain thread, so a sink's backoff is a global pause on log delivery
+    held across ``shutdown()``, which joins that thread. Pass it to ``sinks/_retry.wait`` — or
+    wait on it directly — rather than calling ``time.sleep``, or a shutdown cannot cut the
+    wait short and a slow destination holds process exit for the length of its own backoff.
+    A **wrapper** sink must forward it to whatever actually holds the retry loop; set on a
+    wrapper and stopped there, the signal reaches nothing.
+
+    The name is namespaced deliberately (SPEC-034 FR-006). The library assigns this attribute
+    onto an object it does not own, by ``hasattr`` probe, so a bare ``stop_signal`` — which is
+    what shipped before 1.0 — silently overwrote any attribute of that name a third-party sink
+    already used, with a ``threading.Event``. Reproduced. A prefixed name cannot collide by
+    accident, and the cost is one verbose attribute on the sinks that want interruptibility.
+
     "Safe to call during an emit" is a concurrency requirement once :meth:`emit` is (SPEC-028
     FR-003). The shipped sinks keep their loss counters under a **dedicated** lock, separate
     from whatever guards their transport: an increment is a read-modify-write that Python does
@@ -68,6 +97,7 @@ class Sink(Protocol):
     both, the order is always transport then counter, never the reverse.
     """
 
+    @abstractmethod
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Ships a batch of serialized event dicts.
 
@@ -111,7 +141,11 @@ class Sink(Protocol):
         docstring and a test holds it to it.
 
         Args:
-          batch: The events to ship. ``emit([])`` is a no-op and never raises, since an empty
+          batch: The events to ship. **Borrowed, not given** — the list and the dicts inside it
+            may be handed to other sinks afterwards, which ``MultiSink`` does to every child in
+            turn, so mutating either in place silently changes or empties what a later sink
+            receives. Copy before reshaping or redacting. Reproduced: a child that cleared the
+            list left the next child with nothing and no error anywhere. ``emit([])`` is a no-op and never raises, since an empty
             batch has not failed to deliver — closed or not.
 
         Returns:
@@ -122,6 +156,7 @@ class Sink(Protocol):
         """
         ...
 
+    @abstractmethod
     def close(self) -> None:
         """Flushes and releases any resources.
 

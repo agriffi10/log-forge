@@ -171,7 +171,7 @@ def test_the_worker_hands_the_sink_its_stop_signal() -> None:
     sink = HTTPSink("http://x", opener=FakeOpener())
     worker = Worker(sink, batch_size=1)
     try:
-        assert sink.stop_signal is worker._stop
+        assert sink.log_foundry_stop_signal is worker._stop
     finally:
         worker.shutdown()
 
@@ -184,7 +184,7 @@ def test_a_sink_with_no_stop_signal_attribute_is_left_alone() -> None:
     sink = Plain()
     worker = Worker(sink, batch_size=1)
     try:
-        assert not hasattr(sink, "stop_signal")
+        assert not hasattr(sink, "log_foundry_stop_signal")
     finally:
         worker.shutdown()
 
@@ -193,7 +193,7 @@ def test_a_sink_that_refuses_the_signal_does_not_stop_the_worker(capsys) -> None
     """Losing interruptibility is a degradation; failing to start the worker is an outage."""
 
     class Stubborn:
-        stop_signal = None
+        log_foundry_stop_signal = None
 
         def __setattr__(self, name: str, value: object) -> None:
             raise AttributeError("read-only")
@@ -214,8 +214,8 @@ def test_the_socket_transport_backoff_is_interruptible(monkeypatch) -> None:
 
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=3)
-    transport.stop_signal = threading.Event()
-    transport.stop_signal.set()
+    transport.log_foundry_stop_signal = threading.Event()
+    transport.log_foundry_stop_signal.set()
 
     outcome: list[str] = []
 
@@ -320,9 +320,9 @@ def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:
     missing = [
         name
         for name in _modules_with_a_retry_loop()
-        if "self.stop_signal" not in (root / f"{name}.py").read_text()
+        if "self.log_foundry_stop_signal" not in (root / f"{name}.py").read_text()
     ]
-    assert missing == [], f"no stop_signal: {missing}"
+    assert missing == [], f"no log_foundry_stop_signal: {missing}"
 
 
 def test_no_sink_calls_time_sleep_directly() -> None:
@@ -398,8 +398,8 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
 def test_every_retrying_sink_accepts_a_stop_signal(monkeypatch) -> None:
     """The worker probes by name; a sink without the attribute silently keeps sleeping."""
     for sink in _one_of_each_retrying_sink(monkeypatch):
-        assert hasattr(sink, "stop_signal"), type(sink).__name__
-        assert sink.stop_signal is None, f"{type(sink).__name__} starts uninterruptible"
+        assert hasattr(sink, "log_foundry_stop_signal"), type(sink).__name__
+        assert sink.log_foundry_stop_signal is None, f"{type(sink).__name__} starts uninterruptible"
 
 
 def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
@@ -407,7 +407,7 @@ def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
     for sink in _one_of_each_retrying_sink(monkeypatch):
         worker = Worker(sink, batch_size=1)
         try:
-            assert sink.stop_signal is worker._stop, type(sink).__name__
+            assert sink.log_foundry_stop_signal is worker._stop, type(sink).__name__
         finally:
             worker.shutdown()
 
@@ -428,7 +428,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
     ):
         worker = Worker(sink, batch_size=1)
         try:
-            assert backend(sink).stop_signal is worker._stop, type(sink).__name__
+            assert backend(sink).log_foundry_stop_signal is worker._stop, type(sink).__name__
         finally:
             worker.shutdown()
 
@@ -439,7 +439,7 @@ def test_sentry_forwards_to_its_http_fallback() -> None:
     sink = SentrySink("http://k@sentry.local/1", opener=FakeOpener())
     worker = Worker(sink, batch_size=1)
     try:
-        assert sink._http is not None and sink._http.stop_signal is worker._stop
+        assert sink._http is not None and sink._http.log_foundry_stop_signal is worker._stop
     finally:
         worker.shutdown()
 
@@ -479,7 +479,7 @@ def test_a_standalone_sink_backs_off_exactly_as_before(monkeypatch) -> None:
     monkeypatch.setattr("log_foundry.sinks._retry.time.sleep", slept.append)
 
     sink = RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=2)
-    assert sink.stop_signal is None
+    assert sink.log_foundry_stop_signal is None
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
     assert slept == [0.1, 0.2], "1 + 2 retries, doubling"
@@ -557,14 +557,14 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
         (FilteringSink(http), (http,)),
         (TransformSink(http, lambda e: e), (http,)),
     ):
-        http.stop_signal = None
-        inner.stop_signal = None
+        http.log_foundry_stop_signal = None
+        inner.log_foundry_stop_signal = None
         worker = Worker(wrapper, batch_size=1)
         try:
             for leaf in leaves:
-                assert leaf.stop_signal is worker._stop, type(wrapper).__name__
+                assert leaf.log_foundry_stop_signal is worker._stop, type(wrapper).__name__
             if inner in leaves:
-                assert inner._socket.stop_signal is worker._stop, (
+                assert inner._socket.log_foundry_stop_signal is worker._stop, (
                     "and on through SyslogSink to the transport that actually waits"
                 )
         finally:
@@ -575,7 +575,7 @@ def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> N
     from log_foundry.sinks.multi import MultiSink
 
     class Stubborn:
-        stop_signal = None
+        log_foundry_stop_signal = None
 
         def __setattr__(self, name: str, value: object) -> None:
             raise AttributeError("read-only")
@@ -586,7 +586,7 @@ def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> N
     willing = HTTPSink("http://x", opener=FakeOpener())
     worker = Worker(MultiSink(Stubborn(), willing), batch_size=1)
     try:
-        assert willing.stop_signal is worker._stop, "the sibling still got it"
+        assert willing.log_foundry_stop_signal is worker._stop, "the sibling still got it"
     finally:
         worker.shutdown()
     assert "handing a MultiSink child its stop signal" in capsys.readouterr().err
