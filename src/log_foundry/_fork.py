@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import os
 import sys
 import threading
@@ -10,13 +11,19 @@ from typing import Any
 
 from log_foundry import _diag
 
-_PACKAGE = "log_foundry"
+_PACKAGE = __name__.rpartition(".")[0]
+"""This package's import name, derived rather than written.
+
+A literal is wrong under a vendored install — ``myapp._vendor.log_foundry`` — where both the
+root selection and the ownership test would miss every module and the handler would silently
+repair nothing.
+"""
 
 _RLOCK_TYPE = type(threading.RLock())
 
 _LOCK_TYPES: tuple[type, ...] = (type(threading.Lock()), _RLOCK_TYPE)
 
-_CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict)
+_CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict, collections.deque)
 
 _installed = False
 """Whether :func:`install` has already registered the child handler in this process.
@@ -30,31 +37,74 @@ recording the registration somewhere outside this module, which is a worse trade
 """
 
 
+def _defined_here(cls: type) -> bool:
+    """Whether one class was defined in this package.
+
+    Args:
+      cls: The class to place.
+
+    Returns:
+      Whether its defining module is this package or a module inside it.
+
+    Raises:
+      None.
+    """
+    module = getattr(cls, "__module__", "") or ""
+    return module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
+
+
 def _is_owned(value: object) -> bool:
-    """Whether this object's type is defined by this package.
+    """Whether this object runs code this package defines, anywhere in its ancestry.
 
     The ownership test is what keeps the traversal off third-party state (FR-003 AC-2): a
     ``boto3`` session's locks, a ``librdkafka`` handle and a ``psycopg`` connection are not the
     library's to swap, and reaching into them would be a fork fix that breaks a driver.
 
+    **The whole MRO is asked, not just the defining module**, because subclassing a shipped sink
+    is a documented extension point — ``README`` offers ``Sink`` to subclass and SPEC-038 rebuilt
+    ``HTTPSink.emit`` as a template method for exactly that. An instance of a user's
+    ``class MySink(FileSink)`` reports ``__main__``, so a defining-module test walked straight
+    past a ``_lock`` that ``FileSink.__init__`` built: measured, the child hung in ``info()``
+    while a plain ``FileSink`` in the same probe returned. That is the hang this spec exists to
+    remove, reached through the one door users are told to use.
+
     Args:
       value: Any object, including a class.
 
     Returns:
-      Whether its type — or, for a class, the class itself — was defined in ``log_foundry``.
+      Whether it or any of its ancestors was defined in this package.
 
     Raises:
       None.
     """
     owner = value if isinstance(value, type) else type(value)
-    module = getattr(owner, "__module__", "")
-    return module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
+    return any(_defined_here(base) for base in getattr(owner, "__mro__", (owner,)))
+
+
+def _is_container(value: object) -> bool:
+    """Whether the walk reads this value's members as well as its attributes.
+
+    ``isinstance`` rather than an exact-type test, so a ``deque``, a ``defaultdict`` or any
+    other ordinary subclass is entered: an exact tuple made membership depend on which concrete
+    class a future sink happened to hold its children in, which is the guess FR-003 AC-3 exists
+    to replace.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether it holds members the walk should read.
+
+    Raises:
+      None.
+    """
+    return isinstance(value, _CONTAINER_TYPES)
 
 
 def _is_traversable(value: object) -> bool:
     """Whether the walk descends into this value.
 
-    Three shapes and no others: a module of this package, an object this package's code
+    Three shapes and no others: a module of this package, an object running code this package
     defines, and a plain container, which is traversed because ``MultiSink._sinks`` is one and
     the sinks inside it hold the locks the child's first log call takes.
 
@@ -68,11 +118,9 @@ def _is_traversable(value: object) -> bool:
       None.
     """
     if isinstance(value, types.ModuleType):
-        name = getattr(value, "__name__", "")
+        name = getattr(value, "__name__", "") or ""
         return name == _PACKAGE or name.startswith(f"{_PACKAGE}.")
-    if type(value) in _CONTAINER_TYPES:
-        return True
-    return _is_owned(value)
+    return _is_container(value) or _is_owned(value)
 
 
 def _container_children(container: Any) -> list[Any]:
@@ -84,7 +132,7 @@ def _container_children(container: Any) -> list[Any]:
     correct here rather than merely convenient.
 
     Args:
-      container: A list, tuple, set, frozenset or dict.
+      container: Any value :func:`_is_container` accepted.
 
     Returns:
       Its members, or both its keys and its values for a mapping.
@@ -106,7 +154,10 @@ def _slot_names(holder: object) -> list[str]:
     """Returns every ``__slots__`` name declared across a holder's class hierarchy.
 
     A slotted instance keeps its attributes off ``__dict__``, so a walk reading only ``vars()``
-    would miss them — ``worker._FlushMarker`` is slotted and holds a ``threading.Event``.
+    would miss them. No shipped class needs this today and that is stated rather than dressed
+    up: ``worker._FlushMarker`` is slotted and holds an ``Event``, but a marker lives inside a
+    ``queue.Queue`` the walk never enters. It is here because the shape lint accepts a slotted
+    ``self.<attr>``, so the walk has to be able to reach one.
 
     Args:
       holder: Any object.
@@ -265,6 +316,13 @@ def _reinit_primitives() -> None:
     lock that was *not* held is replaced too: asking whether one is held has no answer that is
     not itself a race (FR-003 AC-6).
 
+    Being a container and being a namespace are **not** exclusive: an owned class that
+    subclasses one holds both members and attributes, and treating the two as alternatives
+    silently drops whichever branch lost. The cost is proportional to what the library's own
+    containers hold, which for a buffering sink is caller data — a ``MemorySink`` holding 100k
+    events measured 202 ms, against 0.45 ms idle. That is accepted rather than bounded: a cap
+    would be a lock this cannot promise to find, and the alternative to finding it is a hang.
+
     Args:
       None.
 
@@ -287,8 +345,9 @@ def _reinit_primitives() -> None:
         if id(holder) in seen:
             continue
         seen.add(id(holder))
-        if type(holder) in _CONTAINER_TYPES:
+        if _is_container(holder):
             stack.extend(child for child in _container_children(holder) if _is_traversable(child))
+        if not isinstance(holder, types.ModuleType | type) and not _is_owned(holder):
             continue
         for name, value in _namespace_items(holder):
             fresh = _fresh_primitive(value, memo, keepalive)

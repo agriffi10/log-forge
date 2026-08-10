@@ -38,7 +38,16 @@ if TYPE_CHECKING:
 
 CHILD_TIMEOUT = 10
 
+_PACKAGE = _fork._PACKAGE
+
 _SRC = pathlib.Path(_fork.__file__).parent
+
+_MODULES = sorted(_SRC.rglob("*.py"))
+
+# A floor, for the reason SPEC-038 made floors the convention: an empty parameter set is a
+# silent skip, not a failure, so a roster whose glob came back empty would look green. The
+# number is well under the module count and moves only if files are deleted.
+assert len(_MODULES) >= 40, f"the module roster collapsed to {len(_MODULES)}"
 
 
 # -- forking, and reaping what was forked ---------------------------------------------------
@@ -363,6 +372,10 @@ def test_the_childs_first_log_call_does_not_block(tmp_path: pathlib.Path) -> Non
     fork, so the child inherits a lock no thread will ever release. Its ``info()`` takes that same
     lock on the application's own thread, which is the deadlock this FR exists to remove: 19 of
     60 children hung in the audit's run, and this construction makes it 60 of 60.
+
+    It stops after the third blocked child. A regression makes every iteration wait out the
+    child's whole watchdog, and a run that takes 8.5 minutes to report a failure it was sure of
+    within seconds is a run people learn to interrupt.
     """
     sink, stream = _gated_file_sink(tmp_path)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
@@ -377,6 +390,8 @@ def test_the_childs_first_log_call_does_not_block(tmp_path: pathlib.Path) -> Non
             gate.release.set()
         if not child.finished:
             blocked.append(iteration)
+        if len(blocked) >= 3:
+            break
 
     assert not blocked, f"children blocked on an inherited lock: {blocked}"
 
@@ -409,6 +424,35 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
 
     assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
     assert child.output == ""
+
+
+def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) -> None:
+    """FR-003 AC-2. The ownership boundary is about *whose code built the lock*, not whose file.
+
+    Subclassing a shipped sink is a documented extension point — the README offers ``Sink`` to
+    subclass, and SPEC-038 rebuilt ``HTTPSink.emit`` as a template method precisely so subclasses
+    override its hooks. An instance of one reports its own module, so an ownership test keyed on
+    the defining module walked straight past a ``_lock`` that ``FileSink.__init__`` built:
+    measured, this child hung in ``info()`` while a plain ``FileSink`` in the same probe
+    returned. That is the 19-of-60 hang coming back through the one door users are told to use.
+    """
+
+    class _UserSink(FileSink):
+        pass
+
+    sink = _UserSink(str(tmp_path / "sub.ndjson"))
+    stream = _GatingStream(sink._stream)
+    sink._stream = stream  # type: ignore[assignment]
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_the_drain_thread(stream, worker, 0)
+    try:
+        child = run_in_child(_log_in_child, timeout=4)
+    finally:
+        gate.release.set()
+
+    assert child.finished, f"a subclassed sink's child blocked: {child.output!r}"
 
 
 def test_a_lock_that_was_never_held_is_replaced_too() -> None:
@@ -506,8 +550,42 @@ def test_third_party_state_is_left_alone(tmp_path: pathlib.Path) -> None:
 # -- FR-003 AC-3: completeness is proved, not asserted ---------------------------------------
 
 
+_PRIMITIVES = ("Lock", "RLock", "Event")
+
+
+def _threading_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """The names this module can build a primitive through, derived from its own imports.
+
+    A detector hardcoding the literal ``threading`` reads zero constructions from
+    ``from threading import Lock`` and from ``import threading as th`` — measured, both green
+    with the lock in a list the walk cannot reach. Reading the imports is what makes the rule
+    about the *primitive* rather than about one spelling of it.
+
+    Args:
+      tree: The parsed module.
+
+    Returns:
+      The names bound to the ``threading`` module, and the names bound directly to a primitive.
+
+    Raises:
+      None.
+    """
+    modules: set[str] = set()
+    direct: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "threading"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "threading":
+            direct.update(
+                alias.asname or alias.name for alias in node.names if alias.name in _PRIMITIVES
+            )
+    return modules, direct
+
+
 def _primitive_constructions(tree: ast.AST) -> list[ast.Call]:
-    """Every ``threading.Lock()`` / ``RLock()`` / ``Event()`` construction in a parsed module.
+    """Every ``Lock`` / ``RLock`` / ``Event`` construction in a parsed module, however spelled.
 
     Args:
       tree: The parsed module.
@@ -518,15 +596,21 @@ def _primitive_constructions(tree: ast.AST) -> list[ast.Call]:
     Raises:
       None.
     """
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("Lock", "RLock", "Event")
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "threading"
-    ]
+    modules, direct = _threading_names(tree)
+    found: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        through_module = (
+            isinstance(func, ast.Attribute)
+            and func.attr in _PRIMITIVES
+            and isinstance(func.value, ast.Name)
+            and func.value.id in modules
+        )
+        if (isinstance(func, ast.Name) and func.id in direct) or through_module:
+            found.append(node)
+    return found
 
 
 def _namespace_stores(tree: ast.AST) -> set[int]:
@@ -622,9 +706,7 @@ def _assignment_targets(tree: ast.AST, call: ast.Call) -> list[ast.expr]:
     return []
 
 
-@pytest.mark.parametrize(
-    "path", sorted(_SRC.rglob("*.py")), ids=lambda p: p.relative_to(_SRC).as_posix()
-)
+@pytest.mark.parametrize("path", _MODULES, ids=lambda p: p.relative_to(_SRC).as_posix())
 def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) -> None:
     """FR-003 AC-3. Completeness is proved by the shape rather than claimed by a roster.
 
@@ -634,10 +716,14 @@ def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) 
     up a lock added by a **later** spec with no edit to ``_fork.py`` — SPEC-036 FR-003 adds a
     counter lock after this one ships.
 
-    One reachability gap is real and is not this rule's to close: ``worker._FlushMarker.event``
-    satisfies the shape, but a marker lives inside a ``queue.Queue``, which is not a container
-    the walk enters. FR-002's rebuild gives the child a fresh queue, so those markers are
-    discarded rather than repaired — a different mechanism for the same guarantee.
+    Two reachability gaps are real and neither is this rule's to close, because neither is a
+    construction in ``src/`` at all. ``Worker._queue`` is a ``queue.Queue``, which builds **its
+    own** mutex and three ``Condition``s: measured, a fork with a thread inside that mutex
+    leaves the child's ``submit()`` blocked, and no AST rule over this package can see a lock
+    the standard library constructs. ``worker._FlushMarker.event`` is the milder one — it
+    satisfies the shape, but a marker lives *inside* that same Queue, which the walk does not
+    enter. FR-002 closes both by giving the child a fresh queue rather than by repairing this
+    one, and it must replace the **object**: draining it would keep the dead mutex.
 
     ``_fork.py`` is the one file out of scope, and the test below is what makes that an
     exclusion rather than a hole: it mints the replacements and stores none of them, so it has
@@ -687,15 +773,22 @@ def test_the_fork_module_stores_no_primitive() -> None:
 # (fixture source, whether the rule accepts it). Every rejected shape is one the walk genuinely
 # cannot reach, and `src/` contains none of them today — so without these the parametrized lint
 # above cannot tell a working rule from one whose body was deleted.
+_IMPORT = "import threading\n"
+
 _SHAPES: list[tuple[str, bool]] = [
-    ("import threading\n_m = threading.Lock()\n", True),
-    ("import threading\n_m: object = threading.RLock()\n", True),
-    ("class C:\n    def __init__(self):\n        self.x = threading.Event()\n", True),
-    ("_locks = [threading.Lock()]\n", False),
-    ("_pair = (threading.Lock(),)\n", False),
-    ("d = {}\nd['k'] = threading.Lock()\n", False),
-    ("def f():\n    other.attr = threading.Lock()\n", False),
-    ("threading.Lock()\n", False),
+    (_IMPORT + "_m = threading.Lock()\n", True),
+    (_IMPORT + "_m: object = threading.RLock()\n", True),
+    (_IMPORT + "class C:\n    def __init__(self):\n        self.x = threading.Event()\n", True),
+    ("import threading as th\n_m = th.Lock()\n", True),
+    ("from threading import Lock\n_m = Lock()\n", True),
+    (_IMPORT + "_locks = [threading.Lock()]\n", False),
+    (_IMPORT + "_pair = (threading.Lock(),)\n", False),
+    (_IMPORT + "d = {}\nd['k'] = threading.Lock()\n", False),
+    (_IMPORT + "def f():\n    other.attr = threading.Lock()\n", False),
+    (_IMPORT + "def f():\n    held = threading.Lock()\n", False),
+    (_IMPORT + "threading.Lock()\n", False),
+    ("import threading as th\n_locks = [th.Lock()]\n", False),
+    ("from threading import Lock as L\n_locks = [L()]\n", False),
 ]
 
 
@@ -705,6 +798,12 @@ def test_the_shape_lint_rejects_the_shapes_it_claims_to() -> None:
     ``src/`` satisfies the rule today, so nothing in the parametrized test can distinguish a
     working lint from one whose body was deleted. Each rejected fixture is a position the
     traversal has no way to write to.
+
+    The last four rows exist because the detector was defeated by import *style*: with the
+    literal ``threading`` hardcoded, ``import threading as th`` and ``from threading import
+    Lock`` both read zero constructions, so a lock in a list passed the rule with nothing
+    said. Every fixture must be seen as a construction first — ``assert calls`` below is that
+    half — before its target shape is judged.
     """
     for source, accepted in _SHAPES:
         tree = ast.parse(source)
@@ -737,6 +836,77 @@ def test_a_module_global_reassigned_inside_a_function_still_counts() -> None:
     for call in calls:
         targets = _assignment_targets(tree, call)
         assert any(_is_reachable_target(t, stores) for t in targets), ast.dump(call)
+
+
+# -- the traversal's own shapes, unit-tested where no shipped object exercises them ----------
+
+
+def test_a_slotted_holder_gives_up_its_primitive() -> None:
+    """The slot path has no shipped subject, so it is held by a unit test rather than by luck.
+
+    ``src/`` has two slotted classes and neither is both reachable and primitive-holding, so
+    deleting the slot descent leaves the whole suite green. The rule the walk must satisfy is
+    the shape lint's: a ``self.<attr>`` is reachable, and a slotted class is one way to write
+    one.
+    """
+
+    class _Slotted:
+        __slots__ = ("guard",)
+
+        def __init__(self) -> None:
+            self.guard = threading.Lock()
+
+    holder = _Slotted()
+    assert dict(_fork._namespace_items(holder)) == {"guard": holder.guard}
+
+    class _Empty:
+        __slots__ = ("guard",)
+
+    assert _fork._namespace_items(_Empty()) == []
+
+
+def test_a_frozen_holder_cannot_refuse_the_repair() -> None:
+    """``_assign`` writes through ``object.__setattr__``, which a frozen dataclass cannot block.
+
+    ``Config`` is frozen (SPEC-034) and the sinks are free to be. An ordinary ``setattr`` raises
+    ``FrozenInstanceError`` there, and the repair would be announced and skipped — leaving a
+    child holding a lock nothing can release, which is the failure this module exists to remove
+    rather than to report.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class _Frozen:
+        guard: Any
+
+    holder = _Frozen(guard=threading.Lock())
+    replacement = threading.Lock()
+    _fork._assign(holder, "guard", replacement)
+    assert holder.guard is replacement
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        holder.guard = threading.Lock()  # type: ignore[misc]
+
+
+def test_the_walk_terminates_on_a_cycle() -> None:
+    """A container holding itself, and two objects holding each other, must not hang the child.
+
+    The walk runs before the forking application gets control back, so a cycle is not a slow
+    repair — it is a process that never returns from ``fork``.
+    """
+    loop: list[Any] = []
+    loop.append(loop)
+    assert _fork._container_children(loop) == [loop]
+
+    seen: set[int] = set()
+    stack: list[Any] = [loop]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        stack.extend(_fork._container_children(node))
+    assert seen == {id(loop)}
 
 
 # -- FR-001 / FR-006: what is registered, and where the mechanism lives ----------------------
@@ -793,9 +963,7 @@ def test_only_after_in_child_is_registered() -> None:
     assert not calls[0].args, "a positional argument to register_at_fork is `before`"
 
 
-@pytest.mark.parametrize(
-    "path", sorted(_SRC.rglob("*.py")), ids=lambda p: p.relative_to(_SRC).as_posix()
-)
+@pytest.mark.parametrize("path", _MODULES, ids=lambda p: p.relative_to(_SRC).as_posix())
 def test_nothing_else_in_the_package_registers_a_fork_handler(path: pathlib.Path) -> None:
     """FR-001 AC-1's scope half: the assertion above is worth nothing if another module registers.
 
@@ -814,19 +982,27 @@ def test_fork_imports_nothing_from_the_package_but_diag() -> None:
     The handler's work touches ``decorator``, ``_lifecycle`` and the sinks, and all three would
     then import this module. It reaches them through ``sys.modules`` and an inverted registry
     instead, so the only intra-package imports it may hold are ``_diag`` and ``sinks.base``.
+
+    **Every** imported name is checked, not merely one of them. A first version asked whether
+    the set *intersected* the allowed names, which passes ``from log_foundry import _diag,
+    decorator`` — and appending to that existing line is the most natural way Phase 2's worker
+    rebuild would be written, so the guard would have stayed green over the very cycle this FR
+    exists to prevent.
     """
-    allowed = {"log_foundry._diag", "log_foundry.sinks.base"}
+    allowed = {f"{_PACKAGE}._diag", f"{_PACKAGE}.sinks.base"}
     for node in ast.walk(_fork_tree()):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert not alias.name.startswith("log_foundry"), alias.name
+                assert not alias.name.startswith(_PACKAGE), alias.name
         elif isinstance(node, ast.ImportFrom):
             assert node.level == 0, "a relative import is an intra-package import"
             module = node.module or ""
-            if not module.startswith("log_foundry"):
+            if not module.startswith(_PACKAGE):
                 continue
-            names = {f"{module}.{alias.name}" for alias in node.names} | {module}
-            assert names & allowed, f"_fork.py may not import from {module}"
+            imported = {
+                f"{module}.{alias.name}" if module == _PACKAGE else module for alias in node.names
+            }
+            assert imported <= allowed, f"_fork.py may not import {sorted(imported - allowed)}"
 
 
 def test_the_handler_is_registered_once_for_a_double_import() -> None:
