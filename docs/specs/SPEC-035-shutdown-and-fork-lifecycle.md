@@ -84,7 +84,7 @@ one-line correction — it is FR-002's enumeration.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `_offer_orphan_signal` skips on ownership **conjoined with the moment** —
+- [x] AC-1: `_offer_orphan_signal` skips on ownership **conjoined with the moment** —
       `_worker.sink is sink and _worker.draining`, the second a new property true while the drain
       loop is running and has not been abandoned. The ownership term stays and must: without it an
       orphan log to sink Y is skipped merely because a live worker is draining into sink X.
@@ -99,17 +99,17 @@ one-line correction — it is FR-002's enumeration.
       has been repeating and this is the one site where it is not the answer. Both wrong
       predicates are pinned by mutation: liveness fails the three tests below, bare ownership
       fails SPEC-033's.
-- [ ] AC-1a: The two directions are covered by different tests, and neither alone is sufficient —
+- [x] AC-1a: The two directions are covered by different tests, and neither alone is sufficient —
       one holds the shutdown's drain window, the other holds the post-shutdown window. An
       abandoned drain (`ShutdownTimeout`) counts as **not** draining: the thread is wedged, the
       shutdown has already given up on it and left the sink open by SPEC-027 FR-004, so nothing
       will cut its backoff, where the retry loop goes on costing the running application.
-- [ ] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`.
-- [ ] AC-3: End to end: with a sink whose backoff is far longer than the shutdown budget, one
+- [x] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`.
+- [x] AC-3: End to end: with a sink whose backoff is far longer than the shutdown budget, one
       concurrent orphan log does not change the outcome — the backoff is still cut short, and
       `stopped_reason` stays `None`. The test keeps the backoff-to-budget **gap** wide rather
       than the budget tight.
-- [ ] AC-4: The sink adopted *after* a retired worker still receives a signal (SPEC-033 FR-004
+- [x] AC-4: The sink adopted *after* a retired worker still receives a signal (SPEC-033 FR-004
       AC-4's second case), so this fix does not re-break what that one fixed.
 
 ### FR-002: One enumeration decides every liveness-or-ownership call site
@@ -126,7 +126,7 @@ sink rosters do. A new call site must either match a declared category or fail t
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A test walks `decorator.py`'s AST and finds every form: `_live_worker()`, every
+- [x] AC-1: A test walks `decorator.py`'s AST and finds every form: `_live_worker()`, every
       `_worker.sink is …` comparison, every bare `_worker is not None`, **and the two FR-001 and
       FR-003 added — `worker.draining` and `_swap_sink`'s `if not adopted:`, which carries the
       answer in a return value rather than a predicate.** A walk looking only for the first two
@@ -134,17 +134,17 @@ sink rosters do. A new call site must either match a declared category or fail t
       looking only for the first three would ship missing both forms this spec itself
       introduced, which is SPEC-032's roster lesson repeated inside a single spec. Line numbers
       are not cited — an earlier draft named `decorator.py:475` and Phase 1 moved it.
-- [ ] AC-1b: The categories are **four**, not two: exists-at-all (existence — `_get_worker`,
+- [x] AC-1b: The categories are **four**, not two: exists-at-all (existence — `_get_worker`,
       `_shutdown_worker`, `_flush_worker`, `_worker_health`), performs-a-swap (liveness),
       owns-a-close (ownership), and **offers-a-signal**, which FR-001 as built makes
       *ownership conjoined with a moment* (`_worker.sink is sink and worker.draining`) rather
       than ownership alone. ~~three~~ — struck: the draft was written before FR-001 discovered
       that neither existing category classifies that site.
-- [ ] AC-2: The category table is **in the test**, one line per site with the reason, so adding a
+- [x] AC-2: The category table is **in the test**, one line per site with the reason, so adding a
       site forces a decision rather than defaulting silently.
-- [ ] AC-3: The test fails when FR-001's fix is reverted, and fails when a new call site is added
+- [x] AC-3: The test fails when FR-001's fix is reverted, and fails when a new call site is added
       without a category. Both are demonstrated by mutation.
-- [ ] AC-4: `docs/architecture.md` §9 states the rule, so it is discoverable from the design doc
+- [x] AC-4: `docs/architecture.md` §9 states the rule, so it is discoverable from the design doc
       and not only from a delivery doc.
 
 ### FR-003: A swap racing a shutdown leaves its sink owned
@@ -163,11 +163,11 @@ flushing its producer — that is a silently lost buffer, the shape SPEC-033 exi
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: In that interleaving, B is closed exactly once by the time the process exits.
-- [ ] AC-2: A is still closed exactly once, and not closed by both paths.
-- [ ] AC-3: The test uses an injected preemption point inside `Worker.swap_sink`'s first
+- [x] AC-1: In that interleaving, B is closed exactly once by the time the process exits.
+- [x] AC-2: A is still closed exactly once, and not closed by both paths.
+- [x] AC-3: The test uses an injected preemption point inside `Worker.swap_sink`'s first
       `flush()`, since the window is a few instructions wide.
-- [ ] AC-4: The uncontended swap paths of SPEC-033 are unchanged — its whole test file still
+- [x] AC-4: The uncontended swap paths of SPEC-033 are unchanged — its whole test file still
       passes, and the transition table in that spec is amended rather than contradicted. Its
       `_swap_sink(N)` / worker-exists row reads "`Worker.swap_sink` owns it", which the declined
       branch makes false, so the table gains a declined row.
@@ -199,17 +199,17 @@ returns early, and the grace still runs once (SPEC-033).
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A second `shutdown()` entered while the first is draining waits for that drain,
+- [x] AC-1: A second `shutdown()` entered while the first is draining waits for that drain,
       bounded by its own timeout, and the events are delivered.
-- [ ] AC-2: `shutdown(timeout=0)` on the second call still returns promptly — the wait is bounded
+- [x] AC-2: `shutdown(timeout=0)` on the second call still returns promptly — the wait is bounded
       by the caller's budget, not by the drain.
-- [ ] AC-3: A second `shutdown()` after the first **completed** still returns immediately;
+- [x] AC-3: A second `shutdown()` after the first **completed** still returns immediately;
       idempotency is not traded for correctness here.
-- [ ] AC-4: The closer grace is granted exactly once **per call**, so twice across two calls,
+- [x] AC-4: The closer grace is granted exactly once **per call**, so twice across two calls,
       and a test asserts the count rather than timing it. ~~exactly once across both calls~~ —
       struck because SPEC-033's invariant is once per `shutdown()`, not once per process, and an
       AC whose test had to be read the other way is an AC to amend rather than reinterpret.
-- [ ] AC-5: A first shutdown that **expired** still returns early from the second call, since the
+- [x] AC-5: A first shutdown that **expired** still returns early from the second call, since the
       drain thread is wedged and waiting on it would hang the exit — the case
       `Worker._join_closers`'s docstring already reasons about.
 
@@ -325,11 +325,11 @@ record a reader of `architecture.md` will ever find.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `architecture.md` §13 records that `_note_orphan_emit` and `_swap_sink` can write a
+- [x] AC-1: `architecture.md` §13 records that `_note_orphan_emit` and `_swap_sink` can write a
       `_diag` line while holding the process-wide `_worker_lock`, that this stalls every orphan
       emit and every first `@trace` behind a wedged console, that it is an error path only, and
       why the fix was judged worse than the trade.
-- [ ] AC-2: The entry names `Worker.submit` as the counter-example — it deliberately writes
+- [x] AC-2: The entry names `Worker.submit` as the counter-example — it deliberately writes
       *outside* its lock for exactly this reason — so a later reader can see the inconsistency is
       known rather than accidental.
 

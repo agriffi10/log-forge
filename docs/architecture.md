@@ -922,6 +922,28 @@ constraint — never by being deleted quietly.
   writes one stderr line stating what was held and what was still queued (SPEC-021 FR-002). The
   worker is not restarted: a thread that resurrects itself fights a process trying to exit.
 
+- **A diagnostic can be written while `_worker_lock` is held (SPEC-035 FR-006).** The
+  process-wide lock in `decorator.py` is released before anything that blocks on a destination —
+  `owed.close()` runs outside it, and `close_detached` only starts a thread — with one exception:
+  three sites can reach `_diag` while still holding it, so a wedged stderr stalls every orphan
+  emit and every first `@trace` in the process behind it.
+
+  - `_note_orphan_emit` → `_offer_orphan_signal` → `_lifecycle.offer_stop_signal` → `_diag.absorbed`
+  - `_adopt_declined_swap` → the same path (this site arrived with SPEC-035 FR-003)
+  - `_swap_sink` → that path, **and** `_lifecycle.close_detached`, which writes on a thread-start
+    failure, also under the lock
+
+  `_close_orphan_sink` is deliberately not one — its `_diag` write sits outside the `with`.
+  It is an **error path only**: `offer_stop_signal` writes just when a sink's `stop_signal`
+  setter objects, and `close_detached` just when the interpreter refuses a thread. The fix —
+  returning a flag and writing after the release — spreads one diagnostic decision across two
+  functions at all three sites to save a write that happens only then, so it is **recorded rather
+  than taken**. `Worker.submit` is the counter-example and is deliberately inconsistent with
+  these: it writes its queue-full line *outside* its own lock for exactly this reason, which is
+  the shape to copy if a fourth site ever sits on a hot path. Found as C5 by the 2026-08-07
+  audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
+  (`docs/process.md`) found the third.
+
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment
   is frozen when the handler returns and killed later without running exit handlers, so there is
