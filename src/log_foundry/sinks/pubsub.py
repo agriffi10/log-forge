@@ -11,6 +11,14 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["GooglePubSubSink"]
 
+DEFAULT_OVERFLOW_TIMEOUT = 30.0
+"""Seconds one ``emit`` waits on an over-bound publish before putting it back (FR-004 AC-2).
+
+Thirty matches ``DEFAULT_MAX_RETRY_AFTER``: it is long enough that an ordinary publish settles
+inside it, and short enough that the single drain thread is never held past what
+``shutdown()``'s own budget allows.
+"""
+
 DEFAULT_MAX_PENDING = 1000
 """Outstanding publish futures one sink will hold before it waits (FR-004 AC-2).
 
@@ -44,15 +52,26 @@ class GooglePubSubSink:
     The list was also append-only for the life of the process until SPEC-038 FR-004: memory grew
     with the total number of events logged, and because ``result()`` ran only at ``close``,
     ``failed`` stayed at zero and ``health()`` reported clean through an entire Pub/Sub outage.
-    Each ``emit`` now reaps whatever has settled and holds at most ``max_pending`` outstanding.
+    Each ``emit`` now reaps whatever has settled and holds at most ``max_pending`` outstanding
+    **between emits**: the reap runs once at the end of a call, so one ``emit`` of 6,000 events
+    peaks at 5,999 futures before the reap trims it. What the bound rules out is growth with the
+    total number of events the process has ever logged, which is what FR-004 is about.
 
     Attributes:
-      max_pending: Outstanding futures held before ``emit`` waits on the oldest.
+      max_pending: Outstanding futures held between emits before ``emit`` waits on the oldest.
+      overflow_timeout: Seconds one over-bound publish is waited on before being put back.
       failed: Publishes the client did not confirm.
       rejected: Publishes the client refused outright, before any future existed.
     """
 
-    def __init__(self, topic: str, *, client: Any = None, max_pending: int | None = None) -> None:
+    def __init__(
+        self,
+        topic: str,
+        *,
+        client: Any = None,
+        max_pending: int | None = None,
+        overflow_timeout: float = DEFAULT_OVERFLOW_TIMEOUT,
+    ) -> None:
         """Binds the sink to a topic.
 
         Args:
@@ -61,6 +80,9 @@ class GooglePubSubSink:
           max_pending: Outstanding futures held before :meth:`emit` waits on the oldest, or
             ``None`` for :data:`DEFAULT_MAX_PENDING`. Floored at one, since a bound of zero would
             make every publish synchronous and defeat the client's own batching.
+          overflow_timeout: Seconds to wait on one over-bound publish before putting it back.
+            The wait runs on the worker's single drain thread, so it is bounded by SPEC-027's
+            rule that no sink wait may be unbounded or uninterruptible.
 
         Returns:
           None.
@@ -75,6 +97,8 @@ class GooglePubSubSink:
         self.topic = topic
         self.client = client
         self.max_pending = max(max_pending if max_pending is not None else DEFAULT_MAX_PENDING, 1)
+        self.overflow_timeout = overflow_timeout
+        self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.rejected = 0
         self._counter_lock = threading.Lock()
@@ -188,6 +212,14 @@ class GooglePubSubSink:
         and holding the lock across it would block every concurrent publish behind it — the I/O
         inside a transport lock that SPEC-028's two-lock arrangement exists to avoid.
 
+        The partition is **one pass**, and that is load-bearing rather than tidy. Two
+        comprehensions query ``done()`` twice per future, and a future that settles between the
+        two queries — which is what a client's commit thread does — lands in neither list: not
+        resolved, and dropped by the reassignment below. Measured, five failed publishes vanished
+        with ``losses()`` reading clean, and under a real thread race 41% of failures went
+        uncounted. That is the silent loss this method exists to end, so the scan may not ask the
+        same future twice.
+
         Overflow is taken from the front, so the oldest publish is the one waited on. Waiting
         rather than discarding is deliberate (AC-2): the event has already been handed to the
         client and may yet be delivered, so dropping it here would invent a loss that the
@@ -203,32 +235,95 @@ class GooglePubSubSink:
           None.
         """
         with self._futures_lock:
-            settled = [future for future in self._futures if _has_settled(future)]
-            outstanding = [future for future in self._futures if not _has_settled(future)]
+            settled: list[Any] = []
+            outstanding: list[Any] = []
+            for future in self._futures:
+                (settled if _has_settled(future) else outstanding).append(future)
             excess = max(len(outstanding) - self.max_pending, 0)
             overflow, self._futures = outstanding[:excess], outstanding[excess:]
-        for future in (*settled, *overflow):
+        for future in settled:
+            self._resolve(future)
+        self._await_overflow(overflow)
+
+    def _await_overflow(self, overflow: list[Any]) -> None:
+        """Waits on the oldest futures once the pending list is over its bound (FR-004 AC-2).
+
+        The wait is **bounded and interruptible**, per SPEC-027. This runs inside ``emit`` on the
+        worker's single drain thread, so an unbounded ``result()`` here is a pause on all log
+        delivery that ``shutdown()`` cannot cut short — measured, an ``emit`` still running after
+        a second with no stop signal reaching it, because this sink had no
+        ``log_foundry_stop_signal`` for the worker to set. Before FR-004 the only blocking
+        ``result()`` was in ``close``, where such a wait belongs.
+
+        A future the wait does not outlast is **put back**, not counted: it may still land, and
+        ``close`` resolves whatever remains. The bound is therefore a bound on the *list between
+        emits*, and briefly exceeding it beats blocking delivery indefinitely. A shutdown skips
+        the wait entirely for the same reason — nothing is lost by deferring it to ``close``,
+        which is the opposite of skipping *work* during a drain.
+
+        Args:
+          overflow: The oldest outstanding futures, already removed from the pending list.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not overflow:
+            return
+        stop = self.log_foundry_stop_signal
+        if stop is not None and stop.is_set():
+            unresolved = overflow
+        else:
+            unresolved = [
+                future
+                for future in overflow
+                if not self._resolve(future, self.overflow_timeout)
+            ]
+        if not unresolved:
+            return
+        with self._futures_lock:
+            if not self._closed:
+                self._futures[:0] = unresolved
+                return
+        for future in unresolved:
             self._resolve(future)
 
-    def _resolve(self, future: Any) -> None:
+    def _resolve(self, future: Any, timeout: float | None = None) -> bool:
         """Waits for one publish to settle, counting and announcing a failure.
 
         Args:
           future: The publish future to resolve.
+          timeout: Seconds to wait, or ``None`` to wait indefinitely — which is what ``close``
+            does, and what a shutdown defers this to.
 
         Returns:
-          None.
+          True when the future settled, False when a *bounded* wait expired with it still in
+          flight. An expired wait is not a failure and moves no counter: the publish is
+          unfinished, not unconfirmed.
+
+          A ``TimeoutError`` is only read that way when this call set a timeout. With none set —
+          which is every call from ``close`` — it is the client reporting that the publish itself
+          timed out, and is counted like any other failure. Conflating the two made a genuinely
+          unconfirmed publish silently uncounted, which an existing ``losses()`` test caught. A
+          server-side timeout arriving *during* a bounded wait is read as "still in flight" and
+          the future is put back, so it is counted at ``close`` rather than here — later, never
+          lost.
 
         Raises:
           None. An unresolved future must never crash the worker (FR-011), and this is called
             from ``close`` as well as from the emitting thread.
         """
         try:
-            future.result()
+            future.result() if timeout is None else future.result(timeout=timeout)
         except Exception as err:
+            if timeout is not None and isinstance(err, TimeoutError):
+                return False
             with self._counter_lock:
                 self.failed += 1
             _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}")
+        return True
 
     def close(self) -> None:
         """Resolves all pending publish futures, counting and logging errors (FR-008).

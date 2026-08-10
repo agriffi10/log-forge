@@ -232,3 +232,137 @@ def test_close_still_resolves_whatever_is_left_outstanding() -> None:
     sink.close()
     assert sink.failed == 4
     assert sink._futures == []
+
+
+class SettlingFuture(PollableFuture):
+    """A future that reports done() False once, then True — a real driver state transition.
+
+    `PollableFuture` above answers from a stable flag, so both halves of a two-pass partition
+    always agree and the race below is invisible to it. This one flips on query, which is what a
+    Pub/Sub client's commit thread does mid-scan.
+    """
+
+    def __init__(self, error: Exception | None = None, *, settle_after: int = 1) -> None:
+        super().__init__(error, settled=False)
+        self.queries = 0
+        self._settle_after = settle_after
+
+    def done(self) -> bool:
+        self.queries += 1
+        return self.queries > self._settle_after
+
+
+def test_a_future_that_settles_mid_scan_is_never_dropped() -> None:
+    """Every future is resolved or retained — never neither. FR-004's own defect, reintroduced.
+
+    Partitioning with two comprehensions queried `done()` twice per future, so one settling
+    between the queries landed in neither list: not resolved, and dropped by the reassignment.
+    Measured, five failed publishes vanished with `losses()` reading clean, and under a thread
+    race 41% of failures went uncounted — the silent loss this method exists to end.
+
+    The assertion is conservation rather than a count, because how many futures settle mid-scan
+    is a race. Conservation holds whichever way the race falls; a count would not.
+    """
+    client = PollablePublisher(lambda _i: SettlingFuture(RuntimeError("publish failed")))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"i": i} for i in range(5)])
+
+    resolved_now = sum(1 for future in client.futures if future.resolved)
+    assert resolved_now + len(sink._futures) == 5, (
+        f"{5 - resolved_now - len(sink._futures)} future(s) were neither resolved nor retained"
+    )
+    sink.close()
+    assert all(future.resolved == 1 for future in client.futures), (
+        "and close() reaches every one of them, exactly once"
+    )
+    assert sink.failed == 5
+
+
+def test_the_reap_asks_each_future_for_its_state_once() -> None:
+    """The property that makes the conservation above hold, pinned directly.
+
+    A second query is a second chance for the answer to change, and the partition cannot act on
+    two different answers about one future.
+    """
+    client = PollablePublisher(lambda _i: SettlingFuture(settle_after=99))
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
+    sink.emit([{"i": 0}])
+    assert [future.queries for future in client.futures] == [1]
+
+
+def test_an_overflow_wait_that_expires_puts_the_publish_back_rather_than_losing_it() -> None:
+    """AC-2 + SPEC-027. The wait runs on the drain thread, so it is bounded — and a bound that
+    discarded the publish would invent the loss AC-2 chose waiting to avoid.
+    """
+
+    class NeverSettles(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.waits: list[float | None] = []
+
+        def result(self, timeout=None):
+            self.waits.append(timeout)
+            raise TimeoutError("still in flight")
+
+    client = PollablePublisher(lambda _i: NeverSettles())
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=2, overflow_timeout=0.01)
+    sink.emit([{"i": i} for i in range(5)])
+
+    assert all(future.waits == [0.01] for future in client.futures if future.waits), (
+        "the wait is bounded by overflow_timeout, not indefinite"
+    )
+    assert len(sink._futures) == 5, "an unfinished publish is retained, not dropped"
+    assert sink.failed == 0, "an expired wait is not a failure; the publish is unfinished"
+
+
+def test_a_shutdown_defers_the_overflow_wait_to_close_rather_than_blocking_the_drain() -> None:
+    """The stop signal skips the *wait*, not the work: close() still resolves everything.
+
+    This is the opposite of the mistake FR-001 made — skipping delivery during the exit drain
+    loses events, while deferring a wait to close() loses nothing, because close() is where an
+    exit-time wait belongs.
+    """
+    import threading
+
+    class NeverSettles(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.waits: list[float | None] = []
+
+        def result(self, timeout=None):
+            self.waits.append(timeout)
+            if timeout is not None:
+                raise TimeoutError("still in flight")
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: NeverSettles())
+    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=1)
+    signal = threading.Event()
+    signal.set()
+    sink.log_foundry_stop_signal = signal
+    sink.emit([{"i": i} for i in range(4)])
+    assert all(future.waits == [] for future in client.futures), "no waiting while stopping"
+    assert len(sink._futures) == 4, "everything is retained for close()"
+    sink.close()
+    assert all(future.waits == [None] for future in client.futures), "close waits unbounded"
+
+
+def test_a_bound_of_zero_is_floored_so_publishing_does_not_become_synchronous() -> None:
+    assert GooglePubSubSink("projects/p/topics/t", client=FakePublisher(), max_pending=0).max_pending == 1
+
+
+def test_the_reap_runs_even_when_every_publish_was_refused() -> None:
+    """The reap is before the total-failure raise, so a wholly-refused batch still trims."""
+
+    class Refusing:
+        def __init__(self, held): self._held = held
+        def publish(self, topic, data=None, **attrs):
+            raise RuntimeError("refused")
+
+    settled = PollableFuture(settled=True)
+    sink = GooglePubSubSink("projects/p/topics/t", client=Refusing(settled))
+    sink._futures.append(settled)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert settled.resolved == 1, "the earlier settled future was reaped despite the raise"
+    assert sink._futures == []

@@ -21,9 +21,19 @@ Two design notes, because each is the kind of thing that rots:
   to the hand-written *rosters* SPEC-032 and SPEC-035 had to replace.
 
 The shape matched is `self.<attr>.<method>(...)` -- a call on something reached *through* `self`.
-`self.<method>(...)` is excluded because that is this library's own code, bound by its own
-docstring contract; a driver reached instead through a local alias is outside the shape, and no
-sink writes one today.
+The bounds, stated in full because a rule that oversells its coverage is worse than one that
+admits it (all four verified absent from `src/` today):
+
+- **`finally` is out of scope.** The rule's own rationale applies verbatim to a `finally`, and
+  the package has one driver cleanup in that shape (`nats.py`'s `self._loop.close()`). Widening
+  is a judgement call this FR did not make; it is named here so the gap is a decision.
+- **Deeper chains and calls in the chain** -- `self._client.connection.rollback()`,
+  `self.connection().rollback()` -- do not match the two-level shape.
+- **A module-level object** (`MODULE_CONN.rollback()`) is not reached through `self`.
+- **`self.<method>()` is excluded**, which is what the fix itself looks like: this rule cannot
+  see a guarded helper whose own `try` is later removed. The behaviour tests cover that; the
+  lint does not, and it is the one exclusion that hides the mandated pattern rather than
+  something exotic.
 """
 
 from __future__ import annotations

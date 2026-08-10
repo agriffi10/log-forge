@@ -221,8 +221,11 @@ class RollbackRaisesConnection(FakeConnection):
         super().__init__(fail_times=-1)
 
     def rollback(self) -> None:
+        # A *distinct* type from the insert's RuntimeError, so the assertions below can tell
+        # which exception the diagnostic and the raise actually describe. With both the same
+        # type the tests passed whichever one won, which is no test at all.
         self.rollbacks += 1
-        raise RuntimeError("the server closed this session")
+        raise TypeError("the server closed this session")
 
 
 def test_a_rollback_that_raises_does_not_consume_the_remaining_attempts() -> None:
@@ -245,6 +248,10 @@ def test_a_total_failure_still_counts_announces_and_raises_the_sink_error(capsys
     assert sink.losses().failed == 3
     err = capsys.readouterr().err
     assert "lost 3 event(s)" in err
+    assert "RuntimeError" in err, "the diagnostic names the *insert's* failure"
+    assert "TypeError" not in err.split("lost 3 event(s)")[1], (
+        "the rollback's own failure must not displace the one being handled"
+    )
     assert "the server closed this session" not in err, "the type, never the driver's message"
 
 
@@ -255,7 +262,7 @@ def test_the_failing_rollback_is_announced_as_absorbed_by_type(capsys) -> None:
         sink.emit([{"i": 1}])
     err = capsys.readouterr().err
     assert "PostgresSink.rollback" in err
-    assert "RuntimeError" in err
+    assert "TypeError" in err, "named by the rollback's own type, distinct from the insert's"
     assert "closed this session" not in err
 
 
