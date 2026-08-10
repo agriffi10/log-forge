@@ -451,3 +451,66 @@ def test_a_future_whose_result_takes_no_timeout_is_not_counted_as_lost() -> None
     sink.close()
     assert sink.failed == 0, "and they resolve cleanly once close() waits unbounded"
     assert all(future.resolved == 1 for future in client.futures)
+
+
+def test_the_slice_loop_does_not_spin_when_a_bounded_wait_fails_instantly() -> None:
+    """SPEC-027 again. A slice the future does not consume must still be waited out.
+
+    Nothing obliges `result(timeout=)` to block for its timeout: a client that raises
+    `TimeoutError` immediately turned the slice loop into a hot spin — measured at 3.5 million
+    `result()` calls and a pegged core for one second, which is thirty at the shipped default,
+    on the worker's single drain thread with no delivery happening. The remainder of each slice
+    now goes through `_retry.wait`, which is where SPEC-027 says a sink's waiting belongs and
+    which the first version of this loop bypassed.
+
+    Asserted on **CPU** time, not wall time: the wall bound was already correct while the loop
+    was spinning, so a wall-clock assertion cannot see this at all.
+    """
+
+    class InstantlyExpiring(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+            self.calls = 0
+
+        def result(self, timeout=None):
+            self.calls += 1
+            if timeout is None:
+                return "message-id"
+            raise TimeoutError("instant")
+
+    client = PollablePublisher(lambda _i: InstantlyExpiring())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.3)
+    cpu = time.process_time()
+    sink.emit([{"i": i} for i in range(4)])
+    burned = time.process_time() - cpu
+    calls = sum(future.calls for future in client.futures)
+    assert burned < 0.1, f"the slice loop spun: {burned:.3f}s of CPU for a 0.3s bounded wait"
+    assert calls < 100, f"and it made {calls} result() calls where a handful should do"
+
+
+def test_an_unboundable_future_is_put_back_at_once_rather_than_waited_out() -> None:
+    """A future whose `result()` takes no timeout cannot succeed under a bounded call.
+
+    Retrying it every slice until the deadline is a pointless wait on the drain thread, so it
+    breaks out immediately — distinct from "not settled yet", which must keep waiting.
+    """
+
+    class NoTimeout:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def done(self) -> bool:
+            return False
+
+        def result(self):
+            self.calls += 1
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: NoTimeout())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=5.0)
+    start = time.monotonic()
+    sink.emit([{"i": i} for i in range(3)])
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"an unboundable future must not be waited out; took {elapsed:.2f}s"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "and it is not counted as lost"
+    assert len(sink._futures) == 3, "it is put back for close()"

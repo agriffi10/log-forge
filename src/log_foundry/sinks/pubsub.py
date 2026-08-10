@@ -8,9 +8,21 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["GooglePubSubSink"]
+
+
+class _Unboundable(Exception):
+    """A future whose ``result()`` takes no ``timeout``, so no bounded wait on it is possible.
+
+    Raised rather than folded into :meth:`GooglePubSubSink._resolve`'s ``False`` because the two
+    need different answers: ``False`` means "not settled yet, wait the rest of the slice and try
+    again", while this means "trying again can only fail the same way". Conflating them spun the
+    slice loop at full speed until the deadline — measured at 3.5 million ``result()`` calls and
+    a pegged core for one second, which is thirty at the shipped default.
+    """
 
 DEFAULT_OVERFLOW_TIMEOUT = 30.0
 """Seconds one ``emit`` waits on an over-bound publish before putting it back (FR-004 AC-2).
@@ -300,10 +312,15 @@ class GooglePubSubSink:
         for index, future in enumerate(overflow):
             settled = False
             while not self._out_of_time(deadline):
-                slice_ = min(deadline - time.monotonic(), _POLL_INTERVAL)
-                if self._resolve(future, slice_):
-                    settled = True
+                began = time.monotonic()
+                slice_ = min(deadline - began, _POLL_INTERVAL)
+                try:
+                    settled = self._resolve(future, slice_)
+                except _Unboundable:
                     break
+                if settled:
+                    break
+                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
             if settled:
                 continue
             unresolved.append(future)
@@ -369,13 +386,17 @@ class GooglePubSubSink:
           lost.
 
         Raises:
-          None. An unresolved future must never crash the worker (FR-011), and this is called
-            from ``close`` as well as from the emitting thread.
+          _Unboundable: When a bounded call cannot be made at all, which only
+            :meth:`_await_overflow` catches. An unresolved future must never crash the worker
+            (FR-011), and this is called from ``close`` as well as from the emitting thread, so
+            nothing else escapes.
         """
         try:
             future.result() if timeout is None else future.result(timeout=timeout)
         except Exception as err:
-            if timeout is not None and isinstance(err, TimeoutError | TypeError):
+            if timeout is not None and isinstance(err, TypeError):
+                raise _Unboundable from None
+            if timeout is not None and isinstance(err, TimeoutError):
                 return False
             with self._counter_lock:
                 self.failed += 1
