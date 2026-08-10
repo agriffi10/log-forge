@@ -121,6 +121,23 @@ async def test_a_bad_message_value_never_reaches_the_caller(path: str) -> None:
     await _emit_on(path, lambda: log_foundry.info(ValueError("not a string")))
 
 
+P1_FIELDS_BROKEN: dict[str, str] = {}
+
+
+@pytest.mark.parametrize("path", [_xfail(p, P1_FIELDS_BROKEN) for p in PATHS])
+async def test_a_non_mapping_fields_argument_never_reaches_the_caller(path: str) -> None:
+    """SPEC-034 FR-004 added a route to this promise and briefly broke it on all four paths.
+
+    `_merge` runs in the emitter, *before* `_log`, so it sits outside that function's orphan
+    guard entirely: an unguarded `{**fields, **kv}` propagated a `TypeError` into the application
+    everywhere, including the orphan path, where the cell above is deliberately not xfailed. It
+    was also a regression on a call that worked before — `info("m", **payload)` with a
+    dynamically-built payload carrying a `fields` key.
+    """
+    log_foundry.configure(service="t", sink=Recorder())
+    await _emit_on(path, lambda: log_foundry.info("m", fields=["not a mapping"]))
+
+
 # -- Promise 2: loss is visible ---------------------------------------------------------------
 # README "Reliability": "Silence is not success anywhere."
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from log_foundry import _diag, context
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
@@ -9,6 +11,9 @@ from log_foundry.context import set_baggage
 from log_foundry.decorator import _note_orphan_emit
 from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = [
     "critical",
@@ -100,13 +105,66 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             _diag.absorbed("echoing to the console", exc)
 
 
-def debug(message: str, *, echo: bool = False, **fields: object) -> None:
+def _merge(fields: Mapping[str, object] | None, kv: dict[str, object]) -> dict[str, object]:
+    """Combines the explicit ``fields=`` mapping with the keyword form.
+
+    ``echo`` and ``message`` were reserved words stolen from the caller's field namespace:
+    ``info("x", echo="incoming payload echoed back")`` dropped a real field *and* turned on an
+    unwanted console line, and ``message=`` raised ``TypeError`` (SPEC-034 FR-004). ``fields=``
+    is the way round all three — including its own name, which is why the escape hatch can
+    express every key including the ones this signature reserves — and the only way to pass a
+    key that is not a Python identifier.
+
+    The keyword form wins a collision. ``fields=`` is the bulk route, usually a mapping built
+    somewhere else; ``**kv`` is what the caller wrote at this call site, and a literal
+    overriding a base is what ``{**base, **overrides}`` already means in the language.
+
+    A ``fields=`` that is not a mapping is **absorbed, not raised**. This helper runs in the
+    emitter, before :func:`_log`, so it sits outside that function's orphan guard entirely: an
+    unguarded ``{**fields, **kv}`` propagated a ``TypeError`` into the application on all four
+    entry paths, including the orphan one where SPEC-025's promise holds today, and inside a span
+    the decorator then recorded ``status=error`` with an ``error.type`` the caller's code never
+    raised. It was also asymmetric in a way neither reading defends — ``fields=[]`` was silently
+    ignored while ``fields=["x"]`` crashed. The library coerces rather than validates (SPEC-017),
+    so the tolerant half is the one that matches, and the fault is announced by type.
+
+    Args:
+      fields: The explicit mapping, or ``None``.
+      kv: The keyword-collected fields.
+
+    Returns:
+      One mapping, with ``kv`` taking precedence. The caller's ``fields`` is never mutated, and a
+        ``fields=`` that could not be merged is dropped rather than costing the event.
+
+    Raises:
+      None.
+    """
+    if not fields:
+        return kv
+    try:
+        return {**fields, **kv}
+    except Exception as exc:
+        _diag.absorbed("merging the fields= argument", exc, "the fields= argument was ignored")
+        return kv
+
+
+def debug(
+    message: str,
+    *,
+    echo: bool = False,
+    fields: Mapping[str, object] | None = None,
+    **kv: object,
+) -> None:
     """Emits a ``DEBUG`` event on the current span, or a standalone orphan span.
 
     Args:
       message: The message text.
       echo: Whether to also write a human-readable console line.
-      **fields: Per-call structured fields.
+      fields: Per-call structured fields, for names ``**kv`` cannot express — the three
+        reserved words ``message``, ``echo`` and ``fields`` itself, and any key that is not a
+        Python identifier at all. Merged **under** ``**kv``, so a name given both ways takes the
+        keyword's value.
+      **kv: Per-call structured fields.
 
     Returns:
       None.
@@ -114,16 +172,26 @@ def debug(message: str, *, echo: bool = False, **fields: object) -> None:
     Raises:
       None.
     """
-    _log("DEBUG", message, echo, fields)
+    _log("DEBUG", message, echo, _merge(fields, kv))
 
 
-def info(message: str, *, echo: bool = False, **fields: object) -> None:
+def info(
+    message: str,
+    *,
+    echo: bool = False,
+    fields: Mapping[str, object] | None = None,
+    **kv: object,
+) -> None:
     """Emits an ``INFO`` event on the current span, or a standalone orphan span.
 
     Args:
       message: The message text.
       echo: Whether to also write a human-readable console line.
-      **fields: Per-call structured fields.
+      fields: Per-call structured fields, for names ``**kv`` cannot express — the three
+        reserved words ``message``, ``echo`` and ``fields`` itself, and any key that is not a
+        Python identifier at all. Merged **under** ``**kv``, so a name given both ways takes the
+        keyword's value.
+      **kv: Per-call structured fields.
 
     Returns:
       None.
@@ -131,16 +199,26 @@ def info(message: str, *, echo: bool = False, **fields: object) -> None:
     Raises:
       None.
     """
-    _log("INFO", message, echo, fields)
+    _log("INFO", message, echo, _merge(fields, kv))
 
 
-def warning(message: str, *, echo: bool = False, **fields: object) -> None:
+def warning(
+    message: str,
+    *,
+    echo: bool = False,
+    fields: Mapping[str, object] | None = None,
+    **kv: object,
+) -> None:
     """Emits a ``WARNING`` event on the current span, or a standalone orphan span.
 
     Args:
       message: The message text.
       echo: Whether to also write a human-readable console line.
-      **fields: Per-call structured fields.
+      fields: Per-call structured fields, for names ``**kv`` cannot express — the three
+        reserved words ``message``, ``echo`` and ``fields`` itself, and any key that is not a
+        Python identifier at all. Merged **under** ``**kv``, so a name given both ways takes the
+        keyword's value.
+      **kv: Per-call structured fields.
 
     Returns:
       None.
@@ -148,16 +226,26 @@ def warning(message: str, *, echo: bool = False, **fields: object) -> None:
     Raises:
       None.
     """
-    _log("WARNING", message, echo, fields)
+    _log("WARNING", message, echo, _merge(fields, kv))
 
 
-def error(message: str, *, echo: bool = False, **fields: object) -> None:
+def error(
+    message: str,
+    *,
+    echo: bool = False,
+    fields: Mapping[str, object] | None = None,
+    **kv: object,
+) -> None:
     """Emits an ``ERROR`` event on the current span, or a standalone orphan span.
 
     Args:
       message: The message text.
       echo: Whether to also write a human-readable console line.
-      **fields: Per-call structured fields.
+      fields: Per-call structured fields, for names ``**kv`` cannot express — the three
+        reserved words ``message``, ``echo`` and ``fields`` itself, and any key that is not a
+        Python identifier at all. Merged **under** ``**kv``, so a name given both ways takes the
+        keyword's value.
+      **kv: Per-call structured fields.
 
     Returns:
       None.
@@ -165,16 +253,26 @@ def error(message: str, *, echo: bool = False, **fields: object) -> None:
     Raises:
       None.
     """
-    _log("ERROR", message, echo, fields)
+    _log("ERROR", message, echo, _merge(fields, kv))
 
 
-def critical(message: str, *, echo: bool = False, **fields: object) -> None:
+def critical(
+    message: str,
+    *,
+    echo: bool = False,
+    fields: Mapping[str, object] | None = None,
+    **kv: object,
+) -> None:
     """Emits a ``CRITICAL`` event on the current span, or a standalone orphan span.
 
     Args:
       message: The message text.
       echo: Whether to also write a human-readable console line.
-      **fields: Per-call structured fields.
+      fields: Per-call structured fields, for names ``**kv`` cannot express — the three
+        reserved words ``message``, ``echo`` and ``fields`` itself, and any key that is not a
+        Python identifier at all. Merged **under** ``**kv``, so a name given both ways takes the
+        keyword's value.
+      **kv: Per-call structured fields.
 
     Returns:
       None.
@@ -182,4 +280,4 @@ def critical(message: str, *, echo: bool = False, **fields: object) -> None:
     Raises:
       None.
     """
-    _log("CRITICAL", message, echo, fields)
+    _log("CRITICAL", message, echo, _merge(fields, kv))

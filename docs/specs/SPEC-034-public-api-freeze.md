@@ -256,18 +256,48 @@ also gives a caller a way to pass a key that is not a Python identifier at all. 
 additive; what is *not* additive is the decision to keep `**fields` alongside it, which is why
 this belongs here.
 
+**Two things this Description leaves out, found by reading `api.py` before writing any of it:**
+
+- **`fields=` is itself breaking, in the direction the FR does not mention.** The var-keyword is
+  literally named `**fields` today, so `info("x", fields={"a": 1})` *already works* and produces
+  a field called `fields` holding that dict. Promoting it to a real parameter silently changes
+  that call's meaning. That strengthens the case for taking it before 1.0 rather than weakening
+  it — but it also makes `fields` the **third** reserved word, which the FR does not say.
+- **The escape hatch must reach its own name**, or "reserved" has a hole: `fields={"fields": …}`
+  puts a field called `fields` in the event. AC-1 named only `echo`, `message` and a
+  non-identifier; `fields` is added to it. That self-hosting property is what makes reserving
+  anything tolerable — every reserved name has exactly one route through.
+- **The merge runs *before* `api._log`, so it is outside that function's orphan guard**, and an
+  unguarded `{**fields, **kv}` therefore raised a `TypeError` into the application on all four
+  entry paths — including the orphan one, where SPEC-025's promise holds and
+  `tests/test_promises.py` does not xfail it. Inside a span the decorator then recorded
+  `status=error` with an `error.type` the caller never raised: the SPEC-025 shape verbatim, in a
+  new place, and a regression on `info("m", **payload)` where a dynamic payload carries a
+  `fields` key. It was also asymmetric in a way neither reading defends — `fields=[]` silently
+  ignored, `fields=["x"]` fatal. The library coerces rather than validates (SPEC-017), so the
+  merge absorbs and announces by type. Found by review; the promise matrix carries the case now.
+- **`dict[str, object]` is invariant, so the annotation rejected the callers it was for.**
+  `mypy --strict` refused `dict[str, str]` — a headers dict, a counter map — and refused
+  `Mapping[str, object]`, which is the natural type for "a mapping built somewhere else", the
+  exact use the docstring cites. The parameter is `Mapping[str, object] | None`; runtime already
+  accepted any mapping, so widening cost nothing. This one freezes at 1.0, which is why it is
+  here rather than noted.
+
 #### Acceptance Criteria:
 
-- [ ] AC-1: `info("x", fields={"echo": "v", "message": "w", "not-an-identifier": 1})` puts all
-      three in the event's `fields`.
-- [ ] AC-2: `**fields` still works for every non-reserved name, unchanged.
-- [ ] AC-3: A key given in both `fields=` and `**fields` resolves deterministically, and the
-      docstring says which wins.
-- [ ] AC-4: `echo=` still controls the console echo — this FR adds a route to the field, it does
+- [x] AC-1: `info("x", fields={"echo": "v", "message": "w", "not-an-identifier": 1,
+      "fields": "self"})` puts all **four** in the event's `fields` — `fields` added at build
+      time, per the Description above.
+- [x] AC-2: `**fields` still works for every non-reserved name, unchanged.
+- [x] AC-3: A key given in both `fields=` and the keyword form resolves deterministically, and
+      the docstring says which wins: **the keyword form**. `fields=` is the bulk route, usually a
+      mapping built somewhere else; `**kv` is what the caller wrote at this call site, and a
+      literal overriding a base is what `{**base, **overrides}` already means in the language.
+- [x] AC-4: `echo=` still controls the console echo — this FR adds a route to the field, it does
       not move the flag.
-- [ ] AC-5: The two reserved names are documented as reserved, with `fields=` named as the way
+- [x] AC-5: The two reserved names are documented as reserved, with `fields=` named as the way
       round them.
-- [ ] AC-6: The same treatment reaches all five emitters, derived rather than hand-applied.
+- [x] AC-6: The same treatment reaches all five emitters, derived rather than hand-applied.
 
 ### FR-005: The extension points are exported
 
