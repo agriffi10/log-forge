@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,25 @@ class Config:
 
 
 _config = Config()
+
+_config_lock = threading.Lock()
+"""Serializes the read-modify-write that replacing a frozen config now is.
+
+Freezing :class:`Config` turned each field assignment into a whole-object
+``replace()`` — a read of every field followed by a write of every field — and one of the two
+call sites, :func:`_ensure_sink`, runs on the **orphan logging path**, on whatever application
+thread called ``info()``. A stale snapshot there puts back the pre-``configure()`` ``service``,
+``version``, ``env``, ``defaults`` *and* ``sink``, permanently. Measured on the unlocked version:
+268 of 2000 trials shipped every later event with ``service="unknown"`` after one concurrent
+``info()``, against 0 before the freeze — a regression, and the SPEC-024 category of wrong data
+rather than lost data.
+
+It does **not** cover reads. :func:`_live_config` is one atomic global read and stays lock-free,
+so the per-event path pays nothing (SPEC-034 FR-003 AC-6). Lock ordering is one-way and stays
+that way: ``_ensure_sink`` is called with ``decorator._worker_lock`` held, and ``configure()``
+releases this lock before ``_swap_live_sink`` takes that one, so nothing acquires
+``_worker_lock`` underneath this.
+"""
 
 
 def _require_positive(name: str, value: int | None) -> None:
@@ -236,7 +256,8 @@ def _rebind(**changed: object) -> None:
       None.
     """
     global _config
-    _config = replace(_config, **changed)  # type: ignore[arg-type]
+    with _config_lock:
+        _config = replace(_config, **changed)  # type: ignore[arg-type]
 
 
 def _live_config() -> Config:
@@ -269,6 +290,14 @@ def _ensure_sink() -> Sink:
     user has not called ``configure()`` yet. The local import defers the ``sinks``
     dependency and avoids a top-level import cycle (arch §7).
 
+    It is called on the **orphan logging path**, on arbitrary application threads, so the
+    default is resolved under :data:`_config_lock` with a double check and the global is re-read
+    inside it (SPEC-034 FR-003). Returning a freshly built local instead handed two racing
+    threads two different ``StdoutSink`` objects — measured 996 of 3000 trials — one of which
+    then received events and was referenced by nothing, so nothing closed it (SPEC-031 FR-006).
+    The unlocked read above it is the fast path: once a sink is configured this is one atomic
+    global read and no lock at all.
+
     Args:
       None.
 
@@ -278,10 +307,17 @@ def _ensure_sink() -> Sink:
     Raises:
       None.
     """
+    global _config
     sink_now = _config.sink
-    if sink_now is None:
-        from log_foundry.sinks.stdout import StdoutSink
+    if sink_now is not None:
+        return sink_now
 
-        sink_now = StdoutSink()
-        _rebind(sink=sink_now)
-    return sink_now
+    from log_foundry.sinks.stdout import StdoutSink
+
+    with _config_lock:
+        if _config.sink is None:
+            _config = replace(_config, sink=StdoutSink())
+        resolved = _config.sink
+    if resolved is None:  # pragma: no cover - unreachable; the branch above just set it
+        raise RuntimeError("the default sink could not be resolved")
+    return resolved

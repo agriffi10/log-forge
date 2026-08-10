@@ -274,7 +274,9 @@ log_foundry.configure(
 ```
 
 **Everything but the sink is read per event; the sink is captured.** `service`, `version`, `env`,
-`defaults` and the payload ceilings are looked up through `get_config()` as each event is built, so
+`defaults` and the payload ceilings are looked up through `config._live_config()` as each event
+  is built — the internal read, which hands back the live object rather than the copy
+  `get_config()` owes a caller (SPEC-034 FR-003), so
 a later `configure()` changes them immediately. The sink is different: the background worker (§9)
 takes it once, when it is lazily built on the first flush. A later `configure(sink=...)` therefore
 has to retarget the worker, or the config and the behaviour disagree — which is what it did until

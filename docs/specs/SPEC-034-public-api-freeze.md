@@ -200,8 +200,20 @@ writing any of it and then measured** (recorded here rather than fixed silently,
 3. **`configure()` writes nine fields one at a time.** Rebinding per field would allocate nine
    configs and, worse, leave a window in which another thread reads a half-applied one — a
    `service` from this call beside a `sink` from the last, stamped onto real events. It is one
-   `replace(**changed)` and one rebind, asserted structurally (a race that reproduces only
-   sometimes is not a test).
+   `replace(**changed)` and one rebind, counted at **runtime**: a first version counted call
+   *nodes* in the source and passed against `for k, v in changed.items(): _rebind(**{k: v})` —
+   one syntactic call, nine executions, nine windows, whole suite green.
+4. **Freezing turns every write into a read-modify-write, and one of the writers is on the
+   logging path.** The worst finding in this FR, and a regression it introduced rather than a
+   defect it inherited: `_ensure_sink()` runs on the orphan path on arbitrary application
+   threads, so a stale snapshot there puts back the pre-`configure()` `service`, `version`,
+   `env`, `defaults` **and** `sink`, permanently. Measured on the unlocked version: **268 of
+   2000** trials shipped every later event with `service="unknown"` after one concurrent
+   `info()`, against **0** before the freeze — wrong data in the log stream for the life of the
+   process, which is SPEC-024's category. `configure()` being documented "not thread-safe" does
+   not cover it: the racing party is `info()`. A dedicated `_config_lock` serializes the two
+   writers; `_live_config()` stays lock-free, so AC-6 is untouched. Lock ordering is one-way —
+   nothing takes `decorator._worker_lock` underneath it.
 
 The alternative, returning the singleton and documenting "do not mutate", is what exists today
 and is what this FR exists to end.

@@ -13,8 +13,8 @@ import inspect
 import pathlib
 import pkgutil
 import re
-import textwrap
 import threading
+import time
 
 import pytest
 
@@ -29,6 +29,18 @@ _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
 # a name alone -- `stream` is a positional *transport* in StdoutSink and a positional
 # *destination* in RedisStreamsSink -- so a syntactic rule would have to guess, and this does not.
 _INJECTED = ("client", "sdk", "producer", "connection", "opener")
+
+
+class _Recorder:
+    """A minimal sink, so a test can configure one without touching the real destinations."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        self.events.extend(batch)
+
+    def close(self) -> None: ...
 
 
 def _sink_classes_with_emit() -> list[tuple[str, ast.ClassDef]]:
@@ -445,13 +457,71 @@ def test_no_module_imports_the_config_singleton_by_value() -> None:
     anywhere would keep the object it bound at import time forever, reading stale settings for
     the life of the process and never failing a test that did not look for it.
     """
-    offenders = [
-        f"{path.relative_to(_ROOT)}:{node.lineno}"
-        for path in (_ROOT / "src").rglob("*.py")
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-        if isinstance(node, ast.ImportFrom) and any(a.name == "_config" for a in node.names)
-    ]
+    offenders = []
+    for path in (_ROOT / "src").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            by_import = isinstance(node, ast.ImportFrom) and any(
+                a.name == "_config" for a in node.names
+            )
+            # `from log_foundry import config` then `_C = config._config` holds the same stale
+            # object by a route no ImportFrom scan sees. Review found the first version blind to
+            # it, so the check is on the binding, not on one syntax for it.
+            by_alias = (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "_config"
+            )
+            if by_import or by_alias:
+                offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
     assert not offenders, f"these hold the pre-rebind config: {offenders}"
+
+
+def test_a_held_config_reference_does_not_track_later_calls() -> None:
+    """`get_config()` is a snapshot now, where it used to track. Pin the behaviour change.
+
+    Correct and intended — it is what makes the copy a copy — but a caller who held the result
+    across a `configure()` used to see the new values and now does not, and nothing said so.
+    """
+    log_foundry.configure(service="before", sink=_Recorder())
+    held = log_foundry.get_config()
+    log_foundry.configure(service="after")
+
+    assert held.service == "before", "a held reference is a snapshot"
+    assert log_foundry.get_config().service == "after", "a fresh read sees the change"
+
+
+def test_configure_distinguishes_an_empty_value_from_an_omitted_one() -> None:
+    """`configure()` filters on `is not None`, and a truthiness filter would be wrong.
+
+    `configure(defaults={})` must *clear* the defaults and `configure(service="")` must apply —
+    both are values the caller supplied. Untested before review; the mutant `if value` survived
+    the whole suite.
+    """
+    log_foundry.configure(service="svc", defaults={"team": "core"}, sink=_Recorder())
+    log_foundry.configure(defaults={})
+    assert log_foundry.get_config().defaults == {}, "an empty dict is a value, not an omission"
+
+    log_foundry.configure(service="")
+    assert log_foundry.get_config().service == "", "an empty string is a value, not an omission"
+
+
+def test_a_nested_default_is_shared_and_says_so() -> None:
+    """FR-003 AC-5's bound, pinned rather than left to the docstring.
+
+    `dict(defaults)` copies one level. A nested mutable stays live and reaches real events —
+    review reproduced it. Deep-copying arbitrary caller objects inside an accessor that must not
+    raise is the wider failure, so the bound is stated and asserted instead of closed.
+    """
+    log_foundry.configure(service="t", defaults={"team": {"name": "core"}}, sink=_Recorder())
+    returned = log_foundry.get_config().defaults
+
+    returned["added"] = True
+    assert "added" not in config._live_config().defaults, "the top level is copied"
+
+    returned["team"]["name"] = "MUTATED"  # type: ignore[index]
+    assert config._live_config().defaults["team"] == {"name": "MUTATED"}, (
+        "a nested value is shared -- documented, not fixed"
+    )
 
 
 def test_the_zero_config_path_still_resolves_a_sink() -> None:
@@ -469,20 +539,124 @@ def test_the_zero_config_path_still_resolves_a_sink() -> None:
     assert config._live_config().sink is resolved, "the resolved default is retained, not rebuilt"
 
 
-def test_configure_applies_every_field_in_one_rebind() -> None:
+def test_configure_applies_every_field_in_one_rebind(monkeypatch) -> None:
     """The second gap: nine rebindings would leave a window on a half-applied config.
 
-    Asserted structurally rather than by racing threads — a race that reproduces only sometimes
-    is not a test. `configure()` must call `_rebind` exactly once, so no reader can observe a
-    `service` from this call beside a `sink` from the last one.
+    Counted at **runtime**, not by shape. A first version counted `_rebind` call *nodes* in
+    `configure()`'s source and passed against the exact defect it names — one syntactic call
+    inside `for k, v in changed.items(): _rebind(**{k: v})` is nine executions and nine windows,
+    with the whole suite green. Found by review, with that mutant.
     """
-    source = inspect.getsource(config.configure)
-    calls = [
-        node
-        for node in ast.walk(ast.parse(textwrap.dedent(source)))
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_rebind"
-    ]
-    assert len(calls) == 1, f"configure() rebinds {len(calls)} times; a reader can see a partial config"
+    log_foundry.configure(service="pre", sink=_Recorder())  # so _ensure_sink cannot rebind below
+    calls = 0
+    real = config._rebind
+
+    def counting(**changed: object) -> None:
+        nonlocal calls
+        calls += 1
+        real(**changed)
+
+    monkeypatch.setattr(config, "_rebind", counting)
+    log_foundry.configure(
+        service="s",
+        version="v",
+        env="e",
+        defaults={"a": 1},
+        max_value_bytes=100,
+        max_stack_bytes=200,
+        max_keys=10,
+        max_depth=3,
+    )
+    assert calls == 1, f"configure() rebound {calls} times; a reader can see a partial config"
+
+
+def test_a_concurrent_orphan_log_cannot_revert_configure() -> None:
+    """The regression the freeze introduced, and the reason `_config_lock` exists.
+
+    Freezing turned each field assignment into a whole-config read-modify-write, and one of the
+    two writers — `_ensure_sink()` — runs on the orphan logging path, on whatever application
+    thread called `info()`. A stale snapshot there puts back the pre-`configure()` service,
+    version, env, defaults **and** sink, permanently. Measured on the unlocked version: 268 of
+    2000 trials, against 0 before the freeze. Wrong data in the log stream, silently, for the
+    life of the process — SPEC-024's category.
+
+    The window is widened deliberately rather than raced for. A first harness used a barrier and
+    a 1 microsecond switch interval and reported 0 reversions **with the defect present**, which
+    would have certified the fix against a measurement that never entered the window it claimed
+    to clear.
+    """
+    real_replace = config.replace
+    reached_the_window = threading.Event()
+
+    def slow_replace(obj: object, **kw: object) -> object:
+        if "sink" in kw and not isinstance(kw.get("sink"), _Recorder):
+            reached_the_window.set()
+            time.sleep(0.2)
+        return real_replace(obj, **kw)
+
+    chosen = _Recorder()
+    config._rebind(sink=None, service="unknown", version="0.0.0")
+    config.replace = slow_replace  # type: ignore[assignment]
+    try:
+        worker = threading.Thread(target=lambda: log_foundry.info("orphan resolves the default"))
+        worker.start()
+        assert reached_the_window.wait(5.0), "the harness never entered the window"
+        log_foundry.configure(service="billing", version="2.1", sink=chosen)
+        worker.join(10.0)
+    finally:
+        config.replace = real_replace  # type: ignore[assignment]
+
+    live = config._live_config()
+    assert (live.service, live.version) == ("billing", "2.1"), "configure() was reverted"
+    assert live.sink is chosen, "configure()'s sink was reverted"
+
+
+def test_two_threads_resolving_the_default_sink_get_the_same_object() -> None:
+    """`_ensure_sink` returning its own local handed racing threads two different sinks.
+
+    Measured 996 of 3000 trials before the double check. One of the two then received events and
+    was referenced by nothing, so nothing closed it — SPEC-031 FR-006's invariant, broken from
+    the other end.
+
+    The window is injected, not raced for. A first version started eight threads on a barrier and
+    **passed against the defect**: the unlocked form still re-read the global on its fast path, so
+    seven of the eight found the first thread's sink and only a hair-fine interleave produced two.
+    Holding the first resolver inside the replace makes every later thread arrive while the sink
+    is still `None`, which is the state the defect needs.
+    """
+    config._rebind(sink=None)
+    real_replace = config.replace
+    first_call = threading.Event()
+
+    def slow_replace(obj: object, **kw: object) -> object:
+        if not first_call.is_set():
+            first_call.set()
+            time.sleep(0.2)
+        return real_replace(obj, **kw)
+
+    resolved: list[object] = []
+    lock = threading.Lock()
+
+    def resolve() -> None:
+        sink = config._ensure_sink()
+        with lock:
+            resolved.append(sink)
+
+    config.replace = slow_replace  # type: ignore[assignment]
+    try:
+        threads = [threading.Thread(target=resolve) for _ in range(8)]
+        threads[0].start()
+        assert first_call.wait(5.0), "the harness never entered the window"
+        for t in threads[1:]:
+            t.start()
+        for t in threads:
+            t.join(10.0)
+    finally:
+        config.replace = real_replace  # type: ignore[assignment]
+
+    assert len(resolved) == 8, "a resolver did not finish"
+    assert len({id(sink) for sink in resolved}) == 1, "racing threads got different default sinks"
+    assert config._live_config().sink is resolved[0], "the global names the sink handed out"
 
 
 def test_the_per_event_path_does_not_pay_for_the_config_copy() -> None:
