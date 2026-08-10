@@ -1,8 +1,8 @@
 # Spec: Sink Correctness
 
 **ID:** SPEC-038  
-**Status:** Draft  
-**Last Updated:** 2026-08-09  
+**Status:** Completed  
+**Last Updated:** 2026-08-10  
 **Depends On:** SPEC-018, SPEC-026, SPEC-027, SPEC-032
 
 ## Overview
