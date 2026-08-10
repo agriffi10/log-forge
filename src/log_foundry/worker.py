@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 from log_foundry import _diag, _lifecycle
@@ -57,7 +58,8 @@ def _bounded_seconds(timeout: float | None) -> str:
         return "?"
 
 
-class Health(NamedTuple):
+@dataclass(frozen=True)
+class Health:
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
     ``stopped_reason``, ``sink``, and SPEC-030's three are defaulted and appended in that
@@ -112,7 +114,10 @@ class Health(NamedTuple):
         may have been misrouted, never merely that a close was slow — ``closing_sinks`` is the
         field for that.
       closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
-        gauge, not a counter, and the only field here that can fall as well as rise. A close is
+        gauge rather than a counter, so it falls as well as rises. ~~the only field here that
+        can fall~~ — struck (SPEC-034 AC-2c): ``queued`` falls on every drain. Those two are the
+        gauges and the other five integers are monotonic, which is the distinction an operator
+        alerting on "any non-zero" needs and which no name here encodes. A close is
         bounded only in how long ``configure()`` waits for it, so this is how a destination
         stuck in ``close()`` becomes visible at all. Reading it non-zero once means a swap just
         happened; reading it non-zero repeatedly means a close is not coming back, and that sink

@@ -850,21 +850,38 @@ def test_a_process_that_never_logged_reports_no_terminal_failure() -> None:
     assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
 
 
-def test_existing_health_fields_keep_their_positions() -> None:
-    sink = RecordingSink()
-    w = Worker(sink, batch_size=1)
+def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
+    """Was `test_existing_health_fields_keep_their_positions` (SPEC-034 FR-008 AC-2b).
+
+    Its whole body was positional — `h[0]`, `h[3]`, `h[4]`, `h[5..7]`, `h[8]`, `len(h) == 9` —
+    which is precisely the contract FR-008 refuses to freeze at 1.0. Six specs appended a field
+    apiece, and each one had to argue that the indices before it were undisturbed; with a
+    dataclass there are no indices to disturb, and two more fields are due immediately
+    (SPEC-036, SPEC-037).
+
+    So the test inverts rather than being deleted: it now asserts that every field is reachable
+    by name **and** that the tuple protocol is gone, which is the breaking half of AC-2 and the
+    thing a caller's `d, f = ...` would otherwise keep working against by accident.
+    """
+    w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
     w.shutdown()
     h = w.health()
-    assert (h[0], h[1], h[2]) == (h.queued, h.dropped, h.failed_batches)
-    assert h[3] is h.stopped_reason
-    # SPEC-026 appended ``sink`` exactly as SPEC-019 appended ``stopped_reason``, and SPEC-030
-    # appended four more after it: every field that came before keeps its index, so positional
-    # reads written against any earlier shape hold.
-    assert len(h) == 9
-    assert h[4] is h.sink
-    assert (h[5], h[6], h[7]) == (h.retired, h.submitted_after_shutdown, h.incomplete_swaps)
-    assert h[8] == h.closing_sinks
+
+    assert (h.queued, h.dropped, h.failed_batches) == (h.queued, h.dropped, h.failed_batches)
+    assert h.stopped_reason is None or isinstance(h.stopped_reason, str)
+    assert h.sink is None or isinstance(h.sink, log_foundry_mod.SinkLosses)
+    assert isinstance(h.retired, bool)
+    assert isinstance(h.submitted_after_shutdown, int)
+    assert isinstance(h.incomplete_swaps, int)
+    assert isinstance(h.closing_sinks, int)
+
+    with pytest.raises(TypeError):
+        _ = h[0]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        len(h)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        _a, _b = h  # type: ignore[misc]
 
 
 def test_the_record_survives_an_unwritable_stderr(monkeypatch) -> None:

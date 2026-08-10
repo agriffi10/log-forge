@@ -14,6 +14,8 @@ from typing import Self
 
 import pytest
 
+from log_foundry import SinkLosses
+
 from conftest import run_concurrently
 from log_foundry.sinks import _socket
 from log_foundry.sinks.base import SinkDeliveryError
@@ -491,7 +493,7 @@ def test_sqs_sink_counts_every_oversized_drop_under_concurrent_emitters() -> Non
     assert errors == []
     assert sink.dropped_oversized == THREADS * PER_THREAD
     assert lock.acquisitions == sink.dropped_oversized, "a drop was counted outside the lock"
-    assert sink.losses() == (THREADS * PER_THREAD, 0)
+    assert sink.losses() == SinkLosses(dropped=THREADS * PER_THREAD, failed=0)
     assert lock.acquisitions == sink.dropped_oversized + 1, "losses() read outside the lock"
 
 
@@ -874,7 +876,7 @@ def test_nats_sink_does_not_reenter_its_managed_event_loop() -> None:
 
     assert errors == [], f"emits collided on the loop: {errors[:3]}"
     assert len(client.published) == THREADS * PER_THREAD
-    assert sink.losses() == (0, 0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
 def test_rabbitmq_publishes_are_not_interleaved_on_one_channel() -> None:

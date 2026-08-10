@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import NamedTuple, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "read_losses"]
 
@@ -19,7 +20,8 @@ class SinkDeliveryError(Exception):
     """
 
 
-class SinkLosses(NamedTuple):
+@dataclass(frozen=True)
+class SinkLosses:
     """What a sink discarded or could not confirm, cumulative for its lifetime (FR-002).
 
     ``failed`` is an upper bound on loss, not a count of it: a sink that also raises on total

@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import functools
 import threading
+from dataclasses import replace
 from collections.abc import Callable
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
@@ -710,7 +711,7 @@ def _worker_health() -> Health:
         )
     health = worker.health()
     if _orphan_retired and not health.retired:
-        return health._replace(retired=True)
+        return replace(health, retired=True)
     return health
 
 
