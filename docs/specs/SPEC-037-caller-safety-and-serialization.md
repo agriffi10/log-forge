@@ -1,7 +1,7 @@
 # Spec: Caller Safety and Serialization
 
 **ID:** SPEC-037  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-034 (FR-008 only)
 
@@ -191,20 +191,20 @@ non-JSON sinks too.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `info("m", ratio=float("nan"))` produces an event that a strict JSON parser accepts
+- [x] AC-1: `info("m", ratio=float("nan"))` produces an event that a strict JSON parser accepts
       — `json.loads(..., parse_constant=<raise>)` does not raise. All four
       `tests/test_promises.py` serialization cells lose their `xfail` markers.
-- [ ] AC-2: `nan`, `inf` and `-inf` each become a distinguishable marker, so a reader can tell
+- [x] AC-2: `nan`, `inf` and `-inf` each become a distinguishable marker, so a reader can tell
       which one was there. Following SPEC-020's shape, e.g. `<float: nan>`.
-- [ ] AC-3: The event's `truncated` marker is set, as it is for every other substitution
+- [x] AC-3: The event's `truncated` marker is set, as it is for every other substitution
       `sanitize` makes — otherwise the replacement is itself a silent change to the data.
-- [ ] AC-4: Ordinary finite floats are untouched, including `0.0`, negative zero, and values at
+- [x] AC-4: Ordinary finite floats are untouched, including `0.0`, negative zero, and values at
       the edge of float precision. A test covers them so the fix cannot over-reach.
-- [ ] AC-5: Non-finite floats nested in a mapping, in a sequence, and as a **mapping key** are all
+- [x] AC-5: Non-finite floats nested in a mapping, in a sequence, and as a **mapping key** are all
       covered — SPEC-020 had to handle keys separately and this will too.
-- [ ] AC-6: `architecture.md` §6 and the README's "field values are coerced and bounded" section
+- [x] AC-6: `architecture.md` §6 and the README's "field values are coerced and bounded" section
       state the substitution, alongside the integer one it mirrors.
-- [ ] AC-7: The hot path cost is not raised measurably for ordinary floats — the check is a
+- [x] AC-7: The hot path cost is not raised measurably for ordinary floats — the check is a
       `math.isfinite` on a value already being dispatched, and a benchmark in the test proves it
       rather than asserting it.
 

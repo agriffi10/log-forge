@@ -205,6 +205,16 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
   separate from reserved/base fields. High-cardinality values (`user_id`) are fine
   here — cardinality is a *metrics* concern, not a logs concern, **as long as we never
   auto-promote these into metric labels**.
+- **A value that cannot be *rendered* is replaced, never passed through or clipped.** Two cases,
+  and they share one rule: an integer past `sys.get_int_max_str_digits()` becomes
+  `<int: ~N digits>` (SPEC-020), and a non-finite float becomes `<float: nan>` / `<float: inf>` /
+  `<float: -inf>` (SPEC-037 FR-003). `json.dumps` writes `NaN` and `Infinity` happily and RFC
+  8259 defines neither, so passing them through hands a strict consumer a record it rejects
+  whole — the same shape as the integer, which raises instead. Both keep *which* value it was
+  rather than coercing to `None` or `0.0`: a wrong number is worse than a visibly elided one.
+  Both set `truncated: true`, because a substitution nobody can see is a silent change to the
+  caller's data. Both live in `sanitize`, not at the sinks — one pass at assembly is correct by
+  consequence for all 40-odd `json.dumps` call sites and reaches the non-JSON sinks too.
 - **The rule holds for what the library says about *itself*, not just for events.** A stderr
   diagnostic is also a place caller data was not asked to reach, and an exception's message
   routinely carries the value that provoked it — so an absorbed failure is reported by

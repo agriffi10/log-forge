@@ -173,11 +173,12 @@ def _strict_json(event: dict) -> None:
     json.loads(json.dumps(event), parse_constant=reject)
 
 
-P3_BROKEN = dict.fromkeys(
-    PATHS,
-    "audit S1 — sanitize returns float unchanged, so NaN/Infinity reach json.dumps and "
-    "produce output a strict consumer rejects, with no truncated marker",
-)
+# ~~P3_BROKEN = dict.fromkeys(PATHS, "audit S1 — sanitize returns float unchanged …")~~
+# Closed by SPEC-037 FR-003 on all four paths: a non-finite float is replaced with a
+# `<float: nan>` / `<float: inf>` / `<float: -inf>` marker and the event's `truncated` flag is
+# set, so the substitution is discoverable rather than silent. The markers are removed rather
+# than left passing, which `strict=True` forces — that is the mechanism keeping this file honest.
+P3_BROKEN: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("path", [_xfail(p, P3_BROKEN) for p in PATHS])
@@ -190,6 +191,10 @@ async def test_every_emitted_event_is_strictly_serializable(path: str) -> None:
     assert sink.events, f"nothing reached the sink on the {path} path"
     for event in sink.events:
         _strict_json(event)
+    assert any(e.get("truncated") for e in sink.events), (
+        "the substitution must be discoverable -- a replaced value with no marker is a silent "
+        "change to the caller's data"
+    )
 
 
 # -- Promise 4: arguments and return values are never captured --------------------------------

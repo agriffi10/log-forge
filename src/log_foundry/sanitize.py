@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -26,7 +27,7 @@ _LOG10_2_DEN = 100000
 
 _INT_LT = int.__lt__
 
-_PLAIN_SCALARS: frozenset[type] = frozenset({int, float, bool})
+_PLAIN_SCALARS: frozenset[type] = frozenset({int, bool})
 
 _TEXTLIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
 
@@ -222,6 +223,8 @@ class _Coercer:
             return self.text(value)  # type: ignore[arg-type]
         if kind is int:
             return self.integer(value)  # type: ignore[arg-type]
+        if kind is float:
+            return self.real(value)  # type: ignore[arg-type]
         if kind in _PLAIN_SCALARS:
             return value
         if kind is dict:
@@ -233,6 +236,8 @@ class _Coercer:
             member = value.value
             if type(member) is int:
                 return self.integer(member)
+            if type(member) is float:
+                return self.real(member)
             if type(member) in _PLAIN_SCALARS or member is None:
                 return member
             if isinstance(member, str):
@@ -243,7 +248,7 @@ class _Coercer:
         if isinstance(value, int):
             return self.integer(value)
         if isinstance(value, float):
-            return value
+            return self.real(value)
         if isinstance(value, (datetime, date, time)):
             return self.text(value.isoformat())
         if isinstance(value, UUID):
@@ -345,6 +350,9 @@ class _Coercer:
         if isinstance(key, int) and not isinstance(key, bool):
             rendered = self.integer(key)
             return self.text(rendered if isinstance(rendered, str) else str(rendered))
+        if isinstance(key, float):
+            replaced = self.real(key)
+            return self.text(replaced if isinstance(replaced, str) else str(replaced))
         return self.text(str(key))
 
     def integer(self, value: int) -> object:
@@ -378,6 +386,35 @@ class _Coercer:
             return value
         self.truncated = True
         return f"<int: ~{digits} digits>"
+
+    def real(self, value: float) -> object:
+        """Replaces a non-finite float, since ``NaN`` and ``Infinity`` are not JSON.
+
+        ``json.dumps`` writes ``NaN``, ``Infinity`` and ``-Infinity`` happily, and RFC 8259
+        defines none of them: a strict consumer — Fluent Bit, a Logstash ``json`` codec, Jackson
+        behind Elasticsearch — rejects the whole record, with nothing on the library side to see.
+        That contradicts ``build_event``'s promise that an event is safe for any sink to
+        serialize (SPEC-017).
+
+        Replaced rather than coerced to ``None`` or ``0.0``, on SPEC-020's reasoning for the
+        over-long integer this mirrors: a wrong number is worse than a visibly elided one, and
+        the marker says which of the three it was. ``truncated`` is set for the same reason it is
+        set everywhere else — a substitution nobody can see is a silent change to the data.
+
+        Args:
+          value: The float to check.
+
+        Returns:
+          The float itself when finite, or a ``<float: nan>`` / ``<float: inf>`` /
+          ``<float: -inf>`` placeholder naming which it was.
+
+        Raises:
+          None.
+        """
+        if isfinite(value):
+            return value
+        self.truncated = True
+        return f"<float: {value}>"
 
     def text(self, value: str) -> str:
         """Applies ``max_value_bytes`` to a string, recording whether it fired.
