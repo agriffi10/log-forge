@@ -1,7 +1,7 @@
 # Spec: Caller Safety and Serialization
 
 **ID:** SPEC-037  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-034 (FR-008 only)
 
@@ -94,19 +94,21 @@ same stated reason.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `info(ValueError("x"))` returns normally inside a span, inside an async span, and
+*`[→]` marks a criterion deliberately carried to another spec, not one left undone.*
+
+- [x] AC-1: `info(ValueError("x"))` returns normally inside a span, inside an async span, and
       outside one. `tests/test_promises.py`'s two `xfail` cells for this lose their markers,
       which `strict=True` forces.
-- [ ] AC-2: The absorbed failure is announced exactly once through `_diag`, naming the exception
+- [x] AC-2: The absorbed failure is announced exactly once through `_diag`, naming the exception
       **type** only (arch §6).
-- [ ] AC-3: `KeyboardInterrupt` and `SystemExit` still propagate from inside a span.
-- [ ] AC-4: The decorated function still returns its value normally, and the span still closes
+- [x] AC-3: `KeyboardInterrupt` and `SystemExit` still propagate from inside a span.
+- [x] AC-4: The decorated function still returns its value normally, and the span still closes
       with `status=ok`.
-- [ ] AC-5: The event that could not be built is lost and **announced** — `_diag.absorbed`, per
+- [x] AC-5: The event that could not be built is lost and **announced** — `_diag.absorbed`, per
       AC-2 — not silently dropped. Counting it is AC-5c, and is deferred to SPEC-036 with the
       counters: the guard is what makes the promise true, and it is true with or without a field
       on `Health`. Splitting the two is what let this spec come off 036's critical path.
-- [ ] AC-5c: **Deferred to SPEC-036.** When the counters land, an orphan call goes to that spec's
+- [→] AC-5c: **Deferred to SPEC-036.** When the counters land, an orphan call goes to that spec's
       `orphan_lost` and an in-span call to a **second, appended** field, `in_span_lost`. The alternative is widening `orphan_lost` to mean *events
       lost before reaching the worker* on both paths, and it is rejected on SPEC-026's own test —
       **whether one number would hide which fix applies.** It would: the two counters aggregate
@@ -120,7 +122,7 @@ same stated reason.
       nor "a field already published" is offered here**: both drafts are unbuilt, and a name is
       cheap to change until it ships — a justification resting on that would be circular with
       036 FR-003 AC-3, which cites this AC in turn.
-- [ ] AC-5a: **Moved to SPEC-036 with AC-5c.** ~~The new field carries the same obligations 036
+- [→] AC-5a: **Moved to SPEC-036 with AC-5c.** ~~The new field carries the same obligations 036
       FR-003 discharged for `orphan_lost`: appended, indices 0..9 unchanged,
       `test_existing_health_fields_keep_their_positions` gaining `h[10]`, its `len(h)` line having
       moved under 036 FR-003 AC-10…~~ — struck with the ordering (SPEC-021). Under the reversed
@@ -130,14 +132,14 @@ same stated reason.
       block documents the field, `tests/conftest.py`'s reset fixture clears it, and if the counter
       takes its own lock, SPEC-039's derived fork roster picks it up — derived precisely so a lock
       added later needs no edit there.
-- [ ] AC-5b: The two are asserted **separately, and neither absorbs the other** — the phrasing
+- [→] AC-5b: The two are asserted **separately, and neither absorbs the other** — the phrasing
       036 FR-003 AC-4 already uses for `orphan_lost` against `failed_batches`. Deliberately *not*
       a criterion on their sum: with different failure populations the total is a number nobody
       can act on, and pinning it would teach a later reader they are two halves of one counter,
       which is the reading AC-5 just rejected.
-- [ ] AC-6: The stale reasoning in `api._log`'s docstring is replaced with what is actually true:
+- [x] AC-6: The stale reasoning in `api._log`'s docstring is replaced with what is actually true:
       the branch calls `build_event`, and `build_event` can raise.
-- [ ] AC-7: Mutation-tested — removing the guard fails AC-1 on all three paths.
+- [x] AC-7: Mutation-tested — removing the guard fails AC-1 on all three paths.
 
 ### FR-002: A span does not report an error its function did not raise
 
@@ -157,17 +159,17 @@ below are what will already be in place to catch it.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A span whose function returned normally is recorded `status=ok` even though a
+- [x] AC-1: A span whose function returned normally is recorded `status=ok` even though a
       library-internal failure occurred during it — asserted through FR-001's own case
       (`info(ValueError(...))` in a span), which after FR-001 is absorbed. This is the assertion
       that FR-001 fixed both halves of A2, not a second mechanism.
-- [ ] AC-2: A span whose function genuinely raised is unchanged — `status=error` and the caller's
+- [x] AC-2: A span whose function genuinely raised is unchanged — `status=error` and the caller's
       own exception type, which is SPEC-001's contract and must not regress.
-- [ ] AC-3: The library-internal failure is still visible, through `_diag` and the FR-001
+- [x] AC-3: The library-internal failure is still visible, through `_diag` and the FR-001
       counter — this FR moves it out of the `error` field, it does not hide it.
-- [ ] AC-4: A test asserts the two cases side by side, since the risk is a fix that makes every
+- [x] AC-4: A test asserts the two cases side by side, since the risk is a fix that makes every
       span read `ok`.
-- [ ] AC-5: The FR records that no other route from library code into the wrapper is known, and
+- [x] AC-5: The FR records that no other route from library code into the wrapper is known, and
       that finding one reopens this FR with a mechanism rather than an assertion.
 
 ### FR-003: `NaN` and `Infinity` are replaced, not passed through
@@ -191,20 +193,20 @@ non-JSON sinks too.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `info("m", ratio=float("nan"))` produces an event that a strict JSON parser accepts
+- [x] AC-1: `info("m", ratio=float("nan"))` produces an event that a strict JSON parser accepts
       — `json.loads(..., parse_constant=<raise>)` does not raise. All four
       `tests/test_promises.py` serialization cells lose their `xfail` markers.
-- [ ] AC-2: `nan`, `inf` and `-inf` each become a distinguishable marker, so a reader can tell
+- [x] AC-2: `nan`, `inf` and `-inf` each become a distinguishable marker, so a reader can tell
       which one was there. Following SPEC-020's shape, e.g. `<float: nan>`.
-- [ ] AC-3: The event's `truncated` marker is set, as it is for every other substitution
+- [x] AC-3: The event's `truncated` marker is set, as it is for every other substitution
       `sanitize` makes — otherwise the replacement is itself a silent change to the data.
-- [ ] AC-4: Ordinary finite floats are untouched, including `0.0`, negative zero, and values at
+- [x] AC-4: Ordinary finite floats are untouched, including `0.0`, negative zero, and values at
       the edge of float precision. A test covers them so the fix cannot over-reach.
-- [ ] AC-5: Non-finite floats nested in a mapping, in a sequence, and as a **mapping key** are all
+- [x] AC-5: Non-finite floats nested in a mapping, in a sequence, and as a **mapping key** are all
       covered — SPEC-020 had to handle keys separately and this will too.
-- [ ] AC-6: `architecture.md` §6 and the README's "field values are coerced and bounded" section
+- [x] AC-6: `architecture.md` §6 and the README's "field values are coerced and bounded" section
       state the substitution, alongside the integer one it mirrors.
-- [ ] AC-7: The hot path cost is not raised measurably for ordinary floats — the check is a
+- [x] AC-7: The hot path cost is not raised measurably for ordinary floats — the check is a
       `math.isfinite` on a value already being dispatched, and a benchmark in the test proves it
       rather than asserting it.
 

@@ -1091,7 +1091,15 @@ entries and `max_depth` levels. `datetime`, `UUID`, `Decimal`, `bytes` and frien
 strings; anything with no JSON form becomes `<unserializable: TypeName>` — the type name only,
 never a `repr`, so coercion can never leak a value the library was careful not to capture.
 
-Integers are the one case worth knowing about. They are passed through unchanged — an ID or an
+**Floats that are not finite are replaced.** `NaN`, `Infinity` and `-Infinity` are values Python
+produces readily — a division that underflowed, a ratio over an empty window — and `json.dumps`
+writes all three happily. RFC 8259 defines none of them, so a strict consumer (Fluent Bit, a
+Logstash `json` codec, Jackson behind Elasticsearch) rejects the **whole record**, with nothing on
+this side to see. Each becomes `<float: nan>`, `<float: inf>` or `<float: -inf>` — which one it
+was is kept, because that is the only information the field still carried. Ordinary floats,
+including `-0.0` and subnormals, pass through untouched.
+
+Integers are the other case worth knowing about. They are passed through unchanged — an ID or an
 amount stays a number, at full precision — but an integer too long to *render* is replaced by
 `<int: ~N digits>`. CPython refuses to convert an integer past `sys.get_int_max_str_digits()`
 decimal digits (**4300** by default) and raises, and `json.dumps` inherits that refusal, so with

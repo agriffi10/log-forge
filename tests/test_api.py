@@ -1006,3 +1006,103 @@ def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None
     assert decorator._worker is not None, "a fresh worker really was built"
 
     assert lf.health().retired is True, "shutdown() happened; a new worker cannot un-happen it"
+
+
+# -- SPEC-037 FR-001/FR-002: no info() call can fail the caller, in a span or out of one ------
+
+
+def test_a_bad_value_is_absorbed_inside_a_span(lf, fake_sink, capsys) -> None:
+    """FR-001 AC-1 and AC-4, and FR-002 AC-1 — the two halves of audit A2 together.
+
+    `info(exc)` is an ordinary slip that `mypy` catches only at typed call sites. It returned
+    normally on the orphan path and killed the decorated function inside a span, which is the
+    same call with opposite outcomes. And the decorator's handler then recorded the span
+    `status=error` with an `error.type` of `AttributeError` the caller never raised.
+    """
+
+    @lf.trace
+    def work() -> str:
+        lf.info(ValueError("not a string"))
+        return "the function completed"
+
+    assert work() == "the function completed", "the caller's own return value survives"
+
+    ends = [e for e in fake_sink.events if e.get("status") is not None]
+    assert ends, "the span still closed"
+    assert ends[-1]["status"] == "ok", "the function returned; the span did not fail"
+    assert "error" not in ends[-1], "a library-internal failure is not the caller's error"
+    assert "AttributeError" in capsys.readouterr().err, "and it is still announced"
+
+
+async def test_a_bad_value_is_absorbed_inside_an_async_span(lf, fake_sink) -> None:
+    """FR-001 AC-1's third path. The async wrapper is a separate code path from the sync one."""
+
+    @lf.trace
+    async def work() -> str:
+        lf.info(ValueError("not a string"))
+        return "the coroutine completed"
+
+    assert await work() == "the coroutine completed"
+
+
+def test_a_bad_value_is_absorbed_outside_a_span(lf, fake_sink) -> None:
+    """FR-001 AC-1's orphan path — already true before this FR, and it must stay true."""
+    lf.info(ValueError("not a string"))
+
+
+def test_the_absorbed_failure_is_announced_once_by_type_only(lf, fake_sink, capsys) -> None:
+    """FR-001 AC-2 and FR-002 AC-3. Moved out of the `error` field, not hidden.
+
+    Type only, never the message: an exception's text routinely carries the value that provoked
+    it, which is the rule `arch §6` states and `_diag` exists to apply once.
+    """
+
+    @lf.trace
+    def work() -> None:
+        lf.info(ValueError("a secret the message would leak"))
+
+    work()
+    err = capsys.readouterr().err
+    assert err.count("absorbed a failure while building an in-span log") == 1
+    assert "AttributeError" in err
+    assert "a secret the message would leak" not in err
+
+
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
+def test_the_operators_intent_still_reaches_the_caller(lf, fake_sink, monkeypatch, escape) -> None:
+    """FR-001 AC-3. `Exception`, never `BaseException` — SPEC-025 FR-004 settled it.
+
+    A `KeyboardInterrupt` or `SystemExit` is the operator's or the runtime's intent and must not
+    be swallowed by a logging call.
+    """
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise escape("the operator's intent")
+
+    monkeypatch.setattr("log_foundry.api.build_event", explode)
+
+    @lf.trace
+    def work() -> None:
+        lf.info("this will raise a BaseException from build_event")
+
+    with pytest.raises(escape):
+        work()
+
+
+def test_a_span_whose_function_genuinely_raised_is_unchanged(lf, fake_sink) -> None:
+    """FR-002 AC-2 and AC-4, asserted beside the ok case.
+
+    The risk of a fix like this is that every span starts reading `ok`. SPEC-001's contract is
+    that a function which raises records `status=error` with the caller's *own* exception type.
+    """
+
+    @lf.trace
+    def work() -> None:
+        raise RuntimeError("the caller's own failure")
+
+    with pytest.raises(RuntimeError):
+        work()
+
+    ends = [e for e in fake_sink.events if e.get("status") is not None]
+    assert ends[-1]["status"] == "error"
+    assert ends[-1]["error"]["type"] == "RuntimeError", "the caller's type, not the library's"

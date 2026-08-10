@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import enum
 import json
+import sys
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
+from time import perf_counter
 from uuid import UUID
 
 import pytest
@@ -587,3 +589,173 @@ def test_the_boundary_behaviour_of_spec_020_is_unchanged_by_the_cached_ceiling()
         "the sign pushes a negative at the limit one over — SPEC-021 FR-003, unchanged"
     )
     assert truncated is True
+
+
+# -- SPEC-037 FR-003: NaN and Infinity are replaced, not passed through ----------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "marker"),
+    [
+        (float("nan"), "<float: nan>"),
+        (float("inf"), "<float: inf>"),
+        (float("-inf"), "<float: -inf>"),
+    ],
+)
+def test_each_non_finite_float_gets_a_distinguishable_marker(value: float, marker: str) -> None:
+    """FR-003 AC-2. A reader must be able to tell which of the three it was.
+
+    Collapsing all three to one token — or to `None` — would answer "there was a number here"
+    and destroy the only information the field still carried.
+    """
+    safe, clipped = sanitize_fields({"v": value}, cfg=Config())
+    assert safe == {"v": marker}
+    assert clipped is True
+
+
+def test_the_substitution_sets_the_truncated_marker() -> None:
+    """FR-003 AC-3. Every other substitution `sanitize` makes sets it; a silent one is a lie."""
+    _, clipped = sanitize_fields({"v": float("nan")}, cfg=Config())
+    assert clipped is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0.0, -0.0, 1.5, -1.5, 1e308, -1e308, 5e-324, sys.float_info.max, sys.float_info.min],
+)
+def test_ordinary_floats_are_untouched(value: float) -> None:
+    """FR-003 AC-4. The fix must not over-reach.
+
+    `-0.0` and the subnormal `5e-324` are the two a naive `if not value:` or `if value != value or
+    abs(value) > BIG:` gets wrong; `sys.float_info.max` is finite and must survive.
+    """
+    safe, clipped = sanitize_fields({"v": value}, cfg=Config())
+    assert safe == {"v": value}
+    assert repr(safe["v"]) == repr(value), "negative zero must not become positive zero"
+    assert clipped is False
+
+
+def test_non_finite_floats_are_replaced_everywhere_a_value_can_sit() -> None:
+    """FR-003 AC-5. Nested, in a sequence, and as a mapping key.
+
+    The key path needed its own branch: a float key went through `str()` and rendered as the
+    bare string `"nan"` — valid JSON, so no sink would complain, but it lost that the key was a
+    float and set no marker. SPEC-020 had to handle keys separately for the same reason.
+    """
+    safe, clipped = sanitize_fields(
+        {
+            "nested": {"x": float("nan")},
+            "seq": [float("inf"), 2.0],
+            "keyed": {float("-inf"): "v"},
+        },
+        cfg=Config(),
+    )
+    assert safe == {
+        "nested": {"x": "<float: nan>"},
+        "seq": ["<float: inf>", 2.0],
+        "keyed": {"<float: -inf>": "v"},
+    }
+    assert clipped is True
+
+
+def test_a_hostile_float_subclass_cannot_choose_what_the_library_prints() -> None:
+    """The placeholder is computed by the library, never by the value (`_FLOAT_REPR`).
+
+    `f"<float: {value}>"` calls `format(value, "")`, which is the value's own `__str__` — so a
+    `float` subclass chose the text. Measured before the fix: a subclass naming its source
+    emitted `<float: inf from probe-7 (token=sk-live-...)>`, one returning two megabytes emitted
+    all of it against a `max_value_bytes` of 8192, and one that raised took every sibling key
+    with it. Three separate failures from one interpolation, and `integer()` beside it already
+    reads `<` through an unbound `int.__lt__` on exactly this reasoning.
+    """
+    cfg = Config()
+
+    class Leaky(float):
+        def __str__(self) -> str:
+            return "inf from probe-7 (token=sk-live-DEADBEEF)"
+
+    class Huge(float):
+        def __str__(self) -> str:
+            return "x" * 2_000_000
+
+    class Boom(float):
+        def __str__(self) -> str:
+            raise RuntimeError("a __str__ the library must not depend on")
+
+    safe, clipped = sanitize_fields({"leak": Leaky("inf"), "huge": Huge("nan")}, cfg=cfg)
+    assert safe == {"leak": "<float: inf>", "huge": "<float: nan>"}
+    assert clipped is True
+
+    # The same subclass in key position. Review found that dropping `key()`'s `text()` wrap
+    # survived the whole suite -- true of the *pre-fix* code, where it was the only thing bounding
+    # a two-megabyte marker. It is not true any more: once the library computes the marker,
+    # `real()` cannot return a long string, so the wrap is defence in depth and **no test can
+    # distinguish it**. Recorded rather than pinned with an assertion that cannot fail.
+    keyed, _ = sanitize_fields({"k": {Huge("inf"): 1}}, cfg=cfg)
+    assert keyed["k"] == {"<float: inf>": 1}
+
+    # And a raising `__str__` must not take its siblings down with it.
+    survived, _ = sanitize_fields({"k": {Boom("nan"): 1, "survivor": 2}}, cfg=cfg)
+    assert survived["k"] == {"<float: nan>": 1, "survivor": 2}
+
+
+def test_a_float_subclass_and_a_float_enum_are_covered_too() -> None:
+    """`float` was in `_PLAIN_SCALARS`, which the exact-type *and* subclass paths both read.
+
+    Removing it from that set without giving the `Enum` branch its own float rule would have sent
+    a float-valued enum member to `str()`, which is a different bug in the same edit.
+    """
+
+    class Ratio(float):
+        pass
+
+    class Level(enum.Enum):
+        BROKEN = float("nan")
+        SUBCLASSED = Ratio("inf")
+
+    safe, clipped = sanitize_fields(
+        {"sub": Ratio("nan"), "enum": Level.BROKEN, "enum_sub": Level.SUBCLASSED}, cfg=Config()
+    )
+    assert safe == {
+        "sub": "<float: nan>",
+        "enum": "<float: nan>",
+        # An Enum member that is a float *subclass* matched neither `type(member) is float` nor
+        # the int arm, and fell through to `str(value)` -- JSON-safe, so nothing complained, but
+        # the marker and `truncated` were both lost. The arm tests `isinstance` now.
+        "enum_sub": "<float: inf>",
+    }
+    assert clipped is True
+
+
+def test_the_finite_path_is_not_measurably_more_expensive() -> None:
+    """FR-003 AC-7, measured against a neighbour rather than against the clock.
+
+    An absolute wall-clock budget is a race with the machine — this repo has been bitten by
+    timing tests failing on their own setup. The honest comparison is the sibling rule: `integer`
+    does `bit_length()`, two multiplications, a division and an unbound `int.__lt__`, where this
+    does one `math.isfinite`. Floats must not cost more than that, with a wide margin so the
+    assertion is about the algorithm and not about scheduling noise.
+
+    **Measured sensitivity:** it catches an order-of-magnitude regression, not a small one — a
+    calibration run survived 5 extra `str()` calls per value and failed at 10. Stated rather than
+    left for "wide margin" to imply a tight bound. Note also that `Config().max_keys` is 256, so
+    only the first 256 of the 2000 keys are coerced per call.
+    """
+    cfg = Config()
+    floats = {f"k{i}": float(i) + 0.5 for i in range(2000)}
+    ints = {f"k{i}": i for i in range(2000)}
+
+    start = perf_counter()
+    for _ in range(20):
+        sanitize_fields(floats, cfg=cfg)
+    float_cost = perf_counter() - start
+
+    start = perf_counter()
+    for _ in range(20):
+        sanitize_fields(ints, cfg=cfg)
+    int_cost = perf_counter() - start
+
+    assert float_cost < int_cost * 3, (
+        f"the float path cost {float_cost:.4f}s against the integer path's {int_cost:.4f}s; "
+        "a finite float should take one isfinite() call, not a rendering-size computation"
+    )

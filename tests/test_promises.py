@@ -102,11 +102,12 @@ async def test_a_failing_sink_never_reaches_the_caller(path: str) -> None:
     await _emit_on(path, lambda: log_foundry.info("the sink will raise on this"))
 
 
-P1_VALUE_BROKEN = {
-    "traced": "audit A2 — the in-span branch of api._log is unguarded, so build_event's "
-    "truncate_str raises AttributeError into the caller",
-    "async": "audit A2 — same unguarded in-span branch",
-}
+# ~~P1_VALUE_BROKEN = {"traced": "audit A2 — the in-span branch of api._log is unguarded …"}~~
+# Closed by SPEC-037 FR-001. The branch was left unguarded on the recorded grounds that it "only
+# appends to a list" — it calls `build_event`, which calls `truncate_str`, which calls
+# `value.encode`. Both halves of A2 go with it: the caller survives, and the span no longer
+# records an `error.type` its own code never raised.
+P1_VALUE_BROKEN: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("path", [_xfail(p, P1_VALUE_BROKEN) for p in PATHS])
@@ -173,11 +174,12 @@ def _strict_json(event: dict) -> None:
     json.loads(json.dumps(event), parse_constant=reject)
 
 
-P3_BROKEN = dict.fromkeys(
-    PATHS,
-    "audit S1 — sanitize returns float unchanged, so NaN/Infinity reach json.dumps and "
-    "produce output a strict consumer rejects, with no truncated marker",
-)
+# ~~P3_BROKEN = dict.fromkeys(PATHS, "audit S1 — sanitize returns float unchanged …")~~
+# Closed by SPEC-037 FR-003 on all four paths: a non-finite float is replaced with a
+# `<float: nan>` / `<float: inf>` / `<float: -inf>` marker and the event's `truncated` flag is
+# set, so the substitution is discoverable rather than silent. The markers are removed rather
+# than left passing, which `strict=True` forces — that is the mechanism keeping this file honest.
+P3_BROKEN: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("path", [_xfail(p, P3_BROKEN) for p in PATHS])
@@ -190,6 +192,10 @@ async def test_every_emitted_event_is_strictly_serializable(path: str) -> None:
     assert sink.events, f"nothing reached the sink on the {path} path"
     for event in sink.events:
         _strict_json(event)
+    assert any(e.get("truncated") for e in sink.events), (
+        "the substitution must be discoverable -- a replaced value with no marker is a silent "
+        "change to the caller's data"
+    )
 
 
 # -- Promise 4: arguments and return values are never captured --------------------------------
