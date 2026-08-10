@@ -573,11 +573,40 @@ lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup
 
 All build on `HTTPSink` (stdlib `urllib`): they POST batches with bounded `429`/`5xx` retry
 (honoring `Retry-After`) and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
-to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`).
+to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`, `max_retry_after=`,
+`max_batch_count=`, `max_batch_bytes=`, `opener=`).
+
+Each sink **re-chunks** a batch to its destination's limits, so one large `emit` — the whole
+pending backlog at process exit, for instance — becomes several requests the destination will
+accept rather than one it rejects whole. Every subclass sets its own defaults from its vendor's
+documentation where there is one; override with `max_batch_count=` / `max_batch_bytes=`. An event
+too large to be sent on its own is dropped and counted in `health().sink.dropped`.
+
+| Sink | `max_batch_count` | `max_batch_bytes` | Where the figure comes from |
+|---|---|---|---|
+| `DatadogSink` | 1,000 | 5,000,000 | both documented by Datadog for the logs intake |
+| `NewRelicSink` | 1,000 | 1,000,000 | the Log API's documented 1 MB (10⁶ bytes) per POST |
+| `HoneycombSink` | 1,000 | 1,000,000 | Honeycomb's documented 1 MB of uncompressed JSON |
+| `ElasticsearchSink` / `OpenSearchSink` | 1,000 | 10,000,000 | chosen below the documented 100 MB `http.max_content_length` |
+| `LokiSink` | 1,000 | 4,000,000 | chosen; Loki's own cap is an operator-tunable server setting |
+| `SplunkHECSink` | 1,000 | 1,000,000 | chosen; Splunk publishes no fixed HEC payload limit |
+| `LogstashSink` (HTTP mode) | 1,000 | 5,000,000 | inherits the generic defaults |
+| `HTTPSink` (generic) | 1,000 | 5,000,000 | chosen, for an endpoint the library knows nothing about |
+
+A count of 1,000 is Datadog's published array limit and a conservative default elsewhere — no
+destination in this family documents a smaller one. `DatadogSink` additionally enforces a
+1,000,000-byte limit on a *single* log, which is the one case where a destination's per-event cap
+is stricter than its per-request one.
+
+Two consequences worth knowing. An event too large to be sent on its own is **dropped**, not
+attempted — including in `LogstashSink`'s HTTP mode, which previously put any size on the wire.
+And because a request now carries one chunk rather than the whole batch, a partial failure is
+reported through `health().sink` rather than raised: `flush()` returning `True` means the drain
+completed, not that every chunk of it landed.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"` |
+| `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3, max_retry_after=30.0, max_batch_count=None, max_batch_bytes=None, opener=None)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"`; the two `max_batch_*` default to `None`, meaning "use this class's limits" from the table below (1,000 / 5,000,000 here); `opener` injects a `urlopen`-shaped callable for tests |
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |

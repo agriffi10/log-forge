@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from log_foundry.sinks._time import epoch_seconds
-from log_foundry.sinks.http import HTTPSink, merge_headers
+from log_foundry.sinks.http import HTTPSink, _Item, merge_headers
 
 __all__ = ["SplunkHECSink"]
 
@@ -21,7 +21,17 @@ class SplunkHECSink(HTTPSink):
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
     is no transport held and ``close()`` releases nothing.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — this library's conservative default.
+      MAX_BATCH_BYTES: 1,000,000 — likewise. Splunk publishes **no fixed** HEC payload limit:
+        it is ``max_content_length`` on the receiving instance, so there is no vendor figure to
+        cite and the default is chosen rather than documented. Raise it with
+        ``max_batch_bytes=`` to match your deployment.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_BATCH_BYTES = 1_000_000
 
     def __init__(
         self,
@@ -52,22 +62,37 @@ class SplunkHECSink(HTTPSink):
         headers = merge_headers({"Authorization": f"Splunk {token}"}, http_kwargs)
         super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[arg-type]
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """Sends the batch as HEC's concatenated JSON objects (FR-008).
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one event's HEC envelope (FR-008).
 
         Args:
-          batch: The events to ship. An empty batch is a no-op.
+          event: The event to wrap and serialize.
 
         Returns:
-          None.
+          The serialized envelope.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned past the retry bound.
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
-        if not batch:
-            return
-        body = "".join(json.dumps(self._envelope(event)) for event in batch).encode("utf-8")
-        self._send(body, content_type="application/json")
+        return json.dumps(self._envelope(event))
+
+    def _body(self, items: list[_Item]) -> tuple[bytes, str]:
+        """Concatenates the envelopes with no separator, as HEC's body format requires.
+
+        The inherited NDJSON body would also be accepted by HEC, but this keeps the bytes on the
+        wire exactly what they have always been, and concatenated objects are what Splunk
+        documents for the endpoint.
+
+        Args:
+          items: The chunk's envelopes, known non-empty.
+
+        Returns:
+          The body bytes and the content type.
+
+        Raises:
+          None.
+        """
+        return "".join(item.rendered for item in items).encode("utf-8"), "application/json"
 
     def _envelope(self, event: dict[str, object]) -> dict[str, object]:
         """Wraps one event in a HEC envelope.

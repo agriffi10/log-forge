@@ -87,26 +87,131 @@ a mechanical change, and Loki's stream grouping still works because it groups *w
 `emit`. Without it a fifth platform sink silently bypasses the chunking, which is the roster
 lesson SPEC-032 and SPEC-035 have already paid for twice.
 
+**The roster is six subclasses, not four, and the note above found four because it read this FR's
+file list rather than the class hierarchy** (2026-08-10, during the build — the same mistake one
+level up). Resolving the bases in `sinks/` gives `DatadogSink`, `LokiSink`, `HoneycombSink`,
+`NewRelicSink`, **`SplunkHECSink`** and **`ElasticsearchSink`** (plus `OpenSearchSink`, which
+inherits through it). Five of the six override `emit`; only `NewRelicSink` inherits it. Two
+consequences the FR did not state:
+
+- **`ElasticsearchSink` needs a second hook.** Its `emit` reads `_send`'s return value and
+  adjudicates the `_bulk` response, so `_body` alone cannot carry it. It gets
+  `_handle_response(payload, items) -> bool`, and its "indexed none of N" raise becomes a
+  per-chunk verdict that the base's all-chunks-failed test aggregates — the `chunks / delivered`
+  shape `KinesisSink` and `FirehoseSink` already use, reused rather than invented.
+- **A third hook, `_render(event) -> str`, carries the per-event framing**, so each event is
+  serialized exactly once and the byte budget measures what actually reaches the wire rather than
+  estimating it. That is `_records`' idiom from the AWS sinks. `_Item` keeps the source event
+  beside the rendered text so Loki can regroup streams inside a chunk without re-parsing.
+
+`LogstashSink` and `SentrySink` **compose** an `HTTPSink` rather than subclass it, so neither is in
+AC-1a's scope and neither needs to be: Logstash's HTTP mode delegates a whole batch to
+`HTTPSink.emit` and inherits the chunking, and Sentry sends one envelope per event through `_send`,
+below the chunk loop entirely.
+
 #### Acceptance Criteria:
 
-- [ ] AC-1: `HTTPSink` gains `max_batch_count` and `max_batch_bytes` and loops `_send` over
+- [x] AC-1: `HTTPSink` gains `max_batch_count` and `max_batch_bytes` and loops `_send` over
       `chunk_items`, with each platform subclass setting its own documented values. **The loop
       lives in `HTTPSink.emit` and the subclasses override a `_body` hook**, per the note above —
-      three of them override `emit` today and would otherwise keep their unchunked path.
-- [ ] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
+      five of the six override `emit` today and would otherwise keep their unchunked path, and
+      two further hooks (`_render`, `_handle_response`) were needed for the reasons recorded there.
+- [x] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
       hierarchy rather than a list, so a later platform sink cannot silently bypass the chunking.
-- [ ] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
+      `tests/test_public_surface.py`, resolving bases transitively so a subclass two levels down
+      is in scope, and resolving an `ast.Attribute` base as well as an `ast.Name` — review
+      demonstrated the bypass by adding a sink spelled `class ProbeSink(http.HTTPSink)` with an
+      `emit` override, which the whole file passed. The roster is **named rather than counted**,
+      since a floor set below the real number is a second way for a subclass to leave silently.
+- [x] AC-1b (**added during the build**): **the two rosters agree about scope, and both can say
+      when they shrink.** Moving five `emit`s into the base dropped those classes out of
+      `test_sink_concurrency.py`'s concurrency and post-close lints as well — 34 classes to 29,
+      in the same commit, with the suite green. Only the sibling roster in
+      `test_public_surface.py` noticed, and only because it carries a floor guard. Both now scope
+      on *defines or inherits*, a class that overrides neither `emit` nor `close` may answer from
+      the ancestor whose code it actually runs, and this file has a floor guard too. That is the
+      SPEC-032 lesson arriving a third time: the lint that catches a roster shrinking is worth
+      more than the roster.
+- [x] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
       each within both limits. This is the reproduction, run against `http.server`.
-- [ ] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
+- [x] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
       counted per SPEC-026, not reported as total failure.
-- [ ] AC-4: 413 joins the retryable set only if retrying could help; the FR states which and why.
-      A payload too large is *permanent* for that chunk, so the right answer is to split, not
-      retry — and if a single event exceeds the limit it is dropped and counted
-      `dropped_oversized`, as the AWS sinks already do.
-- [ ] AC-5: The per-platform limits are cited to their documentation in each subclass docstring.
-- [ ] AC-6: `README.md`'s `HTTPSink` signature table gains `max_batch_count`/`max_batch_bytes`.
+- [x] AC-4: 413 does **not** join the retryable set: the same bytes cannot succeed on a re-send,
+      so `_deliver` halves the chunk and sends each half, which is safe precisely because a 413
+      is a rejection *before* ingestion and so cannot duplicate (SPEC-018's rule). Halving
+      terminates at one event, which is then permanently too large and is dropped and counted
+      `dropped_oversized`, as the AWS sinks already do — as is an event that exceeds the budget
+      before any request is made. The split is offered only to `_deliver`, through `_send`'s
+      `splittable=` flag: `SentrySink` sends one envelope per event and has nothing left to split,
+      so it keeps the counted, announced abandonment it has always had rather than being handed an
+      uncounted exception, which would have been a new silent loss.
+
+      **The search halves the byte budget, not the chunk** — settled over two review rounds, both
+      measured:
+      - *Recursive chunk-halving is `2N-1` requests* — **11,954** for one 5,980-event exit backlog
+        against an endpoint refusing everything, on the single drain thread at the moment a
+        process exits, and **47,816** across the worker's retries, because each accepted size is
+        rediscovered independently in every branch. Capping its *depth* was the first fix and was
+        worse: a 5 MB default against a 20 kB endpoint is a 250× ratio needing ~8 halvings, so a
+        cap of 4 delivered **2 events of 2,000**. Halving the budget instead converges in
+        `log2(ratio)` — **8 wasted requests, 2,002 events delivered, zero loss** on that same
+        scenario — and each reduction halves *the refused body's own size*, since halving the
+        nominal budget converges on how the sink was configured rather than on what was sent.
+      - *A size already refused is not asked about again* within one `emit`, which stops the tail
+        degenerating into one request per event once the budget falls below a single item —
+        **except under `gzip`**, where the shortcut is disabled outright. The refusal is recorded
+        as an *uncompressed* length, because that is what this sink measures and chunks by, while
+        a gzipped request is judged on its compressed bytes; compression ratio is per-event, so
+        "larger uncompressed" stops implying "also refused". Measured: one incompressible event
+        set the mark at 532 bytes and a 6,020-byte event gzipping to 64 was discarded, against a
+        200-byte wire limit, with no request made — loss the library invented, and an inflation
+        of `dropped`, whose contract is an exact count. The bound it buys is also only the
+        uniform-size case: with strictly decreasing sizes every lone item is smaller than
+        anything yet refused, so the cost is O(N) — ~512 requests for 500 events against 9
+        uniform. Under `gzip` the shortcut is off entirely, so that O(N) tail applies to *every*
+        size ordering. Both are properties of a single low-water mark, recorded rather than
+        fixed: the alternative measured out as inventing loss, and a 413 is not retried, so
+        there is no backoff multiplier on the extra requests.
+      - *The comparison is between **bodies**, not charged sizes.* `SplunkHECSink` charges each
+        item a separator its concatenated body never writes, so a lone item's real body is one
+        byte under what it was charged — the only shipped shape whose delta is negative — and an
+        item charged exactly the refused size built a body one byte *smaller* than one already
+        refused. Measured: an event whose 144-byte body fitted a 144-byte limit, discarded
+        unasked. Same species as the gzip hole, one byte wide.
+      - *Only a lone item is ever dropped as permanently refused.* A multi-item chunk that
+        exhausts the reduction budget — reachable only through a pathological `_item_size` —
+        holds events that were never individually refused, so it is reported to the worker as a
+        failed batch rather than counted as permanent drops.
+      - *A permanent drop is settled, not failed.* Returning "not delivered" made `emit` raise, so
+        the worker re-ran the whole search and re-dropped the same events: `losses().dropped`
+        read **23,920 for 5,980 events lost**, against a counter whose contract — unlike
+        `failed`'s — is an exact count.
+      - *The clause was unfalsifiable.* Adding 413 to the retryable set beside 429 left all 1,326
+        tests green, because every 413 test ran at `max_retries=0`. Now asserted on the request
+        count with retries switched on.
+- [x] AC-4a (**added during the build**): **nothing in this sink consults the stop signal to
+      shorten its own work.** A revision did — ending the 413 search and dropping `_send`'s
+      retries to one attempt while stopping — on the reasoning that both run on the thread
+      `shutdown()` is joining. `Worker.shutdown` sets the stop event *before* the join, so
+      `_stopping()` is true for the whole of `_final_drain`: measured, a 2,000-event backlog that
+      had been delivering in 30 requests delivered **nothing**, and a single transient 503 during
+      the exit drain lost one event of six with `failed_batches` at zero. Neither guard bought a
+      bound that `MAX_BUDGET_REDUCTIONS` and `shutdown(timeout=)` did not already provide, and
+      SPEC-027 had already made every backoff *wait* return instantly on a set stop event, so the
+      retry suppression saved request count rather than time. Both reverted, and both now pinned
+      by a test — all three of these mechanisms had survived a whole-suite mutation run.
+- [x] AC-5: The per-platform limits are cited to their documentation in each subclass docstring —
+      **and where the vendor publishes none, the docstring says so and names the value as this
+      library's own choice.** Datadog (1,000 / 5 MB), New Relic (1 MB per POST) and Honeycomb
+      (1 MB) are vendor figures. Elasticsearch's is chosen *below* its documented 100 MB cap;
+      Loki's and Splunk's are chosen outright, because both destinations bound a request by an
+      operator-tunable server setting rather than a published constant. Amended by evidence, per
+      SPEC-023's precedent: an invented citation is worse than a stated choice.
+- [x] AC-6: `README.md`'s `HTTPSink` signature table gains `max_batch_count`/`max_batch_bytes`.
       The README PR is adding `max_retry_after` and `opener` to that same table, so this AC exists
-      to stop the two passes leaving it half-right.
+      to stop the two passes leaving it half-right — all four are now in it, plus a per-sink
+      limits table carrying AC-5's provenance. **PR #126 is a draft parked for `1.0.0` and edits
+      this same table; it must rebase.**
 
 ### FR-002: `PostgresSink`'s rollback cannot bypass the retry, the counter and the diagnostic
 

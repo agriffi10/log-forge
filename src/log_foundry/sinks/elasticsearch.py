@@ -6,8 +6,8 @@ import json
 
 from log_foundry import _diag
 from log_foundry.sinks._batch import usable_results
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.base import SinkLosses
+from log_foundry.sinks.http import HTTPSink, _Item
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
 
@@ -29,7 +29,19 @@ class ElasticsearchSink(HTTPSink):
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
     is no transport held and ``close()`` releases nothing.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — this library's conservative default; Elasticsearch bounds a bulk
+        request by size, not by document count.
+      MAX_BATCH_BYTES: 10,000,000 — chosen *below* the documented hard limit rather than at it.
+        Elasticsearch "limits the maximum size of a HTTP request to 100mb by default", but its
+        bulk guidance is to find a working size by experiment rather than to send the largest
+        request the server will accept, and a 100 MB bulk is a poor default for a log shipper.
+        Raise it with ``max_batch_bytes=``.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_BATCH_BYTES = 10_000_000
 
     def __init__(self, url: str, *, index: str, auth: str | tuple[str, str] | None = None,
                  **http_kwargs: object) -> None:
@@ -54,38 +66,44 @@ class ElasticsearchSink(HTTPSink):
         self.item_errors = 0
         self.dropped_unadjudicated = 0
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """Builds the ``_bulk`` NDJSON payload, POSTs it, and parses the response items.
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one event as its ``_bulk`` action line and source line.
 
-        An abandoned request raises out of ``_send`` (SPEC-026 FR-001): nothing was indexed, so
-        there is no response to parse and nothing downstream to duplicate.
+        Both lines are one item so the pair can never be split across two requests, and so the
+        chunker's byte budget charges the action line the wire actually carries.
 
         Args:
-          batch: The events to index. An empty batch is a no-op.
+          event: The event to index.
 
         Returns:
-          None.
+          The two newline-joined lines, without the trailing newline :meth:`_body` adds.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned, or if every item carried an error so
-            the ``200`` indexed nothing — a total failure like any other, which must reach the
-            worker (FR-001). A retry cannot duplicate, and where the cause is permanent the
-            worker abandons the batch after its bound and records it, which beats a silent
-            success. A response rejecting some items stays partial and is reported through
-            :meth:`losses`.
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
-        if not batch:
-            return
-        lines: list[str] = []
-        for event in batch:
-            lines.append(json.dumps({"index": {"_index": self._index}}))
-            lines.append(json.dumps(event))
-        body = ("\n".join(lines) + "\n").encode("utf-8")
-        payload = self._send(body, content_type="application/x-ndjson")
-        if self._parse_bulk_response(payload, len(batch)):
-            raise SinkDeliveryError(
-                f"{type(self).__name__} indexed none of {len(batch)} event(s)"
-            )
+        action = json.dumps({"index": {"_index": self._index}})
+        return f"{action}\n{json.dumps(event)}"
+
+    def _handle_response(self, payload: bytes, items: list[_Item]) -> bool:
+        """Parses the chunk's ``_bulk`` items and reports whether anything was indexed.
+
+        Returning ``False`` rather than raising is what lets a sibling chunk that succeeded
+        stand: :meth:`~log_foundry.sinks.http.HTTPSink.emit` raises only when *every* chunk came
+        back empty-handed, which is the total failure the worker's retry exists for, while a
+        batch that indexed some of its chunks must not be re-sent whole (SPEC-026 FR-001).
+
+        Args:
+          payload: The response body.
+          items: The chunk the response describes.
+
+        Returns:
+          False when every item in the chunk carried an error, True otherwise — including for a
+          body this sink cannot read, since the request itself succeeded.
+
+        Raises:
+          None.
+        """
+        return not self._parse_bulk_response(payload, len(items))
 
     def losses(self) -> SinkLosses:
         """Reports abandoned requests plus server-rejected bulk items (SPEC-026 FR-002).

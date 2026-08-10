@@ -20,7 +20,19 @@ class DatadogSink(HTTPSink):
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
     is no transport held and ``close()`` releases nothing.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — Datadog's documented maximum array size for the logs intake.
+      MAX_BATCH_BYTES: 5,000,000 — its documented maximum uncompressed payload.
+      MAX_EVENT_BYTES: 1,000,000 — its documented maximum for a *single* log. This is the one
+        sink in the family whose per-event limit is stricter than its request limit, so without
+        it a 2 MB event passes the 5 MB request budget and is rejected by a limit the budget
+        cannot see. All three are the vendor's own figures, from the Logs API's send-logs limits.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_EVENT_BYTES = 1_000_000
+    MAX_BATCH_BYTES = 5_000_000
 
     def __init__(
         self,
@@ -54,22 +66,19 @@ class DatadogSink(HTTPSink):
             headers=headers, body_format="json_array", **http_kwargs,  # type: ignore[arg-type]
         )
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """POSTs each enriched event as one JSON array (FR-007).
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one enriched entry for the JSON array (FR-007).
 
         Args:
-          batch: The events to ship. An empty batch is a no-op.
+          event: The event to enrich and serialize.
 
         Returns:
-          None.
+          The serialized entry.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned past the retry bound.
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
-        if not batch:
-            return
-        body = json.dumps([self._entry(event) for event in batch]).encode("utf-8")
-        self._send(body, content_type="application/json")
+        return json.dumps(self._entry(event))
 
     def _entry(self, event: dict[str, object]) -> dict[str, object]:
         """Copies an event and applies the configured Datadog enrichment.

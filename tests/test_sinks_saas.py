@@ -13,7 +13,7 @@ from log_foundry.sinks.honeycomb import HoneycombSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
-from test_sinks_http import FakeOpener
+from test_sinks_http import FakeOpener, FakeResponse
 
 # --- FR-007: Datadog --------------------------------------------------------------------
 
@@ -146,3 +146,136 @@ def test_sentry_without_sdk_or_dsn_raises(monkeypatch) -> None:
     monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
     with pytest.raises(ValueError):
         SentrySink()
+
+
+# --- SPEC-038 FR-001: every platform sink chunks through HTTPSink.emit -------------------
+
+
+def test_datadog_carries_its_documented_intake_limits() -> None:
+    """AC-1/AC-5. Datadog publishes both figures, so both are the vendor's rather than ours."""
+    assert (DatadogSink.MAX_BATCH_COUNT, DatadogSink.MAX_BATCH_BYTES) == (1000, 5_000_000)
+
+
+def test_datadog_splits_a_batch_over_its_array_limit() -> None:
+    """Before FR-001 this went as one array of 2,500 and the intake rejected all of it."""
+    opener = FakeOpener()
+    DatadogSink("key", opener=opener).emit([{"n": i} for i in range(2500)])
+    counts = [len(json.loads(call["body"])) for call in opener.calls]
+    assert counts == [1000, 1000, 500]
+    assert all(entry["ddsource"] == "log-foundry" for entry in json.loads(opener.calls[0]["body"]))
+
+
+def test_newrelic_splits_a_batch_over_its_one_megabyte_post_limit() -> None:
+    opener = FakeOpener()
+    NewRelicSink("key", opener=opener).emit([{"pad": "x" * 2000} for _ in range(1000)])
+    assert len(opener.calls) > 1
+    assert all(len(call["body"]) <= NewRelicSink.MAX_BATCH_BYTES for call in opener.calls)
+    assert sum(len(json.loads(call["body"])) for call in opener.calls) == 1000
+
+
+def test_honeycomb_splits_a_batch_and_keeps_its_data_envelope() -> None:
+    opener = FakeOpener()
+    HoneycombSink("key", "dataset", opener=opener).emit([{"pad": "x" * 2000} for _ in range(1000)])
+    assert len(opener.calls) > 1
+    assert all(len(call["body"]) <= HoneycombSink.MAX_BATCH_BYTES for call in opener.calls)
+    entries = [entry for call in opener.calls for entry in json.loads(call["body"])]
+    assert len(entries) == 1000
+    assert all(set(entry) == {"data"} for entry in entries)
+
+
+def test_splunk_splits_a_batch_and_keeps_concatenated_hec_envelopes() -> None:
+    opener = FakeOpener()
+    SplunkHECSink("http://splunk:8088", "tok", opener=opener).emit(
+        [{"pad": "x" * 2000} for _ in range(1000)]
+    )
+    assert len(opener.calls) > 1
+    decoder = json.JSONDecoder()
+    total = 0
+    for call in opener.calls:
+        body = call["body"].decode("utf-8")
+        index = 0
+        while index < len(body):
+            envelope, index = decoder.raw_decode(body, index)
+            assert set(envelope) >= {"event", "time", "source"}
+            total += 1
+    assert total == 1000, "HEC stays concatenated JSON objects, one per event, across chunks"
+
+
+def test_every_platform_sink_carries_the_limits_its_docstring_cites() -> None:
+    """AC-1/AC-5. The constants are the contract; without this only Datadog's were pinned.
+
+    Mutating `ElasticsearchSink.MAX_BATCH_BYTES` from 10 MB to 100 MB, `LokiSink`'s from 4 MB to
+    400 MB, or `NewRelicSink`'s down to 100 KB all left the suite green, because the chunking
+    tests pass explicit `max_batch_*` arguments and never exercise the class attributes. The
+    literals here are transcribed from each docstring's cited figure, not read back from the
+    class, so a constant that drifts from its citation fails.
+    """
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+    from log_foundry.sinks.loki import LokiSink
+
+    assert (DatadogSink.MAX_BATCH_COUNT, DatadogSink.MAX_BATCH_BYTES) == (1000, 5_000_000)
+    assert DatadogSink.MAX_EVENT_BYTES == 1_000_000, "its documented single-log cap"
+    assert (NewRelicSink.MAX_BATCH_COUNT, NewRelicSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (HoneycombSink.MAX_BATCH_COUNT, HoneycombSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (SplunkHECSink.MAX_BATCH_COUNT, SplunkHECSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (LokiSink.MAX_BATCH_COUNT, LokiSink.MAX_BATCH_BYTES) == (1000, 4_000_000)
+    assert (ElasticsearchSink.MAX_BATCH_COUNT, ElasticsearchSink.MAX_BATCH_BYTES) == (
+        1000,
+        10_000_000,
+    )
+    assert OpenSearchSink.MAX_BATCH_BYTES == ElasticsearchSink.MAX_BATCH_BYTES, (
+        "OpenSearch reuses the bulk protocol verbatim, limits included"
+    )
+
+
+def test_datadog_drops_an_event_over_its_single_log_cap_though_the_payload_would_fit() -> None:
+    """The one sink whose per-event limit is stricter than its request limit.
+
+    A 2 MB event sits inside the 5 MB payload budget and is rejected by the 1 MB per-log cap —
+    a limit the request budget cannot see, so before `MAX_EVENT_BYTES` it went on the wire.
+    """
+    opener = FakeOpener()
+    sink = DatadogSink("key", opener=opener)
+    sink.emit([{"a": 1}, {"pad": "x" * 2_000_000}, {"b": 2}])
+    assert sink.dropped_oversized == 1
+    entries = [entry for call in opener.calls for entry in json.loads(call["body"])]
+    assert len(entries) == 2, "the two ordinary events still ship"
+
+
+def test_splunk_still_offers_an_event_whose_real_body_is_smaller_than_one_refused() -> None:
+    """The refusal shortcut must compare real bodies, not charged sizes.
+
+    `_item_size` charges a separator Splunk's concatenated body never writes, so a lone item's
+    real body is one byte *under* what it was charged. Splunk is the only shipped shape where the
+    delta is negative (measured: ndjson +0, json_array +1, Loki +13, Datadog +1, Splunk -1),
+    which is why it is the only one where "charged size >= a refused body" can be wrong.
+
+    The window is exactly one byte wide, so the fixture is built to sit in it and asserts that it
+    does — two events whose bodies differ by exactly one. With a wider gap the charged comparison
+    happens to give the right answer and the test would pass against the defect.
+    """
+    stamp = "2026-08-10T00:00:00.000Z"
+    events = [
+        {"timestamp": stamp, "pad": "x" * 31},
+        {"timestamp": stamp, "pad": "x" * 30},
+    ]
+    probe = SplunkHECSink("http://splunk:8088", "tok")
+    items = [probe._items([event])[0] for event in events]
+    bodies = [len(probe._body([item])[0]) for item in items]
+    assert bodies[0] - bodies[1] == 1, f"fixture must straddle the one-byte window: {bodies}"
+    assert items[1].size == bodies[0], (
+        "and the smaller event's *charged* size must equal the larger's real body, which is "
+        f"exactly the case the charged comparison gets wrong: {items[1].size} vs {bodies[0]}"
+    )
+
+    limit = bodies[1]
+    sent: list[int] = []
+
+    def opener(request, timeout=None):
+        sent.append(len(request.data))
+        return FakeResponse(413 if len(request.data) > limit else 200, b"")
+
+    sink = SplunkHECSink("http://splunk:8088", "tok", max_retries=0, opener=opener)
+    sink.emit(events)
+    assert limit in sent, f"the event whose body fits exactly was never offered; sent {sent}"
+    assert sink.dropped_oversized == 1, "only the genuinely oversized event is dropped"
