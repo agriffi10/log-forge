@@ -590,14 +590,23 @@ too large to be sent on its own is dropped and counted in `health().sink.dropped
 | `ElasticsearchSink` / `OpenSearchSink` | 1,000 | 10,000,000 | chosen below the documented 100 MB `http.max_content_length` |
 | `LokiSink` | 1,000 | 4,000,000 | chosen; Loki's own cap is an operator-tunable server setting |
 | `SplunkHECSink` | 1,000 | 1,000,000 | chosen; Splunk publishes no fixed HEC payload limit |
+| `LogstashSink` (HTTP mode) | 1,000 | 5,000,000 | inherits the generic defaults |
 | `HTTPSink` (generic) | 1,000 | 5,000,000 | chosen, for an endpoint the library knows nothing about |
 
 A count of 1,000 is Datadog's published array limit and a conservative default elsewhere — no
-destination in this family documents a smaller one.
+destination in this family documents a smaller one. `DatadogSink` additionally enforces a
+1,000,000-byte limit on a *single* log, which is the one case where a destination's per-event cap
+is stricter than its per-request one.
+
+Two consequences worth knowing. An event too large to be sent on its own is **dropped**, not
+attempted — including in `LogstashSink`'s HTTP mode, which previously put any size on the wire.
+And because a request now carries one chunk rather than the whole batch, a partial failure is
+reported through `health().sink` rather than raised: `flush()` returning `True` means the drain
+completed, not that every chunk of it landed.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3, max_retry_after=30.0, max_batch_count=1000, max_batch_bytes=5_000_000, opener=None)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"`; `opener` injects a `urlopen`-shaped callable for tests |
+| `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3, max_retry_after=30.0, max_batch_count=None, max_batch_bytes=None, opener=None)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"`; the two `max_batch_*` default to `None`, meaning "use this class's limits" from the table below (1,000 / 5,000,000 here); `opener` injects a `urlopen`-shaped callable for tests |
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |

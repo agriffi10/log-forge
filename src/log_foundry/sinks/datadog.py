@@ -23,12 +23,15 @@ class DatadogSink(HTTPSink):
 
     Attributes:
       MAX_BATCH_COUNT: 1,000 — Datadog's documented maximum array size for the logs intake.
-      MAX_BATCH_BYTES: 5,000,000 — its documented maximum uncompressed payload. Both are the
-        vendor's own figures, from the Logs API's send-logs limits; the intake also caps a
-        single log at 1 MB, which the per-item budget below 5 MB already forecloses.
+      MAX_BATCH_BYTES: 5,000,000 — its documented maximum uncompressed payload.
+      MAX_EVENT_BYTES: 1,000,000 — its documented maximum for a *single* log. This is the one
+        sink in the family whose per-event limit is stricter than its request limit, so without
+        it a 2 MB event passes the 5 MB request budget and is rejected by a limit the budget
+        cannot see. All three are the vendor's own figures, from the Logs API's send-logs limits.
     """
 
     MAX_BATCH_COUNT = 1000
+    MAX_EVENT_BYTES = 1_000_000
     MAX_BATCH_BYTES = 5_000_000
 
     def __init__(

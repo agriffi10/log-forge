@@ -39,6 +39,17 @@ payload ceiling), so it is the right *base-class* default for an arbitrary endpo
 knows nothing about, while every subclass that has a documented figure sets its own below it.
 """
 
+MAX_SPLIT_DEPTH = 4
+"""Halvings a ``413`` may provoke before the chunk is abandoned instead (FR-001 AC-4).
+
+Splitting is a correction for a budget somewhat larger than the destination's real limit, and
+four halvings cover a limit down to a sixteenth of the configured one. Past that the
+configuration is wrong rather than slightly off, and the right answer is to stop and say so: the
+recursion is otherwise ``2N-1`` requests for ``N`` events, measured at 11,954 requests for one
+5,980-event exit backlog against an endpoint that answers ``413`` unconditionally. A cap turns
+that into at most ``2**(MAX_SPLIT_DEPTH+1) - 1`` per originally-refused chunk.
+"""
+
 
 @dataclass(frozen=True)
 class _Item:
@@ -71,6 +82,7 @@ class _PayloadTooLarge(SinkDeliveryError):
     — ``SentrySink`` above all — keeps catching it exactly as before. Only the chunk loop, which
     passes ``splittable=True``, ever sees it as its own type.
     """
+
 
 DEFAULT_MAX_RETRY_AFTER = 30.0
 """Ceiling on a server-supplied ``Retry-After``, in seconds (SPEC-027 FR-001).
@@ -123,18 +135,29 @@ class HTTPSink:
 
     Credentials passed as ``auth`` are sent on every request to the URL as given, and nothing
     here requires ``https://``: over a plaintext endpoint a bearer token, and a basic-auth pair,
-    travel in the clear. The worst-case delay is ``max_retries`` waits, each at most
-    ``max_retry_after`` when the server sends a ``Retry-After`` and exponential otherwise — 90 s
-    at the defaults, plus the request timeouts — and that pauses the single drain thread, so it
-    is a pause on all log delivery. ``shutdown()``'s own timeout bounds the total (FR-004).
+    travel in the clear.
+
+    **The worst case is now per chunk, not per batch** (FR-001). One chunk costs ``max_retries``
+    waits, each at most ``max_retry_after`` when the server sends a ``Retry-After`` and
+    exponential otherwise — 90 s at the defaults, plus the request timeouts — and an ``emit``
+    pays that for *each* chunk it produces. All of it runs on the single drain thread, so it is a
+    pause on all log delivery, and a large enough backlog of failing chunks can outlast
+    ``shutdown()``'s own timeout, which then expires and leaves the sink open by SPEC-027
+    FR-004's rule. Two things bound it: once the worker's stop event is set the retries are
+    dropped to a single attempt per chunk, and the ``413`` split stops halving. Sizing
+    ``max_batch_bytes`` to the destination is what keeps the chunk count low in the first place.
 
     Attributes:
       MAX_BATCH_COUNT: Entries one request may carry. A subclass overrides it with its
         destination's documented figure.
       MAX_BATCH_BYTES: Bytes one request's body may reach, likewise.
-      failed: Requests abandoned past the retry bound.
-      dropped_oversized: Events dropped for exceeding this sink's byte budget on their own, plus
-        any single event a destination answered with ``413``.
+      MAX_EVENT_BYTES: A destination's published limit on a *single* event, or ``None`` when it
+        publishes none. Distinct from the request budget: Datadog accepts a 5 MB payload but
+        caps one log at 1 MB, so an event between the two is rejected by a limit the request
+        budget cannot see.
+      failed: Requests abandoned past the retry bound, counted per chunk.
+      dropped_oversized: Events dropped for exceeding the per-event ceiling, plus those a
+        destination answered ``413`` to and no split could rescue.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -146,6 +169,7 @@ class HTTPSink:
 
     MAX_BATCH_COUNT = DEFAULT_MAX_BATCH_COUNT
     MAX_BATCH_BYTES = DEFAULT_MAX_BATCH_BYTES
+    MAX_EVENT_BYTES: int | None = None
 
     def __init__(
         self,
@@ -213,6 +237,7 @@ class HTTPSink:
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0
+        self._learned_max_bytes = self.max_batch_bytes
         self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -229,27 +254,30 @@ class HTTPSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every chunk failed, which is the total failure the worker's
-            retry exists for (SPEC-026 FR-001). A batch that delivered *some* chunks does not
-            raise: the worker retries whole batches, so raising would re-send what landed, and
-            the abandoned chunks are already counted and announced by :meth:`_abandon`.
+          SinkDeliveryError: When no chunk was **settled**, which is the total failure the
+            worker's retry exists for (SPEC-026 FR-001). A chunk is settled when it was
+            delivered *or* when it was permanently discarded, because neither is helped by a
+            retry — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
+            identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
+            already apply). A batch that settled *some* chunks does not raise either: the worker
+            retries whole batches, so raising would re-send what landed.
         """
         if not batch:
             return
         items = self._items(batch)
         if not items:
             return
-        chunks = delivered = 0
+        chunks = settled = 0
         for chunk in chunk_items(
             items,
             max_count=self.max_batch_count,
-            max_bytes=self.max_batch_bytes,
+            max_bytes=self._chunk_budget(),
             size_of=lambda item: item.size,
         ):
             chunks += 1
             if self._deliver(chunk):
-                delivered += 1
-        if chunks and not delivered:
+                settled += 1
+        if chunks and not settled:
             raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
 
     def _items(self, batch: list[dict[str, object]]) -> list[_Item]:
@@ -257,7 +285,9 @@ class HTTPSink:
 
         ``chunk_items`` documents oversized items as the caller's to filter, because a group it
         cannot bound is a group it would yield anyway; dropping here is what the AWS sinks
-        already do in ``_records``.
+        already do in ``_records``. The drops are announced as **one** line carrying the count
+        rather than one line per event, because a batch of oversized events is a configuration
+        fault and 5,980 identical stderr lines describe it no better than one does.
 
         Args:
           batch: The events to render.
@@ -268,22 +298,105 @@ class HTTPSink:
         Raises:
           None.
         """
+        ceiling = self._event_ceiling()
         items: list[_Item] = []
+        dropped = 0
+        largest = 0
         for event in batch:
             rendered = self._render(event)
-            size = len(rendered.encode("utf-8")) + 1
-            if size > self.max_batch_bytes:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost(
-                    "event",
-                    1,
-                    f"{type(self).__name__}, {size} bytes exceeds the "
-                    f"{self.max_batch_bytes}-byte request budget",
-                )
+            size = self._item_size(rendered, event)
+            if size > ceiling:
+                dropped += 1
+                largest = max(largest, size)
                 continue
             items.append(_Item(event=event, rendered=rendered, size=size))
+        if dropped:
+            with self._counter_lock:
+                self.dropped_oversized += dropped
+            _diag.lost(
+                "event",
+                dropped,
+                f"{type(self).__name__}, up to {largest} bytes exceeds the "
+                f"{ceiling}-byte per-event ceiling",
+            )
         return items
+
+    def _event_ceiling(self) -> int:
+        """The most one rendered event may measure and still be sendable.
+
+        Args:
+          None.
+
+        Returns:
+          The smaller of the request budget and any per-event limit the destination publishes.
+
+        Raises:
+          None.
+        """
+        if self.MAX_EVENT_BYTES is None:
+            return self.max_batch_bytes
+        return min(self.max_batch_bytes, self.MAX_EVENT_BYTES)
+
+    def _item_size(self, rendered: str, event: dict[str, object]) -> int:
+        """Charges one rendered event its share of the request body.
+
+        The default is its own bytes plus one for the separator that joins it to its neighbours.
+        A subclass whose body adds framing *per group* rather than per item overrides this to
+        charge that framing too — ``LokiSink`` does, because its streams carry a label map each,
+        and without it a body ran 61% past the budget at high label cardinality.
+
+        Args:
+          rendered: The event's serialized form.
+          event: The source event, for a subclass that sizes framing from its fields.
+
+        Returns:
+          The bytes to charge the chunker.
+
+        Raises:
+          None.
+        """
+        return len(rendered.encode("utf-8")) + 1
+
+    def _body_reserve(self) -> int:
+        """Bytes of whole-body framing not charged to any single item.
+
+        A JSON array adds two brackets while the last item's separator goes unused, so its body
+        is one byte longer than the item sizes sum to; NDJSON is exact, and Splunk's bare
+        concatenation is shorter. Reserving keeps the budget an actual bound rather than a value
+        the body is permitted to sit one byte above.
+
+        Args:
+          None.
+
+        Returns:
+          The bytes to withhold from the chunker's budget.
+
+        Raises:
+          None.
+        """
+        return 1 if self.body_format == "json_array" else 0
+
+    def _chunk_budget(self) -> int:
+        """The byte budget to chunk against right now, floored at one.
+
+        This is the configured budget less :meth:`_body_reserve`, and less anything a ``413``
+        has since taught this sink about the destination's real limit. That ceiling only ever
+        falls: a destination that refuses a size once will refuse it again, and rediscovering it
+        by halving on every batch cost a measured 75% of all bytes uploaded.
+
+        Args:
+          None.
+
+        Returns:
+          The budget in bytes.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            learned = self._learned_max_bytes
+        budget = min(self.max_batch_bytes, learned) - self._body_reserve()
+        return max(budget, 1)
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event into this sink's per-event wire form.
@@ -344,7 +457,7 @@ class HTTPSink:
         """
         return True
 
-    def _deliver(self, items: list[_Item]) -> bool:
+    def _deliver(self, items: list[_Item], depth: int = 0) -> bool:
         """Sends one chunk, splitting it if the destination calls the payload too large.
 
         A ``413`` is permanent for these exact bytes, so re-sending them cannot help and the
@@ -352,11 +465,17 @@ class HTTPSink:
         is a rejection before ingestion, so nothing landed and the halves cannot duplicate
         anything — the SPEC-018 rule that only provable non-delivery may be re-sent.
 
+        The split is refused once ``MAX_SPLIT_DEPTH`` halvings have not found a size the
+        destination accepts, and refused outright while a shutdown is in progress: the halving
+        runs on the one drain thread, and ``shutdown()`` is already joining it.
+
         Args:
           items: The chunk to send, known non-empty.
+          depth: How many halvings led here, which bounds the fan-out.
 
         Returns:
-          True when the chunk, or some part of it, was delivered.
+          True when the chunk was **settled** — delivered, or permanently discarded so that no
+          retry could help. False only for a failure a retry might yet fix.
 
         Raises:
           None.
@@ -365,23 +484,29 @@ class HTTPSink:
         try:
             payload = self._send(body, content_type=content_type, splittable=True)
         except _PayloadTooLarge:
-            return self._split(items)
+            self._learn_ceiling(len(body))
+            return self._split(items, depth)
         except SinkDeliveryError:
             return False
         return self._handle_response(payload, items)
 
-    def _split(self, items: list[_Item]) -> bool:
+    def _split(self, items: list[_Item], depth: int) -> bool:
         """Halves a chunk the destination refused as too large and sends each half.
 
-        Halving terminates at a single item, which no further split can shrink: that one event
-        is larger than this destination accepts, which is permanent, so it is dropped and
-        counted rather than retried into the same answer forever (AC-4).
+        Halving terminates three ways, and all three are settled rather than retried, because a
+        ``413`` is a verdict on the bytes: a single item the destination still refuses is
+        permanently too large, a chunk still refused after ``MAX_SPLIT_DEPTH`` halvings is
+        against a limit far below the configured one, and a shutdown ends the search. Returning
+        "settled" is what stops the worker re-running the whole cascade three more times — the
+        same events were otherwise dropped and counted once per attempt, which made
+        ``losses().dropped`` four times the number of events actually lost.
 
         Args:
           items: The refused chunk, known non-empty.
+          depth: How many halvings led here.
 
         Returns:
-          True when either half delivered anything.
+          True — settled either way. Whichever branch runs, a retry cannot improve on it.
 
         Raises:
           None.
@@ -390,11 +515,57 @@ class HTTPSink:
             with self._counter_lock:
                 self.dropped_oversized += 1
             _diag.lost("event", 1, f"{type(self).__name__}, HTTP 413 for a single event")
-            return False
+            return True
+        if depth >= MAX_SPLIT_DEPTH or self._stopping():
+            reason = "a shutdown is in progress" if self._stopping() else "still 413 when split"
+            with self._counter_lock:
+                self.dropped_oversized += len(items)
+            _diag.lost(
+                "event",
+                len(items),
+                f"{type(self).__name__}, abandoned after {depth} split(s), {reason}",
+            )
+            return True
         middle = len(items) // 2
-        first = self._deliver(items[:middle])
-        second = self._deliver(items[middle:])
+        first = self._deliver(items[:middle], depth + 1)
+        second = self._deliver(items[middle:], depth + 1)
         return first or second
+
+    def _learn_ceiling(self, refused_bytes: int) -> None:
+        """Records that the destination refused a body of this size, so later chunks stay under.
+
+        It only ever lowers the ceiling. A destination that answered ``413`` once will answer it
+        again for the same size, and without this the halving cascade is repaid on every batch
+        forever — measured at 75% of all bytes uploaded being body that is uploaded and then
+        rejected. Half the refused size is the next value tried, which is where the split was
+        going anyway.
+
+        Args:
+          refused_bytes: The size of the body the destination refused.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self._learned_max_bytes = max(min(self._learned_max_bytes, refused_bytes // 2), 1)
+
+    def _stopping(self) -> bool:
+        """Reports whether a shutdown is in progress (SPEC-027 FR-002).
+
+        Args:
+          None.
+
+        Returns:
+          True when the worker's stop event has been set.
+
+        Raises:
+          None.
+        """
+        signal = self.log_foundry_stop_signal
+        return signal is not None and signal.is_set()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and abandoned requests (SPEC-026 FR-002).
@@ -464,32 +635,36 @@ class HTTPSink:
             only what finally fails is a loss.
           SinkDeliveryError: If the request was retried to exhaustion. It used to return
             ``None``, which every caller spelled as "nothing to parse" and the worker read as a
-            successful emit; one request carries the whole batch, so an abandoned one delivered
-            nothing and is exactly the total failure the worker's retry exists for (SPEC-026
-            FR-001).
+            successful emit; an abandoned request delivered nothing, which is the total failure
+            the worker's retry exists for (SPEC-026 FR-001). Since FR-001 a request carries one
+            *chunk* rather than the whole batch, so it is :meth:`emit` that decides whether the
+            batch as a whole failed — one abandoned chunk beside a delivered one is partial
+            failure, and partial failure must not raise.
         """
         headers, data = self._prepare(body, content_type, extra_headers)
-        for attempt in range(self.max_retries + 1):
+        retries = 0 if self._stopping() else self.max_retries
+        for attempt in range(retries + 1):
             request = urllib.request.Request(  # noqa: S310
                 self.url, data=data, method=self.method, headers=headers
             )
             try:
                 status, payload, retry_after = self._attempt(request)
             except (urllib.error.URLError, OSError) as err:
-                if attempt < self.max_retries:
+                if attempt < retries:
                     self._sleep_backoff(attempt, None)
                     continue
                 self._abandon(
-                    f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
+                    f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip(),
+                    retries + 1,
                 )
             if 200 <= status < 300:
                 return payload
-            if (status == 429 or 500 <= status < 600) and attempt < self.max_retries:
+            if (status == 429 or 500 <= status < 600) and attempt < retries:
                 self._sleep_backoff(attempt, retry_after)
                 continue
             if status == 413 and splittable:
                 raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413")
-            self._abandon(f"HTTP {status}")
+            self._abandon(f"HTTP {status}", retries + 1)
         raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
 
     def _prepare(
@@ -602,19 +777,22 @@ class HTTPSink:
         delay = server if server is not None else _BACKOFF_BASE * (2**attempt)
         wait(delay, self.log_foundry_stop_signal)
 
-    def _abandon(self, reason: str) -> NoReturn:
+    def _abandon(self, reason: str, attempts: int) -> NoReturn:
         """Counts and logs a request abandoned past the retry bound, then raises (FR-012).
 
         The counter moves before the raise: ``failed`` is this sink's own record of what it
         could not put on the wire, and it must not depend on who catches what. It therefore
-        counts every worker retry attempt too, making it an upper bound on loss rather than a
-        count of it — see :class:`~log_foundry.sinks.base.SinkLosses`.
+        counts every worker retry attempt too, and now every *chunk* of a batch, making it an
+        upper bound on loss rather than a count of it — see
+        :class:`~log_foundry.sinks.base.SinkLosses`.
 
         Args:
           reason: Why the request was abandoned. It carries only library-controlled values — an
             HTTP status, an exception type, an ``errno`` — never a server-supplied body or an
             exception's text (SPEC-029 FR-002), and it is also the raised error's message for
             the same reason.
+          attempts: How many attempts were actually made, which is one when a shutdown suppressed
+            the retries and is therefore passed in rather than derived from ``max_retries``.
 
         Returns:
           Never returns.
@@ -624,7 +802,7 @@ class HTTPSink:
         """
         with self._counter_lock:
             self.failed += 1
-        detail = f"{type(self).__name__}, {self.max_retries + 1} attempt(s), {reason}"
+        detail = f"{type(self).__name__}, {attempts} attempt(s), {reason}"
         _diag.lost("request", 1, detail)
         raise SinkDeliveryError(detail)
 

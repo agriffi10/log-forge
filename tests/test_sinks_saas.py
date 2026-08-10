@@ -199,3 +199,44 @@ def test_splunk_splits_a_batch_and_keeps_concatenated_hec_envelopes() -> None:
             assert set(envelope) >= {"event", "time", "source"}
             total += 1
     assert total == 1000, "HEC stays concatenated JSON objects, one per event, across chunks"
+
+
+def test_every_platform_sink_carries_the_limits_its_docstring_cites() -> None:
+    """AC-1/AC-5. The constants are the contract; without this only Datadog's were pinned.
+
+    Mutating `ElasticsearchSink.MAX_BATCH_BYTES` from 10 MB to 100 MB, `LokiSink`'s from 4 MB to
+    400 MB, or `NewRelicSink`'s down to 100 KB all left the suite green, because the chunking
+    tests pass explicit `max_batch_*` arguments and never exercise the class attributes. The
+    literals here are transcribed from each docstring's cited figure, not read back from the
+    class, so a constant that drifts from its citation fails.
+    """
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+    from log_foundry.sinks.loki import LokiSink
+
+    assert (DatadogSink.MAX_BATCH_COUNT, DatadogSink.MAX_BATCH_BYTES) == (1000, 5_000_000)
+    assert DatadogSink.MAX_EVENT_BYTES == 1_000_000, "its documented single-log cap"
+    assert (NewRelicSink.MAX_BATCH_COUNT, NewRelicSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (HoneycombSink.MAX_BATCH_COUNT, HoneycombSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (SplunkHECSink.MAX_BATCH_COUNT, SplunkHECSink.MAX_BATCH_BYTES) == (1000, 1_000_000)
+    assert (LokiSink.MAX_BATCH_COUNT, LokiSink.MAX_BATCH_BYTES) == (1000, 4_000_000)
+    assert (ElasticsearchSink.MAX_BATCH_COUNT, ElasticsearchSink.MAX_BATCH_BYTES) == (
+        1000,
+        10_000_000,
+    )
+    assert OpenSearchSink.MAX_BATCH_BYTES == ElasticsearchSink.MAX_BATCH_BYTES, (
+        "OpenSearch reuses the bulk protocol verbatim, limits included"
+    )
+
+
+def test_datadog_drops_an_event_over_its_single_log_cap_though_the_payload_would_fit() -> None:
+    """The one sink whose per-event limit is stricter than its request limit.
+
+    A 2 MB event sits inside the 5 MB payload budget and is rejected by the 1 MB per-log cap —
+    a limit the request budget cannot see, so before `MAX_EVENT_BYTES` it went on the wire.
+    """
+    opener = FakeOpener()
+    sink = DatadogSink("key", opener=opener)
+    sink.emit([{"a": 1}, {"pad": "x" * 2_000_000}, {"b": 2}])
+    assert sink.dropped_oversized == 1
+    entries = [entry for call in opener.calls for entry in json.loads(call["body"])]
+    assert len(entries) == 2, "the two ordinary events still ship"

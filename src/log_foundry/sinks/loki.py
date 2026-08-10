@@ -11,6 +11,14 @@ __all__ = ["LokiSink"]
 
 _PUSH_PATH = "/loki/api/v1/push"
 
+_STREAM_FRAMING = 24
+"""Bytes of per-stream and per-value framing charged to each item (SPEC-038 FR-001).
+
+``{"stream":,"values":[]}`` is 23 characters around one label map, plus one for the comma that
+joins the value to its neighbour. Charged per item rather than per stream because the chunker
+measures items and cannot know how they will group.
+"""
+
 
 class LokiSink(HTTPSink):
     """POSTs a Loki push payload of streams, labels and nanosecond values (FR-004).
@@ -71,6 +79,49 @@ class LokiSink(HTTPSink):
           TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
         return json.dumps([str(epoch_nanos(event.get("timestamp"))), json.dumps(event)])
+
+    def _item_size(self, rendered: str, event: dict[str, object]) -> int:
+        """Charges the event its value bytes *and* the stream framing its labels may cost.
+
+        The inherited accounting charges one separator per item, which is right for a body that
+        concatenates. Loki's does not: it wraps each label set in ``{"stream":…,"values":[…]}``,
+        so a chunk's body grows with the number of distinct label sets in it, not just with the
+        values. Measured before this, 4,000 events carrying a per-pod ``service`` label produced
+        a body 61% past the budget.
+
+        Charging every item for a whole stream header over-counts whenever events share a label
+        set, which is the safe direction: it yields more requests than strictly needed rather
+        than one the destination rejects.
+
+        Args:
+          rendered: The event's serialized push value.
+          event: The source event, whose labels set the framing cost.
+
+        Returns:
+          The bytes to charge the chunker.
+
+        Raises:
+          None.
+        """
+        labels = json.dumps(self._labels_of(event))
+        return len(rendered.encode("utf-8")) + len(labels.encode("utf-8")) + _STREAM_FRAMING
+
+    def _body_reserve(self) -> int:
+        """Withholds the ``{"streams":[…]}`` wrapper, which no item is charged for.
+
+        Fourteen bytes, and not the inherited JSON-array reserve of one: this body is an object
+        wrapping an array, not the bare array ``body_format="json_array"`` otherwise implies.
+
+        Args:
+          None.
+
+        Returns:
+          The bytes to withhold from the chunker's budget.
+
+        Raises:
+          None.
+        """
+        return 14
 
     def _labels_of(self, event: dict[str, object]) -> dict[str, str]:
         """Promotes the configured event keys to stream labels.

@@ -75,18 +75,59 @@ def _sink_class_nodes() -> dict[str, tuple[str, ast.ClassDef]]:
 
 
 def _base_names(cls: ast.ClassDef) -> list[str]:
-    """The immediate base-class names of a class node, ignoring anything not a plain name.
+    """The immediate base-class names of a class node, however the base is spelled.
+
+    `ast.Attribute` is resolved to its final attribute, so `class X(http.HTTPSink)` is seen as
+    inheriting `HTTPSink`. Reading only `ast.Name` was a hole in exactly the direction the lint
+    exists to cover: the person adding a sixth platform sink is the person most likely to write
+    the qualified form, and a bare-`Name` reading made their `emit` override invisible.
 
     Args:
       cls: The class node.
 
     Returns:
-      The base names, which are bare identifiers for every sink in this package.
+      The base names.
 
     Raises:
       None.
     """
-    return [b.id for b in cls.bases if isinstance(b, ast.Name)]
+    names: list[str] = []
+    for base in cls.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
+
+
+def test_every_sink_base_resolves_to_a_name_this_scan_can_follow() -> None:
+    """The resolver handles `Name` and `Attribute`; anything else would be invisible to it.
+
+    Subscripted or call-expression bases (`Generic[T]`, a class factory) resolve to neither, so
+    a sink written that way would silently leave every roster in this file. None exists today,
+    which is what makes this assertable rather than aspirational.
+    """
+    exotic = [
+        f"{stem}.{cls.name} -> {ast.dump(base)[:60]}"
+        for stem, cls in _sink_class_nodes().values()
+        for base in cls.bases
+        if not isinstance(base, ast.Name | ast.Attribute)
+    ]
+    assert not exotic, f"a sink base this scan cannot resolve: {exotic}"
+
+
+def test_no_two_sink_classes_share_a_name() -> None:
+    """`_sink_class_nodes` keys by bare class name, which is only sound while they are unique."""
+    seen: dict[str, str] = {}
+    duplicates: list[str] = []
+    for path in sorted(_SINK_PKG.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                if node.name in seen:
+                    duplicates.append(f"{node.name}: {seen[node.name]} and {path.stem}")
+                seen[node.name] = path.stem
+    assert not duplicates, f"the name-keyed node map would silently lose one: {duplicates}"
 
 
 def _defines_or_inherits_emit(cls: ast.ClassDef, nodes: dict[str, tuple[str, ast.ClassDef]]) -> bool:
@@ -209,14 +250,23 @@ def _http_sink_subclasses() -> list[tuple[str, ast.ClassDef]]:
     return found
 
 
-def test_the_http_subclass_roster_is_not_empty() -> None:
+def test_the_http_subclass_roster_holds_every_shipped_platform_sink() -> None:
     """SPEC-038 FR-001 AC-1a. The lint below is negative, so an empty roster would satisfy it.
 
-    Six subclasses ship today. The floor is deliberately below that -- this guards against the
-    resolver collapsing, not against a sink being retired.
+    Named rather than counted. A floor set below the real number lets subclasses leave silently,
+    which is the failure this whole roster exists to prevent -- and `_base_names` resolving only
+    bare `ast.Name` was a live mechanism for exactly that, since a base written `http.HTTPSink`
+    was invisible to it. Naming them means a retired sink has to be removed here deliberately.
     """
-    roster = _http_sink_subclasses()
-    assert len(roster) >= 5, f"the HTTPSink subclass roster collapsed to {sorted(roster)}"
+    assert {f"{stem}.{cls.name}" for stem, cls in _http_sink_subclasses()} == {
+        "datadog.DatadogSink",
+        "elasticsearch.ElasticsearchSink",
+        "elasticsearch.OpenSearchSink",
+        "honeycomb.HoneycombSink",
+        "loki.LokiSink",
+        "newrelic.NewRelicSink",
+        "splunk.SplunkHECSink",
+    }
 
 
 def test_no_http_sink_subclass_overrides_emit() -> None:

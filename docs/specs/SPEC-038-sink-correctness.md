@@ -119,7 +119,19 @@ below the chunk loop entirely.
 - [x] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
       hierarchy rather than a list, so a later platform sink cannot silently bypass the chunking.
       `tests/test_public_surface.py`, resolving bases transitively so a subclass two levels down
-      is in scope. It has a non-empty guard beside it, because the assertion is negative.
+      is in scope, and resolving an `ast.Attribute` base as well as an `ast.Name` — review
+      demonstrated the bypass by adding a sink spelled `class ProbeSink(http.HTTPSink)` with an
+      `emit` override, which the whole file passed. The roster is **named rather than counted**,
+      since a floor set below the real number is a second way for a subclass to leave silently.
+- [x] AC-1b (**added during the build**): **the two rosters agree about scope, and both can say
+      when they shrink.** Moving five `emit`s into the base dropped those classes out of
+      `test_sink_concurrency.py`'s concurrency and post-close lints as well — 34 classes to 29,
+      in the same commit, with the suite green. Only the sibling roster in
+      `test_public_surface.py` noticed, and only because it carries a floor guard. Both now scope
+      on *defines or inherits*, a class that overrides neither `emit` nor `close` may answer from
+      the ancestor whose code it actually runs, and this file has a floor guard too. That is the
+      SPEC-032 lesson arriving a third time: the lint that catches a roster shrinking is worth
+      more than the roster.
 - [x] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
       each within both limits. This is the reproduction, run against `http.server`.
 - [x] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
@@ -133,6 +145,21 @@ below the chunk loop entirely.
       `splittable=` flag: `SentrySink` sends one envelope per event and has nothing left to split,
       so it keeps the counted, announced abandonment it has always had rather than being handed an
       uncounted exception, which would have been a new silent loss.
+
+      **Three corrections from review, each measured** (2026-08-10):
+      - *The halving is bounded.* Unbounded it is `2N-1` requests — **11,954 measured** for one
+        5,980-event exit backlog against an endpoint answering 413 unconditionally, on the single
+        drain thread at the moment a process exits, and **47,816** across the worker's retries.
+        `MAX_SPLIT_DEPTH` caps the cascade, a shutdown ends it, and what it cannot place is
+        abandoned and counted.
+      - *A permanent drop is settled, not failed.* Returning "not delivered" made `emit` raise, so
+        the worker re-ran the whole cascade and re-dropped the same events: `losses().dropped`
+        read **23,920 for 5,980 events lost**, against a counter whose contract — unlike
+        `failed`'s — is an exact count. A 413 no retry can fix now settles the chunk, matching
+        both `_items`' own oversize drop and `KinesisSink`.
+      - *The clause was unfalsifiable.* Adding 413 to the retryable set beside 429 left all 1,326
+        tests green, because every 413 test ran at `max_retries=0`. Now asserted on the request
+        count with retries switched on.
 - [x] AC-5: The per-platform limits are cited to their documentation in each subclass docstring —
       **and where the vendor publishes none, the docstring says so and names the value as this
       library's own choice.** Datadog (1,000 / 5 MB), New Relic (1 MB per POST) and Honeycomb

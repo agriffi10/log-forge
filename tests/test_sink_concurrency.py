@@ -624,6 +624,21 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
     can satisfy it. ``AsyncFunctionDef`` is walked alongside ``FunctionDef`` so a future async
     sink cannot drop out of scope silently.
 
+    **A class that *inherits* one of the three is in scope too** (SPEC-038 FR-001). Keying on
+    definition alone made scope a function of where a method happens to sit, and moving the five
+    `HTTPSink` subclasses' `emit` up into their base dropped all five out of both lints in a
+    single commit -- 34 classes to 29 -- with the suite green. The sibling roster in
+    `test_public_surface.py` shrank identically and was caught only because it carries a floor
+    guard; this one had none, so the same shrink was silent here. It has one now.
+
+    The earlier docstring argued that an inheriting subclass "inherits both the guard and the
+    answer". That is right, and it is why scope widening does not mean duplicated claims: a class
+    that overrides **neither** `emit` nor `close` runs its parent's code, so it may satisfy the
+    lints from an ancestor's docstring, which `_effective_decision_doc` resolves during this
+    scan. What changed is that being *in scope* no longer depends on where a method happens to
+    sit -- a class that takes ownership of `emit` or `close` must state its own decision, and a
+    class that adds nothing is judged by the answer it actually inherits rather than by nobody.
+
     Args:
       root: The directory to scan, defaulting to the installed ``sinks/``. A test passes a
         temporary directory to exercise the lints end to end against a real module, which is
@@ -641,21 +656,131 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
 
     if root is None:
         root = pathlib.Path(log_foundry.__file__).parent / "sinks"
-    found: list[tuple[str, ast.ClassDef]] = []
+    nodes: dict[str, ast.ClassDef] = {}
+    ordered: list[tuple[str, ast.ClassDef]] = []
     for path in sorted(root.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        found.extend(
-            (path.stem, node)
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and not (path.stem == "base" and node.name == "Sink")
-            and any(
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                nodes[node.name] = node
+                ordered.append((path.stem, node))
+
+    def _implements(cls: ast.ClassDef) -> bool:
+        seen: set[str] = set()
+        queue = [cls]
+        while queue:
+            current = queue.pop()
+            if any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
                 and m.name in ("emit", "send_all", "close")
-                for m in node.body
-            )
+                for m in current.body
+            ):
+                return True
+            for base in current.bases:
+                if isinstance(base, ast.Name) and base.id in nodes and base.id not in seen:
+                    seen.add(base.id)
+                    queue.append(nodes[base.id])
+        return False
+
+    def _owns_delivery(cls: ast.ClassDef) -> bool:
+        return any(
+            isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+            and m.name in ("emit", "send_all", "close")
+            for m in cls.body
         )
-    return found
+
+    def _effective_decision_doc(cls: ast.ClassDef) -> str:
+        """The docstring a decision may be read from: the class's, plus inherited ancestors'."""
+        texts = [ast.get_docstring(cls) or ""]
+        if not _owns_delivery(cls):
+            seen: set[str] = set()
+            queue = [b.id for b in cls.bases if isinstance(b, ast.Name)]
+            while queue:
+                name = queue.pop()
+                if name in seen or name not in nodes:
+                    continue
+                seen.add(name)
+                texts.append(ast.get_docstring(nodes[name]) or "")
+                queue.extend(b.id for b in nodes[name].bases if isinstance(b, ast.Name))
+        return " ".join(" ".join(text.split()) for text in texts)
+
+    in_scope = [
+        (stem, cls)
+        for stem, cls in ordered
+        if not (stem == "base" and cls.name == "Sink") and _implements(cls)
+    ]
+    stem_of = {id(cls): stem for stem, cls in ordered}
+    for _stem, cls in in_scope:
+        cls.lf_decision_doc = _effective_decision_doc(cls)  # type: ignore[attr-defined]
+        inherited: list[str] = []
+        if not _owns_delivery(cls):
+            seen = set()
+            queue = [b.id for b in cls.bases if isinstance(b, ast.Name)]
+            while queue:
+                name = queue.pop()
+                if name in seen or name not in nodes:
+                    continue
+                seen.add(name)
+                ancestor = nodes[name]
+                inherited.append(f"{stem_of[id(ancestor)]}.{name}")
+                queue.extend(b.id for b in ancestor.bases if isinstance(b, ast.Name))
+        cls.lf_inherited = inherited  # type: ignore[attr-defined]
+    return in_scope
+
+
+def _covering_names(stem: str, cls: ast.ClassDef) -> list[str]:
+    """The qualified names whose post-close case covers this class: its own, plus inherited ones.
+
+    A subclass that overrides neither ``emit`` nor ``close`` executes its ancestor's, so an
+    ancestor's registered double exercises this class's behaviour too -- `RedisListSink` is the
+    case in point, since `POST_CLOSE_BUILDERS` registers `redis._RedisSink` and the builder it
+    names constructs a `RedisListSink`.
+
+    Args:
+      stem: The class's module stem.
+      cls: The class node.
+
+    Returns:
+      Qualified names to look for in ``POST_CLOSE_BUILDERS``, own name first.
+
+    Raises:
+      None.
+    """
+    return [f"{stem}.{cls.name}", *getattr(cls, "lf_inherited", [])]
+
+
+def _decision_doc(cls: ast.ClassDef) -> str:
+    """The whitespace-normalized docstring text a lint may read a recorded decision from.
+
+    Falls back to the class's own docstring for a node the scan did not annotate, which is what
+    the synthetic-class tests below build.
+
+    Args:
+      cls: The class node.
+
+    Returns:
+      The text, whitespace-normalized so a claim wrapping across lines still matches.
+
+    Raises:
+      None.
+    """
+    annotated = getattr(cls, "lf_decision_doc", None)
+    if annotated is not None:
+        return str(annotated)
+    return " ".join((ast.get_docstring(cls) or "").split())
+
+
+def test_the_sink_roster_is_not_empty_and_has_not_collapsed() -> None:
+    """SPEC-038 FR-001. Both lints below are negative, and an empty roster satisfies a negative.
+
+    This file's roster shrank 34 -> 29 in one commit, silently, when five `HTTPSink` subclasses
+    stopped defining `emit`. `test_public_surface.py`'s equivalent shrank by exactly the same
+    five and failed loudly -- because it had a floor and this did not. The asymmetry was the
+    whole bug: two rosters over one package, disagreeing about scope, with only one able to say
+    so.
+    """
+    roster = _sink_classes_with_an_emit()
+    assert len(roster) >= 34, f"the sink roster collapsed to {len(roster)}: {sorted(roster)}"
 
 
 def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
@@ -688,12 +813,13 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
             for m in cls.body
             if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
         }
-        emit = helpers.get("emit") or helpers["send_all"]
-
-        if _takes_the_transport_lock(emit, helpers, {emit.name}):
+        # A class inheriting its emit has no body to inspect: it runs its ancestor's, which is
+        # judged on its own account, and `_decision_doc` lets it answer from that ancestor.
+        emit = helpers.get("emit") or helpers.get("send_all")
+        if emit is not None and _takes_the_transport_lock(emit, helpers, {emit.name}):
             continue
-        # Whitespace-normalized: the claim routinely wraps across lines in a real docstring.
-        documented = " ".join((ast.get_docstring(cls) or "").split())
+        # Whitespace-normalized, and including any ancestor whose emit/close this class runs.
+        documented = _decision_doc(cls)
         if "**no** transport lock" in documented and "SPEC-028 FR-002" in documented:
             continue
         undecided.append(f"{stem}.{cls.name}")
@@ -1136,9 +1262,9 @@ def _undecided_post_close(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
     undecided = []
     for stem, cls in entries:
         name = f"{stem}.{cls.name}"
-        if name in POST_CLOSE_BUILDERS:
+        if any(covering in POST_CLOSE_BUILDERS for covering in _covering_names(stem, cls)):
             continue
-        documented = " ".join((ast.get_docstring(cls) or "").split())
+        documented = _decision_doc(cls)
         claimed = ACCEPTS_AFTER_CLOSE in documented and "SPEC-032 FR-003" in documented
         barred = _may_not_claim_it_accepts(cls)
         if claimed and barred is None:

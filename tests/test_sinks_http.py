@@ -15,8 +15,8 @@ import urllib.error
 
 import pytest
 
-from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
+from log_foundry.sinks.http import MAX_SPLIT_DEPTH, HTTPSink
 
 
 class FakeResponse:
@@ -262,23 +262,77 @@ def test_a_413_is_split_rather_than_retried_and_the_halves_land() -> None:
     )
     sink = HTTPSink("http://x", max_retries=3, opener=opener)
     sink.emit([{"a": i} for i in range(4)])
-    accepted = [body for body in opener.calls if body.count(b"\n") <= 2]
-    delivered = [line for body in accepted for line in body.decode().splitlines()]
+    assert len(opener.calls) == 3, (
+        "the whole chunk once, then each half once. A 413 must NOT join the retryable set: "
+        "re-sending identical bytes can only earn the same answer, and the wait before each "
+        f"re-send holds the one drain thread. Got {len(opener.calls)} requests"
+    )
+    delivered = [line for body in opener.calls[1:] for line in body.decode().splitlines()]
     assert sorted(delivered) == [f'{{"a": {i}}}' for i in range(4)], (
         "every event reaches the wire exactly once, in smaller requests"
     )
     assert sink.failed == 0, "a split that delivers is not a failure"
 
 
+def test_a_413_is_never_retried_even_when_retries_are_available() -> None:
+    """AC-4's central clause, asserted on the request count with retries switched on.
+
+    Without this the clause is unfalsifiable: adding 413 to the retryable set beside 429 left
+    the entire suite green, because the other 413 tests all run at `max_retries=0` and so cannot
+    distinguish "not retried" from "no retries configured". This is the SyslogSink pathology
+    FR-007 objects to — futile re-sends with backoff on the single drain thread — reached from
+    the other direction.
+    """
+    opener = FakeOpener([FakeResponse(413, b"")])
+    sink = HTTPSink("http://x", max_retries=5, opener=opener)
+    sink.emit([{"a": 1}])
+    assert len(opener.calls) == 1, (
+        f"one event, one 413, one request — got {len(opener.calls)}, so 413 is being retried"
+    )
+    assert sink.dropped_oversized == 1
+
+
 def test_a_413_for_one_event_is_dropped_rather_than_split_forever(capsys) -> None:
-    """AC-4. Halving terminates at one event, which is then permanently too large."""
+    """AC-4. Halving terminates at one event, which is then permanently too large.
+
+    It does **not** raise. A permanent drop is *settled*: no retry can improve on it, so sending
+    the worker round again only re-runs the whole cascade and re-counts the same events. Before
+    that distinction, a wholly-413 batch reported `losses().dropped` at four times the number of
+    events actually lost — once per worker attempt — against a counter whose contract, unlike
+    `failed`'s, is an exact count rather than an upper bound.
+    """
     opener = FakeOpener([FakeResponse(413, b"")])
     sink = HTTPSink("http://x", max_retries=0, opener=opener)
-    with pytest.raises(SinkDeliveryError):
-        sink.emit([{"a": 1}, {"a": 2}])
-    assert sink.dropped_oversized == 2
+    sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_oversized == 2, "each event counted once, not once per worker attempt"
     assert len(opener.calls) == 3, "the whole chunk, then each half once -- never a re-send loop"
     assert "HTTP 413" in capsys.readouterr().err
+
+
+def test_a_permanently_dropped_batch_does_not_send_the_worker_round_again() -> None:
+    """The counter consequence of AC-4, asserted where it is observable: no raise, one count."""
+    opener = FakeOpener([FakeResponse(413, b"")])
+    sink = HTTPSink("http://x", max_retries=0, opener=opener)
+    for _ in range(4):  # what the worker's retry would have done
+        sink.emit([{"a": 1}, {"a": 2}])
+    assert sink.dropped_oversized == 8, "four deliberate emits, two events each"
+    assert sink.losses().failed == 0, "a permanent drop is not an abandoned request"
+
+
+def test_a_chunk_still_refused_after_the_split_bound_is_abandoned_not_halved_forever() -> None:
+    """AC-4. Halving is a correction for a slightly-too-large budget, not an unbounded search.
+
+    Against an endpoint that answers 413 unconditionally the recursion is 2N-1 requests — 11,954
+    measured for one 5,980-event exit backlog, on the single drain thread, at the moment a
+    process is exiting. The depth cap turns that into a bounded cascade and one abandonment.
+    """
+    opener = FakeOpener([FakeResponse(413, b"")])
+    sink = HTTPSink("http://x", max_retries=0, opener=opener)
+    sink.emit([{"a": i} for i in range(1000)])
+    assert len(opener.calls) <= 2 ** (MAX_SPLIT_DEPTH + 1) - 1, (
+        f"the split cascade was not bounded: {len(opener.calls)} requests"
+    )
+    assert sink.dropped_oversized == 1000, "every event is accounted for exactly once"
 
 
 def test_a_413_is_not_split_for_a_caller_that_cannot_split(capsys) -> None:
@@ -342,3 +396,47 @@ def test_six_thousand_events_in_one_emit_become_many_bounded_real_requests() -> 
     assert max(received) <= 1000, f"a request exceeded the count limit: {max(received)}"
     assert max(len(body) for body in bodies) <= 100_000, "a request exceeded the byte limit"
     assert sink.failed == 0 and sink.dropped_oversized == 0
+
+
+def test_a_batch_of_wholly_oversized_events_reports_success_and_makes_no_request() -> None:
+    """The oversize drop is not a delivery failure, so it must not send the worker round again.
+
+    Consistent with `SQSSink`/`KinesisSink`: an event no request can carry is counted through
+    `losses().dropped` and reported there, not raised. Stated here because `emit` returns before
+    the chunk loop in this case, so no `chunks`/`settled` bookkeeping runs at all.
+    """
+    opener = FakeOpener()
+    sink = HTTPSink("http://x", max_batch_bytes=50, opener=opener)
+    sink.emit([{"pad": "x" * 200} for _ in range(3)])
+    assert opener.calls == [], "nothing could be sent"
+    assert sink.dropped_oversized == 3
+    assert sink.losses() == SinkLosses(dropped=3, failed=0)
+
+
+def test_the_per_item_separator_is_charged_so_an_ndjson_body_stays_within_budget() -> None:
+    """`_Item.size` charges one byte per item for the separator; without it a body overruns.
+
+    The overrun is bounded by `max_batch_count` bytes, which is why it survived every other
+    assertion here — every one of them had slack larger than the item count.
+    """
+    opener = FakeOpener()
+    events = [{"a": i} for i in range(20)]
+    exact = sum(len(json.dumps(event).encode()) + 1 for event in events)
+    sink = HTTPSink("http://x", max_batch_bytes=exact, opener=opener)
+    sink.emit(events)
+    assert len(opener.calls) == 1, "the budget is exactly one body's worth"
+    assert len(opener.calls[0]["body"]) == exact, (
+        "an NDJSON body is exactly the sum of the item sizes: each event plus its newline"
+    )
+
+
+def test_a_json_array_body_never_exceeds_the_budget_at_an_exact_fit() -> None:
+    """The array's brackets are body framing no item is charged for, so they are reserved."""
+    opener = FakeOpener()
+    events = [{"a": i} for i in range(20)]
+    exact = sum(len(json.dumps(event).encode()) + 1 for event in events)
+    sink = HTTPSink("http://x", body_format="json_array", max_batch_bytes=exact, opener=opener)
+    sink.emit(events)
+    assert all(len(call["body"]) <= exact for call in opener.calls), (
+        f"a json_array body ran past the budget: {[len(c['body']) for c in opener.calls]}"
+    )

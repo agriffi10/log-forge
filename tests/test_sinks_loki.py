@@ -102,3 +102,39 @@ def test_a_chunk_holding_two_label_sets_still_carries_two_streams() -> None:
     )
     streams = json.loads(opener.calls[0]["body"])["streams"]
     assert sorted(stream["stream"]["service"] for stream in streams) == ["api", "worker"]
+
+
+def test_the_budget_holds_when_every_event_lands_in_its_own_stream() -> None:
+    """SPEC-038 FR-001. The regime the shared-label test above can never enter.
+
+    Loki's body wraps each distinct label set in `{"stream":{…},"values":[…]}`, so a chunk grows
+    with the number of *streams* in it, not just with the values. Charging only the value bytes
+    produced a body 61-68% past the budget at high label cardinality; with one shared label set
+    the same overshoot is a ~50-byte constant, which is why an assertion written that way passes
+    on granularity luck rather than on the accounting being right.
+    """
+    opener = FakeOpener()
+    budget = 20_000
+    sink = LokiSink("http://loki:3100", max_batch_bytes=budget, opener=opener)
+    sink.emit([{"service": f"pod-{i}", "n": i, "pad": "x" * 200} for i in range(400)])
+
+    oversize = [len(call["body"]) for call in opener.calls if len(call["body"]) > budget]
+    assert not oversize, f"bodies past the {budget}-byte budget: {oversize}"
+    values = [
+        value
+        for call in opener.calls
+        for stream in json.loads(call["body"])["streams"]
+        for value in stream["values"]
+    ]
+    assert len(values) == 400, "and every event still went exactly once"
+    assert len({json.loads(line)["service"] for _ts, line in values}) == 400
+
+
+def test_the_budget_holds_for_a_label_value_large_enough_to_dominate_the_body() -> None:
+    """A long label is charged too: it is repeated in full in every stream header it appears in."""
+    opener = FakeOpener()
+    budget = 8_000
+    sink = LokiSink("http://loki:3100", max_batch_bytes=budget, opener=opener)
+    sink.emit([{"service": f"{'s' * 500}-{i}", "n": i} for i in range(40)])
+    oversize = [len(call["body"]) for call in opener.calls if len(call["body"]) > budget]
+    assert not oversize, f"bodies past the {budget}-byte budget: {oversize}"
