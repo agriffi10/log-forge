@@ -211,7 +211,15 @@ never converging. Every other size-limited sink drops-and-counts before sending.
 #### Acceptance Criteria:
 
 - [x] AC-1: An event over the datagram limit is dropped before the send and counted
-      `dropped_oversized`.
+      `dropped_oversized` — **exactly once per emit, and that is not the same as once per
+      event.** If a batch holds an oversized frame *and* its sendable remainder then fails
+      totally, the emit raises, the worker retries the whole batch, and the filter re-frames and
+      re-drops the same event once per attempt — up to four times for one unsendable frame.
+      `dropped` is an exact count everywhere else in the library, so the departure is recorded
+      here rather than only at the drop site. Nothing in the sink can fix it: the worker owns the
+      retry and hands back the original events, so the sink cannot know it has seen them before.
+      `FirehoseSink._records` and `KinesisSink._records` have the same shape and predate this FR,
+      which is why a fix belongs one level up if it is ever taken.
 - [x] AC-2: The limit is configurable with a documented default (~64 KB for UDP), and TCP is
       unaffected.
 - [x] AC-3: The retry loop no longer treats a permanent `errno` as transient. The permanent set

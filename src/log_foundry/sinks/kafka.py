@@ -54,8 +54,11 @@ class KafkaSink:
     serviced by ``poll()`` and ``flush()``.
 
     The worst case (SPEC-027 FR-005) is not a retry loop — this sink has none — but its
-    ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent from ``shutdown()``'s own
-    budget because ``Worker.shutdown`` closes the live sink inline (arch §13).
+    ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent **beside**
+    ``shutdown()``'s budget rather than from it. ``Worker.shutdown`` joins the drain thread
+    against its deadline and *then* closes the sink inline with no remaining-budget argument
+    (arch §13), so the two add up: measured, ``shutdown(timeout=2.0)`` against a dead broker
+    takes 10.01 s.
 
     Attributes:
       flush_timeout: Seconds :meth:`close` waits for the producer to drain.
@@ -238,8 +241,9 @@ class KafkaSink:
         They were not: ``produce()`` is a local hand-off and ``flush()`` is the only thing that
         drains the producer's batch, so with the stop event set — which it always is by the time
         ``close()`` runs, since ``Worker.shutdown`` sets it *before* the join — Kafka's exit
-        delivery was switched off entirely. Measured through a real ``shutdown()``: nine buffered
-        messages, ``flush(0)``, **zero delivered**, all nine booked as ``failed``. That is worse
+        delivery was switched off entirely. Measured through a real ``shutdown()``: eleven buffered
+        messages — nine ``info()`` calls plus the span's start and end — ``flush(0)``, **zero
+        delivered**, all eleven booked as ``failed``. That is worse
         than the hang this bound exists to fix, and it is the same mistake FR-001 AC-4a records
         for ``HTTPSink`` — skipping *work* during the exit drain, rather than skipping a *wait*.
 
