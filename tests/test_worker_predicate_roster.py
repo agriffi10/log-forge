@@ -104,7 +104,13 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "_live_worker(), because both of those questions have to be answered and a helper "
             "that folds retirement into None collapses them into one: a retired worker still "
             "needs its queue replaced, which is what stops the child's next submit blocking on "
-            "an inherited queue.Queue mutex."
+            "an inherited queue.Queue mutex. **This is the first binding on the roster that "
+            "feeds two categories**, and the category filed is the first question it answers "
+            "rather than a claim that the second is the same. _worker_health's rule - each "
+            "binding classified by the one question it feeds - was written where two questions "
+            "had two bindings, because the second read a different object; here there is one "
+            "object and no second binding to invent honestly. Filing it still does the work a "
+            "binding row is for: rebinding changes this text and the stale-row check fires."
         ),
     ),
     ("_rebuild_worker_after_fork", "worker is None", 0): (

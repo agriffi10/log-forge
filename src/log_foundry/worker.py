@@ -269,13 +269,16 @@ class Worker:
         that field as "the drain thread died", and this child's drain thread is about to be
         running — the alternative reads as the more honest one and is not.
 
-        The two drain events are **cleared** rather than replaced, and the stop signal is
-        re-offered. Clearing keeps ``draining`` and ``flush``'s gate describing the thread
-        starting here rather than the one that did not survive the fork, and preserves the
-        identity anything else holding them relies on. The re-offer covers the sink the fork
-        walk cannot reach: a **third-party** sink is outside its ownership boundary, so it would
-        keep pointing at the pre-fork event while this worker sets a new one — SPEC-027's
-        guarantee broken by the repair meant to preserve it.
+        The two drain events are **set or cleared to match what this child will actually do**,
+        never simply inherited. Resuming clears them, so ``draining`` and ``flush``'s gate
+        describe the thread starting here rather than the one that did not survive the fork;
+        retiring **sets** them, because no thread will ever set them and a child forked while a
+        ``shutdown()`` was mid-join otherwise inherits ``_drain_settled`` unset with nothing to
+        settle it — measured, that child paid the whole 30 s budget at exit, and with
+        ``shutdown(timeout=None)`` it would never exit at all. The stop signal is re-offered for
+        the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
+        boundary, so it would keep pointing at the pre-fork event while this worker sets a new
+        one — SPEC-027's guarantee broken by the repair meant to preserve it.
 
         Args:
           resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
@@ -295,6 +298,8 @@ class Worker:
         self.incomplete_swaps = 0
         self.stopped_reason = None
         if not resume:
+            self._drain_finished.set()
+            self._drain_settled.set()
             return
         self._drain_finished.clear()
         self._drain_settled.clear()

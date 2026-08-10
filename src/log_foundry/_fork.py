@@ -382,10 +382,17 @@ def _reinit_primitives() -> None:
 def register_child_handler(fn: Callable[[], None]) -> None:
     """Adds work to be done in a forked child, after its locks have been re-initialised.
 
-    A handler runs on the child's only thread with nothing else in flight, so it may take any
-    of the library's locks — that is precisely what the ordering in :func:`_reinit_after_fork`
-    buys it, and why registering is the only way in. It must not block: nothing has returned
-    from ``fork`` yet.
+    A handler may take any of the library's locks, which is what the ordering in
+    :func:`_reinit_after_fork` buys it and why registering is the only way in. What it must not
+    assume is that it is alone: handlers run in registration order and an earlier one may have
+    started a thread — ``decorator``'s rebuild does exactly that — so only the *first* runs in a
+    genuinely single-threaded child. None of them may block, since nothing has returned from
+    ``fork`` yet.
+
+    Registering the same function twice is a no-op. The exposure is the one :data:`_installed`
+    records for the fork registration itself: a reload of a module whose body registers here
+    would otherwise stack a second handler, and for the worker rebuild that means two drain
+    threads, the first bound to a queue nothing writes to.
 
     Args:
       fn: Called with no arguments in the child. A failure is absorbed and announced, and the
@@ -397,7 +404,8 @@ def register_child_handler(fn: Callable[[], None]) -> None:
     Raises:
       None.
     """
-    _child_handlers.append(fn)
+    if fn not in _child_handlers:
+        _child_handlers.append(fn)
 
 
 def _reinit_after_fork() -> None:
@@ -418,7 +426,10 @@ def _reinit_after_fork() -> None:
         traceback, carrying the message arch §6 keeps out of anything the library says about
         itself — and it would leave the rest of the repair undone. One handler's failure is
         absorbed separately from the rest for the same reason: a child that cannot rebuild its
-        worker should still have working locks.
+        worker should still have working locks. The list is iterated live rather than copied,
+        which is safe because CPython's list iterator is index-based, so a handler that
+        registers another simply causes it to run — and :func:`register_child_handler` is the
+        only writer, appending only.
     """
     try:
         _reinit_primitives()
