@@ -22,10 +22,12 @@ from __future__ import annotations
 import ast
 import collections
 import faulthandler
+import io
 import os
 import pathlib
 import select
 import signal
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -182,9 +184,10 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     gone = False
     try:
         while True:
-            if deadline - time.monotonic() <= 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            if not select.select([read_fd], [], [], deadline - time.monotonic())[0]:
+            if not select.select([read_fd], [], [], remaining)[0]:
                 continue
             chunk = os.read(read_fd, 65536)
             if not chunk:
@@ -403,6 +406,39 @@ def test_an_inherited_lock_is_dead_in_the_child() -> None:
         holder.join(5.0)
 
     assert child.output == "dead", child.output
+
+
+def test_a_failing_repair_is_absorbed_and_writes_no_message() -> None:
+    """SPEC-025. The handler runs on a thread that has not returned from ``fork`` yet.
+
+    An exception escaping it reaches CPython's unraisable hook, which prints a full traceback
+    carrying the exception's **message** — the user data arch §6 keeps out of anything the
+    library says about itself. Measured with the guard removed: a child's stderr carried the
+    provoking value verbatim, and the whole suite stayed green.
+
+    ``sys.stderr`` is replaced before the fork so the child inherits the buffer and can hand
+    back what the handler wrote. Patching it here rather than in a fixture is deliberate —
+    pytest's capture reverts a fixture's patch before the test body runs.
+    """
+    original = _fork._reinit_primitives
+
+    def boom() -> None:
+        raise RuntimeError("a-value-from-the-event-1234")
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    _fork._reinit_primitives = boom  # type: ignore[assignment]
+    sys.stderr = buffer
+    try:
+        child = run_in_child(buffer.getvalue, timeout=4)
+    finally:
+        sys.stderr = saved
+        _fork._reinit_primitives = original  # type: ignore[assignment]
+
+    assert child.finished, child.output
+    assert "a-value-from-the-event-1234" not in child.output
+    assert "RuntimeError" in child.output, child.output
+    assert "absorbed a failure while repairing the library after a fork" in child.output
 
 
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
@@ -1271,7 +1307,7 @@ def _forbidden_intra_package_imports(tree: ast.AST) -> list[str]:
 # — it asked whether the imported names *intersected* the allowed set, so a second package
 # import on the same line passed — and round 3 fixed the logic with no fixture to hold it, so
 # emptying the reader's body passed too. `_fork.py` holds one allowed import, which is exactly
-# one of the fourteen shapes below.
+# one of the shapes below.
 _IMPORT_SHAPES: list[tuple[str, bool]] = [
     ("from log_foundry import _diag", False),
     ("from log_foundry._diag import absorbed", False),

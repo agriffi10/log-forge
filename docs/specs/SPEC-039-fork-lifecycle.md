@@ -144,7 +144,13 @@ keyed on `_worker.sink is X` and `_lifecycle`'s registry stay valid across it.
 - [ ] AC-1: A child that logs after forking delivers those events.
 - [ ] AC-2: The child's queue starts **empty** and the parent keeps what was in flight, so events
       queued in the parent but undelivered at fork time are not delivered twice. A test asserts
-      the total across both processes.
+      the total across both processes. The queue **object** is replaced, never drained: a
+      `queue.Queue` builds its own mutex and three `Condition`s, which no lock rule over this
+      package can see and FR-003's traversal does not enter — measured in Phase 1, a fork with a
+      thread inside that mutex leaves the child's `submit()` blocked. Draining would keep it.
+      This is also why the *retired* path of AC-4 still needs the replacement: a retired worker
+      goes on accepting submissions (SPEC-030), so a child that logs after forking a retired
+      parent blocks on the same mutex.
 - [ ] AC-3: Counters are zeroed in the child — they describe a drain thread that no longer
       exists — and `health()` in the child describes the child.
 - [ ] AC-4: **A retired parent forks a retired child.** A fork does not undo a `shutdown()`, and
