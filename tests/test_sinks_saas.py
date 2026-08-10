@@ -13,7 +13,7 @@ from log_foundry.sinks.honeycomb import HoneycombSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
-from test_sinks_http import FakeOpener
+from test_sinks_http import FakeOpener, FakeResponse
 
 # --- FR-007: Datadog --------------------------------------------------------------------
 
@@ -240,3 +240,42 @@ def test_datadog_drops_an_event_over_its_single_log_cap_though_the_payload_would
     assert sink.dropped_oversized == 1
     entries = [entry for call in opener.calls for entry in json.loads(call["body"])]
     assert len(entries) == 2, "the two ordinary events still ship"
+
+
+def test_splunk_still_offers_an_event_whose_real_body_is_smaller_than_one_refused() -> None:
+    """The refusal shortcut must compare real bodies, not charged sizes.
+
+    `_item_size` charges a separator Splunk's concatenated body never writes, so a lone item's
+    real body is one byte *under* what it was charged. Splunk is the only shipped shape where the
+    delta is negative (measured: ndjson +0, json_array +1, Loki +13, Datadog +1, Splunk -1),
+    which is why it is the only one where "charged size >= a refused body" can be wrong.
+
+    The window is exactly one byte wide, so the fixture is built to sit in it and asserts that it
+    does — two events whose bodies differ by exactly one. With a wider gap the charged comparison
+    happens to give the right answer and the test would pass against the defect.
+    """
+    stamp = "2026-08-10T00:00:00.000Z"
+    events = [
+        {"timestamp": stamp, "pad": "x" * 31},
+        {"timestamp": stamp, "pad": "x" * 30},
+    ]
+    probe = SplunkHECSink("http://splunk:8088", "tok")
+    items = [probe._items([event])[0] for event in events]
+    bodies = [len(probe._body([item])[0]) for item in items]
+    assert bodies[0] - bodies[1] == 1, f"fixture must straddle the one-byte window: {bodies}"
+    assert items[1].size == bodies[0], (
+        "and the smaller event's *charged* size must equal the larger's real body, which is "
+        f"exactly the case the charged comparison gets wrong: {items[1].size} vs {bodies[0]}"
+    )
+
+    limit = bodies[1]
+    sent: list[int] = []
+
+    def opener(request, timeout=None):
+        sent.append(len(request.data))
+        return FakeResponse(413 if len(request.data) > limit else 200, b"")
+
+    sink = SplunkHECSink("http://splunk:8088", "tok", max_retries=0, opener=opener)
+    sink.emit(events)
+    assert limit in sent, f"the event whose body fits exactly was never offered; sent {sent}"
+    assert sink.dropped_oversized == 1, "only the genuinely oversized event is dropped"

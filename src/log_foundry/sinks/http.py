@@ -177,8 +177,7 @@ class HTTPSink:
     FR-004's rule. What bounds it is ``shutdown(timeout=)`` itself, plus
     ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the
     destination is what keeps the chunk count low in the first place. Nothing here *skips* work
-    because a shutdown is in
-    progress — a revision that did was measured to disable both retries and the ``413`` search
+    because a shutdown is in progress — a revision that did was measured to disable both retries and the ``413`` search
     for the whole of ``Worker._final_drain``, since the stop event is set before the join, losing
     events that had been delivering. The signal is read at exactly one site,
     :meth:`_sleep_backoff`, where SPEC-027 has it cut a *wait* short rather than cancel an
@@ -328,6 +327,8 @@ class HTTPSink:
                 if len(chunk) == 1:
                     self._drop_refused(chunk)
                     settled += 1
+                else:
+                    self._abandon_unreduced(chunk)
                 index += len(chunk)
                 continue
             chunks += 1
@@ -343,11 +344,20 @@ class HTTPSink:
         cheaper than discarding. The point is to stop the tail of a hopeless ``emit`` becoming
         one request per event once the budget has fallen below a single item.
 
+        The comparison builds the item's **real body** rather than reading its charged size,
+        because the two differ per body shape and one of them differs the wrong way: an item's
+        charged size includes a separator ``SplunkHECSink``'s concatenated body never writes, so
+        a lone item charged exactly ``refused_at`` builds a body one byte *smaller* than one
+        already refused. Measured, that discarded an event whose 144-byte body fitted a 144-byte
+        limit. The other shapes err the safe way (``+13`` for Loki, ``+1`` for a JSON array), but
+        "provably no smaller" has to be provable for all of them, and ``refused_at`` is itself a
+        body length — so comparing body lengths is the like-for-like test.
+
         **It is disabled under ``gzip``**, and that is the whole subtlety. ``_PayloadTooLarge``
         carries the *uncompressed* length, because that is what this sink measures and chunks by,
         while a gzipped request is judged by the destination on its compressed bytes. Compression
         ratio is per-event, so "larger uncompressed" stops implying "also refused": measured, one
-        incompressible event set the mark at 441 bytes and a 6,021-byte event that gzipped to 64
+        incompressible event set the mark at 532 bytes and a 6,020-byte event that gzipped to 64
         — against a 200-byte limit — was discarded without a single request being made. That is
         loss the library invented rather than loss it reported, which is what SPEC-025 and
         SPEC-026 exist to prevent, and it also inflated ``dropped``, whose contract is an exact
@@ -364,9 +374,9 @@ class HTTPSink:
         Raises:
           None.
         """
-        if self.gzip or refused_at is None or len(chunk) != 1:
+        if self.gzip or refused_at is None or refused_at <= 0 or len(chunk) != 1:
             return False
-        return chunk[0].size >= refused_at
+        return len(self._body(chunk)[0]) >= refused_at
 
     def _take(self, items: list[_Item], start: int, budget: int) -> list[_Item]:
         """Fills one chunk from ``start`` under the count limit and the current byte budget.
@@ -398,14 +408,47 @@ class HTTPSink:
             end += 1
         return items[start:end]
 
-    def _drop_refused(self, chunk: list[_Item]) -> None:
-        """Discards a single item the destination refuses at the smallest request possible.
+    def _abandon_unreduced(self, chunk: list[_Item]) -> None:
+        """Records a multi-item chunk the reduction budget could not shrink.
 
-        Only ever called with one item, which is what makes the drop honest: that event was
-        offered alone and refused, so it is permanently undeliverable here. It is counted against
-        ``dropped_oversized`` and the chunk reports *settled*, because a retry would re-run the
-        identical search and re-count the identical drops — that is why ``dropped`` can stay an
-        exact count while ``failed`` is only an upper bound.
+        It is counted against ``failed`` and announced, but **not** settled: those events were
+        never individually refused, so calling them permanent drops would invent loss, while
+        saying nothing at all would leave them invisible whenever a sibling chunk delivered and
+        ``emit`` therefore returned normally. Measured before this: 10 events in, 2 delivered,
+        8 gone, every counter at zero and stderr empty.
+
+        Reaching it needs a pathological ``_item_size`` — with the default one, a multi-item
+        chunk cannot survive ``MAX_BUDGET_REDUCTIONS`` halvings unless ``max_batch_count``
+        exceeds 33 million.
+
+        Args:
+          chunk: The events that could not be placed.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.failed += 1
+        _diag.lost(
+            "request",
+            1,
+            f"{type(self).__name__}, {len(chunk)} event(s) still 413 after "
+            f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the destination",
+        )
+
+    def _drop_refused(self, chunk: list[_Item]) -> None:
+        """Discards a single item this destination will not accept at any size available.
+
+        Only ever called with one item. It reaches here two ways: the item was offered alone and
+        answered ``413``, or :meth:`_known_refused` proved its body is no smaller than one this
+        ``emit`` has already had refused — in which case it was **never offered**, which is the
+        whole point of that shortcut. Either way it is permanently undeliverable here, so it is
+        counted against ``dropped_oversized`` and the chunk reports *settled*: a retry would
+        re-run the identical search and re-count the identical drops, which is why ``dropped``
+        can stay an exact count while ``failed`` is only an upper bound.
 
         A *multi*-item chunk reaching the end of the reduction budget is deliberately **not**
         routed here. It needs a pathological ``_item_size`` to happen at all (measured: an
@@ -427,7 +470,7 @@ class HTTPSink:
         _diag.lost(
             "event",
             len(chunk),
-            f"{type(self).__name__}, HTTP 413 at the smallest request this sink can build",
+            f"{type(self).__name__}, refused at the smallest request this sink can build",
         )
 
     def _items(self, batch: list[dict[str, object]]) -> list[_Item]:

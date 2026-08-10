@@ -163,12 +163,21 @@ below the chunk loop entirely.
         as an *uncompressed* length, because that is what this sink measures and chunks by, while
         a gzipped request is judged on its compressed bytes; compression ratio is per-event, so
         "larger uncompressed" stops implying "also refused". Measured: one incompressible event
-        set the mark at 441 bytes and a 6,021-byte event gzipping to 64 was discarded, against a
+        set the mark at 532 bytes and a 6,020-byte event gzipping to 64 was discarded, against a
         200-byte wire limit, with no request made — loss the library invented, and an inflation
         of `dropped`, whose contract is an exact count. The bound it buys is also only the
         uniform-size case: with strictly decreasing sizes every lone item is smaller than
-        anything yet refused, so the cost is O(N) — 507 requests for 500 events against 9
-        uniform. That is a property of a single low-water mark, and is recorded rather than fixed.
+        anything yet refused, so the cost is O(N) — ~512 requests for 500 events against 9
+        uniform. Under `gzip` the shortcut is off entirely, so that O(N) tail applies to *every*
+        size ordering. Both are properties of a single low-water mark, recorded rather than
+        fixed: the alternative measured out as inventing loss, and a 413 is not retried, so
+        there is no backoff multiplier on the extra requests.
+      - *The comparison is between **bodies**, not charged sizes.* `SplunkHECSink` charges each
+        item a separator its concatenated body never writes, so a lone item's real body is one
+        byte under what it was charged — the only shipped shape whose delta is negative — and an
+        item charged exactly the refused size built a body one byte *smaller* than one already
+        refused. Measured: an event whose 144-byte body fitted a 144-byte limit, discarded
+        unasked. Same species as the gzip hole, one byte wide.
       - *Only a lone item is ever dropped as permanently refused.* A multi-item chunk that
         exhausts the reduction budget — reachable only through a pathological `_item_size` —
         holds events that were never individually refused, so it is reported to the worker as a

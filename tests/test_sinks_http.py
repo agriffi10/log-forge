@@ -311,7 +311,7 @@ def test_a_413_for_one_event_is_dropped_rather_than_asked_about_twice(capsys) ->
         "smaller than one the destination has already refused in this emit, so asking again "
         "could only get the same answer"
     )
-    assert "HTTP 413" in capsys.readouterr().err
+    assert "refused at the smallest request" in capsys.readouterr().err
 
 
 def test_a_permanently_dropped_batch_does_not_send_the_worker_round_again() -> None:
@@ -607,5 +607,30 @@ def test_a_multi_item_chunk_at_the_reduction_bound_is_reported_not_discarded() -
     assert sink.dropped_oversized == 0, (
         "events refused only as part of a chunk are not permanent per-event drops"
     )
-    assert sink.losses().failed == 0, "nor abandoned requests; the batch itself is the failure"
+    assert sink.losses().failed > 0, (
+        "but they are counted and announced: leaving them silent hid 8 of 10 events whenever a "
+        "sibling chunk delivered and emit therefore returned normally"
+    )
     assert len(opener.calls) <= MAX_BUDGET_REDUCTIONS + 8, "and the search still terminated"
+
+
+def test_the_diagnostic_reports_the_attempts_actually_made(capsys) -> None:
+    """A non-retryable status abandons on the first request, and must say so.
+
+    Deriving the count from `max_retries` reported "4 attempt(s)" for an HTTP 400 that was sent
+    once. Nothing in the suite asserted an attempt count for this sink, so reverting the fix
+    passed all 1,346 tests.
+    """
+    opener = FakeOpener([FakeResponse(400, b"")])
+    sink = HTTPSink("http://x", max_retries=3, opener=opener)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert len(opener.calls) == 1, "400 is not retryable"
+    assert "1 attempt(s)" in capsys.readouterr().err
+
+    retried = FakeOpener([FakeResponse(500, b"")])
+    exhausted = HTTPSink("http://x", max_retries=2, opener=retried)
+    with pytest.raises(SinkDeliveryError):
+        exhausted.emit([{"a": 1}])
+    assert len(retried.calls) == 3
+    assert "3 attempt(s)" in capsys.readouterr().err, "and an exhausted retry reports all of them"
