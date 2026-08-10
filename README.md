@@ -688,7 +688,7 @@ Each needs its own extra (lazy-imported). All publish + retry within a bound and
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, bootstrap_servers="…", key_field="trace_id")` |
+| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id")` |
 | `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
 | `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
 | `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |

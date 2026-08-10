@@ -28,8 +28,14 @@ class KafkaSink:
     returns without blocking, while the delivery result arrives asynchronously on a callback
     serviced by ``poll()`` and ``flush()``.
 
+    The worst case (SPEC-027 FR-005) is not a retry loop — this sink has none — but its
+    ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent from ``shutdown()``'s own
+    budget because ``Worker.shutdown`` closes the live sink inline (arch §13).
+
     Attributes:
-      failed: Messages whose delivery callback reported an error.
+      flush_timeout: Seconds :meth:`close` waits for the producer to drain.
+      failed: Messages whose delivery callback reported an error, plus any still queued when
+        that close flush expired — the count ``flush()`` returns.
       rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
         — which never reached the producer's batch at all.
 
@@ -60,6 +66,10 @@ class KafkaSink:
           producer: A ``confluent-kafka``-shaped producer, or ``None`` to build one.
           bootstrap_servers: The broker list, required when no producer is injected.
           key_field: The event key used as the message key, or empty for no key.
+          flush_timeout: Seconds :meth:`close` waits for the producer to drain before counting
+            what is left as lost (SPEC-038 FR-006). Unbounded, an unreachable broker held
+            process exit for ``message.timeout.ms`` — five minutes by default — despite
+            ``shutdown(timeout=30)``.
 
         Returns:
           None.
@@ -194,9 +204,17 @@ class KafkaSink:
         ``Producer.flush()`` with no timeout waits for ``message.timeout.ms`` — five minutes by
         default — and ``Worker.shutdown`` closes the live sink **inline and unbounded** (arch
         §13), so an unreachable broker held process exit for five minutes despite
-        ``shutdown(timeout=30)``. The wait is now capped by ``flush_timeout``, and a shutdown in
-        progress cuts it to a single non-blocking pass: the events are already lost either way,
-        and the drain thread is the one ``shutdown()`` is waiting on.
+        ``shutdown(timeout=30)``. The wait is now capped by ``flush_timeout``.
+
+        **The stop signal is deliberately not consulted here.** A revision cut the timeout to
+        zero while a shutdown was in progress, reasoning that the events were lost either way.
+        They were not: ``produce()`` is a local hand-off and ``flush()`` is the only thing that
+        drains the producer's batch, so with the stop event set — which it always is by the time
+        ``close()`` runs, since ``Worker.shutdown`` sets it *before* the join — Kafka's exit
+        delivery was switched off entirely. Measured through a real ``shutdown()``: nine buffered
+        messages, ``flush(0)``, **zero delivered**, all nine booked as ``failed``. That is worse
+        than the hang this bound exists to fix, and it is the same mistake FR-001 AC-4a records
+        for ``HTTPSink`` — skipping *work* during the exit drain, rather than skipping a *wait*.
 
         ``flush()`` *returns* the number of messages still queued, which is exactly the count
         lost at exit — the old call discarded it, so the loss was silent. It is counted into
@@ -211,17 +229,15 @@ class KafkaSink:
         Raises:
           Exception: Whatever the producer raises, which ``close``'s caller already handles.
         """
-        stop = self.log_foundry_stop_signal
-        timeout = 0 if stop is not None and stop.is_set() else self.flush_timeout
-        remaining = self.producer.flush(timeout)
-        if not isinstance(remaining, int) or remaining <= 0:
+        remaining = self.producer.flush(self.flush_timeout)
+        if type(remaining) is not int or remaining <= 0:
             return
         with self._counter_lock:
             self.failed += remaining
         _diag.lost(
             "message",
             remaining,
-            f"KafkaSink, still queued when the {timeout}s close flush expired",
+            f"KafkaSink, still queued when the {self.flush_timeout}s close flush expired",
         )
 
     def _key(self, event: dict[str, object]) -> bytes | None:

@@ -17,9 +17,11 @@ _BACKOFF_BASE = 0.1
 DEFAULT_MAX_DATAGRAM_BYTES = 65507
 """Bytes one UDP datagram may carry, the IPv4 payload maximum (SPEC-038 FR-007).
 
-65,535 less the 20-byte IP header and the 8-byte UDP header. It is the ceiling the *protocol*
-imposes; a path's real limit is often far lower, which is why it is configurable. TCP is a stream
-and has no such limit, so this bounds nothing there.
+65,535 less the 20-byte IP header and the 8-byte UDP header. That is the **IPv4** figure, and
+it is used for IPv6 too: IPv6 does not count its own header in the payload length, so its true
+maximum is 65,527 — a 20-byte discrepancy no real path can reach, since no MTU carries either.
+It is the ceiling the *protocol* imposes; a path's real limit is often far lower, which is why
+it is configurable. TCP is a stream and has no such limit, so this bounds nothing there.
 """
 
 _PERMANENT_ERRNOS = frozenset({errno.EMSGSIZE})
@@ -218,6 +220,16 @@ class SocketTransport:
         Dropping is right rather than raising: the datagram is permanently unsendable on this
         path, so there is nothing for a retry to fix, and reporting it as a delivery failure
         would have the worker re-send the rest of the batch alongside it.
+
+        **``dropped_oversized`` inflates in one case, and it is recorded rather than hidden.**
+        If a batch holds an oversized frame *and* its sendable remainder then fails totally, the
+        emit raises, the worker retries the whole batch, and this filter re-frames and re-drops
+        the same event once per attempt — up to four times for one unsendable frame. Everywhere
+        else ``dropped`` is an exact count, so the exception matters. Nothing here can fix it:
+        the worker owns the retry and hands back the original events, so the sink cannot know it
+        has seen them before. ``FirehoseSink._records`` and ``KinesisSink._records`` have the
+        same shape and predate this, which is why the fix belongs one level up if it is ever
+        taken.
 
         Args:
           messages: The framed messages, in order.

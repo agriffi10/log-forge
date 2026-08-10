@@ -216,14 +216,56 @@ def test_a_clean_flush_counts_nothing() -> None:
     assert sink.losses().failed == 0
 
 
-def test_a_shutdown_cuts_the_close_flush_to_a_single_pass() -> None:
-    """AC-3. The events are lost either way, and the drain thread is what `shutdown()` waits on."""
-    import threading
+def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown() -> None:
+    """AC-3, amended by evidence. The stop signal must NOT shorten this flush.
 
-    producer = FakeProducer()
-    sink = KafkaSink("t", producer=producer, flush_timeout=30.0)
-    signal = threading.Event()
-    signal.set()
-    sink.log_foundry_stop_signal = signal
-    sink.close()
-    assert producer.flush_timeouts == [0], "a shutdown in progress makes the flush non-blocking"
+    A revision cut the timeout to zero while a shutdown was in progress, on the reasoning that
+    the events were lost either way. They were not: `produce()` is a local hand-off and
+    `flush()` is the only thing that drains the producer's batch, so — since `Worker.shutdown`
+    sets the stop event *before* the join, making it always set by the time `close()` runs —
+    Kafka's exit delivery was switched off entirely. Measured: 9 buffered, `flush(0)`, zero
+    delivered, all 9 booked as failed.
+
+    This drives the real `log_foundry.shutdown()` rather than setting the flag by hand, because
+    the hand-set version is exactly what made the defect look correct.
+    """
+    import log_foundry as lf
+
+    class Draining:
+        """Delivers one message per second of allowed flush time."""
+
+        def __init__(self) -> None:
+            self.buffered = 0
+            self.delivered = 0
+            self.saw_timeout: object = "never called"
+
+        def produce(self, topic, value=None, key=None, callback=None) -> None:
+            self.buffered += 1
+
+        def poll(self, timeout) -> None:
+            pass
+
+        def flush(self, timeout=None) -> int:
+            self.saw_timeout = timeout
+            allowed = int(timeout) if isinstance(timeout, int | float) else self.buffered
+            take = min(self.buffered, allowed)
+            self.buffered -= take
+            self.delivered += take
+            return self.buffered
+
+    producer = Draining()
+    lf.configure(sink=KafkaSink("t", producer=producer, flush_timeout=10.0))
+
+    @lf.trace
+    def work() -> None:
+        for i in range(9):
+            lf.info("event", fields={"i": i})
+
+    work()
+    lf.shutdown()
+
+    assert producer.saw_timeout == 10.0, (
+        f"the exit flush must get its real bound, not a shutdown-shortened one; "
+        f"got {producer.saw_timeout!r}"
+    )
+    assert producer.delivered > 0, "and it must actually deliver"

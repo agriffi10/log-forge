@@ -232,13 +232,35 @@ def test_the_newline_is_charged_to_the_per_record_limit() -> None:
 
 
 def test_the_newline_is_charged_to_the_per_request_budget() -> None:
-    """AC-2. The chunker measures `Data`, which now includes the delimiter."""
+    """AC-2, the per-request half — and the record size is what decides whether it can fail.
+
+    `MAX_RECORDS` (500) and `MAX_REQUEST_BYTES` (4 MiB) both bound a chunk, so with small
+    records the *count* binds first and the byte budget never engages: a first version used
+    ~1,012-byte records and passed with the delimiter removed entirely. Above 4 MiB / 500 =
+    8,389 bytes the byte budget binds, and one delimiter per record then makes the difference
+    between a chunk that fits and one that does not.
+
+    The expectation is derived from the sink's own constants, never from `record["Data"]` —
+    re-deriving it from the value under test is how the first version went vacuous.
+    """
     client = FakeFirehose()
     sink = FirehoseSink("stream", client=client)
-    events = [{"pad": "x" * 1000} for _ in range(4000)]
-    sink.emit(events)
+    payload = 9_000
+    count = 900
+    sink.emit([{"pad": "x" * payload} for _ in range(count)])
+
+    assert all(len(chunk) < FirehoseSink.MAX_RECORDS for chunk in client.calls), (
+        "the byte budget must be what bounds these chunks, or the delimiter never matters"
+    )
     for chunk in client.calls:
-        assert sum(len(record["Data"]) for record in chunk) <= FirehoseSink.MAX_REQUEST_BYTES
+        assert sum(len(r["Data"]) for r in chunk) <= FirehoseSink.MAX_REQUEST_BYTES
+
+    # One record's true wire size, delimiter included, decides how many fit. Computed from the
+    # event rather than read back from the request, so a missing delimiter shifts the expectation.
+    one = len(json.dumps({"pad": "x" * payload}).encode("utf-8")) + 1
+    assert len(client.calls[0]) == FirehoseSink.MAX_REQUEST_BYTES // one, (
+        "the first chunk holds exactly as many delimited records as the budget allows"
+    )
 
 
 def test_the_per_record_ceiling_is_the_documented_1000_kib_not_1_mib() -> None:
