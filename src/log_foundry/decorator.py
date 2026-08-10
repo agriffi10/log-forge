@@ -146,26 +146,43 @@ def continue_trace(
       since a caller who did not propagate a header would otherwise get a line per
       invocation.
 
+      **The verdict describes the trace context and nothing else.** ``baggage=`` is merged
+      independently of it (SPEC-014: losing correlating fields is bad, and losing the trace join
+      because one field was malformed is worse), so ``continue_trace(baggage=...)`` alone applies
+      the baggage and still reports falsy — there was no trace context to adopt. The reason then
+      distinguishes the two honestly, because ``"rejected"`` means **exactly** that a rejection
+      was announced through ``_diag``: a malformed ``baggage=`` is a rejection, a well-formed one
+      is not, and each reads back the way the stderr line does. A first version keyed the reason
+      on "was any argument supplied", which reported ``"nothing-supplied"`` for a malformed
+      baggage header *while writing the rejection line for it* — the discrimination FR-007 AC-3
+      exists to provide, stated backwards.
+
     Raises:
       None.
     """
     adopted: tuple[str, str | None] | None = None
+    announced = False
     if traceparent is not None:
         if trace_id is not None or parent_span_id is not None:
             _diag.rejected("both traceparent and explicit ids given; traceparent wins", traceparent)
         parsed = parse_traceparent(traceparent)
         if parsed is None:
             _diag.rejected("unparseable traceparent", traceparent)
+            announced = True
         else:
             adopted = parsed
     elif trace_id is not None:
         if not is_valid_trace_id(trace_id):
             _diag.rejected("invalid trace_id", trace_id)
+            announced = True
         elif parent_span_id is not None and not is_valid_span_id(parent_span_id):
             _diag.rejected("invalid parent_span_id; joining as a root", parent_span_id)
             adopted = (trace_id, None)
         else:
             adopted = (trace_id, parent_span_id)
+    elif parent_span_id is not None:
+        _diag.rejected("parent_span_id given with no trace_id to join", parent_span_id)
+        announced = True
 
     if adopted is not None:
         context.set_adopted_context(*adopted)
@@ -175,13 +192,13 @@ def continue_trace(
         parsed_baggage = context.parse_baggage_header(baggage)
         if parsed_baggage is None:
             _diag.rejected("unusable baggage header", baggage)
+            announced = True
         else:
             context.set_baggage(**parsed_baggage)
 
     if adopted is not None:
         return ContinueResult(ok=True)
-    supplied = traceparent is not None or trace_id is not None or parent_span_id is not None
-    return ContinueResult(ok=False, reason="rejected" if supplied else "nothing-supplied")
+    return ContinueResult(ok=False, reason="rejected" if announced else "nothing-supplied")
 
 
 def _reparent_current_span(trace_id: str, parent_span_id: str | None) -> None:

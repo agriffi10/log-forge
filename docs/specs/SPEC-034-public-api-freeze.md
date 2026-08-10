@@ -387,12 +387,12 @@ working and leaves room to add reasons later — but only if the return type cha
 
 - [x] AC-1: `if flush():` keeps working. `assert flush() is True` **cannot** — an object with
       `__bool__` is never `True` — and a draft of this AC claimed both would, which is the
-      contradiction to avoid. Counted on this branch: **26** identity assertions on `flush()` and
-      **18** on `continue_trace()` across the test suite. All are converted and the count is
-      stated in the PR. Those figures are **recounted at build time regardless** — a count taken
-      on one branch and trusted on another is the kind of stale roster FR-002's lesson is about —
-      though with the order reversed they are now a ceiling rather than a floor: this spec runs
-      before 036 and 037 add their call sites, which is the cheaper end to convert from.
+      contradiction to avoid. ~~Counted on this branch: **26** identity assertions on `flush()`
+      … a ceiling rather than a floor~~ — struck, and by its own rule. The build-time recount is
+      **36** on `flush()` (18 on `continue_trace()` was right), plus 8 collection comparisons:
+      **62** sites. The stale figure was not stale because a *later* spec added call sites, which
+      is what "a ceiling" assumed — Phases 1–3 of **this** spec added ten. A count is recounted on
+      the branch that converts it, and never carried across one.
 - [x] AC-1b: **Both change.** The five outcomes are distinguishable only inside `Worker.flush`
       — retired, thread died, queue full, timed out, abandoned — so a public wrapper over a bare
       `bool` could name none of them without guessing. `_flush_worker` carries the type through

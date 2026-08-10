@@ -16,6 +16,7 @@ import time
 import pytest
 
 log_foundry_mod = pytest.importorskip("log_foundry")
+FlushResult = log_foundry_mod.FlushResult
 worker_mod = pytest.importorskip("log_foundry.worker")
 Worker = worker_mod.Worker
 _SHUTDOWN_SENTINEL = worker_mod._SHUTDOWN
@@ -320,7 +321,13 @@ def test_flush_drains_and_leaves_the_worker_running() -> None:
             w.submit(_span(i))
         assert sink.events == [], "still buffered before the flush"
 
-        assert w.flush(timeout=5.0)
+        result = w.flush(timeout=5.0)
+        assert result
+        assert isinstance(result, FlushResult), (
+            "reverting Worker.flush to a bare bool was caught by exactly one test in 1265, "
+            "and only incidentally -- `assert not x` is satisfied by any falsy value"
+        )
+        assert result.reason is None
         assert [e["message"] for e in sink.events] == list(range(5))
 
         # The whole point: unlike shutdown(), everything is still alive afterwards.
@@ -475,6 +482,10 @@ def test_flush_honours_its_timeout_on_a_wedged_sink() -> None:
         elapsed = time.monotonic() - start
 
         assert not result, "a drain that could not complete reports a falsy result"
+        assert result.reason == "timed-out", (
+            "a slow destination and a retired worker need different fixes, so they need "
+            "different reasons -- `assert not result` alone passes for all five"
+        )
         assert elapsed < 1.0, f"timeout not honoured, took {elapsed:.3f}s"
     finally:
         sink.release.set()
@@ -489,7 +500,9 @@ def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
         # The drain ran and the failure is reported through the return value and
         # failed_batches, not by raising at the caller (SPEC-021 FR-001 changed the first of
         # those from True; see test_flush_reports_false_when_the_batch_is_abandoned).
-        assert not w.flush(timeout=5.0)
+        result = w.flush(timeout=5.0)
+        assert not result
+        assert result.reason == "abandoned", "the drain ran and gave up; the thread is fine"
         assert sink.events == [], "nothing was ever successfully emitted"
         assert w.failed_batches >= 1, "the failure is counted, not swallowed silently"
     finally:
@@ -868,13 +881,14 @@ def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
     w.shutdown()
     h = w.health()
 
-    assert (h.queued, h.dropped, h.failed_batches) == (h.queued, h.dropped, h.failed_batches)
-    assert h.stopped_reason is None or isinstance(h.stopped_reason, str)
-    assert h.sink is None or isinstance(h.sink, log_foundry_mod.SinkLosses)
-    assert isinstance(h.retired, bool)
-    assert isinstance(h.submitted_after_shutdown, int)
-    assert isinstance(h.incomplete_swaps, int)
-    assert isinstance(h.closing_sinks, int)
+    # Values, not types: `X == X` and `isinstance(x, int)` are true of anything the annotation
+    # already promises, and the first version of this test asserted exactly that -- residue of
+    # mechanically rewriting `(h[0], h[1], h[2]) == (h.queued, ...)` to match its own right side.
+    assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
+    assert h.stopped_reason is None, "a clean shutdown is not a failure (SPEC-019)"
+    assert h.sink is None, "RecordingSink reports no losses"
+    assert h.retired is True, "shutdown() was called two lines above"
+    assert (h.submitted_after_shutdown, h.incomplete_swaps, h.closing_sinks) == (0, 0, 0)
 
     with pytest.raises(TypeError):
         _ = h[0]  # type: ignore[index]
@@ -923,7 +937,9 @@ def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
     w = Worker(sink, batch_size=1000, flush_interval=100.0, max_retries=0)
     try:
         w.submit(_span("doomed"))
-        assert not w.flush(timeout=5.0), "a drain that delivered nothing is not a success"
+        abandoned = w.flush(timeout=5.0)
+        assert not abandoned, "a drain that delivered nothing is not a success"
+        assert abandoned.reason == "abandoned"
         assert w.failed_batches == 1, "and the failure it reports is the abandoned batch"
         assert sink.events == []
     finally:
@@ -982,7 +998,9 @@ def test_flush_reports_false_on_a_dead_worker() -> None:
     try:
         w.submit(_span("a"))
         assert _wait_until(lambda: not w._thread.is_alive())
-        assert not w.flush(timeout=5.0)
+        dead = w.flush(timeout=5.0)
+        assert not dead
+        assert dead.reason == "thread-died"
     finally:
         w.shutdown()
 
@@ -1140,7 +1158,9 @@ def test_flush_reports_false_when_the_queue_is_too_full_for_the_marker() -> None
         w.submit(_span("b"))  # fills the queue (max_queue=1)
 
         start = time.monotonic()
-        assert not w.flush(timeout=0.1), "the marker never got in, so nothing was drained"
+        full = w.flush(timeout=0.1)
+        assert not full, "the marker never got in, so nothing was drained"
+        assert full.reason == "queue-full"
         assert time.monotonic() - start < 1.0, "and the put timeout bounds the wait"
     finally:
         sink.release.set()

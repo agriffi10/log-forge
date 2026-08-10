@@ -30,9 +30,10 @@ implementation against the design in `architecture.md`.
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
   `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
   SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
-  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus two leaf helpers no module map
-  anticipated, both of which must import nothing from the package: `sanitize` (SPEC-017) and
-  `_diag` (SPEC-025, owned by SPEC-029). The full module map is now built; the setup-phase
+  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus three leaf helpers no module map
+  anticipated, none of which imports anything from the package: `sanitize` (SPEC-017),
+  `_diag` (SPEC-025, owned by SPEC-029) and `results` (SPEC-034 FR-007 — `FlushResult` /
+  `ContinueResult`). The full module map is now built; the setup-phase
   `core.py` + `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.

@@ -529,8 +529,11 @@ class Worker:
         except queue.Full:
             return FlushResult(ok=False, reason="queue-full")
         if self._drain_finished.is_set() or not self._thread.is_alive():
-            delivered = marker.event.is_set() and marker.delivered
-            return FlushResult(ok=delivered, reason=None if delivered else "thread-died")
+            answered = marker.event.is_set()
+            delivered = answered and marker.delivered
+            if delivered:
+                return FlushResult(ok=True)
+            return FlushResult(ok=False, reason="abandoned" if answered else "thread-died")
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
             return FlushResult(ok=False, reason="timed-out")

@@ -912,8 +912,14 @@ def test_the_readme_documents_the_reserved_names() -> None:
 def test_the_truthy_call_site_is_unchanged() -> None:
     """FR-007 AC-1's first half. `if flush():` had to keep meaning what it meant."""
     log_foundry.configure(service="t", sink=_Recorder())
-    assert log_foundry.flush(2.0), "a successful flush is truthy"
-    assert bool(log_foundry.flush(2.0)) is True
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("so a worker exists and Worker.flush is actually reached")
+
+    work()
+    assert log_foundry.flush(5.0), "a successful flush is truthy"
+    assert bool(log_foundry.flush(5.0)) is True
 
 
 def test_the_identity_call_site_can_no_longer_hold() -> None:
@@ -949,21 +955,55 @@ def test_flush_reasons_distinguish_the_outcomes_that_need_different_fixes() -> N
     assert retired.reason == "retired"
 
 
-def test_continue_trace_distinguishes_nothing_supplied_from_rejected() -> None:
-    """FR-007 AC-3. Both read `False`, and only one of them is a caller bug."""
-    nothing = log_foundry.continue_trace()
-    assert not nothing
-    assert nothing.reason == "nothing-supplied"
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, "nothing-supplied"),
+        ({"traceparent": "not-a-traceparent"}, "rejected"),
+        ({"trace_id": "not-a-trace-id"}, "rejected"),
+        ({"parent_span_id": "0" * 16}, "rejected"),
+        ({"baggage": "\x00 not a header"}, "rejected"),
+        ({"baggage": "team=core"}, "nothing-supplied"),
+    ],
+)
+def test_continue_trace_distinguishes_nothing_supplied_from_rejected(
+    kwargs: dict[str, str], expected: str
+) -> None:
+    """FR-007 AC-3. Both read `False`, and only one of them is a caller bug.
 
-    rejected = log_foundry.continue_trace(traceparent="not-a-traceparent")
-    assert not rejected
-    assert rejected.reason == "rejected"
+    Parametrized over every argument, because `supplied` was a three-term disjunction and only
+    the `traceparent` term had a test: dropping the other two left the suite green while
+    `continue_trace(trace_id="not-valid")` reported "nothing-supplied".
 
+    The rule is that `"rejected"` means **exactly** that a rejection was announced through
+    `_diag`. That is why a *valid* `baggage=` alone is `"nothing-supplied"` — it was applied, and
+    the verdict is about the trace context — while a malformed one is `"rejected"`, matching the
+    stderr line the library already wrote for it. Keying on "was any argument supplied" instead
+    reported "nothing-supplied" for a header the library had just announced as unusable.
+    """
+    result = log_foundry.continue_trace(**kwargs)
+    assert not result
+    assert result.reason == expected
+
+
+def test_continue_trace_reports_no_reason_when_it_adopts() -> None:
+    """The success side of AC-3."""
     good = log_foundry.continue_trace(
         traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     )
     assert good
     assert good.reason is None
+
+
+def test_a_valid_baggage_only_call_still_applies_the_baggage() -> None:
+    """It is falsy and reports "nothing-supplied" — but the baggage must still have landed.
+
+    SPEC-014 merges `baggage=` independently of the trace context, so a falsy verdict must not
+    read as "nothing happened".
+    """
+    log_foundry.reset_context()
+    assert not log_foundry.continue_trace(baggage="team=core")
+    assert log_foundry.get_baggage() == {"team": "core"}
 
 
 def test_the_result_types_are_exported_and_annotatable() -> None:
