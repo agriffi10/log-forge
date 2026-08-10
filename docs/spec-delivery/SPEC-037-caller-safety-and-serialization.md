@@ -2,7 +2,7 @@
 
 ## What was completed?
 
-- **FR-003** — `sanitize.Coercer.real()` replaces a non-finite float with `<float: nan>` /
+- **FR-003** — `sanitize._Coercer.real()` replaces a non-finite float with `<float: nan>` /
   `<float: inf>` / `<float: -inf>` and sets `truncated`, mirroring SPEC-020's integer rule.
   Covers the value, nested mappings, sequences, **mapping keys**, `float` subclasses and
   float-valued `Enum` members.
@@ -35,10 +35,15 @@ The counters (above). No `Health` field was added here.
 
 ## Evidence
 
-Six mutants, each caught by the right test: `real()` passing everything through, the three
-markers collapsed to one token, `truncated` unset, the mapping-key branch removed, the in-span
-guard removed, and the guard widened to `BaseException` (SPEC-025 FR-004's line — it swallowed
-`KeyboardInterrupt`, and two tests said so).
+Thirteen mutants run, eleven killed. The two survivors are recorded rather than hidden: removing
+the exact-type `if kind is float` fast path is behaviourally identical once `float` has left
+`_PLAIN_SCALARS` (the `isinstance` arm catches it), and the benchmark's calibrated sensitivity is
+an order of magnitude — it survived 5 extra `str()` calls per value and failed at 10, which its
+docstring now states rather than implying a tighter bound.
+
+Removing the in-span guard fails **the in-span and async paths**, not all three: the orphan path
+has its own guard and cannot fail. AC-1 holds; an earlier version of this sentence overstated the
+evidence for it.
 
 AC-7's benchmark is measured **against a neighbour rather than the clock**: an absolute
 wall-clock budget is a race with the machine, so the comparison is against `integer()`, which

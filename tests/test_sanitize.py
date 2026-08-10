@@ -658,6 +658,47 @@ def test_non_finite_floats_are_replaced_everywhere_a_value_can_sit() -> None:
     assert clipped is True
 
 
+def test_a_hostile_float_subclass_cannot_choose_what_the_library_prints() -> None:
+    """The placeholder is computed by the library, never by the value (`_FLOAT_REPR`).
+
+    `f"<float: {value}>"` calls `format(value, "")`, which is the value's own `__str__` — so a
+    `float` subclass chose the text. Measured before the fix: a subclass naming its source
+    emitted `<float: inf from probe-7 (token=sk-live-...)>`, one returning two megabytes emitted
+    all of it against a `max_value_bytes` of 8192, and one that raised took every sibling key
+    with it. Three separate failures from one interpolation, and `integer()` beside it already
+    reads `<` through an unbound `int.__lt__` on exactly this reasoning.
+    """
+    cfg = Config()
+
+    class Leaky(float):
+        def __str__(self) -> str:
+            return "inf from probe-7 (token=sk-live-DEADBEEF)"
+
+    class Huge(float):
+        def __str__(self) -> str:
+            return "x" * 2_000_000
+
+    class Boom(float):
+        def __str__(self) -> str:
+            raise RuntimeError("a __str__ the library must not depend on")
+
+    safe, clipped = sanitize_fields({"leak": Leaky("inf"), "huge": Huge("nan")}, cfg=cfg)
+    assert safe == {"leak": "<float: inf>", "huge": "<float: nan>"}
+    assert clipped is True
+
+    # The same subclass in key position. Review found that dropping `key()`'s `text()` wrap
+    # survived the whole suite -- true of the *pre-fix* code, where it was the only thing bounding
+    # a two-megabyte marker. It is not true any more: once the library computes the marker,
+    # `real()` cannot return a long string, so the wrap is defence in depth and **no test can
+    # distinguish it**. Recorded rather than pinned with an assertion that cannot fail.
+    keyed, _ = sanitize_fields({"k": {Huge("inf"): 1}}, cfg=cfg)
+    assert keyed["k"] == {"<float: inf>": 1}
+
+    # And a raising `__str__` must not take its siblings down with it.
+    survived, _ = sanitize_fields({"k": {Boom("nan"): 1, "survivor": 2}}, cfg=cfg)
+    assert survived["k"] == {"<float: nan>": 1, "survivor": 2}
+
+
 def test_a_float_subclass_and_a_float_enum_are_covered_too() -> None:
     """`float` was in `_PLAIN_SCALARS`, which the exact-type *and* subclass paths both read.
 
@@ -670,9 +711,19 @@ def test_a_float_subclass_and_a_float_enum_are_covered_too() -> None:
 
     class Level(enum.Enum):
         BROKEN = float("nan")
+        SUBCLASSED = Ratio("inf")
 
-    safe, clipped = sanitize_fields({"sub": Ratio("nan"), "enum": Level.BROKEN}, cfg=Config())
-    assert safe == {"sub": "<float: nan>", "enum": "<float: nan>"}
+    safe, clipped = sanitize_fields(
+        {"sub": Ratio("nan"), "enum": Level.BROKEN, "enum_sub": Level.SUBCLASSED}, cfg=Config()
+    )
+    assert safe == {
+        "sub": "<float: nan>",
+        "enum": "<float: nan>",
+        # An Enum member that is a float *subclass* matched neither `type(member) is float` nor
+        # the int arm, and fell through to `str(value)` -- JSON-safe, so nothing complained, but
+        # the marker and `truncated` were both lost. The arm tests `isinstance` now.
+        "enum_sub": "<float: inf>",
+    }
     assert clipped is True
 
 
@@ -684,6 +735,11 @@ def test_the_finite_path_is_not_measurably_more_expensive() -> None:
     does `bit_length()`, two multiplications, a division and an unbound `int.__lt__`, where this
     does one `math.isfinite`. Floats must not cost more than that, with a wide margin so the
     assertion is about the algorithm and not about scheduling noise.
+
+    **Measured sensitivity:** it catches an order-of-magnitude regression, not a small one — a
+    calibration run survived 5 extra `str()` calls per value and failed at 10. Stated rather than
+    left for "wide margin" to imply a tight bound. Note also that `Config().max_keys` is 256, so
+    only the first 256 of the 2000 keys are coerced per call.
     """
     cfg = Config()
     floats = {f"k{i}": float(i) + 0.5 for i in range(2000)}

@@ -26,6 +26,19 @@ _LOG10_2_NUM = 30103
 _LOG10_2_DEN = 100000
 
 _INT_LT = int.__lt__
+_FLOAT_REPR = float.__repr__
+"""``float.__repr__``, unbound, so a subclass cannot divert the placeholder's text.
+
+The f-string form ``f"<float: {value}>"`` calls ``format(value, "")``, which is the value's own
+``__str__`` — so a ``float`` subclass chose what the library printed. Measured: a subclass whose
+``__str__`` names its source emitted ``<float: inf from probe-7 (token=sk-live-…)>`` into the event
+stream, and one returning two megabytes emitted all of it against a configured
+``max_value_bytes`` of 8192. Both are the disclosure arch §6 forbids and the ceiling this module
+exists to apply, defeated by the one new rule that handed the decision back to the value.
+
+The same reasoning as :data:`_INT_LT` beside it, and as ``_placeholder``'s refusal to use
+``repr()``: what the library writes about a value must be computed by the library.
+"""
 
 _PLAIN_SCALARS: frozenset[type] = frozenset({int, bool})
 
@@ -236,7 +249,7 @@ class _Coercer:
             member = value.value
             if type(member) is int:
                 return self.integer(member)
-            if type(member) is float:
+            if isinstance(member, float) and not isinstance(member, bool):
                 return self.real(member)
             if type(member) in _PLAIN_SCALARS or member is None:
                 return member
@@ -336,6 +349,12 @@ class _Coercer:
         a placeholder, so one hostile key would take every sibling with it, unmarked. ``bool``
         is excluded because ``True`` must render as the key ``"True"``, not ``"1"``.
 
+        A float key goes through :meth:`real` for the same reason, and its ``text()`` wrap is
+        defence in depth rather than load-bearing: ``real`` computes its placeholder through
+        :data:`_FLOAT_REPR`, so it cannot hand back a long string. No test distinguishes the wrap
+        from its absence, which is recorded here rather than pinned by an assertion that cannot
+        fail.
+
         Args:
           key: The mapping key, of any type.
 
@@ -414,7 +433,7 @@ class _Coercer:
         if isfinite(value):
             return value
         self.truncated = True
-        return f"<float: {value}>"
+        return f"<float: {_FLOAT_REPR(value)}>"
 
     def text(self, value: str) -> str:
         """Applies ``max_value_bytes`` to a string, recording whether it fired.
