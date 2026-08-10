@@ -502,6 +502,63 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
   into sends of ≤ 10 messages and ≤ 256 KB apiece. This keeps the worker dumb and lets each
   sink own the limits only it knows about.
 
+
+### 9.2 Four questions a guard can ask about the worker
+
+Every guard in `decorator.py` that mentions the worker is classified as exactly one of four
+categories, and answering with the wrong one is this codebase's most repeated defect: three
+reviewers told SPEC-033 "ownership, not liveness", each naming a different call site, each was
+fixed, and a fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a
+predicate that would have re-broken SPEC-033 in the opposite direction.
+
+| Category | Predicate | What it decides |
+|---|---|---|
+| **Existence** | `_worker is None` | is there anything to do, or a worker to build |
+| **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
+| **Ownership** | `_worker.sink is X` | who **owns** a close; a retired worker still owns its sink's |
+| **Ownership ∧ moment** | `worker is not None and worker.sink is sink and worker.draining` | whose stop event the sink should be holding **now** |
+
+The fourth is a **conjunction**, not a new question, which is why it is named for both terms
+rather than for `Worker.draining` alone. A category named for the moment by itself would have no
+site — the moment never decides anything on its own here — and a contributor reaching for one
+would be reaching for something the roster does not accept.
+
+Liveness and ownership diverge the instant `retired` latches — which is **entry** to
+`shutdown()`, not its completion. The moment is independent of both rather than a refinement of
+either:
+`_offer_orphan_signal` needs ownership **and** the moment, because ownership alone hands a set
+event to a sink still being written to (every later backoff collapses to zero) while liveness
+alone strips the drain thread of the event it is about to wait on. One ownership question is
+answered by a **return value** rather than a predicate — `Worker.swap_sink` reports whether it
+adopted the sink, because the decline is taken between its two lock acquisitions and nothing
+outside observes it.
+
+The rule is enforced, not just written down: `tests/test_worker_predicate_roster.py` derives
+every expression **in boolean position** naming the worker from `decorator.py`'s AST and fails
+unless each one is declared with a category and a reason. Position rather than node shape is
+load-bearing — `if _worker.retired:` asks exactly what `if not _worker.retired:` asks, and a
+draft that matched on shape recognised only the second, which let a real guard through with the
+whole suite green. Three limitations are measured and disclosed in the test rather than
+hidden: the subject is recognised by **name**, matched as a substring, so
+`if owner is None:` is invisible while `if owner.retired:` is caught and `if networker:` is
+over-matched; a question hoisted through anything but a bare boolean operator
+(`alive = bool(_worker)`, a tuple target, a container literal) is not followed, though in a test
+position all of those are caught; and a lambda body is searched only when it is itself boolean.
+`match` is likewise uncovered and unused here. Each is a scope decision: following every value an
+arbitrary expression could carry is a walker nobody can reason about. A new call site cannot be added without deciding which
+question it asks. That is deliberately a *derived* roster and not a hand-written list, for the
+reason the sink rosters are (SPEC-028, SPEC-032): the completeness is the point, and a
+hand-maintained list rots.
+
+What it is complete about is guards that **name the worker**, which is narrower than the
+ownership question itself. The orphan path decides who owns a close with no worker in the
+expression — `_note_orphan_emit`'s `sink is _orphan_sink`, `_close_orphan_sink`'s `owed is None`,
+`_adopt_declined_swap`'s re-arm guard, `_swap_sink`'s `old is None or old is new_sink` — and none
+is filed. SPEC-035 FR-003's own defect lived in that family, as an assignment rather than a
+predicate, so a green roster is not evidence about it. Widening the sentinels to reach it would
+match every sink comparison in the module, so it is recorded here instead of quietly extended.
+
+
 ---
 
 ## 10. Sampling (deferred)
@@ -864,6 +921,28 @@ constraint — never by being deleted quietly.
   thread's terminal guard, which records the exception *type* in `health().stopped_reason` and
   writes one stderr line stating what was held and what was still queued (SPEC-021 FR-002). The
   worker is not restarted: a thread that resurrects itself fights a process trying to exit.
+
+- **A diagnostic can be written while `_worker_lock` is held (SPEC-035 FR-006).** The
+  process-wide lock in `decorator.py` is released before anything that blocks on a destination —
+  `owed.close()` runs outside it, and `close_detached` only starts a thread — with one exception:
+  three sites can reach `_diag` while still holding it, so a wedged stderr stalls every orphan
+  emit and every first `@trace` in the process behind it.
+
+  - `_note_orphan_emit` → `_offer_orphan_signal` → `_lifecycle.offer_stop_signal` → `_diag.absorbed`
+  - `_adopt_declined_swap` → the same path (this site arrived with SPEC-035 FR-003)
+  - `_swap_sink` → that path, **and** `_lifecycle.close_detached`, which writes on a thread-start
+    failure, also under the lock
+
+  `_close_orphan_sink` is deliberately not one — its `_diag` write sits outside the `with`.
+  It is an **error path only**: `offer_stop_signal` writes just when a sink's `stop_signal`
+  setter objects, and `close_detached` just when the interpreter refuses a thread. The fix —
+  returning a flag and writing after the release — spreads one diagnostic decision across two
+  functions at all three sites to save a write that happens only then, so it is **recorded rather
+  than taken**. `Worker.submit` is the counter-example and is deliberately inconsistent with
+  these: it writes its queue-full line *outside* its own lock for exactly this reason, which is
+  the shape to copy if a fourth site ever sits on a hot path. Found as C5 by the 2026-08-07
+  audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
+  (`docs/process.md`) found the third.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment
