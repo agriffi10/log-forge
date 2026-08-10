@@ -306,10 +306,25 @@ worker abandoned after spending a retry budget, and delivery continues after it;
 batch, no retry and no worker. Not `SinkLosses` — the sink did not absorb anything, it raised,
 which is what SPEC-026 requires of it. `flush()` is deliberately untouched (see Out of Scope).
 
+**It gains a second field with it: `in_span_lost`, SPEC-037's AC-5c.** That spec builds first
+under the reversed order and ships the *guard* — an unguarded `build_event` inside a span can fail
+the caller — while deferring the counting here, so the two are designed as a pair in the spec that
+invents the vocabulary rather than one per spec with a name negotiated across two drafts. The
+distinction they preserve is SPEC-026's test, *would one number hide which fix applies*:
+`orphan_lost` covers everything inside the orphan guard, including a failing `sink.emit`, so it
+climbing means **the destination or the data**; the in-span path cannot lose an event at `emit`
+(that is `failed_batches`), so `in_span_lost` climbing means **the data**, always. Different
+remediation, two fields.
+
 #### Acceptance Criteria:
 
 - [ ] AC-1: Five `info()` calls with no span against a sink whose `emit` raises leave
       `health().orphan_lost == 5`.
+- [ ] AC-1a: `in_span_lost` lands here too, discharging SPEC-037 AC-5c: five `info(ValueError(…))`
+      calls **inside** a span leave `health().in_span_lost == 5`, and the two counters are
+      asserted separately with neither absorbing the other (037 AC-5b). Deliberately not a
+      criterion on their sum — with different failure populations the total is a number nobody can
+      act on, and pinning it would teach a later reader they are two halves of one counter.
 - [ ] AC-2: `flush()` is unchanged — it still returns `True` in that process, and a test pins
       that, with a comment naming SPEC-021 so a later reader does not "fix" it.
 - [ ] AC-3: The new field is **appended** to `Health`. ~~so every existing field keeps its index;
