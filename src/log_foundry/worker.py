@@ -81,7 +81,10 @@ class Health:
         report. Non-``None`` is categorically worse than the two counters above: they measure
         loss the worker absorbed and kept running through, this one means the worker is gone
         (SPEC-019 FR-003). Also ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown`
-        expired before the drain finished (SPEC-027 FR-004), the same thing to a reader.
+        expired before the drain finished (SPEC-027 FR-004), and the type name of whatever
+        stopped a forked child's rebuild from starting a thread at all (SPEC-039 FR-002) — a
+        case where the drain thread never ran rather than died. All three are the same thing to
+        a reader, which is why they share the field: nothing is delivering.
       sink: The configured sink's own loss counters, or ``None`` when there is no worker or
         the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the
         integers above because they count different things: ``dropped`` here is backpressure
@@ -292,8 +295,16 @@ class Worker:
         on a live worker reading ``draining`` forever, and the next ``shutdown()`` would take a
         ``RuntimeError`` from ``join`` straight out of a public call documented to raise nothing.
         The inherited thread object is kept instead, which is safe because CPython repairs it
-        across the fork — it reports dead and joins instantly — and the failure is recorded as a
-        ``stopped_reason``, which is exactly SPEC-019's vocabulary for "nothing is delivering".
+        across the fork — measured, it reports dead and both a bounded and an unbounded ``join``
+        return in 0.0000 s — and the failure is recorded as a ``stopped_reason``, which is
+        exactly SPEC-019's vocabulary for "nothing is delivering". Setting both drain events is
+        what keeps :meth:`shutdown` from queueing a sentinel into a queue no thread will read.
+
+        The success path assigns ``self._thread`` *after* the start, so for an instant a live
+        drain thread coexists with the inherited dead one in that attribute. That is safe only
+        because the drain thread never reads it — ``_run``, ``_drain``, ``_terminal_failure``
+        and ``_release_waiters`` do not, and the three readers are all on caller threads — which
+        is an invariant this note states rather than one anything enforces.
 
         Args:
           resume: Whether to start a drain thread. ``False`` for a retired parent, which forks

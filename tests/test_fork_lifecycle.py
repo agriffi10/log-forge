@@ -1298,7 +1298,10 @@ def test_a_child_that_cannot_start_a_thread_reports_it_rather_than_raising(
     def report() -> str:
         health = log_foundry.health()
         log_foundry.shutdown(timeout=5.0)
-        return f"{health.stopped_reason},{decorator._worker.draining}"
+        # `queued` after the shutdown is what covers the drain events being set here: with
+        # `_drain_finished` clear, `shutdown` queues its sentinel into a queue no thread will
+        # ever read, and it stays counted for the life of the process.
+        return f"{health.stopped_reason},{decorator._worker.draining},{log_foundry.health().queued}"
 
     threading.Thread.start = refusing  # type: ignore[method-assign]
     try:
@@ -1307,7 +1310,7 @@ def test_a_child_that_cannot_start_a_thread_reports_it_rather_than_raising(
         threading.Thread.start = original_start  # type: ignore[method-assign]
 
     assert child.finished, f"the child's shutdown raised: {child.output!r}"
-    assert child.output == "RuntimeError,False", child.output
+    assert child.output == "RuntimeError,False,0", child.output
 
 
 def test_the_worker_rebuild_is_registered_rather_than_reached_for() -> None:
