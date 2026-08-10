@@ -72,10 +72,29 @@ whatever batch it is handed. `Worker._final_drain` hands it the entire pending b
 5,980 events measured. Datadog's intake rejects it, `_send` treats 400/413 as non-retryable
 (429/5xx only), and `_abandon` fires on the whole thing.
 
+**The stated fix reaches one of the four sinks, and that was checked before building rather than
+during** (2026-08-10). `DatadogSink`, `LokiSink` and `HoneycombSink` all **override `emit`** —
+each builds a body from the whole batch and calls `_send` once — so a chunking loop added to
+`HTTPSink.emit` would apply to `NewRelicSink` alone, which is the only one that inherits it. The
+FR's own AC-1 says "`HTTPSink` … loops `_send` over `chunk_items`", which is true and
+insufficient.
+
+The shape that works is a template method: `HTTPSink.emit` owns the chunk loop and the subclasses
+override a `_body(chunk) -> tuple[bytes, str]` hook instead of `emit`. All four already have
+exactly that shape inside their `emit` (`if not batch: return` → build a body → `_send`), so it is
+a mechanical change, and Loki's stream grouping still works because it groups *within* a chunk.
+**AC-1a is the part that makes it stay fixed**: a lint asserting no `HTTPSink` subclass overrides
+`emit`. Without it a fifth platform sink silently bypasses the chunking, which is the roster
+lesson SPEC-032 and SPEC-035 have already paid for twice.
+
 #### Acceptance Criteria:
 
 - [ ] AC-1: `HTTPSink` gains `max_batch_count` and `max_batch_bytes` and loops `_send` over
-      `chunk_items`, with each platform subclass setting its own documented values.
+      `chunk_items`, with each platform subclass setting its own documented values. **The loop
+      lives in `HTTPSink.emit` and the subclasses override a `_body` hook**, per the note above —
+      three of them override `emit` today and would otherwise keep their unchunked path.
+- [ ] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
+      hierarchy rather than a list, so a later platform sink cannot silently bypass the chunking.
 - [ ] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
       each within both limits. This is the reproduction, run against `http.server`.
 - [ ] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
