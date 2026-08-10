@@ -109,6 +109,19 @@ So the loop rotates the frame instead of adding rounds:
   adversarial *execution*, whole-module fresh eyes (not the diff), or concurrency.
 - **Exit on a new frame finding nothing**, not on the current frame converging. "The reviewer
   found nothing" means "nothing within the frame I gave it."
+- **Every frame is entered at most twice, and when they are exhausted, stop.** SPEC-035 FR-002
+  ran to **eleven** rounds: six same-frame on the walker (the cap above, ignored five times over),
+  one library-first, three attacker, and an eleventh killed mid-run. The last two attacker rounds
+  did find real holes — so the rule is not "stop sooner regardless", it is that a *third* round in
+  one frame is evidence the frame is exhausted, and the choice then is a **different** frame or
+  the decision to ship. Rounds 5–8 all found defects in the lint added at round 4, never in the
+  roster it guards: when consecutive rounds find defects in the *previous round's fix* rather than
+  in the subject, the review has become its own subject.
+- **When a change is a guard on a guard, bound it before starting.** A test that polices a rule is
+  worth having; a test that polices the test that polices the rule is where eleven rounds went.
+  Decide up front what it is allowed to cost, and if it exceeds that, record the residual exposure
+  and merge — the exposure is usually smaller than the delay. Better still, ask whether the rule
+  could be made unrepresentable instead of policed (SPEC-040 is that question, asked late).
 - **At least one pass must start from the library, not the diff.** Every diff-scoped review is
   structurally blind to a defect that predates the diff — which is how `flush()` came to be blind
   to an open span, breaking the documented serverless recipe, through ten specs of review.
@@ -162,6 +175,28 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
 - **No Open Questions.** Resolve every decision while authoring — a spec doesn't reach Draft-ready with
   unanswered questions. Issues that only surface during the build are handled in-session (§3), not
   parked in the spec.
+
+**An acceptance criterion is a pass/fail test, not an argument for itself.** Measured on this
+repo: SPEC-029 and SPEC-030 carried 19–25 criteria averaging ~20 words and took 2–3 review rounds;
+SPEC-033 and SPEC-036 carry 48–57 averaging ~95 and took 8 and 11. The extra prose did not buy
+correctness — SPEC-033 shipped two regressions to `main` after eight rounds. So:
+
+- **Keep the criterion itself to a sentence or two.** If a decision needs a paragraph to justify,
+  the paragraph belongs in the FR's Description, where a reader meets it once, not inside a
+  checkbox they re-read every session.
+- **Provenance goes at the bottom, not inside the requirement.** "An earlier draft said X and was
+  measurably wrong" is genuinely valuable — SPEC-021's rule is that a superseded decision is
+  struck in place, never deleted — but it is *history*, and `§1` says the builder reads the whole
+  spec every session. Put it under a `## Revision history` heading, or in the delivery doc, and
+  leave a one-line strike-through where it was.
+- **Don't cite another unbuilt spec's AC number.** SPEC-034, 036 and 037 cited each other's
+  criteria 21 times, to the point where one AC had to disclaim its own circularity in writing.
+  Cross-spec coupling is a sequencing decision; make it in `INDEX.md`'s build order, where it can
+  be read in one place and changed in one place.
+- **Reserve mutation testing for assertions that guard a fixed defect.** "Every assertion is
+  mutation-tested" applied to a README-wording criterion multiplies the work without protecting
+  anything. The rule that earns its keep is narrower: *a test that claims to catch a bug must be
+  run against that bug.*
 
 `scripts/spec-lint.sh` enforces the structural side of this in CI: it **fails** a spec that is missing
 a required section or that contains an "Open Questions" / "Checkpoint" heading, and **warns** on

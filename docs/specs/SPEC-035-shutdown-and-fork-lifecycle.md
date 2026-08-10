@@ -1,7 +1,7 @@
 # Spec: Shutdown and Fork Lifecycle
 
 **ID:** SPEC-035  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033
 
@@ -12,12 +12,14 @@ Four defects in the process-lifecycle plumbing, found by the concurrency surface
 introduced and are on `main` now**, which is why this spec is first in the arc: `main` currently
 has a worse shutdown story than it did before that spec landed.
 
-The other two are older and larger. `atexit` can return through `shutdown()`'s idempotent path
-and abandon a drain that is still running — measured, **nothing delivered and the process
-gone in 0.39 s**. And `os.fork()` is unhandled anywhere in the tree: the child inherits a worker
-whose thread does not exist, and — worse — sink locks held by a thread that no longer exists.
-**19 of 60 forked children hung permanently** inside `FileSink.emit`. Prefork servers
-(gunicorn, uWSGI, Celery) are a mainstream deployment for a logging library.
+The third is older and larger: `atexit` can return through `shutdown()`'s idempotent path and
+abandon a drain that is still running — measured, **nothing delivered and the process gone in
+0.39 s**.
+
+The fourth was `os.fork()`, and it is now [SPEC-039](SPEC-039-fork-lifecycle.md). It was the
+largest piece of work here and the only one needing a new mechanism; it left after everything
+else had shipped, so that this spec could complete rather than stay open across a build as big
+again. FR-005 below is struck in place with the reasoning.
 
 Lock ordering, counter synchronisation and `contextvars` were audited alongside these and are
 **clean**; that is recorded in the audit so this spec does not have to re-establish it.
@@ -29,7 +31,7 @@ Lock ordering, counter synchronisation and `contextvars` were audited alongside 
 - The two SPEC-033 regressions: a stolen stop signal, and a swap that leaves its new sink owned
   by nobody.
 - `shutdown()`'s idempotent path waiting for the drain it did not start.
-- `os.fork()`: the inherited worker, and the inherited locks.
+- ~~`os.fork()`: the inherited worker, and the inherited locks.~~ — moved to SPEC-039.
 
 ### Out of Scope
 
@@ -213,107 +215,25 @@ returns early, and the grace still runs once (SPEC-033).
       drain thread is wedged and waiting on it would hang the exit — the case
       `Worker._join_closers`'s docstring already reasons about.
 
-### FR-005: `os.fork()` is handled, or refused loudly
+### ~~FR-005: `os.fork()` is handled, or refused loudly~~ — moved to SPEC-039
 
-#### Description:
+**Struck in place rather than deleted** (SPEC-021's rule), because a requirement that simply
+disappears takes its reasoning with it and a reader cannot tell a descoped item from a dropped
+one. The subject is unchanged and nothing is abandoned: the two measured failures, the
+`after_in_child`-only settlement, the struck "file sinks are immune" claim, the derived lock
+roster, and the four measurements taken while preparing it are all carried into
+[SPEC-039](SPEC-039-fork-lifecycle.md) — which restates them as six FRs rather than one FR with
+eleven criteria.
 
-Nothing in `src/`, `docs/` or `tests/` mentions `fork`. Two distinct failures, both measured:
+**Why it moved.** It is the largest single piece of work in this spec, the only one needing a new
+mechanism and a new module (`_fork.py`), and the only one whose subject is not a shutdown path.
+The other five FRs were finished; holding a completed spec open for it would have kept SPEC-035
+`In Progress` through a build at least as large as everything already shipped here, and would have
+put a fork mechanism and a shutdown fix under one delivery doc. It also inverts a dependency
+usefully: SPEC-039 depends on this spec's FR-002 roster, which its own new guards must satisfy.
 
-**The child inherits a worker whose thread does not exist.** `submit` still enqueues; nothing
-drains. The child's 6 events were never delivered, `atexit` closed the sink without draining, and
-`health()` read `queued=2, dropped=0, failed_batches=0, stopped_reason=None, retired=False` —
-the documented alert idiom is blind. `flush()` returning `False` was the only honest surface, and
-the library wrote nothing to stderr across the whole run.
+Nothing else in this spec depended on it.
 
-**The child inherits a sink lock held by a thread that no longer exists.** Fork while the drain
-thread is inside `FileSink.emit` and the child's first `log_foundry.info()` blocks forever, on the
-application's own thread. Measured: **19 of 60 forked children hung permanently**, `faulthandler`
-showing `file.py:78 in emit ← api.py:93 in _log`. This reaches every sink SPEC-028 locked —
-`FileSink`, `SQLiteSink`, `PostgresSink`, `ClickHouseSink`, the socket sinks.
-
-The second is the one that matters: losing a child's logs is bad, hanging the application is
-worse, and a logging call is the last place an application expects to deadlock.
-
-`os.register_at_fork` is the mechanism. The **design decision this FR must settle** is what the
-child does, and the options are not equivalent:
-
-- *Rebuild the worker in the child.* Delivery continues, and each child gets its own drain
-  thread — which for a prefork server is what the user wants. But the child inherits the parent's
-  sink object, and two processes writing one socket or one SQLite handle is its own defect.
-- *Retire the worker in the child and record why.* Nothing is delivered, but nothing is lost
-  silently either: `stopped_reason` says the process forked, and the operator sees it.
-
-The recommendation is **rebuild the queue and thread, re-initialise every lock, and leave the
-sink alone** — the sink is the caller's object and the caller's choice, `Sink` already documents
-concurrent use, and a child that silently stops logging is the failure this arc exists to remove.
-A `stopped_reason` of `"Forked"` is *not* right for a child that then works.
-
-#### Acceptance Criteria:
-
-- [ ] AC-0: **No `before` handler is built, and no `after_in_parent` with it.** The question was
-      left open by an earlier draft; it is settled here on two grounds, and the cost is the weaker
-      of them. Cost first: acquiring a sink's SPEC-028 transport lock while the drain thread is
-      mid-`emit` blocked the fork for a measured 1.20 s, and with `HTTPSink`'s documented 90 s
-      worst case it would block gunicorn's master thread for that long, with no shutdown in
-      progress, so the stop signal cannot cut it. The load-bearing ground is AC-0b's: `before` does
-      not run for a C-level fork at all, so every hazard it would close has to be closed in the
-      child regardless — which makes a parent-side handler a partial fix bought at that price,
-      not a fix. AC-2 and AC-0b together are what the child needs; the `Data Model` block below
-      registers `after_in_child` only.
-- [ ] AC-0a: **The hazard the omission accepts is duplication, it reaches the library's own file
-      sinks, and the child is what has to close it.** Without `before`, a fork landing *inside*
-      `emit` — after the write loop, before the flush — leaves the child holding the parent's
-      unflushed bytes, which both processes then write. `FileSink` opens a **buffered** stream
-      (`file.py:55`) and flushes once at the end of the batch (`:80-84`), so the window is the
-      whole batch. Measured against `5ad6699`, forking mid-batch with the child re-initialising
-      the lock per AC-2 and continuing to log per AC-3 — identical for `RotatingFileSink`:
-
-      ```
-      {"seq": 0, "msg": "a"}   {"seq": 1, "msg": "b"}   {"seq": 0, "msg": "a"}   {"seq": 99, …}
-      seq-0 appears 2x
-      ```
-
-      **An earlier draft of this AC claimed the file sinks were immune, on a measurement that
-      forked *after* `emit` returned** — when the buffer is empty by construction, so it exercised
-      the non-hazard. Recorded rather than deleted (SPEC-021's rule) because "it writes and
-      flushes inside `emit`" is true, reads like immunity, and will be re-derived otherwise. It is
-      also why the omission is *not* settled by AC-7 — that criterion names a shared handle, which
-      is the caller's sink to share, where this is the library's own sink duplicating its own
-      bytes.
-- [ ] AC-0b: **The child, not the parent, discards inherited buffered writes**, and this is what
-      makes AC-0's settlement sound rather than a waiver. `os.register_at_fork(before=)` is not
-      invoked for a C-level fork — uWSGI calls `PyOS_AfterFork_Child` only — so on one of the
-      three deployments this spec names, a `before` handler would not run and the duplication
-      would happen anyway. A parent-side fix is therefore not available in general, which settles
-      AC-0 on a stronger ground than cost alone: the child handler must be sufficient, for AC-1
-      **and** for this. A test forks mid-`emit`, as the measurement above does, and asserts the
-      child re-emits none of the parent's buffered bytes.
-- [ ] AC-1: After a fork, the child's first log call does not block. A test forks repeatedly
-      (≥50 iterations) with the drain thread actively emitting into a locking sink, and every
-      child completes within a timeout. The pre-fix version of this test hangs, which is
-      demonstrated.
-- [ ] AC-2: Every lock the library owns is re-initialised in the child. **The roster is derived,
-      and the derivation rule is stated** — every `threading.Lock`/`RLock` attribute reachable
-      from the package's own objects — rather than the illustrative list
-      (`decorator._worker_lock`, `_lifecycle._closers_lock`, `Worker._lock`, the counter locks,
-      each locking sink's pair) being the roster. A hand-list is what FR-002 exists to stop, and
-      SPEC-036 FR-003 adds a lock after this spec is built that must be picked up automatically.
-- [ ] AC-3: A child that logs after forking delivers those events.
-- [ ] AC-4: The parent is unaffected: its worker, queue and counters are unchanged across the
-      fork, and a test asserts the parent's delivery continues.
-- [ ] AC-5: Events queued in the parent but undelivered at fork time are **not** delivered twice.
-      The child's queue starts empty; the parent keeps them. A test asserts the total across both
-      processes.
-- [ ] AC-6: `architecture.md` §9 and the README state the fork behaviour. A user running gunicorn
-      preload needs to be able to find it.
-- [ ] AC-7: A sink shared across a fork is documented as the caller's responsibility, with the
-      concrete hazard named (one socket or one SQLite handle, two processes).
-- [ ] AC-8: **Whatever AC-0b does not reach is recorded in `architecture.md` §13**, not left in
-      an AC. AC-0b covers the library's own buffered writes; a third-party client that buffers
-      across `emit` (`KafkaSink`'s producer, `GooglePubSubSink`'s futures — SPEC-036 FR-002's
-      roster) holds state the library cannot reach into, so a fork mid-batch there can still
-      duplicate or strand it. SPEC-021's rule is that an accepted item is *recorded*; AC-7's
-      shared-handle sentence is a different hazard and does not cover this one.
 
 ### FR-006: The accepted constraint is written down
 
@@ -337,18 +257,8 @@ record a reader of `architecture.md` will ever find.
 
 ## Data Model
 
-No new state, no `Health` field. FR-005 adds one fork handler, registered at import:
-
-```python
-# src/log_foundry/_lifecycle.py — or a new _fork.py if the roster grows
-os.register_at_fork(
-    after_in_child=_reinit_after_fork,    # fresh locks, fresh queue + thread; the sink object
-)                                         #   is kept (AC-3), its inherited buffered writes
-                                          #   are discarded (AC-0b)
-# No `before` / `after_in_parent`: AC-0. `before` does not run for a C-level fork, so the child
-# has to close these hazards regardless; pre-acquiring the library's locks would buy a partial
-# fix for a measured 1.20 s on the parent's fork path, ~90 s worst case with HTTPSink.
-```
+No new state and no `Health` field, on any FR that shipped. The fork handler this section used to
+specify moved with FR-005 to [SPEC-039](SPEC-039-fork-lifecycle.md).
 
 ## Implementation Phases
 
@@ -362,7 +272,8 @@ The test that stops FR-001 recurring, plus the §9 statement.
 
 ### Phase 3: The idempotent shutdown (FR-004)
 
-### Phase 4: Fork (FR-005)
+### Phase 4: The recorded constraint (FR-006)
 
-Largest, and the only one needing a new mechanism. The lock roster comes first, since AC-2's
-derivation decides how much of the rest is mechanical.
+~~Fork (FR-005)~~ — moved to SPEC-039, which is its own spec and its own phases. FR-006 is what
+remained: the §13 entry for audit C5, which grew from two named sites to three while being
+written.

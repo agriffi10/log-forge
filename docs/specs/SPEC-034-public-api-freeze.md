@@ -3,10 +3,29 @@
 **ID:** SPEC-034  
 **Status:** Draft  
 **Last Updated:** 2026-08-09  
-**Depends On:** SPEC-026, SPEC-030, SPEC-033, SPEC-036, SPEC-037 — FR-008 converts `Health` to a
-dataclass, and both 036 (FR-003, `orphan_lost`) and 037 (FR-001 AC-5, `in_span_lost`) append a
-field to it as a `NamedTuple` first; building this before either would make that spec's criteria
-unsatisfiable, and AC-2b's "tenth and eleventh indices" needs both to have landed
+**Depends On:** SPEC-026, SPEC-030, SPEC-033
+
+~~**Depends On:** … SPEC-036, SPEC-037 — FR-008 converts `Health` to a dataclass, and both 036
+(FR-003, `orphan_lost`) and 037 (FR-001 AC-5, `in_span_lost`) append a field to it as a
+`NamedTuple` first; building this before either would make that spec's criteria unsatisfiable,
+and AC-2b's "tenth and eleventh indices" needs both to have landed~~
+
+**Struck (SPEC-021), and the arc's build order reversed with it.** The dependency was real but
+self-inflicted, and it ran the wrong way. Scheduling FR-008's conversion *last* is precisely what
+forced 036 and 037 each to append a field **as a tuple** and prove indices 0..8 unchanged, and
+then forced this spec to undo both. Nine acceptance criteria and two test rewrites existed only
+to serve that ordering: 036 FR-003 AC-3/AC-10/AC-11, 037 FR-001 AC-5a, and this spec's AC-2b,
+AC-2c and AC-3.
+
+Converted **first**, a `Health` field is plainly additive — no index proof, no `len(h)`
+migration, no `test_health_gains_no_field` rewrite, and no NamedTuple→dataclass churn for a field
+that only ever existed as a tuple member to satisfy an ordering. It also moves AC-2c's
+whole-field-set review to before two more fields land, which is when it is useful rather than
+merely possible.
+
+The second consequence is larger than the paperwork: with `Health` a dataclass and the `Sink`
+members probed by name, most of what remains in this arc becomes **additive and free in `1.x`** —
+so it no longer has to precede the tag. See the cut line in `docs/specs/INDEX.md`.
 
 ## Overview
 
@@ -281,19 +300,24 @@ working and leaves room to add reasons later — but only if the return type cha
       `__bool__` is never `True` — and a draft of this AC claimed both would, which is the
       contradiction to avoid. Counted on this branch: **26** identity assertions on `flush()` and
       **18** on `continue_trace()` across the test suite. All are converted and the count is
-      stated in the PR. Those figures are a **floor, recounted at build time**: SPEC-036 and
-      SPEC-037 both add call sites before this spec builds, so a count taken on this branch and
-      trusted at build time is the kind of stale roster FR-002's lesson is about.
+      stated in the PR. Those figures are **recounted at build time regardless** — a count taken
+      on one branch and trusted on another is the kind of stale roster FR-002's lesson is about —
+      though with the order reversed they are now a ceiling rather than a floor: this spec runs
+      before 036 and 037 add their call sites, which is the cheaper end to convert from.
 - [ ] AC-1b: The FR states whether `Worker.flush` changes type too, or only the public
       `log_foundry.flush` — they are different call sites with different callers.
 - [ ] AC-2: `flush().reason` distinguishes at least retired-worker, timed-out and
-      batch-abandoned — **plus the two SPEC-036 adds**, a failed span sweep and a failed
-      `sink.flush()`, since this lands after it.
+      batch-abandoned. ~~plus the two SPEC-036 adds, a failed span sweep and a failed
+      `sink.flush()`, since this lands after it~~ — struck with the reversed order: 036 now lands
+      *after* this and adds its own two reasons, which AC-5 is what makes possible. The
+      obligation does not disappear, it moves — SPEC-036 FR-001 and FR-002 each carry an AC
+      requiring the reason they invent to be surfaced here.
 - [ ] AC-3: The same treatment for `continue_trace()`, distinguishing "nothing supplied" from
-      "supplied and rejected" — **plus the third reason SPEC-036 FR-001 AC-11a adds**, supplied
-      and well-formed but refused because the span had been swept, since this lands after it.
-      Stated explicitly for the reason AC-2 states its two: a reason invented in 036 with nothing
-      on this side to carry it is a reason that quietly does not survive the freeze.
+      "supplied and rejected". Its third reason — supplied, well-formed, and refused because the
+      span had been swept — likewise moves to SPEC-036 FR-001 AC-11a, which is where it is
+      invented. What must **not** move is AC-5's guarantee: a reason added later is additive, so
+      a reason invented in 036 with nothing on this side to carry it is the failure this AC was
+      written to prevent, and reversing the order makes AC-5 the thing that prevents it.
 - [ ] AC-4: `mypy --strict` is clean, and the return types are exported so a caller can annotate.
 - [ ] AC-5: Adding a new reason later is additive — the type is documented as growing by new
       `reason` values, never by changing `__bool__`.
@@ -303,18 +327,24 @@ working and leaves room to add reasons later — but only if the return type cha
 #### Description:
 
 Both are `NamedTuple`s, so length and positional unpacking are part of the contract at 1.0.
-`Health` has grown in six consecutive specs and grows twice more in this arc — `orphan_lost`
-(SPEC-036 FR-003) and `in_span_lost` (SPEC-037 FR-001 AC-5); `d, f = sink.losses()`
+`Health` has grown in six consecutive specs and is due to grow twice more in this arc —
+`orphan_lost` (SPEC-036 FR-003) and `in_span_lost` (SPEC-037 FR-001 AC-5); `d, f = sink.losses()`
 works today and breaks the moment `SinkLosses` gains a third counter, which SPEC-018's
 `dropped_unadjudicated` vocabulary makes likely.
+
+**Those two fields are the reason this FR moved to the front of the arc rather than the back.**
+Appending to a `NamedTuple` costs an index proof and a `len()` migration in the spec that appends
+it, and then costs this spec the undoing of both; appending to a frozen dataclass costs nothing.
+Converting first is not merely cheaper — it is what makes the remaining `Health` work additive,
+and therefore what takes it off the critical path to `1.0.0` (see the header).
 
 Two ways out, and the FR must pick: convert both to frozen dataclasses (attribute access
 unchanged, unpacking and `len()` gone — itself breaking, and free only now), or keep the
 `NamedTuple` and state in the docstring that only attribute access is supported.
 
 The recommendation is **convert**. "Documented as unsupported" is what the tuple shape already
-effectively is, and it has not stopped anything: the shape is still real, still relied upon by
-`len(h) == 9` in this repo's own test suite until SPEC-036 changes it.
+effectively is, and it has not stopped anything: the shape is still real, and still relied upon by
+`len(h) == 9` in this repo's own test suite.
 
 #### Acceptance Criteria:
 
@@ -322,23 +352,26 @@ effectively is, and it has not stopped anything: the shape is still real, still 
 - [ ] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
       breaking.
 - [ ] AC-2b: **Two** tests become impossible under a dataclass and both are updated here —
-      `tests/test_orphan_sink_handoff.py::test_health_gains_no_field`, which by then pins
-      `Health._fields[:9]` plus the tenth and eleventh names and carries the `len(h)` assertion
-      relocated into it by SPEC-036 FR-003 AC-10; and
+      `tests/test_orphan_sink_handoff.py::test_health_gains_no_field` and
       `tests/test_worker.py::test_existing_health_fields_keep_their_positions`, whose **whole
-      body** is positional (`h[0]`, `h[3]`, `h[4]`, `h[5..7]`, `h[8]`, plus `h[10]` after
-      SPEC-037 AC-5a) and which 036 and 037 both leave in place. A draft of this AC named only
-      the first and called itself the catcher, which is how the second would have arrived as a
-      red build rather than a criterion. **Both** appended fields are in scope because the build
-      order is 035 → 036 → 037 → 034: this spec is the last to see `Health` as a tuple.
+      body** is positional (`h[0]`, `h[3]`, `h[4]`, `h[5..7]`, `h[8]`). A draft of this AC named
+      only the first and called itself the catcher, which is how the second would have arrived as
+      a red build rather than a criterion. Both pin **nine** fields, not eleven: with the order
+      reversed this spec is the **first** to touch `Health`, not the last, so `orphan_lost` and
+      `in_span_lost` are appended to a dataclass afterwards and neither test has to be written
+      twice. ~~Both appended fields are in scope because the build order is 035 → 036 → 037 →
+      034~~ — struck with the ordering it depended on.
 - [ ] AC-2c: The `Health` field set is reviewed **as a whole**, once, before the type freezes —
-      eleven fields arrived across nine specs, each appended on its own merits and none of them
-      ever looked at together. The freeze is the last moment that review is free. It is a review
-      with a recorded outcome, not a licence to rename: anything it does change is a change made
-      here rather than in `1.x`.
+      nine fields arrived across seven specs, each appended on its own merits and none of them
+      ever looked at together, with two more due. The freeze is the last moment that review is
+      free, and running it **before** those two land is the point of the reversal: a review that
+      arrives after them can only ratify them. It is a review with a recorded outcome, not a
+      licence to rename — anything it does change is changed here rather than in `1.x` — and its
+      outcome is an input to SPEC-036 FR-003 and SPEC-037 FR-001 AC-5, which name the two fields
+      it will be asked about.
 - [ ] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
       positional sites exist today (`tests/test_sink_losses.py:213`, `:228`), so a draft claiming
-      this was already true was wrong. Verified by grep before the type changes.
+      this was already true was wrong. Re-grepped at build time rather than trusted from here.
 - [ ] AC-4: `_replace`-style updates keep working, or their call sites are converted with the
       type.
 - [ ] AC-5: `SinkLosses` converts with it. It does **not** start accepting a plain object with
