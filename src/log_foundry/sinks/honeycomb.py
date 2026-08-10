@@ -18,7 +18,16 @@ class HoneycombSink(HTTPSink):
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
     is no transport held and ``close()`` releases nothing.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — this library's conservative default, since Honeycomb documents no
+        maximum event count for the batch endpoint.
+      MAX_BATCH_BYTES: 1,000,000 — Honeycomb's documented 1 MB of uncompressed JSON for the
+        Create Events endpoint.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_BATCH_BYTES = 1_000_000
 
     def __init__(
         self,
@@ -48,19 +57,16 @@ class HoneycombSink(HTTPSink):
             headers=headers, body_format="json_array", **http_kwargs,  # type: ignore[arg-type]
         )
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """POSTs the batch in Honeycomb's ``[{"data": event}, ...]`` shape (FR-010).
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one event in Honeycomb's ``{"data": event}`` batch shape (FR-010).
 
         Args:
-          batch: The events to ship. An empty batch is a no-op.
+          event: The event to wrap and serialize.
 
         Returns:
-          None.
+          The serialized entry.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned past the retry bound.
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
-        if not batch:
-            return
-        body = json.dumps([{"data": event} for event in batch]).encode("utf-8")
-        self._send(body, content_type="application/json")
+        return json.dumps({"data": event})

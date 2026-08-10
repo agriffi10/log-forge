@@ -14,7 +14,16 @@ class NewRelicSink(HTTPSink):
 
     The batch goes as a JSON array to the region-specific Log API endpoint with an ``Api-Key``
     header.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — this library's conservative default, since New Relic documents no
+        maximum entry count, only a payload size.
+      MAX_BATCH_BYTES: 1,000,000 — the Log API's documented "1MB (10^6 bytes) maximum per POST".
+        Measured uncompressed here, which is the conservative reading when ``gzip=True``.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_BATCH_BYTES = 1_000_000
 
     def __init__(self, api_key: str, *, region: str = "US", **http_kwargs: object) -> None:
         """Points the sink at a region's Log API endpoint.

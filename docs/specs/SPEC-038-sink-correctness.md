@@ -87,26 +87,64 @@ a mechanical change, and Loki's stream grouping still works because it groups *w
 `emit`. Without it a fifth platform sink silently bypasses the chunking, which is the roster
 lesson SPEC-032 and SPEC-035 have already paid for twice.
 
+**The roster is six subclasses, not four, and the note above found four because it read this FR's
+file list rather than the class hierarchy** (2026-08-10, during the build — the same mistake one
+level up). Resolving the bases in `sinks/` gives `DatadogSink`, `LokiSink`, `HoneycombSink`,
+`NewRelicSink`, **`SplunkHECSink`** and **`ElasticsearchSink`** (plus `OpenSearchSink`, which
+inherits through it). Five of the six override `emit`; only `NewRelicSink` inherits it. Two
+consequences the FR did not state:
+
+- **`ElasticsearchSink` needs a second hook.** Its `emit` reads `_send`'s return value and
+  adjudicates the `_bulk` response, so `_body` alone cannot carry it. It gets
+  `_handle_response(payload, items) -> bool`, and its "indexed none of N" raise becomes a
+  per-chunk verdict that the base's all-chunks-failed test aggregates — the `chunks / delivered`
+  shape `KinesisSink` and `FirehoseSink` already use, reused rather than invented.
+- **A third hook, `_render(event) -> str`, carries the per-event framing**, so each event is
+  serialized exactly once and the byte budget measures what actually reaches the wire rather than
+  estimating it. That is `_records`' idiom from the AWS sinks. `_Item` keeps the source event
+  beside the rendered text so Loki can regroup streams inside a chunk without re-parsing.
+
+`LogstashSink` and `SentrySink` **compose** an `HTTPSink` rather than subclass it, so neither is in
+AC-1a's scope and neither needs to be: Logstash's HTTP mode delegates a whole batch to
+`HTTPSink.emit` and inherits the chunking, and Sentry sends one envelope per event through `_send`,
+below the chunk loop entirely.
+
 #### Acceptance Criteria:
 
-- [ ] AC-1: `HTTPSink` gains `max_batch_count` and `max_batch_bytes` and loops `_send` over
+- [x] AC-1: `HTTPSink` gains `max_batch_count` and `max_batch_bytes` and loops `_send` over
       `chunk_items`, with each platform subclass setting its own documented values. **The loop
       lives in `HTTPSink.emit` and the subclasses override a `_body` hook**, per the note above —
-      three of them override `emit` today and would otherwise keep their unchunked path.
-- [ ] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
+      five of the six override `emit` today and would otherwise keep their unchunked path, and
+      two further hooks (`_render`, `_handle_response`) were needed for the reasons recorded there.
+- [x] AC-1a: A lint asserts no `HTTPSink` subclass overrides `emit`, derived from the class
       hierarchy rather than a list, so a later platform sink cannot silently bypass the chunking.
-- [ ] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
+      `tests/test_public_surface.py`, resolving bases transitively so a subclass two levels down
+      is in scope. It has a non-empty guard beside it, because the assertion is negative.
+- [x] AC-2: A single `emit` of 6,000 events against a fake HTTP server produces multiple requests,
       each within both limits. This is the reproduction, run against `http.server`.
-- [ ] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
+- [x] AC-3: A chunk that fails does not abandon chunks that succeeded — partial delivery is
       counted per SPEC-026, not reported as total failure.
-- [ ] AC-4: 413 joins the retryable set only if retrying could help; the FR states which and why.
-      A payload too large is *permanent* for that chunk, so the right answer is to split, not
-      retry — and if a single event exceeds the limit it is dropped and counted
-      `dropped_oversized`, as the AWS sinks already do.
-- [ ] AC-5: The per-platform limits are cited to their documentation in each subclass docstring.
-- [ ] AC-6: `README.md`'s `HTTPSink` signature table gains `max_batch_count`/`max_batch_bytes`.
+- [x] AC-4: 413 does **not** join the retryable set: the same bytes cannot succeed on a re-send,
+      so `_deliver` halves the chunk and sends each half, which is safe precisely because a 413
+      is a rejection *before* ingestion and so cannot duplicate (SPEC-018's rule). Halving
+      terminates at one event, which is then permanently too large and is dropped and counted
+      `dropped_oversized`, as the AWS sinks already do — as is an event that exceeds the budget
+      before any request is made. The split is offered only to `_deliver`, through `_send`'s
+      `splittable=` flag: `SentrySink` sends one envelope per event and has nothing left to split,
+      so it keeps the counted, announced abandonment it has always had rather than being handed an
+      uncounted exception, which would have been a new silent loss.
+- [x] AC-5: The per-platform limits are cited to their documentation in each subclass docstring —
+      **and where the vendor publishes none, the docstring says so and names the value as this
+      library's own choice.** Datadog (1,000 / 5 MB), New Relic (1 MB per POST) and Honeycomb
+      (1 MB) are vendor figures. Elasticsearch's is chosen *below* its documented 100 MB cap;
+      Loki's and Splunk's are chosen outright, because both destinations bound a request by an
+      operator-tunable server setting rather than a published constant. Amended by evidence, per
+      SPEC-023's precedent: an invented citation is worse than a stated choice.
+- [x] AC-6: `README.md`'s `HTTPSink` signature table gains `max_batch_count`/`max_batch_bytes`.
       The README PR is adding `max_retry_after` and `opener` to that same table, so this AC exists
-      to stop the two passes leaving it half-right.
+      to stop the two passes leaving it half-right — all four are now in it, plus a per-sink
+      limits table carrying AC-5's provenance. **PR #126 is a draft parked for `1.0.0` and edits
+      this same table; it must rebase.**
 
 ### FR-002: `PostgresSink`'s rollback cannot bypass the retry, the counter and the diagnostic
 

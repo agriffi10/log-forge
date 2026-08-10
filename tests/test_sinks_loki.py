@@ -55,3 +55,50 @@ def test_timestamp_fallback_is_numeric_when_absent() -> None:
     LokiSink("http://loki:3100", labels=("service",), opener=opener).emit([{"service": "api"}])
     ns = json.loads(opener.calls[0]["body"])["streams"][0]["values"][0][0]
     assert ns.isdigit()
+
+
+# --- SPEC-038 FR-001: chunking, and grouping that survives it ----------------------------
+
+
+def test_a_large_batch_is_split_and_every_line_survives() -> None:
+    opener = FakeOpener()
+    sink = LokiSink("http://loki:3100", max_batch_bytes=20_000, opener=opener)
+    sink.emit([{"service": "api", "level": "INFO", "n": i, "pad": "x" * 500} for i in range(200)])
+    assert len(opener.calls) > 1
+    assert all(len(call["body"]) <= 20_000 for call in opener.calls)
+    values = [
+        value
+        for call in opener.calls
+        for stream in json.loads(call["body"])["streams"]
+        for value in stream["values"]
+    ]
+    assert len(values) == 200
+    assert sorted(json.loads(line)["n"] for _ts, line in values) == list(range(200))
+
+
+def test_streams_are_regrouped_inside_each_chunk() -> None:
+    """Grouping is per request, so a chunk carries only the labels its own events have."""
+    opener = FakeOpener()
+    sink = LokiSink("http://loki:3100", max_batch_count=2, opener=opener)
+    sink.emit(
+        [
+            {"service": "api", "n": 0},
+            {"service": "api", "n": 1},
+            {"service": "worker", "n": 2},
+            {"service": "worker", "n": 3},
+        ]
+    )
+    assert len(opener.calls) == 2
+    first, second = (json.loads(call["body"])["streams"] for call in opener.calls)
+    assert len(first) == 1 and first[0]["stream"] == {"service": "api"}
+    assert len(second) == 1 and second[0]["stream"] == {"service": "worker"}
+    assert len(first[0]["values"]) == 2 and len(second[0]["values"]) == 2
+
+
+def test_a_chunk_holding_two_label_sets_still_carries_two_streams() -> None:
+    opener = FakeOpener()
+    LokiSink("http://loki:3100", opener=opener).emit(
+        [{"service": "api", "n": 0}, {"service": "worker", "n": 1}]
+    )
+    streams = json.loads(opener.calls[0]["body"])["streams"]
+    assert sorted(stream["stream"]["service"] for stream in streams) == ["api", "worker"]

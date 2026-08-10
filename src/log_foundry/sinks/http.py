@@ -8,9 +8,11 @@ import threading
 import urllib.error
 import urllib.request
 from base64 import b64encode
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from log_foundry import _diag
+from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -20,6 +22,55 @@ if TYPE_CHECKING:
 __all__ = ["HTTPSink", "merge_headers"]
 
 _BACKOFF_BASE = 0.1
+
+DEFAULT_MAX_BATCH_COUNT = 1000
+"""Entries one request may carry, unless a subclass documents its destination's own (FR-001).
+
+A thousand is Datadog's published array limit and a conservative default everywhere else: no
+destination in this family documents a *smaller* count, and a count bound is the cheap half of
+the guard, since it holds whatever the per-event size turns out to be.
+"""
+
+DEFAULT_MAX_BATCH_BYTES = 5_000_000
+"""Bytes one request's body may reach, unless a subclass documents its destination's own.
+
+Five million is the largest limit published by any sink in this family (Datadog's uncompressed
+payload ceiling), so it is the right *base-class* default for an arbitrary endpoint the library
+knows nothing about, while every subclass that has a documented figure sets its own below it.
+"""
+
+
+@dataclass(frozen=True)
+class _Item:
+    """One event rendered into this sink's per-event wire form, with its measured size.
+
+    Rendering once and chunking over the result is the ``KinesisSink``/``FirehoseSink`` idiom:
+    it costs one ``json.dumps`` per event rather than one to measure and another to build the
+    body, and it makes the byte budget exact rather than estimated.
+
+    Attributes:
+      event: The source event, kept so a :meth:`HTTPSink._body` that groups rather than
+        concatenates — Loki's, which re-forms streams per chunk — can read the fields it groups
+        on without re-parsing what :meth:`HTTPSink._render` just serialized.
+      rendered: The event's serialized form, without the separator that joins it to its
+        neighbours.
+      size: ``rendered``'s UTF-8 length plus one byte for that separator. The two bytes of a
+        JSON array's brackets are not modelled, which is why the budget is a bound on the body
+        rather than its exact length.
+    """
+
+    event: dict[str, object]
+    rendered: str
+    size: int
+
+
+class _PayloadTooLarge(SinkDeliveryError):
+    """A ``413`` for a chunk the caller may be able to split and re-send (FR-001 AC-4).
+
+    It subclasses ``SinkDeliveryError`` so that every pre-existing caller of :meth:`HTTPSink._send`
+    — ``SentrySink`` above all — keeps catching it exactly as before. Only the chunk loop, which
+    passes ``splittable=True``, ever sees it as its own type.
+    """
 
 DEFAULT_MAX_RETRY_AFTER = 30.0
 """Ceiling on a server-supplied ``Retry-After``, in seconds (SPEC-027 FR-001).
@@ -57,11 +108,18 @@ def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[
 class HTTPSink:
     """A :class:`~log_foundry.sinks.base.Sink` that POSTs each batch to an HTTP endpoint.
 
-    This is the dependency-free base every other HTTP platform sink builds on: it serializes a
-    batch, applies headers, auth and optional gzip, POSTs it, and retries ``429`` and ``5xx``
-    with bounded exponential backoff. These are terminal, direct-ship sinks — per arch §9.1 they
-    couple application delivery to the destination's availability, so for durability put a queue
-    in front.
+    This is the dependency-free base every other HTTP platform sink builds on: it re-chunks a
+    batch to the destination's limits, serializes each chunk, applies headers, auth and optional
+    gzip, POSTs it, and retries ``429`` and ``5xx`` with bounded exponential backoff. These are
+    terminal, direct-ship sinks — per arch §9.1 they couple application delivery to the
+    destination's availability, so for durability put a queue in front.
+
+    **Subclasses extend it by overriding hooks, never** :meth:`emit` (FR-001). The chunk loop
+    lives here, so a subclass that overrode ``emit`` would deliver whatever batch it was handed —
+    which is what three shipped subclasses did, and why ``Worker._final_drain`` could hand this
+    family an entire exit backlog (5,980 events measured) in one request that the destination
+    then rejected whole. The hooks are :meth:`_render`, :meth:`_body` and
+    :meth:`_handle_response`; a test asserts no subclass defines ``emit``.
 
     Credentials passed as ``auth`` are sent on every request to the URL as given, and nothing
     here requires ``https://``: over a plaintext endpoint a bearer token, and a basic-auth pair,
@@ -71,9 +129,12 @@ class HTTPSink:
     is a pause on all log delivery. ``shutdown()``'s own timeout bounds the total (FR-004).
 
     Attributes:
+      MAX_BATCH_COUNT: Entries one request may carry. A subclass overrides it with its
+        destination's documented figure.
+      MAX_BATCH_BYTES: Bytes one request's body may reach, likewise.
       failed: Requests abandoned past the retry bound.
-      dropped_oversized: Events dropped for exceeding a destination's hard size limit, used by
-        subclasses that enforce one; the generic core imposes no universal limit.
+      dropped_oversized: Events dropped for exceeding this sink's byte budget on their own, plus
+        any single event a destination answered with ``413``.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -82,6 +143,9 @@ class HTTPSink:
     a batch emitted afterwards still reaches the endpoint, and refusing it would be loss the
     library invented rather than loss it reported.
     """
+
+    MAX_BATCH_COUNT = DEFAULT_MAX_BATCH_COUNT
+    MAX_BATCH_BYTES = DEFAULT_MAX_BATCH_BYTES
 
     def __init__(
         self,
@@ -95,6 +159,8 @@ class HTTPSink:
         gzip: bool = False,
         max_retries: int = 3,
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
+        max_batch_count: int | None = None,
+        max_batch_bytes: int | None = None,
         opener: Callable[..., Any] | None = None,
     ) -> None:
         """Configures the endpoint, encoding, credentials and retry bounds.
@@ -114,6 +180,11 @@ class HTTPSink:
             nor rejected here, because ``clamp_server_delay`` refuses an unusable ceiling and
             falls back to exponential backoff, keeping the validation in one place; it is stored
             as given so a caller can read back what they passed.
+          max_batch_count: Entries one request may carry, or ``None`` for this class's
+            :attr:`MAX_BATCH_COUNT`. Floored at one, since a zero or negative bound would make
+            every event oversized and discard the batch.
+          max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
+            :attr:`MAX_BATCH_BYTES`. Floored at one for the same reason.
           opener: A ``urlopen``-shaped callable, which a test can inject to assert on the
             request without any network access.
 
@@ -132,6 +203,12 @@ class HTTPSink:
         self.gzip = gzip
         self.max_retries = max(max_retries, 0)
         self.max_retry_after = max_retry_after
+        self.max_batch_count = max(
+            max_batch_count if max_batch_count is not None else self.MAX_BATCH_COUNT, 1
+        )
+        self.max_batch_bytes = max(
+            max_batch_bytes if max_batch_bytes is not None else self.MAX_BATCH_BYTES, 1
+        )
         self.log_foundry_stop_signal: threading.Event | None = None
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
@@ -139,7 +216,11 @@ class HTTPSink:
         self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Serializes the batch per the configured body format and POSTs it (FR-001).
+        """Re-chunks the batch to this destination's limits and POSTs each chunk (FR-001).
+
+        Subclasses must not override this. They shape the request through :meth:`_render`,
+        :meth:`_body` and :meth:`_handle_response`, which is what keeps the chunk loop on every
+        path to the wire.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -148,12 +229,172 @@ class HTTPSink:
           None.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned past the retry bound.
+          SinkDeliveryError: When every chunk failed, which is the total failure the worker's
+            retry exists for (SPEC-026 FR-001). A batch that delivered *some* chunks does not
+            raise: the worker retries whole batches, so raising would re-send what landed, and
+            the abandoned chunks are already counted and announced by :meth:`_abandon`.
         """
         if not batch:
             return
-        body, content_type = self._encode(batch)
-        self._send(body, content_type=content_type)
+        items = self._items(batch)
+        if not items:
+            return
+        chunks = delivered = 0
+        for chunk in chunk_items(
+            items,
+            max_count=self.max_batch_count,
+            max_bytes=self.max_batch_bytes,
+            size_of=lambda item: item.size,
+        ):
+            chunks += 1
+            if self._deliver(chunk):
+                delivered += 1
+        if chunks and not delivered:
+            raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
+
+    def _items(self, batch: list[dict[str, object]]) -> list[_Item]:
+        """Renders each event and discards any that cannot fit a request on its own.
+
+        ``chunk_items`` documents oversized items as the caller's to filter, because a group it
+        cannot bound is a group it would yield anyway; dropping here is what the AWS sinks
+        already do in ``_records``.
+
+        Args:
+          batch: The events to render.
+
+        Returns:
+          The items that can be sent, in order.
+
+        Raises:
+          None.
+        """
+        items: list[_Item] = []
+        for event in batch:
+            rendered = self._render(event)
+            size = len(rendered.encode("utf-8")) + 1
+            if size > self.max_batch_bytes:
+                with self._counter_lock:
+                    self.dropped_oversized += 1
+                _diag.lost(
+                    "event",
+                    1,
+                    f"{type(self).__name__}, {size} bytes exceeds the "
+                    f"{self.max_batch_bytes}-byte request budget",
+                )
+                continue
+            items.append(_Item(event=event, rendered=rendered, size=size))
+        return items
+
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one event into this sink's per-event wire form.
+
+        The hook a subclass overrides to wrap or enrich an event — Datadog's ``ddsource`` keys,
+        Splunk's HEC envelope, Elasticsearch's action-plus-source pair. It must not include the
+        separator that joins it to its neighbours; :meth:`_body` adds that.
+
+        Args:
+          event: The event to serialize.
+
+        Returns:
+          The serialized form.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+        """
+        return json.dumps(event)
+
+    def _body(self, items: list[_Item]) -> tuple[bytes, str]:
+        """Joins one chunk's rendered items into a request body.
+
+        Args:
+          items: The chunk's items, known non-empty.
+
+        Returns:
+          The body bytes and the default content type for the configured format.
+
+        Raises:
+          None.
+        """
+        if self.body_format == "json_array":
+            return (
+                ("[" + ",".join(item.rendered for item in items) + "]").encode("utf-8"),
+                "application/json",
+            )
+        return (
+            "".join(item.rendered + "\n" for item in items).encode("utf-8"),
+            "application/x-ndjson",
+        )
+
+    def _handle_response(self, payload: bytes, items: list[_Item]) -> bool:
+        """Reports whether a ``2xx`` response means the chunk was actually accepted.
+
+        The hook for a destination whose ``2xx`` can still describe per-record failures —
+        Elasticsearch's ``_bulk`` items. A status in the success range is the whole answer
+        everywhere else, so the default ignores the body.
+
+        Args:
+          payload: The response body.
+          items: The chunk the response describes.
+
+        Returns:
+          True, meaning delivered.
+
+        Raises:
+          None.
+        """
+        return True
+
+    def _deliver(self, items: list[_Item]) -> bool:
+        """Sends one chunk, splitting it if the destination calls the payload too large.
+
+        A ``413`` is permanent for these exact bytes, so re-sending them cannot help and the
+        answer is a smaller request (AC-4). Splitting is safe to do here and only here: ``413``
+        is a rejection before ingestion, so nothing landed and the halves cannot duplicate
+        anything — the SPEC-018 rule that only provable non-delivery may be re-sent.
+
+        Args:
+          items: The chunk to send, known non-empty.
+
+        Returns:
+          True when the chunk, or some part of it, was delivered.
+
+        Raises:
+          None.
+        """
+        body, content_type = self._body(items)
+        try:
+            payload = self._send(body, content_type=content_type, splittable=True)
+        except _PayloadTooLarge:
+            return self._split(items)
+        except SinkDeliveryError:
+            return False
+        return self._handle_response(payload, items)
+
+    def _split(self, items: list[_Item]) -> bool:
+        """Halves a chunk the destination refused as too large and sends each half.
+
+        Halving terminates at a single item, which no further split can shrink: that one event
+        is larger than this destination accepts, which is permanent, so it is dropped and
+        counted rather than retried into the same answer forever (AC-4).
+
+        Args:
+          items: The refused chunk, known non-empty.
+
+        Returns:
+          True when either half delivered anything.
+
+        Raises:
+          None.
+        """
+        if len(items) == 1:
+            with self._counter_lock:
+                self.dropped_oversized += 1
+            _diag.lost("event", 1, f"{type(self).__name__}, HTTP 413 for a single event")
+            return False
+        middle = len(items) // 2
+        first = self._deliver(items[:middle])
+        second = self._deliver(items[middle:])
+        return first or second
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and abandoned requests (SPEC-026 FR-002).
@@ -187,29 +428,13 @@ class HTTPSink:
           None.
         """
 
-    def _encode(self, batch: list[dict[str, object]]) -> tuple[bytes, str]:
-        """Serializes the batch in the configured body format.
-
-        Args:
-          batch: The events to serialize.
-
-        Returns:
-          The body bytes and the default content type for that format.
-
-        Raises:
-          TypeError: If an event is not JSON-serializable, which ``sanitize`` prevents.
-        """
-        if self.body_format == "json_array":
-            return json.dumps(batch).encode("utf-8"), "application/json"
-        text = "".join(json.dumps(event) + "\n" for event in batch)
-        return text.encode("utf-8"), "application/x-ndjson"
-
     def _send(
         self,
         body: bytes,
         *,
         content_type: str,
         extra_headers: dict[str, str] | None = None,
+        splittable: bool = False,
     ) -> bytes:
         """POSTs a body with bounded retry and returns the response bytes.
 
@@ -222,12 +447,21 @@ class HTTPSink:
           body: The serialized batch.
           content_type: The default content type, overridable by caller headers.
           extra_headers: Per-request headers beneath the caller's own.
+          splittable: Whether the caller can respond to a ``413`` by sending smaller requests.
+            Only :meth:`_deliver` can, so it alone passes ``True`` and alone sees
+            ``_PayloadTooLarge``. Every other caller — ``SentrySink``, which sends one envelope
+            per event and has nothing left to split — keeps the counted, announced abandonment
+            it has always had, because a ``413`` raised past it uncounted would be exactly the
+            silent loss this file's counters exist to prevent.
 
         Returns:
           The response bytes, which subclasses that must inspect the response — such as
           Elasticsearch's ``_bulk`` items — read.
 
         Raises:
+          _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
+            line, because the caller is about to re-send the same events in smaller requests and
+            only what finally fails is a loss.
           SinkDeliveryError: If the request was retried to exhaustion. It used to return
             ``None``, which every caller spelled as "nothing to parse" and the worker read as a
             successful emit; one request carries the whole batch, so an abandoned one delivered
@@ -253,6 +487,8 @@ class HTTPSink:
             if (status == 429 or 500 <= status < 600) and attempt < self.max_retries:
                 self._sleep_backoff(attempt, retry_after)
                 continue
+            if status == 413 and splittable:
+                raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413")
             self._abandon(f"HTTP {status}")
         raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
 

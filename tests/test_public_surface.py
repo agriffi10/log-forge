@@ -49,8 +49,82 @@ class _Recorder:
     def close(self) -> None: ...
 
 
+def _sink_class_nodes() -> dict[str, tuple[str, ast.ClassDef]]:
+    """Every class defined anywhere in `sinks/`, keyed by name.
+
+    Names collide across modules in principle and do not in fact, so a flat map is enough to
+    resolve a base by name. Reading the source rather than importing keeps every sink in scope
+    in an environment with no optional extras installed, which is what CI is.
+
+    Args:
+      None.
+
+    Returns:
+      ``{class name: (module stem, class node)}``.
+
+    Raises:
+      None.
+    """
+    found: dict[str, tuple[str, ast.ClassDef]] = {}
+    for path in sorted(_SINK_PKG.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                found[node.name] = (path.stem, node)
+    return found
+
+
+def _base_names(cls: ast.ClassDef) -> list[str]:
+    """The immediate base-class names of a class node, ignoring anything not a plain name.
+
+    Args:
+      cls: The class node.
+
+    Returns:
+      The base names, which are bare identifiers for every sink in this package.
+
+    Raises:
+      None.
+    """
+    return [b.id for b in cls.bases if isinstance(b, ast.Name)]
+
+
+def _defines_or_inherits_emit(cls: ast.ClassDef, nodes: dict[str, tuple[str, ast.ClassDef]]) -> bool:
+    """Reports whether a class defines `emit` or inherits one from within `sinks/`.
+
+    Inheritance is walked because a sink that gets its `emit` from a base is a sink, and the
+    signature checks below apply to its own `__init__` regardless of where its `emit` came from.
+    Keying scope on "defines an emit" alone was what let five `HTTPSink` subclasses leave this
+    roster the moment FR-001 moved their `emit` up into the base class.
+
+    Args:
+      cls: The class node to judge.
+      nodes: The name-to-node map to resolve bases through.
+
+    Returns:
+      True when the class has an `emit` by definition or by inheritance.
+
+    Raises:
+      None.
+    """
+    seen: set[str] = set()
+    queue = [cls]
+    while queue:
+        node = queue.pop()
+        if any(
+            isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef) and m.name == "emit"
+            for m in node.body
+        ):
+            return True
+        for name in _base_names(node):
+            if name not in seen and name in nodes:
+                seen.add(name)
+                queue.append(nodes[name][1])
+    return False
+
+
 def _sink_classes_with_emit() -> list[tuple[str, ast.ClassDef]]:
-    """Every class in `sinks/` that defines an `emit`, by source rather than by import.
+    """Every class in `sinks/` that defines *or inherits* an `emit`, by source not by import.
 
     This is SPEC-032's lint scope and deliberately not "every class named ``*Sink``": the two
     rosters differ (34 against 39 at the time SPEC-034 was written), and a roster whose whole
@@ -67,18 +141,12 @@ def _sink_classes_with_emit() -> list[tuple[str, ast.ClassDef]]:
     Raises:
       None.
     """
-    found: list[tuple[str, ast.ClassDef]] = []
-    for path in sorted(_SINK_PKG.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            if any(
-                isinstance(b, ast.FunctionDef | ast.AsyncFunctionDef) and b.name == "emit"
-                for b in node.body
-            ):
-                found.append((path.stem, node))
-    return found
+    nodes = _sink_class_nodes()
+    return [
+        (stem, cls)
+        for stem, cls in nodes.values()
+        if _defines_or_inherits_emit(cls, nodes)
+    ]
 
 
 def _positional_params(cls: ast.ClassDef) -> list[str]:
@@ -108,6 +176,74 @@ def test_the_roster_is_the_emit_defining_classes_and_is_not_empty() -> None:
     """
     roster = _sink_classes_with_emit()
     assert len(roster) >= 30, f"the sink roster collapsed to {len(roster)}: {roster}"
+
+
+def _http_sink_subclasses() -> list[tuple[str, ast.ClassDef]]:
+    """Every transitive subclass of `HTTPSink` in `sinks/`, derived from the bases in the source.
+
+    Transitive rather than direct, so `OpenSearchSink` -- which inherits through
+    `ElasticsearchSink` -- is in scope, and so a subclass added two levels down cannot slip past.
+
+    Args:
+      None.
+
+    Returns:
+      One ``(module stem, class node)`` pair per subclass, excluding `HTTPSink` itself.
+
+    Raises:
+      None.
+    """
+    nodes = _sink_class_nodes()
+    found: list[tuple[str, ast.ClassDef]] = []
+    for stem, cls in nodes.values():
+        seen: set[str] = set()
+        queue = list(_base_names(cls))
+        while queue:
+            name = queue.pop()
+            if name == "HTTPSink":
+                found.append((stem, cls))
+                break
+            if name in nodes and name not in seen:
+                seen.add(name)
+                queue.extend(_base_names(nodes[name][1]))
+    return found
+
+
+def test_the_http_subclass_roster_is_not_empty() -> None:
+    """SPEC-038 FR-001 AC-1a. The lint below is negative, so an empty roster would satisfy it.
+
+    Six subclasses ship today. The floor is deliberately below that -- this guards against the
+    resolver collapsing, not against a sink being retired.
+    """
+    roster = _http_sink_subclasses()
+    assert len(roster) >= 5, f"the HTTPSink subclass roster collapsed to {sorted(roster)}"
+
+
+def test_no_http_sink_subclass_overrides_emit() -> None:
+    """SPEC-038 FR-001 AC-1a. The chunk loop lives in `HTTPSink.emit` and must stay reachable.
+
+    An overriding subclass builds its own body and calls `_send` once, which is how `DatadogSink`,
+    `LokiSink`, `HoneycombSink`, `SplunkHECSink` and `ElasticsearchSink` all bypassed chunking
+    entirely -- `Worker._final_drain` handed them an exit backlog of 5,980 events in a single
+    request and the destination rejected the lot. Fixing the five without this lint would leave a
+    sixth platform sink free to reintroduce it silently, which is the roster lesson SPEC-032 and
+    SPEC-035 have each already paid for.
+
+    The subclasses extend through `_render`, `_body` and `_handle_response` instead. Those are
+    unrestricted: the rule is only that nothing may take ownership of the loop.
+    """
+    offenders = [
+        f"{stem}.{cls.name}"
+        for stem, cls in _http_sink_subclasses()
+        if any(
+            isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef) and m.name == "emit"
+            for m in cls.body
+        )
+    ]
+    assert not offenders, (
+        f"HTTPSink subclasses must override _body/_render, not emit, or they bypass the "
+        f"per-destination chunking: {offenders}"
+    )
 
 
 def test_no_sink_takes_an_injected_transport_positionally() -> None:

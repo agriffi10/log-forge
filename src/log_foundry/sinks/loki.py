@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from log_foundry.sinks._time import epoch_nanos
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.http import HTTPSink, _Item
 
 __all__ = ["LokiSink"]
 
@@ -22,7 +22,18 @@ class LokiSink(HTTPSink):
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
     is no transport held and ``close()`` releases nothing.
+
+    Attributes:
+      MAX_BATCH_COUNT: 1,000 — this library's conservative default; Loki bounds a push by size,
+        not by entry count.
+      MAX_BATCH_BYTES: 4,000,000 — chosen, not vendor-fixed. Loki's own default is far larger
+        (``distributor.max_recv_msg_size``, 100 MB for the compressed body), but that is an
+        operator-tunable server setting and a hosted Loki is routinely configured well below it,
+        so the default here is the conservative one. Raise it with ``max_batch_bytes=``.
     """
+
+    MAX_BATCH_COUNT = 1000
+    MAX_BATCH_BYTES = 4_000_000
 
     def __init__(self, url: str, *, labels: tuple[str, ...] = ("service", "env", "level"),
                  **http_kwargs: object) -> None:
@@ -44,30 +55,62 @@ class LokiSink(HTTPSink):
             url.rstrip("/") + _PUSH_PATH, body_format="json_array", **http_kwargs  # type: ignore[arg-type]
         )
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """Groups events into labelled streams and POSTs the push payload (FR-004).
+    def _render(self, event: dict[str, object]) -> str:
+        """Serializes one event as the ``[timestamp, line]`` value Loki's push payload carries.
+
+        This is the exact text that reaches the wire, so the chunker's byte budget measures what
+        is actually sent rather than the event alone.
 
         Args:
-          batch: The events to push. An empty batch is a no-op.
+          event: The event to serialize.
 
         Returns:
-          None.
+          The serialized push value.
 
         Raises:
-          SinkDeliveryError: If the request was abandoned past the retry bound.
+          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
         """
-        if not batch:
-            return
-        streams: dict[tuple[tuple[str, str], ...], tuple[dict[str, str], list[list[str]]]] = {}
-        for event in batch:
-            labels = {key: str(event[key]) for key in self._labels if key in event}
-            stream_key = tuple(sorted(labels.items()))
-            value = [str(epoch_nanos(event.get("timestamp"))), json.dumps(event)]
-            streams.setdefault(stream_key, (labels, []))[1].append(value)
-        payload = {
-            "streams": [
-                {"stream": labels, "values": values} for labels, values in streams.values()
-            ]
-        }
-        body = json.dumps(payload).encode("utf-8")
-        self._send(body, content_type="application/json")
+        return json.dumps([str(epoch_nanos(event.get("timestamp"))), json.dumps(event)])
+
+    def _labels_of(self, event: dict[str, object]) -> dict[str, str]:
+        """Promotes the configured event keys to stream labels.
+
+        Args:
+          event: The event to read.
+
+        Returns:
+          The labels, which are absent rather than empty when the event lacks the key.
+
+        Raises:
+          None.
+        """
+        return {key: str(event[key]) for key in self._labels if key in event}
+
+    def _body(self, items: list[_Item]) -> tuple[bytes, str]:
+        """Groups one chunk's values into labelled streams and builds the push payload (FR-004).
+
+        Grouping happens per chunk rather than per batch, which is what makes chunking safe
+        here: streams are re-formed inside each request, so two chunks may each carry a stream
+        with the same labels and Loki accepts both. The payload is assembled from the
+        already-rendered values rather than re-serialized, so each event is encoded once.
+
+        Args:
+          items: The chunk's rendered values, known non-empty.
+
+        Returns:
+          The body bytes and the content type.
+
+        Raises:
+          None.
+        """
+        streams: dict[tuple[tuple[str, str], ...], tuple[dict[str, str], list[str]]] = {}
+        for item in items:
+            labels = self._labels_of(item.event)
+            streams.setdefault(tuple(sorted(labels.items())), (labels, []))[1].append(
+                item.rendered
+            )
+        parts = [
+            f'{{"stream":{json.dumps(labels)},"values":[{",".join(values)}]}}'
+            for labels, values in streams.values()
+        ]
+        return f'{{"streams":[{",".join(parts)}]}}'.encode(), "application/json"

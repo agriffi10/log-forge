@@ -146,3 +146,56 @@ def test_sentry_without_sdk_or_dsn_raises(monkeypatch) -> None:
     monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
     with pytest.raises(ValueError):
         SentrySink()
+
+
+# --- SPEC-038 FR-001: every platform sink chunks through HTTPSink.emit -------------------
+
+
+def test_datadog_carries_its_documented_intake_limits() -> None:
+    """AC-1/AC-5. Datadog publishes both figures, so both are the vendor's rather than ours."""
+    assert (DatadogSink.MAX_BATCH_COUNT, DatadogSink.MAX_BATCH_BYTES) == (1000, 5_000_000)
+
+
+def test_datadog_splits_a_batch_over_its_array_limit() -> None:
+    """Before FR-001 this went as one array of 2,500 and the intake rejected all of it."""
+    opener = FakeOpener()
+    DatadogSink("key", opener=opener).emit([{"n": i} for i in range(2500)])
+    counts = [len(json.loads(call["body"])) for call in opener.calls]
+    assert counts == [1000, 1000, 500]
+    assert all(entry["ddsource"] == "log-foundry" for entry in json.loads(opener.calls[0]["body"]))
+
+
+def test_newrelic_splits_a_batch_over_its_one_megabyte_post_limit() -> None:
+    opener = FakeOpener()
+    NewRelicSink("key", opener=opener).emit([{"pad": "x" * 2000} for _ in range(1000)])
+    assert len(opener.calls) > 1
+    assert all(len(call["body"]) <= NewRelicSink.MAX_BATCH_BYTES for call in opener.calls)
+    assert sum(len(json.loads(call["body"])) for call in opener.calls) == 1000
+
+
+def test_honeycomb_splits_a_batch_and_keeps_its_data_envelope() -> None:
+    opener = FakeOpener()
+    HoneycombSink("key", "dataset", opener=opener).emit([{"pad": "x" * 2000} for _ in range(1000)])
+    assert len(opener.calls) > 1
+    assert all(len(call["body"]) <= HoneycombSink.MAX_BATCH_BYTES for call in opener.calls)
+    entries = [entry for call in opener.calls for entry in json.loads(call["body"])]
+    assert len(entries) == 1000
+    assert all(set(entry) == {"data"} for entry in entries)
+
+
+def test_splunk_splits_a_batch_and_keeps_concatenated_hec_envelopes() -> None:
+    opener = FakeOpener()
+    SplunkHECSink("http://splunk:8088", "tok", opener=opener).emit(
+        [{"pad": "x" * 2000} for _ in range(1000)]
+    )
+    assert len(opener.calls) > 1
+    decoder = json.JSONDecoder()
+    total = 0
+    for call in opener.calls:
+        body = call["body"].decode("utf-8")
+        index = 0
+        while index < len(body):
+            envelope, index = decoder.raw_decode(body, index)
+            assert set(envelope) >= {"event", "time", "source"}
+            total += 1
+    assert total == 1000, "HEC stays concatenated JSON objects, one per event, across chunks"
