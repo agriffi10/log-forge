@@ -146,20 +146,37 @@ below the chunk loop entirely.
       so it keeps the counted, announced abandonment it has always had rather than being handed an
       uncounted exception, which would have been a new silent loss.
 
-      **Three corrections from review, each measured** (2026-08-10):
-      - *The halving is bounded.* Unbounded it is `2N-1` requests — **11,954 measured** for one
-        5,980-event exit backlog against an endpoint answering 413 unconditionally, on the single
-        drain thread at the moment a process exits, and **47,816** across the worker's retries.
-        `MAX_SPLIT_DEPTH` caps the cascade, a shutdown ends it, and what it cannot place is
-        abandoned and counted.
+      **The search halves the byte budget, not the chunk** — settled over two review rounds, both
+      measured:
+      - *Recursive chunk-halving is `2N-1` requests* — **11,954** for one 5,980-event exit backlog
+        against an endpoint refusing everything, on the single drain thread at the moment a
+        process exits, and **47,816** across the worker's retries, because each accepted size is
+        rediscovered independently in every branch. Capping its *depth* was the first fix and was
+        worse: a 5 MB default against a 20 kB endpoint is a 250× ratio needing ~8 halvings, so a
+        cap of 4 delivered **2 events of 2,000**. Halving the budget instead converges in
+        `log2(ratio)` — **8 wasted requests, 2,002 events delivered, zero loss** on that same
+        scenario — and each reduction halves *the refused body's own size*, since halving the
+        nominal budget converges on how the sink was configured rather than on what was sent.
+      - *A size already refused is not asked about again* within one `emit`, which stops the tail
+        degenerating into one request per event once the budget falls below a single item.
       - *A permanent drop is settled, not failed.* Returning "not delivered" made `emit` raise, so
-        the worker re-ran the whole cascade and re-dropped the same events: `losses().dropped`
+        the worker re-ran the whole search and re-dropped the same events: `losses().dropped`
         read **23,920 for 5,980 events lost**, against a counter whose contract — unlike
-        `failed`'s — is an exact count. A 413 no retry can fix now settles the chunk, matching
-        both `_items`' own oversize drop and `KinesisSink`.
+        `failed`'s — is an exact count.
       - *The clause was unfalsifiable.* Adding 413 to the retryable set beside 429 left all 1,326
         tests green, because every 413 test ran at `max_retries=0`. Now asserted on the request
         count with retries switched on.
+- [x] AC-4a (**added during the build**): **nothing in this sink consults the stop signal to
+      shorten its own work.** A revision did — ending the 413 search and dropping `_send`'s
+      retries to one attempt while stopping — on the reasoning that both run on the thread
+      `shutdown()` is joining. `Worker.shutdown` sets the stop event *before* the join, so
+      `_stopping()` is true for the whole of `_final_drain`: measured, a 2,000-event backlog that
+      had been delivering in 30 requests delivered **nothing**, and a single transient 503 during
+      the exit drain lost one event of six with `failed_batches` at zero. Neither guard bought a
+      bound that `MAX_BUDGET_REDUCTIONS` and `shutdown(timeout=)` did not already provide, and
+      SPEC-027 had already made every backoff *wait* return instantly on a set stop event, so the
+      retry suppression saved request count rather than time. Both reverted, and both now pinned
+      by a test — all three of these mechanisms had survived a whole-suite mutation run.
 - [x] AC-5: The per-platform limits are cited to their documentation in each subclass docstring —
       **and where the vendor publishes none, the docstring says so and names the value as this
       library's own choice.** Datadog (1,000 / 5 MB), New Relic (1 MB per POST) and Honeycomb

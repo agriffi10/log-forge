@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from log_foundry import _diag
-from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -39,15 +38,26 @@ payload ceiling), so it is the right *base-class* default for an arbitrary endpo
 knows nothing about, while every subclass that has a documented figure sets its own below it.
 """
 
-MAX_SPLIT_DEPTH = 4
-"""Halvings a ``413`` may provoke before the chunk is abandoned instead (FR-001 AC-4).
+MAX_BUDGET_REDUCTIONS = 24
+"""``413``-driven halvings of the byte budget one ``emit`` may make (FR-001 AC-4).
 
-Splitting is a correction for a budget somewhat larger than the destination's real limit, and
-four halvings cover a limit down to a sixteenth of the configured one. Past that the
-configuration is wrong rather than slightly off, and the right answer is to stop and say so: the
-recursion is otherwise ``2N-1`` requests for ``N`` events, measured at 11,954 requests for one
-5,980-event exit backlog against an endpoint that answers ``413`` unconditionally. A cap turns
-that into at most ``2**(MAX_SPLIT_DEPTH+1) - 1`` per originally-refused chunk.
+A ``413`` says the destination's real limit is below the configured budget, and the search for a
+size it accepts is a **halving of the budget**, not a halving of the chunk. The distinction is
+what bounds the cost. Halving the *chunk* recursively is ``2N-1`` requests for ``N`` events —
+measured at 11,954 for one 5,980-event exit backlog against an endpoint refusing everything —
+because each accepted size is rediscovered independently in every branch. Halving the *budget*
+re-chunks the remaining work once per reduction, so a destination limit any ratio below the
+budget is found in ``log2(ratio)`` wasted requests: 8 for a 5 MB default against a
+20 kB endpoint, a ratio of 250, against ~2,000 for the recursion.
+
+Each reduction halves **the refused body's own size**, not the nominal budget. Halving the budget
+converges on whatever it was configured to be rather than on what was actually sent, so a 36-byte
+body refused under a 5,000,000-byte budget took twenty reductions to reach the size that had
+already been rejected. Halving what was refused reaches it immediately.
+
+Twenty-four is a backstop, not a policy limit: the loop terminates on its own, because a chunk
+reduced to a single item takes the permanent-drop path instead. It exists against a pathological
+``size_of``, which is why it sits far above what any real destination requires.
 """
 
 
@@ -76,12 +86,33 @@ class _Item:
 
 
 class _PayloadTooLarge(SinkDeliveryError):
-    """A ``413`` for a chunk the caller may be able to split and re-send (FR-001 AC-4).
+    """A ``413`` for a request the caller may be able to make smaller (FR-001 AC-4).
 
     It subclasses ``SinkDeliveryError`` so that every pre-existing caller of :meth:`HTTPSink._send`
     — ``SentrySink`` above all — keeps catching it exactly as before. Only the chunk loop, which
     passes ``splittable=True``, ever sees it as its own type.
+
+    Attributes:
+      size: The refused body's length in bytes, which lets one ``emit`` avoid building another
+        request that large. Without it a destination refusing everything costs one request per
+        event — ~5,980 for one exit backlog — each asking a question already answered.
     """
+
+    def __init__(self, message: str, size: int = 0) -> None:
+        """Records the refused size alongside the message.
+
+        Args:
+          message: The abandonment detail, carrying only library-controlled values (arch §6).
+          size: The refused body's length in bytes.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        super().__init__(message)
+        self.size = size
 
 
 DEFAULT_MAX_RETRY_AFTER = 30.0
@@ -143,9 +174,12 @@ class HTTPSink:
     pays that for *each* chunk it produces. All of it runs on the single drain thread, so it is a
     pause on all log delivery, and a large enough backlog of failing chunks can outlast
     ``shutdown()``'s own timeout, which then expires and leaves the sink open by SPEC-027
-    FR-004's rule. Two things bound it: once the worker's stop event is set the retries are
-    dropped to a single attempt per chunk, and the ``413`` split stops halving. Sizing
-    ``max_batch_bytes`` to the destination is what keeps the chunk count low in the first place.
+    FR-004's rule. What bounds it is ``shutdown(timeout=)`` itself, plus
+    ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the destination is what keeps the chunk
+    count low in the first place. Nothing here consults the stop signal to shorten its own work —
+    a revision that did was measured to disable both retries and the ``413`` search for the whole of
+    ``Worker._final_drain``, since the stop event is set before the join, losing events that had
+    been delivering.
 
     Attributes:
       MAX_BATCH_COUNT: Entries one request may carry. A subclass overrides it with its
@@ -237,7 +271,6 @@ class HTTPSink:
         self._opener = opener if opener is not None else urllib.request.urlopen
         self.failed = 0
         self.dropped_oversized = 0
-        self._learned_max_bytes = self.max_batch_bytes
         self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -267,18 +300,92 @@ class HTTPSink:
         items = self._items(batch)
         if not items:
             return
-        chunks = settled = 0
-        for chunk in chunk_items(
-            items,
-            max_count=self.max_batch_count,
-            max_bytes=self._chunk_budget(),
-            size_of=lambda item: item.size,
-        ):
-            chunks += 1
-            if self._deliver(chunk):
+        budget = self._chunk_budget()
+        refused_at: int | None = None
+        reductions = index = chunks = settled = 0
+        while index < len(items):
+            chunk = self._take(items, index, budget)
+            if len(chunk) == 1 and refused_at is not None and chunk[0].size >= refused_at:
+                self._drop_refused(chunk)
+                chunks += 1
                 settled += 1
+                index += 1
+                continue
+            try:
+                delivered = self._deliver(chunk)
+            except _PayloadTooLarge as refusal:
+                refused_at = min(refused_at or refusal.size, refusal.size) or None
+                if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
+                    budget = max(min(budget, refusal.size) // 2, 1)
+                    reductions += 1
+                    continue
+                self._drop_refused(chunk)
+                chunks += 1
+                settled += 1
+                index += len(chunk)
+                continue
+            chunks += 1
+            settled += delivered
+            index += len(chunk)
         if chunks and not settled:
             raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
+
+    def _take(self, items: list[_Item], start: int, budget: int) -> list[_Item]:
+        """Fills one chunk from ``start`` under the count limit and the current byte budget.
+
+        Always yields at least one item, however small the budget: an item that cannot fit alone
+        is the caller's to resolve, which :meth:`emit` does by dropping it once the destination
+        has refused it. That mirrors ``chunk_items``, which this replaces here only because the
+        budget can change between chunks and a generator cannot be re-aimed mid-iteration.
+
+        Args:
+          items: Every renderable item of the batch.
+          start: The index to fill from.
+          budget: The byte budget for this chunk.
+
+        Returns:
+          The chunk, never empty.
+
+        Raises:
+          None.
+        """
+        total = items[start].size
+        end = start + 1
+        while (
+            end < len(items)
+            and end - start < self.max_batch_count
+            and total + items[end].size <= budget
+        ):
+            total += items[end].size
+            end += 1
+        return items[start:end]
+
+    def _drop_refused(self, chunk: list[_Item]) -> None:
+        """Discards a chunk the destination refuses at any size this sink can offer.
+
+        Reached when the budget can be reduced no further — in practice when the chunk is a
+        single item, since the reduction loop keeps halving until it is. Such an event is larger
+        than the destination will ever accept, which is permanent: it is counted against
+        ``dropped_oversized`` and the chunk reports *settled*, because a retry would re-run the
+        identical search and re-count the identical drops. That is why ``dropped`` can stay an
+        exact count while ``failed`` is only an upper bound.
+
+        Args:
+          chunk: The refused items.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.dropped_oversized += len(chunk)
+        _diag.lost(
+            "event",
+            len(chunk),
+            f"{type(self).__name__}, HTTP 413 at the smallest request this sink can build",
+        )
 
     def _items(self, batch: list[dict[str, object]]) -> list[_Item]:
         """Renders each event and discards any that cannot fit a request on its own.
@@ -328,14 +435,18 @@ class HTTPSink:
           None.
 
         Returns:
-          The smaller of the request budget and any per-event limit the destination publishes.
+          The smaller of the chunk budget and any per-event limit the destination publishes. The
+          *chunk* budget rather than the raw configured one, because ``chunk_items`` yields a
+          lone oversized item regardless of budget, so an item admitted here at exactly
+          ``max_batch_bytes`` produced a body that much plus :meth:`_body_reserve` — the one case
+          where a body could still sit above the budget.
 
         Raises:
           None.
         """
         if self.MAX_EVENT_BYTES is None:
-            return self.max_batch_bytes
-        return min(self.max_batch_bytes, self.MAX_EVENT_BYTES)
+            return self._chunk_budget()
+        return min(self._chunk_budget(), self.MAX_EVENT_BYTES)
 
     def _item_size(self, rendered: str, event: dict[str, object]) -> int:
         """Charges one rendered event its share of the request body.
@@ -377,12 +488,17 @@ class HTTPSink:
         return 1 if self.body_format == "json_array" else 0
 
     def _chunk_budget(self) -> int:
-        """The byte budget to chunk against right now, floored at one.
+        """The byte budget to chunk against, floored at one.
 
-        This is the configured budget less :meth:`_body_reserve`, and less anything a ``413``
-        has since taught this sink about the destination's real limit. That ceiling only ever
-        falls: a destination that refuses a size once will refuse it again, and rediscovering it
-        by halving on every batch cost a measured 75% of all bytes uploaded.
+        The configured budget less :meth:`_body_reserve`. It is deliberately **not** adaptive.
+        A revision that remembered a ``413``-refused size — so the halving cascade was not
+        rediscovered on every batch — was measured to ratchet: one transient ``413`` took the
+        budget from 1,000,000 to 44,345 permanently, and a five-minute proxy misconfiguration
+        left a healthy sink issuing 200 requests where it had issued one. It also made the
+        depth-bound abandonment recoverable-by-retry while the code reported it settled. The
+        rediscovery it saved is real but is bounded by ``MAX_SPLIT_DEPTH`` and only arises
+        against a destination whose limit is below the configured budget, which has a direct
+        remedy: pass ``max_batch_bytes=``.
 
         Args:
           None.
@@ -393,10 +509,7 @@ class HTTPSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            learned = self._learned_max_bytes
-        budget = min(self.max_batch_bytes, learned) - self._body_reserve()
-        return max(budget, 1)
+        return max(self.max_batch_bytes - self._body_reserve(), 1)
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event into this sink's per-event wire form.
@@ -457,115 +570,33 @@ class HTTPSink:
         """
         return True
 
-    def _deliver(self, items: list[_Item], depth: int = 0) -> bool:
-        """Sends one chunk, splitting it if the destination calls the payload too large.
+    def _deliver(self, items: list[_Item]) -> bool:
+        """Sends one chunk and reports whether it needs no further attention.
 
-        A ``413`` is permanent for these exact bytes, so re-sending them cannot help and the
-        answer is a smaller request (AC-4). Splitting is safe to do here and only here: ``413``
-        is a rejection before ingestion, so nothing landed and the halves cannot duplicate
-        anything — the SPEC-018 rule that only provable non-delivery may be re-sent.
-
-        The split is refused once ``MAX_SPLIT_DEPTH`` halvings have not found a size the
-        destination accepts, and refused outright while a shutdown is in progress: the halving
-        runs on the one drain thread, and ``shutdown()`` is already joining it.
+        A ``413`` is *not* handled here. It is a statement about the request size rather than
+        about this chunk, so it propagates to :meth:`emit`, which lowers the byte budget and
+        re-chunks the remaining work — see :data:`MAX_BUDGET_REDUCTIONS` for why that is the
+        cheap shape and recursive chunk-halving is not. Re-sending after a ``413`` cannot
+        duplicate anything: the rejection precedes ingestion, so nothing landed (SPEC-018's rule
+        that only provable non-delivery may be re-sent).
 
         Args:
           items: The chunk to send, known non-empty.
-          depth: How many halvings led here, which bounds the fan-out.
 
         Returns:
-          True when the chunk was **settled** — delivered, or permanently discarded so that no
-          retry could help. False only for a failure a retry might yet fix.
+          True when the chunk was delivered, False for a failure a retry might yet fix.
 
         Raises:
-          None.
+          _PayloadTooLarge: When the destination refused the request as too large.
         """
         body, content_type = self._body(items)
         try:
             payload = self._send(body, content_type=content_type, splittable=True)
         except _PayloadTooLarge:
-            self._learn_ceiling(len(body))
-            return self._split(items, depth)
+            raise
         except SinkDeliveryError:
             return False
         return self._handle_response(payload, items)
-
-    def _split(self, items: list[_Item], depth: int) -> bool:
-        """Halves a chunk the destination refused as too large and sends each half.
-
-        Halving terminates three ways, and all three are settled rather than retried, because a
-        ``413`` is a verdict on the bytes: a single item the destination still refuses is
-        permanently too large, a chunk still refused after ``MAX_SPLIT_DEPTH`` halvings is
-        against a limit far below the configured one, and a shutdown ends the search. Returning
-        "settled" is what stops the worker re-running the whole cascade three more times — the
-        same events were otherwise dropped and counted once per attempt, which made
-        ``losses().dropped`` four times the number of events actually lost.
-
-        Args:
-          items: The refused chunk, known non-empty.
-          depth: How many halvings led here.
-
-        Returns:
-          True — settled either way. Whichever branch runs, a retry cannot improve on it.
-
-        Raises:
-          None.
-        """
-        if len(items) == 1:
-            with self._counter_lock:
-                self.dropped_oversized += 1
-            _diag.lost("event", 1, f"{type(self).__name__}, HTTP 413 for a single event")
-            return True
-        if depth >= MAX_SPLIT_DEPTH or self._stopping():
-            reason = "a shutdown is in progress" if self._stopping() else "still 413 when split"
-            with self._counter_lock:
-                self.dropped_oversized += len(items)
-            _diag.lost(
-                "event",
-                len(items),
-                f"{type(self).__name__}, abandoned after {depth} split(s), {reason}",
-            )
-            return True
-        middle = len(items) // 2
-        first = self._deliver(items[:middle], depth + 1)
-        second = self._deliver(items[middle:], depth + 1)
-        return first or second
-
-    def _learn_ceiling(self, refused_bytes: int) -> None:
-        """Records that the destination refused a body of this size, so later chunks stay under.
-
-        It only ever lowers the ceiling. A destination that answered ``413`` once will answer it
-        again for the same size, and without this the halving cascade is repaid on every batch
-        forever — measured at 75% of all bytes uploaded being body that is uploaded and then
-        rejected. Half the refused size is the next value tried, which is where the split was
-        going anyway.
-
-        Args:
-          refused_bytes: The size of the body the destination refused.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        with self._counter_lock:
-            self._learned_max_bytes = max(min(self._learned_max_bytes, refused_bytes // 2), 1)
-
-    def _stopping(self) -> bool:
-        """Reports whether a shutdown is in progress (SPEC-027 FR-002).
-
-        Args:
-          None.
-
-        Returns:
-          True when the worker's stop event has been set.
-
-        Raises:
-          None.
-        """
-        signal = self.log_foundry_stop_signal
-        return signal is not None and signal.is_set()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and abandoned requests (SPEC-026 FR-002).
@@ -642,7 +673,7 @@ class HTTPSink:
             failure, and partial failure must not raise.
         """
         headers, data = self._prepare(body, content_type, extra_headers)
-        retries = 0 if self._stopping() else self.max_retries
+        retries = self.max_retries
         for attempt in range(retries + 1):
             request = urllib.request.Request(  # noqa: S310
                 self.url, data=data, method=self.method, headers=headers
@@ -663,7 +694,7 @@ class HTTPSink:
                 self._sleep_backoff(attempt, retry_after)
                 continue
             if status == 413 and splittable:
-                raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413")
+                raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413", len(body))
             self._abandon(f"HTTP {status}", retries + 1)
         raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
 

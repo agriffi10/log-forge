@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 import urllib.error
 
 import pytest
 
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
-from log_foundry.sinks.http import MAX_SPLIT_DEPTH, HTTPSink
+from log_foundry.sinks.http import MAX_BUDGET_REDUCTIONS, HTTPSink
 
 
 class FakeResponse:
@@ -292,8 +293,8 @@ def test_a_413_is_never_retried_even_when_retries_are_available() -> None:
     assert sink.dropped_oversized == 1
 
 
-def test_a_413_for_one_event_is_dropped_rather_than_split_forever(capsys) -> None:
-    """AC-4. Halving terminates at one event, which is then permanently too large.
+def test_a_413_for_one_event_is_dropped_rather_than_asked_about_twice(capsys) -> None:
+    """AC-4. The search terminates at one event, which is then permanently too large.
 
     It does **not** raise. A permanent drop is *settled*: no retry can improve on it, so sending
     the worker round again only re-runs the whole cascade and re-counts the same events. Before
@@ -305,7 +306,11 @@ def test_a_413_for_one_event_is_dropped_rather_than_split_forever(capsys) -> Non
     sink = HTTPSink("http://x", max_retries=0, opener=opener)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.dropped_oversized == 2, "each event counted once, not once per worker attempt"
-    assert len(opener.calls) == 3, "the whole chunk, then each half once -- never a re-send loop"
+    assert len(opener.calls) == 2, (
+        "the pair, then one event alone. The second is dropped without a request: its body is no "
+        "smaller than one the destination has already refused in this emit, so asking again "
+        "could only get the same answer"
+    )
     assert "HTTP 413" in capsys.readouterr().err
 
 
@@ -319,20 +324,88 @@ def test_a_permanently_dropped_batch_does_not_send_the_worker_round_again() -> N
     assert sink.losses().failed == 0, "a permanent drop is not an abandoned request"
 
 
-def test_a_chunk_still_refused_after_the_split_bound_is_abandoned_not_halved_forever() -> None:
-    """AC-4. Halving is a correction for a slightly-too-large budget, not an unbounded search.
+def test_an_endpoint_that_refuses_everything_costs_one_pass_not_one_request_per_event() -> None:
+    """AC-4. The search is bounded, and a size already refused is not asked about again.
 
-    Against an endpoint that answers 413 unconditionally the recursion is 2N-1 requests — 11,954
-    measured for one 5,980-event exit backlog, on the single drain thread, at the moment a
-    process is exiting. The depth cap turns that into a bounded cascade and one abandonment.
+    Recursive chunk-halving was 2N-1 requests — 11,954 measured for one 5,980-event backlog.
+    Halving the *budget* converges in log2(ratio), and remembering the smallest refused body
+    within the emit stops the tail becoming one request per event once the budget is below a
+    single item.
     """
     opener = FakeOpener([FakeResponse(413, b"")])
     sink = HTTPSink("http://x", max_retries=0, opener=opener)
     sink.emit([{"a": i} for i in range(1000)])
-    assert len(opener.calls) <= 2 ** (MAX_SPLIT_DEPTH + 1) - 1, (
-        f"the split cascade was not bounded: {len(opener.calls)} requests"
+    assert len(opener.calls) <= MAX_BUDGET_REDUCTIONS + 2, (
+        f"the 413 search was not bounded: {len(opener.calls)} requests for 1,000 events"
     )
-    assert sink.dropped_oversized == 1000, "every event is accounted for exactly once"
+    assert sink.dropped_oversized == 1000, "every event accounted for exactly once"
+    assert sink.losses().failed == 0, "a 413 is a size verdict, not an abandoned request"
+
+
+def test_a_destination_smaller_than_the_budget_still_delivers_everything() -> None:
+    """The common misconfiguration: a 5 MB default budget against a much smaller endpoint.
+
+    A depth-capped chunk-halving delivered 2 events of 2,000 here, because a 250x ratio needs
+    ~8 halvings and the cap allowed 4. Budget reduction has no such cliff.
+    """
+    limit = 2_000
+    opener = _ResponseScript(
+        lambda _n, body: FakeResponse(413, b"") if len(body) > limit else FakeResponse(200, b"")
+    )
+    sink = HTTPSink("http://x", max_batch_bytes=1_000_000, max_retries=0, opener=opener)
+    sink.emit([{"a": i, "pad": "y" * 60} for i in range(500)])
+    accepted = [body for body in opener.calls if len(body) <= limit]
+    delivered = [line for body in accepted for line in body.decode().splitlines()]
+    assert len(delivered) == 500, f"only {len(delivered)} of 500 events reached the wire"
+    assert sink.dropped_oversized == 0 and sink.losses().failed == 0
+    assert len(opener.calls) - len(accepted) <= MAX_BUDGET_REDUCTIONS, "the search stayed bounded"
+
+
+def _stopping_sink(opener, **kwargs) -> HTTPSink:
+    """A sink whose worker stop event is already set, as it is throughout the exit drain."""
+    sink = HTTPSink("http://x", opener=opener, **kwargs)
+    signal = threading.Event()
+    signal.set()
+    sink.log_foundry_stop_signal = signal
+    return sink
+
+
+def test_the_413_split_still_runs_during_a_shutdown() -> None:
+    """`Worker.shutdown` sets the stop event *before* joining, so `_final_drain` emits with it set.
+
+    A revision ended the split while stopping, reasoning that the halving runs on the thread
+    `shutdown()` is joining. Measured, that disabled splitting for the whole exit drain: a
+    2,000-event backlog that had been delivering in 30 requests delivered **nothing**, against
+    `losses().dropped == 2000`. The fan-out is bounded by MAX_SPLIT_DEPTH and the total by
+    `shutdown(timeout=)`, so the guard bought no bound and cost every deliverable event on the
+    one path FR-001 exists to protect.
+    """
+    opener = _ResponseScript(
+        lambda _n, body: FakeResponse(413, b"") if body.count(b"\n") > 2 else FakeResponse(200, b"")
+    )
+    sink = _stopping_sink(opener)
+    sink.emit([{"a": i} for i in range(4)])
+    delivered = [line for body in opener.calls[1:] for line in body.decode().splitlines()]
+    assert sorted(delivered) == [f'{{"a": {i}}}' for i in range(4)], (
+        "the split must still run while stopping, or the exit drain delivers nothing"
+    )
+    assert sink.dropped_oversized == 0
+
+
+def test_a_transient_failure_is_still_retried_during_a_shutdown() -> None:
+    """Likewise for `_send`'s retries: the exit drain is where a retry matters most.
+
+    Suppressing them while stopping lost one event of six to a single transient 503 — invisible
+    at the batch level, because partial failure correctly does not raise, so the removed retry
+    was the only one that chunk would ever get. SPEC-027 already makes every backoff *wait*
+    return instantly on a set stop event, so suppression bought request count, not time, and
+    `shutdown(timeout=)` already bounds that.
+    """
+    opener = FakeOpener([FakeResponse(503, b""), FakeResponse(200, b"")])
+    sink = _stopping_sink(opener, max_retries=3)
+    sink.emit([{"a": 1}])
+    assert len(opener.calls) == 2, "the transient 503 must still be retried while stopping"
+    assert sink.failed == 0
 
 
 def test_a_413_is_not_split_for_a_caller_that_cannot_split(capsys) -> None:

@@ -603,6 +603,33 @@ def _takes_the_transport_lock(
     return False
 
 
+def _base_names(cls: ast.ClassDef) -> list[str]:
+    """The immediate base-class names of a class node, however the base is spelled.
+
+    `ast.Attribute` is resolved to its final attribute, so `class X(http.HTTPSink)` is seen as
+    inheriting `HTTPSink`. This must agree with `test_public_surface.py`'s resolver of the same
+    name: the two rosters cover one package, and a base spelling that one follows and the other
+    does not is a class visible to one lint and invisible to the other -- measured at 40 classes
+    against 39 while both files were green.
+
+    Args:
+      cls: The class node.
+
+    Returns:
+      The base names.
+
+    Raises:
+      None.
+    """
+    names: list[str] = []
+    for base in cls.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
+
+
 def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
     """Returns every class in ``sinks/`` defining ``emit``, ``send_all`` or ``close``.
 
@@ -658,7 +685,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
         root = pathlib.Path(log_foundry.__file__).parent / "sinks"
     nodes: dict[str, ast.ClassDef] = {}
     ordered: list[tuple[str, ast.ClassDef]] = []
-    for path in sorted(root.glob("*.py")):
+    for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -676,10 +703,10 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
                 for m in current.body
             ):
                 return True
-            for base in current.bases:
-                if isinstance(base, ast.Name) and base.id in nodes and base.id not in seen:
-                    seen.add(base.id)
-                    queue.append(nodes[base.id])
+            for name in _base_names(current):
+                if name in nodes and name not in seen:
+                    seen.add(name)
+                    queue.append(nodes[name])
         return False
 
     def _owns_delivery(cls: ast.ClassDef) -> bool:
@@ -694,14 +721,14 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
         texts = [ast.get_docstring(cls) or ""]
         if not _owns_delivery(cls):
             seen: set[str] = set()
-            queue = [b.id for b in cls.bases if isinstance(b, ast.Name)]
+            queue = list(_base_names(cls))
             while queue:
                 name = queue.pop()
                 if name in seen or name not in nodes:
                     continue
                 seen.add(name)
                 texts.append(ast.get_docstring(nodes[name]) or "")
-                queue.extend(b.id for b in nodes[name].bases if isinstance(b, ast.Name))
+                queue.extend(_base_names(nodes[name]))
         return " ".join(" ".join(text.split()) for text in texts)
 
     in_scope = [
@@ -715,7 +742,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
         inherited: list[str] = []
         if not _owns_delivery(cls):
             seen = set()
-            queue = [b.id for b in cls.bases if isinstance(b, ast.Name)]
+            queue = list(_base_names(cls))
             while queue:
                 name = queue.pop()
                 if name in seen or name not in nodes:
@@ -723,7 +750,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
                 seen.add(name)
                 ancestor = nodes[name]
                 inherited.append(f"{stem_of[id(ancestor)]}.{name}")
-                queue.extend(b.id for b in ancestor.bases if isinstance(b, ast.Name))
+                queue.extend(_base_names(ancestor))
         cls.lf_inherited = inherited  # type: ignore[attr-defined]
     return in_scope
 
@@ -1875,4 +1902,34 @@ def test_three_code_derived_facts_outrank_the_exemption_claim(tmp_path: Path) ->
     assert "liar.DelegatingLiar" not in caught, (
         "the recorded limit has moved: a rule now catches the delegation shape. Check "
         "FilteringSink, TransformSink and SentrySink for false positives before widening it."
+    )
+
+
+def test_this_roster_and_the_public_surface_roster_cover_the_same_classes() -> None:
+    """SPEC-038 AC-1b. Two rosters over one package must not disagree about who is in scope.
+
+    They were built independently and drifted twice in one spec: first on the trigger (defines
+    an `emit` vs defines-or-inherits), then on base spelling (`ast.Name` only vs `Name` plus
+    `Attribute`) and on `glob` vs `rglob`. Each drift makes a class visible to one lint and
+    invisible to the other, which is the failure both rosters exist to prevent -- and neither
+    can report it, because each is internally consistent.
+
+    They are not required to be *identical* in what they demand, only in whom they judge. Two
+    differences are deliberate and are therefore named here rather than papered over by comparing
+    loosely: `base.Sink` is the Protocol stating the contract rather than a sink satisfying it,
+    which this file excludes and the other -- judging signatures -- is unbothered by; and
+    `_socket.SocketTransport` is in scope here through `send_all`/`close` while having no `emit`
+    at all, so it falls outside the other roster's remit by that roster's own definition. Any
+    third difference is drift.
+    """
+    import test_public_surface
+
+    agreed = {"base.Sink", "_socket.SocketTransport"}
+    here = {f"{stem}.{cls.name}" for stem, cls in _sink_classes_with_an_emit()} - agreed
+    there = {
+        f"{stem}.{cls.name}" for stem, cls in test_public_surface._sink_classes_with_emit()
+    } - agreed
+    assert here == there, (
+        f"the rosters disagree; only here: {sorted(here - there)}; "
+        f"only there: {sorted(there - here)}"
     )
