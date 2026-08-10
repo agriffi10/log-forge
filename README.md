@@ -32,6 +32,25 @@ pip install log-foundry          # core, zero dependencies
 pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
 
+> **Breaking in `1.0.0`.** Three public shapes change once, before the API is frozen under
+> semantic versioning, because none of them could be changed afterwards without a major version:
+>
+> - **`health()` and `sink.losses()` return frozen dataclasses**, not `NamedTuple`s. Attribute
+>   access (`h.dropped`, `losses.failed`) is unchanged and is the whole contract; `len(h)`,
+>   `h[0]` and `queued, dropped, failed = health()` now raise `TypeError`. `Health` has gained a
+>   field in six consecutive specs and gains more — with no positions, that stops being breaking.
+> - **`flush()` returns a `FlushResult` and `continue_trace()` a `ContinueResult`**, each truthy
+>   or falsy with a `reason` naming *why*. `if lf.flush():` is unchanged; **`lf.flush() is True`
+>   is not** — the result is an object. A one-bit return could not grow a reason later without
+>   silently changing what `if flush():` means, which is why it moved now.
+> - **`SQSSink`'s injected client is keyword-only** (`SQSSink(url, client=…)`), **`SentrySink`
+>   injects through `client=`** rather than the old `sdk` keyword, with no alias, and the sink attribute the
+>   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
+>   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
+>
+> `echo`, `message` and `fields` are reserved parameter names on the emitters; pass fields of
+> those names through `fields={...}`, which also takes keys that are not Python identifiers.
+
 > **Renamed in 0.2.0: `log_forge` → `log_foundry`.** The import package now matches the
 > distribution name — `pip install log-foundry`, then `import log_foundry`. If you are on
 > `0.1.x`, update your imports; there is no compatibility shim. The project was originally
@@ -369,7 +388,7 @@ def handler(event, context):
 
 | Call | Does |
 |---|---|
-| `continue_trace(traceparent=None, *, trace_id=None, parent_span_id=None, baggage=None)` | Adopt an inbound context. `True` if adopted, `False` if nothing valid was supplied. Never raises. |
+| `continue_trace(traceparent=None, *, trace_id=None, parent_span_id=None, baggage=None)` | Adopt an inbound context. Returns a `ContinueResult`: truthy if adopted, else falsy with `reason` of `"nothing-supplied"` or `"rejected"`. The verdict is about the **trace context** — `baggage=` is merged independently and does not make it truthy. Never raises. |
 | `current_traceparent()` | This span as a W3C `traceparent` string, or `None` if no span is active. |
 | `current_trace_context()` | `(trace_id, span_id)`, for when moving two fields beats moving a string. |
 | `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). |
@@ -901,11 +920,12 @@ by design: a later level call is *refused* at the closed sink and announced on s
 guards its own post-close state — rather than queued where nothing will drain it, and those are not
 the same claim. A stateless sink such as the default `StdoutSink` still accepts it.
 
-Read a snapshot by attribute (`h.dropped`), as above. `Health` is a `NamedTuple` and has gained
-fields over time — a fourth (`stopped_reason`) in `v0.7.0`, and a fifth (`sink`) plus four more
-(`retired`, `submitted_after_shutdown`, `incomplete_swaps`, `closing_sinks`) not yet in a tagged
-release — so unpacking it whole (`queued, dropped, failed = health()`) raises `ValueError`. Every
-field keeps its position when a new one is appended, so attribute and index access stay stable.
+Read a snapshot **by attribute** (`h.dropped`), as above — that is the whole contract. `Health`
+and `SinkLosses` are frozen dataclasses, so `len(h)`, `h[0]` and `queued, dropped, failed =
+health()` all raise `TypeError`. They were `NamedTuple`s before `1.0.0` and the tuple shape is
+deliberately gone: `Health` has gained a field in six consecutive specs and gains more, and every
+one of those had to argue that the positions before it were undisturbed. There are no positions to
+disturb now, and adding a field is not a breaking change.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
@@ -919,12 +939,12 @@ which one you want depends on whether the process is about to end:
 ```python
 import log_foundry as lf
 
-lf.flush()      # drain to the sink and keep going; returns True when everything landed
+lf.flush()      # drain to the sink and keep going; truthy when everything landed
 lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained (30s cap)
 ```
 
 Both are bounded, because both can be called somewhere with a deadline. `flush(timeout=5.0)`
-returns `False` if the drain did not complete; `shutdown(timeout=30.0)` returns having stopped
+is falsy if the drain did not complete; `shutdown(timeout=30.0)` returns having stopped
 what it could, and reports `health().stopped_reason == "ShutdownTimeout"`. Passing `None` to
 either waits indefinitely, which is unsafe in any environment with an execution deadline.
 
@@ -949,11 +969,30 @@ docstring states its own worst case.
 explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
 end of a short script. It is idempotent.
 
-`flush(timeout=5.0)` returns `True` when **nothing was lost while the call was outstanding** — the
-drain it forces reached the sink, and so did anything else the worker emitted while it waited its
-turn. It returns `False` on timeout, when the worker was already shut down or has died, and when
-any batch was abandoned inside that window. A `True` is evidence of delivery, not merely that a
-drain took place.
+`flush(timeout=5.0)` returns a **`FlushResult`**, truthy when **nothing was lost while the call
+was outstanding** — the drain it forces reached the sink, and so did anything else the worker
+emitted while it waited its turn. A truthy result is evidence of delivery, not merely that a drain
+took place.
+
+Falsy carries a `reason` saying which of five things happened, because they need different fixes:
+
+| `reason` | Means |
+|---|---|
+| `"timed-out"` | The drain did not finish inside your timeout — the destination is slow. |
+| `"retired"` | `shutdown()` was already called. Your lifecycle is wrong, not the sink. |
+| `"thread-died"` | The drain thread is gone; see `health().stopped_reason`. |
+| `"queue-full"` | Backpressure — the queue could not even accept the marker. |
+| `"abandoned"` | A batch was given up on after its retry budget. The destination is broken. |
+
+```python
+result = lf.flush(5.0)
+if not result:
+    print(f"undelivered: {result.reason}")
+```
+
+`if lf.flush():` works exactly as it always did. `lf.flush() is True` does **not** — the result is
+an object, not a bool. New `reason` values may appear in any release, so treat an unrecognised one
+as "some other failure" rather than matching exhaustively.
 
 The window starts when you call it. A batch abandoned *before* that is deliberately not its
 business: the loss is already counted in `health().failed_batches` and reported on stderr, and

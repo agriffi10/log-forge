@@ -436,7 +436,7 @@ def test_events_are_flushed_before_the_wrapper_returns(fake_sink) -> None:
 
     def body() -> None:
         work()
-        assert log_foundry.flush() is True
+        assert log_foundry.flush()
         assert any(e["function"] == "work" for e in fake_sink.events)
 
     contextvars.copy_context().run(body)

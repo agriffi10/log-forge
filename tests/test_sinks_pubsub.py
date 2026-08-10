@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.pubsub import GooglePubSubSink
 
@@ -67,7 +68,7 @@ def test_a_closed_sink_refuses_a_publish_without_moving_a_counter() -> None:
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
 
-    assert sink.losses() == (0, 0), "a refusal moved a loss counter"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "a refusal moved a loss counter"
     assert client.published == []
 
 
@@ -96,7 +97,7 @@ def test_a_close_landing_mid_batch_counts_the_rest_unconfirmed_and_does_not_rais
 
     assert len(client.published) == 2, "the loop stopped early instead of counting the rest"
     assert sink._futures == [], "a future was appended to a list nothing will resolve"
-    assert sink.losses() == (0, 2), "the unconfirmed publishes were not counted"
+    assert sink.losses() == SinkLosses(dropped=0, failed=2), "the unconfirmed publishes were not counted"
 
 
 def test_a_batch_every_event_of_which_was_refused_still_raises() -> None:
@@ -113,4 +114,4 @@ def test_a_batch_every_event_of_which_was_refused_still_raises() -> None:
     sink = GooglePubSubSink("projects/p/topics/t", client=RefusingPublisher())
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"a": 2}])
-    assert sink.losses() == (2, 0)
+    assert sink.losses() == SinkLosses(dropped=2, failed=0)

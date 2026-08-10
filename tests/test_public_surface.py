@@ -904,3 +904,124 @@ def test_the_readme_documents_the_reserved_names() -> None:
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     assert "`fields={...}`" in readme, "the README does not introduce the escape hatch"
     assert "**reserved**" in readme, "the README does not say the names are reserved"
+
+
+# -- FR-007: flush() and continue_trace() can grow a reason ----------------------------------
+
+
+def test_the_truthy_call_site_is_unchanged() -> None:
+    """FR-007 AC-1's first half. `if flush():` had to keep meaning what it meant."""
+    log_foundry.configure(service="t", sink=_Recorder())
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("so a worker exists and Worker.flush is actually reached")
+
+    work()
+    assert log_foundry.flush(5.0), "a successful flush is truthy"
+    assert bool(log_foundry.flush(5.0)) is True
+
+
+def test_the_identity_call_site_can_no_longer_hold() -> None:
+    """FR-007 AC-1's second half, and the reason the type had to change before 1.0.
+
+    An object with `__bool__` is never `is True`. A draft of the AC claimed both forms would
+    keep working, which is the contradiction that makes this a pre-1.0 change: retrofitting it
+    afterwards would silently flip every `if flush():` if a tuple were used instead.
+    """
+    log_foundry.configure(service="t", sink=_Recorder())
+    result = log_foundry.flush(2.0)
+    assert result is not True
+    assert result.ok is True
+
+
+def test_flush_reasons_distinguish_the_outcomes_that_need_different_fixes() -> None:
+    """FR-007 AC-2. `flush()` after `shutdown()` and `flush(0)` used to be indistinguishable.
+
+    A handler needs "the worker is retired, my code is wrong" separated from "the sink is slow":
+    the first is a bug in the caller's lifecycle, the second is a destination problem.
+    """
+    log_foundry.configure(service="t", sink=_Recorder())
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("in a span")
+
+    work()
+    log_foundry.shutdown()
+
+    retired = log_foundry.flush(2.0)
+    assert not retired
+    assert retired.reason == "retired"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, "nothing-supplied"),
+        ({"traceparent": "not-a-traceparent"}, "rejected"),
+        ({"trace_id": "not-a-trace-id"}, "rejected"),
+        ({"parent_span_id": "0" * 16}, "rejected"),
+        ({"baggage": "\x00 not a header"}, "rejected"),
+        ({"baggage": "team=core"}, "nothing-supplied"),
+    ],
+)
+def test_continue_trace_distinguishes_nothing_supplied_from_rejected(
+    kwargs: dict[str, str], expected: str
+) -> None:
+    """FR-007 AC-3. Both read `False`, and only one of them is a caller bug.
+
+    Parametrized over every argument, because `supplied` was a three-term disjunction and only
+    the `traceparent` term had a test: dropping the other two left the suite green while
+    `continue_trace(trace_id="not-valid")` reported "nothing-supplied".
+
+    The rule is that `"rejected"` means **exactly** that a rejection was announced through
+    `_diag`. That is why a *valid* `baggage=` alone is `"nothing-supplied"` — it was applied, and
+    the verdict is about the trace context — while a malformed one is `"rejected"`, matching the
+    stderr line the library already wrote for it. Keying on "was any argument supplied" instead
+    reported "nothing-supplied" for a header the library had just announced as unusable.
+    """
+    result = log_foundry.continue_trace(**kwargs)
+    assert not result
+    assert result.reason == expected
+
+
+def test_continue_trace_reports_no_reason_when_it_adopts() -> None:
+    """The success side of AC-3."""
+    good = log_foundry.continue_trace(
+        traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    )
+    assert good
+    assert good.reason is None
+
+
+def test_a_valid_baggage_only_call_still_applies_the_baggage() -> None:
+    """It is falsy and reports "nothing-supplied" — but the baggage must still have landed.
+
+    SPEC-014 merges `baggage=` independently of the trace context, so a falsy verdict must not
+    read as "nothing happened".
+    """
+    log_foundry.reset_context()
+    assert not log_foundry.continue_trace(baggage="team=core")
+    assert log_foundry.get_baggage() == {"team": "core"}
+
+
+def test_the_result_types_are_exported_and_annotatable() -> None:
+    """FR-007 AC-4. A caller cannot annotate a type they cannot import."""
+    assert "FlushResult" in log_foundry.__all__
+    assert "ContinueResult" in log_foundry.__all__
+    assert isinstance(log_foundry.flush(2.0), log_foundry.FlushResult)
+    assert isinstance(log_foundry.continue_trace(), log_foundry.ContinueResult)
+
+
+def test_a_new_reason_is_additive() -> None:
+    """FR-007 AC-5. The type grows by new `reason` values, never by changing `__bool__`.
+
+    SPEC-036 invents two more reasons (a failed span sweep, a failed `sink.flush()`) and
+    SPEC-036 FR-001 AC-11a a third for `continue_trace`. Each must be able to land without
+    touching a call site, which is only true while `__bool__` is the whole contract.
+    """
+    invented = log_foundry.FlushResult(ok=False, reason="a-reason-invented-later")
+    assert not invented
+    assert invented.reason == "a-reason-invented-later"
+    assert bool(log_foundry.FlushResult(ok=True)) is True

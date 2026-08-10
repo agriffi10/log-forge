@@ -30,9 +30,10 @@ implementation against the design in `architecture.md`.
   `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
   `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
   SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
-  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus two leaf helpers no module map
-  anticipated, both of which must import nothing from the package: `sanitize` (SPEC-017) and
-  `_diag` (SPEC-025, owned by SPEC-029). The full module map is now built; the setup-phase
+  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus three leaf helpers no module map
+  anticipated, none of which imports anything from the package: `sanitize` (SPEC-017),
+  `_diag` (SPEC-025, owned by SPEC-029) and `results` (SPEC-034 FR-007 — `FlushResult` /
+  `ContinueResult`). The full module map is now built; the setup-phase
   `core.py` + `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
@@ -573,6 +574,36 @@ so they are free in `1.x`.
   derived too, to a fixpoint: a function whose return value names the worker is itself a worker
   name, or `worker = _snapshot()` rebinds a guard's category behind a neutral name with everything
   green. A roster that hand-lists anything — sites or tokens — rots. (SPEC-035, arch §9.2)
+- **A public accessor hands out a copy; the library reads the live object** — `get_config()` and
+  `get_baggage()` copy, because a public getter documented "do not mutate" is a promise the
+  caller's slip breaks silently, while `config._live_config()` and `context._live_baggage()` are
+  the per-event reads, since `build_event` runs one to three config reads and one baggage read
+  **per event** and a copy there allocates per event. Both copies are **one level**: deep-copying
+  arbitrary caller objects inside an accessor that must never raise trades a narrow sharing bound
+  for a wide new failure, so the bound is stated and pinned rather than closed. Freezing `Config`
+  also turned every write into a read-modify-write, and one writer (`_ensure_sink`) runs on the
+  orphan logging path — measured, one concurrent `info()` permanently reverted `configure()` in
+  268 of 2000 trials — so `_config_lock` serializes the writers while reads stay lock-free.
+  (SPEC-034 FR-003, FR-005)
+- **A result that can grow a reason must stop being a `bool` before 1.0, not after** — `flush()`
+  answered five outcomes with one bit and `continue_trace()` two. A `NamedTuple` cannot be
+  retrofitted (a non-empty tuple is always truthy, so every `if flush():` would silently keep
+  passing), so `FlushResult`/`ContinueResult` carry `__bool__` plus a `reason`, and grow by new
+  reason values only. `Worker.flush` carries the type too: the five outcomes are distinguishable
+  only there. For the same reason `Health` and `SinkLosses` became frozen dataclasses — six specs
+  had each argued their appended field left the indices undisturbed, and with a dataclass there
+  are no indices. (SPEC-034 FR-007, FR-008)
+- **A protocol that is exported is a protocol that will be inherited** — `Sink`'s members were
+  empty-bodied and not `@abstractmethod`, so a subclass with one typo instantiated happily and
+  its inherited `emit` returned `None`: three events gone, `flush()` truthy, every counter zero.
+  `mypy` refused it and only the runtime did not. Structural satisfaction is untouched, which
+  matters because none of the 34 shipped sinks inherits it. (SPEC-034 FR-005)
+- **A reserved word needs exactly one route through, including its own name** — `echo` and
+  `message` were parameters stealing ordinary words from the field namespace, and `fields=` is
+  the escape hatch, so `fields` becomes the third reserved word and `fields={"fields": …}` must
+  work. The keyword form wins a collision (`{**base, **overrides}`), and the merge **absorbs** a
+  non-mapping rather than raising: it runs in the emitter, outside `api._log`'s orphan guard, so
+  an unguarded merge broke SPEC-025's promise on all four paths. (SPEC-034 FR-004)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

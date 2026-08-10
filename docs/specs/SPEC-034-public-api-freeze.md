@@ -1,7 +1,7 @@
 # Spec: The Public API Freeze
 
 **ID:** SPEC-034  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-08-09  
 **Depends On:** SPEC-026, SPEC-030, SPEC-033
 
@@ -385,30 +385,33 @@ working and leaves room to add reasons later — but only if the return type cha
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `if flush():` keeps working. `assert flush() is True` **cannot** — an object with
+- [x] AC-1: `if flush():` keeps working. `assert flush() is True` **cannot** — an object with
       `__bool__` is never `True` — and a draft of this AC claimed both would, which is the
-      contradiction to avoid. Counted on this branch: **26** identity assertions on `flush()` and
-      **18** on `continue_trace()` across the test suite. All are converted and the count is
-      stated in the PR. Those figures are **recounted at build time regardless** — a count taken
-      on one branch and trusted on another is the kind of stale roster FR-002's lesson is about —
-      though with the order reversed they are now a ceiling rather than a floor: this spec runs
-      before 036 and 037 add their call sites, which is the cheaper end to convert from.
-- [ ] AC-1b: The FR states whether `Worker.flush` changes type too, or only the public
-      `log_foundry.flush` — they are different call sites with different callers.
-- [ ] AC-2: `flush().reason` distinguishes at least retired-worker, timed-out and
+      contradiction to avoid. ~~Counted on this branch: **26** identity assertions on `flush()`
+      … a ceiling rather than a floor~~ — struck, and by its own rule. The build-time recount is
+      **36** on `flush()` (18 on `continue_trace()` was right), plus 8 collection comparisons:
+      **62** sites. The stale figure was not stale because a *later* spec added call sites, which
+      is what "a ceiling" assumed — Phases 1–3 of **this** spec added ten. A count is recounted on
+      the branch that converts it, and never carried across one.
+- [x] AC-1b: **Both change.** The five outcomes are distinguishable only inside `Worker.flush`
+      — retired, thread died, queue full, timed out, abandoned — so a public wrapper over a bare
+      `bool` could name none of them without guessing. `_flush_worker` carries the type through
+      unchanged, and its null-worker path returns a truthy result with no reason, because a
+      process that never logged has lost nothing.
+- [x] AC-2: `flush().reason` distinguishes at least retired-worker, timed-out and
       batch-abandoned. ~~plus the two SPEC-036 adds, a failed span sweep and a failed
       `sink.flush()`, since this lands after it~~ — struck with the reversed order: 036 now lands
       *after* this and adds its own two reasons, which AC-5 is what makes possible. The
       obligation does not disappear, it moves — SPEC-036 FR-001 and FR-002 each carry an AC
       requiring the reason they invent to be surfaced here.
-- [ ] AC-3: The same treatment for `continue_trace()`, distinguishing "nothing supplied" from
+- [x] AC-3: The same treatment for `continue_trace()`, distinguishing "nothing supplied" from
       "supplied and rejected". Its third reason — supplied, well-formed, and refused because the
       span had been swept — likewise moves to SPEC-036 FR-001 AC-11a, which is where it is
       invented. What must **not** move is AC-5's guarantee: a reason added later is additive, so
       a reason invented in 036 with nothing on this side to carry it is the failure this AC was
       written to prevent, and reversing the order makes AC-5 the thing that prevents it.
-- [ ] AC-4: `mypy --strict` is clean, and the return types are exported so a caller can annotate.
-- [ ] AC-5: Adding a new reason later is additive — the type is documented as growing by new
+- [x] AC-4: `mypy --strict` is clean, and the return types are exported so a caller can annotate.
+- [x] AC-5: Adding a new reason later is additive — the type is documented as growing by new
       `reason` values, never by changing `__bool__`.
 
 ### FR-008: `Health` and `SinkLosses` do not freeze their tuple shape
@@ -437,10 +440,10 @@ effectively is, and it has not stopped anything: the shape is still real, and st
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: Attribute access is unchanged everywhere — `h.dropped`, `h.sink.failed`.
-- [ ] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
+- [x] AC-1: Attribute access is unchanged everywhere — `h.dropped`, `h.sink.failed`.
+- [x] AC-2: Unpacking and `len()` no longer work, and the change is in the release notes as
       breaking.
-- [ ] AC-2b: **Two** tests become impossible under a dataclass and both are updated here —
+- [x] AC-2b: **Two** tests become impossible under a dataclass and both are updated here —
       `tests/test_orphan_sink_handoff.py::test_health_gains_no_field` and
       `tests/test_worker.py::test_existing_health_fields_keep_their_positions`, whose **whole
       body** is positional (`h[0]`, `h[3]`, `h[4]`, `h[5..7]`, `h[8]`). A draft of this AC named
@@ -450,7 +453,7 @@ effectively is, and it has not stopped anything: the shape is still real, and st
       `in_span_lost` are appended to a dataclass afterwards and neither test has to be written
       twice. ~~Both appended fields are in scope because the build order is 035 → 036 → 037 →
       034~~ — struck with the ordering it depended on.
-- [ ] AC-2c: The `Health` field set is reviewed **as a whole**, once, before the type freezes —
+- [x] AC-2c: The `Health` field set is reviewed **as a whole**, once, before the type freezes —
       nine fields arrived across seven specs, each appended on its own merits and none of them
       ever looked at together, with two more due. The freeze is the last moment that review is
       free, and running it **before** those two land is the point of the reversal: a review that
@@ -458,12 +461,12 @@ effectively is, and it has not stopped anything: the shape is still real, and st
       licence to rename — anything it does change is changed here rather than in `1.x` — and its
       outcome is an input to SPEC-036 FR-003 and SPEC-037 FR-001 AC-5, which name the two fields
       it will be asked about.
-- [ ] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
+- [x] AC-3: Every construction site is converted to keywords **first, as its own commit** — two
       positional sites exist today (`tests/test_sink_losses.py:213`, `:228`), so a draft claiming
       this was already true was wrong. Re-grepped at build time rather than trusted from here.
-- [ ] AC-4: `_replace`-style updates keep working, or their call sites are converted with the
+- [x] AC-4: `_replace`-style updates keep working, or their call sites are converted with the
       type.
-- [ ] AC-5: `SinkLosses` converts with it. It does **not** start accepting a plain object with
+- [x] AC-5: `SinkLosses` converts with it. It does **not** start accepting a plain object with
       the right attributes: `read_losses` gates on `isinstance(losses, SinkLosses)`, which
       SPEC-026 FR-002 settled deliberately, and a draft of this AC would have re-opened that
       decision by accident. Duck-typed loss reporting is out of scope; if it is wanted it is its

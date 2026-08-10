@@ -1,5 +1,6 @@
 """SPEC-033 — the orphan-path sink handoff, where no worker exists to own the close."""
 
+import dataclasses
 import threading
 import time
 
@@ -752,8 +753,13 @@ def test_the_worker_still_records_its_own_unconfirmed_drain() -> None:
 
 
 def test_health_gains_no_field() -> None:
-    """AC-5."""
-    assert worker_mod.Health._fields == (
+    """AC-5, rewritten for the frozen dataclass (SPEC-034 FR-008 AC-2b).
+
+    It read `Health._fields`, which a `NamedTuple` has and a dataclass does not. The property it
+    pins is unchanged and is about *names*, never positions — the tuple protocol was only ever
+    how it reached them.
+    """
+    assert [f.name for f in dataclasses.fields(worker_mod.Health)] == [
         "queued",
         "dropped",
         "failed_batches",
@@ -763,7 +769,7 @@ def test_health_gains_no_field() -> None:
         "submitted_after_shutdown",
         "incomplete_swaps",
         "closing_sinks",
-    )
+    ]
 
 
 # -- fresh-context review of PR #125: the ownership rule applies to the swap too --------------

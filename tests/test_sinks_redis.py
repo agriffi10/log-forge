@@ -8,6 +8,7 @@ import types
 
 import pytest
 
+from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
 
@@ -120,7 +121,7 @@ def test_a_closed_sink_refuses_a_batch_without_moving_a_counter() -> None:
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
 
-    assert sink.losses() == (0, 0), "a refusal moved a loss counter"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "a refusal moved a loss counter"
     assert client.pipelines == [], "the sink asked a closed client for a pipeline"
 
 
