@@ -175,7 +175,13 @@ class RedisStreamsSink(_RedisSink):
     """Appends each event to a Redis stream via ``XADD``, pipelined per batch (FR-005)."""
 
     def __init__(
-        self, stream: str, *, client: Any = None, url: str | None = None, max_retries: int = 3
+        self,
+        stream: str,
+        *,
+        client: Any = None,
+        url: str | None = None,
+        max_retries: int = 3,
+        maxlen: int | None = None,
     ) -> None:
         """Binds the sink to a stream.
 
@@ -184,6 +190,18 @@ class RedisStreamsSink(_RedisSink):
           client: A ``redis-py``-shaped client to borrow, or ``None`` to open one.
           url: The connection URL used when opening a client.
           max_retries: Retries per batch.
+          maxlen: A ceiling on the destination's length, or ``None`` for no ceiling.
+
+            The default is ``None`` — today's unbounded behaviour — because silently discarding
+            a user's buffered logs is not a default this library may choose (SPEC-038 FR-008).
+            Used as arch §9.1 recommends, as the durable buffer in front of a consumer, a stalled
+            consumer otherwise OOMs the Redis instance with no ceiling the operator can set from
+            here.
+
+            **Trimming discards at the *destination*, outside anything :meth:`losses` can see.**
+            Redis drops the oldest entries itself, after this sink has already reported the write
+            as delivered, so those events are invisible to ``health()`` — which is the trade a
+            bounded buffer makes, and is why it is opt-in.
 
         Returns:
           None.
@@ -192,6 +210,7 @@ class RedisStreamsSink(_RedisSink):
           ImportError: If the ``redis`` extra is not installed.
         """
         self._stream = stream
+        self.maxlen = maxlen
         super().__init__(client=client, url=url, max_retries=max_retries)
 
     def _stage(self, pipe: Any, event: dict[str, object]) -> None:
@@ -207,14 +226,25 @@ class RedisStreamsSink(_RedisSink):
         Raises:
           Exception: Whatever the client raises.
         """
-        pipe.xadd(self._stream, {"event": json.dumps(event)})
+        if self.maxlen is None:
+            pipe.xadd(self._stream, {"event": json.dumps(event)})
+        else:
+            pipe.xadd(
+                self._stream, {"event": json.dumps(event)}, maxlen=self.maxlen, approximate=True
+            )
 
 
 class RedisListSink(_RedisSink):
     """Pushes each event onto a Redis list via ``RPUSH``, pipelined per batch (FR-005)."""
 
     def __init__(
-        self, key: str, *, client: Any = None, url: str | None = None, max_retries: int = 3
+        self,
+        key: str,
+        *,
+        client: Any = None,
+        url: str | None = None,
+        max_retries: int = 3,
+        maxlen: int | None = None,
     ) -> None:
         """Binds the sink to a list.
 
@@ -223,6 +253,18 @@ class RedisListSink(_RedisSink):
           client: A ``redis-py``-shaped client to borrow, or ``None`` to open one.
           url: The connection URL used when opening a client.
           max_retries: Retries per batch.
+          maxlen: A ceiling on the destination's length, or ``None`` for no ceiling.
+
+            The default is ``None`` — today's unbounded behaviour — because silently discarding
+            a user's buffered logs is not a default this library may choose (SPEC-038 FR-008).
+            Used as arch §9.1 recommends, as the durable buffer in front of a consumer, a stalled
+            consumer otherwise OOMs the Redis instance with no ceiling the operator can set from
+            here.
+
+            **Trimming discards at the *destination*, outside anything :meth:`losses` can see.**
+            Redis drops the oldest entries itself, after this sink has already reported the write
+            as delivered, so those events are invisible to ``health()`` — which is the trade a
+            bounded buffer makes, and is why it is opt-in.
 
         Returns:
           None.
@@ -231,6 +273,7 @@ class RedisListSink(_RedisSink):
           ImportError: If the ``redis`` extra is not installed.
         """
         self._key = key
+        self.maxlen = maxlen
         super().__init__(client=client, url=url, max_retries=max_retries)
 
     def _stage(self, pipe: Any, event: dict[str, object]) -> None:
@@ -247,3 +290,5 @@ class RedisListSink(_RedisSink):
           Exception: Whatever the client raises.
         """
         pipe.rpush(self._key, json.dumps(event))
+        if self.maxlen is not None:
+            pipe.ltrim(self._key, -self.maxlen, -1)

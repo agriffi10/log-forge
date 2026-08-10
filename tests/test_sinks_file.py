@@ -202,3 +202,82 @@ def test_invalid_when_unit_raises_before_opening(tmp_path) -> None:
     with pytest.raises(ValueError):
         RotatingFileSink(str(path), when="Q")
     assert not path.exists()  # failed at construction, before any file was opened
+
+
+# --- SPEC-038 FR-012: the default must keep a generation ----------------------------------
+
+
+def _lines(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def test_the_default_keeps_one_generation_instead_of_destroying_it(tmp_path) -> None:
+    """AC-1. At `backup_count=0` a rotation called `os.remove` on the active file.
+
+    `RotatingFileSink("app.log", max_bytes=10_000_000)` silently threw away 10 MB at every
+    rollover — the default, and the shape a caller reaches for first. Every existing test in this
+    file passes `backup_count` explicitly, so none of them covered it.
+    """
+    path = str(tmp_path / "app.ndjson")
+    sink = RotatingFileSink(path)  # no backup_count: the default is what is under test
+    sink.emit([{"n": i, "pad": "x" * 50} for i in range(6)])
+    sink._rotate()
+    sink.emit([{"n": 100}])
+    sink.close()
+
+    assert os.path.exists(path + ".1"), "the pre-rotation generation must survive"
+    assert [event["n"] for event in _lines(path + ".1")] == list(range(6))
+    assert [event["n"] for event in _lines(path)] == [100]
+
+
+def test_backup_count_zero_still_truncates_unchanged(tmp_path) -> None:
+    """AC-2. The old behaviour stays available to a caller who asks for it."""
+    path = str(tmp_path / "app.ndjson")
+    sink = RotatingFileSink(path, backup_count=0)
+    sink.emit([{"n": 1}])
+    sink._rotate()
+    sink.emit([{"n": 2}])
+    sink.close()
+    assert not os.path.exists(path + ".1")
+    assert [event["n"] for event in _lines(path)] == [2]
+
+
+def test_two_rollovers_keep_the_second_generation_and_no_third(tmp_path) -> None:
+    """AC-6. Written past `max_bytes` repeatedly: `.1` is the generation before the live one.
+
+    Asserted on a monotonic sequence rather than on emit boundaries — `max_bytes` can rotate
+    *within* one emit, so "the second batch" and "the second generation" are not the same thing,
+    and an assertion phrased on batches passes or fails on padding arithmetic instead of on
+    retention.
+    """
+    path = str(tmp_path / "app.ndjson")
+    sink = RotatingFileSink(path, max_bytes=200)
+    for group in range(3):
+        sink.emit([{"n": group * 4 + i, "pad": "y" * 40} for i in range(4)])
+    sink.close()
+
+    assert os.path.exists(path + ".1"), "one generation is retained"
+    assert not os.path.exists(path + ".2"), "and only one, at the default backup_count"
+
+    retained = [event["n"] for event in _lines(path + ".1")]
+    current = [event["n"] for event in _lines(path)]
+    assert retained and current, f"both files carry events: {retained} / {current}"
+    assert max(retained) + 1 == min(current), (
+        f"`.1` must be the generation immediately before the live file, with nothing between "
+        f"them: {retained} then {current}"
+    )
+    assert max(current) == 11, "and the live file holds the newest events"
+
+
+def test_the_rotating_sink_reports_no_losses_for_what_retention_discards(tmp_path) -> None:
+    """AC-3. A bounded ring counts nothing: retention working is not loss.
+
+    `MemorySink(maxlen)` is the precedent — neither `dropped` (discarded *before* a delivery
+    attempt) nor `failed` describes an event that was written and flushed to disk.
+    """
+    path = str(tmp_path / "app.ndjson")
+    sink = RotatingFileSink(path, max_bytes=100, backup_count=0)
+    sink.emit([{"pad": "z" * 60} for _ in range(10)])
+    sink.close()
+    assert not hasattr(sink, "losses"), "no losses() accessor, deliberately"

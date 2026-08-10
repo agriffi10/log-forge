@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import socket
 import threading
 
@@ -12,6 +13,24 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 __all__ = ["SocketTransport"]
 
 _BACKOFF_BASE = 0.1
+
+DEFAULT_MAX_DATAGRAM_BYTES = 65507
+"""Bytes one UDP datagram may carry, the IPv4 payload maximum (SPEC-038 FR-007).
+
+65,535 less the 20-byte IP header and the 8-byte UDP header. It is the ceiling the *protocol*
+imposes; a path's real limit is often far lower, which is why it is configurable. TCP is a stream
+and has no such limit, so this bounds nothing there.
+"""
+
+_PERMANENT_ERRNOS = frozenset({errno.EMSGSIZE})
+"""Socket errnos that describe the message rather than the destination (FR-007 AC-3).
+
+``EMSGSIZE`` alone. Every other errno this transport can raise — ``ECONNREFUSED``,
+``EHOSTUNREACH``, ``ENETDOWN``, ``EPIPE``, ``ETIMEDOUT`` — describes a destination that may come
+back, and treating any of those as permanent would turn a transient outage into silent loss. A
+set stated here rather than a condition inferred at the call site, so adding to it is a decision
+someone makes deliberately.
+"""
 
 
 def _make_tcp(host: str, port: int, timeout: float) -> socket.socket:
@@ -95,6 +114,8 @@ class SocketTransport:
 
     Attributes:
       failed: Messages abandoned past the reconnect-retry bound.
+      dropped_oversized: UDP datagrams discarded before any send for exceeding
+        ``max_datagram_bytes``.
     """
 
     def __init__(
@@ -105,6 +126,7 @@ class SocketTransport:
         transport: str = "tcp",
         timeout: float = 5.0,
         max_retries: int = 3,
+        max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
     ) -> None:
         """Configures the destination and retry bound without opening a socket yet.
 
@@ -116,6 +138,8 @@ class SocketTransport:
           max_retries: Reconnect retries per message, floored at zero for the reason
             ``Worker._emit`` floors its own (SPEC-021) — a negative value made no attempt at all
             and abandoned the message without moving ``failed``.
+          max_datagram_bytes: The largest UDP datagram to attempt, defaulting to
+            :data:`DEFAULT_MAX_DATAGRAM_BYTES`. Ignored for TCP, which is a stream.
 
         Returns:
           None.
@@ -130,8 +154,10 @@ class SocketTransport:
         self._transport = transport
         self._timeout = timeout
         self._max_retries = max(max_retries, 0)
+        self._max_datagram_bytes = max_datagram_bytes
         self._sock: socket.socket | None = None
         self.failed = 0
+        self.dropped_oversized = 0
         self._counter_lock = threading.Lock()
         self.log_foundry_stop_signal: threading.Event | None = None
         self._lock = threading.Lock()
@@ -170,14 +196,51 @@ class SocketTransport:
                     f"SocketTransport delivered none of {len(messages)} message(s): "
                     f"the transport is closed"
                 )
+            sendable = self._sendable(messages)
             delivered = 0
-            for message in messages:
+            for message in sendable:
                 if self._send_one(message):
                     delivered += 1
-        if delivered == 0:
+        if sendable and delivered == 0:
             raise SinkDeliveryError(
-                f"SocketTransport delivered none of {len(messages)} message(s)"
+                f"SocketTransport delivered none of {len(sendable)} message(s)"
             )
+
+    def _sendable(self, messages: list[bytes]) -> list[bytes]:
+        """Discards UDP datagrams too large to send, before any attempt (FR-007 AC-1).
+
+        A 70 KB event produced ``OSError errno=40`` (EMSGSIZE), which the retry loop treated as
+        transient: four sends with backoff, counted as ``failed``, then a raise that sent the
+        worker round for three more rounds — roughly sixteen futile sends and seconds of backoff
+        on the single drain thread, never converging. The size is knowable *before* sending, and
+        every other size-limited sink here drops and counts first, so this one does too.
+
+        Dropping is right rather than raising: the datagram is permanently unsendable on this
+        path, so there is nothing for a retry to fix, and reporting it as a delivery failure
+        would have the worker re-send the rest of the batch alongside it.
+
+        Args:
+          messages: The framed messages, in order.
+
+        Returns:
+          Those within the datagram limit. All of them under TCP, which is a stream.
+
+        Raises:
+          None.
+        """
+        if self._transport != "udp":
+            return messages
+        sendable = [m for m in messages if len(m) <= self._max_datagram_bytes]
+        dropped = len(messages) - len(sendable)
+        if dropped:
+            with self._counter_lock:
+                self.dropped_oversized += dropped
+            _diag.lost(
+                "message",
+                dropped,
+                f"SocketTransport, over the {self._max_datagram_bytes}-byte datagram limit",
+            )
+        return sendable
 
     def losses(self) -> SinkLosses:
         """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
@@ -192,7 +255,7 @@ class SocketTransport:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
 
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).
@@ -224,6 +287,12 @@ class SocketTransport:
         refused" from "host unknown", and the code is an integer from the OS rather than caller
         data.
 
+        An errno in ``_PERMANENT_ERRNOS`` skips the remaining attempts (FR-007 AC-3): a re-send
+        of identical bytes to the same destination can only earn the same answer, so retrying
+        buys nothing and costs the drain thread its backoff. :meth:`_sendable` normally catches
+        the oversized case first; this is the backstop for a path MTU smaller than the datagram
+        limit, which no local check can know.
+
         Args:
           message: The exact bytes to put on the wire.
 
@@ -242,7 +311,7 @@ class SocketTransport:
                 return True
             except OSError as err:
                 self._reset()
-                if attempt < self._max_retries:
+                if attempt < self._max_retries and err.errno not in _PERMANENT_ERRNOS:
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:

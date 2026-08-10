@@ -120,9 +120,18 @@ class RotatingFileSink:
     Rotation renames the active file through numbered backups, prunes any beyond the backup
     count, and opens a fresh active file — a backup count of zero keeps none, simply replacing
     the active file. Backups are numbered rather than timestamped, so no filename derives from
-    a clock at all and the monotonic deadline has no naming consequence. No event is lost across
-    a rotation, because the rotate happens before the pending event is written and the event
-    lands in the fresh file.
+    a clock at all and the monotonic deadline has no naming consequence. **The pending event is
+    not lost across a rotation**, because the rotate happens before it is written and it lands in
+    the fresh file (SPEC-038 FR-012 AC-5). That is the whole of the claim: it says nothing about
+    events *already written*, which retention governs — at ``backup_count=0`` every one of them
+    is destroyed at each rollover, which is why that is no longer the default.
+
+    No counter is added for what retention discards, at any ``backup_count``. This sink is a
+    bounded ring buffer, retention *is* the configuration, and discarding the oldest generation
+    is that configuration working — the precedent being ``MemorySink(maxlen)``, which behaves as
+    a bounded ring, counts nothing and implements no ``losses()``. Neither ``dropped`` (defined
+    as discarded *before* attempting delivery) nor ``failed`` fits an event that was written and
+    flushed to disk.
 
     A rotation rebinds the active stream, so it is the sink where concurrent writers did real
     damage: a second thread mid-``emit`` could write to the handle rotation had just closed, or
@@ -135,7 +144,7 @@ class RotatingFileSink:
         path: str,
         *,
         max_bytes: int = 0,
-        backup_count: int = 0,
+        backup_count: int = 1,
         when: str | None = None,
         interval: int = 1,
     ) -> None:
@@ -148,7 +157,15 @@ class RotatingFileSink:
         Args:
           path: The active file to append to.
           max_bytes: The size trigger, or 0 to disable it.
-          backup_count: How many numbered backups to retain.
+          backup_count: How many numbered backups to retain. **The default is 1** (SPEC-038
+            FR-012): at ``0`` a rotation calls ``os.remove`` on the active file, so
+            ``RotatingFileSink("app.log", max_bytes=10_000_000)`` silently threw away 10 MB at
+            every rollover. ``0`` still truncates, unchanged, for a caller who wants that.
+
+            The cost of the new default is disk: **2 x max_bytes under a size trigger, or one
+            full rollover period under a time-only one** — and ``max_bytes`` defaults to ``0``,
+            which bounds nothing, so a time-triggered sink's ceiling is whatever one period
+            writes.
           when: The time-trigger unit code, matched case-insensitively, or ``None`` to disable
             it. The vocabulary mirrors a subset of the stdlib ``TimedRotatingFileHandler``'s.
           interval: How many units make up one rollover period.

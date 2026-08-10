@@ -202,3 +202,54 @@ def test_well_formed_responses_count_nothing_and_say_nothing(
     sink.emit([{"trace_id": "t1", "a": 1}, {"trace_id": "t2", "a": 2}])
     assert sink.dropped_unadjudicated == 0
     assert capsys.readouterr().err == ""
+
+
+# --- SPEC-038 FR-009: the request budget must charge the partition key --------------------
+
+
+def test_the_request_budget_charges_the_partition_key_it_sends() -> None:
+    """AC-2. `PutRecords` charges the key against the 5 MiB limit; ignoring it understates.
+
+    The record size matters to whether this test can fail at all. `MAX_RECORDS` (500) and
+    `MAX_REQUEST_BYTES` both bound a chunk, and with small records the *count* binds first — so
+    the key is invisible and the test passes against the defect. At 20,000 bytes the byte limit
+    binds at 262 records, whose keys add 67 KB against only 2,880 bytes of slack. A first version
+    of this test used 9,000-byte records, where the count caps the chunk at 500 and the assertion
+    could never fail.
+    """
+    client = FakeKinesis()
+    sink = KinesisSink("stream", client=client, partition_key_field="pk")
+    sink.emit([{"pk": "k" * 256, "pad": "x" * 20_000} for _ in range(1500)])
+
+    assert all(len(chunk) < KinesisSink.MAX_RECORDS for chunk in client.calls), (
+        "the byte limit must be what bounds these chunks, or the key never enters the sum"
+    )
+    for chunk in client.calls:
+        charged = sum(len(r["Data"]) + len(r["PartitionKey"]) for r in chunk)
+        assert charged <= KinesisSink.MAX_REQUEST_BYTES, (
+            f"a chunk exceeded the real budget once its keys are counted: {charged}"
+        )
+
+
+def test_the_chunks_stay_packed_once_the_key_is_charged() -> None:
+    """AC-3. The fix must not be a blanket over-reservation that halves throughput."""
+    client = FakeKinesis()
+    sink = KinesisSink("stream", client=client, partition_key_field="pk")
+    sink.emit([{"pk": "k" * 256, "pad": "x" * 20_000} for _ in range(1500)])
+    worst = max(
+        sum(len(r["Data"]) + len(r["PartitionKey"]) for r in chunk) for chunk in client.calls
+    )
+    assert worst <= KinesisSink.MAX_REQUEST_BYTES
+    assert worst > KinesisSink.MAX_REQUEST_BYTES - 40_000, (
+        f"chunks are packed to within one record of the budget, not split conservatively: {worst}"
+    )
+
+
+def test_firehose_has_no_partition_key_to_charge() -> None:
+    """AC-2's other half: this applies to Kinesis only, so Firehose's sizing is unchanged."""
+    from log_foundry.sinks.firehose import FirehoseSink
+    from test_sinks_firehose import FakeFirehose
+
+    client = FakeFirehose()
+    FirehoseSink("stream", client=client).emit([{"a": 1}])
+    assert set(client.calls[0][0]) == {"Data"}, "a Firehose record carries no PartitionKey"

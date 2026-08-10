@@ -18,6 +18,8 @@ class FakeProducer:
         self.produced: list[tuple] = []
         self.polls = 0
         self.flushes = 0
+        self.flush_timeouts: list[object] = []
+        self.still_queued = 0
         self._deliver_error = deliver_error
 
     def produce(self, topic, value=None, key=None, callback=None) -> None:
@@ -28,8 +30,12 @@ class FakeProducer:
     def poll(self, timeout) -> None:
         self.polls += 1
 
-    def flush(self, *args) -> None:
+    def flush(self, *args) -> int:
+        # The real Producer.flush returns the number of messages still queued, and takes a
+        # timeout; the double records both so SPEC-038 FR-006 can be asserted on them.
         self.flushes += 1
+        self.flush_timeouts.append(args[0] if args else None)
+        return getattr(self, "still_queued", 0)
 
 
 def test_is_a_sink() -> None:
@@ -172,3 +178,52 @@ def test_close_is_idempotent_and_flushes_once() -> None:
     sink.close()
     sink.close()
     assert producer.flushes == 1
+
+
+# --- SPEC-038 FR-006: close() is bounded and counts what it lost --------------------------
+
+
+def test_close_passes_a_bounded_timeout_to_flush() -> None:
+    """AC-1. `flush()` with no timeout waits `message.timeout.ms` — five minutes by default.
+
+    `Worker.shutdown` closes the live sink inline and unbounded (arch §13), so an unreachable
+    broker held process exit for those five minutes despite `shutdown(timeout=30)`.
+    """
+    producer = FakeProducer()
+    KafkaSink("t", producer=producer, flush_timeout=7.5).close()
+    assert producer.flush_timeouts == [7.5], "the wait must be capped, not open-ended"
+
+
+def test_a_non_zero_remainder_is_counted_and_announced_once(capsys) -> None:
+    """AC-2. `flush()` returns what is still queued — exactly the count lost at exit.
+
+    The old call discarded that return value, so the loss was silent.
+    """
+    producer = FakeProducer()
+    producer.still_queued = 42
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 42
+    err = capsys.readouterr().err
+    assert "lost 42 message(s)" in err, "one line carrying the count, not 42 lines"
+    assert err.count("KafkaSink") == 1
+
+
+def test_a_clean_flush_counts_nothing() -> None:
+    producer = FakeProducer()
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 0
+
+
+def test_a_shutdown_cuts_the_close_flush_to_a_single_pass() -> None:
+    """AC-3. The events are lost either way, and the drain thread is what `shutdown()` waits on."""
+    import threading
+
+    producer = FakeProducer()
+    sink = KafkaSink("t", producer=producer, flush_timeout=30.0)
+    signal = threading.Event()
+    signal.set()
+    sink.log_foundry_stop_signal = signal
+    sink.close()
+    assert producer.flush_timeouts == [0], "a shutdown in progress makes the flush non-blocking"

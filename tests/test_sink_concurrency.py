@@ -273,7 +273,7 @@ def test_close_during_an_in_flight_emit_does_not_strand_the_writer(tmp_path: Pat
                 may_finish.wait(timeout=10)
             return self._inner.write(data)
 
-        def flush(self) -> None:
+        def flush(self, timeout=None) -> int:
             self._inner.flush()
 
         def close(self) -> None:
@@ -734,7 +734,7 @@ def test_close_waits_for_an_in_flight_emit_on_every_locked_sink(
                 may_finish.wait(timeout=10)
             return self._inner.write(data)
 
-        def flush(self) -> None:
+        def flush(self, timeout=None) -> int:
             self._inner.flush()
 
         def close(self) -> None:
@@ -1368,7 +1368,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             def poll(self, timeout: float) -> int:
                 return 0
 
-            def flush(self) -> None:
+            def flush(self, timeout=None) -> int:
                 pass
 
         return KafkaSink("logs", producer=Producer()), lambda: len(opened)
@@ -1629,7 +1629,7 @@ def test_kafka_sets_its_closed_flag_before_flushing() -> None:
         def poll(self, timeout: float) -> int:
             return 0
 
-        def flush(self) -> None:
+        def flush(self, timeout=None) -> int:
             flushing.set()
             may_finish.wait(timeout=10)
 

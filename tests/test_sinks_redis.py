@@ -19,11 +19,14 @@ class FakePipeline:
         self.executed = 0
         self._fail = fail
 
-    def xadd(self, name, fields) -> None:
-        self.ops.append(("xadd", name, fields))
+    def xadd(self, name, fields, **options) -> None:
+        self.ops.append(("xadd", name, fields, options))
 
     def rpush(self, name, value) -> None:
         self.ops.append(("rpush", name, value))
+
+    def ltrim(self, name, start, end) -> None:
+        self.ops.append(("ltrim", name, start, end))
 
     def execute(self) -> list:
         self.executed += 1
@@ -64,8 +67,8 @@ def test_streams_xadd_pipelined() -> None:
     pipe = client.pipelines[0]
     assert pipe.executed == 1
     assert pipe.ops == [
-        ("xadd", "mystream", {"event": json.dumps({"a": 1})}),
-        ("xadd", "mystream", {"event": json.dumps({"a": 2})}),
+        ("xadd", "mystream", {"event": json.dumps({"a": 1})}, {}),
+        ("xadd", "mystream", {"event": json.dumps({"a": 2})}, {}),
     ]
 
 
@@ -158,3 +161,55 @@ def test_close_is_idempotent() -> None:
     sink.close()
     sink.close()
     assert closes == [1]
+
+
+# --- SPEC-038 FR-008: the destination can be bounded --------------------------------------
+
+
+def test_the_stream_is_unbounded_by_default() -> None:
+    """AC-2. Silently discarding a user's buffered logs is not a default this library chooses."""
+    client = FakeRedis()
+    RedisStreamsSink("s", client=client).emit([{"a": 1}])
+    kind, name, _fields, options = client.pipelines[0].ops[0]
+    assert (kind, name) == ("xadd", "s")
+    assert options == {}, "no maxlen is passed unless one was configured"
+
+
+def test_a_stream_maxlen_is_passed_as_an_approximate_trim() -> None:
+    """AC-1. `approximate=True` is what makes Redis trim at a radix boundary rather than exactly.
+
+    An exact trim costs Redis O(n) per insert; approximate is the form the driver documents for
+    a capped stream, and the cap is a buffer ceiling rather than an exact retention promise.
+    """
+    client = FakeRedis()
+    RedisStreamsSink("s", client=client, maxlen=500).emit([{"a": 1}, {"a": 2}])
+    for kind, _name, _fields, options in client.pipelines[0].ops:
+        assert kind == "xadd"
+        assert options == {"maxlen": 500, "approximate": True}
+
+
+def test_the_list_is_unbounded_by_default() -> None:
+    client = FakeRedis()
+    RedisListSink("k", client=client).emit([{"a": 1}])
+    assert [op[0] for op in client.pipelines[0].ops] == ["rpush"], "no LTRIM without a maxlen"
+
+
+def test_a_list_maxlen_trims_to_the_newest_entries_after_each_push() -> None:
+    """AC-1. `ltrim(key, -n, -1)` keeps the newest `n`, which is the end RPUSH appends to."""
+    client = FakeRedis()
+    RedisListSink("k", client=client, maxlen=100).emit([{"a": 1}, {"a": 2}])
+    ops = client.pipelines[0].ops
+    assert [op[0] for op in ops] == ["rpush", "ltrim", "rpush", "ltrim"]
+    assert ops[1] == ("ltrim", "k", -100, -1), "keep the newest 100, not the oldest"
+
+
+def test_trimming_moves_no_loss_counter_because_it_happens_at_the_destination() -> None:
+    """AC-3. Redis drops the entries itself, after this sink reported the write delivered.
+
+    Those events are invisible to `health()`, which is the trade a bounded buffer makes and why
+    it is opt-in rather than a default.
+    """
+    client = FakeRedis()
+    sink = RedisStreamsSink("s", client=client, maxlen=1)
+    sink.emit([{"a": i} for i in range(50)])
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
