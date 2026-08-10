@@ -20,6 +20,14 @@ that other family, as an assignment rather than a predicate, so a reader must no
 roster as covering it. Recorded rather than quietly widened (SPEC-021), because widening the
 sentinels to reach it would also match every sink comparison in the module.
 
+**The module boundary is `decorator.py`, and that is a scope choice too.** `worker.py` decides
+the same kind of question inside the object — `_close_if_owed`, `swap_sink`'s three
+`_shutdown_done` re-checks, `shutdown`'s own gates — and none is filed. The four defects this
+exists for were all in `decorator.py`, where the question is "which of the module's several
+paths owns this", while inside `Worker` the answer is always "this worker"; but a fifth defect
+is not obliged to respect that, and the FR's single-module scope is stated here rather than
+left to be inferred from what the walker happens to be pointed at.
+
 **One cost is recorded rather than paid down here.** The seam lint below and its exclusive
 helpers are ~43% of this file, and four consecutive review rounds found a defect in them while
 finding none in the roster they sit beside — what they protect is prose in a data table. A
@@ -100,8 +108,10 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         OWNERSHIP_AND_MOMENT,
         (
             "the snapshot FR-001's conjunction below reads. Rebinding it to _live_worker() is "
-            "precisely the revert FR-001 exists to stop, and it changes this row's text as well "
-            "as the one below, so the stale-row check catches it from two directions."
+            "precisely the revert FR-001 exists to stop, and it is caught here rather than "
+            "below: the conjunction's text does not change at all, so this row goes stale and "
+            "a new unclassified site appears, both about this line. A draft claimed the row "
+            "below moved too, which is false and was checked."
         ),
     ),
     ("_offer_orphan_signal", "worker is not None and worker.sink is sink and worker.draining", 0): (
@@ -180,6 +190,14 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "clean shutdown and under a live writer on an expired one - both measured."
         ),
     ),
+    ("_swap_sink", "worker.swap_sink(new_sink, timeout)", 0): (
+        OWNERSHIP,
+        (
+            "the call that produces the ownership verdict the row below reads. Filed because "
+            "the roster files bindings positionally: a delegation retargeted at _worker rather "
+            "than the live snapshot is the round-9 attack wearing a different value shape."
+        ),
+    ),
     ("_swap_sink", "not worker_holds_sink", 0): (
         OWNERSHIP,
         (
@@ -198,8 +216,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         EXISTENCE,
         (
             "the snapshot the existence test below reads. Deliberately the raw global rather "
-            "than _live_worker(): a retired worker still has a queue worth draining, and "
-            "flush() is the call a serverless process makes when it is not exiting."
+            "than _live_worker(), and what that buys is the honest verdict, not a drain: "
+            "Worker.flush returns False immediately once _shutdown_done, so resolving liveness "
+            "here would answer True for a queue nothing will ever read - SPEC-021's false "
+            "success, in the call SPEC-013 built for a process that is not exiting. Measured "
+            "with one post-shutdown call queued, and pinned by "
+            "test_module_flush_after_shutdown_returns_false_promptly."
         ),
     ),
     ("_flush_worker", "worker is None", 0): (
@@ -214,7 +236,18 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         (
             "the snapshot the existence test below reads. The raw global again, and for the "
             "same reason: a retired worker's counters are exactly what health() is asked for "
-            "(SPEC-030 FR-001), so resolving liveness here would report zeros instead."
+            "(SPEC-030 FR-001), so resolving liveness here reports zeros instead - measured, "
+            "queued, failed_batches and submitted_after_shutdown all collapse to 0, which "
+            "leaves SPEC-030's retired-plus-submitted pair with a term that can never fire."
+        ),
+    ),
+    ("_worker_health", "worker.health()", 0): (
+        LIVENESS,
+        (
+            "the snapshot whose retired field the row below reads, and the reason this "
+            "function's binding is not ambiguous: the two questions here are fed by two "
+            "bindings, so each is classified by the one question it feeds rather than by a "
+            "choice between them."
         ),
     ),
     ("_worker_health", "worker is None", 0): (
@@ -279,17 +312,26 @@ def _boolean_positions(node: ast.AST) -> list[ast.AST]:
     None` then `if alive:` — is an ordinary refactor, and a position model that only looked at
     `if` tests lost the site entirely.
 
-    An assignment whose value is a bare name or attribute is filed as well, and that one is not
-    a question at all — it is a **binding**, filed because rebinding is how a guard changes
-    category while its text stays identical. One inserted `worker = _worker` above
-    `_swap_sink`'s existing `if worker is not None:` turned that guard from liveness into
-    existence with the roster, the suite, ruff and mypy all green, while the row below went on
-    declaring liveness; measured, `configure()` then stopped fencing the previous sink's close
-    (2.01 s → 0.00 s, `B.closed` 1 → 0). A binding is classified by the question it feeds,
-    which is the only category a binding can have. `Return` is deliberately excluded — `return
-    worker` hands the object to a caller who must ask their own question — and a `Call` value
-    is excluded too, so `worker = worker.health()` stays out while `worker = _live_worker()` is
-    caught by :func:`_is_boolean_expr` instead.
+    **Every** assignment value is filed, whatever its shape, and those are not questions at all
+    — they are **bindings**, filed because rebinding is how a guard changes category while its
+    text stays identical. One inserted `worker = _worker` above `_swap_sink`'s existing `if
+    worker is not None:` turned that guard from liveness into existence with the roster, the
+    suite, ruff and mypy all green, while the row below went on declaring liveness; measured,
+    `configure()` then stopped fencing the previous sink's close (2.01 s → 0.00 s, `B.closed`
+    1 → 0).
+
+    The rule is **positional, not a list of value shapes**, and that is the whole lesson. A
+    first version filed `Name` and `Attribute` values only; the same attack then went straight
+    back through `worker, _unused = _worker, None`, through `worker = [_worker][0]`, and
+    through a second accessor `worker = _process_worker()` — each reproducing the identical
+    measurement. Enumerating shapes loses ground every round, because the set is open. Filing
+    the value and letting `_sites`' sentinel filter decide over-matches instead, which is the
+    safe direction: `snapshot = worker.health()` becomes a row nobody minds, while
+    `_worker = Worker(_ensure_sink())` stays out on its own, the sentinel being lower-case.
+
+    A binding is classified by the question it feeds. `Return` is deliberately excluded —
+    `return worker` hands the object to a caller who must ask their own question, and the call
+    that fetches it is filed at that caller.
 
     Neither a `BoolOp` nor a `not` is decomposed into its operand. It is filed whole wherever it appears, so
     one guard is one row; an earlier version returned the operands here, which filed a hoisted
@@ -312,9 +354,7 @@ def _boolean_positions(node: ast.AST) -> list[ast.AST]:
         return [node.body]
     if isinstance(node, ast.Return | ast.Assign | ast.AnnAssign) and _is_boolean_expr(node.value):
         return [node.value]
-    if isinstance(node, ast.Assign | ast.AnnAssign) and isinstance(
-        node.value, ast.Name | ast.Attribute
-    ):
+    if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
         return [node.value]
     return []
 
@@ -426,11 +466,12 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
        false, which is why the claim is now stated at its widest. The substring model also
        over-matches — `if networker:` and `if ticket.retired:` are filed — and that direction is
        the safe one, since it demands a classification rather than skipping one.
-    2. **A hoisted question is only followed through a bare boolean operator, or a bare name.**
-       `alive = _worker is not None` and `held = _worker` are caught; `alive = bool(_worker)`,
-       `alive = getattr(_worker, "retired", False)`, `alive, _ = _worker is not None, 1`,
-       `flags = [_worker is not None]` and `alive |= _worker is not None` are not. In a test
-       position all of these are caught, because there the position alone settles it.
+    2. **A hoist is followed only through an assignment.** Every assignment value is filed
+       whatever its shape, so `held = _worker`, `held, _ = _worker, 1`, `held = [_worker][0]`
+       and `held = _process_worker()` are all caught. An augmented assignment
+       (`alive |= _worker is not None`), a `global`/`nonlocal` rebinding, a `setattr`, and a
+       walrus outside a filed position are not. In a test position all of them are caught,
+       because there the position alone settles it.
     3. **The *use* of a filed expression is not followed.** `owns = _worker is not None and
        _worker.sink is owed` is filed, and `if not owns:` below it carries no sentinel, so
        inverting a guard by negating its hoisted local passes with the roster green. Filing the
@@ -526,12 +567,32 @@ def test_every_worker_predicate_is_classified() -> None:
 
 
 def test_every_row_states_a_category_and_a_reason() -> None:
-    """AC-2. A category with no reason is a row that will be copied rather than thought about."""
+    """AC-2. A category with no reason is a row that will be copied rather than thought about.
+
+    The distinctness check is not pedantry. The valid set below is built from the same four
+    constants the rows are written with, so a constant edited to another's text validates
+    itself: setting `OWNERSHIP` to `EXISTENCE`'s string left the whole file green with all six
+    ownership rows silently reading as existence.
+    """
+    categories = {EXISTENCE, LIVENESS, OWNERSHIP, OWNERSHIP_AND_MOMENT}
+    assert len(categories) == 4, "two categories carry the same text, so the rows using them agree"
+
     for site, (category, reason) in ROSTER.items():
-        assert category in {EXISTENCE, LIVENESS, OWNERSHIP, OWNERSHIP_AND_MOMENT}, (
-            f"{site} has an unknown category"
-        )
+        assert category in categories, f"{site} has an unknown category"
         assert len(reason) > 40, f"{site}'s reason is too short to be one"
+
+
+def test_the_two_identical_swap_guards_keep_their_own_reasons() -> None:
+    """A reason swap between two rows sharing one expression is otherwise undetectable.
+
+    Prose cannot be checked in general, but these two name the branch they describe, so the
+    pairing is assertable — and this is the pair the occurrence index exists for, where getting
+    it wrong is exactly round 3's defect re-introduced by hand.
+    """
+    in_lock = ROSTER[("_swap_sink", "worker is not None", 0)][1]
+    out_of_lock = ROSTER[("_swap_sink", "worker is not None", 1)][1]
+    assert "the in-lock branch" in in_lock and "out-of-lock" not in in_lock
+    assert "the out-of-lock branch" in out_of_lock
 
 
 def test_the_roster_finds_the_bare_form_that_shipped_unseen() -> None:
@@ -583,6 +644,7 @@ def test_the_walker_matches_every_shape_it_claims_to() -> None:
             while worker.draining:
                 pass
             x = None if worker is None or worker.retired else worker
+            emit(None if _worker.draining else worker)
             assert _worker.sink is owed
             y = _live_worker()
             if not worker_holds_sink:
@@ -592,14 +654,23 @@ def test_the_walker_matches_every_shape_it_claims_to() -> None:
             if _worker:
                 pass
             held = _worker.sink
+            pair, _ = _worker, None
+            boxed = [_worker][0]
+            fetched = _process_worker()
+            snapshot = worker.health()
             return _worker is not None and _worker.sink is None
         """
     )
     assert found == {
         "_worker.sink",
+        "(_worker, None)",
+        "[_worker][0]",
+        "_process_worker()",
+        "worker.health()",
         "_worker is None",
         "worker.draining",
-        "worker is None or worker.retired",
+        "None if worker is None or worker.retired else worker",
+        "_worker.draining",
         "_worker.sink is owed",
         "_live_worker()",
         "not worker_holds_sink",
@@ -630,7 +701,6 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
             worker.shutdown(timeout)
             worker.flush(timeout)
             _worker.sink = new_sink
-            snapshot = worker.health()
             return worker
         """
     )
