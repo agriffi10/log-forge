@@ -516,15 +516,16 @@ predicate that would have re-broken SPEC-033 in the opposite direction.
 | **Existence** | `_worker is None` | is there anything to do, or a worker to build |
 | **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
 | **Ownership** | `_worker.sink is X` | who **owns** a close; a retired worker still owns its sink's |
-| **Ownership ∧ moment** | `_worker.sink is X and _worker.draining` | whose stop event the sink should be holding **now** |
+| **Ownership ∧ moment** | `worker is not None and worker.sink is sink and worker.draining` | whose stop event the sink should be holding **now** |
 
-Three *axes*, four categories: the fourth is a conjunction, not a new question, which is why it
-is named for both terms rather than for `Worker.draining` alone. A category named for the moment
-by itself would have no site — the moment never decides anything on its own here — and a
-contributor reaching for it would be reaching for something the roster does not accept.
+The fourth is a **conjunction**, not a new question, which is why it is named for both terms
+rather than for `Worker.draining` alone. A category named for the moment by itself would have no
+site — the moment never decides anything on its own here — and a contributor reaching for one
+would be reaching for something the roster does not accept.
 
 Liveness and ownership diverge the instant `retired` latches — which is **entry** to
-`shutdown()`, not its completion. The moment is a third axis rather than a refinement of either:
+`shutdown()`, not its completion. The moment is independent of both rather than a refinement of
+either:
 `_offer_orphan_signal` needs ownership **and** the moment, because ownership alone hands a set
 event to a sink still being written to (every later backoff collapses to zero) while liveness
 alone strips the drain thread of the event it is about to wait on. One ownership question is

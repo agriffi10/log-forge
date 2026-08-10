@@ -566,29 +566,32 @@ def test_no_reason_fuses_words_at_a_string_seam() -> None:
     characters), which was simultaneously one of its own cited examples and live in the file; it
     also rejected any long English word the source happened not to use. Both failures come from
     guessing at the output. The seam itself is exact: in an implicitly concatenated literal,
-    every part but the last must end with whitespace, or the next must begin with one.
+    every part but the last must end with whitespace, or the next must begin with one. Exact
+    against false *negatives*, which is the direction that matters; a part ending in a tab, a
+    carriage return or a non-breaking space is reported as a fusion when it is not.
     """
-    roster = _roster_node(_SOURCE)
-
-    interpolated = [ast.unparse(node)[:48] for node in ast.walk(roster) if _is_fstring(node)]
-    assert not interpolated, (
-        "a reason must be a plain literal — this lint cannot read an f-string:\n  "
-        + "\n  ".join(interpolated)
-    )
-
+    shapes: list[str] = []
     fused: list[str] = []
     unreadable: list[str] = []
-    for node in ast.walk(roster):
-        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-            continue
-        try:
-            siblings = _literal_parts(node, _SOURCE)
-        except _UnsupportedLiteral as exc:
-            unreadable.append(str(exc))
-            continue
-        for left, right in itertools.pairwise(siblings):
-            if not left.endswith((" ", "\n")) and not right.startswith((" ", "\n")):
-                fused.append(f"...{left[-24:]}|{right[:24]}...")
+    for subtree in _linted_nodes(_SOURCE):
+        for node in ast.walk(subtree):
+            if _is_unreadable_shape(node):
+                shapes.append(ast.unparse(node)[:48])
+                continue
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str | bytes):
+                continue
+            try:
+                siblings = _literal_parts(node, _SOURCE)
+            except _UnsupportedLiteral as exc:
+                unreadable.append(str(exc))
+                continue
+            for left, right in itertools.pairwise(siblings):
+                if not left.endswith((" ", "\n")) and not right.startswith((" ", "\n")):
+                    fused.append(f"...{left[-24:]}|{right[:24]}...")
+    assert not shapes, (
+        "write this as one plain literal or an implicit concatenation — this lint cannot read "
+        "an interpolated or `+`-joined one:\n  " + "\n  ".join(shapes)
+    )
     assert not unreadable, (
         "this lint could not read these literals, so it did not check them:\n  "
         + "\n  ".join(unreadable)
@@ -596,45 +599,75 @@ def test_no_reason_fuses_words_at_a_string_seam() -> None:
     assert not fused, "these string seams fuse two words together:\n  " + "\n  ".join(fused)
 
 
-def _roster_node(source: str) -> ast.AST:
-    """Returns the ``ROSTER`` assignment node in a parsed source string.
+def _linted_nodes(source: str) -> list[ast.AST]:
+    """Every subtree whose prose this lint answers for, **derived** rather than named.
+
+    The scope is ``ROSTER`` plus every module-level constant ``ROSTER`` references by name —
+    the four categories today, and a fifth automatically if one is ever added. Scoping to
+    ``ROSTER`` alone was a guess, and the guess was wrong: it excluded ``LIVENESS``, a
+    three-part literal carrying the *category* half of what AC-2 calls "a category and a
+    reason", and two live fusions inserted there passed the whole file. A lint whose value is
+    completeness cannot rest on a hand-drawn boundary (SPEC-032's roster lesson, one level up).
+
+    The module is deliberately **not** linted whole: it is full of legitimate f-strings, and
+    refusing those shapes only makes sense where the string is prose a human reads.
 
     Args:
-      source: Python source containing an annotated ``ROSTER`` assignment.
+      source: This module's own source.
 
     Returns:
-      The assignment node, whose subtree is every key and reason.
+      The `ROSTER` node first, then each referenced constant's assignment.
 
     Raises:
       StopIteration: If the source declares no ``ROSTER``.
     """
-    return next(
+    module = ast.parse(source)
+    roster = next(
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(module)
         if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "ROSTER"
     )
+    referenced = {node.id for node in ast.walk(roster) if isinstance(node, ast.Name)}
+    linted: list[ast.AST] = [roster]
+    for node in module.body:
+        if node is roster:
+            continue
+        if isinstance(node, ast.AnnAssign):
+            targets: list[ast.expr] = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id in referenced for t in targets):
+            linted.append(node)
+    return linted
 
 
-def _is_fstring(node: ast.AST) -> bool:
-    """Whether this node is an f-string, which the seam lint refuses rather than reads.
+def _is_unreadable_shape(node: ast.AST) -> bool:
+    """Whether this node builds a string in a way the seam reader cannot follow.
 
-    Refused at the **AST**, not by looking for an ``f`` prefix in the source, because there is
-    none to find: CPython folds ``f"a" "b"`` into one ``Constant`` whose recorded position starts
-    *inside* the f-string, so :func:`ast.get_source_segment` hands back ``a" "b"`` — a fragment
-    that happens to tokenize as one ordinary string and was therefore skipped in silence. A
-    reason is static prose and has no business being interpolated, so rejecting the shape is
-    both exact and sufficient, where detecting it downstream is neither.
+    Two shapes, refused rather than read, and both at the **AST** because neither is visible
+    downstream. An f-string cannot be caught by looking for an ``f`` prefix in the source:
+    CPython folds ``f"a" "b"`` into one ``Constant`` whose recorded position starts *inside* the
+    f-string, so :func:`ast.get_source_segment` hands back ``a" "b"`` — a fragment that happens
+    to tokenize as an ordinary single-part string and was skipped in silence. A ``+`` join is
+    the opposite problem: it is never folded at all, so each operand reads as a complete
+    one-part literal and a fusion across the operator is invisible with nothing raised.
+
+    A reason is static prose, so neither shape has any business here and refusing them is
+    cheaper and more honest than teaching the reader to follow them. An earlier version refused
+    only the f-string and called that "both exact and sufficient", which measured false.
 
     Args:
       node: Any AST node.
 
     Returns:
-      Whether it is an ``f``-string.
+      Whether it is an f-string or a binary operation.
 
     Raises:
       None.
     """
-    return isinstance(node, ast.JoinedStr)
+    return isinstance(node, ast.JoinedStr | ast.BinOp)
 
 
 class _UnsupportedLiteral(Exception):
@@ -718,6 +751,7 @@ _LITERAL_SHAPES: list[tuple[str, list[str] | str]] = [
     ('x = "ab" "cd" "ef"', ["ab", "cd", "ef"]),
     ('x = "abcd"', []),
     ('x = b"ab" b"cd"', _UNREADABLE),
+    ('x = f"the" "process"', _UNREADABLE),
 ]
 
 
@@ -726,6 +760,13 @@ def test_the_seam_lint_reads_every_literal_shape_it_claims_to() -> None:
 
     Deleting :func:`_literal_parts`' body outright left the whole file green before this
     existed, which is what let two successive versions of the lint ship blind to a quote shape.
+
+    All three ways of being unreadable are covered, and the coverage is uneven for a reason:
+    the folded-f-string row is the one that has actually fired, the bytes row is reachable from
+    the real lint only because it stopped pre-filtering constants to `str`, and the third —
+    a node whose source segment cannot be recovered at all — has no source form, so it is
+    driven from a synthesised node rather than a fixture. Two of the three reverted to
+    `return []` with the whole file green before this said so.
     """
     for source, expected in _LITERAL_SHAPES:
         node = _only_constant(source)
@@ -735,26 +776,78 @@ def test_the_seam_lint_reads_every_literal_shape_it_claims_to() -> None:
             continue
         assert _literal_parts(node, source) == expected, source
 
+    positionless = ast.Constant(value="x")
+    positionless.lineno = 1
+    with pytest.raises(_UnsupportedLiteral):
+        _literal_parts(positionless, 'x = "x"')
 
-def test_an_interpolated_reason_is_refused_rather_than_skipped() -> None:
-    """The round-7 finding: an f-string reason was not checked, and said nothing about it.
 
-    Both halves are pinned. The first is that the seam reader genuinely cannot see one, and the
-    shape that proves it is an f-string in the **middle**: CPython gives each surrounding literal
-    its own one-part source segment, so a fusion across them reads as two literals with nothing
-    to check and the reader stays silent — where a leading f-string only mangles the segment and
-    is now at least loud. The second is that :func:`_is_fstring` catches the shape at the AST,
-    where it is unambiguous either way.
+def test_a_reason_built_by_interpolation_or_addition_is_refused() -> None:
+    """Rounds 7 and 8: two ways of building a string that were not checked and said nothing.
+
+    Each is pinned in both halves — that the reader genuinely cannot see the fusion, and that
+    the shape is refused at the AST where it is unambiguous. The f-string case is proved with
+    one in the **middle**, since CPython gives each surrounding literal its own one-part segment
+    and the reader stays silent; a *leading* one only mangles the segment and is now at least
+    loud. The `+` case never folds at all, so both operands read as complete one-part literals.
     """
     silent = 'x = "the" f"{y}" "process"'
     assert [_literal_parts(node, silent) for node in ast.walk(ast.parse(silent)) if
             isinstance(node, ast.Constant) and isinstance(node.value, str)] == [[], []]
 
-    interpolated = 'ROSTER: dict = {("f", "x", 0): (EXISTENCE, f"a{1}" "b")}'
-    assert any(_is_fstring(node) for node in ast.walk(_roster_node(interpolated)))
+    joined = 'x = "the" + "process"'
+    assert [_literal_parts(node, joined) for node in ast.walk(ast.parse(joined)) if
+            isinstance(node, ast.Constant)] == [[], []]
+
+    for refused in ('(EXISTENCE, f"a{1}" "b")', '(EXISTENCE, "a" + "b")'):
+        source = f'ROSTER: dict = {{("f", "x", 0): {refused}}}'
+        subtrees = _linted_nodes(source)
+        assert any(_is_unreadable_shape(node) for sub in subtrees for node in ast.walk(sub)), source
 
     plain = 'ROSTER: dict = {("f", "x", 0): (EXISTENCE, "a " "b")}'
-    assert not any(_is_fstring(node) for node in ast.walk(_roster_node(plain)))
+    assert not any(
+        _is_unreadable_shape(node) for sub in _linted_nodes(plain) for node in ast.walk(sub)
+    )
+
+
+def _linted_names(source: str) -> set[str]:
+    """The names of the assignments :func:`_linted_nodes` selected.
+
+    Args:
+      source: Python source declaring a `ROSTER`.
+
+    Returns:
+      One name per selected assignment.
+
+    Raises:
+      None.
+    """
+    names: set[str] = set()
+    for node in _linted_nodes(source):
+        targets = [node.target] if isinstance(node, ast.AnnAssign) else getattr(node, "targets", [])
+        names.update(t.id for t in targets if isinstance(t, ast.Name))
+    return names
+
+
+def test_the_lint_covers_the_categories_and_not_the_whole_module() -> None:
+    """Round 8: scoping to `ROSTER` alone excluded `LIVENESS`, and two fusions there passed.
+
+    Both bounds are asserted, because each failure mode is real. Too narrow leaves the category
+    half of "a category and a reason" unchecked. Too wide — the whole module — refuses the
+    f-strings this file legitimately uses to build its own failure messages, so the lint could
+    not run at all. Deriving the scope from what `ROSTER` *references* is what makes a fifth
+    category picked up with no edit here.
+    """
+    assert _linted_names(_SOURCE) == {
+        "ROSTER",
+        "EXISTENCE",
+        "LIVENESS",
+        "OWNERSHIP",
+        "OWNERSHIP_AND_MOMENT",
+    }
+
+    unreferenced = 'UNUSED = "x"\nUSED = "y"\nROSTER: dict = {("f", "e", 0): (USED, "a")}\n'
+    assert _linted_names(unreferenced) == {"ROSTER", "USED"}
 
 
 # (fixture source, the scope names the walker must produce). The `try:`/`except ImportError:`
