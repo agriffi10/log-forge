@@ -271,6 +271,15 @@ words with `fields=` as the escape hatch; and `FlushResult`/`ContinueResult` plu
 `NamedTuple` → frozen-dataclass conversion. **Three of its four blocking findings were regressions
 it introduced and none was visible in its own diff** — see `docs/audits/HANDOFF-2026-08-10.md`.
 
+**SPEC-037 (caller safety and serialization) is Completed** — two promises the library makes in
+its first paragraph, each broken on a path its own spec did not check. `NaN`/`Infinity` passed
+through `sanitize` into `json.dumps`, which writes tokens RFC 8259 does not define, so a strict
+consumer rejected the whole record; each is now replaced by a `<float: …>` marker with
+`truncated` set, on SPEC-020's reasoning. And `api._log`'s in-span branch was unguarded on the
+recorded grounds that it "only appends to a list" — it calls `build_event`, so `info(exc)`
+returned normally outside a span and killed the decorated function inside one, *and* the
+decorator recorded an `error.type` the caller never raised. Six `xfail` cells cleared.
+
 **The 2026-08-07 audit arc's build order was reversed** to `034 → 037 → 038 → 036 → 039 → 041 →
 040`, and most of it no longer blocks `v1.0.0`. Reasoning in `docs/specs/INDEX.md`; the short form
 is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later

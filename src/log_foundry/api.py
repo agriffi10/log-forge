@@ -57,12 +57,21 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     sink that was written to. ``_ensure_sink`` is resolved first, so a sink that fails to
     *construct* arms nothing: there is nothing to close.
 
-    The orphan branch is the one that reaches the sink on the caller's own thread, with no
-    worker between them to absorb a failure, so the whole branch is guarded (SPEC-025
-    FR-003) — ``_ensure_sink`` constructs the sink on first use, so a sink that fails to
-    build raises here too. The in-span branch is deliberately left untouched, since it only
-    appends to a list. The echo runs after the emit, so a closed or redirected stream never
-    costs the event itself.
+    **Both branches are guarded.** The orphan branch reaches the sink on the caller's own
+    thread, with no worker between them to absorb a failure (SPEC-025 FR-003) — ``_ensure_sink``
+    constructs the sink on first use, so a sink that fails to build raises here too.
+
+    ~~The in-span branch is deliberately left untouched, since it only appends to a list.~~ —
+    struck (SPEC-021), and it is why that branch shipped unguarded: it does not *only* append.
+    It calls ``build_event``, which calls ``truncate_str``, which calls ``value.encode`` — so
+    ``info(some_exception)``, a slip ``mypy`` catches only at typed call sites, returned normally
+    on the orphan path and killed the caller's function inside a span. Worse than a crash: the
+    decorator's own handler then recorded the span ``status=error`` with an ``error.type`` of
+    ``AttributeError`` that the caller's code never raised — wrong data *and* a broken caller.
+    A guard that reads "this cannot fail" is a guard that stops being true when the code under
+    it changes, and this one had already stopped.
+
+    The echo runs after the emit, so a closed or redirected stream never costs the event itself.
 
     Args:
       level: The severity label to stamp on the event.
@@ -81,8 +90,11 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     span = context.current_span()
     event: dict[str, object] | None = None
     if span is not None:
-        event = build_event(span, level, message, fields=fields, baggage=baggage)
-        span.events.append(event)
+        try:
+            event = build_event(span, level, message, fields=fields, baggage=baggage)
+            span.events.append(event)
+        except Exception as exc:
+            _diag.absorbed("building an in-span log", exc, "the event was lost")
     else:
         try:
             orphan = Span(

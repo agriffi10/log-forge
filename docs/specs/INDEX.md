@@ -41,7 +41,7 @@ to status only — no prose.
 | [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Completed | SPEC-026, SPEC-030, SPEC-033 |
 | [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
 | [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037 |
-| [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-034 |
+| [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-034 |
 | [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Draft | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
 | [SPEC-039](SPEC-039-fork-lifecycle.md) | Fork Lifecycle | Draft | SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035 |
 | [SPEC-040](SPEC-040-lifecycle-ownership.md) | Lifecycle Ownership — One Owner for the Worker and the Sink | Draft | SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039 |

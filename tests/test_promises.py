@@ -102,11 +102,12 @@ async def test_a_failing_sink_never_reaches_the_caller(path: str) -> None:
     await _emit_on(path, lambda: log_foundry.info("the sink will raise on this"))
 
 
-P1_VALUE_BROKEN = {
-    "traced": "audit A2 — the in-span branch of api._log is unguarded, so build_event's "
-    "truncate_str raises AttributeError into the caller",
-    "async": "audit A2 — same unguarded in-span branch",
-}
+# ~~P1_VALUE_BROKEN = {"traced": "audit A2 — the in-span branch of api._log is unguarded …"}~~
+# Closed by SPEC-037 FR-001. The branch was left unguarded on the recorded grounds that it "only
+# appends to a list" — it calls `build_event`, which calls `truncate_str`, which calls
+# `value.encode`. Both halves of A2 go with it: the caller survives, and the span no longer
+# records an `error.type` its own code never raised.
+P1_VALUE_BROKEN: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("path", [_xfail(p, P1_VALUE_BROKEN) for p in PATHS])
