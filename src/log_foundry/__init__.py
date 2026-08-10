@@ -3,6 +3,7 @@
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
+from log_foundry import _fork
 from log_foundry.api import critical, debug, error, info, set_baggage, warning
 from log_foundry.config import Config, configure, get_config
 from log_foundry.context import (
@@ -21,6 +22,8 @@ try:
     __version__ = _dist_version("log-foundry")
 except PackageNotFoundError:
     __version__ = "0.0.0"
+
+_fork.install()
 
 
 def flush(timeout: float | None = 5.0) -> FlushResult:
