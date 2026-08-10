@@ -215,6 +215,45 @@ def test_the_readme_and_all_cannot_drift() -> None:
     )
 
 
+def test_an_incomplete_sink_subclass_cannot_be_instantiated() -> None:
+    """FR-005 made `Sink` public, which invites inheritance — and inheritance was unsafe.
+
+    A `Protocol` whose members have empty bodies is an ABC to its subclasses only if those
+    members are `@abstractmethod`. Without them, `class MySink(Sink)` with `def emmit` (one
+    typo) instantiated happily and its inherited `emit` returned `None`: measured, three events
+    gone, `flush()` returning `True`, every counter at zero — the "sink the worker believes"
+    failure SPEC-018/026/032 were spent removing. `mypy` refused it; only the runtime did not,
+    and the runtime is the side that loses data.
+    """
+    with pytest.raises(TypeError, match="abstract"):
+
+        class Typo(log_foundry.Sink):  # type: ignore[misc]
+            def emmit(self, batch: list[dict[str, object]]) -> None: ...
+            def close(self) -> None: ...
+
+        Typo()
+
+
+def test_a_complete_sink_subclass_and_a_structural_one_both_work() -> None:
+    """The guard must not cost the structural satisfaction every shipped sink relies on.
+
+    No sink in this package inherits `Sink` — they all satisfy it structurally — so a fix that
+    made inheritance mandatory would break the entire sink family and the third-party contract
+    with it.
+    """
+
+    class Inherited(log_foundry.Sink):
+        def emit(self, batch: list[dict[str, object]]) -> None: ...
+        def close(self) -> None: ...
+
+    class Structural:
+        def emit(self, batch: list[dict[str, object]]) -> None: ...
+        def close(self) -> None: ...
+
+    Inherited()
+    assert isinstance(Structural(), log_foundry.Sink)
+
+
 def test_get_baggage_round_trips_with_set_baggage() -> None:
     """FR-005 AC-3. Baggage was publicly *settable* and readable only as a serialized header."""
     log_foundry.reset_context()

@@ -255,6 +255,14 @@ deliberate once `1.0.0` freezes: a name absent from `__all__` at 1.0 says "not p
 - [x] AC-2: `Config`, `read_losses` and `get_baggage` likewise.
 - [x] AC-3: `get_baggage()` returns the current baggage as a `dict`, and a test asserts it
       round-trips with `set_baggage`.
+- [x] AC-3b: **The name is `get_baggage`, not `current_baggage`, and that was a decision.**
+      Review raised it: the context readers are `current_traceparent()`,
+      `current_trace_context()` and `current_baggage_header()`, so the new name sits beside a
+      family it does not join, and a rename costs a major version after 1.0. It pairs with
+      `set_baggage()` instead, which is the right pairing — the `current_*` family reads the
+      **trace context**, which the caller never sets directly, while baggage is the one piece of
+      context a caller does set, and a getter whose name does not mirror its setter is the worse
+      surprise. Recorded rather than renamed.
 - [x] AC-3a: **It returns a copy, and the library's own hot path does not pay for it.** Added at
       build time: `context.get_baggage()` returned the live mapping with a docstring saying "must
       not be mutated in place", and *exporting* that is FR-003's defect under another name — a

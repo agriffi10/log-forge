@@ -181,13 +181,20 @@ def _swap_live_sink(sink: Sink) -> None:
 
 
 def get_config() -> Config:
-    """Returns the current global config singleton.
+    """Returns the current global config, for reading.
+
+    **Mutating what this returns is unsupported and will raise from 1.0** (SPEC-034 FR-003).
+    Today it hands back the live singleton, so assigning to it retargets what the config
+    *reports* while every event continues to the sink the worker already captured, and assigning
+    a ceiling bypasses the validation :func:`configure` performs — ``max_value_bytes = 0`` is
+    accepted and empties every event it touches. Both measured. :func:`configure` is the only
+    supported route to a change.
 
     Args:
       None.
 
     Returns:
-      The process-wide :class:`Config`.
+      The process-wide :class:`Config`, to be treated as read-only.
 
     Raises:
       None.

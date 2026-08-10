@@ -430,13 +430,16 @@ undoing the erasure. It never raises.
 A **sink** is the swappable output transport — any object satisfying the `Sink` protocol. It
 receives already-built, batched event dicts and knows nothing about spans or context:
 
-```python
-from log_foundry import Sink   # the protocol, for annotating your own
-
-class Sink(Protocol):
-    def emit(self, batch: list[dict[str, object]]) -> None: ...
-    def close(self) -> None: ...
 ```
+emit(batch: list[dict[str, object]]) -> None
+close() -> None
+```
+
+Satisfy it **structurally** — any object with those two methods is a sink, and every sink shipped
+here is one. You do not need to inherit. If you prefer to, `from log_foundry import Sink` gives you
+the protocol to annotate against or subclass; both methods are abstract, so a subclass that
+misspells `emit` fails at construction rather than silently accepting every batch and delivering
+nothing.
 
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
 call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
@@ -696,6 +699,10 @@ loss-reporting apparatus is built on them:
   whole operation that assumes exclusivity. If it holds none, you need do nothing. The library
   cannot serialize this for you: it does not own the calling thread.
 
+- **The batch is borrowed, not given.** The list and the dicts in it may go to other sinks after
+  you — `MultiSink` hands the same objects to every child in turn — so copy before you redact or
+  reshape. A child that cleared the list in place left the next child with nothing, and no error
+  anywhere.
 - **Raise when you delivered none of the batch**, after your own retries are spent. That is the
   signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
   a retry cannot duplicate anything: nothing landed downstream. Raise `SinkDeliveryError` (from
@@ -784,8 +791,30 @@ There is one drain thread, so your backoff pauses *all* log delivery, and it is 
 process exit for 30 seconds. The name is prefixed because the library assigns this attribute onto
 an object it does not own: a bare `stop_signal` would silently overwrite one you already had.
 
-If you write a **wrapper** sink, forward it to whatever actually holds the retry loop. Set on the
-wrapper and stopped there, the signal reaches nothing.
+If you write a **wrapper** sink, forward it to whatever actually holds the retry loop — a plain
+attribute on the wrapper is assigned, stops there, and the inner sink never sees it. Measured: a
+wrapper built from the leaf template above left an inner sink's 4-second backoff uninterrupted,
+`shutdown(timeout=30)` ran the full 30 seconds, `stopped_reason` read `"ShutdownTimeout"` and the
+sink was left open — against 0.00 s for the same sink configured directly. Use a property:
+
+```python
+class MyWrapper:
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._stop_signal: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        return self._stop_signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
+        self._stop_signal = signal
+        self._inner.log_foundry_stop_signal = signal   # the one line that matters
+```
+
+Every wrapper shipped here — `MultiSink`, `FilteringSink`, `TransformSink`, `SyslogSink`,
+`LogstashSink`, `SentrySink` — does exactly this.
 
 ### Flushing and shutdown
 

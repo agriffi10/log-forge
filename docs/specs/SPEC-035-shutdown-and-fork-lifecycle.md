@@ -111,7 +111,11 @@ one-line correction — it is FR-002's enumeration.
       abandoned drain (`ShutdownTimeout`) counts as **not** draining: the thread is wedged, the
       shutdown has already given up on it and left the sink open by SPEC-027 FR-004, so nothing
       will cut its backoff, where the retry loop goes on costing the running application.
-- [x] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`.
+- [x] AC-2: An orphan log during `shutdown()`'s drain leaves `sink.stop_signal is worker._stop`
+      — the attribute is `log_foundry_stop_signal` since SPEC-034 FR-006 renamed it, and the
+      shipped test was swept with it. Noted here rather than rewritten: this criterion was
+      checked against the code as it stood, and a reader re-verifying it needs the current name
+      to find anything. The measured output above it is left exactly as measured.
 - [x] AC-3: End to end: with a sink whose backoff is far longer than the shutdown budget, one
       concurrent orphan log does not change the outcome — the backoff is still cut short, and
       `stopped_reason` stays `None`. The test keeps the backoff-to-budget **gap** wide rather

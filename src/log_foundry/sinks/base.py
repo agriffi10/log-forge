@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import NamedTuple, Protocol, runtime_checkable
 
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "read_losses"]
@@ -58,6 +59,16 @@ class Sink(Protocol):
     sink written against the pre-SPEC-026 interface satisfying this one. :func:`read_losses` is
     the probe.
 
+    :meth:`emit` and :meth:`close` are ``@abstractmethod`` (SPEC-034 FR-005). A ``Protocol`` is
+    normally satisfied *structurally* and that is still how every shipped sink satisfies this
+    one — but making it a public export invites inheritance, and an incomplete subclass of a
+    protocol whose members have empty bodies instantiates happily and returns ``None`` from the
+    method it failed to define. Reproduced before the decorators were added: one typo
+    (``def emmit``) and three events were gone with ``flush()`` reporting ``True`` and every
+    counter at zero — the "sink the worker believes" failure this file exists to prevent.
+    ``mypy`` already refused it; only the runtime did not. Inheriting is still not required, and
+    ``isinstance`` remains structural.
+
     A fourth is optional in the same way and is an attribute rather than a method:
     ``log_foundry_stop_signal``. A sink that defines it — a plain
     ``threading.Event | None``, initialised to ``None`` — is handed the worker's shutdown event
@@ -86,6 +97,7 @@ class Sink(Protocol):
     both, the order is always transport then counter, never the reverse.
     """
 
+    @abstractmethod
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Ships a batch of serialized event dicts.
 
@@ -129,7 +141,11 @@ class Sink(Protocol):
         docstring and a test holds it to it.
 
         Args:
-          batch: The events to ship. ``emit([])`` is a no-op and never raises, since an empty
+          batch: The events to ship. **Borrowed, not given** — the list and the dicts inside it
+            may be handed to other sinks afterwards, which ``MultiSink`` does to every child in
+            turn, so mutating either in place silently changes or empties what a later sink
+            receives. Copy before reshaping or redacting. Reproduced: a child that cleared the
+            list left the next child with nothing and no error anywhere. ``emit([])`` is a no-op and never raises, since an empty
             batch has not failed to deliver — closed or not.
 
         Returns:
@@ -140,6 +156,7 @@ class Sink(Protocol):
         """
         ...
 
+    @abstractmethod
     def close(self) -> None:
         """Flushes and releases any resources.
 
