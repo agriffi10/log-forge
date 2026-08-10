@@ -271,6 +271,18 @@ words with `fields=` as the escape hatch; and `FlushResult`/`ContinueResult` plu
 `NamedTuple` → frozen-dataclass conversion. **Three of its four blocking findings were regressions
 it introduced and none was visible in its own diff** — see `docs/audits/HANDOFF-2026-08-10.md`.
 
+**SPEC-038 (sink correctness) is Completed** — ten defects where a sink did not match what its
+destination requires, in three PRs. The worst was not sink-specific in origin: `_final_drain`
+hands the exit backlog over as one batch (5,980 events measured) and the HTTP family never
+re-chunked, so `HTTPSink.emit` is now a template method owning the chunk loop with
+`_render`/`_body`/`_handle_response` as the hooks. Also: Postgres's unguarded rollback, Pub/Sub's
+append-only futures, Firehose's missing NDJSON delimiter and its `1024*1024`-vs-1,024,000
+ceiling, Kinesis's uncharged `PartitionKey`, Kafka's unbounded close flush, Syslog retrying
+`EMSGSIZE`, unbounded Redis destinations, `RotatingFileSink`'s generation-destroying default, and
+the `sinks.util` move. **Twelve review rounds found seven blocking defects, five of them
+introduced by a previous round's fix** — four being one mistake repeated, recorded in Key
+Decisions as "a shutdown shortens a wait, never work".
+
 **SPEC-037 (caller safety and serialization) is Completed** — two promises the library makes in
 its first paragraph, each broken on a path its own spec did not check. `NaN`/`Infinity` passed
 through `sanitize` into `json.dumps`, which writes tokens RFC 8259 does not define, so a strict
@@ -622,6 +634,38 @@ so they are free in `1.x`.
   work. The keyword form wins a collision (`{**base, **overrides}`), and the merge **absorbs** a
   non-mapping rather than raising: it runs in the emitter, outside `api._log`'s orphan guard, so
   an unguarded merge broke SPEC-025's promise on all four paths. (SPEC-034 FR-004)
+- **A shutdown shortens a *wait*; it must never skip *work*** — `Worker.shutdown` sets the stop
+  event **before** joining the drain thread, so it is set for the whole of `_final_drain`. Any
+  sink consulting it to do *less* is therefore degrading itself on the exit drain, which is the
+  one path a serverless process has. Measured four times in one spec: `HTTPSink` ending its 413
+  search delivered **nothing** of a 2,000-event backlog that had been going out in 30 requests;
+  `KafkaSink` cutting its flush to zero delivered **0 of 11**, since `produce()` is a local
+  hand-off and `flush()` is the only thing that drains the producer. `_retry.wait` is the one
+  place the signal belongs — it shortens a backoff and cancels no attempt. (SPEC-038 FR-001
+  AC-4a, FR-006 AC-3)
+- **A destination's limit is found by halving the *budget*, not the chunk** — recursive
+  chunk-halving is `2N-1` requests (11,954 measured for one exit backlog), because each accepted
+  size is rediscovered in every branch; halving the budget re-chunks the remainder once per
+  reduction and converges in `log2(ratio)` (8 for a 5 MB default against a 20 kB endpoint).
+  Capping the recursion *depth* instead is the trap: a 250× ratio needs ~8 halvings, so a cap of
+  4 delivered 2 events of 2,000. Each reduction halves **what was refused**, not the nominal
+  budget. A `413` is never retried — it is a verdict on the bytes — and a size already refused is
+  not asked about again, **except under `gzip`**, where the refusal is uncompressed and the
+  destination judges the wire. (SPEC-038 FR-001)
+- **A subclass that inherits a method is still in the roster** — scope keyed on *defining* one
+  makes membership a function of where code happens to sit, and moving five `emit`s into a base
+  dropped those classes out of two lints in a single commit, 34 → 29, with the suite green. Only
+  the sibling roster noticed, and only because it had a floor guard. Both rosters now scope on
+  defines-or-inherits, both carry floors, a class overriding neither `emit` nor `close` may answer
+  from the ancestor whose code it runs, and **a test asserts the two cover the same classes** —
+  they had already drifted twice on trigger and on base spelling. (SPEC-038 FR-001 AC-1a/AC-1b)
+- **A bound is only a bound if it is measured where it binds** — the recurring shape behind five
+  of this spec's seven blocking defects. A wall-clock assertion cannot see a busy-spin (a slice
+  loop bounded at 1.00 s wall burned 3.5 M calls and a pegged core, so the test asserts **CPU**
+  time); a timeout applied per *item* is `n × timeout`, not a bound; and a chunk size is a floor
+  division, so a byte-charging test only bites at sizes where the division tips — the same test
+  was vacuous at 1,012 bytes (the count limit binds first) and again at 9,000, and now asserts
+  its own sensitivity as a precondition. (SPEC-038 FR-004, FR-005)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
