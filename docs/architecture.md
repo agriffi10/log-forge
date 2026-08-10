@@ -505,26 +505,32 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
 
 ### 9.2 Four questions a guard can ask about the worker
 
-Every guard in `decorator.py` that mentions the worker is asking exactly one of four questions,
-and answering with the wrong one is this codebase's most repeated defect: three reviewers told
-SPEC-033 "ownership, not liveness", each naming a different call site, each was fixed, and a
-fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a predicate that
-would have re-broken SPEC-033 in the opposite direction.
+Every guard in `decorator.py` that mentions the worker is classified as exactly one of four
+categories, and answering with the wrong one is this codebase's most repeated defect: three
+reviewers told SPEC-033 "ownership, not liveness", each naming a different call site, each was
+fixed, and a fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a
+predicate that would have re-broken SPEC-033 in the opposite direction.
 
-| Question | Predicate | What it decides |
+| Category | Predicate | What it decides |
 |---|---|---|
 | **Existence** | `_worker is None` | is there anything to do, or a worker to build |
-| **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing |
+| **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
 | **Ownership** | `_worker.sink is X` | who **owns** a close; a retired worker still owns its sink's |
-| **Moment** | `Worker.draining` | whether this worker's `_stop` is *still* the sink's route to a cut-short backoff |
+| **Ownership ∧ moment** | `_worker.sink is X and _worker.draining` | whose stop event the sink should be holding **now** |
+
+Three *axes*, four categories: the fourth is a conjunction, not a new question, which is why it
+is named for both terms rather than for `Worker.draining` alone. A category named for the moment
+by itself would have no site — the moment never decides anything on its own here — and a
+contributor reaching for it would be reaching for something the roster does not accept.
 
 Liveness and ownership diverge the instant `retired` latches — which is **entry** to
 `shutdown()`, not its completion. The moment is a third axis rather than a refinement of either:
 `_offer_orphan_signal` needs ownership **and** the moment, because ownership alone hands a set
 event to a sink still being written to (every later backoff collapses to zero) while liveness
-alone strips the drain thread of the event it is about to wait on. One question is answered by a
-**return value** rather than a predicate — `Worker.swap_sink` reports whether it adopted the
-sink, because only the worker knows whether it got as far as reassigning.
+alone strips the drain thread of the event it is about to wait on. One ownership question is
+answered by a **return value** rather than a predicate — `Worker.swap_sink` reports whether it
+adopted the sink, because the decline is taken between its two lock acquisitions and nothing
+outside observes it.
 
 The rule is enforced, not just written down: `tests/test_worker_predicate_roster.py` derives
 every expression **in boolean position** naming the worker from `decorator.py`'s AST and fails
@@ -542,6 +548,14 @@ arbitrary expression could carry is a walker nobody can reason about. A new call
 question it asks. That is deliberately a *derived* roster and not a hand-written list, for the
 reason the sink rosters are (SPEC-028, SPEC-032): the completeness is the point, and a
 hand-maintained list rots.
+
+What it is complete about is guards that **name the worker**, which is narrower than the
+ownership question itself. The orphan path decides who owns a close with no worker in the
+expression — `_note_orphan_emit`'s `sink is _orphan_sink`, `_close_orphan_sink`'s `owed is None`,
+`_adopt_declined_swap`'s re-arm guard, `_swap_sink`'s `old is None or old is new_sink` — and none
+is filed. SPEC-035 FR-003's own defect lived in that family, as an assignment rather than a
+predicate, so a green roster is not evidence about it. Widening the sentinels to reach it would
+match every sink comparison in the module, so it is recorded here instead of quietly extended.
 
 
 ---
