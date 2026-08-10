@@ -7,9 +7,12 @@ import os
 import sys
 import threading
 import types
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _PACKAGE = __name__.rpartition(".")[0]
 """This package's import name, derived rather than written.
@@ -24,6 +27,15 @@ _RLOCK_TYPE = type(threading.RLock())
 _LOCK_TYPES: tuple[type, ...] = (type(threading.Lock()), _RLOCK_TYPE)
 
 _CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict, collections.deque)
+
+_child_handlers: list[Callable[[], None]] = []
+"""What runs in the child once its locks are its own again, in registration order.
+
+**An inverted registry, and that is what keeps the dependency arrow pointing one way**
+(FR-006). The work a child needs done belongs to ``decorator``, ``_lifecycle`` and the sinks,
+and all three would have to import this module for it to reach them; instead they register with
+it, so this module imports nothing that imports it and there is no cycle to break later.
+"""
 
 _installed = False
 """Whether :func:`install` has already registered the child handler in this process.
@@ -367,12 +379,33 @@ def _reinit_primitives() -> None:
                 stack.append(value)
 
 
+def register_child_handler(fn: Callable[[], None]) -> None:
+    """Adds work to be done in a forked child, after its locks have been re-initialised.
+
+    A handler runs on the child's only thread with nothing else in flight, so it may take any
+    of the library's locks — that is precisely what the ordering in :func:`_reinit_after_fork`
+    buys it, and why registering is the only way in. It must not block: nothing has returned
+    from ``fork`` yet.
+
+    Args:
+      fn: Called with no arguments in the child. A failure is absorbed and announced, and the
+        remaining handlers still run.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _child_handlers.append(fn)
+
+
 def _reinit_after_fork() -> None:
     """Repairs the library in a child that has just returned from ``fork``.
 
-    **The order of work here is the contract** (FR-001 AC-2): locks and events first, because
-    anything running afterwards may take one, and a lock re-initialised after a handler that
-    takes it is a handler that hangs.
+    **The order of work here is the contract** (FR-001 AC-2): locks and events first, then the
+    registered handlers. A lock re-initialised *after* a handler that takes it is a handler
+    that hangs, and it hangs on the child's only thread with nothing to interrupt it.
 
     Args:
       None.
@@ -383,12 +416,19 @@ def _reinit_after_fork() -> None:
     Raises:
       None. A fork handler that raises has its exception printed by CPython with a full
         traceback, carrying the message arch §6 keeps out of anything the library says about
-        itself — and it would leave the rest of the repair undone.
+        itself — and it would leave the rest of the repair undone. One handler's failure is
+        absorbed separately from the rest for the same reason: a child that cannot rebuild its
+        worker should still have working locks.
     """
     try:
         _reinit_primitives()
     except Exception as exc:
         _diag.absorbed("repairing the library after a fork", exc, "this child may block or lose")
+    for handler in _child_handlers:
+        try:
+            handler()
+        except Exception as exc:
+            _diag.absorbed("running a fork handler", exc, "this child may not deliver")
 
 
 def install() -> None:

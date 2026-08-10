@@ -229,6 +229,7 @@ class Worker:
         self.stopped_reason: str | None = None
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
+        self._max_queue = max_queue
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._drain_finished = threading.Event()
@@ -240,6 +241,65 @@ class Worker:
         self._thread = threading.Thread(
             target=self._run, name="log-foundry-worker", daemon=True
         )
+        self._thread.start()
+
+    def _reinit_after_fork(self, *, resume: bool) -> None:
+        """Rebuilds this worker **in place** for a child that has just forked (SPEC-039 FR-002).
+
+        The child inherits a ``Worker`` whose thread does not exist, so ``submit`` goes on
+        enqueueing and nothing drains: measured, six events never delivered, ``atexit`` closing
+        the sink without a drain, and ``health()`` reading ``queued=2`` with every other field
+        clean — the documented alert idiom blind. Rebuilding rather than retiring is the design:
+        a prefork server's child is a working process, and a child that silently stops logging
+        is the failure this arc exists to remove.
+
+        **In place, never a new object** (FR-002 AC-5). The ownership guards keyed on
+        ``_worker.sink is X`` and ``_lifecycle``'s registry are identity comparisons, so
+        replacing the worker would leave every one of them answering about something else.
+
+        **The queue is replaced, not drained.** Emptying it would keep ``queue.Queue``'s own
+        mutex and its three ``Condition``s, which the fork walk cannot reach — it enters no
+        standard-library container — and a fork landing inside that mutex leaves the child's
+        very next ``submit`` blocked on the application's thread. That is why the replacement
+        happens even when nothing is resumed: a retired worker still *accepts* submissions
+        (SPEC-030 FR-001), so a retired child would block on the same mutex. Starting empty is
+        also what stops the parent's undelivered backlog being sent twice (AC-2).
+
+        ``stopped_reason`` is cleared rather than set to ``"Forked"`` (AC-6). SPEC-019 defines
+        that field as "the drain thread died", and this child's drain thread is about to be
+        running — the alternative reads as the more honest one and is not.
+
+        The two drain events are **cleared** rather than replaced, and the stop signal is
+        re-offered. Clearing keeps ``draining`` and ``flush``'s gate describing the thread
+        starting here rather than the one that did not survive the fork, and preserves the
+        identity anything else holding them relies on. The re-offer covers the sink the fork
+        walk cannot reach: a **third-party** sink is outside its ownership boundary, so it would
+        keep pointing at the pre-fork event while this worker sets a new one — SPEC-027's
+        guarantee broken by the repair meant to preserve it.
+
+        Args:
+          resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
+            a retired child (AC-4): a fork does not undo a ``shutdown()``, and reviving a worker
+            the caller terminated would be the library overruling them.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._queue = queue.Queue(maxsize=self._max_queue)
+        self.dropped = 0
+        self.failed_batches = 0
+        self.submitted_after_shutdown = 0
+        self.incomplete_swaps = 0
+        self.stopped_reason = None
+        if not resume:
+            return
+        self._drain_finished.clear()
+        self._drain_settled.clear()
+        self._offer_stop_signal()
+        self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         self._thread.start()
 
     def _offer_stop_signal(self) -> None:

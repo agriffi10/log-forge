@@ -646,6 +646,271 @@ def test_third_party_state_is_left_alone(tmp_path: pathlib.Path) -> None:
     assert child.output == "True", child.output
 
 
+# -- FR-002: the child's worker is rebuilt, not retired --------------------------------------
+
+
+def _idle_worker(sink: FileSink) -> Worker:
+    """Installs a worker that will not drain on its own, so submissions stay queued.
+
+    A long interval and a large batch are what make "the parent's backlog" a fact of the test
+    rather than a race against the drain loop — and the backlog is the subject of AC-2.
+
+    Args:
+      sink: The sink to deliver through.
+
+    Returns:
+      The installed worker.
+
+    Raises:
+      None.
+    """
+    worker = Worker(sink, batch_size=1000, flush_interval=100.0)
+    decorator._worker = worker
+    return worker
+
+
+def test_a_child_that_logs_after_forking_delivers(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-1. The child inherits a ``Worker`` whose thread does not exist.
+
+    ``submit`` went on enqueueing and nothing drained: measured, six events never delivered,
+    ``atexit`` closing the sink without a drain, and ``health()`` reading ``queued=2`` with
+    ``dropped``, ``failed_batches``, ``stopped_reason`` and ``retired`` all clean — the
+    documented alert idiom blind on every term.
+    """
+    path = tmp_path / "child.ndjson"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    def work_in_child() -> str:
+        @log_foundry.trace
+        def child_span() -> None:
+            pass
+
+        child_span()
+        return str(bool(log_foundry.flush(timeout=5.0)))
+
+    child = run_in_child(work_in_child, timeout=8)
+    assert child.output == "True", child.output
+    assert "child_span" in path.read_text(encoding="utf-8")
+
+
+def test_the_parents_backlog_is_not_delivered_twice(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-2. The child starts empty and the parent keeps what was in flight.
+
+    Both halves are asserted across the two processes, because either alone is satisfiable by
+    the wrong fix: a child that inherited the queue would deliver the parent's backlog a second
+    time, and a child that *drained* it would take those events away from the parent.
+
+    The queue is replaced rather than emptied, and that is not a stylistic choice —
+    ``queue.Queue`` builds its own mutex, which the fork walk cannot reach.
+    """
+    path = tmp_path / "split.ndjson"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = _idle_worker(sink)
+    for index in range(5):
+        worker.submit([{"msg": f"parent-{index}"}])
+
+    def work_in_child() -> str:
+        queued = log_foundry.health().queued
+        decorator._worker.submit([{"msg": "child-0"}])
+        return f"{queued},{bool(log_foundry.flush(timeout=5.0))}"
+
+    child = run_in_child(work_in_child, timeout=8)
+    assert child.output == "0,True", child.output
+
+    assert log_foundry.flush(timeout=5.0)
+    written = path.read_text(encoding="utf-8")
+    for index in range(5):
+        assert written.count(f"parent-{index}") == 1, written
+    assert written.count("child-0") == 1, written
+
+
+def test_the_childs_counters_describe_the_child(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-3. Inherited counters describe a drain thread that no longer exists.
+
+    The parent's ``dropped`` is driven up for real — a queue of one, overflowed — rather than
+    assigned, so the zeroing is measured against a counter the library itself moved.
+    """
+    sink = FileSink(str(tmp_path / "counters.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1000, flush_interval=100.0, max_queue=1)
+    decorator._worker = worker
+    for index in range(20):
+        worker.submit([{"msg": f"overflow-{index}"}])
+    assert worker.dropped > 0, "the parent's counter never moved, so zeroing proves nothing"
+
+    def report() -> str:
+        health = log_foundry.health()
+        return f"{health.dropped},{health.failed_batches},{health.queued},{health.retired}"
+
+    child = run_in_child(report, timeout=6)
+    assert child.output == "0,0,0,False", child.output
+    assert worker.dropped > 0, "the parent's counters were zeroed too"
+
+
+def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-4. A fork does not undo a ``shutdown()``.
+
+    The alternative silently revives a worker the caller terminated, which is the library
+    overruling an explicit instruction. The child still gets a **fresh queue**, though: a
+    retired worker goes on accepting submissions (SPEC-030 FR-001), so an inherited
+    ``queue.Queue`` mutex would block the child's next ``submit`` on the application's thread.
+
+    **The thread has to be observed directly, and every indirect signal was tried first.** The
+    outcome cannot separate the two worlds: ``health().retired`` reads a flag the child inherits
+    either way, ``_thread.is_alive()`` reads ``False`` in both — a resumed thread whose ``_stop``
+    is already set leaves within microseconds — and the queue stays put in both, because that
+    thread has finished its one final drain before the child's code runs at all. Measured:
+    starting the thread regardless left an earlier version of this test green on every one of
+    those assertions. So ``Worker._run`` is instrumented to announce itself, which is the fact
+    ``resume`` actually governs.
+
+    The wait is a bounded negative, the one thing no synchronization primitive expresses: there
+    is no event for "nothing will ever happen". Its soundness is the gap — a started thread
+    announces itself in milliseconds, against a second of waiting.
+    """
+    path = tmp_path / "retired.ndjson"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = _idle_worker(sink)
+    log_foundry.shutdown()
+
+    started = threading.Event()
+    original_run = Worker._run
+
+    def announcing_run(self: Worker) -> None:
+        started.set()
+        original_run(self)
+
+    Worker._run = announcing_run  # type: ignore[method-assign]
+
+    def report() -> str:
+        live = decorator._worker
+        live.submit([{"msg": "after-the-fork"}])
+        health = log_foundry.health()
+        drained = started.wait(1.0)
+        return f"{health.retired},{health.queued},{drained}"
+
+    try:
+        child = run_in_child(report, timeout=8)
+    finally:
+        Worker._run = original_run  # type: ignore[method-assign]
+
+    assert child.output == "True,1,False", child.output
+    assert worker.retired
+    assert path.read_text(encoding="utf-8") == "", "the retired child delivered"
+
+
+def test_the_rebuilt_worker_is_the_same_object(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-5. Rebuilding as a new object is the obvious implementation and breaks guards.
+
+    Every ownership guard SPEC-033 shipped is an identity comparison — ``_worker.sink is X``,
+    and ``_lifecycle``'s registry — so a replacement worker leaves each of them answering about
+    an object nothing else refers to. The queue is asserted to have moved in the same breath,
+    since "same object" must not be satisfied by rebuilding nothing at all.
+    """
+    sink = FileSink(str(tmp_path / "identity.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = _idle_worker(sink)
+    worker_id = id(worker)
+    queue_id = id(worker._queue)
+
+    def report() -> str:
+        live = decorator._worker
+        return f"{id(live) == worker_id},{id(live._queue) != queue_id},{live.sink is sink}"
+
+    child = run_in_child(report, timeout=6)
+    assert child.output == "True,True,True", child.output
+
+
+def test_the_rebuild_records_no_stopped_reason(tmp_path: pathlib.Path) -> None:
+    """FR-002 AC-6. ``"Forked"`` reads as the more honest answer and is not.
+
+    SPEC-019 defines ``stopped_reason`` as "the drain thread died", and the alert idiom built on
+    it treats a reason as a delivery outage. A child that is delivering must not report one.
+    """
+    sink = FileSink(str(tmp_path / "reason.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+
+    child = run_in_child(lambda: str(log_foundry.health().stopped_reason), timeout=6)
+    assert child.output == "None", child.output
+
+
+# -- FR-001 AC-2 / FR-006: the order of work, and where it is registered from ----------------
+
+
+def test_a_handler_runs_after_the_locks_are_the_childs_own(tmp_path: pathlib.Path) -> None:
+    """FR-001 AC-2. The order is the contract: locks first, then the registered handlers.
+
+    A lock re-initialised *after* a handler that takes it is a handler that hangs — on the
+    child's only thread, with nothing left to interrupt it. The probe records what it saw rather
+    than asserting in the child, so a wrong order is a reported value rather than a deadlock the
+    test would have to survive to report.
+    """
+    sink = FileSink(str(tmp_path / "order.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    _idle_worker(sink)
+    lock_before = id(sink._lock)
+    seen: list[str] = []
+
+    def probe() -> None:
+        seen.append(f"{id(sink._lock) != lock_before},{sink._lock.acquire(timeout=1.0)}")
+
+    _fork.register_child_handler(probe)
+    try:
+        child = run_in_child(lambda: ",".join(seen), timeout=6)
+    finally:
+        _fork._child_handlers.remove(probe)
+
+    assert child.output == "True,True", child.output
+
+
+def test_one_handler_failing_does_not_stop_the_others(tmp_path: pathlib.Path) -> None:
+    """SPEC-025 at the registry level: a child that cannot rebuild still has working locks.
+
+    Handlers are independent pieces of repair, so one raising must not take the rest with it —
+    and the failure is announced by type, never by message (arch §6).
+    """
+    sink = FileSink(str(tmp_path / "isolated.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    reached: list[str] = []
+
+    def boom() -> None:
+        raise RuntimeError("a-value-from-the-event-9876")
+
+    def after() -> None:
+        reached.append("ran")
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    _fork.register_child_handler(boom)
+    _fork.register_child_handler(after)
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: f"{reached},{buffer.getvalue()}", timeout=6)
+    finally:
+        sys.stderr = saved
+        _fork._child_handlers.remove(boom)
+        _fork._child_handlers.remove(after)
+
+    assert "['ran']" in child.output, child.output
+    assert "a-value-from-the-event-9876" not in child.output
+    assert "absorbed a failure while running a fork handler (RuntimeError)" in child.output
+
+
+def test_the_worker_rebuild_is_registered_rather_than_reached_for() -> None:
+    """FR-006. ``decorator`` registers with ``_fork``; ``_fork`` does not import ``decorator``.
+
+    The import test above states the rule; this states that the rule is being *used* rather
+    than satisfied by a module that simply does nothing yet. A registry with no registrations
+    would pass every import assertion ever written.
+    """
+    assert decorator._rebuild_worker_after_fork in _fork._child_handlers
+
+
 # -- FR-003 AC-3: completeness is proved, not asserted ---------------------------------------
 
 

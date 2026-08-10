@@ -97,6 +97,35 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "merge, and collapsing them hides that the outer one is deliberately unlocked."
         ),
     ),
+    ("_rebuild_worker_after_fork", "_worker", 0): (
+        EXISTENCE,
+        (
+            "the snapshot the two questions below read, taken once. The raw global rather than "
+            "_live_worker(), because both of those questions have to be answered and a helper "
+            "that folds retirement into None collapses them into one: a retired worker still "
+            "needs its queue replaced, which is what stops the child's next submit blocking on "
+            "an inherited queue.Queue mutex."
+        ),
+    ),
+    ("_rebuild_worker_after_fork", "worker is None", 0): (
+        EXISTENCE,
+        (
+            "whether this process ever built a worker. A child of a parent that only ever "
+            "logged outside a span has nothing to rebuild, and standing one up here would give "
+            "it a drain thread the parent never had - SPEC-013's refusal to create a worker in "
+            "order to prove there is nothing to drain."
+        ),
+    ),
+    ("_rebuild_worker_after_fork", "not worker.retired", 0): (
+        LIVENESS,
+        (
+            "who performs: a retired worker performs no delivery, so the child gets no drain "
+            "thread and a fork does not undo a shutdown() (SPEC-039 FR-002 AC-4). Hoisted into "
+            "a named binding rather than left inline in the call, because a keyword argument is "
+            "not a position this roster files - the decision would have been invisible. It is "
+            "deliberately not ownership: nothing here is deciding who closes a sink."
+        ),
+    ),
     ("_live_worker", "_worker", 0): (
         LIVENESS,
         (
