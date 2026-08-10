@@ -269,6 +269,12 @@ deliberate once `1.0.0` freezes: a name absent from `__all__` at 1.0 says "not p
       `log_foundry.sinks.base`.
 - [x] AC-5: A test asserts every name in `__all__` is importable and every name the README
       documents as public is in `__all__` — derived from the README, so the two cannot drift.
+      **Both halves are built.** The first build shipped only the first and ticked the AC;
+      review caught it, and the anti-drift half then caught two of that review's own findings.
+      "Documents as public" is read as the `from log_foundry import ...` form only: `import
+      log_foundry as lf` then `lf.info(...)` says the *module* is public and says nothing about
+      `__all__`, so treating every attribute reached that way as a claim would let the README's
+      prose examples define the API surface.
 
 ### FR-006: `stop_signal` is a declared, namespaced part of the sink contract
 

@@ -360,6 +360,7 @@ def handler(event, context):
 | `current_traceparent()` | This span as a W3C `traceparent` string, or `None` if no span is active. |
 | `current_trace_context()` | `(trace_id, span_id)`, for when moving two fields beats moving a string. |
 | `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). |
+| `get_baggage()` | Current baggage as a `dict`. A shallow copy — rebinding a key does not reach the library, but a nested mutable value is shared. |
 | `reset_context()` | Clear baggage and any adopted context. `@trace` users do not need it. Never raises. |
 
 Details worth knowing:
@@ -430,13 +431,16 @@ A **sink** is the swappable output transport — any object satisfying the `Sink
 receives already-built, batched event dicts and knows nothing about spans or context:
 
 ```python
+from log_foundry import Sink   # the protocol, for annotating your own
+
 class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None: ...
     def close(self) -> None: ...
 ```
 
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
-call falls back to `StdoutSink()`. Sinks are **not** re-exported at the top level — import each
+call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
+`SinkDeliveryError`, `SinkLosses` and `read_losses`; the **concrete sinks** are not, so import each
 from its own module, e.g. `from log_foundry.sinks.sqs import SQSSink`.
 
 A few conventions hold across every sink below:

@@ -399,7 +399,8 @@ def test_a_swap_that_raises_does_not_fail_configure(monkeypatch, capsys) -> None
     """SPEC-025: a sink swap must never be the reason an application cannot start.
 
     This guards the whole ``swap_sink`` call, not the close inside it — a third-party sink can
-    raise from ``emit`` during the drain, or from a ``log_foundry_stop_signal`` setter, and ``configure()``
+    raise from ``emit`` during the drain, or from a ``log_foundry_stop_signal`` setter, and
+    ``configure()``
     has never raised for anything but a rejected ceiling.
     """
     worker = _worker_with(SwapSink())

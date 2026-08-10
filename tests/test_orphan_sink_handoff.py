@@ -614,7 +614,8 @@ def test_a_sink_that_rejects_the_signal_loses_interruptibility_not_the_emit(caps
     """AC-3's error path, matching `Worker._offer_stop_signal`."""
 
     class Hostile:
-        """A read-only ``log_foundry_stop_signal`` — the case `Worker._offer_stop_signal` also absorbs."""
+        """A read-only ``log_foundry_stop_signal`` — the case `Worker._offer_stop_signal` also
+        absorbs."""
 
         def __init__(self) -> None:
             self.held: list[dict] = []

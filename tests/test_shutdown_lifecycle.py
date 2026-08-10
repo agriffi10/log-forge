@@ -33,9 +33,11 @@ class CountingSink:
 
 
 class BackoffSink(CountingSink):
-    """Backs off inside ``emit``, re-reading ``log_foundry_stop_signal`` the way a retrying sink does.
+    """Backs off inside ``emit``, re-reading ``log_foundry_stop_signal`` the way a retrying sink
+    does.
 
-    The re-read is the whole point. ``sinks/_retry.wait`` consults ``self.log_foundry_stop_signal`` once per
+    The re-read is the whole point. ``sinks/_retry.wait`` consults ``self.log_foundry_stop_signal``
+    once per
     attempt, so a signal swapped out *during* a backoff is the one the next attempt waits on — a
     sink that captured the event at entry could not observe FR-001 at all.
     """

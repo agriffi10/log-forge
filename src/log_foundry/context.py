@@ -103,17 +103,21 @@ def get_baggage() -> dict[str, object]:
     before any span opened. With no span open at all nothing releases them and they
     accumulate for the life of the context; :func:`reset_context` is the release there.
 
-    It is a **copy** (SPEC-034 FR-005). This became public at 1.0, and a public accessor that
-    hands out the live mapping documented as "do not mutate" is FR-003's ``get_config()``
-    defect under another name — the caller's slip is silent, and it edits the context every
-    later event reads. The library's own hot path does not pay for the copy: :func:`_live_baggage`
-    is the internal read, for the reason FR-003 AC-6 gives.
+    It is a **shallow** copy (SPEC-034 FR-005). This became public at 1.0, and a public accessor
+    that hands out the live mapping documented as "do not mutate" is FR-003's ``get_config()``
+    defect under another name. Shallow rather than deep because :func:`set_baggage` accepts
+    arbitrary values: a deep copy would run user objects through ``copy.deepcopy`` inside a
+    getter that must never raise, which trades a narrow sharing bound for a wide new failure —
+    and the library never mutates a baggage value either, so the sharing is only reachable
+    through the caller's own object. The library's own hot path does not pay even for the
+    shallow copy: :func:`_live_baggage` is the internal read, for the reason FR-003 AC-6 gives.
 
     Args:
       None.
 
     Returns:
-      A copy of the baggage mapping. Mutating it does not affect the library.
+      A shallow copy of the baggage mapping. Rebinding a key does not affect the library; a
+        nested mutable value is shared, and mutating one *does* reach every later event.
 
     Raises:
       None.

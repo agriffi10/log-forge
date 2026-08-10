@@ -143,12 +143,16 @@ def test_no_sdk_keyword_or_attribute_survives() -> None:
     `.sdk` attribute access anywhere. The narrowing is recorded in the spec, not only here.
     """
     offenders = []
-    for path in [*(_ROOT / "src").rglob("*.py"), *(_ROOT / "tests").rglob("*.py"), _ROOT / "README.md"]:
+    scanned = 0
+    paths = [*(_ROOT / "src").rglob("*.py"), *(_ROOT / "tests").rglob("*.py"), _ROOT / "README.md"]
+    for path in paths:
         if path.name == pathlib.Path(__file__).name:
             continue
+        scanned += 1
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if re.search(r"(?<![\w.])sdk\s*=(?!=)", line) or re.search(r"\.sdk(?![\w])", line):
                 offenders.append(f"{path.relative_to(_ROOT)}:{lineno}: {line.strip()}")
+    assert scanned > 100, f"the scan collapsed to {scanned} files -- an absence it cannot see"
     assert not offenders, "the `sdk` injection name survives:\n" + "\n".join(offenders)
 
 
@@ -163,6 +167,52 @@ def test_every_exported_name_is_importable() -> None:
     """FR-005 AC-5, first half: `__all__` cannot name something that is not there."""
     missing = [n for n in log_foundry.__all__ if not hasattr(log_foundry, n)]
     assert not missing, f"named in __all__ but absent: {missing}"
+
+
+def _names_the_readme_imports() -> set[str]:
+    """Every name the README tells a reader to import from `log_foundry`.
+
+    Derived from the README text rather than listed, which is the half of FR-005 AC-5 that makes
+    the two unable to drift. Only the `from log_foundry import ...` form is read: `import
+    log_foundry as lf` followed by `lf.info(...)` says the *module* is public and says nothing
+    about `__all__`, and treating every attribute reached that way as a claim would make the
+    README's prose examples define the API surface.
+
+    Args:
+      None.
+
+    Returns:
+      The names imported from the top-level package anywhere in the README.
+
+    Raises:
+      None.
+    """
+    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    names: set[str] = set()
+    for match in re.finditer(r"^from log_foundry import (.+)$", text, re.MULTILINE):
+        # An inline comment is part of the line, and dropping the `isidentifier` survivors
+        # without cutting it first silently loses the name: the README's own `Sink` import
+        # carries one, so the first version of this scan saw nothing and passed the mutant that
+        # removed `Sink` from `__all__`. Caught by running that mutation, not by reading.
+        imported = match.group(1).split("#", 1)[0]
+        names.update(part.strip() for part in imported.split(","))
+    return {n for n in names if n and n.isidentifier()}
+
+
+def test_the_readme_and_all_cannot_drift() -> None:
+    """FR-005 AC-5, second half — the anti-drift one, and the reason the AC exists.
+
+    A name the README tells you to import that is not exported is a broken documented import;
+    the check is derived from the README so neither side can move without the other. Review of
+    the first build of this file found the AC ticked with only the first half implemented, and
+    this test failing would have caught two of that review's own findings on its first run.
+    """
+    documented = _names_the_readme_imports()
+    assert documented, "the README-derived roster is empty -- the scan stopped matching"
+    unexported = sorted(documented - set(log_foundry.__all__))
+    assert not unexported, (
+        f"the README imports these from log_foundry, but __all__ omits them: {unexported}"
+    )
 
 
 def test_get_baggage_round_trips_with_set_baggage() -> None:
@@ -187,6 +237,24 @@ def test_get_baggage_hands_back_a_copy() -> None:
     assert log_foundry.get_baggage() == {"user_id": "u42"}
 
 
+def test_the_per_event_path_does_not_pay_for_the_baggage_copy() -> None:
+    """FR-005 AC-3a's cost argument, pinned rather than asserted in prose.
+
+    `get_baggage()` copies because it is public; `api._log` reads baggage **once per event**, so
+    routing it through the public accessor would allocate per event. Nothing failed if a future
+    refactor put `get_baggage()` back there -- the behaviour is identical and only the cost
+    changes, which is the kind of regression no behavioural test can see. FR-003 AC-6 requires a
+    benchmark for the config equivalent; this is the same guarantee, checked structurally.
+    """
+    api_src = (_ROOT / "src" / "log_foundry" / "api.py").read_text(encoding="utf-8")
+    calls = [
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(api_src))
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith("baggage()")
+    ]
+    assert calls == ["context._live_baggage()"], f"api._log's baggage read is {calls}"
+
+
 def test_the_stop_signal_attribute_is_namespaced_everywhere() -> None:
     """FR-006 AC-2 and AC-3, derived from the package rather than a list of sinks.
 
@@ -203,7 +271,11 @@ def test_the_stop_signal_attribute_is_namespaced_everywhere() -> None:
     it linted; caught here by this test failing on its own first run.
     """
     offenders = []
-    for path in (_ROOT / "src").rglob("*.py"):
+    scanned = 0
+    for path in [*(_ROOT / "src").rglob("*.py"), *(_ROOT / "tests").rglob("*.py")]:
+        if path.name == pathlib.Path(__file__).name:
+            continue
+        scanned += 1
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             named = (
@@ -214,6 +286,7 @@ def test_the_stop_signal_attribute_is_namespaced_everywhere() -> None:
             )
             if named:
                 offenders.append(f"{path.relative_to(_ROOT)}:{getattr(node, 'lineno', 0)}")
+    assert scanned > 100, f"the scan collapsed to {scanned} files -- an absence it cannot see"
     assert not offenders, "the un-namespaced attribute survives in code:\n" + "\n".join(offenders)
 
 

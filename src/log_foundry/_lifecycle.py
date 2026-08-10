@@ -165,7 +165,8 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
       None.
 
     Raises:
-      None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose ``__setattr__``
+      None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose
+      ``__setattr__``
         objects, loses interruptibility rather than preventing the caller from proceeding.
     """
     try:

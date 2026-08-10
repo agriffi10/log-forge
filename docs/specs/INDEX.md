@@ -38,7 +38,7 @@ to status only — no prose.
 | [SPEC-031](SPEC-031-audit-small-corrections.md) | Audit Small Corrections | Completed | SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032 |
 | [SPEC-032](SPEC-032-post-close-sink-behaviour.md) | Post-Close Sink Behaviour | Completed | SPEC-026, SPEC-028, SPEC-030 |
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
-| [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Draft | SPEC-026, SPEC-030, SPEC-033 |
+| [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | In Progress | SPEC-026, SPEC-030, SPEC-033 |
 | [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
 | [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Draft | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037 |
 | [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-034 |

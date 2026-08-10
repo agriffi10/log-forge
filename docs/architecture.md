@@ -934,7 +934,7 @@ constraint — never by being deleted quietly.
     failure, also under the lock
 
   `_close_orphan_sink` is deliberately not one — its `_diag` write sits outside the `with`.
-  It is an **error path only**: `offer_stop_signal` writes just when a sink's `stop_signal`
+  It is an **error path only**: `offer_stop_signal` writes just when a sink's `log_foundry_stop_signal`
   setter objects, and `close_detached` just when the interpreter refuses a thread. The fix —
   returning a flag and writing after the release — spreads one diagnostic decision across two
   functions at all three sites to save a write that happens only then, so it is **recorded rather
