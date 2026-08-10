@@ -389,10 +389,12 @@ def register_child_handler(fn: Callable[[], None]) -> None:
     genuinely single-threaded child. None of them may block, since nothing has returned from
     ``fork`` yet.
 
-    Registering the same function twice is a no-op. The exposure is the one :data:`_installed`
-    records for the fork registration itself: a reload of a module whose body registers here
-    would otherwise stack a second handler, and for the worker rebuild that means two drain
-    threads, the first bound to a queue nothing writes to.
+    Registering the same function twice is a no-op, compared by **identity**: ``in`` would ask
+    a registered object's ``__eq__``, which is not this function's to trust and would raise into
+    a caller documented as raising nothing. The exposure is the one :data:`_installed` records
+    for the fork registration itself: a reload of a module whose body registers here would
+    otherwise stack a second handler, and for the worker rebuild that means two drain threads,
+    the first bound to a queue nothing writes to.
 
     Args:
       fn: Called with no arguments in the child. A failure is absorbed and announced, and the
@@ -404,7 +406,7 @@ def register_child_handler(fn: Callable[[], None]) -> None:
     Raises:
       None.
     """
-    if fn not in _child_handlers:
+    if not any(handler is fn for handler in _child_handlers):
         _child_handlers.append(fn)
 
 
@@ -413,7 +415,10 @@ def _reinit_after_fork() -> None:
 
     **The order of work here is the contract** (FR-001 AC-2): locks and events first, then the
     registered handlers. A lock re-initialised *after* a handler that takes it is a handler
-    that hangs, and it hangs on the child's only thread with nothing to interrupt it.
+    that hangs, and it hangs on the child's only thread with nothing to interrupt it. Work that
+    must happen before *any* handler belongs inline between the two steps rather than registered
+    — the buffer discard FR-004 adds is the case, and registering it would put it after
+    ``decorator``'s rebuild, which has started a live drain thread by then.
 
     Args:
       None.

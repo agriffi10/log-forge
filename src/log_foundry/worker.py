@@ -273,9 +273,15 @@ class Worker:
         never simply inherited. Resuming clears them, so ``draining`` and ``flush``'s gate
         describe the thread starting here rather than the one that did not survive the fork;
         retiring **sets** them, because no thread will ever set them and a child forked while a
-        ``shutdown()`` was mid-join otherwise inherits ``_drain_settled`` unset with nothing to
-        settle it — measured, that child paid the whole 30 s budget at exit, and with
-        ``shutdown(timeout=None)`` it would never exit at all. The stop signal is re-offered for
+        ``shutdown()`` was mid-join otherwise inherits them unset with nothing to settle them.
+        Two consequences, both measured: that child paid the whole 30 s budget at exit and with
+        ``shutdown(timeout=None)`` would never exit at all, and — reaching further —
+        ``_offer_orphan_signal`` reads it as still draining and skips, leaving the sink holding
+        a **set** stop event, so every later backoff returns instantly against a destination
+        that is already refusing (SPEC-033 FR-004). ``_drain_finished`` has no reader on a
+        retired worker and is set for the invariant rather than for an observable: settled with
+        finished clear is what :attr:`draining` defines as an *abandoned* drain, and a child
+        reporting no ``stopped_reason`` must not read that way. The stop signal is re-offered for
         the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
         boundary, so it would keep pointing at the pre-fork event while this worker sets a new
         one — SPEC-027's guarantee broken by the repair meant to preserve it.

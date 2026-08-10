@@ -936,6 +936,14 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
 
     The window is constructed: the drain thread is parked inside ``emit`` so the parent's
     ``shutdown()`` is genuinely still joining when the fork happens.
+
+    **Both events are asserted, not just the one the elapsed time can see.** ``_drain_settled``
+    set with ``_drain_finished`` clear is what ``draining``'s own docstring defines as an
+    *abandoned* drain — a wedged thread the shutdown gave up on — and a child that reports
+    ``stopped_reason=None`` must not read that way to an operator. Nothing consumes
+    ``_drain_finished`` on a retired worker today, so the elapsed time cannot distinguish it and
+    a first version of this test left that statement unkillable while the commit claimed
+    otherwise; the state is asserted directly instead.
     """
     sink, stream = _gated_file_sink(tmp_path, name="mid-shutdown.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
@@ -950,9 +958,11 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
 
     def report() -> str:
+        live = decorator._worker
         started = time.monotonic()
         log_foundry.shutdown(timeout=30.0)
-        return f"{time.monotonic() - started < 5.0}"
+        prompt = time.monotonic() - started < 5.0
+        return f"{prompt},{live._drain_settled.is_set()},{live._drain_finished.is_set()}"
 
     try:
         child = run_in_child(report, timeout=12)
@@ -960,7 +970,76 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
         gate.release.set()
         shutting_down.join(10.0)
 
-    assert child.output == "True", f"the retired child waited out a drain that cannot run: {child}"
+    assert child.output == "True,True,True", (
+        f"the retired child waited out a drain that cannot run, or reads as abandoned: {child}"
+    )
+
+
+def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib.Path) -> None:
+    """The retired path's drain events reach further than the exit budget they were added for.
+
+    ``_offer_orphan_signal`` skips handing a fresh signal when ``worker.sink is sink and
+    worker.draining`` (SPEC-035 FR-001). A retired child that inherited ``_drain_settled``
+    **unset** reads as draining, so the skip applies, and the sink keeps the parent's **set**
+    ``_stop`` — every ``sinks/_retry`` backoff then returns instantly, which against a
+    rate-limited destination is SPEC-033 FR-004's tight retry loop. Measured in both directions.
+
+    This is a second, independent consequence of the same statement, and a stronger one than the
+    exit budget: a wedged exit is slow, and a collapsed backoff hammers a destination that is
+    already refusing.
+
+    **The window is a shutdown still joining, not a shutdown that finished.** A completed
+    ``shutdown()`` leaves ``_drain_settled`` set in the parent, so the child inherits the right
+    answer and the statement under test does nothing — a first version of this test did exactly
+    that and passed in both worlds. The drain thread is parked inside ``emit`` and the shutdown
+    runs on its own thread, so the fork lands while ``_drain_settled`` is genuinely unset.
+    """
+
+    class _SignalGateSink:
+        def __init__(self) -> None:
+            self.log_foundry_stop_signal: threading.Event | None = None
+            self.gate: _Gate | None = None
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            gate = self.gate
+            if gate is not None:
+                self.gate = None
+                gate.entered.set()
+                gate.release.wait(CHILD_TIMEOUT)
+
+        def close(self) -> None:
+            pass
+
+    sink = _SignalGateSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _Gate()
+    sink.gate = gate
+    worker.submit([{"msg": "parks the drain thread"}])
+    assert gate.entered.wait(5.0), "the drain thread never parked, so the fork misses the window"
+
+    shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
+    shutting_down.start()
+    deadline = time.monotonic() + 5.0
+    while not worker.retired and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
+    assert sink.log_foundry_stop_signal is not None
+    assert sink.log_foundry_stop_signal.is_set(), "the parent's signal must be set to prove this"
+
+    def report() -> str:
+        log_foundry.info("an orphan log in a retired child")
+        live = sink.log_foundry_stop_signal
+        return f"{decorator._worker.draining},{live is not None and live.is_set()}"
+
+    try:
+        child = run_in_child(report, timeout=6)
+    finally:
+        gate.release.set()
+        shutting_down.join(10.0)
+
+    assert child.output == "False,False", child.output
 
 
 def test_a_third_party_sink_is_handed_the_childs_own_stop_signal() -> None:
