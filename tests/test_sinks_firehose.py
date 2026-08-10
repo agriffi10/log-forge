@@ -234,18 +234,24 @@ def test_the_newline_is_charged_to_the_per_record_limit() -> None:
 def test_the_newline_is_charged_to_the_per_request_budget() -> None:
     """AC-2, the per-request half — and the record size is what decides whether it can fail.
 
-    `MAX_RECORDS` (500) and `MAX_REQUEST_BYTES` (4 MiB) both bound a chunk, so with small
-    records the *count* binds first and the byte budget never engages: a first version used
-    ~1,012-byte records and passed with the delimiter removed entirely. Above 4 MiB / 500 =
-    8,389 bytes the byte budget binds, and one delimiter per record then makes the difference
-    between a chunk that fits and one that does not.
+    Two independent ways this test can be vacuous, and it has been both:
 
-    The expectation is derived from the sink's own constants, never from `record["Data"]` —
-    re-deriving it from the value under test is how the first version went vacuous.
+    1. `MAX_RECORDS` (500) and `MAX_REQUEST_BYTES` (4 MiB) both bound a chunk, so with small
+       records the *count* binds first and the byte budget never engages. The first version used
+       ~1,012-byte records and passed with the delimiter removed entirely.
+    2. Above 4 MiB / 500 = 8,389 bytes the byte budget binds — but the chunk size is a *floor
+       division*, so one byte per record only changes it at the sizes where the division tips.
+       The second version used 9,000-byte records: 4194304 // 9012 == 4194304 // 9011 == 465, so
+       the delimiter still made no difference and un-charging it from `size_of` left the whole
+       file green.
+
+    8,989 is chosen so the record is 9,001 bytes: 465 per chunk with the delimiter charged, 466
+    without. Only 359 of the sizes between 8,400 and 30,000 are sensitive that way, which is why
+    picking a round number twice landed on an insensitive one.
     """
     client = FakeFirehose()
     sink = FirehoseSink("stream", client=client)
-    payload = 9_000
+    payload = 8_989  # 9,001 bytes per record: see the docstring
     count = 900
     sink.emit([{"pad": "x" * payload} for _ in range(count)])
 
@@ -256,8 +262,12 @@ def test_the_newline_is_charged_to_the_per_request_budget() -> None:
         assert sum(len(r["Data"]) for r in chunk) <= FirehoseSink.MAX_REQUEST_BYTES
 
     # One record's true wire size, delimiter included, decides how many fit. Computed from the
-    # event rather than read back from the request, so a missing delimiter shifts the expectation.
+    # event rather than read back from the request, so an uncharged delimiter shifts the answer.
     one = len(json.dumps({"pad": "x" * payload}).encode("utf-8")) + 1
+    assert FirehoseSink.MAX_REQUEST_BYTES // one != FirehoseSink.MAX_REQUEST_BYTES // (one - 1), (
+        "the fixture must sit where one byte per record moves the chunk boundary, or this "
+        "assertion cannot fail"
+    )
     assert len(client.calls[0]) == FirehoseSink.MAX_REQUEST_BYTES // one, (
         "the first chunk holds exactly as many delimited records as the budget allows"
     )

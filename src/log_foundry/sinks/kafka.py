@@ -11,12 +11,37 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KafkaSink"]
 
+
+def _usable_timeout(value: float) -> float:
+    """Returns a flush timeout that is actually a bound, or the default.
+
+    ``0`` is the value that switched this sink's exit delivery off, and ``inf`` is the unbounded
+    wait FR-006 exists to remove, so neither is accepted from a caller. The test is
+    ``not (0 < value < inf)`` rather than a pair of comparisons, because ``NaN`` compares
+    ``False`` to everything and would otherwise slip through (SPEC-027 FR-001's reasoning for
+    ``Retry-After``).
+
+    Args:
+      value: The caller's timeout.
+
+    Returns:
+      The value if it bounds anything, else :data:`DEFAULT_FLUSH_TIMEOUT`.
+
+    Raises:
+      None.
+    """
+    return value if 0 < value < float("inf") else DEFAULT_FLUSH_TIMEOUT
+
 DEFAULT_FLUSH_TIMEOUT = 10.0
 """Seconds :meth:`KafkaSink.close` waits for the producer to drain (SPEC-038 FR-006).
 
-Ten rather than ``message.timeout.ms``'s five minutes, and comfortably inside
-``shutdown()``'s own 30-second default — ``Worker.shutdown`` closes the live sink *inline*
-(arch §13), so this wait is spent from that budget rather than beside it.
+Ten rather than ``message.timeout.ms``'s five minutes.
+
+It is spent **beside** ``shutdown()``'s budget, not from it: ``Worker.shutdown`` joins the drain
+thread against its deadline and *then* closes the sink inline, with no remaining-budget argument
+(arch §13, since ``Sink.close`` takes no timeout). Measured, ``shutdown(timeout=2.0)`` against a
+dead broker takes 10.01 s. Ten seconds is chosen to keep that overrun small rather than to fit
+inside a budget it cannot see — five minutes is what it replaces.
 """
 
 
@@ -69,7 +94,10 @@ class KafkaSink:
           flush_timeout: Seconds :meth:`close` waits for the producer to drain before counting
             what is left as lost (SPEC-038 FR-006). Unbounded, an unreachable broker held
             process exit for ``message.timeout.ms`` — five minutes by default — despite
-            ``shutdown(timeout=30)``.
+            ``shutdown(timeout=30)``. Non-positive or non-finite values fall back to the
+            default, as ``Worker._emit`` floors its own retries (SPEC-021): ``0`` reinstates
+            exactly the ``flush(0)`` that switched this sink's exit delivery off, and ``inf``
+            reinstates the unbounded wait.
 
         Returns:
           None.
@@ -89,8 +117,7 @@ class KafkaSink:
         self.topic = topic
         self.producer = producer
         self.key_field = key_field
-        self.flush_timeout = flush_timeout
-        self.log_foundry_stop_signal: threading.Event | None = None
+        self.flush_timeout = _usable_timeout(flush_timeout)
         self.failed = 0
         self.rejected = 0
         self._counter_lock = threading.Lock()

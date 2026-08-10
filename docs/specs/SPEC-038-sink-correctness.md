@@ -187,7 +187,17 @@ at exit, thrown away.
 - [x] AC-1: `close()` passes a bounded timeout, and the sink documents its worst case as the
       other retrying sinks do.
 - [x] AC-2: A non-zero remainder is counted into `failed` with one `_diag.lost` line.
-- [x] AC-3: The bound interacts correctly with SPEC-027's stop signal — a shutdown cuts it short.
+- [x] AC-3: ~~The bound interacts correctly with SPEC-027's stop signal — a shutdown cuts it
+      short.~~ **Amended by evidence** (2026-08-10), as FR-001 AC-4a was and on the same
+      reasoning. It was built as written and the result was total loss: `Worker.shutdown` sets
+      the stop event *before* the join, so it is always set when `close()` runs, and `produce()`
+      is a local hand-off while `flush()` is the only thing that drains the producer's batch —
+      so cutting the timeout short switched Kafka's exit delivery off entirely. Measured through
+      a real `shutdown()`: 11 buffered, `flush(0)`, **zero delivered**, all 11 booked as
+      `failed`, which is worse than the five-minute hang the bound exists to fix. The stop
+      signal is therefore **not consulted**, the sink no longer carries the attribute, and
+      `flush_timeout` is the whole bound. A shutdown shortens a *wait*; it must never skip
+      *work* on the exit drain.
 
 ### FR-007: `SyslogSink` drops an oversized datagram rather than retrying it
 

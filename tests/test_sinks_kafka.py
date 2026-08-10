@@ -8,7 +8,7 @@ import pytest
 
 from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.kafka import KafkaSink
+from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, KafkaSink
 
 
 class FakeProducer:
@@ -224,7 +224,7 @@ def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown(
     `flush()` is the only thing that drains the producer's batch, so — since `Worker.shutdown`
     sets the stop event *before* the join, making it always set by the time `close()` runs —
     Kafka's exit delivery was switched off entirely. Measured: 9 buffered, `flush(0)`, zero
-    delivered, all 9 booked as failed.
+    delivered, all 11 booked as failed — 9 `info()` calls plus the span's start and end.
 
     This drives the real `log_foundry.shutdown()` rather than setting the flag by hand, because
     the hand-set version is exactly what made the defect look correct.
@@ -232,7 +232,11 @@ def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown(
     import log_foundry as lf
 
     class Draining:
-        """Delivers one message per second of allowed flush time."""
+        """Drains its whole batch when given any time at all, and none when given none.
+
+        That is the contrast the defect turns on: `flush()` is the only thing that drains the
+        producer, so a zero timeout delivers nothing however healthy the broker.
+        """
 
         def __init__(self) -> None:
             self.buffered = 0
@@ -247,10 +251,9 @@ def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown(
 
         def flush(self, timeout=None) -> int:
             self.saw_timeout = timeout
-            allowed = int(timeout) if isinstance(timeout, int | float) else self.buffered
-            take = min(self.buffered, allowed)
-            self.buffered -= take
-            self.delivered += take
+            if timeout is None or timeout > 0:
+                self.delivered += self.buffered
+                self.buffered = 0
             return self.buffered
 
     producer = Draining()
@@ -268,4 +271,32 @@ def test_the_exit_flush_gets_its_real_bound_when_driven_through_a_real_shutdown(
         f"the exit flush must get its real bound, not a shutdown-shortened one; "
         f"got {producer.saw_timeout!r}"
     )
-    assert producer.delivered > 0, "and it must actually deliver"
+    assert producer.delivered == 11, (
+        f"9 info() calls plus span.start and span.end; delivered {producer.delivered}"
+    )
+    assert producer.buffered == 0
+
+
+def test_a_producer_returning_a_bool_does_not_book_a_phantom_loss() -> None:
+    """`bool` is an `int`, so `isinstance(remaining, int)` accepted `True` as "one still queued".
+
+    Reverting to `isinstance` passed the whole suite, because no double returned a bool.
+    """
+    producer = FakeProducer()
+    producer.still_queued = True
+    sink = KafkaSink("t", producer=producer)
+    sink.close()
+    assert sink.losses().failed == 0, "True is not a count of queued messages"
+
+
+def test_a_flush_timeout_that_bounds_nothing_falls_back_to_the_default() -> None:
+    """`0` reinstates the `flush(0)` that switched exit delivery off; `inf` the unbounded wait.
+
+    Floored for the reason `Worker._emit` floors its retries (SPEC-021): a value that disables
+    the guard must not arrive silently through the constructor.
+    """
+    producer = FakeProducer()
+    for bad in (0, -1.0, float("inf"), float("nan")):
+        sink = KafkaSink("t", producer=producer, flush_timeout=bad)
+        assert sink.flush_timeout == DEFAULT_FLUSH_TIMEOUT, f"{bad!r} bounds nothing"
+    assert KafkaSink("t", producer=producer, flush_timeout=2.5).flush_timeout == 2.5
