@@ -68,6 +68,12 @@ def _is_owned(value: object) -> bool:
     while a plain ``FileSink`` in the same probe returned. That is the hang this spec exists to
     remove, reached through the one door users are told to use.
 
+    What that widening costs is recorded rather than left to be discovered: a class **mixing in**
+    a third-party base alongside a library one has its foreign attributes replaced too, measured
+    on ``class MySink(FileSink, ThirdPartyBase)``. A separately *held* client is still untouched,
+    which is the boundary FR-005 states — the two cannot be told apart from the instance, and
+    refusing the mixed case would mean refusing the sink's own lock with it.
+
     Args:
       value: Any object, including a class.
 
@@ -139,7 +145,10 @@ def _container_children(container: Any) -> list[Any]:
 
     Raises:
       None. A container mutating under the walk would raise, and a child that cannot finish
-        repairing itself must still repair what it reached.
+        repairing itself must still repair what it reached. A foreign container subclass
+        reachable from an owned attribute runs its own ``__iter__`` here, which is absorbed if
+        it raises — but a *blocking* one is a child that never returns from ``fork``, and there
+        is nothing to catch that with.
     """
     try:
         if isinstance(container, dict):

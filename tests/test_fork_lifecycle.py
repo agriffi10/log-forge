@@ -9,19 +9,24 @@ exercises the non-hazard — the lock is free and the buffer empty by constructi
 earlier draft of this spec drew a false conclusion from exactly that. So the gate below parks the
 drain thread *inside* a locked ``emit`` and the fork happens while it is there.
 
-**Children are self-limiting.** Each one arms ``signal.alarm`` before doing anything, so a child
-that hangs — which is the whole subject of FR-003 — dies on its own rather than outliving the
-test run. A trailing ``kill`` in the parent is not enough: the parent is what blocks first, on
-the pipe the hung child still holds open.
+**Both sides are bounded.** Each child arms ``signal.alarm`` before doing anything, so one that
+hangs — the whole subject of FR-003 — dies on its own rather than outliving the test run. That
+alone is not enough, and the gap is the case that matters most: ``fork`` clears a pending alarm
+in the child and the library's handler runs before any test code, so a repair that hangs *there*
+produces a child no alarm can kill, and a parent waiting on the pipe would hang the suite rather
+than fail one test. The parent holds its own deadline and sends ``SIGKILL``.
 """
 
 from __future__ import annotations
 
 import ast
+import collections
 import os
 import pathlib
+import select
 import signal
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -99,32 +104,43 @@ class _Child:
 
     @property
     def blocked(self) -> bool:
-        """Whether the child's own watchdog killed it, which is what a deadlock looks like here.
+        """Whether a signal ended the child, which is what a deadlock looks like here.
+
+        Either watchdog counts. ``SIGALRM`` is the child's own, and ``SIGKILL`` is the parent's
+        for the case the child's cannot fire — a repair that hangs *inside* the fork handler
+        leaves a child with no pending alarm, since ``fork`` clears one in the child and the
+        handler runs before any test code can arm another.
 
         Args:
           None.
 
         Returns:
-          Whether ``SIGALRM`` terminated it.
+          Whether a signal terminated it.
 
         Raises:
           None.
         """
-        return os.WIFSIGNALED(self.status) and os.WTERMSIG(self.status) == signal.SIGALRM
+        return os.WIFSIGNALED(self.status)
 
 
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
     """Forks, runs ``work`` in the child, and reaps it.
 
     The child writes ``work``'s return value down a pipe and leaves through ``os._exit``, so it
-    never runs the parent's ``atexit`` handlers or pytest's teardown. It arms ``signal.alarm``
-    first, so the pipe reaches EOF and this call returns even when the point of the test is that
-    the child blocks forever.
+    never runs the parent's ``atexit`` handlers or pytest's teardown.
+
+    **Both sides are bounded, and the parent's bound is not redundant.** The child arms
+    ``signal.alarm`` for the ordinary case, but ``fork`` clears a pending alarm in the child and
+    the library's fork handler runs *before* any of this code — so a repair that hangs in the
+    handler produces a child no alarm will ever kill, and a parent sitting in ``os.read`` would
+    hang the whole suite rather than fail one test. The parent therefore waits on a deadline of
+    its own and sends ``SIGKILL``.
 
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
         is sent back as the child's output.
-      timeout: Seconds before the child's watchdog kills it.
+      timeout: Seconds before the child's watchdog kills it. The parent allows a little more,
+        so an alarm that *can* fire is what ends the child and the diagnosis stays specific.
 
     Returns:
       The reaped child.
@@ -149,9 +165,16 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
         finally:
             os._exit(code)
     os.close(write_fd)
+    deadline = time.monotonic() + timeout + 2.0
     chunks: list[bytes] = []
     try:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.kill(pid, signal.SIGKILL)
+                break
+            if not select.select([read_fd], [], [], remaining)[0]:
+                continue
             chunk = os.read(read_fd, 65536)
             if not chunk:
                 break
@@ -451,6 +474,7 @@ def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) 
         child = run_in_child(_log_in_child, timeout=4)
     finally:
         gate.release.set()
+        worker.shutdown()
 
     assert child.finished, f"a subclassed sink's child blocked: {child.output!r}"
 
@@ -550,10 +574,18 @@ def test_third_party_state_is_left_alone(tmp_path: pathlib.Path) -> None:
 # -- FR-003 AC-3: completeness is proved, not asserted ---------------------------------------
 
 
-_PRIMITIVES = ("Lock", "RLock", "Event")
+_REPAIRABLE = ("Lock", "RLock", "Event")
+
+# `threading` primitives the walk does **not** know how to replace. They are detected anyway, so
+# that adding one is a decision somebody takes rather than a silent hole: a `Condition` owns a
+# lock, so an inherited one reintroduces exactly the hang FR-003 removes, and a `Semaphore` or
+# `Barrier` carries a count that a naive replacement would reset. `src/` has none today.
+_UNREPAIRABLE = ("Condition", "Semaphore", "BoundedSemaphore", "Barrier")
+
+_PRIMITIVES = _REPAIRABLE + _UNREPAIRABLE
 
 
-def _threading_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+def _threading_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
     """The names this module can build a primitive through, derived from its own imports.
 
     A detector hardcoding the literal ``threading`` reads zero constructions from
@@ -561,34 +593,46 @@ def _threading_names(tree: ast.AST) -> tuple[set[str], set[str]]:
     with the lock in a list the walk cannot reach. Reading the imports is what makes the rule
     about the *primitive* rather than about one spelling of it.
 
+    Four shapes remain invisible and are disclosed rather than chased: a rebinding
+    (``T = threading``), a ``getattr(threading, "Lock")()``, a star-import, and a lock built by
+    a helper and returned. Following an arbitrary value is a walker nobody can reason about,
+    and every one of the four is a shape no module here uses.
+
     Args:
       tree: The parsed module.
 
     Returns:
-      The names bound to the ``threading`` module, and the names bound directly to a primitive.
+      The names bound to the ``threading`` module, and a map from each locally bound name to
+      the primitive it names — a map rather than a set, because ``from threading import Lock as
+      L`` binds a name that says nothing about which primitive it is, and matching the *bound*
+      name against the wanted list left the aliased form undetected.
 
     Raises:
       None.
     """
     modules: set[str] = set()
-    direct: set[str] = set()
+    direct: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            modules.update(
-                alias.asname or alias.name for alias in node.names if alias.name == "threading"
-            )
+            for alias in node.names:
+                if alias.name != "threading" and not alias.name.startswith("threading."):
+                    continue
+                # A dotted `import threading.x` binds `threading`, not the submodule, unless it
+                # is aliased — in which case the alias names the submodule and no primitive.
+                modules.add(alias.asname or alias.name.split(".", 1)[0])
         elif isinstance(node, ast.ImportFrom) and node.module == "threading":
-            direct.update(
-                alias.asname or alias.name for alias in node.names if alias.name in _PRIMITIVES
-            )
+            for alias in node.names:
+                if alias.name in _PRIMITIVES:
+                    direct[alias.asname or alias.name] = alias.name
     return modules, direct
 
 
-def _primitive_constructions(tree: ast.AST) -> list[ast.Call]:
-    """Every ``Lock`` / ``RLock`` / ``Event`` construction in a parsed module, however spelled.
+def _primitive_constructions(tree: ast.AST, names: tuple[str, ...] = _REPAIRABLE) -> list[ast.Call]:
+    """Every construction of one of ``names`` in a parsed module, however it is spelled.
 
     Args:
       tree: The parsed module.
+      names: The primitive class names to look for.
 
     Returns:
       One call node per construction.
@@ -604,11 +648,12 @@ def _primitive_constructions(tree: ast.AST) -> list[ast.Call]:
         func = node.func
         through_module = (
             isinstance(func, ast.Attribute)
-            and func.attr in _PRIMITIVES
+            and func.attr in names
             and isinstance(func.value, ast.Name)
             and func.value.id in modules
         )
-        if (isinstance(func, ast.Name) and func.id in direct) or through_module:
+        directly = isinstance(func, ast.Name) and direct.get(func.id) in names
+        if directly or through_module:
             found.append(node)
     return found
 
@@ -714,7 +759,13 @@ def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) 
     A lock constructed into a list, a tuple, a closure cell or a bare local is invisible to it,
     and would be a silent return of the 19-of-60 hang. Forbidding the shape is also what picks
     up a lock added by a **later** spec with no edit to ``_fork.py`` — SPEC-036 FR-003 adds a
-    counter lock after this one ships.
+    counter lock after this one ships. A primitive of a *type* the walk cannot replace is a
+    different question and is refused by its own test below, rather than folded in here.
+
+    The rule errs toward rejecting, and three reachable shapes are caught by it:
+    ``_a, _b = threading.Lock(), threading.Lock()``, a ``C.guard = …`` inside a method, and
+    ``self.a.b = …``. Each fails loudly with the position named, which is the safe direction —
+    a shape nobody uses costing a rewrite, against a lock nobody repairs costing a deadlock.
 
     Two reachability gaps are real and neither is this rule's to close, because neither is a
     construction in ``src/`` at all. ``Worker._queue`` is a ``queue.Queue``, which builds **its
@@ -747,6 +798,28 @@ def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) 
     assert not offenders, (
         "these locks are built where the fork walk cannot reach them — assign each to a module "
         "global or a `self` attribute:\n  " + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize("path", _MODULES, ids=lambda p: p.relative_to(_SRC).as_posix())
+def test_no_module_builds_a_primitive_the_walk_cannot_repair(path: pathlib.Path) -> None:
+    """FR-003 AC-3's boundary, made loud instead of left implicit.
+
+    ``_fresh_primitive`` replaces a ``Lock``, an ``RLock`` and an ``Event``, and nothing else. A
+    ``Condition`` owns a lock, so an inherited one is the 19-of-60 hang wearing another name,
+    and a ``Semaphore`` or ``Barrier`` carries a count a fresh instance would silently reset —
+    each needs a decision about what "the same primitive, minted again" even means. So they are
+    detected and refused rather than quietly walked past, which is what the docstring above can
+    honestly claim to pick up from a later spec.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found = [
+        f"line {call.lineno}: {ast.unparse(call)}"
+        for call in _primitive_constructions(tree, _UNREPAIRABLE)
+    ]
+    assert not found, (
+        "the fork walk has no replacement for these, so a child would inherit them dead — "
+        "teach `_fresh_primitive` about the type, or use one it knows:\n  " + "\n  ".join(found)
     )
 
 
@@ -888,25 +961,79 @@ def test_a_frozen_holder_cannot_refuse_the_repair() -> None:
         holder.guard = threading.Lock()  # type: ignore[misc]
 
 
-def test_the_walk_terminates_on_a_cycle() -> None:
-    """A container holding itself, and two objects holding each other, must not hang the child.
+def test_the_walk_terminates_on_a_cycle(tmp_path: pathlib.Path) -> None:
+    """A self-referencing sink must not stop the child returning from ``fork``.
 
-    The walk runs before the forking application gets control back, so a cycle is not a slow
-    repair — it is a process that never returns from ``fork``.
+    Driven through a real fork rather than by re-running the loop here. A first version popped,
+    marked and extended in the test body and asserted on its own local ``seen`` — it never
+    called the function whose termination it named, so deleting ``seen.add`` from
+    ``_reinit_primitives`` left it passing while a cycle spun forever. The expectation has to
+    come from the production path, not from a copy of it.
+
+    A cycle is not a slow repair. The handler runs before the forking application gets control
+    back, so a walk that does not terminate is a process that never returns from ``fork`` — and
+    the child cannot be rescued by its own watchdog, because ``fork`` cleared the alarm and the
+    handler runs before anything can arm one. The parent's ``SIGKILL`` is what ends it.
     """
+    sink = FileSink(str(tmp_path / "cycle.ndjson"))
+    sink.self_ref = sink  # type: ignore[attr-defined]
     loop: list[Any] = []
     loop.append(loop)
-    assert _fork._container_children(loop) == [loop]
+    sink.loop = loop  # type: ignore[attr-defined]
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    before = id(sink._lock)
+    try:
+        child = run_in_child(lambda: str(id(sink._lock) != before), timeout=6)
+    finally:
+        sink.close()
 
-    seen: set[int] = set()
-    stack: list[Any] = [loop]
-    while stack:
-        node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        stack.extend(_fork._container_children(node))
-    assert seen == {id(loop)}
+    assert child.finished, f"the walk did not terminate on a cycle: {child.output!r}"
+    assert child.output == "True", child.output
+
+
+def test_an_owned_container_subclass_is_both_walked_and_repaired(tmp_path: pathlib.Path) -> None:
+    """Being a container and being a namespace are not exclusive, and were treated as if.
+
+    A ``continue`` after the container branch skipped the attributes of anything that also held
+    members, so an owned sink subclassing one kept its ``_lock`` — the hang, in a class the walk
+    had already decided to enter. No shipped class has this shape, which is why nothing else
+    catches a revert.
+    """
+
+    class _BufferSink(FileSink, list):  # type: ignore[misc]
+        pass
+
+    sink = _BufferSink(str(tmp_path / "buffer.ndjson"))
+    sink.append({"queued": 1})
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    before = id(sink._lock)
+    try:
+        child = run_in_child(lambda: str(id(sink._lock) != before), timeout=6)
+    finally:
+        sink.close()
+
+    assert child.output == "True", child.output
+
+
+def test_a_container_the_walk_enters_is_not_one_exact_type(tmp_path: pathlib.Path) -> None:
+    """FR-003 AC-2. Which concrete container a sink holds its children in must not decide this.
+
+    An exact-type test entered a ``list`` and a ``tuple`` and walked past a ``deque``, a
+    ``defaultdict`` and every other ordinary subclass — so a future sink's children would be
+    unrepaired for no reason a reader could predict. ``MultiSink`` is the shipped shape; the
+    container under it is the variable.
+    """
+    inner = FileSink(str(tmp_path / "deque.ndjson"))
+    wrapper = MultiSink(inner)
+    wrapper._sinks = collections.deque([inner])  # type: ignore[assignment]
+    log_foundry.configure(service="fork", version="0", env="test", sink=wrapper)
+    before = id(inner._lock)
+    try:
+        child = run_in_child(lambda: str(id(inner._lock) != before), timeout=6)
+    finally:
+        inner.close()
+
+    assert child.output == "True", child.output
 
 
 # -- FR-001 / FR-006: what is registered, and where the mechanism lives ----------------------
@@ -971,7 +1098,7 @@ def test_nothing_else_in_the_package_registers_a_fork_handler(path: pathlib.Path
     ``_fork.py`` green while reintroducing exactly what that criterion rules out.
     """
     if path.name == "_fork.py":
-        return
+        pytest.skip("the one module that may register; test_only_after_in_child_is_registered")
     tree = ast.parse(path.read_text(encoding="utf-8"))
     assert not _register_calls(tree), f"{path.name} registers a fork handler; FR-001 says one does"
 
@@ -988,6 +1115,10 @@ def test_fork_imports_nothing_from_the_package_but_diag() -> None:
     decorator`` — and appending to that existing line is the most natural way Phase 2's worker
     rebuild would be written, so the guard would have stayed green over the very cycle this FR
     exists to prevent.
+
+    A name is allowed when the module it comes from is allowed, or when the module plus the
+    name is. Both are needed: ``from log_foundry.sinks.base import Sink`` names a member of an
+    allowed module, while ``from log_foundry.sinks import base`` names the module itself.
     """
     allowed = {f"{_PACKAGE}._diag", f"{_PACKAGE}.sinks.base"}
     for node in ast.walk(_fork_tree()):
@@ -999,10 +1130,12 @@ def test_fork_imports_nothing_from_the_package_but_diag() -> None:
             module = node.module or ""
             if not module.startswith(_PACKAGE):
                 continue
-            imported = {
-                f"{module}.{alias.name}" if module == _PACKAGE else module for alias in node.names
-            }
-            assert imported <= allowed, f"_fork.py may not import {sorted(imported - allowed)}"
+            forbidden = sorted(
+                f"{module}.{alias.name}"
+                for alias in node.names
+                if module not in allowed and f"{module}.{alias.name}" not in allowed
+            )
+            assert not forbidden, f"_fork.py may not import {forbidden}"
 
 
 def test_the_handler_is_registered_once_for_a_double_import() -> None:
