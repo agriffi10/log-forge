@@ -59,7 +59,12 @@ from log_foundry import decorator
 # a name that hides what it is about. A first draft used the token `adopted` instead and matched
 # `continue_trace`'s trace-context variable, which is not a worker question at all: a heuristic
 # broad enough to catch every phrasing also catches things that are not the subject.
-_SENTINELS = ("_worker", "worker", "draining", "retired")
+#
+# These four are the *base*. The set actually used is derived per-tree by
+# :func:`_accessor_names`, which adds any function that hands the worker back, because a
+# hand-written token list is the one hand-list left in a file whose whole argument is that
+# hand-lists rot.
+_BASE_SENTINELS = ("_worker", "worker", "draining", "retired")
 
 EXISTENCE = "existence — is there a worker at all, and therefore anything to do"
 LIVENESS = (
@@ -434,6 +439,57 @@ def _named_scopes(
     return scopes
 
 
+def _accessor_names(tree: ast.AST, base: tuple[str, ...]) -> tuple[str, ...]:
+    """The sentinel tokens for one tree: `base`, plus every function that hands the worker back.
+
+    A roster keyed on names has exactly one way to be defeated that rewriting cannot reach — a
+    **new** site under a name of the author's choosing — and the cheapest such name is a fresh
+    accessor: `def _snapshot(): return _worker`, then `worker = _snapshot()` above an existing
+    guard. Measured on `7a10348`, that converted `_swap_sink`'s out-of-lock guard from liveness
+    to existence with the roster at 13 passed and the suite at 1196 passed. The binding *was*
+    filed — every assignment value is — but `_snapshot()` named nothing the filter recognised.
+
+    So the filter's vocabulary is derived from the module rather than written beside it: a
+    function whose return value names the worker **is** a worker name, and one that returns the
+    result of such a function is one too, which is why this runs to a fixpoint rather than one
+    pass. The direction is the same over-match the substring model already chooses — a function
+    returning `span.retired_at` would be added and cost a row nobody minds — because demanding a
+    classification is the safe failure and skipping one is not.
+
+    `Return` is the only shape read. An accessor that hands the worker back through a mutable
+    argument or a module global is not covered, and is limitation 3 in :func:`_sites`.
+
+    Args:
+      tree: The parsed module.
+      base: The tokens that name the worker outright.
+
+    Returns:
+      Every token that makes an expression a question about the worker, in this tree.
+
+    Raises:
+      None.
+    """
+    tokens = set(base)
+    scopes = [
+        (path.rsplit(".", 1)[-1].split("#", 1)[0], node) for path, node in _named_scopes(tree, ())
+    ]
+    while True:
+        added = False
+        for name, scope in scopes:
+            if name in tokens:
+                continue
+            returns = [
+                node.value
+                for node in _own_nodes(scope)
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            if any(token in ast.unparse(value) for value in returns for token in tokens):
+                tokens.add(name)
+                added = True
+        if not added:
+            return tuple(sorted(tokens))
+
+
 def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     """Every worker question in a parsed module, keyed by scope, text and source ordinal.
 
@@ -453,17 +509,22 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     hoisted one this walker had just added, so the note was over-optimistic in the direction that
     costs a contributor a green suite.
 
-    1. **The subject is recognised by name** (`_SENTINELS`), matched as a substring of the
-       rendered text. So `if owner is None:` is invisible where `if _worker is None:` is not —
-       though `if owner.retired:` **is** caught, because `retired` is itself a token. What
-       *rewriting* an existing site cannot do is hide, since the stale-row check fires on the
-       text that disappeared regardless of what replaced it; so the exposure is **net-new sites
-       under a name of the author's choosing**, and it is not confined to existence guards. An
-       aliased ownership guard (`held = _worker` … `held.sink is owed` — with the alias filed,
-       but a second alias would not be) and an aliased `_live_worker` call are equally
-       unfilterable by name. Two drafts of this note claimed less: one that the failure mode was
-       purely a missed site, one that only pure-existence guards were exposed. Both measured
-       false, which is why the claim is now stated at its widest. The substring model also
+    1. **The subject is recognised by name**, matched as a substring of the rendered text
+       against tokens :func:`_accessor_names` derives from the module. So `if owner is None:`
+       is invisible where `if _worker is None:` is not — though `if owner.retired:` **is**
+       caught, because `retired` is itself a token. What *rewriting* an existing site cannot do
+       is hide, since the stale-row check fires on the text that disappeared regardless of what
+       replaced it; so the exposure is **net-new sites under a name of the author's choosing**,
+       and it is not confined to existence guards. Two drafts of this note claimed less: one
+       that the failure mode was purely a missed site, one that only pure-existence guards were
+       exposed. Both measured false, which is why the claim is stated at its widest.
+
+       ~~An aliased `_live_worker` call, and an accessor added under a neutral name, are equally
+       unfilterable.~~ — struck (SPEC-021) rather than deleted, because it read as a permanent
+       property of a name-keyed filter and is not one. A function that hands the worker back is
+       now itself a token, to a fixpoint, so `worker = _snapshot()` is filed; what remains is a
+       fresh **local** whose value never passes through a `return` the derivation can read —
+       a worker fetched into a mutable argument or a module global. The substring model also
        over-matches — `if networker:` and `if ticket.retired:` are filed — and that direction is
        the safe one, since it demands a classification rather than skipping one.
     2. **A hoist is followed only through an assignment.** Every assignment value is filed
@@ -495,6 +556,7 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     Raises:
       None.
     """
+    sentinels = _accessor_names(tree, _BASE_SENTINELS)
     scopes: list[tuple[str, ast.AST]] = [("<module>", tree)]
     scopes.extend(_named_scopes(tree, ()))
 
@@ -513,8 +575,10 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
                 for descendant in ast.walk(expr):
                     filed.add(id(descendant))
                 rendered = ast.unparse(expr)
-                if any(token in rendered for token in _SENTINELS):
-                    hits.append((getattr(expr, "lineno", 0), getattr(expr, "col_offset", 0), rendered))
+                if any(token in rendered for token in sentinels):
+                    hits.append(
+                        (getattr(expr, "lineno", 0), getattr(expr, "col_offset", 0), rendered)
+                    )
         seen: dict[str, int] = {}
         for _, _, rendered in sorted(hits):
             seen[rendered] = seen.get(rendered, -1) + 1
@@ -705,6 +769,80 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
         """
     )
     assert not found, f"these are actions on the worker, not questions about it: {found}"
+
+
+def test_an_accessor_under_a_neutral_name_cannot_hide_a_binding() -> None:
+    """The round-11 attack: a fresh accessor whose own name says nothing about the worker.
+
+    `worker = _snapshot()` above `_swap_sink`'s out-of-lock guard converts it from liveness to
+    existence. Measured on `7a10348`, before :func:`_accessor_names`: roster 13 passed, suite
+    1196 passed, `configure()` 2.01 s → 0.00 s, `B.closed` 1 → 0. The binding was filed and the
+    filter did not recognise it.
+    """
+    found = _walk_source(
+        """
+        def _snapshot():
+            return _worker
+
+        def _swap_sink(new_sink):
+            worker = _snapshot()
+            if worker is not None:
+                pass
+        """
+    )
+    assert "_snapshot()" in found, f"the accessor's call site was not filed: {found}"
+
+
+def test_an_accessor_of_an_accessor_is_reached_in_either_order() -> None:
+    """The wrapper is filed whether or not it is defined after what it calls.
+
+    This is why :func:`_accessor_names` runs to a fixpoint. **Source order is the whole test**:
+    a single pass already reaches `_fetch` when `_snapshot` is above it, since the token set is
+    updated as the pass goes — a first version of this test used that order, and the
+    no-fixpoint mutant passed it. Defining the wrapper *first* is the case that needs the
+    second pass, and no rule says an attacker must add their accessor at the top of the file.
+    """
+    wrapper_first = """
+        def _fetch():
+            return _snapshot()
+
+        def _snapshot():
+            return _worker
+    """
+    snapshot_first = """
+        def _snapshot():
+            return _worker
+
+        def _fetch():
+            return _snapshot()
+    """
+    for order, source in (("wrapper first", wrapper_first), ("snapshot first", snapshot_first)):
+        tokens = _accessor_names(ast.parse(textwrap.dedent(source)), _BASE_SENTINELS)
+        assert "_fetch" in tokens, f"{order}: {tokens}"
+
+
+def test_a_function_that_hands_back_no_worker_is_not_a_sentinel() -> None:
+    """The derivation must not degenerate into "every function name is a token".
+
+    That would file every call in the module and make the roster unmaintainable — which is the
+    failure mode of over-matching, and the reason the added tokens are the ones a `return`
+    justifies rather than all of them.
+    """
+    tokens = _accessor_names(
+        ast.parse(
+            textwrap.dedent(
+                """
+                def _ensure_sink():
+                    return _config.sink
+
+                def _open_span(name):
+                    return Span(name=name)
+                """
+            )
+        ),
+        _BASE_SENTINELS,
+    )
+    assert tokens == tuple(sorted(_BASE_SENTINELS)), tokens
 
 
 def test_no_reason_fuses_words_at_a_string_seam() -> None:
@@ -941,12 +1079,18 @@ def test_a_reason_built_by_interpolation_or_addition_is_refused() -> None:
     loud. The `+` case never folds at all, so both operands read as complete one-part literals.
     """
     silent = 'x = "the" f"{y}" "process"'
-    assert [_literal_parts(node, silent) for node in ast.walk(ast.parse(silent)) if
-            isinstance(node, ast.Constant) and isinstance(node.value, str)] == [[], []]
+    assert [
+        _literal_parts(node, silent)
+        for node in ast.walk(ast.parse(silent))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ] == [[], []]
 
     joined = 'x = "the" + "process"'
-    assert [_literal_parts(node, joined) for node in ast.walk(ast.parse(joined)) if
-            isinstance(node, ast.Constant)] == [[], []]
+    assert [
+        _literal_parts(node, joined)
+        for node in ast.walk(ast.parse(joined))
+        if isinstance(node, ast.Constant)
+    ] == [[], []]
 
     for refused in ('(EXISTENCE, f"a{1}" "b")', '(EXISTENCE, "a" + "b")'):
         source = f'ROSTER: dict = {{("f", "x", 0): {refused}}}'
@@ -1004,9 +1148,15 @@ def test_the_lint_covers_the_categories_and_not_the_whole_module() -> None:
 # so both were named `f` and collapsed onto one roster row.
 _SCOPE_SHAPES: list[tuple[str, list[str]]] = [
     ("def f():\n    pass\n\n\ndef f():\n    pass\n", ["f", "f#1"]),
-    ("try:\n    def f():\n        pass\nexcept ImportError:\n    def f():\n        pass\n", ["f", "f#1"]),
+    (
+        "try:\n    def f():\n        pass\nexcept ImportError:\n    def f():\n        pass\n",
+        ["f", "f#1"],
+    ),
     ("if x:\n    def f():\n        pass\nelse:\n    def f():\n        pass\n", ["f", "f#1"]),
-    ("class A:\n    def m(self):\n        pass\n\n\nclass B:\n    def m(self):\n        pass\n", ["A.m", "B.m"]),
+    (
+        "class A:\n    def m(self):\n        pass\n\n\nclass B:\n    def m(self):\n        pass\n",
+        ["A.m", "B.m"],
+    ),
     ("def outer():\n    def inner():\n        pass\n", ["outer", "outer.inner"]),
 ]
 
