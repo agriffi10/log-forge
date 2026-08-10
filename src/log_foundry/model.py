@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from log_foundry.config import get_config
+from log_foundry.config import _live_config
 from log_foundry.ids import new_log_id
 from log_foundry.sanitize import sanitize_fields, truncate_str, truncate_tail
 
@@ -93,7 +93,7 @@ def build_event(
     Raises:
       None.
     """
-    cfg = get_config()
+    cfg = _live_config()
     merged: dict[str, object] = {**cfg.defaults, **span.defaults, **baggage, **fields}
     safe, clipped = sanitize_fields(merged, cfg=cfg)
     bounded_message, message_clipped = truncate_str(message, cfg.max_value_bytes)
@@ -236,7 +236,7 @@ def end_event(
     event["duration_ms"] = (time.monotonic() - span.start_ts) * 1000.0
     event["status"] = status
     if exc is not None:
-        error, clipped = _error_fields(exc, cfg=get_config())
+        error, clipped = _error_fields(exc, cfg=_live_config())
         event["error"] = error
         if clipped:
             event[_TRUNCATED] = True
@@ -269,7 +269,7 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
     """
     if not baggage:
         return
-    safe, clipped = sanitize_fields(baggage, cfg=get_config())
+    safe, clipped = sanitize_fields(baggage, cfg=_live_config())
     for event in span.events:
         if event.get("message") in (_START_MESSAGE, _END_MESSAGE):
             fields = event.get("fields")

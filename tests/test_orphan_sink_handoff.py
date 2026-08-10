@@ -68,15 +68,21 @@ def _eventually(predicate, timeout: float = 5.0) -> bool:
 def test_the_recorded_sink_is_the_one_emitted_to_not_the_one_configured() -> None:
     """AC-2. The property the boolean lacked, asserted directly.
 
-    `configure()` assigns `_config.sink` before it calls the swap, so a close resolved through
-    `_ensure_sink()` at close time would target whatever was configured last, not what was
-    written to.
+    `configure()` assigns the config's sink before it calls the swap, so a close resolved
+    through `_ensure_sink()` at close time would target whatever was configured last, not what
+    was written to.
+
+    Reaches that state through `config._rebind` rather than `get_config().sink = later`, which
+    is what it used to do: SPEC-034 FR-003 froze `Config` and made `get_config()` return a copy,
+    so the public back door this test walked through no longer exists — which is the point of
+    that FR. The state being simulated is unchanged: the config names a sink that no orphan emit
+    ever reached.
     """
     written, later = CountingSink("written"), CountingSink("later")
     log_foundry.configure(service="t", sink=written)
     log_foundry.info("reaches written")
 
-    config.get_config().sink = later  # reassigned behind the library's back
+    config._rebind(sink=later)  # the config now names a sink nothing was written to
 
     decorator._close_orphan_sink()
 

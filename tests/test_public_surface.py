@@ -8,15 +8,19 @@ SPEC-032 and SPEC-035 both paid for.
 """
 
 import ast
+import dataclasses
 import inspect
 import pathlib
 import pkgutil
 import re
+import textwrap
 import threading
 
 import pytest
 
 log_foundry = pytest.importorskip("log_foundry")
+config = pytest.importorskip("log_foundry.config")
+model = pytest.importorskip("log_foundry.model")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
@@ -368,3 +372,160 @@ def test_every_shipped_sink_module_imports() -> None:
         except Exception as exc:
             failed.append(f"{info.name}: {type(exc).__name__}: {exc}")
     assert not failed, "sink modules failed to import:\n" + "\n".join(failed)
+
+
+# -- FR-003: get_config() cannot be used to mutate the live config --------------------------
+
+
+def test_the_returned_config_refuses_a_sink_reassignment() -> None:
+    """FR-003 AC-1. SPEC-030's defect, reachable publicly with no underscore in sight.
+
+    Assigning `.sink` retargeted what the config *reported* while every event continued to the
+    sink the worker had already captured: measured before the fix as A got 4, B got 0, the
+    config claiming B, `incomplete_swaps` at zero and A never closed.
+    """
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        log_foundry.get_config().sink = object()  # type: ignore[misc]
+
+
+def test_the_returned_config_refuses_a_ceiling_that_configure_would_reject() -> None:
+    """FR-003 AC-2. `max_value_bytes = 0` empties every event it touches."""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        log_foundry.get_config().max_value_bytes = 0  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        log_foundry.configure(max_value_bytes=0)
+
+
+def test_every_documented_read_still_works() -> None:
+    """FR-003 AC-3. The freeze must cost a reader nothing."""
+    log_foundry.configure(service="billing", version="2.1", env="prod", defaults={"team": "core"})
+    cfg = log_foundry.get_config()
+    assert (cfg.service, cfg.version, cfg.env) == ("billing", "2.1", "prod")
+    assert cfg.defaults == {"team": "core"}
+    assert cfg.sink is not None
+    assert (cfg.max_value_bytes, cfg.max_stack_bytes, cfg.max_keys, cfg.max_depth) == (
+        8192,
+        32768,
+        256,
+        8,
+    )
+
+
+def test_the_returned_config_is_a_copy_not_the_live_object() -> None:
+    """FR-003 AC-4. `object.__setattr__` reaches through any frozen dataclass.
+
+    So the freeze alone is not the guarantee — the guarantee is that what a caller can reach is
+    not the object the library reads.
+    """
+    cfg = log_foundry.get_config()
+    assert cfg is not config._live_config()
+    object.__setattr__(cfg, "service", "defeated")
+    assert config._live_config().service != "defeated"
+
+
+def test_the_returned_defaults_dict_is_copied_too() -> None:
+    """FR-003 AC-5, and the one the FR's own recipe would have failed.
+
+    The Description proposes `dataclasses.replace(_config)` as "the straightforward answer".
+    Measured while building this: `replace` **shares** the `defaults` dict, so that recipe hands
+    back a frozen shell around the live mapping and the freeze is cosmetic at the one field that
+    is not a scalar.
+    """
+    log_foundry.configure(service="t", defaults={"team": "core"})
+    returned = log_foundry.get_config().defaults
+    returned["team"] = "MUTATED"
+    returned["injected"] = True
+    assert config._live_config().defaults == {"team": "core"}
+
+
+def test_no_module_imports_the_config_singleton_by_value() -> None:
+    """FR-003 AC-7. The rebind is only safe because nothing holds the pre-rebind object.
+
+    `configure()` replaces the module global; a `from log_foundry.config import _config`
+    anywhere would keep the object it bound at import time forever, reading stale settings for
+    the life of the process and never failing a test that did not look for it.
+    """
+    offenders = [
+        f"{path.relative_to(_ROOT)}:{node.lineno}"
+        for path in (_ROOT / "src").rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.ImportFrom) and any(a.name == "_config" for a in node.names)
+    ]
+    assert not offenders, f"these hold the pre-rebind config: {offenders}"
+
+
+def test_the_zero_config_path_still_resolves_a_sink() -> None:
+    """The gap the spec's design missed, found by reading `config.py` before writing any of it.
+
+    `_ensure_sink()` assigns `_config.sink = StdoutSink()` when nothing was configured — a
+    second in-place mutation the FR never names, on the path a process takes when it calls
+    `info()` without ever calling `configure(sink=...)`. Under `frozen=True` and without the
+    rebind it raises `FrozenInstanceError` into the orphan guard, and every zero-config log is
+    absorbed and lost.
+    """
+    config._rebind(sink=None)
+    resolved = config._ensure_sink()
+    assert resolved is not None
+    assert config._live_config().sink is resolved, "the resolved default is retained, not rebuilt"
+
+
+def test_configure_applies_every_field_in_one_rebind() -> None:
+    """The second gap: nine rebindings would leave a window on a half-applied config.
+
+    Asserted structurally rather than by racing threads — a race that reproduces only sometimes
+    is not a test. `configure()` must call `_rebind` exactly once, so no reader can observe a
+    `service` from this call beside a `sink` from the last one.
+    """
+    source = inspect.getsource(config.configure)
+    calls = [
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_rebind"
+    ]
+    assert len(calls) == 1, f"configure() rebinds {len(calls)} times; a reader can see a partial config"
+
+
+def test_the_per_event_path_does_not_pay_for_the_config_copy() -> None:
+    """FR-003 AC-6. `build_event` reads the config one to three times per event.
+
+    Routing those through `get_config()` would allocate a `Config` **and** a `defaults` dict per
+    event. Checked structurally for the same reason the baggage equivalent is: the behaviour is
+    identical and only the cost changes, which no behavioural test can see.
+    """
+    model_src = (_ROOT / "src" / "log_foundry" / "model.py").read_text(encoding="utf-8")
+    calls = {
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(model_src))
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith("config()")
+    }
+    assert calls == {"_live_config()"}, f"model.py's config reads are {sorted(calls)}"
+
+
+def test_no_config_copy_is_allocated_per_event(monkeypatch) -> None:
+    """FR-003 AC-6's benchmark, counted rather than timed.
+
+    The AC asks for a benchmark rather than an assertion. A wall-clock one would be a race
+    against the machine — this repo has been bitten by timing tests that failed on their own
+    setup — so what is measured is the thing the cost *is*: how many `Config` copies the
+    per-event path allocates. `get_config()` calls `replace`; `_live_config()` does not. Five
+    hundred events must allocate none.
+    """
+    copies = 0
+    real_replace = config.replace
+
+    def counting_replace(*args: object, **kwargs: object) -> object:
+        nonlocal copies
+        copies += 1
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(config, "replace", counting_replace)
+    log_foundry.configure(service="bench", defaults={"team": "core"})
+    copies = 0  # discard the configure() rebind; only the per-event path is under measurement
+
+    span = model.Span(
+        trace_id="0" * 32, span_id="0" * 16, parent_span_id=None, name="bench", start_ts=0.0
+    )
+    for i in range(500):
+        model.build_event(span, "INFO", "m", fields={"i": i}, baggage={"team": "core"})
+
+    assert copies == 0, f"{copies} Config copies allocated across 500 events"
