@@ -158,7 +158,21 @@ below the chunk loop entirely.
         scenario — and each reduction halves *the refused body's own size*, since halving the
         nominal budget converges on how the sink was configured rather than on what was sent.
       - *A size already refused is not asked about again* within one `emit`, which stops the tail
-        degenerating into one request per event once the budget falls below a single item.
+        degenerating into one request per event once the budget falls below a single item —
+        **except under `gzip`**, where the shortcut is disabled outright. The refusal is recorded
+        as an *uncompressed* length, because that is what this sink measures and chunks by, while
+        a gzipped request is judged on its compressed bytes; compression ratio is per-event, so
+        "larger uncompressed" stops implying "also refused". Measured: one incompressible event
+        set the mark at 441 bytes and a 6,021-byte event gzipping to 64 was discarded, against a
+        200-byte wire limit, with no request made — loss the library invented, and an inflation
+        of `dropped`, whose contract is an exact count. The bound it buys is also only the
+        uniform-size case: with strictly decreasing sizes every lone item is smaller than
+        anything yet refused, so the cost is O(N) — 507 requests for 500 events against 9
+        uniform. That is a property of a single low-water mark, and is recorded rather than fixed.
+      - *Only a lone item is ever dropped as permanently refused.* A multi-item chunk that
+        exhausts the reduction budget — reachable only through a pathological `_item_size` —
+        holds events that were never individually refused, so it is reported to the worker as a
+        failed batch rather than counted as permanent drops.
       - *A permanent drop is settled, not failed.* Returning "not delivered" made `emit` raise, so
         the worker re-ran the whole search and re-dropped the same events: `losses().dropped`
         read **23,920 for 5,980 events lost**, against a counter whose contract — unlike

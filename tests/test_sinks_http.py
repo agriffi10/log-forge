@@ -331,6 +331,13 @@ def test_an_endpoint_that_refuses_everything_costs_one_pass_not_one_request_per_
     Halving the *budget* converges in log2(ratio), and remembering the smallest refused body
     within the emit stops the tail becoming one request per event once the budget is below a
     single item.
+
+    The bound asserted here holds for **uniformly-sized** events, which is what this test builds.
+    It is not the general worst case: with sizes in strictly decreasing order every lone item is
+    smaller than anything yet refused, so each asks a genuinely new question and the cost is O(N)
+    — measured at 507 requests for 500 such events, against 9 uniform and 11 increasing. That is
+    a property of the memory being a single low-water mark, not a defect, and a random backlog
+    gives the ~ln N expectation.
     """
     opener = FakeOpener([FakeResponse(413, b"")])
     sink = HTTPSink("http://x", max_retries=0, opener=opener)
@@ -513,3 +520,92 @@ def test_a_json_array_body_never_exceeds_the_budget_at_an_exact_fit() -> None:
     assert all(len(call["body"]) <= exact for call in opener.calls), (
         f"a json_array body ran past the budget: {[len(c['body']) for c in opener.calls]}"
     )
+
+
+def test_a_compressible_event_is_still_offered_after_an_incompressible_one_was_refused() -> None:
+    """The refusal memory is uncompressed; under gzip the destination judges the wire bytes.
+
+    Compression ratio is per-event, so "larger uncompressed" stops implying "also refused". A
+    6,021-byte event that gzips to 64 was being discarded with no request made, because a
+    441-byte incompressible event had set the mark — against a limit of 200 on the wire. That is
+    loss the library invented, and it inflated `dropped`, whose contract is an exact count.
+    """
+    import hashlib
+
+    # Deterministic high-entropy text: gzip cannot shrink digest output meaningfully.
+    noise = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(8))
+    incompressible = {"i": 0, "pad": noise}
+    compressible = {"i": 1, "pad": "a" * 6000}
+
+    limit = 200
+    sizes: list[int] = []
+
+    def opener(request, timeout=None):
+        sizes.append(len(request.data))
+        return FakeResponse(413 if len(request.data) > limit else 200, b"")
+
+    sink = HTTPSink("http://x", gzip=True, max_retries=0, opener=opener)
+    sink.emit([incompressible, compressible])
+    assert sink.dropped_oversized == 1, (
+        f"only the incompressible event is undeliverable; dropped {sink.dropped_oversized}"
+    )
+    assert sizes[-1] <= limit, "the compressible event was offered alone, and fitted"
+
+
+def test_a_lone_item_exactly_at_the_budget_is_dropped_rather_than_sent_over_it() -> None:
+    """`_event_ceiling` subtracts the body reserve, which is the one case a body could overrun.
+
+    `_take` yields a lone item whatever the budget, so an item admitted at exactly
+    `max_batch_bytes` produced a body that much plus the framing no item is charged for — one
+    byte for a JSON array, fourteen for Loki. Reverting this passed the entire suite.
+    """
+    opener = FakeOpener()
+    event = {"a": "x" * 40}
+    size = len(json.dumps(event).encode()) + 1
+    sink = HTTPSink("http://x", body_format="json_array", max_batch_bytes=size, opener=opener)
+    sink.emit([event])
+    assert opener.calls == [], "an item that cannot fit once framed is dropped, not overrun"
+    assert sink.dropped_oversized == 1
+
+    roomy = HTTPSink(
+        "http://x", body_format="json_array", max_batch_bytes=size + 1, opener=(ok := FakeOpener())
+    )
+    roomy.emit([event])
+    assert len(ok.calls) == 1, "one more byte of budget and it ships"
+    assert len(ok.calls[0]["body"]) <= size + 1
+
+
+def test_a_multi_item_chunk_at_the_reduction_bound_is_reported_not_discarded() -> None:
+    """The backstop path: those events were never individually refused, so they are not drops.
+
+    Reaching it needs a `_item_size` that does not shrink with the budget, which no shipped sink
+    has — but a backstop nothing exercises is a backstop that rots. Discarding here would count
+    events as permanently undeliverable on the strength of a chunk-level refusal, inventing loss
+    and inflating `dropped`, whose contract is an exact count.
+    """
+
+    class BadlySized(HTTPSink):
+        def _item_size(self, rendered: str, event: dict[str, object]) -> int:
+            """Reports every item as free, so no reduction ever shrinks a chunk.
+
+            Args:
+              rendered: Unused.
+              event: Unused.
+
+            Returns:
+              Zero.
+
+            Raises:
+              None.
+            """
+            return 0
+
+    opener = FakeOpener([FakeResponse(413, b"")])
+    sink = BadlySized("http://x", max_retries=0, max_batch_count=8, opener=opener)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": i} for i in range(20)])
+    assert sink.dropped_oversized == 0, (
+        "events refused only as part of a chunk are not permanent per-event drops"
+    )
+    assert sink.losses().failed == 0, "nor abandoned requests; the batch itself is the failure"
+    assert len(opener.calls) <= MAX_BUDGET_REDUCTIONS + 8, "and the search still terminated"

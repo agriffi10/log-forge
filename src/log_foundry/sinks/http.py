@@ -57,7 +57,7 @@ already been rejected. Halving what was refused reaches it immediately.
 
 Twenty-four is a backstop, not a policy limit: the loop terminates on its own, because a chunk
 reduced to a single item takes the permanent-drop path instead. It exists against a pathological
-``size_of``, which is why it sits far above what any real destination requires.
+``_item_size``, which is why it sits far above what any real destination requires.
 """
 
 
@@ -175,11 +175,14 @@ class HTTPSink:
     pause on all log delivery, and a large enough backlog of failing chunks can outlast
     ``shutdown()``'s own timeout, which then expires and leaves the sink open by SPEC-027
     FR-004's rule. What bounds it is ``shutdown(timeout=)`` itself, plus
-    ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the destination is what keeps the chunk
-    count low in the first place. Nothing here consults the stop signal to shorten its own work —
-    a revision that did was measured to disable both retries and the ``413`` search for the whole of
-    ``Worker._final_drain``, since the stop event is set before the join, losing events that had
-    been delivering.
+    ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the
+    destination is what keeps the chunk count low in the first place. Nothing here *skips* work
+    because a shutdown is in
+    progress — a revision that did was measured to disable both retries and the ``413`` search
+    for the whole of ``Worker._final_drain``, since the stop event is set before the join, losing
+    events that had been delivering. The signal is read at exactly one site,
+    :meth:`_sleep_backoff`, where SPEC-027 has it cut a *wait* short rather than cancel an
+    attempt.
 
     Attributes:
       MAX_BATCH_COUNT: Entries one request may carry. A subclass overrides it with its
@@ -305,7 +308,7 @@ class HTTPSink:
         reductions = index = chunks = settled = 0
         while index < len(items):
             chunk = self._take(items, index, budget)
-            if len(chunk) == 1 and refused_at is not None and chunk[0].size >= refused_at:
+            if self._known_refused(chunk, refused_at):
                 self._drop_refused(chunk)
                 chunks += 1
                 settled += 1
@@ -314,14 +317,17 @@ class HTTPSink:
             try:
                 delivered = self._deliver(chunk)
             except _PayloadTooLarge as refusal:
-                refused_at = min(refused_at or refusal.size, refusal.size) or None
+                refused_at = (
+                    refusal.size if refused_at is None else min(refused_at, refusal.size)
+                )
                 if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
                     budget = max(min(budget, refusal.size) // 2, 1)
                     reductions += 1
                     continue
-                self._drop_refused(chunk)
                 chunks += 1
-                settled += 1
+                if len(chunk) == 1:
+                    self._drop_refused(chunk)
+                    settled += 1
                 index += len(chunk)
                 continue
             chunks += 1
@@ -329,6 +335,38 @@ class HTTPSink:
             index += len(chunk)
         if chunks and not settled:
             raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
+
+    def _known_refused(self, chunk: list[_Item], refused_at: int | None) -> bool:
+        """Reports whether this chunk is provably no smaller than one already refused.
+
+        Only a lone item qualifies: a multi-item chunk can still be reduced, and reducing is
+        cheaper than discarding. The point is to stop the tail of a hopeless ``emit`` becoming
+        one request per event once the budget has fallen below a single item.
+
+        **It is disabled under ``gzip``**, and that is the whole subtlety. ``_PayloadTooLarge``
+        carries the *uncompressed* length, because that is what this sink measures and chunks by,
+        while a gzipped request is judged by the destination on its compressed bytes. Compression
+        ratio is per-event, so "larger uncompressed" stops implying "also refused": measured, one
+        incompressible event set the mark at 441 bytes and a 6,021-byte event that gzipped to 64
+        — against a 200-byte limit — was discarded without a single request being made. That is
+        loss the library invented rather than loss it reported, which is what SPEC-025 and
+        SPEC-026 exist to prevent, and it also inflated ``dropped``, whose contract is an exact
+        count. Comparing like with like would mean gzipping each candidate purely to decide
+        whether to ask, which costs more than the request it saves.
+
+        Args:
+          chunk: The chunk about to be sent.
+          refused_at: The smallest body this ``emit`` has seen refused, or ``None``.
+
+        Returns:
+          True when the chunk can be discarded without offering it.
+
+        Raises:
+          None.
+        """
+        if self.gzip or refused_at is None or len(chunk) != 1:
+            return False
+        return chunk[0].size >= refused_at
 
     def _take(self, items: list[_Item], start: int, budget: int) -> list[_Item]:
         """Fills one chunk from ``start`` under the count limit and the current byte budget.
@@ -361,14 +399,19 @@ class HTTPSink:
         return items[start:end]
 
     def _drop_refused(self, chunk: list[_Item]) -> None:
-        """Discards a chunk the destination refuses at any size this sink can offer.
+        """Discards a single item the destination refuses at the smallest request possible.
 
-        Reached when the budget can be reduced no further — in practice when the chunk is a
-        single item, since the reduction loop keeps halving until it is. Such an event is larger
-        than the destination will ever accept, which is permanent: it is counted against
+        Only ever called with one item, which is what makes the drop honest: that event was
+        offered alone and refused, so it is permanently undeliverable here. It is counted against
         ``dropped_oversized`` and the chunk reports *settled*, because a retry would re-run the
-        identical search and re-count the identical drops. That is why ``dropped`` can stay an
+        identical search and re-count the identical drops — that is why ``dropped`` can stay an
         exact count while ``failed`` is only an upper bound.
+
+        A *multi*-item chunk reaching the end of the reduction budget is deliberately **not**
+        routed here. It needs a pathological ``_item_size`` to happen at all (measured: an
+        override returning zero abandoned 20 events in whole chunks), and those events were never
+        individually refused, so counting them as permanent drops would be loss the library
+        invented. They are left unsettled and reach the worker as the failure they are.
 
         Args:
           chunk: The refused items.
@@ -436,7 +479,7 @@ class HTTPSink:
 
         Returns:
           The smaller of the chunk budget and any per-event limit the destination publishes. The
-          *chunk* budget rather than the raw configured one, because ``chunk_items`` yields a
+          *chunk* budget rather than the raw configured one, because :meth:`_take` yields a
           lone oversized item regardless of budget, so an item admitted here at exactly
           ``max_batch_bytes`` produced a body that much plus :meth:`_body_reserve` — the one case
           where a body could still sit above the budget.
@@ -496,7 +539,7 @@ class HTTPSink:
         budget from 1,000,000 to 44,345 permanently, and a five-minute proxy misconfiguration
         left a healthy sink issuing 200 requests where it had issued one. It also made the
         depth-bound abandonment recoverable-by-retry while the code reported it settled. The
-        rediscovery it saved is real but is bounded by ``MAX_SPLIT_DEPTH`` and only arises
+        rediscovery it saved is real but is bounded by ``MAX_BUDGET_REDUCTIONS`` and only arises
         against a destination whose limit is below the configured budget, which has a direct
         remedy: pass ``max_batch_bytes=``.
 
@@ -686,7 +729,7 @@ class HTTPSink:
                     continue
                 self._abandon(
                     f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip(),
-                    retries + 1,
+                    attempt + 1,
                 )
             if 200 <= status < 300:
                 return payload
@@ -695,7 +738,7 @@ class HTTPSink:
                 continue
             if status == 413 and splittable:
                 raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413", len(body))
-            self._abandon(f"HTTP {status}", retries + 1)
+            self._abandon(f"HTTP {status}", attempt + 1)
         raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
 
     def _prepare(
@@ -822,8 +865,9 @@ class HTTPSink:
             HTTP status, an exception type, an ``errno`` — never a server-supplied body or an
             exception's text (SPEC-029 FR-002), and it is also the raised error's message for
             the same reason.
-          attempts: How many attempts were actually made, which is one when a shutdown suppressed
-            the retries and is therefore passed in rather than derived from ``max_retries``.
+          attempts: How many requests were actually made. Passed in rather than derived from
+            ``max_retries``, because a non-retryable status abandons on the first attempt: the
+            derived form reported "4 attempt(s)" for an HTTP 400 that was sent once.
 
         Returns:
           Never returns.
