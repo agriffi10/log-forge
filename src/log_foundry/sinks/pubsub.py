@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 from log_foundry import _diag
@@ -16,7 +17,18 @@ DEFAULT_OVERFLOW_TIMEOUT = 30.0
 
 Thirty matches ``DEFAULT_MAX_RETRY_AFTER``: it is long enough that an ordinary publish settles
 inside it, and short enough that the single drain thread is never held past what
-``shutdown()``'s own budget allows.
+``shutdown()``'s own budget allows. It bounds the **whole** overflow pass of one ``emit``, not
+each future in it — per-future it would be thirty seconds times however many futures are over
+the limit, which is not a bound at all.
+"""
+
+_POLL_INTERVAL = 0.05
+"""Longest single wait on one future, so a shutdown is noticed within it (SPEC-027).
+
+The deadline bounds the *total*, but a client honouring a 30-second timeout on one future
+blocks for all thirty regardless — measured, a shutdown 0.05 s into an emit went unnoticed for
+10 s. Waiting in slices makes the stop signal effective within one slice, which is the
+"interruptible" half of SPEC-027's rule; the deadline is the "bounded" half.
 """
 
 DEFAULT_MAX_PENDING = 1000
@@ -53,9 +65,12 @@ class GooglePubSubSink:
     with the total number of events logged, and because ``result()`` ran only at ``close``,
     ``failed`` stayed at zero and ``health()`` reported clean through an entire Pub/Sub outage.
     Each ``emit`` now reaps whatever has settled and holds at most ``max_pending`` outstanding
-    **between emits**: the reap runs once at the end of a call, so one ``emit`` of 6,000 events
-    peaks at 5,999 futures before the reap trims it. What the bound rules out is growth with the
-    total number of events the process has ever logged, which is what FR-004 is about.
+    **between emits, while the client is resolving**. Two documented exceptions: the reap runs
+    once at the end of a call, so one ``emit`` of 6,000 events peaks at 5,999 futures before it
+    trims; and against a client resolving nothing at all the list grows by a batch per emit,
+    because :meth:`_await_overflow` puts back what its bounded wait did not outlast rather than
+    discarding it. What the bound rules out is growth with the total number of events a *healthy*
+    process has logged, which is what FR-004 is about.
 
     Attributes:
       max_pending: Outstanding futures held between emits before ``emit`` waits on the oldest.
@@ -250,16 +265,24 @@ class GooglePubSubSink:
 
         The wait is **bounded and interruptible**, per SPEC-027. This runs inside ``emit`` on the
         worker's single drain thread, so an unbounded ``result()`` here is a pause on all log
-        delivery that ``shutdown()`` cannot cut short — measured, an ``emit`` still running after
-        a second with no stop signal reaching it, because this sink had no
-        ``log_foundry_stop_signal`` for the worker to set. Before FR-004 the only blocking
+        delivery that ``shutdown()`` cannot cut short. Before FR-004 the only blocking
         ``result()`` was in ``close``, where such a wait belongs.
 
+        **One deadline covers the whole list, and the stop signal is re-read each time round.**
+        A per-*future* timeout is not a bound: with the shipped 30 s and ten futures over the
+        limit, one ``emit`` blocked for five minutes, and a shutdown landing mid-loop was not
+        noticed until every future had been waited on — measured at 5.04 s for a signal set after
+        0.3 s. Both were regressions against a version of this sink that never blocked at all.
+
         A future the wait does not outlast is **put back**, not counted: it may still land, and
-        ``close`` resolves whatever remains. The bound is therefore a bound on the *list between
-        emits*, and briefly exceeding it beats blocking delivery indefinitely. A shutdown skips
-        the wait entirely for the same reason — nothing is lost by deferring it to ``close``,
-        which is the opposite of skipping *work* during a drain.
+        ``close`` resolves whatever remains. That has a consequence worth stating rather than
+        hiding, because it is a real limit: against a client that resolves *nothing*, the pending
+        list grows by a batch per emit (measured 10 → 60 over six emits) and the ``max_pending``
+        bound stops holding. Nothing better is available — the three properties "never invent
+        loss", "never block delivery indefinitely" and "bound memory" cannot all hold when the
+        destination has stopped answering, and the first two are the ones this library is for.
+        The growth is a symptom of the outage, every event in it is still accounted for, and
+        ``losses()`` reports what resolves.
 
         Args:
           overflow: The oldest outstanding futures, already removed from the pending list.
@@ -272,15 +295,21 @@ class GooglePubSubSink:
         """
         if not overflow:
             return
-        stop = self.log_foundry_stop_signal
-        if stop is not None and stop.is_set():
-            unresolved = overflow
-        else:
-            unresolved = [
-                future
-                for future in overflow
-                if not self._resolve(future, self.overflow_timeout)
-            ]
+        deadline = time.monotonic() + self.overflow_timeout
+        unresolved: list[Any] = []
+        for index, future in enumerate(overflow):
+            settled = False
+            while not self._out_of_time(deadline):
+                slice_ = min(deadline - time.monotonic(), _POLL_INTERVAL)
+                if self._resolve(future, slice_):
+                    settled = True
+                    break
+            if settled:
+                continue
+            unresolved.append(future)
+            if self._out_of_time(deadline):
+                unresolved.extend(overflow[index + 1 :])
+                break
         if not unresolved:
             return
         with self._futures_lock:
@@ -289,6 +318,26 @@ class GooglePubSubSink:
                 return
         for future in unresolved:
             self._resolve(future)
+
+    def _out_of_time(self, deadline: float) -> bool:
+        """Reports whether the overflow pass must stop, on the deadline or on a shutdown.
+
+        The stop signal is read here rather than once before the loop: read once, a shutdown
+        arriving mid-pass was not noticed until every future had been waited on.
+
+        Args:
+          deadline: The monotonic time the pass may not run past.
+
+        Returns:
+          True when no further waiting may happen.
+
+        Raises:
+          None.
+        """
+        if time.monotonic() >= deadline:
+            return True
+        stop = self.log_foundry_stop_signal
+        return stop is not None and stop.is_set()
 
     def _resolve(self, future: Any, timeout: float | None = None) -> bool:
         """Waits for one publish to settle, counting and announcing a failure.
@@ -302,6 +351,14 @@ class GooglePubSubSink:
           True when the future settled, False when a *bounded* wait expired with it still in
           flight. An expired wait is not a failure and moves no counter: the publish is
           unfinished, not unconfirmed.
+
+          A ``TypeError`` from a *bounded* call is read the same way, because a future whose
+          ``result()`` takes no ``timeout`` cannot be waited on within one: counting it would
+          invent loss on a publish that was going to succeed, which an injected ``client=`` makes
+          reachable (measured: three of four healthy publishes reported ``failed`` with a
+          ``TypeError`` line). It is put back and resolved unbounded at ``close`` instead. A
+          genuine ``TypeError`` from the publish itself takes the same route and is counted
+          there, so nothing is lost either way.
 
           A ``TimeoutError`` is only read that way when this call set a timeout. With none set —
           which is every call from ``close`` — it is the client reporting that the publish itself
@@ -318,7 +375,7 @@ class GooglePubSubSink:
         try:
             future.result() if timeout is None else future.result(timeout=timeout)
         except Exception as err:
-            if timeout is not None and isinstance(err, TimeoutError):
+            if timeout is not None and isinstance(err, TimeoutError | TypeError):
                 return False
             with self._counter_lock:
                 self.failed += 1

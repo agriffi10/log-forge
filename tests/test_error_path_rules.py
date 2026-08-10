@@ -22,11 +22,15 @@ Two design notes, because each is the kind of thing that rots:
 
 The shape matched is `self.<attr>.<method>(...)` -- a call on something reached *through* `self`.
 The bounds, stated in full because a rule that oversells its coverage is worse than one that
-admits it (all four verified absent from `src/` today):
+admits it. All are verified absent from `src/` today **except the first**, which has exactly one
+instance:
 
-- **`finally` is out of scope.** The rule's own rationale applies verbatim to a `finally`, and
-  the package has one driver cleanup in that shape (`nats.py`'s `self._loop.close()`). Widening
-  is a judgement call this FR did not make; it is named here so the gap is a decision.
+- **A `finally` block is out of scope**, and so is a nested `try` whose own handler is too
+  narrow to catch what the cleanup raises (`except ValueError` around a `rollback()` that can
+  raise a `TypeError`). The rule's rationale applies verbatim to both. The package has one
+  driver cleanup in a `finally` — `nats.py`'s `self._loop.close()` — so this bound is the one
+  with a live instance. Widening is a judgement call this FR did not make; it is named here so
+  the gap is a decision rather than an oversight.
 - **Deeper chains and calls in the chain** -- `self._client.connection.rollback()`,
   `self.connection().rollback()` -- do not match the two-level shape.
 - **A module-level object** (`MODULE_CONN.rollback()`) is not reached through `self`.
@@ -106,11 +110,15 @@ def _unguarded_cleanup_calls(root: pathlib.Path) -> list[str]:
     """
     offenders: list[str] = []
     for path, handler in _except_handlers(root):
+        # The nested try's *body* only. Walking the whole `ast.Try` also swallowed its own
+        # `finally` and `else`, which its handler does not protect, so a cleanup written there
+        # read as guarded when it is not. Narrowing costs no false positive against `src/`.
         guarded = {
             id(sub)
             for node in ast.walk(handler)
             if isinstance(node, ast.Try)
-            for sub in ast.walk(node)
+            for stmt in node.body
+            for sub in ast.walk(stmt)
         }
         for node in ast.walk(handler):
             if not isinstance(node, ast.Call) or id(node) in guarded:
@@ -196,3 +204,43 @@ def test_the_rule_rejects_a_real_module_that_reintroduces_the_shape(tmp_path) ->
     offenders = _unguarded_cleanup_calls(tmp_path)
     assert len(offenders) == 1, f"expected exactly the unguarded rollback, got {offenders}"
     assert "newsink.py" in offenders[0] and "rollback" in offenders[0]
+
+
+def test_a_cleanup_in_a_nested_finally_is_not_treated_as_guarded(tmp_path) -> None:
+    """A nested `try`'s handler protects its *body*, not its `finally` or its `else`.
+
+    Walking the whole `ast.Try` for the guarded set swallowed all three, so a cleanup written in
+    a `finally` inside an `except` read as guarded when nothing catches it. The package's own
+    `finally` cleanups sit outside any `except` and so are out of scope for a different reason,
+    named in this module's docstring.
+    """
+    (tmp_path / "newsink.py").write_text(
+        '"""A sink whose cleanup hides in a nested finally."""\n'
+        "\n"
+        "class FinallySink:\n"
+        '    """The rollback is in a finally, which the nested handler does not protect."""\n'
+        "    def emit(self, batch):\n"
+        "        try:\n"
+        "            self._conn.execute(batch)\n"
+        "        except Exception:\n"
+        "            try:\n"
+        "                pass\n"
+        "            finally:\n"
+        "                self._conn.rollback()\n"
+        "\n"
+        "class ElseSink:\n"
+        '    """Likewise for an else clause."""\n'
+        "    def emit(self, batch):\n"
+        "        try:\n"
+        "            self._conn.execute(batch)\n"
+        "        except Exception:\n"
+        "            try:\n"
+        "                pass\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "            else:\n"
+        "                self._conn.close()\n",
+        encoding="utf-8",
+    )
+    offenders = _unguarded_cleanup_calls(tmp_path)
+    assert len(offenders) == 2, f"both shapes must be reported, got {offenders}"
