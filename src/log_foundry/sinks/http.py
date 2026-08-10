@@ -177,9 +177,9 @@ class HTTPSink:
     FR-004's rule. What bounds it is ``shutdown(timeout=)`` itself, plus
     ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the
     destination is what keeps the chunk count low in the first place. Nothing here *skips* work
-    because a shutdown is in progress — a revision that did was measured to disable both retries and the ``413`` search
-    for the whole of ``Worker._final_drain``, since the stop event is set before the join, losing
-    events that had been delivering. The signal is read at exactly one site,
+    because a shutdown is in progress — a revision that did was measured to disable both retries
+    and the ``413`` search for the whole of ``Worker._final_drain``, since the stop event is set
+    before the join, losing events that had been delivering. The signal is read at one site,
     :meth:`_sleep_backoff`, where SPEC-027 has it cut a *wait* short rather than cancel an
     attempt.
 
