@@ -1,4 +1,8 @@
-# Spec: Shutdown and Fork Lifecycle
+# Spec: Shutdown Lifecycle
+
+~~Shutdown **and Fork** Lifecycle~~ — the fork half is SPEC-039. The **filename keeps `-and-fork-`**
+deliberately: it is what every link, commit message and delivery doc in the arc already points at,
+and a rename to tidy a title would break them to save nothing.
 
 **ID:** SPEC-035  
 **Status:** Completed  
@@ -38,8 +42,9 @@ Lock ordering, counter synchronisation and `contextvars` were audited alongside 
 - **Making the orphan path non-blocking**, or any other item in `architecture.md` §13's recorded
   constraints. Those are accepted trades, not defects.
 - **Restarting a worker after a terminal failure.** SPEC-019 settled that a thread which
-  resurrects itself fights a process trying to exit. FR-004 rebuilds a worker after a **fork**,
-  which is a different event: the process is new, and nothing is trying to exit.
+  resurrects itself fights a process trying to exit. ~~FR-004 rebuilds a worker after a **fork**~~
+  — that distinction moved to SPEC-039 with the fork FR, and it was mis-numbered here in any case
+  (FR-005, not FR-004). Nothing in this spec rebuilds a worker.
 - **`shutdown()`'s unbounded close of the live sink.** Recorded in §13, and narrowing it needs
   the sink contract to change (SPEC-027 FR-004).
 - **The stderr write under `_worker_lock`** (audit C5). An error path only, and the fix —
