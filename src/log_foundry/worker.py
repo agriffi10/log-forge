@@ -128,8 +128,12 @@ class Health:
         still holds its resources. It is deliberately a live read rather than a count of expired
         joins: a slow close and a stuck one are indistinguishable at the moment a join expires,
         and SPEC-028 reverted a design that guessed.
-      inherited_sink: Whether this process would deliver to a sink it may not release — one it
-        inherited across a ``fork`` (SPEC-042 FR-004). **The referent is one object, named
+      inherited_sink: Whether the sink this process **last installed for delivery** is one it
+        may not release — one it inherited across a ``fork`` (SPEC-042 FR-004). "Last
+        installed", not "would deliver to now": after ``shutdown()`` the process delivers
+        nowhere, and reporting ``True`` there is the point rather than a wrinkle, since an
+        inherited sink left open at exit is exactly what this explains. **The referent is one
+        object, named
         here because SPEC-033 measured three candidates disagreeing**: the worker's sink if a
         worker exists, else the sink the orphan path recorded, else the configured one. It
         describes that object and *not* the graph beneath it, so a child that wraps an

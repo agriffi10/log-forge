@@ -351,7 +351,8 @@ def _mark_inherited() -> None:
         either way**: a sink that returned from its hook provably holds its own transport, and a
         walk that failed is no reason to refuse it forever — which is the outcome
         :func:`reclaim`'s own docstring says a ``setdefault`` would wrongly cause. The ceiling
-        path already reached it; the exception path did not, and the two differed silently. The outer guard is for a fault
+        path already reached it; the exception path did not, and the two differed silently.
+        The outer guard is for a fault
         in this function's own frame — resolving the roots, or an object whose ``__class__``
         property raises, which makes ``isinstance`` raise here. Not a hostile *metaclass*: a
         value's ``__instancecheck__`` is never consulted, since ``Sink``'s own ``_ProtocolMeta``

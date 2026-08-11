@@ -138,6 +138,11 @@ class FileSink:
         taking it could only wait on a holder that cannot exist. A hook that blocks here blocks a
         child that has not yet returned from ``fork``, where no watchdog can reach it.
 
+        A **closed** sink returns without re-acquiring anything, which is a trivially true claim
+        rather than an empty one: there is no transport left to hold, so nothing a later close
+        could destroy. Stated because ``sinks/base.py`` says returning normally *is* the claim,
+        and this is the one shipped sink that can return having done nothing.
+
         Args:
           None.
 

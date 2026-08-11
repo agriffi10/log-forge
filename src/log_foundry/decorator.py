@@ -729,16 +729,26 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
 
 
 def _delivering_to_an_inherited_sink() -> bool:
-    """Whether the sink this process would deliver to now is one it may not release (FR-004).
+    """Whether the sink this process last installed for delivery is one it may not release.
 
     Answerable with **no worker**, which is what makes it truthful in a process that only ever
     logs outside a span — the same refusal :func:`_worker_health` already makes for ``retired``,
     and for the same reason: standing up a thread to answer ``health()`` is forbidden.
 
-    The three candidates are asked in delivery order, because SPEC-033 measured them
-    disagreeing: the worker's sink if a worker exists, else the sink an orphan emit reached,
-    else the configured one. With no sink resolved at all there is nothing to deliver to and
-    nothing inherited, so the answer is ``False`` rather than a guess.
+    The three candidates are asked in delivery order: the worker's sink if a worker exists,
+    else the sink an orphan emit reached, else the configured one. SPEC-033's measured
+    disagreement is worker-versus-config, which the **first** term already covers — and the
+    second cannot currently produce a distinct answer, because with no worker ``_orphan_sink``
+    is either ``None`` or the same object the config holds (``_swap_sink`` re-points both, and
+    where it returns early the record is ``None``). It is kept rather than removed, and recorded
+    rather than tested: every other orphan-path read in this module treats ``_orphan_sink`` as
+    the authority on which sink an emit reached, and dropping it here would make one site read
+    the config while its neighbours read the record — resting on a property of ``_swap_sink``'s
+    current body that nothing states as an invariant. A test would have to arrange an
+    unreachable state by hand, which is the fixture-built vacuity this repo keeps finding.
+
+    With no sink resolved at all there is nothing installed and nothing inherited, so the answer
+    is ``False`` rather than a guess.
 
     Args:
       None.

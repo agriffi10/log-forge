@@ -2579,6 +2579,10 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
     assert "absorbed a failure while re-acquiring a transport after a fork" in announced
     assert "(RuntimeError)" in announced
     assert "_RaisesOnReacquire may write the parent's pending bytes again" in announced
+    assert "and this child will not release it" in announced, (
+        "SPEC-042 FR-005 AC-4: a failed re-acquisition is not a claim, so the consequence is "
+        "also that the sink stays unreleasable here — the line has to say both"
+    )
 
 
 class _BareSink:

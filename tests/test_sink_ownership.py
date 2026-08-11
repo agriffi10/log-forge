@@ -1311,3 +1311,39 @@ def test_a_marking_walk_that_fails_still_honours_a_re_acquisition(
         assert _lifecycle.releasable(sink) is True, "and the re-acquisition still counted"
     finally:
         _lifecycle._marking_failed = False
+
+
+def test_the_reacquired_roster_is_empty_when_the_repair_walk_starts() -> None:
+    """The rebind is the belt to `_FORK_SKIP`'s brace, and only this pins it.
+
+    Moving the rebind back after the walk survives the entire suite while the opt-out stands --
+    the two are deliberately redundant, so behaviour cannot distinguish them. A claim that only
+    behaviour could reach is a claim nothing checks, and this exact docstring was false and
+    untested one round ago: it said "at the start of every child repair" while rebinding in the
+    middle. So the assertion is made where the claim is, at the walk's entry.
+    """
+    observed: list[int] = []
+    original = _fork._reinit_primitives
+
+    def spy() -> list[object]:
+        observed.append(len(_fork.reacquired_in_child))
+        return original()
+
+    import tempfile
+
+    from log_foundry.sinks.file import FileSink
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log_foundry.configure(service="own", sink=FileSink(f"{tmp}/pin.log"))
+        _fork._reinit_primitives = spy  # type: ignore[assignment]
+        try:
+            _fork._reinit_after_fork()
+            assert _fork.reacquired_in_child, "the precondition: this fork did populate a roster"
+            _fork._reinit_after_fork()
+        finally:
+            _fork._reinit_primitives = original  # type: ignore[assignment]
+
+    assert observed == [0, 0], (
+        f"the walk saw a non-empty roster on entry: {observed}. The previous generation's sinks "
+        "are then re-collected, their hooks re-run, and the reclaim stamps them for this pid"
+    )
