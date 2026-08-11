@@ -20,6 +20,36 @@ _WHEN_SECONDS = {
 }
 
 
+def _reopen_discarding(stream: TextIO, path: str, encoding: str) -> TextIO:
+    """Strands an inherited stream's pending bytes and returns a fresh one on the same path.
+
+    ``os.dup2`` points the inherited descriptor at ``os.devnull`` **before** the replacement is
+    opened, so the buffer this process inherited can only ever reach the null device — whether
+    it is flushed deliberately, by the interpreter at exit, or by the garbage collector when
+    the old object is dropped. Reopening rather than reusing the descriptor is what gives the
+    child a stream of its own, and it picks up the currently active file if the parent rotated.
+
+    Args:
+      stream: The inherited stream, still holding whatever the parent had not flushed.
+      path: The file to reopen in append mode.
+      encoding: The text encoding to open it in.
+
+    Returns:
+      The replacement stream.
+
+    Raises:
+      OSError: If the descriptor cannot be redirected or the path cannot be reopened.
+      ValueError: If the stream has no usable descriptor, which means there is no inherited
+        buffer this can strand and the caller must not carry on as though there were.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, stream.fileno())
+    finally:
+        os.close(devnull)
+    return open(path, "a", encoding=encoding)
+
+
 class FileSink:
     """A :class:`~log_foundry.sinks.base.Sink` that appends events as NDJSON to one file.
 
@@ -83,6 +113,35 @@ class FileSink:
             for event in batch:
                 self._stream.write(json.dumps(event) + "\n")
             self._stream.flush()
+
+    def discard_buffered_after_fork(self) -> None:
+        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+
+        ``emit`` writes a whole batch into a **buffered** stream and flushes once at the end, so
+        a fork landing inside it leaves both processes holding the same pending bytes and both
+        writing them: measured, the event at the fork point appeared on disk twice. Without a
+        ``before`` handler there is nowhere to empty the buffer from (FR-001), so the child
+        strands it instead — the parent's copy is untouched and still reaches disk exactly once.
+
+        No lock is taken, for the reason ``decorator._rebuild_worker_after_fork`` gives: there is
+        one thread here by construction, and the lock was re-initialised moments earlier, so
+        taking it could only wait on a holder that cannot exist. A hook that blocks here blocks a
+        child that has not yet returned from ``fork``, where no watchdog can reach it.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the descriptor cannot be redirected or the file cannot be reopened.
+          ValueError: If the stream has no usable descriptor. ``_fork`` absorbs and announces
+            either, since a child that cannot strand its buffer still has working locks.
+        """
+        if self._closed:
+            return
+        self._stream = _reopen_discarding(self._stream, self._path, self._encoding)
 
     def close(self) -> None:
         """Flushes and closes the file handle, with a second call a no-op (FR-001).
@@ -220,6 +279,34 @@ class RotatingFileSink:
                 self._stream.write(line)
                 self._size += data
             self._stream.flush()
+
+    def discard_buffered_after_fork(self) -> None:
+        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+
+        Identical to :meth:`FileSink.discard_buffered_after_fork` and measured on this class
+        too, because the window is the same one: a whole batch written into a buffered stream
+        and flushed once at the end.
+
+        ``_size`` is deliberately left as the parent set it. It counts bytes this sink believes
+        are in the active file, and the moment two processes append to one path that is an
+        approximation whichever way it is computed (FR-005 AC-1) — re-reading the file's size
+        here would claim a precision a shared handle cannot support, and the only consequence of
+        the stale count is a rotation that fires marginally early.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the descriptor cannot be redirected or the file cannot be reopened.
+          ValueError: If the stream has no usable descriptor. ``_fork`` absorbs and announces
+            either, since a child that cannot strand its buffer still has working locks.
+        """
+        if self._closed:
+            return
+        self._stream = _reopen_discarding(self._stream, self._path, self._encoding)
 
     def close(self) -> None:
         """Flushes and closes the active handle, with a second call a no-op (FR-002).
