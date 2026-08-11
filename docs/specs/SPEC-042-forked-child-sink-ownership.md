@@ -1,7 +1,7 @@
 # Spec: Forked-Child Sink Ownership
 
 **ID:** SPEC-042  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-11  
 **Depends On:** SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039
 

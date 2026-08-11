@@ -500,14 +500,17 @@ decorated call ends
      stops a sink's `log_foundry_stop_signal` drifting from the worker's `_stop`. An AST lint
      forbids building a primitive anywhere the walk cannot write it back, so a lock added by a
      later spec is picked up with no edit.
-  2. **Discard inherited buffered writes.** A fork landing inside `emit`, after the write loop
+  2. **Re-acquire what can be re-acquired.** A fork landing inside `emit`, after the write loop
      and before the flush, leaves both processes holding the same pending bytes; the child
      strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
-     optional `reacquire_after_fork()` hook `sinks/base.py` documents (§8).
-  3. **Run the registered handlers**, `decorator`'s worker rebuild among them. The worker is
-     rebuilt **in place** with a fresh queue and zeroed counters, so ownership guards keyed on
-     `_worker.sink is X` survive; a retired parent forks a retired child, since a fork does not
-     undo a `shutdown()`.
+     optional `reacquire_after_fork()` hook `sinks/base.py` documents (§8). The name says the
+     larger half (SPEC-042 FR-005): a sink that returns from it has claimed the transport as
+     **this process's own**, which is what makes releasing it safe later. Which hooks returned
+     is published, not acted on — ownership is `_lifecycle`'s.
+  3. **Run the registered handlers**, `_lifecycle`'s inherited-sink marking first and
+     `decorator`'s worker rebuild after it. The worker is rebuilt **in place** with a fresh
+     queue and zeroed counters, so ownership guards keyed on `_worker.sink is X` survive; a
+     retired parent forks a retired child, since a fork does not undo a `shutdown()`.
 
   The order is the whole of it: a lock re-initialised *after* a handler that takes it is a
   handler that hangs, on the child's only thread with nothing left to interrupt it. Nothing is
@@ -515,21 +518,27 @@ decorated call ends
   `PyOS_AfterFork_Child` only), so the child handler has to be sufficient regardless, and a
   parent-side handler would buy a partial fix for a measured 1.20 s hold on the forking thread.
 
-  **What the fork does not reach is the caller's, and a shared sink is the sharpest case.** The
-  child inherits the parent's sink *object* — one socket, one SQLite handle, one file, two
-  processes — and beyond the buffer discard the library neither clones nor re-opens it. It does
-  **close** it, twice over: each process closes its own copy at exit, and a `configure(sink=…)`
-  in the child closes the inherited one immediately, because the swap SPEC-030 built cannot see
-  that the object it is retiring is still another process's transport (measured — both are
-  recorded in §13). That is harmless for an append-only file and destructive for a connection,
-  where `close()` is protocol-visible: a measured probe had the child's `configure()` send the
-  goodbye and the *parent's* next write fail with `ECONNRESET`.
+  **The child's contract is three verbs: repair, deliver, and release only what it acquired
+  here** (SPEC-042). The first two are the steps above. The third is the one a fork makes
+  non-obvious: the child inherits the parent's sink *object* — one socket, one SQLite handle,
+  one file, two processes — and beyond the re-acquisition the library neither clones nor
+  re-opens it, so closing it is the parent's transport going away. It used to do exactly that,
+  twice over (§13, both struck). Now the library records which process was **handed** each sink,
+  at `configure()` and at the lazy default, and every close it performs consults that record —
+  the three lifecycle sites and the five shipped wrapper sinks alike. A child refuses the object
+  it inherited and closes the one it built itself.
 
-  So the remedy is not "reconfigure in the child" — it is **do not build a connection-holding
-  sink before the fork at all.** Call `configure()` only in the worker process (gunicorn's
-  `post_fork`, never preload) and leave the master unlogged, or give the master a sink whose
-  `close()` costs nothing to share. `README.md` says the same where a user deploying prefork
-  will find it. Third-party state is out of scope by construction — a driver's locks, threads
+  **Unrecorded has to be unclaimable, not merely unreleasable**, which is why the child marks
+  what it inherited *before* any handler runs. Write-once alone defends only a record that
+  already exists, so where the parent's walk recorded nothing a child could `configure()` its
+  way into genuine ownership and destroy the transport legitimately — measured, through a
+  third-party wrapper the stamp walk may not descend into.
+
+  The deployment advice survives as the **recommendation** rather than as an "or else": build a
+  connection-holding sink in the worker process. Call `configure()` from gunicorn's `post_fork`
+  rather than at preload, or give the master a sink whose `close()` costs nothing to share.
+  `README.md` says the same where a user deploying prefork will find it. Reconfiguring in the
+  child is no longer harmful; it is simply one process fewer sharing a connection. Third-party state is out of scope by construction — a driver's locks, threads
   and descriptors are not the library's to swap, and reaching into them would be a fork fix
   that breaks a driver (§13).
 
@@ -1043,6 +1052,73 @@ constraint — never by being deleted quietly.
   - **A sink the application holds but never gave the library is not reached at all** — the walk
     starts from this package's modules. Same accepted boundary the locks already carry.
 
+- **A forked child releases only a transport it acquired in *this* process, and what that
+  cannot decide is listed here** (SPEC-042). The record is stamped when the library is handed a
+  sink — `configure(sink=…)` and `_ensure_sink()`'s lazy default, over the whole reachable sink
+  graph — and every close the library performs consults it. A child marks everything it
+  inherited before any fork handler runs, so "no record" is unclaimable rather than merely
+  unreleasable. Eight things it does **not** settle:
+
+  1. **A sink the parent held only in application state.** Build a connection sink at import in
+     a gunicorn master, never hand it to the library, and let the child's `post_fork` call
+     `configure(sink=that_object)`: the child is the *first* process to hand it over, so it
+     acquires it legitimately and closes the parent's transport at exit. Measured. Undecidable
+     inside the rule — FR-001 releases what it was handed, and FR-001 AC-3 requires a child's
+     configured sink to be releasable — and nothing distinguishes the two without marking the
+     whole heap. **This is the only remaining route to a destructive close**; a 17-shape
+     claiming matrix refuses everywhere else. §9's advice is the remedy.
+  2. **A sink that returns from `reacquire_after_fork()` without having re-acquired everything
+     it holds.** Returning normally *is* the claim and the library cannot check it. The reachable
+     case is inheritance: `class MySink(FileSink)` that also holds a socket inherits a hook which
+     re-opens only the file, returns, and thereby claims the whole object — measured, the child
+     then closes the parent's connection. `sinks/base.py` states the obligation; a subclass that
+     cannot honour it should define the member to raise, which is refused and therefore safe.
+     Listed here rather than with the leaks below because it is the opposite polarity — an
+     over-claim, not a refusal.
+  3. **A sink the library was never handed at all** — a wrapper mutated after `configure()`
+     walked it. Refused through that wrapper, so it leaks a handle rather than being closed on a
+     guess. No shipped sink mutates itself after `__init__` (AST-scanned).
+  4. **A re-acquired child under a refused wrapper.** Only the children implement the hook, so a
+     child inheriting `MultiSink(FileSink, FileSink)` re-stamps the two files while the wrapper
+     keeps the parent's mark and stays refused — leaving them reachable only through something
+     nothing will release. A leak; nothing is lost, since `emit` flushes per batch.
+  5. **A third-party wrapper's own `close()`.** A user's wrapper closes its children directly and
+     the library never sees the call, so the refusal cannot reach it. Same boundary SPEC-039
+     FR-005 draws; the remedy is the one §9 gives.
+  6. **The stamp walk's container bound.** It scans a container one level and does not recurse,
+     which is what keeps `configure()` at ~2 ms against a measured 1,109 ms unbounded on a
+     `MemorySink` holding 100k events. A sink two container hops below an owned holder is
+     therefore unrecorded — refused, so leaked rather than closed. Its sibling trade: the walk
+     tests sink-shaped before container-shaped, so an owned *non-sink* container subclass, and a
+     container-subclass sink's own members, lose reach there. Neither is a destructive close, and
+     the child's marking walk compensates.
+  7. **`_marking_failed` catches an escaping fault and the visit ceiling, not a partial walk.**
+     Every read inside the walk is absorbed a level down in `_fork`, so a walk that quietly
+     reached less than everything raises nothing and leaves the flag clear; the sinks it missed
+     are unrecorded rather than marked.
+  8. **The record never shrinks.** One entry per sink ever handed to the library, each pinned by
+     a strong reference — required, because an `id` is reusable once its object dies and a
+     collected sink closes itself. Startup-scale in an application, since `configure()` is a
+     startup call.
+
+  What a refused close costs, measured from the shipped `close()` bodies: `KafkaSink` and
+  `GooglePubSubSink` do not deliver their buffer, `NATSSink` does not drain its loop, and
+  `SQLiteSink` and `PostgresSink` do not **commit** — for those two the child's inserts are left
+  uncommitted on a connection the parent also holds, which is nonetheless the safer outcome,
+  since committing there writes into a transaction the parent may be mid-way through. A
+  flush-without-release hook is SPEC-036's subject, and that spec is handed this roster of five;
+  its own names two.
+
+- **`_fork._reinit_primitives` can exhaust memory, not merely hang** (SPEC-039, measured under
+  SPEC-042). Its container read is `list(container)`, so a `list` subclass with a
+  non-terminating `__iter__` reachable from any sink never returns: measured **5.7 GB RSS in
+  nine minutes**, and the parent could not kill the child because the parent was being starved.
+  SPEC-042 bounded its own two walks — the stamp walk and the child's marking walk both read
+  through a capped helper, and tripping the cap sets `_marking_failed` and refuses everything
+  unrecorded, a leak rather than a destructive close. The repair walk is unbounded still, and it
+  is SPEC-039's to change: recorded as *exhausts memory* rather than *hangs*, because the two
+  call for different operator responses.
+
 - **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
   AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,
   so one socket, one SQLite handle or one file is now written by two processes — see §9 for the
@@ -1050,13 +1126,18 @@ constraint — never by being deleted quietly.
   sentence. `RotatingFileSink` lets **both** processes rotate: a child can rename the file the
   parent is writing to, and each keeps its own `_size`, which is why the discard hook leaves
   that counter alone rather than claiming a precision a shared file cannot support. And both
-  processes hold an orphan-path close record for the same sink object, so **each closes its own
+  processes hold an orphan-path close record for the same sink object, so ~~**each closes its own
   copy at exit** — deliberately left rather than fixed, since neither side can tell whether the
-  other still needs it.
+  other still needs it~~ — **fixed by SPEC-042**: the child refuses, because the record now says
+  which process acquired the sink, and neither side has to guess.
 
-  **And a `configure(sink=…)` in the child closes the inherited sink immediately.** Measured with
-  a socket sink whose `close()` writes a goodbye the server acts on: the child's `configure()`
-  sent it and the parent's next write failed with `ECONNRESET`.
+  ~~**And a `configure(sink=…)` in the child closes the inherited sink immediately.** Measured
+  with a socket sink whose `close()` writes a goodbye the server acts on: the child's
+  `configure()` sent it and the parent's next write failed with `ECONNRESET`.~~ — **fixed by
+  SPEC-042 FR-001/FR-002.** The record is stamped when the library is *handed* a sink and
+  consulted at the one place it closes one, so a child refuses the object it inherited. Both
+  swap paths, `shutdown()`, the exit close and the five wrapper sinks all go through it; a
+  re-run of that same socket probe across eight route combinations produced no goodbye at all.
 
   Both halves of the mechanism are worth stating exactly, because this paragraph is what a later
   spec will be scoped from. **The trigger is not "the parent logged"** — it is that an emit has
@@ -1069,10 +1150,12 @@ constraint — never by being deleted quietly.
   the old sink to `_lifecycle.release(..., detached=True)` with neither drain. A process that only ever logged
   outside a span takes the second, so "there is no worker here" is not an escape.
 
-  That is why §9's remedy is "do not build a connection-holding sink before the fork" rather than
-  "rebuild it in the child": the obvious phrasing of the advice performs the damage sooner and
-  more completely than the hazard it was meant to avoid. Whether the library should instead
-  **disown** an inherited sink in the child is now **SPEC-042**, which settles it on the
+  §9's remedy stayed "do not build a connection-holding sink before the fork" rather than
+  "rebuild it in the child" *because* the obvious phrasing of the advice performed the damage
+  sooner and more completely than the hazard it avoided. **That is no longer true** — SPEC-042
+  made reconfiguring in the child harmless — so the advice survives as the better deployment
+  rather than as an "or else". Whether the library should **disown** an inherited sink in the
+  child was **SPEC-042**, which settled it on the
   distinction this record could not draw: a child may release only a transport it acquired **in
   this process** — by being handed the sink here, or by re-acquiring it through FR-004's hook,
   which after the reopen is exactly what the file sinks did and what a connection sink did not

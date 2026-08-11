@@ -309,6 +309,18 @@ specs to append fields as tuple members and prove indices, and then forced the f
 both — and that converting first makes the arc's remaining counters, hooks and reasons additive,
 so they are free in `1.x`.
 
+**SPEC-042 (forked-child sink ownership) is Completed** — a forked child closed transports it
+never opened: a `configure(sink=…)` sent a connection sink's protocol goodbye and the **parent's**
+next write failed with `ECONNRESET`, a `shutdown()` closed the inherited object, and at exit both
+processes closed their own copy. For a prefork server — gunicorn, uWSGI, Celery, the deployment
+SPEC-039 exists for — one worker's routine startup could take down the transport every other
+worker logs through. SPEC-039 documented its way around it ("do not build a connection-holding
+sink before the fork"); that advice is now the recommendation rather than an "or else". Four PRs:
+one release path → the record and the refusal → the hook's contract and `Health.inherited_sink` →
+the docs. Five review rounds found 2, 4, 4, 1 and 0 blocking defects, and **five separate
+assertions were caught passing against the defect they named**, two of which survived the whole
+suite.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -692,6 +704,21 @@ so they are free in `1.x`.
   passed 1626 tests because every test forked with the file empty on disk, making truncate and
   append the same program. The hook is per-sink precisely because `StdoutSink` has the same window
   and must **not** be fixed. (SPEC-039 FR-004)
+- **A process releases only a transport it acquired *here*, and unrecorded must be unclaimable
+  rather than merely unreleasable** — the record is stamped when the library is *handed* a sink
+  (`configure()`, the lazy default) over the whole reachable graph, and every close consults it,
+  the five shipped wrappers included. Write-once alone was not enough: it defends a record that
+  already exists, so where the parent's bounded walk saw nothing a child could `configure()` its
+  way into genuine ownership and destroy the parent's transport legitimately — measured on a
+  socket. A fork handler marks everything inherited `_FOREIGN` **before any other handler runs**,
+  which is what gives "no record" a terminal state. The one default that is *not* refusal is a
+  sink no wrapper the library holds is releasing: that is the caller's own object, and refusing
+  there turned `FilteringSink(inner).close()` into a silent no-op. Descent is bounded on a
+  measurement (1,109 ms → 2 ms on a 100k-event `MemorySink`) and every gap it leaves fails toward
+  a leak. `reacquire_after_fork()` is renamed from the discard: returning from it *is* a claim of
+  ownership, which is why a subclass adding a transport must override it. The residual — a sink
+  the parent held only in application state, first handed over by the child — is undecidable
+  inside the rule and recorded in §13, not asserted away. (SPEC-042, arch §9, §13)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
