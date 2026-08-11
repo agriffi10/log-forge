@@ -292,6 +292,16 @@ recorded grounds that it "only appends to a list" — it calls `build_event`, so
 returned normally outside a span and killed the decorated function inside one, *and* the
 decorator recorded an `error.type` the caller never raised. Six `xfail` cells cleared.
 
+**SPEC-039 (fork lifecycle) is Completed** — `os.fork()` was unhandled anywhere in the tree, and
+prefork servers (gunicorn, uWSGI, Celery) are a mainstream deployment for a logging library. A
+child inherited a worker whose drain thread does not exist — six events never delivered with
+`health()` clean on every term — and locks held by threads that do not exist, which hung **19 of
+60 children** permanently inside `info()`, on the application's own thread. New `_fork.py`
+registers one `after_in_child` handler whose order of work is the contract: re-init every lock
+and event the library owns → discard inherited buffered writes → run the registered handlers,
+`decorator`'s in-place worker rebuild among them. It was SPEC-035 FR-005, moved out once that
+spec's other five FRs shipped.
+
 **The 2026-08-07 audit arc's build order was reversed** to `034 → 037 → 038 → 036 → 039 → 041 →
 040`, and most of it no longer blocks `v1.0.0`. Reasoning in `docs/specs/INDEX.md`; the short form
 is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later
@@ -666,6 +676,22 @@ so they are free in `1.x`.
   division, so a byte-charging test only bites at sizes where the division tips — the same test
   was vacuous at 1,012 bytes (the count limit binds first) and again at 9,000, and now asserts
   its own sensitivity as a precondition. (SPEC-038 FR-004, FR-005)
+- **Only the forked *child* is repaired, and its order of work is the contract** — locks and
+  events, then inherited buffers, then the registered handlers, because a lock re-initialised
+  after a handler that takes it is a handler that hangs on the child's only thread. `before` does
+  not run for a C-level fork at all (uWSGI calls `PyOS_AfterFork_Child` only), so the child
+  handler must be sufficient regardless. The repaired roster is **derived, never listed** — a walk
+  over this package's own objects, with an AST lint forbidding a primitive built where the walk
+  cannot write it back, and an identity memo so a sink's `log_foundry_stop_signal` stays the
+  worker's `_stop`. The worker is rebuilt **in place** with a replaced queue *object*; a retired
+  parent forks a retired child. What the walk cannot reach is the caller's and is recorded, not
+  half-fixed — including the shared sink, which both processes also *close*. (SPEC-039, arch §9, §13)
+- **A value the child inherits is stranded, never merely detached** — `dup2` to `/dev/null` *and*
+  reopen in **append** mode. Rebinding the stream alone leaves the old object flushing to the real
+  file when the GC reaches it; reopening in `"w"` truncates a log shared with the parent, which
+  passed 1626 tests because every test forked with the file empty on disk, making truncate and
+  append the same program. The hook is per-sink precisely because `StdoutSink` has the same window
+  and must **not** be fixed. (SPEC-039 FR-004)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name

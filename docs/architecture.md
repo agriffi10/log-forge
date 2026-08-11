@@ -352,9 +352,15 @@ A sink is a small interface so the transport is swappable:
 class Sink(Protocol):
     def emit(self, batch: list[dict]) -> None: ...   # ship a batch of events
     def close(self) -> None: ...                      # flush + release resources
-    # optional (SPEC-026):
-    # def losses(self) -> SinkLosses | None: ...      # cumulative loss this sink absorbed
+    # optional, each probed by name — never required, so no sink stops satisfying this:
+    # def losses(self) -> SinkLosses | None: ...      # cumulative loss absorbed (SPEC-026)
+    # log_foundry_stop_signal: threading.Event | None # interruptible backoff (SPEC-027)
+    # def discard_buffered_after_fork(self) -> None:  # strand a forked child's inherited
+    #                                                 # buffer (SPEC-039)
 ```
+
+`sinks/base.py` is authoritative for all three — what each promises, and for the last one which
+sinks are actually asked, which is narrower than "whichever define it".
 
 **A sink carries two reporting obligations** (SPEC-026), because the worker's retry and
 `health()` are built on them:
@@ -480,6 +486,53 @@ decorated call ends
   different things. The sink's is what never reached the wire — usually an event that can never
   fit, but for the sinks whose client owns a local buffer (`KafkaSink`, `GooglePubSubSink`) also
   what that buffer refused, which is backpressure one layer further out.
+- **A forked child repairs itself, in a fixed order, and only the child** (SPEC-039). `fork`
+  copies the memory and leaves the threads behind, so a child inherits a worker whose drain
+  thread does not exist and locks held by threads that do not exist — measured, the child's
+  events were never delivered while `health()` read clean on every term, and 19 of 60 children
+  hung permanently in `info()` on the application's own thread. `_fork.py` registers **one**
+  `os.register_at_fork(after_in_child=…)` handler, whose order of work is the contract:
+
+  1. **Re-initialise every lock and event the library owns**, found by walking this package's
+     modules and descending only into objects it defines and plain containers. A lock that was
+     not held is replaced too — asking whether one is held has no answer that is not itself a
+     race — and an identity memo keeps two holders of one primitive sharing it, which is what
+     stops a sink's `log_foundry_stop_signal` drifting from the worker's `_stop`. An AST lint
+     forbids building a primitive anywhere the walk cannot write it back, so a lock added by a
+     later spec is picked up with no edit.
+  2. **Discard inherited buffered writes.** A fork landing inside `emit`, after the write loop
+     and before the flush, leaves both processes holding the same pending bytes; the child
+     strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
+     optional `discard_buffered_after_fork()` hook `sinks/base.py` documents (§8).
+  3. **Run the registered handlers**, `decorator`'s worker rebuild among them. The worker is
+     rebuilt **in place** with a fresh queue and zeroed counters, so ownership guards keyed on
+     `_worker.sink is X` survive; a retired parent forks a retired child, since a fork does not
+     undo a `shutdown()`.
+
+  The order is the whole of it: a lock re-initialised *after* a handler that takes it is a
+  handler that hangs, on the child's only thread with nothing left to interrupt it. Nothing is
+  registered for the parent side — `before` does not run for a C-level fork at all (uWSGI calls
+  `PyOS_AfterFork_Child` only), so the child handler has to be sufficient regardless, and a
+  parent-side handler would buy a partial fix for a measured 1.20 s hold on the forking thread.
+
+  **What the fork does not reach is the caller's, and a shared sink is the sharpest case.** The
+  child inherits the parent's sink *object* — one socket, one SQLite handle, one file, two
+  processes — and beyond the buffer discard the library neither clones nor re-opens it. It does
+  **close** it, twice over: each process closes its own copy at exit, and a `configure(sink=…)`
+  in the child closes the inherited one immediately, because the swap SPEC-030 built cannot see
+  that the object it is retiring is still another process's transport (measured — both are
+  recorded in §13). That is harmless for an append-only file and destructive for a connection,
+  where `close()` is protocol-visible: a measured probe had the child's `configure()` send the
+  goodbye and the *parent's* next write fail with `ECONNRESET`.
+
+  So the remedy is not "reconfigure in the child" — it is **do not build a connection-holding
+  sink before the fork at all.** Call `configure()` only in the worker process (gunicorn's
+  `post_fork`, never preload) and leave the master unlogged, or give the master a sink whose
+  `close()` costs nothing to share. `README.md` says the same where a user deploying prefork
+  will find it. Third-party state is out of scope by construction — a driver's locks, threads
+  and descriptors are not the library's to swap, and reaching into them would be a fork fix
+  that breaks a driver (§13).
+
 - **A retired worker still receiving submissions is a reported state, not a prevented one**
   (SPEC-030). `shutdown()` is terminal and the worker never comes back, but `submit()` keeps
   accepting — so a process that logs again queues events nothing will drain. `health().retired`
@@ -955,6 +1008,84 @@ constraint — never by being deleted quietly.
   the shape to copy if a fourth site ever sits on a hot path. Found as C5 by the 2026-08-07
   audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
   (`docs/process.md`) found the third.
+
+- **A fork's repair stops at the library's own objects, and five things sit outside it**
+  (SPEC-039 FR-005). The child's walk descends into what this package defines and the plain
+  containers those objects hold (§9); everything below is reachable only by reaching into
+  somebody else's state, which would be a fork fix that breaks a driver.
+
+  - **A third-party client that buffers across `emit`.** `KafkaSink`'s producer holds a local
+    batch and `GooglePubSubSink` holds unresolved futures, so a fork mid-batch there can still
+    duplicate what the parent had queued or strand it in a child that never resolves it. This is
+    a *different* hazard from the shared handle below — that one is the caller's object, this is
+    a buffer nobody in this process can address — and the `discard_buffered_after_fork()` hook
+    cannot help, because there is no descriptor to redirect.
+  - **`StdoutSink` carries the file sinks' duplication hazard and is deliberately not fixed.**
+    It flushes once per batch exactly as they do, so the window is identical — but `sys.stdout`
+    is a **process**-owned buffer, and discarding the application's pending output to protect
+    the library's own is not a trade a logging library may make. This occupant was not expected
+    when the hook was designed and is the reason it is per-sink rather than global.
+  - **A third-party sink's own locks are not repaired, and its hook is never called.** A sink
+    satisfying `Sink` *structurally* — which is how every shipped sink satisfies it — is outside
+    the ownership test, so a lock it holds stays held by a thread that does not exist and a
+    buffer it owns stays inherited, even when a wrapper this library owns is holding it.
+    Inheriting from `Sink` or from a shipped sink is what brings it inside. The one consequence
+    that would otherwise break an earlier guarantee is closed separately: the worker rebuild
+    **re-offers** its fresh stop signal, so SPEC-027's interruptible backoff still holds for a
+    sink the walk cannot enter.
+  - **The converse costs a mixed-base class its foreign attributes.** Ownership is keyed on the
+    whole MRO, because subclassing a shipped sink is a documented extension point and a
+    defining-module test walked straight past a `_lock` that `FileSink.__init__` built — measured,
+    the child hung. So `class MySink(FileSink, ThirdPartyBase)` has its *foreign* primitives
+    replaced too, measured. A separately **held** client is still untouched; the two cannot be
+    told apart from the instance, and refusing the mixed case would mean refusing the sink's own
+    lock with it.
+  - **A sink the application holds but never gave the library is not reached at all** — the walk
+    starts from this package's modules. Same accepted boundary the locks already carry.
+
+- **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
+  AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,
+  so one socket, one SQLite handle or one file is now written by two processes — see §9 for the
+  caller's remedy. Two consequences are worth naming because they are not obvious from that
+  sentence. `RotatingFileSink` lets **both** processes rotate: a child can rename the file the
+  parent is writing to, and each keeps its own `_size`, which is why the discard hook leaves
+  that counter alone rather than claiming a precision a shared file cannot support. And both
+  processes hold an orphan-path close record for the same sink object, so **each closes its own
+  copy at exit** — deliberately left rather than fixed, since neither side can tell whether the
+  other still needs it.
+
+  **And a `configure(sink=…)` in the child closes the inherited sink immediately.** Measured with
+  a socket sink whose `close()` writes a goodbye the server acts on: the child's `configure()`
+  sent it and the parent's next write failed with `ECONNRESET`.
+
+  Both halves of the mechanism are worth stating exactly, because this paragraph is what a later
+  spec will be scoped from. **The trigger is not "the parent logged"** — it is that an emit has
+  reached the inherited sink object in *this process's* record before the `configure()` runs,
+  which the parent arms by logging before the fork (usual under preload) and **the child arms
+  for itself** by logging before it reconfigures. Measured in all four combinations. **And both
+  swap paths close it**, not just the worker's: `Worker.swap_sink` drains, installs, *fences with
+  a second drain* and then closes — the fence being what makes the close safe within one process
+  and, provably, does nothing across two — while `decorator._swap_sink`'s no-worker branch hands
+  the old sink to `_lifecycle.close_detached` with neither drain. A process that only ever logged
+  outside a span takes the second, so "there is no worker here" is not an escape.
+
+  That is why §9's remedy is "do not build a connection-holding sink before the fork" rather than
+  "rebuild it in the child": the obvious phrasing of the advice performs the damage sooner and
+  more completely than the hazard it was meant to avoid. Whether the library should instead
+  **disown** an inherited sink in the child is a live question that needs its own spec — not
+  SPEC-040's, which is a pure refactor whose Out of Scope forbids behaviour change and directs
+  exactly this kind of finding elsewhere (it records the item, and the shape it is evidence of,
+  under FR-005). Disowning is not free: a child that closes nothing loses whatever its own sink
+  was holding at exit, and from inside the child an inherited connection it must not touch and
+  one it is now the only user of look identical.
+
+- **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
+  (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one
+  in that attribute. Safe only because the drain thread never reads it — `_run`, `_drain`,
+  `_terminal_failure` and `_release_waiters` do not, and every reader is on a caller thread —
+  which nothing enforces. The alternative was measured and is worse: assigning first leaves a
+  worker whose `start()` raised reading `draining` forever and handing the next `shutdown()` a
+  `RuntimeError` from `join`, out of a public call documented to raise nothing.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment

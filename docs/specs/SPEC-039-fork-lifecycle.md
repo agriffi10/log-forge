@@ -1,8 +1,8 @@
 # Spec: Fork Lifecycle
 
 **ID:** SPEC-039  
-**Status:** Draft  
-**Last Updated:** 2026-08-09  
+**Status:** Completed  
+**Last Updated:** 2026-08-11  
 **Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035
 
 ## Overview
@@ -111,12 +111,12 @@ sufficient regardless — and a parent-side handler would be a partial fix bough
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: Only `after_in_child` is registered. A test asserts no `before` or `after_in_parent`
+- [x] AC-1: Only `after_in_child` is registered. A test asserts no `before` or `after_in_parent`
       handler is installed, so a later change has to argue with this FR rather than slip past it.
-- [ ] AC-2: The order of work in the child is the contract and is stated in the module: re-init
+- [x] AC-2: The order of work in the child is the contract and is stated in the module: re-init
       locks → discard buffers → registered handlers. A lock re-initialised after a handler that
       takes it is a handler that hangs.
-- [ ] AC-3: The parent is unaffected — its worker, queue and counters are unchanged across the
+- [x] AC-3: The parent is unaffected — its worker, queue and counters are unchanged across the
       fork, and a test asserts the parent's delivery continues.
 
 ### FR-002: The child's worker is rebuilt, not retired
@@ -141,8 +141,8 @@ keyed on `_worker.sink is X` and `_lifecycle`'s registry stay valid across it.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A child that logs after forking delivers those events.
-- [ ] AC-2: The child's queue starts **empty** and the parent keeps what was in flight, so events
+- [x] AC-1: A child that logs after forking delivers those events.
+- [x] AC-2: The child's queue starts **empty** and the parent keeps what was in flight, so events
       queued in the parent but undelivered at fork time are not delivered twice. A test asserts
       the total across both processes. The queue **object** is replaced, never drained: a
       `queue.Queue` builds its own mutex and three `Condition`s, which no lock rule over this
@@ -151,14 +151,14 @@ keyed on `_worker.sink is X` and `_lifecycle`'s registry stay valid across it.
       This is also why the *retired* path of AC-4 still needs the replacement: a retired worker
       goes on accepting submissions (SPEC-030), so a child that logs after forking a retired
       parent blocks on the same mutex.
-- [ ] AC-3: Counters are zeroed in the child — they describe a drain thread that no longer
+- [x] AC-3: Counters are zeroed in the child — they describe a drain thread that no longer
       exists — and `health()` in the child describes the child.
-- [ ] AC-4: **A retired parent forks a retired child.** A fork does not undo a `shutdown()`, and
+- [x] AC-4: **A retired parent forks a retired child.** A fork does not undo a `shutdown()`, and
       a test pins it: the alternative silently revives a worker the caller terminated.
-- [ ] AC-5: The rebuilt worker is the same object, so a guard keyed on `_worker.sink is X` holds
+- [x] AC-5: The rebuilt worker is the same object, so a guard keyed on `_worker.sink is X` holds
       across the fork. A test asserts identity, since rebuilding as a new object is the obvious
       implementation and breaks SPEC-033's ownership guards.
-- [ ] AC-6: `Worker.stopped_reason` is **not** set to `"Forked"` on the rebuild path — the child
+- [x] AC-6: `Worker.stopped_reason` is **not** set to `"Forked"` on the rebuild path — the child
       works, and SPEC-019's field means the drain thread died. Stated because the alternative
       reads as the more honest one and is not.
 
@@ -183,24 +183,24 @@ at all, and they must carry their set state across.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: After a fork, the child's first log call does not block. A test forks repeatedly
+- [x] AC-1: After a fork, the child's first log call does not block. A test forks repeatedly
       (≥50 iterations) with the drain thread actively emitting into a locking sink, and every
       child completes within a timeout. **The pre-fix version of this test hangs, and that is
       demonstrated** rather than asserted.
-- [ ] AC-2: The traversal walks every `log_foundry.*` module in `sys.modules`, then descends only
+- [x] AC-2: The traversal walks every `log_foundry.*` module in `sys.modules`, then descends only
       into log_foundry-owned instances and classes and plain containers. Containers are traversed
       because `MultiSink._sinks` is one; third-party client state is deliberately not reached
       (FR-005).
-- [ ] AC-3: **Completeness is proved, not asserted:** an AST test that every
+- [x] AC-3: **Completeness is proved, not asserted:** an AST test that every
       `threading.Lock()`/`RLock()`/`Event()` construction in `src/` is assigned either to a module
       global or to a `self.<attr>` — the two shapes the traversal reaches. A lock held inside a
       container would be unreachable, so the test forbids that shape. This is what picks up
       SPEC-036 FR-003's lock with no edit here.
-- [ ] AC-4: Two objects sharing one lock or one `Event` still share it afterwards, asserted by
+- [x] AC-4: Two objects sharing one lock or one `Event` still share it afterwards, asserted by
       identity. The `log_foundry_stop_signal`/`_stop` pair is the case that matters and is named
       in the test.
-- [ ] AC-5: A re-initialised `Event` carries its set state across the fork.
-- [ ] AC-6: A lock that was **not** held at fork time is still replaced. Re-initialising only the
+- [x] AC-5: A re-initialised `Event` carries its set state across the fork.
+- [x] AC-6: A lock that was **not** held at fork time is still replaced. Re-initialising only the
       held ones needs a way to ask whether a lock is held, and `threading.Lock` has none that is
       not itself a race.
 
@@ -237,14 +237,14 @@ sink stops satisfying `Sink`.
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: A test forks **mid-`emit`** — interposing on the stream's `write`, per the method note
+- [x] AC-1: A test forks **mid-`emit`** — interposing on the stream's `write`, per the method note
       above — and asserts the child re-emits none of the parent's buffered bytes.
-- [ ] AC-2: The parent's own pending bytes still reach disk exactly once.
-- [ ] AC-3: `FileSink` and `RotatingFileSink` implement the hook; a sink without it is
+- [x] AC-2: The parent's own pending bytes still reach disk exactly once.
+- [x] AC-3: `FileSink` and `RotatingFileSink` implement the hook; a sink without it is
       unaffected, asserted with a bare `emit`/`close` class.
-- [ ] AC-4: `sinks/base.py` documents the hook beside `losses()`, including that it runs in a
+- [x] AC-4: `sinks/base.py` documents the hook beside `losses()`, including that it runs in a
       forked child with a single thread and must not block.
-- [ ] AC-5: A lint asserts every sink that writes to a buffered stream it owns implements the
+- [x] AC-5: A lint asserts every sink that writes to a buffered stream it owns implements the
       hook, derived from the sink roster rather than a hand-written list — SPEC-032's scope gate.
 
 ### FR-005: The boundary is documented, and what is beyond it is recorded
@@ -257,20 +257,20 @@ a third-party client's buffer is nobody's, and `sys.stdout` is the application's
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: **A sink shared across a fork is the caller's responsibility**, with the concrete
+- [x] AC-1: **A sink shared across a fork is the caller's responsibility**, with the concrete
       hazard named: one socket or one SQLite handle, two processes. `README.md` and
       `architecture.md` §9 say so — a user running gunicorn preload needs to be able to find it.
-- [ ] AC-2: **A third-party client that buffers across `emit`** — `KafkaSink`'s producer,
+- [x] AC-2: **A third-party client that buffers across `emit`** — `KafkaSink`'s producer,
       `GooglePubSubSink`'s futures (SPEC-036 FR-002's roster) — holds state the library cannot
       reach, so a fork mid-batch there can still duplicate or strand it. Recorded in
       `architecture.md` §13. FR-005 AC-1's shared-handle sentence is a different hazard and does
       not cover this one.
-- [ ] AC-3: **`StdoutSink` carries the same duplication hazard as the file sinks and is
+- [x] AC-3: **`StdoutSink` carries the same duplication hazard as the file sinks and is
       deliberately not fixed**: `sys.stdout` is a *process*-owned buffer, and the library must not
       discard the application's pending output to protect its own. Recorded in §13. This occupant
       was not expected when FR-004's hook was designed and is the reason the hook is per-sink
       rather than global.
-- [ ] AC-4: `architecture.md` §9 states the fork behaviour as a whole — what the child rebuilds,
+- [x] AC-4: `architecture.md` §9 states the fork behaviour as a whole — what the child rebuilds,
       what it discards, and what it leaves alone.
 
 ### FR-006: The mechanism lives where it cannot create an import cycle
@@ -288,13 +288,17 @@ FR-002's roster and must be classified. That is the roster working as intended, 
 
 #### Acceptance Criteria:
 
-- [ ] AC-1: `_fork.py` imports nothing from the package but `_diag` and `sinks.base`, asserted by
+- [x] AC-1: `_fork.py` imports nothing from the package but `_diag` and `sinks.base`, asserted by
       the same kind of import test the package already uses for `_diag` and `sanitize`.
-- [ ] AC-2: Registration happens at import of the package, once, and a double import does not
+      **Narrower as shipped:** `sinks.base` was allowed for FR-004's hook and turned out not to be
+      needed — the hook is probed by name off objects the traversal already reaches, so the module
+      imports `_diag` alone. The allowance stays in the test's fixture list, since the rule being
+      pinned is the *arrow*, not the count.
+- [x] AC-2: Registration happens at import of the package, once, and a double import does not
       register twice.
-- [ ] AC-3: The new guards in `decorator.py` are classified in the FR-002 roster with reasons, and
+- [x] AC-3: The new guards in `decorator.py` are classified in the FR-002 roster with reasons, and
       the roster is green.
-- [ ] AC-4: A platform without `os.register_at_fork` (Windows) imports the package cleanly and
+- [x] AC-4: A platform without `os.register_at_fork` (Windows) imports the package cleanly and
       the rest of the library is unaffected. CI runs Linux and macOS only, so this is asserted by
       construction — the registration is guarded — and stated in the docstring.
 
