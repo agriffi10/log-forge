@@ -1,5 +1,10 @@
 # Handoff — SPEC-039, Phases 3 and 4
 
+> **Superseded — SPEC-039 is Completed** (#150 FR-004, #151 FR-005 + the ritual). Kept because
+> its method lessons and measurements are what the build ran on, and because the seven review
+> rounds it records are the reason the later ones were budgeted for. For what shipped, read
+> `docs/spec-delivery/SPEC-039-fork-lifecycle.md`; nothing below is outstanding work.
+
 Written at a context boundary, mid-spec. Everything below is verifiable from the repo; where a
 number is quoted it was measured, not estimated.
 
@@ -8,8 +13,8 @@ finish SPEC-039 without re-deriving what its first two phases already settled.
 
 ## Where things stand in one line
 
-**SPEC-039 Phases 1 and 2 are merged and `main` is green; Phase 3 is FR-004 and Phase 4 is FR-005
-plus the completion ritual.**
+~~**SPEC-039 Phases 1 and 2 are merged and `main` is green; Phase 3 is FR-004 and Phase 4 is
+FR-005 plus the completion ritual.**~~ — all four phases are now merged.
 
 ## State
 
@@ -19,7 +24,7 @@ plus the completion ritual.**
 | Suite | 1612 passed, 2 skipped, 2 xfailed |
 | Merged | #147 (FR-003, FR-001 AC-1/AC-3, FR-006 AC-1/AC-2/AC-4) · #148 (FR-002, FR-006 AC-2/AC-3, FR-001 AC-2) |
 | Left | **FR-004** (Phase 3), **FR-005** (Phase 4), then the completion ritual |
-| Spec file | `docs/specs/SPEC-039-fork-lifecycle.md`, still `Status: Draft` |
+| Spec file | `docs/specs/SPEC-039-fork-lifecycle.md` — ~~`Status: Draft`~~ **Completed** |
 
 The spec was amended once during Phase 1 — FR-002 AC-2 now records that the queue **object** must
 be replaced rather than drained, and why the retired path needs it too. That amendment is on
