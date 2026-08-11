@@ -2141,6 +2141,13 @@ def _buffered_sink(
     it is the one an earlier draft of this spec measured *after* ``emit`` returned, when the
     buffer is empty by construction.
 
+    **One batch is delivered and flushed before the window is armed**, so the file is not empty
+    on disk when the child reopens it. That is not scene-setting: with nothing on disk, opening
+    the replacement in ``"w"`` mode is indistinguishable from ``"a"``, and a review measured
+    that mutant passing all 1626 tests — a child truncating the shared log on every fork, which
+    is strictly worse than the duplication this whole FR removes. It is written before the
+    wrapper is installed so it does not consume the wrapper's write count.
+
     Args:
       tmp_path: The directory to write into.
       kind: ``"file"``, ``"rotating"`` or ``"multi"`` — the last wrapping a ``FileSink`` in a
@@ -2155,6 +2162,7 @@ def _buffered_sink(
     """
     path = tmp_path / name
     inner: Any = RotatingFileSink(str(path)) if kind == "rotating" else FileSink(str(path))
+    inner.emit([{"msg": "before-the-fork"}])
     stream = _GatingStream(inner._stream, park_after=1)
     inner._stream = stream
     sink = MultiSink(inner) if kind == "multi" else inner
@@ -2220,12 +2228,19 @@ def test_the_child_does_not_write_the_parents_buffered_bytes(
     worker was handed, so a repair that asked ``worker.sink`` rather than every sink the walk
     reached would leave a fan-out's children duplicating — the shape FR-003 AC-2 already had to
     close for the locks.
+
+    ``before-the-fork`` is on disk before any of this and is asserted to survive, which is what
+    holds the child's reopen to **append** mode. Without a line already written, ``"w"`` and
+    ``"a"`` are the same program: a review measured that mutant green across the whole suite,
+    with every child truncating the shared log.
     """
     sink, stream, path = _buffered_sink(tmp_path, kind, name=f"{kind}.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
     decorator._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
-    assert path.read_text(encoding="utf-8") == "", "nothing is buffered, so this proves nothing"
+    at_the_fork = path.read_text(encoding="utf-8")
+    assert _lines_holding(at_the_fork, "before-the-fork") == 1, at_the_fork
+    assert "parent-a" not in at_the_fork, "nothing is buffered, so this proves nothing"
 
     def log_in_child() -> str:
         log_foundry.info("child-0")
@@ -2239,7 +2254,7 @@ def test_the_child_does_not_write_the_parents_buffered_bytes(
     assert child.output == "logged", child.output
     assert log_foundry.flush(timeout=5.0)
     written = path.read_text(encoding="utf-8")
-    for marker in ("parent-a", "parent-b", "child-0"):
+    for marker in ("before-the-fork", "parent-a", "parent-b", "child-0"):
         assert _lines_holding(written, marker) == 1, f"{marker} in {written!r}"
 
 
@@ -2283,6 +2298,147 @@ def test_the_same_child_duplicates_when_the_discard_is_taken_away(
     assert log_foundry.flush(timeout=5.0)
     written = path.read_text(encoding="utf-8")
     assert _lines_holding(written, "parent-a") == 2, written
+
+
+def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) -> None:
+    """FR-001 AC-2's third step, pinned rather than promised.
+
+    The order in the child is the contract — locks, then the discard, then the registered
+    handlers — and the reason the discard is inline rather than registered is that
+    ``decorator``'s rebuild registers first and has a **live drain thread** by the time any
+    later handler runs, emitting into the very sink whose buffer is still the parent's.
+
+    Being straight about what this is: moving the step below the handler loop is not currently
+    observable as a duplicate, because the rebuilt worker starts with an empty queue and so has
+    nothing to emit in the window. It is an unenforced contract rather than a live defect —
+    which is exactly the state SPEC-035's predicate roster was built for, after three reviewers
+    each named a different unenforced ordering site and a fourth shipped anyway. The probe
+    records what it saw rather than asserting in the child, as the locks' order test does.
+    """
+    sink, stream, _path = _buffered_sink(tmp_path, "file", name="ordering.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_inside_a_buffered_batch(stream, worker)
+    inherited = sink._stream
+    seen: list[str] = []
+
+    def probe() -> None:
+        seen.append("discarded" if sink._stream is not inherited else "still-the-parents")
+
+    _fork.register_child_handler(probe)
+    try:
+        child = run_in_child(lambda: ",".join(seen), timeout=6)
+    finally:
+        _fork._child_handlers.remove(probe)
+        gate.release.set()
+
+    assert child.output == "discarded", child.output
+
+
+def test_the_reopened_stream_keeps_the_encoding_it_was_given(tmp_path: pathlib.Path) -> None:
+    """A child that reopens under a different encoding writes a second half nobody can decode.
+
+    ``FileSink`` takes an ``encoding`` and the file is shared with the parent, so the
+    replacement has to be opened in the same one — dropping it falls back to the locale default
+    and the file becomes two encodings deep in one stream. No fork is needed to see it, and
+    UTF-16 is the pair that shows it: ``json.dumps`` escapes non-ASCII, so a UTF-8 replacement
+    is byte-identical to a Latin-1 one and would prove nothing.
+    """
+    path = tmp_path / "encoded.ndjson"
+    sink = FileSink(str(path), encoding="utf-16")
+    try:
+        sink.emit([{"msg": "before"}])
+        sink.discard_buffered_after_fork()
+        sink.emit([{"msg": "after"}])
+    finally:
+        sink.close()
+
+    decoded = path.read_bytes().decode("utf-16")
+    assert _lines_holding(decoded, "before") == 1, decoded
+    assert _lines_holding(decoded, "after") == 1, decoded
+
+
+def test_a_hostile_attribute_read_does_not_abort_the_lock_repair(tmp_path: pathlib.Path) -> None:
+    """The probe for one hazard must not cost the child the repair for the other.
+
+    ``getattr`` propagates anything that is not an ``AttributeError``, so an owned object whose
+    ``__getattr__`` raises would end the walk — and what is lost then is not a buffer but every
+    lock the walk had not reached yet, which is the hang this module exists to remove. Every
+    other read the walk makes is guarded individually; this asserts the probe is too.
+
+    Nothing owned defines ``__getattr__`` today, so the subject is built here — and it must be
+    a sink that does **not** already carry the hook, or normal lookup succeeds and
+    ``__getattr__`` is never consulted at all. A first version subclassed ``FileSink`` and was
+    vacuous for exactly that reason: it inherited the method, and removing the guard left it
+    green. It raises only for this one name, so the rest of the child's repair is judged on its
+    own behaviour rather than on collateral from the double.
+
+    The stderr assertion is the load-bearing one. An abort is announced by
+    ``_reinit_after_fork``'s own guard wherever it happens, while which locks were already
+    replaced depends on where the walk was — deterministic only in the world where nothing
+    aborts.
+    """
+
+    class _Hostile(MemorySink):
+        def __getattr__(self, name: str) -> Any:
+            if name == "discard_buffered_after_fork":
+                raise RuntimeError("this attribute is not yours to ask about")
+            raise AttributeError(name)
+
+    hostile = _Hostile()
+    later = FileSink(str(tmp_path / "later.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=MultiSink(hostile, later))
+    before = id(later._lock)
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: f"{id(later._lock) != before}|{buffer.getvalue()}", timeout=6)
+    finally:
+        sys.stderr = saved
+        later.close()
+
+    repaired, _, announced = child.output.partition("|")
+    assert repaired == "True", child.output
+    assert announced == "", f"the child announced something: {announced!r}"
+
+
+@pytest.mark.parametrize("value", [None, "disabled"])
+def test_a_member_of_that_name_which_is_not_callable_is_not_the_hook(
+    tmp_path: pathlib.Path, value: object
+) -> None:
+    """The probe asks whether the hook is *callable*, as ``read_losses`` does for ``losses()``.
+
+    ``None`` is not a hypothetical value for an optional member here: the fourth one,
+    ``log_foundry_stop_signal``, is documented as a plain attribute initialised to ``None``, so
+    a sink written against that pattern may well carry this name the same way. Reading it as a
+    hook produces a ``TypeError`` absorbed into a stderr line on every fork — a library
+    announcing a fault of its own invention, on a sink that simply opted out (SPEC-025).
+
+    Both rows are needed and neither is decoration: a ``None`` check alone passes the first and
+    fails the second, so with only ``None`` here the weaker rule is indistinguishable from the
+    one the code states.
+    """
+
+    class _NotAHook(FileSink):
+        pass
+
+    _NotAHook.discard_buffered_after_fork = value  # type: ignore[assignment]
+    sink = _NotAHook(str(tmp_path / "notahook.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(buffer.getvalue, timeout=6)
+    finally:
+        sys.stderr = saved
+        sink.close()
+
+    assert child.finished, child.output
+    assert child.output == "", f"the child announced something: {child.output!r}"
 
 
 def test_the_inherited_buffer_can_only_reach_the_null_device(tmp_path: pathlib.Path) -> None:

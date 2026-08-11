@@ -339,6 +339,33 @@ place the name is read.
 """
 
 
+def _offers_discard(holder: object) -> bool:
+    """Whether this object carries FR-004's buffer hook, without letting the question raise.
+
+    Every other read the walk makes is guarded individually, and this one has to be too: an
+    owned ``__getattr__`` raising anything but ``AttributeError`` would abort the walk, and
+    what is lost then is not a buffer but the **lock repair** for everything the walk had not
+    reached yet — the hang this module exists to remove, arrived at through the probe for a
+    different hazard. Nothing owned defines ``__getattr__`` today.
+
+    Callability is part of the question, so an attribute of that name which is not a method is
+    simply not the hook.
+
+    Args:
+      holder: Any object the walk has entered.
+
+    Returns:
+      Whether it offers the hook.
+
+    Raises:
+      None.
+    """
+    try:
+        return callable(getattr(holder, _DISCARD_HOOK, None))
+    except Exception:
+        return False
+
+
 def _reinit_primitives() -> list[Any]:
     """Replaces every lock and event this package owns, wherever the walk reaches one.
 
@@ -388,7 +415,7 @@ def _reinit_primitives() -> list[Any]:
         if not isinstance(holder, types.ModuleType | type):
             if not _is_owned(holder):
                 continue
-            if hasattr(holder, _DISCARD_HOOK):
+            if _offers_discard(holder):
                 buffered.append(holder)
         for name, value in _namespace_items(holder):
             fresh = _fresh_primitive(value, memo, keepalive)

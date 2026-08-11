@@ -23,16 +23,26 @@ _WHEN_SECONDS = {
 def _reopen_discarding(stream: TextIO, path: str, encoding: str) -> TextIO:
     """Strands an inherited stream's pending bytes and returns a fresh one on the same path.
 
-    ``os.dup2`` points the inherited descriptor at ``os.devnull`` **before** the replacement is
-    opened, so the buffer this process inherited can only ever reach the null device — whether
-    it is flushed deliberately, by the interpreter at exit, or by the garbage collector when
-    the old object is dropped. Reopening rather than reusing the descriptor is what gives the
-    child a stream of its own, and it picks up the currently active file if the parent rotated.
+    ``os.dup2`` points the inherited descriptor at ``os.devnull``, so the buffer this process
+    inherited can only ever reach the null device — whether it is flushed deliberately, by the
+    interpreter at exit, or by the garbage collector when the old object is dropped. The two
+    steps are written in this order for readability and **not** because the order is what makes
+    it safe: the replacement takes a different descriptor either way, since the inherited one is
+    still occupied, and nothing else is running to flush anything in between. Reopening rather
+    than reusing the descriptor is what gives the child a stream of its own, and it picks up the
+    currently active file if the parent rotated.
+
+    ``dup2`` leaves the redirected descriptor **inheritable** across an ``exec``, where the one
+    ``open`` produced carried ``O_CLOEXEC``. That is a behaviour change and it is harmless: the
+    descriptor names the null device, so what an exec'd process inherits is a handle on nothing.
 
     Args:
       stream: The inherited stream, still holding whatever the parent had not flushed.
-      path: The file to reopen in append mode.
-      encoding: The text encoding to open it in.
+      path: The file to reopen. **Append mode**, never write mode: the child shares this file
+        with the parent and with whatever was written before either existed, so truncating here
+        would destroy a log to protect it — strictly worse than the duplication this prevents.
+      encoding: The text encoding to open it in, carried across so a child does not start
+        writing a differently-encoded second half into the parent's file.
 
     Returns:
       The replacement stream.
