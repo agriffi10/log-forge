@@ -627,7 +627,7 @@ so they are free in `1.x`.
   empty-bodied and not `@abstractmethod`, so a subclass with one typo instantiated happily and
   its inherited `emit` returned `None`: three events gone, `flush()` truthy, every counter zero.
   `mypy` refused it and only the runtime did not. Structural satisfaction is untouched, which
-  matters because none of the 34 shipped sinks inherits it. (SPEC-034 FR-005)
+  matters because no shipped sink inherits it. (SPEC-034 FR-005)
 - **A reserved word needs exactly one route through, including its own name** — `echo` and
   `message` were parameters stealing ordinary words from the field namespace, and `fields=` is
   the escape hatch, so `fields` becomes the third reserved word and `fields={"fields": …}` must

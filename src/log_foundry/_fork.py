@@ -330,7 +330,43 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
     return fresh
 
 
-def _reinit_primitives() -> None:
+_DISCARD_HOOK = "discard_buffered_after_fork"
+"""The optional sink member a forked child asks to strand the parent's pending bytes.
+
+Probed by name, as ``losses()`` and ``log_foundry_stop_signal`` are, so no existing sink stops
+satisfying ``Sink`` by not having it. ``sinks/base.py`` states the contract; this is the only
+place the name is read.
+"""
+
+
+def _offers_discard(holder: object) -> bool:
+    """Whether this object carries FR-004's buffer hook, without letting the question raise.
+
+    Every other read the walk makes is guarded individually, and this one has to be too: an
+    owned ``__getattr__`` raising anything but ``AttributeError`` would abort the walk, and
+    what is lost then is not a buffer but the **lock repair** for everything the walk had not
+    reached yet — the hang this module exists to remove, arrived at through the probe for a
+    different hazard. Nothing owned defines ``__getattr__`` today.
+
+    Callability is part of the question, so an attribute of that name which is not a method is
+    simply not the hook.
+
+    Args:
+      holder: Any object the walk has entered.
+
+    Returns:
+      Whether it offers the hook.
+
+    Raises:
+      None.
+    """
+    try:
+        return callable(getattr(holder, _DISCARD_HOOK, None))
+    except Exception:
+        return False
+
+
+def _reinit_primitives() -> list[Any]:
     """Replaces every lock and event this package owns, wherever the walk reaches one.
 
     An inherited ``Lock`` stays locked with no owner — measured, ``acquire(timeout=1)`` returns
@@ -345,11 +381,17 @@ def _reinit_primitives() -> None:
     events measured 202 ms, against 0.45 ms idle. That is accepted rather than bounded: a cap
     would be a lock this cannot promise to find, and the alternative to finding it is a hang.
 
+    **The sinks carrying FR-004's buffer hook are collected on this same walk** rather than by
+    a second one, because the traversal is the expensive part and its cost is proportional to
+    caller data — paying 202 ms twice on a process that forks is a worse trade than one function
+    reporting what it passed. Collected, not called: a hook may take a lock, and the contract is
+    that every lock is the child's own before any of them runs (FR-001 AC-2).
+
     Args:
       None.
 
     Returns:
-      None.
+      The owned instances carrying :data:`_DISCARD_HOOK`, in the order the walk reached them.
 
     Raises:
       None.
@@ -357,6 +399,7 @@ def _reinit_primitives() -> None:
     memo: dict[int, Any] = {}
     keepalive: list[Any] = []
     seen: set[int] = set()
+    buffered: list[Any] = []
     stack: list[Any] = [
         module
         for name, module in list(sys.modules.items())
@@ -369,14 +412,49 @@ def _reinit_primitives() -> None:
         seen.add(id(holder))
         if _is_container(holder):
             stack.extend(child for child in _container_children(holder) if _is_traversable(child))
-        if not isinstance(holder, types.ModuleType | type) and not _is_owned(holder):
-            continue
+        if not isinstance(holder, types.ModuleType | type):
+            if not _is_owned(holder):
+                continue
+            if _offers_discard(holder):
+                buffered.append(holder)
         for name, value in _namespace_items(holder):
             fresh = _fresh_primitive(value, memo, keepalive)
             if fresh is not None:
                 _assign(holder, name, fresh)
             elif _is_traversable(value):
                 stack.append(value)
+    return buffered
+
+
+def _discard_buffers(holders: list[Any]) -> None:
+    """Asks each sink that owns a buffered stream to strand what it inherited (FR-004).
+
+    A fork landing inside ``emit`` — after the write loop, before the flush — leaves the child
+    holding the parent's unflushed bytes, which both processes then write: measured, the event
+    at the fork point appeared on disk twice. Without a ``before`` handler there is nowhere to
+    empty the buffer from (FR-001), so the child throws its copy away instead.
+
+    Args:
+      holders: What :func:`_reinit_primitives` collected on its walk.
+
+    Returns:
+      None.
+
+    Raises:
+      None. One sink's failure is absorbed separately from the rest, so a hook that cannot
+        strand its buffer costs that sink a duplicated batch rather than costing every other
+        sink its repair — and the consequence is named, because an absorbed failure is
+        invisible apart from that line.
+    """
+    for holder in holders:
+        try:
+            getattr(holder, _DISCARD_HOOK)()
+        except Exception as exc:
+            _diag.absorbed(
+                "discarding an inherited buffer after a fork",
+                exc,
+                f"{type(holder).__name__} may write the parent's pending bytes again",
+            )
 
 
 def register_child_handler(fn: Callable[[], None]) -> None:
@@ -414,11 +492,12 @@ def _reinit_after_fork() -> None:
     """Repairs the library in a child that has just returned from ``fork``.
 
     **The order of work here is the contract** (FR-001 AC-2): locks and events first, then the
-    registered handlers. A lock re-initialised *after* a handler that takes it is a handler
-    that hangs, and it hangs on the child's only thread with nothing to interrupt it. Work that
-    must happen before *any* handler belongs inline between the two steps rather than registered
-    — the buffer discard FR-004 adds is the case, and registering it would put it after
-    ``decorator``'s rebuild, which has started a live drain thread by then.
+    buffer discard, then the registered handlers. A lock re-initialised *after* a handler that
+    takes it is a handler that hangs, and it hangs on the child's only thread with nothing to
+    interrupt it. Work that must happen before *any* handler stays inline between the two steps
+    rather than being registered — the discard is the case, and registering it would put it
+    after ``decorator``'s rebuild, which has started a live drain thread by then, emitting into
+    the very sink whose buffer is still the parent's.
 
     Args:
       None.
@@ -436,10 +515,12 @@ def _reinit_after_fork() -> None:
         registers another simply causes it to run — and :func:`register_child_handler` is the
         only writer, appending only.
     """
+    buffered: list[Any] = []
     try:
-        _reinit_primitives()
+        buffered = _reinit_primitives()
     except Exception as exc:
         _diag.absorbed("repairing the library after a fork", exc, "this child may block or lose")
+    _discard_buffers(buffered)
     for handler in _child_handlers:
         try:
             handler()

@@ -36,11 +36,18 @@ import pytest
 
 import log_foundry
 from log_foundry import _fork, decorator
-from log_foundry.sinks.base import SinkDeliveryError
-from log_foundry.sinks.file import FileSink
+from log_foundry.sinks.base import Sink, SinkDeliveryError
+from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.worker import Worker
+
+# FR-004 AC-5's roster is the one `test_sink_concurrency` already derives -- every class in
+# `sinks/` defining or inheriting a delivery method, floored so it cannot collapse silently.
+# Importing it is the point: two rosters over one package that disagree about scope is the
+# defect SPEC-038 FR-001 measured, and a second derivation here would be a second one to drift.
+from test_sink_concurrency import _base_names, _sink_classes_with_an_emit
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -239,11 +246,15 @@ class _GatingStream:
     in that process will set.
     """
 
-    def __init__(self, stream: Any) -> None:
+    def __init__(self, stream: Any, *, park_after: int = 0) -> None:
         """Wraps a stream with no gate armed.
 
         Args:
           stream: The real file object to forward to.
+          park_after: How many writes to forward before the armed gate takes one. ``0`` parks
+            the first, which is FR-003's window — the lock is held and nothing has been written.
+            FR-004 needs the other one: a write already forwarded and **unflushed**, so the fork
+            lands with the parent's bytes sitting in the stream's own buffer.
 
         Returns:
           None.
@@ -252,10 +263,12 @@ class _GatingStream:
           None.
         """
         self._stream = stream
+        self._park_after = park_after
+        self._writes = 0
         self.gate: _Gate | None = None
 
     def write(self, data: str) -> int:
-        """Parks if a gate is armed, then forwards the write.
+        """Parks if a gate is armed and enough writes have gone through, then forwards.
 
         Args:
           data: The text to write.
@@ -267,10 +280,11 @@ class _GatingStream:
           None.
         """
         gate = self.gate
-        if gate is not None:
+        if gate is not None and self._writes >= self._park_after:
             self.gate = None
             gate.entered.set()
             gate.release.wait(CHILD_TIMEOUT)
+        self._writes += 1
         return int(self._stream.write(data))
 
     def flush(self) -> None:
@@ -2037,9 +2051,11 @@ def test_the_handler_is_registered_once_for_a_double_import() -> None:
     runs: list[int] = []
     original = _fork._reinit_primitives
 
-    def counted() -> None:
+    def counted() -> list[Any]:
         runs.append(1)
-        original()
+        # The walk's return value is FR-004's roster of buffer-holding sinks, so a double that
+        # swallowed it would leave the discard step running against nothing on this path.
+        return original()
 
     _fork._reinit_primitives = counted  # type: ignore[assignment]
     try:
@@ -2109,3 +2125,754 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     work()
     assert log_foundry.flush(timeout=5.0)
     assert "work" in path.read_text(encoding="utf-8")
+
+
+# -- FR-004: the child discards the buffered writes it inherited -----------------------------
+
+
+def _buffered_sink(
+    tmp_path: pathlib.Path, kind: str, *, name: str = "buffered.ndjson"
+) -> tuple[Any, _GatingStream, pathlib.Path]:
+    """Builds a file-backed sink whose *second* write parks, and makes it the process sink.
+
+    The first write is forwarded into the real stream and **not** flushed — ``emit`` flushes
+    once at the end of the batch — so a fork taken while the second is parked lands with the
+    parent's bytes in a buffer both processes then own. That is the window FR-004 is about, and
+    it is the one an earlier draft of this spec measured *after* ``emit`` returned, when the
+    buffer is empty by construction.
+
+    **One batch is delivered and flushed before the window is armed**, so the file is not empty
+    on disk when the child reopens it. That is not scene-setting: with nothing on disk, opening
+    the replacement in ``"w"`` mode is indistinguishable from ``"a"``, and a review measured
+    that mutant passing all 1626 tests — a child truncating the shared log on every fork, which
+    is strictly worse than the duplication this whole FR removes. It is written before the
+    wrapper is installed so it does not consume the wrapper's write count.
+
+    Args:
+      tmp_path: The directory to write into.
+      kind: ``"file"``, ``"rotating"`` or ``"multi"`` — the last wrapping a ``FileSink`` in a
+        ``MultiSink``, so the sink holding the buffer is not the one the worker was given.
+      name: The file to append to.
+
+    Returns:
+      The sink to give the worker, the stream wrapper arming the window, and the path.
+
+    Raises:
+      None.
+    """
+    path = tmp_path / name
+    inner: Any = RotatingFileSink(str(path)) if kind == "rotating" else FileSink(str(path))
+    inner.emit([{"msg": "before-the-fork"}])
+    stream = _GatingStream(inner._stream, park_after=1)
+    inner._stream = stream
+    sink = MultiSink(inner) if kind == "multi" else inner
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    return sink, stream, path
+
+
+def _park_inside_a_buffered_batch(
+    stream: _GatingStream, worker: Worker
+) -> _Gate:
+    """Submits a two-event batch and returns once the drain thread is inside the second write.
+
+    Args:
+      stream: The wrapper whose gate is armed.
+      worker: The worker whose drain thread will take the gate.
+
+    Returns:
+      The armed gate, which the caller releases after forking.
+
+    Raises:
+      AssertionError: If the drain thread never reached the window.
+    """
+    gate = _Gate()
+    stream.gate = gate
+    worker.submit([{"msg": "parent-a"}, {"msg": "parent-b"}])
+    assert gate.entered.wait(5.0), "the drain thread never reached the second write of the batch"
+    return gate
+
+
+def _lines_holding(written: str, marker: str) -> int:
+    """Counts the *lines* a marker appears in, which is what "delivered once" means here.
+
+    A substring count is the wrong measure and was measured wrong: a built event carries the
+    logged text in both ``message`` and ``function``, so one delivery of ``child-0`` reads as
+    two occurrences and a duplicate reads as four.
+
+    Args:
+      written: The file's contents.
+      marker: The text to look for.
+
+    Returns:
+      How many lines contain it.
+
+    Raises:
+      None.
+    """
+    return sum(1 for line in written.splitlines() if marker in line)
+
+
+@pytest.mark.parametrize("kind", ["file", "rotating", "multi"])
+def test_the_child_does_not_write_the_parents_buffered_bytes(
+    tmp_path: pathlib.Path, kind: str
+) -> None:
+    """FR-004 AC-1 and AC-2. The fork lands mid-``emit``, with bytes pending on both sides.
+
+    Without the discard both processes flush the same buffer and the event at the fork point
+    appears on disk twice — measured against ``5ad6699``, and identical for
+    ``RotatingFileSink``. The child must re-emit none of it, and the parent's own copy must
+    still reach disk exactly once, which is why both are asserted here rather than only the
+    absence of a duplicate: a child that discarded the parent's *file* would satisfy one half.
+
+    The ``multi`` case is not decoration. The sink holding the buffer is then not the one the
+    worker was handed, so a repair that asked ``worker.sink`` rather than every sink the walk
+    reached would leave a fan-out's children duplicating — the shape FR-003 AC-2 already had to
+    close for the locks.
+
+    ``before-the-fork`` is on disk before any of this and is asserted to survive, which is what
+    holds the child's reopen to **append** mode. Without a line already written, ``"w"`` and
+    ``"a"`` are the same program: a review measured that mutant green across the whole suite,
+    with every child truncating the shared log.
+    """
+    sink, stream, path = _buffered_sink(tmp_path, kind, name=f"{kind}.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_inside_a_buffered_batch(stream, worker)
+    at_the_fork = path.read_text(encoding="utf-8")
+    assert _lines_holding(at_the_fork, "before-the-fork") == 1, at_the_fork
+    assert "parent-a" not in at_the_fork, "nothing is buffered, so this proves nothing"
+
+    def log_in_child() -> str:
+        log_foundry.info("child-0")
+        return "logged"
+
+    try:
+        child = run_in_child(log_in_child, timeout=6)
+    finally:
+        gate.release.set()
+
+    assert child.output == "logged", child.output
+    assert log_foundry.flush(timeout=5.0)
+    written = path.read_text(encoding="utf-8")
+    for marker in ("before-the-fork", "parent-a", "parent-b", "child-0"):
+        assert _lines_holding(written, marker) == 1, f"{marker} in {written!r}"
+
+
+def test_the_same_child_duplicates_when_the_discard_is_taken_away(
+    tmp_path: pathlib.Path,
+) -> None:
+    """FR-004 AC-1's other half: the unfixed behaviour is **demonstrated**, not asserted.
+
+    The discard step is removed for the length of one fork, which puts the child in exactly the
+    state the library shipped in before this spec: it inherits the parent's pending bytes, and
+    its own first log call flushes them along with its own. The parent's line then lands twice,
+    which is the measurement against ``5ad6699`` reproduced rather than quoted.
+
+    Without this, the test above could pass against a fork that never entered the window — an
+    empty buffer duplicates nothing, and "each marker appears once" is satisfied by a sink that
+    was never in danger.
+
+    Restoring the inherited *stream object* in the child does not express this and was tried:
+    ``dup2`` has already pointed that object's descriptor at ``/dev/null``, so putting it back
+    sends the child's own line there too and the file shows **less** rather than more. The step
+    has to be absent before the handler runs, not undone after it.
+    """
+    sink, stream, path = _buffered_sink(tmp_path, "file", name="unrepaired.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_inside_a_buffered_batch(stream, worker)
+
+    original = _fork._discard_buffers
+
+    def keep_the_parents_buffer(holders: list[Any]) -> None:
+        pass
+
+    _fork._discard_buffers = keep_the_parents_buffer  # type: ignore[assignment]
+    try:
+        child = run_in_child(_log_in_child, timeout=6)
+    finally:
+        _fork._discard_buffers = original  # type: ignore[assignment]
+        gate.release.set()
+
+    assert child.output == "logged", child.output
+    assert log_foundry.flush(timeout=5.0)
+    written = path.read_text(encoding="utf-8")
+    assert _lines_holding(written, "parent-a") == 2, written
+
+
+def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) -> None:
+    """FR-001 AC-2's third step, pinned rather than promised.
+
+    The order in the child is the contract — locks, then the discard, then the registered
+    handlers — and the reason the discard is inline rather than registered is that
+    ``decorator``'s rebuild registers first and has a **live drain thread** by the time any
+    later handler runs, emitting into the very sink whose buffer is still the parent's.
+
+    Being straight about what this is: moving the step below the handler loop is not currently
+    observable as a duplicate, because the rebuilt worker starts with an empty queue and so has
+    nothing to emit in the window. It is an unenforced contract rather than a live defect —
+    which is exactly the state SPEC-035's predicate roster was built for, after three reviewers
+    each named a different unenforced ordering site and a fourth shipped anyway. The probe
+    records what it saw rather than asserting in the child, as the locks' order test does.
+
+    **The probe is registered first, and appending it is what this test was doing wrong.**
+    ``decorator``'s rebuild is the only other handler and is the one the contract is about, so a
+    probe on the end reads "the discard ran before the *last* handler" — green against a discard
+    slid to just after that rebuild, which is verbatim the hazard the contract names: a live
+    drain thread emitting into a sink whose buffer is still the parent's. From position 0 the
+    same mutant reports ``still-the-parents``.
+    """
+    sink, stream, _path = _buffered_sink(tmp_path, "file", name="ordering.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_inside_a_buffered_batch(stream, worker)
+    inherited = sink._stream
+    seen: list[str] = []
+
+    def probe() -> None:
+        seen.append("discarded" if sink._stream is not inherited else "still-the-parents")
+
+    _fork._child_handlers.insert(0, probe)
+    try:
+        child = run_in_child(lambda: ",".join(seen), timeout=6)
+    finally:
+        _fork._child_handlers.remove(probe)
+        gate.release.set()
+
+    assert child.output == "discarded", child.output
+
+
+def test_the_reopened_stream_keeps_the_encoding_it_was_given(tmp_path: pathlib.Path) -> None:
+    """A child that reopens under a different encoding writes a second half nobody can decode.
+
+    ``FileSink`` takes an ``encoding`` and the file is shared with the parent, so the
+    replacement has to be opened in the same one — dropping it falls back to the locale default
+    and the file becomes two encodings deep in one stream. No fork is needed to see it, and
+    UTF-16 is the pair that shows it: ``json.dumps`` escapes non-ASCII, so a UTF-8 replacement
+    is byte-identical to a Latin-1 one and would prove nothing.
+    """
+    path = tmp_path / "encoded.ndjson"
+    sink = FileSink(str(path), encoding="utf-16")
+    try:
+        sink.emit([{"msg": "before"}])
+        sink.discard_buffered_after_fork()
+        sink.emit([{"msg": "after"}])
+    finally:
+        sink.close()
+
+    decoded = path.read_bytes().decode("utf-16")
+    assert _lines_holding(decoded, "before") == 1, decoded
+    assert _lines_holding(decoded, "after") == 1, decoded
+
+
+def test_a_hostile_attribute_read_does_not_abort_the_lock_repair(tmp_path: pathlib.Path) -> None:
+    """The probe for one hazard must not cost the child the repair for the other.
+
+    ``getattr`` propagates anything that is not an ``AttributeError``, so an owned object whose
+    ``__getattr__`` raises would end the walk — and what is lost then is not a buffer but every
+    lock the walk had not reached yet, which is the hang this module exists to remove. Every
+    other read the walk makes is guarded individually; this asserts the probe is too.
+
+    Nothing owned defines ``__getattr__`` today, so the subject is built here — and it must be
+    a sink that does **not** already carry the hook, or normal lookup succeeds and
+    ``__getattr__`` is never consulted at all. A first version subclassed ``FileSink`` and was
+    vacuous for exactly that reason: it inherited the method, and removing the guard left it
+    green. It raises only for this one name, so the rest of the child's repair is judged on its
+    own behaviour rather than on collateral from the double.
+
+    The stderr assertion is the load-bearing one. An abort is announced by
+    ``_reinit_after_fork``'s own guard wherever it happens, while which locks were already
+    replaced depends on where the walk was — deterministic only in the world where nothing
+    aborts.
+    """
+
+    class _Hostile(MemorySink):
+        def __getattr__(self, name: str) -> Any:
+            if name == "discard_buffered_after_fork":
+                raise RuntimeError("this attribute is not yours to ask about")
+            raise AttributeError(name)
+
+    hostile = _Hostile()
+    later = FileSink(str(tmp_path / "later.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=MultiSink(hostile, later))
+    before = id(later._lock)
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: f"{id(later._lock) != before}|{buffer.getvalue()}", timeout=6)
+    finally:
+        sys.stderr = saved
+        later.close()
+
+    repaired, _, announced = child.output.partition("|")
+    assert repaired == "True", child.output
+    assert announced == "", f"the child announced something: {announced!r}"
+
+
+@pytest.mark.parametrize("value", [None, "disabled"])
+def test_a_member_of_that_name_which_is_not_callable_is_not_the_hook(
+    tmp_path: pathlib.Path, value: object
+) -> None:
+    """The probe asks whether the hook is *callable*, as ``read_losses`` does for ``losses()``.
+
+    ``None`` is not a hypothetical value for an optional member here: the fourth one,
+    ``log_foundry_stop_signal``, is documented as a plain attribute initialised to ``None``, so
+    a sink written against that pattern may well carry this name the same way. Reading it as a
+    hook produces a ``TypeError`` absorbed into a stderr line on every fork — a library
+    announcing a fault of its own invention, on a sink that simply opted out (SPEC-025).
+
+    Both rows are needed and neither is decoration: a ``None`` check alone passes the first and
+    fails the second, so with only ``None`` here the weaker rule is indistinguishable from the
+    one the code states.
+    """
+
+    class _NotAHook(FileSink):
+        pass
+
+    _NotAHook.discard_buffered_after_fork = value  # type: ignore[assignment]
+    sink = _NotAHook(str(tmp_path / "notahook.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(buffer.getvalue, timeout=6)
+    finally:
+        sys.stderr = saved
+        sink.close()
+
+    assert child.finished, child.output
+    assert child.output == "", f"the child announced something: {child.output!r}"
+
+
+def test_the_inherited_buffer_can_only_reach_the_null_device(tmp_path: pathlib.Path) -> None:
+    """FR-004. The buffer is **stranded**, not merely detached, and the two differ.
+
+    Rebinding ``self._stream`` alone leaves the inherited object holding the parent's bytes and
+    a descriptor still pointing at the file — so the flush nobody wrote lands anyway: CPython
+    flushes a ``TextIOWrapper`` when it is garbage-collected, which happens the moment the sink
+    drops its last reference, and again at interpreter exit. ``dup2`` is what makes that flush
+    harmless, and it is measurement 3 of the spec's prior work.
+
+    The flush is driven explicitly here rather than waited for. A test process holds the wrapper
+    from its own frame, so the collection that makes this bite in production never happens
+    inside the child — and a test that hoped for it would pass with ``dup2`` deleted.
+    """
+    sink, stream, path = _buffered_sink(tmp_path, "file", name="stranded.ndjson")
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    decorator._worker = worker
+    gate = _park_inside_a_buffered_batch(stream, worker)
+
+    def flush_what_was_inherited() -> str:
+        stream.flush()
+        return "flushed"
+
+    try:
+        child = run_in_child(flush_what_was_inherited, timeout=6)
+    finally:
+        gate.release.set()
+
+    assert child.output == "flushed", child.output
+    assert log_foundry.flush(timeout=5.0)
+    written = path.read_text(encoding="utf-8")
+    assert _lines_holding(written, "parent-a") == 1, written
+
+
+def _open_descriptors() -> int:
+    """Counts this process's open file descriptors.
+
+    Args:
+      None.
+
+    Returns:
+      How many descriptors are open, by the directory both Linux and macOS publish.
+
+    Raises:
+      None.
+    """
+    return len(os.listdir("/dev/fd"))
+
+
+def test_discarding_a_buffer_leaks_no_descriptor(tmp_path: pathlib.Path) -> None:
+    """The null device is opened to be duplicated over, and then it is nobody's.
+
+    A prefork server forks continuously, and a descriptor leaked per sink per fork is a
+    process that eventually cannot open a file at all — a failure that surfaces nowhere near
+    the fork handler that caused it. No fork is needed to see it: the hook is called directly,
+    which is also what keeps the count stable enough to assert on.
+
+    The replaced stream closes its own descriptor when the sink drops it, so a correct discard
+    is descriptor-neutral rather than merely bounded.
+    """
+    sink = FileSink(str(tmp_path / "descriptors.ndjson"))
+    try:
+        sink.discard_buffered_after_fork()
+        before = _open_descriptors()
+        for _ in range(20):
+            sink.discard_buffered_after_fork()
+        assert _open_descriptors() == before, "the discard leaked a descriptor per call"
+    finally:
+        sink.close()
+
+
+@pytest.mark.parametrize("build", [FileSink, RotatingFileSink])
+def test_a_closed_sink_is_asked_for_nothing(tmp_path: pathlib.Path, build: type) -> None:
+    """A closed sink has no descriptor to redirect, and asking it for one raises.
+
+    ``close()`` is the documented state a sink can be in when a fork happens — ``atexit`` and a
+    caller's own cleanup both reach it — and ``fileno()`` on a closed stream raises
+    ``ValueError``. Without the guard that is an absorbed failure and a stderr line on a path
+    where nothing is wrong, which is the invented fault SPEC-025 removed everywhere else.
+    """
+    sink = build(str(tmp_path / "closed.ndjson"))
+    sink.close()
+    sink.discard_buffered_after_fork()
+
+
+def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The hook is an implementer's code, and it runs where an exception cannot be allowed out.
+
+    A raise here reaches CPython's unraisable hook, which prints a full traceback carrying the
+    exception's **message** — the user data arch §6 keeps out of anything the library says about
+    itself — and it would leave every later step of the repair undone. Each hook is therefore
+    absorbed on its own account, exactly as the registered handlers are, so one sink's failure
+    costs that sink a duplicated batch rather than costing the next sink its discard.
+    """
+
+    class _RaisesOnDiscard(FileSink):
+        def discard_buffered_after_fork(self) -> None:
+            raise RuntimeError("a-value-from-the-event-4321")
+
+    class _RecordsItRan(FileSink):
+        def __init__(self, path: str) -> None:
+            super().__init__(path)
+            self.ran: list[str] = []
+
+        def discard_buffered_after_fork(self) -> None:
+            self.ran.append("yes")
+
+    raising = _RaisesOnDiscard(str(tmp_path / "raising.ndjson"))
+    recording = _RecordsItRan(str(tmp_path / "recording.ndjson"))
+    log_foundry.configure(
+        service="fork", version="0", env="test", sink=MultiSink(raising, recording)
+    )
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(lambda: f"{len(recording.ran)}|{buffer.getvalue()}", timeout=6)
+    finally:
+        sys.stderr = saved
+        raising.close()
+        recording.close()
+
+    assert child.finished, child.output
+    ran, _, announced = child.output.partition("|")
+    assert ran == "1", child.output
+    assert "a-value-from-the-event-4321" not in announced
+    assert "absorbed a failure while discarding an inherited buffer after a fork" in announced
+    assert "(RuntimeError)" in announced
+    assert "_RaisesOnDiscard may write the parent's pending bytes again" in announced
+
+
+class _BareSink:
+    """A sink with an ``emit`` and a ``close`` and nothing else, per FR-004 AC-3.
+
+    It is deliberately declared outside this library's ownership boundary as well as without
+    the hook, since the two exemptions are different: the walk never enters a foreign object at
+    all, and an owned sink without the hook is entered and must simply not be asked.
+    """
+
+    def __init__(self) -> None:
+        """Starts an empty collection.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.events: list[dict[str, object]] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Collects the batch.
+
+        Args:
+          batch: The events to collect.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.events.extend(batch)
+
+    def close(self) -> None:
+        """Releases nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+
+@pytest.mark.parametrize("build", [MemorySink, _BareSink])
+def test_a_sink_without_the_hook_is_unaffected(build: type) -> None:
+    """FR-004 AC-3. The hook is optional, and both kinds of "without it" are covered.
+
+    ``MemorySink`` is the case that can actually break: it is owned, so the walk enters it and
+    the probe runs against it, and a repair that assumed the member exists would take an
+    ``AttributeError`` on every fork of every process using it — a library announcing a fault of
+    its own invention (SPEC-025). The bare class is the criterion's own wording, and is refused
+    a level earlier, at the ownership boundary.
+
+    Silence is asserted as well as delivery, because a probe that raised and was absorbed would
+    still leave the child working while writing a line on every fork.
+    """
+    sink = build()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(
+            lambda: f"{(log_foundry.info('child-0'), len(sink.events))[1]},{buffer.getvalue()}",
+            timeout=6,
+        )
+    finally:
+        sys.stderr = saved
+
+    assert child.output == "1,", child.output
+
+
+def test_the_hook_is_documented_where_an_implementer_reads_the_contract() -> None:
+    """FR-004 AC-4. The hook is probed by name, so its only contract is what ``Sink`` says.
+
+    A third-party sink owning a buffered stream has no other way to learn that the member
+    exists, that it runs in a child that has not returned from ``fork``, or that blocking there
+    produces a process no watchdog can end.
+
+    The **boundary** clause is asserted alongside them, because it is the one a reader acts on
+    and the one that was wrong: the first version of this paragraph said a sink defining the
+    hook is asked, and a review measured a structurally-satisfying third-party sink — which is
+    how every shipped sink satisfies this Protocol — being asked zero times. A claim about who
+    is *not* reached can be deleted with every other assertion here still green.
+    """
+    documented = " ".join((Sink.__doc__ or "").split())
+    assert "discard_buffered_after_fork" in documented
+    assert "must not block" in documented
+    assert "SPEC-039 FR-004" in documented
+    assert "its hook is never called" in documented
+
+
+_DISCARD_HOOK = "discard_buffered_after_fork"
+
+
+def _opens_a_stream_into_self(cls: ast.ClassDef) -> bool:
+    """Whether a class assigns the result of ``open()`` to one of its own attributes.
+
+    That is the evidence of *ownership* the roster needs, and it is what separates the file
+    sinks from ``StdoutSink``, which holds a stream the process owns and is deliberately left
+    alone (FR-005 AC-3). A caller-supplied stream is the caller's buffer; one this class opened
+    is this class's.
+
+    Two shapes are invisible and are disclosed rather than chased: a stream opened by a helper
+    and returned to the assignment, and one opened through something other than the ``open``
+    builtin — ``pathlib.Path.open``, ``os.fdopen``, ``gzip.open``. No module in ``sinks/`` uses
+    either, and following an arbitrary value is the guesswork SPEC-032 took out of this gate.
+
+    Args:
+      cls: The class node to inspect.
+
+    Returns:
+      Whether it opens a stream into a ``self`` attribute anywhere in its body.
+
+    Raises:
+      None.
+    """
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        value = node.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "open"
+        ):
+            continue
+        if any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            for target in targets
+        ):
+            return True
+    return False
+
+
+def _has_the_discard_hook(cls: ast.ClassDef, nodes: dict[str, ast.ClassDef]) -> bool:
+    """Whether a class defines the hook or inherits it from an ancestor in the same scan.
+
+    Defines-**or**-inherits, for the reason SPEC-038 FR-001 made both sink rosters scope that
+    way: keying on where a method happens to sit makes membership a function of a refactor, and
+    moving five ``emit`` implementations into a base dropped five classes out of two lints in
+    one commit with the suite green.
+
+    Args:
+      cls: The class node to judge.
+      nodes: Every class node in the scan, by name, for resolving bases.
+
+    Returns:
+      Whether the hook is reachable on this class.
+
+    Raises:
+      None.
+    """
+    seen: set[str] = set()
+    queue = [cls]
+    while queue:
+        current = queue.pop()
+        if any(
+            isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
+            and member.name == _DISCARD_HOOK
+            for member in current.body
+        ):
+            return True
+        for name in _base_names(current):
+            if name in nodes and name not in seen:
+                seen.add(name)
+                queue.append(nodes[name])
+    return False
+
+
+def _sinks_missing_the_discard_hook(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
+    """Returns the classes that own a buffered stream and cannot discard it after a fork.
+
+    Written as a function over its input rather than over the package, so the red path can be
+    exercised directly — a lint whose failure path never runs is one a refactor of its own
+    matching can defeat silently.
+
+    Args:
+      entries: ``(module_stem, class node)`` pairs to judge.
+
+    Returns:
+      The qualified names of the offenders, sorted.
+
+    Raises:
+      None.
+    """
+    nodes = {cls.name: cls for _stem, cls in entries}
+    return sorted(
+        f"{stem}.{cls.name}"
+        for stem, cls in entries
+        if _opens_a_stream_into_self(cls) and not _has_the_discard_hook(cls, nodes)
+    )
+
+
+def test_every_sink_that_owns_a_buffered_stream_discards_it_after_a_fork() -> None:
+    """FR-004 AC-5. The roster is derived from the sinks, not written next to them.
+
+    Scope is the sink roster ``test_sink_concurrency`` already derives — every class in
+    ``sinks/`` defining or inheriting ``emit``/``send_all``/``close``, floored so it cannot
+    collapse silently (SPEC-032's scope gate, SPEC-038's floor). What varies is the question:
+    which of those classes opens a stream of its own, and therefore inherits a buffer a forked
+    child would write a second time.
+
+    The two file sinks are named as a **precondition**, not as the assertion. A detector that
+    matched nothing would satisfy the negative below while the next stream-owning sink shipped
+    with no hook and no failure — the vacuity this suite exists to keep out. ``StdoutSink`` is
+    asserted *out* of scope for the same reason in reverse: it holds a stream the process owns,
+    and FR-005 AC-3 records that discarding the application's pending output to protect the
+    library's own is not a trade this library may make.
+    """
+    roster = _sink_classes_with_an_emit()
+    assert len(roster) >= 34, f"the sink roster collapsed to {len(roster)}"
+    opening = {f"{stem}.{cls.name}" for stem, cls in roster if _opens_a_stream_into_self(cls)}
+    assert {"file.FileSink", "file.RotatingFileSink"} <= opening, opening
+    assert "stdout.StdoutSink" not in opening, "FR-005 AC-3 keeps the process's stream out"
+
+    missing = _sinks_missing_the_discard_hook(roster)
+    assert not missing, (
+        "these sinks open a buffered stream of their own but cannot discard what a fork leaves "
+        f"pending in it — implement {_DISCARD_HOOK}(): {missing}"
+    )
+
+
+def _synthetic_sink(name: str, body: str, *, bases: str = "") -> tuple[str, ast.ClassDef]:
+    """Parses a one-off sink class, for the lint's red path.
+
+    Args:
+      name: The class name.
+      body: The indented class body.
+      bases: The base list, without parentheses.
+
+    Returns:
+      A ``(module_stem, class node)`` pair shaped like the package scan's.
+
+    Raises:
+      None.
+    """
+    header = f"class {name}({bases}):" if bases else f"class {name}:"
+    module = ast.parse(f"{header}\n{body}")
+    cls = module.body[0]
+    assert isinstance(cls, ast.ClassDef)
+    return ("brandnew", cls)
+
+
+def test_the_buffer_lint_reads_the_shapes_it_claims_to() -> None:
+    """Guards the guard: ``sinks/`` satisfies the rule today, so nothing above can fail.
+
+    Four shapes, each a real decision rather than a variation. A sink that opens a stream and
+    cannot discard it is the offence. One that opens and can is the fix. A **subclass** of the
+    second is why the rule is defines-or-inherits. And a sink assigning a stream it was *given*
+    is ``StdoutSink``, which must stay out of scope without a hand-written exemption — an
+    exemption list is what this whole gate exists to replace.
+    """
+    opener = _synthetic_sink(
+        "OpenerSink",
+        '    def __init__(self, path):\n        self._stream = open(path, "a")\n'
+        "    def emit(self, batch): ...\n",
+    )
+    fixed = _synthetic_sink(
+        "FixedSink",
+        '    def __init__(self, path):\n        self._stream = open(path, "a")\n'
+        "    def emit(self, batch): ...\n"
+        f"    def {_DISCARD_HOOK}(self): ...\n",
+    )
+    inheriting = _synthetic_sink(
+        "InheritingSink",
+        '    def __init__(self, path):\n        self._stream = open(path, "a")\n'
+        "    def emit(self, batch): ...\n",
+        bases="FixedSink",
+    )
+    given = _synthetic_sink(
+        "GivenSink",
+        "    def __init__(self, stream):\n        self._stream = stream\n"
+        "    def emit(self, batch): ...\n",
+    )
+
+    assert _sinks_missing_the_discard_hook([opener]) == ["brandnew.OpenerSink"]
+    assert _sinks_missing_the_discard_hook([fixed]) == []
+    assert _sinks_missing_the_discard_hook([fixed, inheriting]) == []
+    assert _sinks_missing_the_discard_hook([inheriting]) == ["brandnew.InheritingSink"]
+    assert _sinks_missing_the_discard_hook([given]) == []

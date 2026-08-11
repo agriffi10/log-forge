@@ -89,6 +89,33 @@ class Sink(Protocol):
     already used, with a ``threading.Event``. Reproduced. A prefixed name cannot collide by
     accident, and the cost is one verbose attribute on the sinks that want interruptibility.
 
+    A fifth is optional in the same way and exists for one event only:
+    ``discard_buffered_after_fork() -> None``. A sink that owns a **buffered** stream — one it
+    opened itself, rather than the process's ``sys.stdout`` — inherits the parent's unflushed
+    bytes in a forked child, and both processes then write them (SPEC-039 FR-004). Defining this
+    method is how a sink says it can strand what it inherited; a sink holding no buffer of its
+    own needs nothing here. It is *called* rather than assigned, which is why it carries no
+    ``log_foundry_`` prefix: the collision the fourth member's name guards against is an
+    attribute the library writes onto an object it does not own.
+
+    **Which sinks are actually asked is narrower than "whichever define it", and the boundary is
+    the same one every fork repair has.** The child's repair walks this package's own objects —
+    a sink whose class is defined here or **inherits** one that is, ``Sink`` included, and the
+    **owned** sinks such an object holds, ``MultiSink``'s children among them. A third-party
+    sink satisfying this Protocol *structurally*, which is how every shipped sink satisfies it,
+    is outside that walk exactly as its locks are (SPEC-039 FR-005): its hook is never called,
+    and a fork mid-batch there can still duplicate — including when a wrapper this library owns
+    is holding it. Inheriting from ``Sink`` or from a shipped sink is what brings it inside. A
+    **wrapper** sink the walk enters need do nothing itself, because the owned sinks it holds
+    are reached directly rather than through it.
+
+    **It runs in a child that has not yet returned from ``fork``, on that child's only thread,
+    and must not block.** Nothing else is running there, so there is no holder a lock could be
+    waiting for — and no watchdog to end a wait taken anyway, since a pending alarm does not
+    survive the fork and this runs before any application code can arm one. It may raise: the
+    library absorbs and announces that, and the cost is a child that may write the parent's
+    pending bytes a second time.
+
     "Safe to call during an emit" is a concurrency requirement once :meth:`emit` is (SPEC-028
     FR-003). The shipped sinks keep their loss counters under a **dedicated** lock, separate
     from whatever guards their transport: an increment is a read-modify-write that Python does
