@@ -32,12 +32,16 @@ resolver now reads that shape, which both makes the claim above reproduce and cl
 hole: a ninth close written `self._x = HTTPSink(...)` would have been missed silently, and that
 is the idiom this codebase actually uses.
 
-**What the resolver still cannot see** is stated rather than left to be found, because Phase 2's
-ownership guard is exactly as complete as this lint: a receiver reached through a comprehension,
-a nested function's closure over an outer local, `getattr`, an unannotated module global, tuple
-unpacking, a subscript, or a stored callable. Each would be a sink close this lint waves
-through. None occurs in `src/` today -- verified by enumerating all sixteen `.close()` calls --
-and `test_the_resolver_blind_spots_are_the_stated_ones` pins the list so it stays honest.
+**What this lint still cannot see** is stated rather than left to be found, because Phase 2's
+ownership guard is exactly as complete as it is. Two kinds, and the difference matters. The
+*resolver* reaches the close and declines it -- a receiver from a comprehension, a nested
+function's closure over an outer local, an unannotated module global, tuple unpacking, a
+subscript -- and a better resolver would rescue those. The *collector* never offers it at all:
+a `getattr`-dispatched close is not an `ast.Attribute` call, so no resolver improvement can
+reach it. None occurs in `src/` today, verified by enumerating all sixteen `.close()` calls, and
+`test_the_resolver_blind_spots_are_the_stated_ones` pins both groups -- with a precondition that
+each member of the first genuinely reaches the resolver, since a test asserting "nothing is
+caught" is otherwise the easiest kind to write vacuously.
 """
 
 from __future__ import annotations
@@ -87,14 +91,6 @@ _EXPECTED_REQUESTERS = {
 They are held to the same roster because the helper's return value is theirs: SPEC-030 FR-003
 gave each a bounded wait, and a helper that stopped returning the thread would take it away
 silently (FR-002 AC-8).
-"""
-
-_CLOSER_FLOOR = 8
-"""What the roster may not silently fall below.
-
-SPEC-038 measured what a missing floor costs: moving five `emit` methods into a base dropped
-five classes out of two lints in one commit, 34 to 29, with the suite green, and only the roster
-that carried a floor noticed.
 """
 
 
@@ -226,6 +222,12 @@ def _self_attribute_names(cls: ast.ClassDef, attr: str) -> set[str]:
     reason -- not because a `SocketTransport` is not a sink, but because the resolver could not
     see what it was. A ninth *sink* close written `self._x = HTTPSink(...)` would have been
     missed the same way, silently, which is the failure mode this whole file exists to prevent.
+
+    **The third route takes any callable's name as a type**, which it cannot verify: a factory
+    named like a sink, or a local rebinding that shadows one, both resolve to the roster name.
+    In `src/` today this records `_reopen_discarding`, `open` and `new_event_loop` as candidate
+    types, inert only because none collides. That is the safe direction -- a false positive is
+    a lint failure somebody reads, where a false negative is a sink close nobody sees.
 
     Args:
       cls: The class the attribute belongs to.
@@ -485,7 +487,14 @@ def test_the_only_sink_close_in_src_is_the_release_helper() -> None:
 
 
 def test_every_library_closer_goes_through_the_release_helper() -> None:
-    """The eight are the eight, and the two detached requesters are the two."""
+    """The eight are the eight, and the two detached requesters are the two.
+
+    **This is also the floor.** SPEC-038's lesson -- five classes silently leaving a roster in
+    one commit, caught only where a floor existed -- applies to a roster that is *derived*, and
+    an exact-equality comparison against a hand-written expectation already cannot shrink
+    unnoticed. A separate `>= 8` assertion beside this one reads as a second safety net while
+    being strictly implied by it, so it is stated here instead of asserted twice.
+    """
     assert _release_call_sites() == _EXPECTED_CLOSERS | _EXPECTED_REQUESTERS
 
 
@@ -582,15 +591,6 @@ def test_the_worker_waits_for_the_swapped_out_close_it_started() -> None:
         assert elapsed >= close_seconds, "so the worker waited rather than firing and forgetting"
     finally:
         worker.shutdown(2.0)
-
-
-def test_the_closer_roster_has_not_collapsed() -> None:
-    """A floor, because a roster that silently empties passes every other test here.
-
-    SPEC-038 measured the failure this guards: five classes left two lints in one commit with the
-    suite green, and only the lint carrying a floor noticed.
-    """
-    assert len(_release_call_sites()) >= _CLOSER_FLOOR
 
 
 def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
@@ -698,6 +698,30 @@ def test_a_ninth_direct_close_is_caught(tmp_path: pathlib.Path) -> None:
     assert caught == {("ninth", "retire"), ("tenth", "Wrapper.close")}
 
 
+_DECLINED_BY_THE_RESOLVER = {
+    "comprehension": "def f(sinks: list[Sink]) -> None:\n    [s.close() for s in sinks]\n",
+    "closure": "def f(sink: Sink) -> None:\n    def inner() -> None:\n        sink.close()\n",
+    "unannotated_global": "SINK = None\n\n\ndef f() -> None:\n    SINK.close()\n",
+    "unpacking": "def f(pair: tuple[Sink, Sink]) -> None:\n    a, b = pair\n    a.close()\n",
+    "subscript": "def f(sinks: list[Sink]) -> None:\n    sinks[0].close()\n",
+}
+"""Shapes whose `.close()` the collector *does* reach, and `_resolve` then declines.
+
+These are the ones a better resolver could rescue, so a shape that starts being caught is a
+resolver improvement somebody should notice and move out of this group.
+"""
+
+_NEVER_REACHES_THE_RESOLVER = {
+    "getattr": "def f(sink: Sink) -> None:\n    getattr(sink, 'close')()\n",
+}
+"""Shapes excluded one step earlier, at the `isinstance(func, ast.Attribute)` call filter.
+
+Kept in a separate group because no resolver improvement can ever move one out: `_resolve` is
+never consulted for them. Filing this with the group above overstated what a better resolver
+would buy -- the lint would need a different *collector* to see a `getattr`-dispatched close.
+"""
+
+
 def test_the_resolver_blind_spots_are_the_stated_ones(tmp_path: pathlib.Path) -> None:
     """What the lint waves through, pinned so the module docstring stays honest.
 
@@ -706,21 +730,27 @@ def test_the_resolver_blind_spots_are_the_stated_ones(tmp_path: pathlib.Path) ->
     all sixteen `.close()` calls were enumerated -- and this test is what turns "none today"
     into something that fails the day one appears, rather than the day it causes a defect.
 
-    A shape that starts being *caught* fails here too, which is the point: that is a resolver
-    improvement somebody should notice and move out of this list.
+    **The precondition is the point of the test, not decoration.** Asserting that nothing is
+    caught passes just as happily against a shape that no longer contains a `.close()` at all,
+    so each member of the first group is first proved to reach the resolver. Writing that
+    precondition is what showed `getattr` was in the wrong group.
     """
-    shapes = {
-        "comprehension": "def f(sinks: list[Sink]) -> None:\n    [s.close() for s in sinks]\n",
-        "closure": "def f(sink: Sink) -> None:\n    def inner() -> None:\n        sink.close()\n",
-        "getattr": "def f(sink: Sink) -> None:\n    getattr(sink, 'close')()\n",
-        "unannotated_global": "SINK = None\n\n\ndef f() -> None:\n    SINK.close()\n",
-        "unpacking": "def f(pair: tuple[Sink, Sink]) -> None:\n    a, b = pair\n    a.close()\n",
-        "subscript": "def f(sinks: list[Sink]) -> None:\n    sinks[0].close()\n",
-    }
-    for name, body in shapes.items():
+    for name, body in {**_DECLINED_BY_THE_RESOLVER, **_NEVER_REACHES_THE_RESOLVER}.items():
         (tmp_path / f"{name}.py").write_text(
             f"from log_foundry.sinks.base import Sink\n\n\n{body}", encoding="utf-8"
         )
+
+    for name in _DECLINED_BY_THE_RESOLVER:
+        tree = ast.parse((tmp_path / f"{name}.py").read_text(encoding="utf-8"))
+        candidates = [
+            node
+            for node, _fn, _cls in _walk_scopes(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "close"
+        ]
+        assert candidates, f"{name} reaches the resolver, or it proves nothing by being declined"
+
     assert _sink_close_sites(tmp_path) == [], (
         "a shape here is now caught -- move it out of the list"
     )
