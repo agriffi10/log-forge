@@ -366,6 +366,43 @@ def _offers_discard(holder: object) -> bool:
         return False
 
 
+_SKIP_ATTRIBUTE = "_FORK_SKIP"
+"""A module's opt-out: attribute names the walk must not read or descend into.
+
+**Bookkeeping that pins objects is not live state to repair**, and the difference is invisible
+to a walk that only sees a container. ``_lifecycle._owned`` is the case: SPEC-042 FR-001 requires
+it to hold a **strong** reference to every sink this process ever acquired, so without an opt-out
+the walk reaches sinks the process abandoned several ``configure()`` calls ago — replacing their
+locks, which is merely wasteful, and calling their fork hooks, which is not. Measured: a forked
+child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink``
+in that state would have its file reopened on every fork for the life of the process.
+
+Declared by the module that owns the state rather than listed here, which keeps this module's
+rule that it imports nothing but ``_diag`` (SPEC-039 FR-006). Nothing is lost by skipping: a sink
+that is still *live* is reached through the config and the worker, which are not opted out.
+"""
+
+
+def _skipped_names(holder: object) -> frozenset[str]:
+    """Returns the attribute names a holder has opted out of the walk.
+
+    Args:
+      holder: The module, class or instance the walk is about to read.
+
+    Returns:
+      The opted-out names, empty for anything that declares none.
+
+    Raises:
+      None. A malformed or unreadable declaration opts nothing out, so the walk does more work
+        rather than less — the safe direction for a repair whose absence is a hang.
+    """
+    try:
+        declared = getattr(holder, _SKIP_ATTRIBUTE, None)
+        return frozenset(declared) if declared else frozenset()
+    except Exception:
+        return frozenset()
+
+
 def _reinit_primitives() -> list[Any]:
     """Replaces every lock and event this package owns, wherever the walk reaches one.
 
@@ -417,7 +454,10 @@ def _reinit_primitives() -> list[Any]:
                 continue
             if _offers_discard(holder):
                 buffered.append(holder)
+        skip = _skipped_names(holder)
         for name, value in _namespace_items(holder):
+            if name in skip:
+                continue
             fresh = _fresh_primitive(value, memo, keepalive)
             if fresh is not None:
                 _assign(holder, name, fresh)

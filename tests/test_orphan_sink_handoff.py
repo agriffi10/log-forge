@@ -911,9 +911,17 @@ def test_shutdown_joins_a_closer_started_before_the_worker_existed(monkeypatch) 
 
 
 def test_lifecycle_imports_nothing_that_could_cycle() -> None:
-    """AC-3. It is imported by both `worker` and `decorator`, so it must stay a leaf."""
+    """AC-3. It is imported by `worker`, `decorator`, `config` and five sinks, so it stays a leaf.
+
+    SPEC-042 added the last six of those importers, which makes the property this asserts more
+    load-bearing than when it was written, not less.
+    """
     import ast
     import pathlib
+
+    from log_foundry import _diag as diag
+    from log_foundry import _fork as fork_mod
+    from log_foundry.sinks import base as sink_base
 
     source = pathlib.Path(lifecycle.__file__).read_text()
     tree = ast.parse(source)
@@ -934,21 +942,33 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
                 found |= {f"{node.module}.{a.name}" for a in node.names}
         return found
 
-    type_checking = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "TYPE_CHECKING"
-        and not node.orelse
-    ]
+    # SPEC-042 widened this from `{_diag}` to three, and both additions are deliberate.
+    # `_fork` is the second arrow FR-001 states outright: the ownership record owns the walk
+    # over a handed-over sink graph, and it reuses `_fork`'s descent predicates rather than
+    # duplicating them. `sinks.base` moved from TYPE_CHECKING to runtime because the walk has to
+    # ask `isinstance(x, Sink)` -- FR-001 puts the sink-shape test on this side precisely so
+    # `_fork`'s own rule (it imports nothing but `_diag`) stays untouched.
+    allowed = {"log_foundry._diag", "log_foundry._fork", "log_foundry.sinks.base.Sink"}
+    assert package_modules(tree.body) == allowed, (
+        f"at runtime it may import only {sorted(allowed)}, got {package_modules(tree.body)}"
+    )
 
-    assert package_modules(tree.body) == {"log_foundry._diag"}, (
-        f"at runtime it may import only `_diag`, got {package_modules(tree.body)}"
-    )
-    assert len(type_checking) == 1, "one TYPE_CHECKING block, with no else"
-    assert package_modules(type_checking[0].body) == {"log_foundry.sinks.base.Sink"}, (
-        "`Sink` is the only TYPE_CHECKING-guarded package import"
-    )
+    # The exact-set assertion above is the guard; this is why that set is safe. The property is
+    # not "few imports" but "nothing that imports back", and it is checked rather than argued --
+    # every module this one pulls in is read and must not name `_lifecycle`.
+    for module in (diag, fork_mod, sink_base):
+        imported = package_modules(ast.parse(pathlib.Path(module.__file__).read_text()).body)
+        assert not any("_lifecycle" in name for name in imported), (
+            f"{module.__name__} imports back into _lifecycle, which is the cycle this forbids"
+        )
+
+    # And the four that would certainly cycle are named, so a future edit that adds one fails
+    # here with the reason rather than at import time with a traceback.
+    assert not any(
+        name.startswith(f"log_foundry.{module}")
+        for name in package_modules(tree.body)
+        for module in ("worker", "decorator", "config", "api")
+    ), "these import `_lifecycle`; importing one back is a cycle"
 
 
 def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:

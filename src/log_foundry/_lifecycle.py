@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
-from typing import TYPE_CHECKING
 
-from log_foundry import _diag
-
-if TYPE_CHECKING:
-    from log_foundry.sinks.base import Sink
+from log_foundry import _diag, _fork
+from log_foundry.sinks.base import Sink
 
 DEFAULT_CLOSER_GRACE = 2.0
 """Seconds a shutdown gives an outstanding swapped-out close to finish.
@@ -23,8 +21,236 @@ more likely stuck than slow, and every second spent on it is a second the proces
 _closers: list[threading.Thread] = []
 _closers_lock = threading.Lock()
 
+_FORK_SKIP = ("_owned",)
+"""Keeps the ownership record out of ``_fork``'s repair walk (``_fork._SKIP_ATTRIBUTE``).
 
-def release(sink: Sink, *, detached: bool = False) -> threading.Thread | None:
+The record strongly references every sink this process ever acquired, so the walk would
+otherwise reach ones the process abandoned several ``configure()`` calls ago and call their fork
+hooks — measured, a child announced a buffer discard for a superseded sink, and a ``FileSink``
+there would be reopened on every fork forever. A sink that is still live is reached through the
+config and the worker, so nothing the repair needs is lost.
+"""
+
+_owned: dict[int, tuple[int, object]] = {}
+"""Which sinks this process acquired, keyed by ``id`` and holding the pid that acquired them.
+
+**No record means refused** (FR-001), and that default is the whole mechanism: a sink the library
+was never handed was never its to release, so every gap fails toward a leaked handle rather than
+toward closing a transport another process is still using.
+
+The value holds a **strong reference beside the pid**, which is load-bearing twice. An ``id`` is
+reusable the moment its object dies, so a bare pid could be handed to an unrelated later object
+that happened to land on the address; and a garbage-collected sink closes itself, which is the
+same destructive close by another route. ``_fork._fresh_primitive`` already pairs an id with a
+keepalive for the first of those reasons.
+
+It therefore grows by one entry per sink ever handed to the library and never shrinks. That is
+accepted rather than bounded: ``configure()`` is a startup call, so the count is startup-scale,
+and evicting an entry is exactly the "no record" state that makes a sink unreleasable.
+"""
+
+_owned_lock = threading.Lock()
+"""Guards :data:`_owned`, and is the **last** lock in the process's order (FR-001 AC-12).
+
+``_worker_lock`` → ``_config_lock`` → this, never the reverse in any pair. The three-term form
+is the real one: ``decorator._get_worker`` calls ``config._ensure_sink()`` while holding
+``_worker_lock``, and ``_ensure_sink``'s construction branch takes ``_config_lock`` before it can
+stamp. The criterion states the two-term version, which is true but skips the middle term.
+
+The orphan logging path is the opposite constraint and takes **no** lock at all: it reaches
+``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
+"""
+
+_PLAIN_TYPES = frozenset(
+    {dict, list, tuple, set, frozenset, str, bytes, int, float, bool, type(None)}
+)
+"""Builtin types that provably cannot be a sink, skipped before any structural test.
+
+A fact rather than a heuristic: ``Sink`` requires ``emit`` and ``close``, and no builtin has
+either. Tested by **exact type, never ``isinstance``**, so a ``class MySink(dict)`` is still
+asked — measured, the exact form answers ``True`` for a dict-subclass sink and ``False`` for a
+plain dict.
+
+It is the single largest term in the walk's cost, because a buffering sink's contents are almost
+entirely these: skipping them took a ``MemorySink`` holding 100k events from 1,109 ms to 279 ms
+before the descent was bounded at all (FR-001 AC-11).
+"""
+
+
+def _may_be_a_sink(value: object) -> bool:
+    """Whether a value is worth asking the structural question about at all.
+
+    Args:
+      value: Any object reached by the walk.
+
+    Returns:
+      Whether its exact type is something other than a plain builtin.
+
+    Raises:
+      None.
+    """
+    return type(value) not in _PLAIN_TYPES
+
+
+def _reachable_sinks(root: object) -> list[object]:
+    """Returns every sink reachable from one object handed to the library (FR-001).
+
+    A wrapper is handed over *with* its children, so the same act acquires them and the record
+    has to reach the whole graph — a first draft stamped only what ``configure()`` was given, and
+    a structural sink inside a ``MultiSink`` was then neither stamped nor reachable by
+    ``_fork``'s mark, which is the object a forked child closed twice.
+
+    **Reaching the graph is a descent question, not an ownership one**, and that distinction is
+    what keeps this inside SPEC-039's boundary. The walk enters library objects and plain
+    containers as that module's predicates already define, and *records* any sink-shaped member
+    it meets even where it will not descend into it. Recording reads nothing from the object: an
+    ``id``, a reference, and the two attribute lookups a runtime-checkable Protocol performs.
+    "Do not reach into third-party state" (SPEC-039 FR-003 AC-2) forbids mutating and traversing
+    a foreign object, not noticing one.
+
+    **A container is scanned one level and never recursed into**, which is a bound chosen with a
+    measurement in hand (FR-001 AC-11). A sink is never inside *caller data*: it is an owned
+    object's attribute, or a member of a container an owned object holds directly, which is what
+    ``MultiSink._sinks`` is. Unbounded descent enters every event dict a buffering sink holds and
+    measured 279 ms on a ``MemorySink`` with 100k events against 2 ms for this; both return an
+    identical set for every shape the library ships or ``README.md`` documents. What the bound
+    gives up is a sink two container hops below an owned holder, which is then unrecorded,
+    therefore refused, therefore **leaked rather than destructively closed** — the one direction
+    FR-001 permits a gap to fail in.
+
+    Args:
+      root: The object ``configure()`` or ``_ensure_sink()`` was handed.
+
+    Returns:
+      The sinks reached, each once, in the order the walk met them.
+
+    Raises:
+      None. The reads are the ones ``_fork`` already guards, and a graph that cannot be walked
+        fully leaves the unreached sinks unrecorded — refused, which is the safe default.
+    """
+    seen: set[int] = set()
+    found: list[object] = []
+    stack: list[object] = [root]
+    while stack:
+        holder = stack.pop()
+        if id(holder) in seen or not _may_be_a_sink(holder):
+            continue
+        seen.add(id(holder))
+        if isinstance(holder, Sink):
+            found.append(holder)
+        if not _fork._is_owned(holder):
+            continue
+        for _name, value in _fork._namespace_items(holder):
+            if _fork._is_container(value):
+                stack.extend(
+                    member for member in _fork._container_children(value) if _is_candidate(member)
+                )
+            elif _is_candidate(value):
+                stack.append(value)
+    return found
+
+
+def _is_candidate(value: object) -> bool:
+    """Whether the walk pushes this value onto its stack.
+
+    Args:
+      value: A member or attribute the walk has just read.
+
+    Returns:
+      Whether it is either sink-shaped or an object this package defines.
+
+    Raises:
+      None.
+    """
+    return _may_be_a_sink(value) and (isinstance(value, Sink) or _fork._is_owned(value))
+
+
+def stamp(sink: object) -> None:
+    """Records that this process acquired a sink, and everything reachable from it (FR-001).
+
+    Called at the one moment ownership is knowable — when the library is *handed* a sink, by
+    ``configure(sink=…)`` or by ``_ensure_sink()`` building the lazy default — and never on
+    ``_ensure_sink``'s fast-path return, which runs once per orphan event (AC-10).
+
+    **Write-once per object.** A stamp naming another process is never overwritten, so a forked
+    child cannot claim an inherited sink by configuring its way back to it, and the answer
+    survives a second fork. Overwriting on every ``configure()`` satisfies every other criterion
+    in FR-001 and fails AC-4.
+
+    The walk runs **outside** the lock and only the record write takes it, so an arbitrary
+    object graph is never traversed while holding a process-wide lock.
+
+    Args:
+      sink: The sink being installed, whose reachable graph is acquired with it.
+
+    Returns:
+      None.
+
+    Raises:
+      None. This runs inside ``configure()``, which must not fail an application's startup over
+        a bookkeeping step; an unrecorded sink is a refused one, which leaks rather than closes.
+    """
+    try:
+        reachable = _reachable_sinks(sink)
+    except Exception as exc:
+        _diag.absorbed("recording which sinks this process owns", exc, "they will not be closed")
+        return
+    pid = os.getpid()
+    with _owned_lock:
+        for found in reachable:
+            _owned.setdefault(id(found), (pid, found))
+
+
+def releasable(sink: object, *, owner: object = None) -> bool:
+    """Whether this process may close a sink (FR-001).
+
+    A recorded sink answers for itself: releasable exactly when the record names this process.
+    That is the whole mechanism for the defect — after a fork every stamp names the parent, so a
+    child refuses the object it inherited.
+
+    **An *unrecorded* sink inherits the answer from whatever is releasing it**, and that is a
+    correction to FR-001's flat "no record means refused". Every lifecycle path stamps: a sink
+    reaches the worker or the orphan record only through ``config._ensure_sink()``, which the
+    two acquisition points cover. So "no record" never occurs on a path the fork defect travels
+    — it occurs when a **user** calls ``close()`` on a wrapper the library was never handed, and
+    refusing there turns a documented public API into a silent no-op, which is the failure mode
+    this whole arc exists to remove. ``FilteringSink(inner).close()`` must still close ``inner``.
+
+    The wrapper is what makes the two distinguishable, so it is asked:
+
+    - Neither recorded — a graph the library never saw. The caller owns it; honour the close.
+    - The child recorded elsewhere — the inherited sink. Refused however it was reached, which
+      is what closes the wrapper route (FR-002 AC-3).
+    - The wrapper recorded, the child not — the sink added to a wrapper *after* ``configure()``
+      walked it. Refused, per FR-001 AC-6: the library holds this graph, so a member it has no
+      record of is one it must not assume is this process's. The consequence is a leak, recorded
+      in §13.
+
+    Identity is re-checked against the strong reference rather than trusting the ``id``. The
+    reference is what makes an id collision impossible while a record stands, so this can only
+    fail if that invariant breaks — and answering ``False`` there is the safe direction.
+
+    Args:
+      sink: The sink a caller is about to close.
+      owner: The wrapper forwarding the close, when one is. ``None`` from the three lifecycle
+        sites, which hold the sink directly.
+
+    Returns:
+      Whether this process may close it.
+
+    Raises:
+      None.
+    """
+    pid = os.getpid()
+    with _owned_lock:
+        record = _owned.get(id(sink))
+        owner_record = None if owner is None else _owned.get(id(owner))
+    if record is not None:
+        return record[1] is sink and record[0] == pid
+    return owner_record is None
+
+
+def release(sink: Sink, *, detached: bool = False, owner: object = None) -> threading.Thread | None:
     """Closes a sink on the library's behalf — the one path by which it ever does (SPEC-042 FR-002).
 
     Eight sites closed a sink directly before this existed, and guarding only the three the
@@ -40,19 +266,38 @@ def release(sink: Sink, *, detached: bool = False) -> threading.Thread | None:
     a documented ``Raises:``. Folding the ``try/except`` in here would drop absorbed close
     failures out of ``Health.sink.failed`` — a SPEC-026 regression — and falsify those three.
 
+    **A sink this process did not acquire is skipped, not failed** (FR-001, FR-002). A forked
+    child inherits the parent's sink object, and closing it sends a real protocol goodbye on a
+    connection the parent is still using — measured, the parent's next write failed with
+    ``ECONNRESET``. Refusing here is a **skip**: nothing is counted as lost, nothing is retried,
+    and every caller's control flow is unchanged, so ``MultiSink.close`` still isolates and
+    continues, ``shutdown()`` still returns, and a swap still installs its new sink. The sink is
+    left **open**, which is the trade SPEC-027 FR-004 and SPEC-030 already made twice: a leaked
+    resource in an exiting process beats a corrupt write.
+
+    Only the *release* is refused. Every **drain** is untouched (FR-003), so a child still gets
+    its own events out through the sink it inherited.
+
     Args:
       sink: The sink to close.
       detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
         the caller has stopped delivering to and must not block on (SPEC-030 FR-003).
+      owner: The wrapper forwarding this close, when one is. The five shipped wrappers pass
+        themselves; the three lifecycle sites hold their sink directly and pass nothing. See
+        :func:`releasable` for what the distinction decides.
 
     Returns:
-      The started closer thread for a detached release, or ``None`` — both when an inline close
-      completed and when the platform would not give the process another thread.
+      The started closer thread for a detached release, or ``None`` — for a refused release, for
+      a completed inline close, and when the platform would not give the process another thread.
+      A caller needing to tell those apart consults :func:`releasable`, which it already has.
 
     Raises:
-      Exception: Whatever an inline ``close()`` raised. A detached release raises nothing: the
-        thread body absorbs, since there is no caller left to hand it to.
+      Exception: Whatever an inline ``close()`` raised. A refused release raises nothing, and
+        neither does a detached one: its thread body absorbs, since there is no caller left to
+        hand it to.
     """
+    if not releasable(sink, owner=owner):
+        return None
     if detached:
         return _start_closer(sink)
     sink.close()

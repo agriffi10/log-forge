@@ -153,4 +153,4 @@ class TransformSink:
         Raises:
           Exception: Whatever the inner sink raises on close.
         """
-        _lifecycle.release(self._inner)
+        _lifecycle.release(self._inner, owner=self)

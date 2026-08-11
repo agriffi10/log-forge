@@ -907,7 +907,17 @@ def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     `StdoutSink()` run there, and `StdoutSink.__init__` is a single attribute assignment.
 
     Asserted as a whitelist rather than a search for the bad case: the set of things that would
-    be unsafe is open, and the set that is currently safe is two.
+    be unsafe is open, and the set that is currently safe is three.
+
+    **`_lifecycle.stamp` is the third (SPEC-042 FR-001), and it is here on purpose rather than
+    for want of somewhere else.** The stamp must be taken *before* the sink is published, and
+    publication is the `replace()` inside this lock, so moving it out means either stamping a
+    sink that may lose the construction race or stamping after another thread can already reach
+    it. It clears both hazards this test names. It cannot block: its argument here is a
+    freshly-built `StdoutSink`, a one-object walk measured at 0.005 ms, and the only lock it
+    takes is `_owned_lock`, which is *last* in the process order (`_worker_lock` ->
+    `_config_lock` -> `_owned_lock`) and held only across dict writes. The second assertion
+    below checks the reach-back directly rather than leaving it to this paragraph.
     """
     under_lock: list[str] = []
 
@@ -925,11 +935,30 @@ def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     source = (_ROOT / "src" / "log_foundry" / "config.py").read_text(encoding="utf-8")
     walk(ast.parse(source), False)
 
-    assert set(under_lock) == {"replace", "StdoutSink"}, (
+    assert set(under_lock) == {"replace", "StdoutSink", "_lifecycle.stamp"}, (
         f"new work under _config_lock: {sorted(set(under_lock))}. "
         "Anything that blocks, or that reaches for _worker_lock, deadlocks or stalls "
         "every configure() and every zero-config log."
     )
+
+    # The named hazard, checked rather than argued. `_lifecycle` is the one module reachable
+    # from under this lock, so if it -- or anything it imports -- ever *references*
+    # `_worker_lock`, the whitelist above has stopped meaning what its docstring says.
+    #
+    # Identifiers, not text: `_lifecycle`'s own docstrings state the lock order, and a substring
+    # search flags that prose as a violation. Written that way first, and it failed -- the
+    # ordering being documented is the opposite of the ordering being broken.
+    for module in ("_lifecycle", "_fork", "_diag"):
+        tree = ast.parse((_ROOT / "src" / "log_foundry" / f"{module}.py").read_text("utf-8"))
+        referenced = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        }
+        assert "_worker_lock" not in referenced, (
+            f"{module} reaches for _worker_lock, which is taken *before* _config_lock; "
+            "acquiring it from under _config_lock inverts the order and deadlocks"
+        )
 
 
 # -- FR-004: echo and message stop being reserved words --------------------------------------
