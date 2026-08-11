@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag
+from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import read_losses
 
 if TYPE_CHECKING:
@@ -172,6 +172,10 @@ class FilteringSink:
     def close(self) -> None:
         """Closes the inner sink (FR-003).
 
+        Routed through ``_lifecycle.release`` so a sink this process may not release is refused
+        here as it is at the lifecycle's own closers (SPEC-042 FR-002). The propagation is
+        unchanged: the helper re-raises, and this method's ``Raises:`` is the reason it does.
+
         Args:
           None.
 
@@ -181,4 +185,4 @@ class FilteringSink:
         Raises:
           Exception: Whatever the inner sink raises on close.
         """
-        self._inner.close()
+        _lifecycle.release(self._inner)

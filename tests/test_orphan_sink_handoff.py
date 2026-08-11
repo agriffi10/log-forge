@@ -535,7 +535,7 @@ def test_the_live_orphan_sinks_close_stays_inline_and_unbounded() -> None:
 
     assert slow.closed == 1, "shutdown waited for it rather than detaching it"
     assert elapsed >= 0.4, "it did not return before the close finished"
-    # The thread is the observable. Elapsed time is not: routed through `close_detached`, the
+    # The thread is the observable. Elapsed time is not: routed through a detached `release`, the
     # exit grace joins a 0.4 s close and both assertions above still pass — measured.
     assert closed_on == [caller], (
         f"the live sink's close must run inline on the caller's thread, not detached — ran on "

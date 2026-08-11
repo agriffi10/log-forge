@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlparse
 
-from log_foundry import _diag
+from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
@@ -128,7 +128,9 @@ class SentrySink:
         Idempotent, and it releases nothing — which is why the class docstring's post-close claim
         holds despite this method calling a ``close()``. ``HTTPSink.close`` is a documented no-op,
         since ``urllib`` builds a fresh connection per request; the forward exists so a future
-        ``HTTPSink`` that *did* hold a pool would be released here rather than leaked.
+        ``HTTPSink`` that *did* hold a pool would be released here rather than leaked. It goes
+        through ``_lifecycle.release`` for that same future: the day the forward releases
+        something is the day a forked child must not perform it (SPEC-042 FR-002).
 
         Args:
           None.
@@ -140,7 +142,7 @@ class SentrySink:
           None.
         """
         if self._http is not None:
-            self._http.close()
+            _lifecycle.release(self._http)
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:

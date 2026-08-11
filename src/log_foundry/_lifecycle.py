@@ -24,7 +24,42 @@ _closers: list[threading.Thread] = []
 _closers_lock = threading.Lock()
 
 
-def close_detached(sink: Sink) -> threading.Thread | None:
+def release(sink: Sink, *, detached: bool = False) -> threading.Thread | None:
+    """Closes a sink on the library's behalf — the one path by which it ever does (SPEC-042 FR-002).
+
+    Eight sites closed a sink directly before this existed, and guarding only the three the
+    lifecycle owns was measurably insufficient: a forked child that wraps an **inherited** sink in
+    a ``MultiSink`` of its own reaches the inner sink through the wrapper, so the parent's
+    structural sink was closed twice with all three lifecycle sites guarded. Routing every
+    library closer through one function is what gives the ownership question one home.
+
+    **The guard moves here; the error handling does not.** This propagates whatever ``close()``
+    raises, because the callers do not agree today and must not be made to: four absorb, under
+    three distinct ``_diag`` texts naming the site (SPEC-029), ``MultiSink`` also increments its
+    ``failed`` counter, and ``FilteringSink``/``TransformSink``/``LogstashSink`` propagate under
+    a documented ``Raises:``. Folding the ``try/except`` in here would drop absorbed close
+    failures out of ``Health.sink.failed`` — a SPEC-026 regression — and falsify those three.
+
+    Args:
+      sink: The sink to close.
+      detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
+        the caller has stopped delivering to and must not block on (SPEC-030 FR-003).
+
+    Returns:
+      The started closer thread for a detached release, or ``None`` — both when an inline close
+      completed and when the platform would not give the process another thread.
+
+    Raises:
+      Exception: Whatever an inline ``close()`` raised. A detached release raises nothing: the
+        thread body absorbs, since there is no caller left to hand it to.
+    """
+    if detached:
+        return _start_closer(sink)
+    sink.close()
+    return None
+
+
+def _start_closer(sink: Sink) -> threading.Thread | None:
     """Starts a daemon close of a sink no longer being delivered to (SPEC-030 FR-003).
 
     The thread is returned rather than joined, so a caller holding a lock can start under it and
@@ -79,7 +114,8 @@ def _close_guarded(sink: Sink) -> None:
     The guard is what makes the thread safe to leave unattended: an exception escaping here
     would reach CPython's thread bootstrap, which prints a full traceback carrying the
     exception's message — the user data arch §6 keeps out of anything the library says about
-    itself.
+    itself. It goes back through :func:`release` rather than calling ``close()`` itself, so the
+    thread body is one of the eight callers rather than a ninth close (SPEC-042 FR-002).
 
     Args:
       sink: The sink to close.
@@ -91,7 +127,7 @@ def _close_guarded(sink: Sink) -> None:
       None.
     """
     try:
-        sink.close()
+        release(sink)
     except Exception as exc:
         _diag.absorbed("closing a swapped-out sink", exc, "it may still hold its resources")
 
