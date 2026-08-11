@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import threading
 
+from log_foundry import _lifecycle
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPSink
@@ -124,6 +125,11 @@ class LogstashSink:
     def close(self) -> None:
         """Closes whichever backend is held (FR-005).
 
+        The two branches are deliberately not symmetric. The HTTP backend is a ``Sink`` and goes
+        through ``_lifecycle.release``, so a forked child cannot release one it inherited
+        (SPEC-042 FR-002); the socket is a ``SocketTransport`` this sink built and owns
+        outright, which no sink-ownership record describes.
+
         Args:
           None.
 
@@ -134,7 +140,7 @@ class LogstashSink:
           Exception: Whatever the backend raises on close.
         """
         if self._http is not None:
-            self._http.close()
+            _lifecycle.release(self._http)
         elif self._socket is not None:
             self._socket.close()
 

@@ -790,7 +790,7 @@ class Worker:
             wait this method exists to remove, in the one situation where the process is
             already under resource pressure.
         """
-        closer = _lifecycle.close_detached(sink)
+        closer = _lifecycle.release(sink, detached=True)
         if closer is not None:
             closer.join(timeout)
 
@@ -1009,7 +1009,7 @@ class Worker:
           None.
         """
         try:
-            self.sink.close()
+            _lifecycle.release(self.sink)
         except Exception as exc:
             _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 

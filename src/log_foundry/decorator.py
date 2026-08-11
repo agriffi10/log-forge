@@ -504,7 +504,7 @@ def _close_orphan_sink() -> None:
         _orphan_sink = None
         _orphan_closed_sink = owed
     try:
-        owed.close()
+        _lifecycle.release(owed)
     except Exception as exc:
         _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
@@ -637,7 +637,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             _offer_orphan_signal(new_sink)
             if _worker is None or _worker.sink is not old:
                 _orphan_closed_sink = old
-                closer = _lifecycle.close_detached(old)
+                closer = _lifecycle.release(old, detached=True)
     if worker is not None:
         try:
             worker_holds_sink = worker.swap_sink(new_sink, timeout)

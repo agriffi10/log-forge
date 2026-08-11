@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag
+from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkLosses, read_losses
 
 if TYPE_CHECKING:
@@ -178,7 +178,11 @@ class MultiSink:
         """Closes every child, isolating a failing one so the rest still close (FR-002).
 
         Unlike :meth:`emit` this keeps the unconditional isolate-and-continue behaviour even on
-        total failure, because a failed close has nothing to retry.
+        total failure, because a failed close has nothing to retry. Each child goes through
+        ``_lifecycle.release`` rather than being closed here, so a child this process may not
+        release is refused by the same guard the lifecycle's own closers consult (SPEC-042
+        FR-002) — the wrapper route is how a forked child reached a parent's sink with all three
+        lifecycle sites already guarded.
 
         Args:
           None.
@@ -191,7 +195,7 @@ class MultiSink:
         """
         for sink in self._sinks:
             try:
-                sink.close()
+                _lifecycle.release(sink)
             except Exception as err:
                 with self._counter_lock:
                     self.failed += 1
