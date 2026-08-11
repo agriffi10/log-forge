@@ -292,6 +292,16 @@ recorded grounds that it "only appends to a list" — it calls `build_event`, so
 returned normally outside a span and killed the decorated function inside one, *and* the
 decorator recorded an `error.type` the caller never raised. Six `xfail` cells cleared.
 
+**SPEC-039 (fork lifecycle) is Completed** — `os.fork()` was unhandled anywhere in the tree, and
+prefork servers (gunicorn, uWSGI, Celery) are a mainstream deployment for a logging library. A
+child inherited a worker whose drain thread does not exist — six events never delivered with
+`health()` clean on every term — and locks held by threads that do not exist, which hung **19 of
+60 children** permanently inside `info()`, on the application's own thread. New `_fork.py`
+registers one `after_in_child` handler whose order of work is the contract: re-init every lock
+and event the library owns → discard inherited buffered writes → run the registered handlers,
+`decorator`'s in-place worker rebuild among them. It was SPEC-035 FR-005, moved out once that
+spec's other five FRs shipped.
+
 **The 2026-08-07 audit arc's build order was reversed** to `034 → 037 → 038 → 036 → 039 → 041 →
 040`, and most of it no longer blocks `v1.0.0`. Reasoning in `docs/specs/INDEX.md`; the short form
 is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later
@@ -666,6 +676,35 @@ so they are free in `1.x`.
   division, so a byte-charging test only bites at sizes where the division tips — the same test
   was vacuous at 1,012 bytes (the count limit binds first) and again at 9,000, and now asserts
   its own sensitivity as a precondition. (SPEC-038 FR-004, FR-005)
+- **A forked child repairs itself, in one order, and the parent is never touched** — locks and
+  events first, then inherited buffers, then the registered handlers (arch §9). The order *is* the
+  contract: a lock re-initialised after a handler that takes it is a handler that hangs, on the
+  child's only thread with nothing left to interrupt it, which is why the buffer discard is inline
+  rather than registered — `decorator`'s rebuild registers first and has a live drain thread by
+  then. Only `after_in_child` is registered: `before` does not run for a C-level fork at all
+  (uWSGI calls `PyOS_AfterFork_Child` only), so the child handler must be sufficient regardless,
+  and a parent-side one would buy a partial fix for a measured 1.20 s hold on the forking thread.
+  The roster of what gets repaired is **derived, never listed** — a walk over this package's own
+  objects plus plain containers, with an AST lint forbidding a primitive built anywhere the walk
+  cannot write it back, so a lock a later spec adds is picked up with no edit here. An identity
+  memo is load-bearing rather than tidy: a sink's `log_foundry_stop_signal` *is* the worker's
+  `_stop`, and two fresh events would leave the worker setting one and the sink waiting on the
+  other. The worker is rebuilt **in place** with a replaced queue *object* (draining it keeps
+  `queue.Queue`'s own mutex, which no lock rule over this package can see) so ownership guards
+  keyed on `_worker.sink is X` survive; a retired parent forks a retired child, because a fork
+  does not undo a `shutdown()`. What the walk cannot reach is the caller's and is recorded rather
+  than half-fixed (arch §13): a third-party sink's locks and buffer hook, a driver's internal
+  state, `sys.stdout`'s process-owned buffer, and the shared sink object itself — construct the
+  sink *after* the fork if it holds a connection. (SPEC-039, arch §9, §13)
+- **A value the child inherits is stranded, never merely detached** — a fork inside `emit`, after
+  the write loop and before the flush, leaves both processes holding the same bytes, so the child
+  points the inherited descriptor at `/dev/null` and reopens the path in **append** mode. Both
+  halves are the fix: rebinding the stream alone leaves the old object flushing to the real file
+  when the GC or interpreter exit reaches it, and reopening in `"w"` would truncate a log shared
+  with the parent — which passed 1626 tests, because every test built a file that was empty on
+  disk at fork time and asserted that emptiness as its precondition, making truncate and append
+  the same program. The hook is per-sink, not global, precisely because `StdoutSink` has the same
+  window and must **not** be fixed. (SPEC-039 FR-004)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
