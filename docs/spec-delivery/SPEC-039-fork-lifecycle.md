@@ -42,7 +42,8 @@ locks and hook, and a mixed-base class whose foreign attributes are replaced wit
   questions in `decorator.py` are classified in SPEC-035 FR-002's roster.
 - `architecture.md` §9 states the fork behaviour, §13 records the five things beyond the boundary,
   the shared-sink hazard, and the `_thread`-install invariant. `README.md`'s sink conventions gain
-  a **Forking** bullet: configure *after* the fork if your sink holds a connection.
+  a **Forking** bullet: build a connection-holding sink only in the worker process, never
+  before the fork.
 
 ## Verification
 
@@ -50,11 +51,13 @@ locks and hook, and a mixed-base class whose foreign attributes are replaced wit
 full CI on 3.12 and 3.13. Every new statement was mutation-swept scoped to its own function — 20
 mutants in the last implementation phase alone, all killed by their intended test.
 
-Ten adversarial review rounds across the four phases. **Every blocking finding after the first was
+Twelve adversarial review rounds across the four phases. **Every blocking finding after the first was
 a defect in the previous round's fix**, and the sharpest was evidence rather than behaviour:
 `open(path, "a")` → `"w"` passed all 1626 tests, because every test built a file that was *empty on
 disk* at fork time and asserted that emptiness as its own precondition — so truncate and append
 were the same program, and a prefork child would have destroyed the shared log on every fork. The
 documentation phase repeated the lesson in its own register: the remedy it first gave for a shared
 connection (reconfigure in the child) was measured *breaking the parent's connection*, because
-SPEC-030's swap closes what it replaces. Recorded in §13 and handed to SPEC-040.
+both swap paths close what they replace. Recorded in §13 and carried as a named finding on
+SPEC-040 (FR-005 AC-3), which cannot fix it — that spec forbids behaviour change — but is where
+the shape it belongs to is being addressed.

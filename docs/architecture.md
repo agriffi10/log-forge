@@ -1054,18 +1054,30 @@ constraint — never by being deleted quietly.
   copy at exit** — deliberately left rather than fixed, since neither side can tell whether the
   other still needs it.
 
-  **And a `configure(sink=…)` in the child closes the inherited sink immediately.** SPEC-030's
-  swap drains to the old sink, installs the new one and closes the old — correct within one
-  process, and cross-process it retires an object that is still the parent's transport. Measured
-  with a socket sink whose `close()` writes a goodbye the server acts on: the child's
-  `configure()` sent it and the parent's next write failed with `ECONNRESET`. It fires only when
-  the parent logged before forking, which under preload it usually has. That is why §9's remedy
-  is "do not build a connection-holding sink before the fork" rather than "rebuild it in the
-  child" — the obvious phrasing of the advice performs the damage sooner and more completely
-  than the hazard it was meant to avoid. Whether the library should instead disown an inherited
-  sink in the child, rather than document around it, is **SPEC-040's** question: it is exactly
-  "one owner for the worker and the sink", and disowning has its own cost — a child that closes
-  nothing loses whatever its own sink was holding at exit.
+  **And a `configure(sink=…)` in the child closes the inherited sink immediately.** Measured with
+  a socket sink whose `close()` writes a goodbye the server acts on: the child's `configure()`
+  sent it and the parent's next write failed with `ECONNRESET`.
+
+  Both halves of the mechanism are worth stating exactly, because this paragraph is what a later
+  spec will be scoped from. **The trigger is not "the parent logged"** — it is that an emit has
+  reached the inherited sink object in *this process's* record before the `configure()` runs,
+  which the parent arms by logging before the fork (usual under preload) and **the child arms
+  for itself** by logging before it reconfigures. Measured in all four combinations. **And both
+  swap paths close it**, not just the worker's: `Worker.swap_sink` drains, installs, *fences with
+  a second drain* and then closes — the fence being what makes the close safe within one process
+  and, provably, does nothing across two — while `decorator._swap_sink`'s no-worker branch hands
+  the old sink to `_lifecycle.close_detached` with neither drain. A process that only ever logged
+  outside a span takes the second, so "there is no worker here" is not an escape.
+
+  That is why §9's remedy is "do not build a connection-holding sink before the fork" rather than
+  "rebuild it in the child": the obvious phrasing of the advice performs the damage sooner and
+  more completely than the hazard it was meant to avoid. Whether the library should instead
+  **disown** an inherited sink in the child is a live question that needs its own spec — not
+  SPEC-040's, which is a pure refactor whose Out of Scope forbids behaviour change and directs
+  exactly this kind of finding elsewhere (it records the item, and the shape it is evidence of,
+  under FR-005). Disowning is not free: a child that closes nothing loses whatever its own sink
+  was holding at exit, and from inside the child an inherited connection it must not touch and
+  one it is now the only user of look identical.
 
 - **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
   (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one

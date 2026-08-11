@@ -2,7 +2,7 @@
 
 **ID:** SPEC-040  
 **Status:** Draft  
-**Last Updated:** 2026-08-09  
+**Last Updated:** 2026-08-11  
 **Depends On:** SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039
 
 ## Overview
@@ -29,9 +29,10 @@ Every one of these came out of that, and nothing else:
 | audit C2 | a swap racing `shutdown()` left the new sink owned by nobody — a SPEC-033 regression |
 | SPEC-035 FR-001/003 | those two regressions |
 | SPEC-035 FR-002 | a test that walks the AST and forces each of sixteen worker questions to declare which of four categories it asks |
+| SPEC-039 (handed here) | a `configure(sink=…)` in a **forked child** closes the *parent's* sink — measured breaking the parent's connection — because both swap paths retire an object the child never owned |
 
-Seven pieces of work, one shape: **"who owns the worker or the sink at this instant, and what may
-this path therefore do?"** — asked ad hoc at sixteen sites in one module, answered by four
+Seven pieces of work and one open finding, one shape: **"who owns the worker or the sink at this
+instant, and what may this path therefore do?"** — asked ad hoc at sixteen sites in one module, answered by four
 categories that exist only in a test's data table and `architecture.md` §9.2.
 
 FR-002's roster is the right response to a defect that recurs at *sites*, and it works: it caught
@@ -161,8 +162,8 @@ in a different form.
 
 #### Description:
 
-Two questions this spec deliberately leaves open, recorded per SPEC-021 so they are decisions
-rather than omissions.
+Three questions this spec deliberately leaves open, recorded per SPEC-021 so they are
+decisions rather than omissions. The third arrived from another spec rather than from this one.
 
 #### Acceptance Criteria:
 
@@ -172,6 +173,13 @@ rather than omissions.
       removes its subject leaves nothing watching either.
 - [ ] AC-2: `worker.py` at 1,220 lines is recorded in §13 as the same shape one level down,
       unsplit and not scheduled.
+- [ ] AC-3 (**handed over by SPEC-039**): a `configure(sink=…)` in a forked child closes the
+      *parent's* sink — measured breaking the parent's connection — because both swap paths
+      retire an object this process never owned. It is this spec's shape exactly (ownership asked
+      ad hoc, and neither path can ask "is this even mine?"), and it is a **behaviour** change,
+      which Out of Scope forbids here. So it is carried as a named finding for its own spec rather
+      than fixed in passing, with the counter-cost stated: a child that disowns closes nothing and
+      loses whatever its own sink held at exit. `architecture.md` §13 is the durable record.
 
 ---
 
