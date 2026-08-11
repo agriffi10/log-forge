@@ -80,9 +80,11 @@ def _clear_ownership_record() -> Iterator[None]:
     """
     with _lifecycle._owned_lock:
         _lifecycle._owned.clear()
+    _lifecycle._marking_failed = False
     yield
     with _lifecycle._owned_lock:
         _lifecycle._owned.clear()
+    _lifecycle._marking_failed = False
 
 
 # -- FR-001: the acquisition record ------------------------------------------------------------
@@ -351,22 +353,118 @@ def test_the_marking_walk_leaves_a_childs_own_sinks_alone() -> None:
     assert child.output == "True,1", child.output
 
 
-def test_a_marking_walk_that_fails_refuses_everything_unrecorded() -> None:
+def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """If the walk could not finish, an unrecorded sink may be one it missed.
 
-    Refusing then costs a leaked handle, which is the direction FR-001 requires. The flag is the
-    only thing standing between a partial walk and the destructive close it exists to prevent.
+    Refusing then costs a leaked handle, which is the direction FR-001 requires.
+
+    **The failure is induced through the real walk**, not by assigning the flag. Written the
+    other way first, and it only proved that `releasable` reads a global — mutating the handler
+    so it never sets the flag survived. Driving `_mark_inherited` with a raising root resolver
+    exercises the guard, the flag, and the refusal together.
     """
     unrecorded = RecordingSink()
     assert _lifecycle.releasable(unrecorded) is True, "the baseline: unrecorded is the caller's"
 
-    _lifecycle._marking_failed = True
+    def exploding_roots() -> list[object]:
+        raise RuntimeError("the roots cannot be resolved")
+
+    monkeypatch.setattr(_lifecycle, "_inheritance_roots", exploding_roots)
     try:
+        _lifecycle._mark_inherited()
+        assert _lifecycle._marking_failed is True, "the guard caught it and withdrew the default"
         assert _lifecycle.releasable(unrecorded) is False
         assert _lifecycle.release(unrecorded) is None
         assert unrecorded.closed == 0, "and the refusal is a skip, not a raise"
     finally:
         _lifecycle._marking_failed = False
+
+
+def test_a_superseded_wrapper_still_shields_the_transport_beneath_it() -> None:
+    """`_owned.values()` is the load-bearing root, and nothing else reaches this sink.
+
+    A wrapper one `configure()` has replaced is no live delivery target, so none of the four
+    live handles finds it -- but the transport inside it is still the parent's. Dropping the
+    recorded-sinks root leaves this a destructive close with the whole suite green, which is
+    why it is asserted separately from the live-target roots.
+    """
+    conn = RecordingSink()
+    log_foundry.configure(service="own", sink=MultiSink(ThirdPartyWrapper(conn)))
+    log_foundry.configure(sink=StdoutSink())
+
+    live = {id(found) for found in _lifecycle._inheritance_roots()}
+    assert id(conn) not in live, "the precondition: it is not reachable as a live target"
+
+    def in_child() -> str:
+        log_foundry.configure(sink=MultiSink(conn))
+        log_foundry.info("child event")
+        log_foundry.shutdown(3.0)
+        return f"{_lifecycle.releasable(conn)},{conn.closed}"
+
+    child = run_in_child(in_child)
+    assert child.output == "False,0", child.output
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda inner: FilteringSink(inner), id="FilteringSink"),
+        pytest.param(lambda inner: TransformSink(inner, lambda event: event), id="TransformSink"),
+        pytest.param(lambda inner: MultiSink(inner), id="MultiSink"),
+    ],
+)
+def test_a_sink_subclassing_a_builtin_container_is_still_recorded(build: object) -> None:
+    """Sink-shaped must beat container-shaped, or a wrapper stops closing its child.
+
+    `class MySink(dict)` satisfies both tests. With the container branch first it was read as a
+    bag of members and never recorded, so `releasable(inner, owner=wrapper)` took the
+    "wrapper recorded, child not" arm and refused -- `FilteringSink(MySink()).close()` closed
+    nothing, silently, with no fork involved. That is a regression against the unguarded release
+    this replaced, and it contradicts the public-API promise beside it.
+
+    `MultiSink` is here as the control: it escaped the bug by accident of position, its children
+    arriving through the container branch, so a fix that only reordered *its* path would leave
+    the other two broken and this parametrisation green.
+    """
+
+    class DictSink(dict):  # type: ignore[type-arg]
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Keeps nothing; the close is what is under test."""
+
+        def close(self) -> None:
+            """Counts the close."""
+            self.closed += 1
+
+    inner = DictSink()
+    wrapper = build(inner)  # type: ignore[operator]
+    log_foundry.configure(service="own", sink=wrapper)
+
+    with _lifecycle._owned_lock:
+        assert id(inner) in _lifecycle._owned, "a sink that is also a container is still a sink"
+
+    wrapper.close()
+    assert inner.closed == 1, "and its wrapper still closes it"
+
+
+def test_the_marking_handler_runs_before_the_worker_rebuild() -> None:
+    """FR-005 AC-7's ordering: the marks are in place before any handler that may release.
+
+    Robust rather than incidental -- `decorator` imports `_lifecycle`, so `_lifecycle`'s module
+    body and its registration always complete first, whatever is imported first at the top. The
+    docstring claimed a test pinned this and none did.
+    """
+    handlers = [handler.__name__ for handler in _fork._child_handlers]
+    assert "_mark_inherited" in handlers, "the marking handler is registered at all"
+    assert "_rebuild_worker_after_fork" in handlers
+    assert handlers.index("_mark_inherited") < handlers.index("_rebuild_worker_after_fork"), (
+        "a handler that reaches a release path must not run before the marks exist"
+    )
 
 
 def _configure_without_keeping_a_reference() -> int:

@@ -140,6 +140,16 @@ def _reachable_sinks(root: object) -> list[object]:
     therefore refused, therefore **leaked rather than destructively closed** — the one direction
     FR-001 permits a gap to fail in.
 
+    **Sink-shaped is tested before container-shaped**, and the order is load-bearing. A sink
+    whose class subclasses a builtin container — ``class MySink(dict)``, or anything built on a
+    ``NamedTuple`` — satisfies both tests, and with the container branch first it was read as a
+    bag of members and never recorded. Held as a bare attribute that is exactly
+    ``FilteringSink._inner``, so ``FilteringSink(MySink()).close()`` silently closed nothing:
+    measured, a regression against the unguarded release this replaced, needing no fork at all.
+    ``MultiSink`` escaped only by accident of position, its children arriving through the
+    container branch. A plain ``tuple`` or ``list`` is not sink-shaped, so the wrapper case still
+    takes the container branch as it must.
+
     Args:
       root: The object ``configure()`` or ``_ensure_sink()`` was handed.
 
@@ -163,12 +173,12 @@ def _reachable_sinks(root: object) -> list[object]:
         if not _fork._is_owned(holder):
             continue
         for _name, value in _fork._namespace_items(holder):
-            if _fork._is_container(value):
+            if _is_candidate(value):
+                stack.append(value)
+            elif _fork._is_container(value):
                 stack.extend(
                     member for member in _fork._container_children(value) if _is_candidate(member)
                 )
-            elif _is_candidate(value):
-                stack.append(value)
     return found
 
 
@@ -191,8 +201,25 @@ def _inheritance_roots() -> list[object]:
     """Returns everything a forked child may have inherited a sink through.
 
     The live delivery targets and every sink already recorded, which together are the only
-    handles the library itself holds. A sink reachable from none of them is one no library path
-    can reach either, so it is nothing this process could destroy.
+    handles the library itself holds at fork time.
+
+    **A sink reachable from none of them is not thereby safe**, and saying so was worse than
+    saying nothing. The residual is real and measured: a parent that builds a connection sink in
+    application state and never hands it to the library — `sink = SocketSink(...)` at import in
+    a gunicorn master — leaves nothing for this walk to find, and a child whose ``post_fork``
+    calls ``configure(sink=that_object)`` is the *first* process to hand it over, so it acquires
+    it legitimately and closes the parent's transport at shutdown. That cannot be decided here:
+    FR-001's rule is that the library may release what it was handed, FR-001 AC-3 requires a
+    child's ``configure()``d sink to be releasable, and nothing distinguishes the two without
+    marking the whole heap. It is recorded as a constraint in ``architecture.md`` §13 rather
+    than asserted away, and ``README.md``'s "build a connection-holding sink in the worker
+    process" is exactly the deployment advice that avoids it.
+
+    ``_owned.values()`` is the load-bearing entry, not the four live handles. It is the only one
+    that reaches a sink held inside a **superseded** wrapper — one ``configure()`` replaced, so
+    it is no live target, while the transport beneath it is still the parent's. Dropping it is a
+    destructive close; dropping any of the other four changes nothing, since each is itself
+    stamped and therefore already in the record.
 
     Args:
       None.
@@ -237,9 +264,12 @@ def _mark_inherited() -> None:
     what a wrapper holds so as to leave it alone is the opposite obligation, and FR-001 already
     draws that line for recording.
 
-    The cost is one-off per fork and of the same order as the repair walk beside it — the exact
-    type pre-filter keeps the per-object test off the caller data that dominates, which measured
-    1,109 ms against 279 ms for a ``MemorySink`` holding 100k events.
+    The cost is one-off per fork and of the same order as the repair walk beside it: measured in
+    the child at 0.0 ms idle, 0.3 ms for a 50-deep ``MultiSink`` and **117 ms** for a
+    ``MemorySink`` holding 100k events, against SPEC-039's 202 ms for the repair walk. Fork cost
+    roughly doubles rather than changing character. The pre-filter gates the structural test and
+    the descent, not the push, so this is not :func:`_reachable_sinks`' number and the two must
+    not be quoted for each other.
 
     Args:
       None.
@@ -248,8 +278,14 @@ def _mark_inherited() -> None:
       None.
 
     Raises:
-      None. A failure sets :data:`_marking_failed`, after which every unrecorded sink in this
-        child is refused rather than trusted — a leaked handle instead of a destructive close.
+      None. An escaping exception sets :data:`_marking_failed`, after which every unrecorded
+        sink in this child is refused rather than trusted — a leaked handle instead of a
+        destructive close. **That covers less than it appears to**: every read the walk makes is
+        already absorbed one level down in ``_fork``, which returns empty and announces, so the
+        common failure is a *partial* walk that raises nothing and leaves the flag clear. Sinks
+        it did not reach are then unrecorded rather than marked. The outer guard is for a fault
+        in this function's own frame — resolving the roots, or a hostile metaclass answering
+        ``isinstance`` — and the partial-walk residual is recorded in §13.
     """
     global _marking_failed
     try:
