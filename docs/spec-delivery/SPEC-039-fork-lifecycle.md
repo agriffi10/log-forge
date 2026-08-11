@@ -51,8 +51,8 @@ locks and hook, and a mixed-base class whose foreign attributes are replaced wit
 full CI on 3.12 and 3.13. Every new statement was mutation-swept scoped to its own function — 20
 mutants in the last implementation phase alone, all killed by their intended test.
 
-Twelve adversarial review rounds across the four phases. **Every blocking finding after the first was
-a defect in the previous round's fix**, and the sharpest was evidence rather than behaviour:
+Twelve adversarial review rounds across the four phases. **Every blocking finding after the
+first was a defect in the previous round's fix**, and the sharpest was evidence rather than behaviour:
 `open(path, "a")` → `"w"` passed all 1626 tests, because every test built a file that was *empty on
 disk* at fork time and asserted that emptiness as its own precondition — so truncate and append
 were the same program, and a prefork child would have destroyed the shared log on every fork. The

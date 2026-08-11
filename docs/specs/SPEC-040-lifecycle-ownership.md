@@ -32,8 +32,8 @@ Every one of these came out of that, and nothing else:
 | SPEC-039 (handed here) | a `configure(sink=…)` in a **forked child** closes the *parent's* sink — measured breaking the parent's connection — because both swap paths retire an object the child never owned |
 
 Seven pieces of work and one open finding, one shape: **"who owns the worker or the sink at this
-instant, and what may this path therefore do?"** — asked ad hoc at sixteen sites in one module, answered by four
-categories that exist only in a test's data table and `architecture.md` §9.2.
+instant, and what may this path therefore do?"** — asked ad hoc at sixteen sites in one module,
+answered by four categories that exist only in a test's data table and `architecture.md` §9.2.
 
 FR-002's roster is the right response to a defect that recurs at *sites*, and it works: it caught
 a real regression during its own review. But it polices the symptom. Sixteen sites asking four
