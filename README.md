@@ -915,6 +915,8 @@ if (
 
 `closing_sinks` is deliberately not a term here: it is briefly non-zero during a perfectly healthy
 sink swap, so a single reading is not a fault. Watch it over time instead — see the table below.
+`inherited_sink` is not a term either, for a different reason: it reports a *state* the process is
+in rather than a loss it took, and in a prefork deployment it is `True` on every worker by design.
 
 They tell you different things, and they want different responses:
 
@@ -927,6 +929,7 @@ They tell you different things, and they want different responses:
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
+| `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter, and the only field that falls as well as rises. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when

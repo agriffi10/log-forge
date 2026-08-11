@@ -15,6 +15,7 @@ a same-process double cannot exhibit it.
 from __future__ import annotations
 
 import gc
+import pathlib
 import socket
 import threading
 import time
@@ -1034,7 +1035,7 @@ def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
         passing.
         """
 
-        def discard_buffered_after_fork(self) -> None:
+        def reacquire_after_fork(self) -> None:
             """The hook `_fork` collects; named as it is on `main` until FR-005 renames it."""
             hooked.append(type(self).__name__)
 
@@ -1055,3 +1056,294 @@ def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
         "its fork hook"
     )
     assert hooked == [], "and it did not call the hook either"
+
+
+# -- FR-005: the hook claims the transport; FR-004: the state is reported ----------------------
+
+
+def test_the_hook_is_named_for_the_claim_it_makes() -> None:
+    """AC-1. The old name described one consequence of the step rather than the step.
+
+    A sink that only dropped a buffer without re-opening would satisfy a name describing only
+    the discard -- which this member carried until now -- while leaving the child holding the
+    parent's descriptor, making a destructive close look safe. The rename is free now and will not be later: the
+    member has never been in a stable release.
+    """
+    from log_foundry.sinks import base
+
+    assert base.Sink.__doc__ is not None
+    documented = base.Sink.__doc__
+    assert "reacquire_after_fork" in documented
+    assert "claim the transport as this process's own" in documented, "both halves are stated"
+    assert _fork._REACQUIRE_HOOK == "reacquire_after_fork"
+
+
+def test_the_old_hook_name_is_gone_from_src_and_tests() -> None:
+    """AC-1. Nowhere in the shipped code or its tests; the completed spec keeps it (AC-2).
+
+    The name is assembled rather than written, or this file matches itself and the scan can
+    never pass -- which is how it failed first.
+    """
+    retired = "discard_buffered" + "_after_fork"
+    root = pathlib.Path(_lifecycle.__file__).parent.parent.parent
+    scanned = 0
+    for area in ("src", "tests"):
+        for path in sorted((root / area).rglob("*.py")):
+            assert retired not in path.read_text(encoding="utf-8"), path
+            scanned += 1
+    assert scanned > 50, "the scan actually reached the tree rather than an empty directory"
+
+
+def test_a_reacquiring_sink_is_releasable_in_the_child_and_one_without_the_hook_is_not(
+    tmp_path: pathlib.Path,
+) -> None:
+    """AC-3. Both directions, and both scoped to a sink the child *inherited*.
+
+    A sink the child constructed itself is releasable with no hook at all (FR-001 AC-3), so an
+    unscoped reading of this criterion asserts the opposite of the truth.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    reacquiring = FileSink(str(tmp_path / "child.log"))
+    plain = RecordingSink()
+    log_foundry.configure(service="own", sink=MultiSink(reacquiring, plain))
+
+    def in_child() -> str:
+        return f"{_lifecycle.releasable(reacquiring)},{_lifecycle.releasable(plain)}"
+
+    child = run_in_child(in_child)
+    assert child.output == "True,False", child.output
+
+
+def test_a_hook_that_raises_leaves_the_sink_unreleasable(tmp_path: pathlib.Path) -> None:
+    """AC-4. A failed re-acquisition is not a claim, so it must not make a close look safe."""
+    from log_foundry.sinks.file import FileSink
+
+    class Angry(FileSink):
+        def reacquire_after_fork(self) -> None:
+            """Fails the re-acquisition; SPEC-039 absorbs it, and this pins what it means."""
+            raise RuntimeError("cannot reopen")
+
+    angry = Angry(str(tmp_path / "angry.log"))
+    log_foundry.configure(service="own", sink=angry)
+
+    def in_child() -> str:
+        return str(_lifecycle.releasable(angry))
+
+    child = run_in_child(in_child)
+    assert child.output == "False", child.output
+
+
+def test_reacquisition_restamps_the_sink_and_nothing_above_it(tmp_path: pathlib.Path) -> None:
+    """AC-8. The wrapper keeps the parent's mark, which is a stated leak rather than a bug.
+
+    Only the children implement the hook, so a `MultiSink` of two `FileSink`s leaves the
+    re-acquired children reachable only through a wrapper nothing will release. Nothing is lost
+    -- `FileSink.emit` flushes at the end of every batch -- but AC-6's descriptor test uses a
+    bare `FileSink` and passes while this stands, so it is asserted rather than discovered.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    first = FileSink(str(tmp_path / "a.log"))
+    second = FileSink(str(tmp_path / "b.log"))
+    wrapper = MultiSink(first, second)
+    log_foundry.configure(service="own", sink=wrapper)
+
+    def in_child() -> str:
+        return (
+            f"{_lifecycle.releasable(first)},"
+            f"{_lifecycle.releasable(second)},"
+            f"{_lifecycle.releasable(wrapper)}"
+        )
+
+    child = run_in_child(in_child)
+    assert child.output == "True,True,False", child.output
+
+
+def test_the_child_holds_its_own_descriptor(tmp_path: pathlib.Path) -> None:
+    """AC-6. `FileSink` needs no behavioural change -- the rename makes its claim explicit."""
+    from log_foundry.sinks.file import FileSink
+
+    path = tmp_path / "descriptors.log"
+    sink = FileSink(str(path))
+    log_foundry.configure(service="own", sink=sink)
+    parent_fd = sink._stream.fileno()
+
+    def in_child() -> str:
+        return str(sink._stream.fileno())
+
+    child = run_in_child(in_child)
+    assert child.output is not None
+    assert int(child.output) != parent_fd, (
+        "the child reopened, which is the claim the rename makes explicit -- identical "
+        "descriptors would mean it still holds the parent's"
+    )
+
+
+def test_health_reports_an_inherited_sink() -> None:
+    """FR-004 AC-2. False before a fork, True in a child, False again once it installs its own."""
+    log_foundry.configure(service="own", sink=RecordingSink())
+    assert log_foundry.health().inherited_sink is False
+
+    def inherited() -> str:
+        return str(log_foundry.health().inherited_sink)
+
+    def replaced() -> str:
+        log_foundry.configure(sink=RecordingSink())
+        return str(log_foundry.health().inherited_sink)
+
+    assert run_in_child(inherited).output == "True"
+    assert run_in_child(replaced).output == "False"
+
+
+def test_health_answers_the_inherited_question_with_no_worker() -> None:
+    """FR-004 AC-3. Synthesized as `retired` already is; no worker is created to answer it."""
+    log_foundry.configure(service="own", sink=RecordingSink())
+    log_foundry.info("orphan only")
+    assert decorator._worker is None, "the precondition: nothing built a worker"
+
+    def in_child() -> str:
+        log_foundry.info("child orphan")
+        return f"{log_foundry.health().inherited_sink},{decorator._worker is None}"
+
+    child = run_in_child(in_child)
+    assert child.output == "True,True", child.output
+
+
+def test_the_inherited_field_describes_one_sink_not_the_graph() -> None:
+    """FR-004 AC-1. The opposite reading is the natural one, so it is pinned.
+
+    A child that wraps an inherited sink in a `MultiSink` of its own is delivering to a sink it
+    *may* release, so this reads `False` -- while the wrapper's child stays refused. Reporting
+    the graph would make the field true whenever anything beneath it was inherited, which is a
+    different and much noisier signal.
+    """
+    inner = RecordingSink()
+    log_foundry.configure(service="own", sink=inner)
+
+    def in_child() -> str:
+        log_foundry.configure(sink=MultiSink(inner))
+        return f"{log_foundry.health().inherited_sink},{_lifecycle.releasable(inner)}"
+
+    child = run_in_child(in_child)
+    assert child.output == "False,False", child.output
+
+
+def test_health_reports_an_inherited_sink_through_the_worker_too() -> None:
+    """FR-004 AC-1's first candidate: the worker's sink, which has its own `health()` path.
+
+    Every other test here takes the orphan branch, so `_worker_health`'s synthesis covered them
+    all and `Worker.health` was untested -- mutating its term to a constant `False` passed 52 of
+    52. A span is opened deliberately so a worker exists and answers for itself.
+    """
+    sink = RecordingSink()
+    log_foundry.configure(service="own", sink=sink)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("in-span")
+
+    work()
+    assert decorator._worker is not None, "the precondition: this test is about the worker path"
+    assert log_foundry.health().inherited_sink is False
+
+    def in_child() -> str:
+        work()
+        return f"{decorator._worker is not None},{log_foundry.health().inherited_sink}"
+
+    child = run_in_child(in_child)
+    assert child.output == "True,True", child.output
+
+
+def test_the_reacquired_roster_does_not_survive_into_the_next_fork(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The roster holds sinks, so `_fork`'s walk must not treat it as live state either.
+
+    This is `_owned`'s hazard reached by a second route: a new module global holding sinks,
+    added without an opt-out. Measured before the fix — a child's repair walk collected a sink
+    two `configure()` calls out of date, its hook ran, and the reclaim that follows stamped it
+    for the *grandchild's* pid, so a sink no descendant ever acquired read `releasable=True`.
+
+    A ratchet rather than a one-off: once a hook-implementing sink enters a roster, every
+    descendant's walk finds it again. Nothing referenced `reacquired_in_child` or `reclaim` by
+    name anywhere in the suite, which is how a docstring claiming the opposite survived.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    first = FileSink(str(tmp_path / "first.log"))
+    log_foundry.configure(service="own", sink=first)
+
+    def in_child() -> str:
+        log_foundry.configure(sink=FileSink(str(tmp_path / "second.log")))
+        log_foundry.configure(sink=FileSink(str(tmp_path / "third.log")))
+        collected = len(_fork._reinit_primitives())
+        grandchild = run_in_child(lambda: str(_lifecycle.releasable(first)))
+        return f"{collected},{grandchild.output}"
+
+    child = run_in_child(in_child, timeout=12)
+    assert child.output == "1,False", (
+        f"got {child.output!r}: the walk should reach only the live sink, and a grandchild must "
+        "not be able to claim one the parent configured and superseded"
+    )
+
+
+def test_a_marking_walk_that_fails_still_honours_a_re_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failed walk is no reason to refuse a sink that provably re-acquired its transport.
+
+    The exception path used to `return` before the reclaim loop while the ceiling path fell
+    through to it, so the two failure modes differed silently — and the exception one produced
+    exactly the outcome `reclaim` exists to prevent.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    sink = FileSink(str(tmp_path / "reacquired.log"))
+    monkeypatch.setattr(_fork, "reacquired_in_child", [sink])
+    monkeypatch.setattr(
+        _lifecycle, "_inheritance_roots", lambda: (_ for _ in ()).throw(RuntimeError("no roots"))
+    )
+
+    _lifecycle._mark_inherited()
+    try:
+        assert _lifecycle._marking_failed is True, "the walk did fail"
+        assert _lifecycle.releasable(sink) is True, "and the re-acquisition still counted"
+    finally:
+        _lifecycle._marking_failed = False
+
+
+def test_the_reacquired_roster_is_empty_when_the_repair_walk_starts() -> None:
+    """The rebind is the belt to `_FORK_SKIP`'s brace, and only this pins it.
+
+    Moving the rebind back after the walk survives the entire suite while the opt-out stands --
+    the two are deliberately redundant, so behaviour cannot distinguish them. A claim that only
+    behaviour could reach is a claim nothing checks, and this exact docstring was false and
+    untested one round ago: it said "at the start of every child repair" while rebinding in the
+    middle. So the assertion is made where the claim is, at the walk's entry.
+    """
+    observed: list[int] = []
+    original = _fork._reinit_primitives
+
+    def spy() -> list[object]:
+        observed.append(len(_fork.reacquired_in_child))
+        return original()
+
+    import tempfile
+
+    from log_foundry.sinks.file import FileSink
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log_foundry.configure(service="own", sink=FileSink(f"{tmp}/pin.log"))
+        _fork._reinit_primitives = spy  # type: ignore[assignment]
+        try:
+            _fork._reinit_after_fork()
+            assert _fork.reacquired_in_child, "the precondition: this fork did populate a roster"
+            _fork._reinit_after_fork()
+        finally:
+            _fork._reinit_primitives = original  # type: ignore[assignment]
+
+    assert observed == [0, 0], (
+        f"the walk saw a non-empty roster on entry: {observed}. The previous generation's sinks "
+        "are then re-collected, their hooks re-run, and the reclaim stamps them for this pid"
+    )

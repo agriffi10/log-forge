@@ -18,7 +18,9 @@ only.
   zeroed counters, so guards keyed on `_worker.sink is X` survive. A retired parent forks a retired
   child. `stopped_reason` is *not* set to `"Forked"` — SPEC-019 defines that field as "the drain
   thread died", and this child's is running.
-- **`discard_buffered_after_fork()`** — a new optional, probed-by-name member of the sink
+- **`discard_buffered_after_fork()`** — *renamed `reacquire_after_fork()` by SPEC-042 FR-005,
+  which restated the contract as a claim of ownership rather than only a discard; the name below
+  is what this spec shipped* — a new optional, probed-by-name member of the sink
   protocol, documented in `sinks/base.py` beside `losses()` and implemented by `FileSink` and
   `RotatingFileSink` (`dup2` to `/dev/null`, then reopen in **append** mode).
 - **Three lints**, all derived rather than hand-listed: every `Lock`/`RLock`/`Event` in `src/` must

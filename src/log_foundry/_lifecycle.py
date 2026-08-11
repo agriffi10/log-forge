@@ -347,7 +347,12 @@ def _mark_inherited() -> None:
         destructive close. **That covers less than it appears to**: every read the walk makes is
         already absorbed one level down in ``_fork``, which returns empty and announces, so the
         common failure is a *partial* walk that raises nothing and leaves the flag clear. Sinks
-        it did not reach are then unrecorded rather than marked. The outer guard is for a fault
+        it did not reach are then unrecorded rather than marked. **The reclaim below runs
+        either way**: a sink that returned from its hook provably holds its own transport, and a
+        walk that failed is no reason to refuse it forever — which is the outcome
+        :func:`reclaim`'s own docstring says a ``setdefault`` would wrongly cause. The ceiling
+        path already reached it; the exception path did not, and the two differed silently.
+        The outer guard is for a fault
         in this function's own frame — resolving the roots, or an object whose ``__class__``
         property raises, which makes ``isinstance`` raise here. Not a hostile *metaclass*: a
         value's ``__instancecheck__`` is never consulted, since ``Sink``'s own ``_ProtocolMeta``
@@ -384,6 +389,9 @@ def _mark_inherited() -> None:
             for _name, value in _fork._namespace_items(holder):
                 if _fork._is_container(value) or _may_be_a_sink(value):
                     stack.append(value)
+        with _owned_lock:
+            for inherited in found:
+                _owned.setdefault(id(inherited), (_FOREIGN, inherited))
     except Exception as exc:
         _marking_failed = True
         _diag.absorbed(
@@ -391,10 +399,37 @@ def _mark_inherited() -> None:
             exc,
             "this child will refuse to close any sink it has no record of",
         )
-        return
+    for reacquired in _fork.reacquired_in_child:
+        reclaim(reacquired)
+
+
+def reclaim(sink: object) -> None:
+    """Records that a sink re-acquired its transport in this process (SPEC-042 FR-005).
+
+    The one write that **overrides** an existing record, and it has to be: :func:`_mark_inherited`
+    has already stamped everything inherited ``_FOREIGN`` by the time the hook roster is read, so
+    a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
+    forever.
+
+    **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
+    inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement
+    the hook — while the wrapper keeps the parent's mark and stays refused, which leaves the
+    re-acquired children reachable only through a wrapper nothing will release. That is a leak
+    and loses nothing, since ``FileSink.emit`` flushes at the end of every batch, but it is
+    stated rather than discovered.
+
+    Args:
+      sink: The sink whose hook returned normally.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    pid = os.getpid()
     with _owned_lock:
-        for inherited in found:
-            _owned.setdefault(id(inherited), (_FOREIGN, inherited))
+        _owned[id(sink)] = (pid, sink)
 
 
 def stamp(sink: object) -> None:
