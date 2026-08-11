@@ -173,13 +173,14 @@ decisions rather than omissions. The third arrived from another spec rather than
       removes its subject leaves nothing watching either.
 - [ ] AC-2: `worker.py` at 1,220 lines is recorded in §13 as the same shape one level down,
       unsplit and not scheduled.
-- [ ] AC-3 (**handed over by SPEC-039**): a `configure(sink=…)` in a forked child closes the
-      *parent's* sink — measured breaking the parent's connection — because both swap paths
-      retire an object this process never owned. It is this spec's shape exactly (ownership asked
-      ad hoc, and neither path can ask "is this even mine?"), and it is a **behaviour** change,
-      which Out of Scope forbids here. So it is carried as a named finding for its own spec rather
-      than fixed in passing, with the counter-cost stated: a child that disowns closes nothing and
-      loses whatever its own sink held at exit. `architecture.md` §13 is the durable record.
+- [ ] AC-3 (**handed over by SPEC-039, now SPEC-042**): a `configure(sink=…)` in a forked child
+      closes the *parent's* sink — measured breaking the parent's connection — because both swap
+      paths retire an object this process never owned. It is this spec's shape exactly (ownership
+      asked ad hoc, and neither path can ask "is this even mine?"), and it is a **behaviour**
+      change, which Out of Scope forbids here. **SPEC-042 owns the fix**; what this spec records
+      is that the defect is evidence for the motivation above, and that the two are independent —
+      042 does not wait on this refactor, and this refactor must not silently absorb it. If 042
+      lands first, its release helper is one of the methods FR-002 moves onto the owner.
 
 ---
 
