@@ -430,8 +430,11 @@ def _mark_inherited() -> None: ...            # a fork handler; marks everything
                                               # _FOREIGN so "no record" is unclaimable in a child
 def releasable(sink: object, *, owner: object = None) -> bool: ...
     # Stamped for this pid. An *unrecorded* sink inherits the answer from the wrapper releasing
-    # it: no wrapper, or an unrecorded one, means the caller's own object and therefore True.
-def release(sink: object, *, detached: bool = False, owner: object = None) -> threading.Thread | None: ...
+    # it — no wrapper, or an unrecorded one, means the caller's own object — and only while the
+    # child's marking walk completed: the shipped test is
+    # `owner_record is None and not _marking_failed`, and that second term is what makes the
+    # relaxation safe when the walk could not finish.
+def release(sink: Sink, *, detached: bool = False, owner: object = None) -> threading.Thread | None: ...
     # The one close path (FR-002). Returns the closer thread for a detached release, and
     # None both when the release was refused and when an inline close completed —
     # the two are distinguished by `releasable`, which callers already have to consult.

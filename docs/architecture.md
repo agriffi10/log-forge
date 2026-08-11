@@ -1076,18 +1076,22 @@ constraint — never by being deleted quietly.
      acquires it legitimately and closes the parent's transport at exit. Measured. Undecidable
      inside the rule — FR-001 releases what it was handed, and FR-001 AC-3 requires a child's
      configured sink to be releasable — and nothing distinguishes the two without marking the
-     whole heap. **This is the only route the record cannot *decide*** — a 17-shape claiming
-     matrix refuses everywhere else. It is not the only remaining destructive close: #2 below is
-     the other, and the record decides that one *wrongly* rather than not at all, because the
-     hook told it something untrue. §9's advice is the remedy for both.
+     whole heap. **This is the only route where the library was never told** — a 17-shape
+     claiming matrix refuses everywhere else. It is not the only remaining destructive close:
+     #2 below is the other, and there the library was told something *untrue*. Both end with the
+     record answering `True` through its recorded branch; what differs is the input, and that is
+     what picks the remedy — deployment discipline here, a subclass honouring its contract there.
+     §9's advice covers both.
   2. **A sink that returns from `reacquire_after_fork()` without having re-acquired everything
      it holds.** Returning normally *is* the claim and the library cannot check it. The reachable
      case is inheritance: `class MySink(FileSink)` that also holds a socket inherits a hook which
      re-opens only the file, returns, and thereby claims the whole object — measured, the child
      then closes the parent's connection. `sinks/base.py` states the obligation; a subclass that
      cannot honour it should define the member to raise, which is refused and therefore safe.
-     Listed here rather than with the leaks below because it is the opposite polarity — an
-     over-claim, not a refusal.
+     It must be the sink the library holds **directly**: inside a `MultiSink` the wrapper is
+     refused first, so the over-claiming child is never reached and the transport survives
+     (measured). Listed here rather than with the leaks below because it is the opposite
+     polarity — an over-claim, not a refusal.
   3. **A sink the library was never handed at all** — a wrapper mutated after `configure()`
      walked it. Refused through that wrapper, so it leaks a handle rather than being closed on a
      guess. No shipped sink mutates itself after `__init__` (AST-scanned).
@@ -1166,7 +1170,8 @@ constraint — never by being deleted quietly.
   §9's remedy stayed "build a connection-holding sink in the worker process" rather than "rebuild
   it in the child" *because* the obvious phrasing of the advice performed the damage sooner and
   more completely than the hazard it avoided. **That is no longer true of a sink the library was
-  handed here** — SPEC-042 makes the child refuse it — so the advice survives as the better
+  handed here** — SPEC-042 has the child either refuse it or close a copy it re-acquired for
+  itself — so the advice survives as the better
   deployment rather than as an "or else". It is still an "or else" for the two cases above: a
   sink the parent built and never configured (#1), and a subclass that inherits the
   re-acquisition hook while holding a transport the hook does not re-acquire (#2).
