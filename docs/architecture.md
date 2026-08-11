@@ -1072,12 +1072,17 @@ constraint — never by being deleted quietly.
   That is why §9's remedy is "do not build a connection-holding sink before the fork" rather than
   "rebuild it in the child": the obvious phrasing of the advice performs the damage sooner and
   more completely than the hazard it was meant to avoid. Whether the library should instead
-  **disown** an inherited sink in the child is a live question that needs its own spec — not
-  SPEC-040's, which is a pure refactor whose Out of Scope forbids behaviour change and directs
-  exactly this kind of finding elsewhere (it records the item, and the shape it is evidence of,
-  under FR-005). Disowning is not free: a child that closes nothing loses whatever its own sink
-  was holding at exit, and from inside the child an inherited connection it must not touch and
-  one it is now the only user of look identical.
+  **disown** an inherited sink in the child is now **SPEC-042**, which settles it on the
+  distinction this record could not draw: a child may release only a transport it acquired **in
+  this process** — by being handed the sink here, or by re-acquiring it through FR-004's hook,
+  which after the reopen is exactly what the file sinks did and what a connection sink did not
+  (measured: the child's `FileSink` holds a different descriptor from the parent's, while a
+  socket-holding sink holds the same one).
+  It is not SPEC-040's: that one is a pure refactor whose Out of Scope forbids behaviour change
+  and directs this kind of finding elsewhere, so it records the defect as evidence for its own
+  motivation and nothing more. What stays true either way is the residual SPEC-042 accepts — a
+  shared sink whose `close()` performs delivery loses whatever the child had buffered in it, which
+  is SPEC-036's roster.
 
 - **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
   (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one

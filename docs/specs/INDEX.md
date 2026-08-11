@@ -46,6 +46,7 @@ to status only — no prose.
 | [SPEC-039](SPEC-039-fork-lifecycle.md) | Fork Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035 |
 | [SPEC-040](SPEC-040-lifecycle-ownership.md) | Lifecycle Ownership — One Owner for the Worker and the Sink | Draft | SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039 |
 | [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | Draft | SPEC-026, SPEC-027, SPEC-038 |
+| [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Draft | SPEC-027, SPEC-030, SPEC-033, SPEC-039 |
 
 ## Arcs (build order)
 
@@ -208,6 +209,14 @@ Group related specs and record the order to build them in. Delete this section i
   largest single piece of the audit arc and the only one needing a new module, which is why
   holding SPEC-035 open for it was costing more than the split. Its four prepared measurements
   moved with it and must not be re-derived.
+
+- **Forked-child sink ownership:** SPEC-042 — the behaviour half of the finding SPEC-039 could
+  only document and SPEC-040 may only record. A forked child closes transports it never opened:
+  measured, a child's `configure()` sends a connection sink's goodbye and the parent's next write
+  fails with `ECONNRESET`, and a child's `shutdown()` closes the inherited object. Build it
+  **after SPEC-039** (done) and in either order against SPEC-040 — it does not wait on that
+  refactor, because a correctness fix should not queue behind a tidy-up, and if SPEC-040 lands
+  first the release path is one method on its owner rather than a module helper.
 
 - **Lifecycle ownership:** SPEC-040 — the only spec here that fixes no bug. `decorator.py` owns
   the process's delivery lifecycle in seven loose globals with no state machine over them, and
