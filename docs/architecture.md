@@ -539,12 +539,17 @@ decorated call ends
   rather than at preload, or give the master a sink whose `close()` costs nothing to share.
   `README.md` says the same where a user deploying prefork will find it.
 
-  Reconfiguring in the child is no longer harmful **for a sink the library was handed in this
-  process** — the child refuses it, and the swap is one process fewer sharing a connection. The
-  qualifier is load-bearing: a master that *builds* a connection sink and never configures it
-  leaves the child as the first process to hand it over, so the child acquires it legitimately
-  and closes it. That is §13's first residual and the reason the advice above is still the
-  advice. Third-party state is out of scope by construction — a driver's locks, threads
+  Reconfiguring in the child is no longer harmful for a sink the library was handed here **and
+  whose ownership the record therefore decides correctly** — the child either refuses it, or has
+  re-acquired a copy of its own through the hook and is closing that. Two exceptions, and both
+  are §13 residuals rather than wrinkles in the wording. A master that *builds* a connection sink
+  and never configures it leaves the child as the first process to hand it over, so the child
+  acquires it legitimately and closes it (#1). And a sink that **returns from the hook without
+  having re-acquired everything it holds** — the reachable case being a subclass of a shipped sink
+  that adds a transport — has told the record it owns the whole object, so the child closes the
+  part the parent class never knew about (#2). Note the mechanism differs between the safe cases:
+  refusal covers the sinks with no hook, and re-acquisition covers the ones with it. Naming only
+  refusal would be wrong for every `FileSink`, which reads *releasable* in the child by design. Third-party state is out of scope by construction — a driver's locks, threads
   and descriptors are not the library's to swap, and reaching into them would be a fork fix
   that breaks a driver (§13).
 
@@ -1071,8 +1076,10 @@ constraint — never by being deleted quietly.
      acquires it legitimately and closes the parent's transport at exit. Measured. Undecidable
      inside the rule — FR-001 releases what it was handed, and FR-001 AC-3 requires a child's
      configured sink to be releasable — and nothing distinguishes the two without marking the
-     whole heap. **This is the only remaining route to a destructive close**; a 17-shape
-     claiming matrix refuses everywhere else. §9's advice is the remedy.
+     whole heap. **This is the only route the record cannot *decide*** — a 17-shape claiming
+     matrix refuses everywhere else. It is not the only remaining destructive close: #2 below is
+     the other, and the record decides that one *wrongly* rather than not at all, because the
+     hook told it something untrue. §9's advice is the remedy for both.
   2. **A sink that returns from `reacquire_after_fork()` without having re-acquired everything
      it holds.** Returning normally *is* the claim and the library cannot check it. The reachable
      case is inheritance: `class MySink(FileSink)` that also holds a socket inherits a hook which
@@ -1160,8 +1167,9 @@ constraint — never by being deleted quietly.
   it in the child" *because* the obvious phrasing of the advice performed the damage sooner and
   more completely than the hazard it avoided. **That is no longer true of a sink the library was
   handed here** — SPEC-042 makes the child refuse it — so the advice survives as the better
-  deployment rather than as an "or else". It is still an "or else" for the one case the record
-  cannot decide, which is residual #1 above: a sink the parent built and never configured.
+  deployment rather than as an "or else". It is still an "or else" for the two cases above: a
+  sink the parent built and never configured (#1), and a subclass that inherits the
+  re-acquisition hook while holding a transport the hook does not re-acquire (#2).
   Whether the library should **disown** an inherited sink in the child was **SPEC-042**, which
   settled it on the
   distinction this record could not draw: a child may release only a transport it acquired **in
