@@ -290,6 +290,10 @@ FR-002's roster and must be classified. That is the roster working as intended, 
 
 - [x] AC-1: `_fork.py` imports nothing from the package but `_diag` and `sinks.base`, asserted by
       the same kind of import test the package already uses for `_diag` and `sanitize`.
+      **Narrower as shipped:** `sinks.base` was allowed for FR-004's hook and turned out not to be
+      needed — the hook is probed by name off objects the traversal already reaches, so the module
+      imports `_diag` alone. The allowance stays in the test's fixture list, since the rule being
+      pinned is the *arrow*, not the count.
 - [x] AC-2: Registration happens at import of the package, once, and a double import does not
       register twice.
 - [x] AC-3: The new guards in `decorator.py` are classified in the FR-002 roster with reasons, and

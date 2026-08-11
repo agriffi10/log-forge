@@ -493,12 +493,16 @@ A few conventions hold across every sink below:
   delivering, re-initialises every lock (without which the child's *first* log call can deadlock),
   and throws away any buffered bytes it inherited so they are not written twice. What it does **not**
   do is give the child a sink of its own: the child inherits the same object, so one socket, one
-  SQLite handle or one file is now written by two processes. That is fine for an append-only file or
-  a queue client and wrong for a connection with transaction scope. **Under gunicorn, uWSGI or
-  Celery, call `configure()` after the fork** — gunicorn's `post_fork` hook rather than preload — if
-  your sink holds a connection. A sink you wrote yourself is repaired only if it subclasses `Sink` or
-  a shipped sink; one that satisfies the protocol structurally is outside the repair, along with any
-  third-party client's own locks and buffers.
+  SQLite handle or one file is now written by two processes — and *closed* by both, each at its own
+  exit. That is fine for an append-only file or a queue client and wrong for a connection with
+  transaction scope, where a close is protocol-visible. **Under gunicorn, uWSGI or Celery, build a
+  connection-holding sink only in the worker process** — `configure()` from gunicorn's `post_fork`
+  hook, never under preload, and don't log from the master. Reconfiguring in the child is *not* the
+  remedy and is worse than the problem: `configure(sink=...)` closes the sink it replaces, which
+  there is the parent's live connection. A master that must log should use a sink whose `close()`
+  costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote yourself is repaired
+  only if it subclasses `Sink` or a shipped sink; one that satisfies the protocol structurally is
+  outside the repair, along with any third-party client's own locks and buffers.
 - **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
   delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.

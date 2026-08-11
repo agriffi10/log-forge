@@ -352,9 +352,15 @@ A sink is a small interface so the transport is swappable:
 class Sink(Protocol):
     def emit(self, batch: list[dict]) -> None: ...   # ship a batch of events
     def close(self) -> None: ...                      # flush + release resources
-    # optional (SPEC-026):
-    # def losses(self) -> SinkLosses | None: ...      # cumulative loss this sink absorbed
+    # optional, each probed by name — never required, so no sink stops satisfying this:
+    # def losses(self) -> SinkLosses | None: ...      # cumulative loss absorbed (SPEC-026)
+    # log_foundry_stop_signal: threading.Event | None # interruptible backoff (SPEC-027)
+    # def discard_buffered_after_fork(self) -> None:  # strand a forked child's inherited
+    #                                                 # buffer (SPEC-039)
 ```
+
+`sinks/base.py` is authoritative for all three — what each promises, and for the last one which
+sinks are actually asked, which is narrower than "whichever define it".
 
 **A sink carries two reporting obligations** (SPEC-026), because the worker's retry and
 `health()` are built on them:
@@ -497,7 +503,7 @@ decorated call ends
   2. **Discard inherited buffered writes.** A fork landing inside `emit`, after the write loop
      and before the flush, leaves both processes holding the same pending bytes; the child
      strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
-     optional `discard_buffered_after_fork()` hook §8 documents.
+     optional `discard_buffered_after_fork()` hook `sinks/base.py` documents (§8).
   3. **Run the registered handlers**, `decorator`'s worker rebuild among them. The worker is
      rebuilt **in place** with a fresh queue and zeroed counters, so ownership guards keyed on
      `_worker.sink is X` survive; a retired parent forks a retired child, since a fork does not
@@ -511,13 +517,21 @@ decorated call ends
 
   **What the fork does not reach is the caller's, and a shared sink is the sharpest case.** The
   child inherits the parent's sink *object* — one socket, one SQLite handle, one file, two
-  processes — and the library does not clone, close or re-open it beyond the buffer discard.
-  That is fine for an append-only file or a queue client and wrong for a connection with
-  transaction scope, and it is the caller's to decide: construct the sink **after** the fork
-  (gunicorn's `post_fork`, not preload) if it holds a connection. `README.md` says the same
-  where a user deploying prefork will find it. Third-party state is out of scope by
-  construction — a driver's locks, threads and descriptors are not the library's to swap, and
-  reaching into them would be a fork fix that breaks a driver (§13).
+  processes — and beyond the buffer discard the library neither clones nor re-opens it. It does
+  **close** it, twice over: each process closes its own copy at exit, and a `configure(sink=…)`
+  in the child closes the inherited one immediately, because the swap SPEC-030 built cannot see
+  that the object it is retiring is still another process's transport (measured — both are
+  recorded in §13). That is harmless for an append-only file and destructive for a connection,
+  where `close()` is protocol-visible: a measured probe had the child's `configure()` send the
+  goodbye and the *parent's* next write fail with `ECONNRESET`.
+
+  So the remedy is not "reconfigure in the child" — it is **do not build a connection-holding
+  sink before the fork at all.** Call `configure()` only in the worker process (gunicorn's
+  `post_fork`, never preload) and leave the master unlogged, or give the master a sink whose
+  `close()` costs nothing to share. `README.md` says the same where a user deploying prefork
+  will find it. Third-party state is out of scope by construction — a driver's locks, threads
+  and descriptors are not the library's to swap, and reaching into them would be a fork fix
+  that breaks a driver (§13).
 
 - **A retired worker still receiving submissions is a reported state, not a prevented one**
   (SPEC-030). `shutdown()` is terminal and the worker never comes back, but `submit()` keeps
@@ -1039,6 +1053,19 @@ constraint — never by being deleted quietly.
   processes hold an orphan-path close record for the same sink object, so **each closes its own
   copy at exit** — deliberately left rather than fixed, since neither side can tell whether the
   other still needs it.
+
+  **And a `configure(sink=…)` in the child closes the inherited sink immediately.** SPEC-030's
+  swap drains to the old sink, installs the new one and closes the old — correct within one
+  process, and cross-process it retires an object that is still the parent's transport. Measured
+  with a socket sink whose `close()` writes a goodbye the server acts on: the child's
+  `configure()` sent it and the parent's next write failed with `ECONNRESET`. It fires only when
+  the parent logged before forking, which under preload it usually has. That is why §9's remedy
+  is "do not build a connection-holding sink before the fork" rather than "rebuild it in the
+  child" — the obvious phrasing of the advice performs the damage sooner and more completely
+  than the hazard it was meant to avoid. Whether the library should instead disown an inherited
+  sink in the child, rather than document around it, is **SPEC-040's** question: it is exactly
+  "one owner for the worker and the sink", and disowning has its own cost — a child that closes
+  nothing loses whatever its own sink was holding at exit.
 
 - **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
   (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one

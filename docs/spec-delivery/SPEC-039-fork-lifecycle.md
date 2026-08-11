@@ -48,11 +48,13 @@ locks and hook, and a mixed-base class whose foreign attributes are replaced wit
 
 `pytest -q` 1631 passed / 2 skipped / 2 xfailed, `ruff check .`, `mypy --strict`, `spec-lint`, and
 full CI on 3.12 and 3.13. Every new statement was mutation-swept scoped to its own function — 20
-mutants in the final phase alone, all killed by their intended test.
+mutants in the last implementation phase alone, all killed by their intended test.
 
-Three adversarial review rounds across Phase 3, plus seven across Phases 1–2. **Every blocking
-finding after round 1 was a defect in the previous round's fix**, and the sharpest was evidence
-rather than behaviour: `open(path, "a")` → `"w"` passed all 1626 tests, because every test built a
-file that was *empty on disk* at fork time and asserted that emptiness as its own precondition — so
-truncate and append were the same program, and a prefork child would have destroyed the shared log
-on every fork.
+Ten adversarial review rounds across the four phases. **Every blocking finding after the first was
+a defect in the previous round's fix**, and the sharpest was evidence rather than behaviour:
+`open(path, "a")` → `"w"` passed all 1626 tests, because every test built a file that was *empty on
+disk* at fork time and asserted that emptiness as its own precondition — so truncate and append
+were the same program, and a prefork child would have destroyed the shared log on every fork. The
+documentation phase repeated the lesson in its own register: the remedy it first gave for a shared
+connection (reconfigure in the child) was measured *breaking the parent's connection*, because
+SPEC-030's swap closes what it replaces. Recorded in §13 and handed to SPEC-040.
