@@ -33,7 +33,8 @@ parent's and closing it is destructive.
 
 ### In Scope
 
-- Recording, per process, which sink objects it acquired rather than inherited.
+- Recording, per process, which sink objects it acquired — the configured sink and every sink
+  reachable from it — so that anything else is refused rather than assumed releasable.
 - Making **every** sink close in the library ask that question — including the five shipped
   wrapper sinks that close their children directly.
 - Reporting the refusal through `health()` rather than leaving it silent.
@@ -94,60 +95,84 @@ referenced, since their scratchpads do not survive.
    its *own* `MultiSink` around an **inherited** inner sink closed the parent's inner sink
    **twice** — once through the old wrapper on the swap, once through its own wrapper at exit — and
    the inner was a *structural* sink, the case `README.md` addresses. A refusal keyed only on the
-   object handed to the lifecycle's release path stops neither.
+   object handed to the lifecycle's release path stops neither — and neither does a record that
+   reaches only what `configure()` was handed and what SPEC-039's walk enters, which is measured:
+   the container yields that inner and `_is_traversable` then declines it.
 
 ---
 
 ## Functional Requirements
 
-### FR-001: The acquisition record, and why it has two independent sources
+### FR-001: The acquisition record — one mechanism, taken when the library is handed the sink
 
 #### Description:
 
-A sink is releasable by this process when this process acquired it. The library cannot ask an
-object where it came from, so it records the answer at the two moments it is knowable, and the two
-mechanisms exist because each covers the other's blind spot.
+**The library may release only what it acquired here, and it records that at the one moment it is
+knowable: when a sink is handed to it.** `configure(sink=…)` and `config._ensure_sink()`'s lazy
+default stamp the current pid against the object — and against **every sink reachable from it**,
+because a wrapper is handed over with its children and those children are acquired by the same act.
+After a fork every stamp names another process, and a stamp is what a release consults.
 
-**A stamp when the library takes the sink.** `configure(sink=…)` and `config._ensure_sink()`'s lazy
-default record the current pid against the object. After a fork every stamp names another process,
-which is what makes a **structurally**-satisfying third-party sink — the case in the Overview and
-in `README.md` — decidable without reaching into it at all.
+A first draft used two sources — this stamp plus a mark laid down by SPEC-039's fork walk — and
+review found the union still had a hole exactly where the fix was aimed: a **structural** sink
+inside a `MultiSink` is neither stamped (`configure()` was handed the wrapper) nor marked
+(`_is_traversable` is `_is_container(v) or _is_owned(v)`, and a foreign object is neither, so the
+walk yields it from the container and then declines to enter it — measured). That object is the one
+in prior work 6. Two mechanisms with a shared blind spot are worse than one whose coverage a reader
+can state, so the mark is gone and the stamp reaches the whole graph.
 
-**A mark when the child repairs itself.** SPEC-039's walk already enters this package's objects and
-the plain containers they hold, so it reaches sinks the caller never passed to `configure()` —
-`MultiSink`'s children above all, which carry no stamp of their own.
+Reaching the graph is a **descent** question, not an ownership one, and the distinction is what
+keeps this inside SPEC-039's boundary: the walk enters library objects and plain containers as it
+always has, and *records* any sink-shaped member it encounters even when it will not descend into
+it. Recording reads nothing from the object — an `id()`, a reference, and the two attribute lookups
+`isinstance(x, Sink)` performs on a runtime-checkable Protocol. "Do not reach into third-party
+state" (SPEC-039 FR-003 AC-2) forbids mutating and traversing a foreign object, not noticing it.
 
-The stamp is written **once per object** and `configure()` never overwrites one that names another
-process; only FR-005's re-acquisition may re-stamp. That is what stops a child claiming an
-inherited sink by configuring its way back to it, and what makes the answer survive a second fork.
-The record holds a strong reference beside the id, since an id is reusable once its object dies and
-because a garbage-collected sink closes itself — the same destructive close arriving by another
-route. `_fork._fresh_primitive` already uses that pairing for the same reason.
+Three properties, each load-bearing:
+
+- **Write-once per object.** `configure()` never overwrites a stamp naming another process; only
+  FR-005's re-acquisition may re-stamp. That stops a child claiming an inherited sink by
+  configuring its way back to it, and makes the answer survive a second fork.
+- **No record means refused.** The default is the whole point of the spec: every gap must fail
+  toward the leak, never toward the destructive close. A sink the library was never handed was
+  never its to release.
+- **A strong reference beside the id**, since an id is reusable once its object dies, and a
+  garbage-collected sink closes itself — the same destructive close by another route.
+  `_fork._fresh_primitive` already uses that pairing for the same reason.
 
 #### Acceptance Criteria:
 
 - [ ] AC-1: A sink `configure()`d in this process is releasable here; the same object after a fork
       is not. Asserted in a real child.
 - [ ] AC-2: A **structural** third-party sink — no library base, matching `README.md`'s documented
-      shape — is correctly refused in the child. This is the headline case and the one a
-      walk-based mark alone cannot see, since SPEC-039's traversal deliberately does not enter
-      foreign objects.
+      shape — is refused in the child, both when it is the configured sink and when it is held
+      **inside a `MultiSink`**. The second is the case both of a first draft's mechanisms missed
+      and is not satisfiable by an owned inner.
 - [ ] AC-3: A sink the child constructs itself and installs with `configure()` **is** releasable
-      there, and is closed normally at `shutdown()`.
+      there, and is closed normally at `shutdown()` — including a `MultiSink`'s children, which
+      the same act acquired.
 - [ ] AC-4: `configure(sink=A)` in the child, naming the object it inherited, leaves A refused. A
-      stamp that is overwritten on every `configure()` passes every other criterion here and fails
-      this one.
+      stamp overwritten on every `configure()` passes every other criterion here and fails this one.
 - [ ] AC-5: A grandchild refuses too: fork, fork again, and the second child still refuses a sink
       the first inherited.
-- [ ] AC-6: A `MultiSink`'s children are refused in the child even though they were never
-      `configure()`d — the mark, not the stamp, is what covers them, and a test names which
-      mechanism it is exercising.
+- [ ] AC-6: A sink with **no record at all** is refused, and a test names the case — one added to a
+      wrapper after `configure()` ran. The consequence is a leak and is recorded in §13 (FR-006);
+      a default of releasable is what this criterion exists to forbid.
 - [ ] AC-7: The record holds a strong reference: a test proves an inherited sink is not
       garbage-collected in the child while the record stands.
 - [ ] AC-8: The parent's records are untouched, asserted by identity (SPEC-039 FR-001 AC-3).
-- [ ] AC-9: Both mechanisms' blind spots are stated in the module docstring rather than left to be
-      discovered: a stamp cannot cover an object the library was never handed, and the mark cannot
-      cover one the walk does not reach.
+- [ ] AC-9: The one blind spot is stated in the module docstring rather than left to be discovered:
+      a sink the library was never handed carries no stamp, so it is refused — safe here, and the
+      reason a wrapper mutated after `configure()` leaks.
+- [ ] AC-10: The stamp walk's cost is **measured and stated**, on the shape that makes it worst —
+      a sink holding caller data, as SPEC-039 measured 202 ms for a `MemorySink` with 100k events.
+      It runs once per `configure()` rather than per fork or per event, and if the number argues
+      for bounding the descent, that bound is chosen with the measurement in hand rather than
+      guessed.
+- [ ] AC-11: `_ensure_sink()` runs **under `decorator._worker_lock`** on the orphan path
+      (`config.py`), so the record takes its own lock and the order is stated and pinned:
+      `_worker_lock` → record lock, never the reverse. The repo's lock-ordering history is what
+      makes this an AC rather than a note.
 
 ### FR-002: One release path, and every closer in the library uses it
 
@@ -164,19 +189,44 @@ nothing is retried, and the caller's control flow and error handling are unchang
 `MultiSink.close` still isolates and continues; `shutdown()` still returns; the swap still installs
 the new sink.
 
+**The guard moves; the error handling stays.** The eight sites do not agree today and must not be
+made to: three absorb with three different `_diag` texts (SPEC-029 wants the site named),
+`MultiSink` absorbs *and* increments its `failed` counter, and `FilteringSink`/`TransformSink`
+**propagate** — a documented `Raises:`. So the helper propagates whatever `close()` raises and each
+caller keeps its own handler. Folding the `try/except` into the helper is the obvious reading of
+"one release path" and it silently costs two things: `MultiSink.failed` stops moving, which drops
+absorbed close failures out of `Health.sink.failed` (a SPEC-026 regression), and two documented
+`Raises:` clauses become false.
+
+**It also creates the first `sinks/ → ` core import arrow.** Today `sinks/*.py` imports `_diag` and
+its own siblings, nothing else — the probe-by-name idiom (`losses()`,
+`log_foundry_stop_signal`, `_fork`'s inverted registry) exists to keep it that way. That idiom
+exists so the core does not reach into *third-party* sinks; five sinks the library ships calling one
+of its own helpers is a different question, and pushing a predicate onto five wrappers instead would
+be five attributes to keep in sync for no gain. So the arrow is **taken deliberately** — it is not a
+cycle (`_lifecycle` imports `_diag`, and `Sink` only under `TYPE_CHECKING`) and AC-9 pins that.
+
 #### Acceptance Criteria:
 
-- [ ] AC-1: Every sink close in `src/` goes through the release helper. A lint derives the sites
-      rather than listing them, carries a floor, and names the eight known ones so a ninth is a
-      decision somebody takes. Closes of a *driver's* handle — `self._conn`, `self.client`,
-      `self._loop` — are outside the rule and the lint's discriminator is stated in its docstring,
-      since "closes something" and "closes a sink" are different questions.
+- [ ] AC-1: Every sink close in `src/` goes through the release helper, enforced by a lint whose
+      **discriminator is named here rather than delegated to its docstring**, because a rule left
+      to the builder is a hand-list wearing a derivation's clothes: resolve each `.close()`
+      receiver to an annotation — through a local alias to a module global, through an attribute to
+      its `__init__` parameter, and through an iteration to the container's — and the site is in
+      scope iff that annotation names `Sink` or a class in the sink roster `test_sink_concurrency`
+      already derives. All eight resolve; every driver close resolves to a non-sink type or to
+      nothing, which is why the call expression alone cannot decide it (three of the eight carry no
+      annotation at the call site, and so do several driver closes). The lint carries a floor and
+      names the eight so a ninth is a decision somebody takes.
 - [ ] AC-2: The refusal holds at each of the three lifecycle sites, with a test per site: the swap
       (both paths), the worker's shutdown close, and the orphan-path exit close. A fix covering two
       of three is the shape this defect already took once.
 - [ ] AC-3: **The wrapper route is closed, and the pre-fix failure is demonstrated.** A child that
       builds its own `MultiSink` around an inherited inner sink closes it zero times; the test is
-      shown failing with the wrapper sites unguarded, where it measures two closes.
+      shown failing with the wrapper sites unguarded, where it measures two closes. **The inner is
+      a structural sink**, named in the criterion because an owned one passes against a record that
+      still has FR-001's old hole — the test would go 2 → 0 and prove nothing about the case it was
+      written from.
 - [ ] AC-4: A refused release does not raise, does not move `incomplete_swaps`, and does not move
       any loss counter. The sink is left **open**, which is the trade SPEC-027 FR-004 and SPEC-030
       already made twice: a leaked resource in an exiting process beats a corrupt write.
@@ -192,6 +242,11 @@ the new sink.
       cannot pass.
 - [ ] AC-8: The helper returns what its callers need — two sites hand `close_detached`'s thread on
       to a `join` after releasing a lock — so no caller loses its bounded wait (SPEC-030 FR-003).
+- [ ] AC-9: The five wrappers' error handling is unchanged, asserted rather than assumed: a child
+      whose `close()` raises still increments `MultiSink.failed` and still reaches
+      `Health.sink.failed`, and `FilteringSink`/`TransformSink` still propagate as their `Raises:`
+      documents. The new `sinks/ → _lifecycle` import is pinned by the existing import test as
+      **not** a cycle, and `_lifecycle` gains no import of a concrete sink.
 
 ### FR-003: The drain is untouched; only the release is refused
 
@@ -230,7 +285,10 @@ field can be appended without proving indices.
 - [ ] AC-1: `Health` gains `inherited_sink: bool`, and its **referent is named in the docstring**:
       the sink this process would deliver to now — the worker's if a worker exists, else the orphan
       record's, else the configured one. SPEC-033 measured those three disagreeing, so a field that
-      says "the sink" without saying which is a field two readers read differently.
+      says "the sink" without saying which is a field two readers read differently. It describes
+      that **one** object, not the graph beneath it: in FR-002 AC-3's case the child built its own
+      wrapper, so this reads `False` while the wrapper's child is refused — stated here because the
+      opposite reading is the natural one.
 - [ ] AC-2: It reads `False` in a process that never forked, `True` in a child that inherited its
       sink, and `False` again in a child that installed one of its own.
 - [ ] AC-3: It is answerable with no worker — synthesized as `retired` already is (SPEC-031 FR-006)
@@ -320,10 +378,10 @@ committing there writes into a transaction the parent may be mid-way through.
 
 ```python
 # src/log_foundry/_lifecycle.py — process-global, as the closer registry already is
-def stamp(sink: object) -> None: ...          # configure()/_ensure_sink(); never overwrites
-def mark_inherited(sink: object) -> None: ... # the child's repair, for what it reached
-def reclaim(sink: object) -> None: ...        # FR-005: the hook returned, so it is ours
-def releasable(sink: object) -> bool: ...
+def stamp(sink: object) -> None: ...          # configure()/_ensure_sink(), over the reachable
+                                              # sink graph; never overwrites another pid's stamp
+def reclaim(sink: object) -> None: ...        # FR-005: the hook returned, so it is ours now
+def releasable(sink: object) -> bool: ...     # stamped for this pid; **no record means False**
 def release(sink: object, *, detached: bool = False) -> threading.Thread | None: ...
     # The one close path (FR-002). Returns the closer thread for a detached release, and
     # None both when the release was refused and when an inline close completed —
@@ -339,9 +397,11 @@ class Health:
 #   optional: losses(), log_foundry_stop_signal, reacquire_after_fork()
 ```
 
-`_fork.py` still imports only `_diag` (SPEC-039 FR-006). It publishes what it reached and which
-hooks succeeded; the handler `_lifecycle` registers with it does the marking, so the dependency
-arrow is unchanged.
+`_fork.py` still imports only `_diag` (SPEC-039 FR-006): it publishes which hooks succeeded, and
+the handler `_lifecycle` registers with it re-stamps those. Nothing else happens at fork time —
+the record was laid down at `configure()`, which is what removes the fork walk from this
+mechanism entirely. The new arrow this spec does add is `sinks/ → _lifecycle`, taken deliberately
+(FR-002).
 
 ## Implementation Phases
 
