@@ -23,7 +23,7 @@ FR-005 plus the completion ritual.**~~ — all four phases are now merged.
 | `main` | `71af180` — green, every workflow including Release |
 | Suite | 1612 passed, 2 skipped, 2 xfailed |
 | Merged | #147 (FR-003, FR-001 AC-1/AC-3, FR-006 AC-1/AC-2/AC-4) · #148 (FR-002, FR-006 AC-2/AC-3, FR-001 AC-2) |
-| Left | **FR-004** (Phase 3), **FR-005** (Phase 4), then the completion ritual |
+| Left | ~~**FR-004** (Phase 3), **FR-005** (Phase 4), then the completion ritual~~ — all shipped |
 | Spec file | `docs/specs/SPEC-039-fork-lifecycle.md` — ~~`Status: Draft`~~ **Completed** |
 
 The spec was amended once during Phase 1 — FR-002 AC-2 now records that the queue **object** must
@@ -31,6 +31,10 @@ be replaced rather than drained, and why the retired path needs it too. That ame
 `main` and is already implemented.
 
 ## Start here
+
+> Historical, and the line numbers below are **as of `173f6c7`** — `_fork.py` and
+> `sinks/file.py` both grew during FR-004, so three of them have drifted. Read the section for its
+> reasoning, not as navigation.
 
 1. **Read `_fork.py`'s `_reinit_after_fork` (line 413) before planning.** It is a two-step
    contract today — `_reinit_primitives()` at line 440, then the handler loop at line 443 — and
