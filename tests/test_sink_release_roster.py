@@ -22,15 +22,35 @@ claims `LogstashSink`'s and `SyslogSink`'s socket closes, taking the roster to t
 transports the sink built and owns outright, which no sink-ownership record describes and which
 a forked child must still be able to release. Requiring an `emit` is what the word "sink" means
 here, and it is derived from the same scan rather than carved out by name.
+
+**That sentence was false when it was first written, and how it was false is the more useful
+half.** As first shipped the resolver claimed only *one* of the two socket closes. `SyslogSink`
+escaped because it holds its transport as `self._socket = SocketTransport(...)` -- a bare
+assignment whose right-hand side is a *call* -- which `_self_attribute_names` could not read at
+all, so the receiver resolved to nothing and the site was excluded for the wrong reason. The
+resolver now reads that shape, which both makes the claim above reproduce and closes a real
+hole: a ninth close written `self._x = HTTPSink(...)` would have been missed silently, and that
+is the idiom this codebase actually uses.
+
+**What the resolver still cannot see** is stated rather than left to be found, because Phase 2's
+ownership guard is exactly as complete as this lint: a receiver reached through a comprehension,
+a nested function's closure over an outer local, `getattr`, an unannotated module global, tuple
+unpacking, a subscript, or a stored callable. Each would be a sink close this lint waves
+through. None occurs in `src/` today -- verified by enumerating all sixteen `.close()` calls --
+and `test_the_resolver_blind_spots_are_the_stated_ones` pins the list so it stays honest.
 """
 
 from __future__ import annotations
 
 import ast
 import pathlib
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import log_foundry
+from log_foundry import _lifecycle
+from log_foundry.worker import Worker
 from test_sink_concurrency import _base_names, _sink_classes_with_an_emit
 
 if TYPE_CHECKING:
@@ -78,11 +98,15 @@ that carried a floor noticed.
 """
 
 
-def _modules() -> Iterator[tuple[str, ast.Module]]:
-    """Yields every module of the installed package, keyed by a path-shaped stem.
+def _modules(root: pathlib.Path | None = None) -> Iterator[tuple[str, ast.Module]]:
+    """Yields every module under one root, keyed by a path-shaped stem.
+
+    The `root` parameter is what lets a test scan a temporary directory through the *real*
+    collector rather than reimplementing its filter, which is how the sibling roster
+    (`_sink_classes_with_an_emit`) already does it -- a duplicated predicate is one that drifts.
 
     Args:
-      None.
+      root: The directory to scan, defaulting to the installed package.
 
     Returns:
       One `(stem, parsed module)` pair per source file, `sinks/multi` rather than `multi` so a
@@ -91,8 +115,9 @@ def _modules() -> Iterator[tuple[str, ast.Module]]:
     Raises:
       None.
     """
-    for path in sorted(_SRC.rglob("*.py")):
-        stem = str(path.relative_to(_SRC).with_suffix(""))
+    base = _SRC if root is None else root
+    for path in sorted(base.rglob("*.py")):
+        stem = str(path.relative_to(base).with_suffix(""))
         yield stem, ast.parse(path.read_text(encoding="utf-8"))
 
 
@@ -188,18 +213,26 @@ def _parameter_annotation(fn: ast.FunctionDef | ast.AsyncFunctionDef, name: str)
 
 
 def _self_attribute_names(cls: ast.ClassDef, attr: str) -> set[str]:
-    """Resolves `self.<attr>` to an annotation, through the class body or `__init__`.
+    """Resolves `self.<attr>` to a type, through the class body or a method's assignments.
 
-    Two routes, both used by the eight: an annotated assignment anywhere in the class
-    (`self._http: HTTPSink | None = ...`), and a bare `self._inner = inner` whose right-hand
-    side is a parameter of the enclosing method.
+    Three routes. An annotated assignment anywhere in the class
+    (`self._http: HTTPSink | None = ...`); a bare `self._inner = inner` whose right-hand side is
+    a parameter of the enclosing method; and `self._socket = SocketTransport(...)`, a bare
+    assignment whose right-hand side *constructs* the thing.
+
+    That third route was missing when this lint was first written, and the omission is the
+    reason to be explicit about it: `SyslogSink` holds its transport exactly that way, so its
+    `close()` receiver resolved to nothing at all and the site was out of scope for the wrong
+    reason -- not because a `SocketTransport` is not a sink, but because the resolver could not
+    see what it was. A ninth *sink* close written `self._x = HTTPSink(...)` would have been
+    missed the same way, silently, which is the failure mode this whole file exists to prevent.
 
     Args:
       cls: The class the attribute belongs to.
       attr: The attribute name.
 
     Returns:
-      The names, empty when neither route resolves.
+      The names, empty when no route resolves.
 
     Raises:
       None.
@@ -211,12 +244,13 @@ def _self_attribute_names(cls: ast.ClassDef, attr: str) -> set[str]:
         for node in ast.walk(fn):
             if isinstance(node, ast.AnnAssign) and _is_self_attr(node.target, attr):
                 names |= _annotation_names(node.annotation)
-            elif (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Name)
-                and any(_is_self_attr(target, attr) for target in node.targets)
+            elif isinstance(node, ast.Assign) and any(
+                _is_self_attr(target, attr) for target in node.targets
             ):
-                names |= _parameter_annotation(fn, node.value.id)
+                if isinstance(node.value, ast.Name):
+                    names |= _parameter_annotation(fn, node.value.id)
+                elif isinstance(node.value, ast.Call):
+                    names |= _annotation_names(node.value.func)
     for node in cls.body:
         if (
             isinstance(node, ast.AnnAssign)
@@ -377,11 +411,13 @@ def _qualified(fn: ast.FunctionDef | ast.AsyncFunctionDef | None, cls: ast.Class
     return f"{cls.name}.{fn.name}" if cls is not None else fn.name
 
 
-def _sink_close_sites() -> list[tuple[str, str, int, frozenset[str]]]:
-    """Returns every `.close()` in `src/` whose receiver resolves to a sink type.
+def _sink_close_sites(
+    root: pathlib.Path | None = None,
+) -> list[tuple[str, str, int, frozenset[str]]]:
+    """Returns every `.close()` under one root whose receiver resolves to a sink type.
 
     Args:
-      None.
+      root: The directory to scan, defaulting to the installed package.
 
     Returns:
       One `(module stem, scope, line, resolved names)` tuple per in-scope site.
@@ -391,7 +427,7 @@ def _sink_close_sites() -> list[tuple[str, str, int, frozenset[str]]]:
     """
     sink_names = _sink_type_names()
     sites: list[tuple[str, str, int, frozenset[str]]] = []
-    for stem, tree in _modules():
+    for stem, tree in _modules(root):
         globals_ = _module_globals(tree)
         for node, fn, cls in _walk_scopes(tree):
             if not isinstance(node, ast.Call):
@@ -453,13 +489,14 @@ def test_every_library_closer_goes_through_the_release_helper() -> None:
     assert _release_call_sites() == _EXPECTED_CLOSERS | _EXPECTED_REQUESTERS
 
 
-def test_the_detached_requesters_still_receive_a_thread_to_join() -> None:
-    """Both bounded waits survive the move (FR-002 AC-8).
+def test_the_detached_requesters_still_bind_the_thread_they_are_handed() -> None:
+    """Both callers still capture the return value (FR-002 AC-8), which is half the claim.
 
-    A helper that stopped returning the closer thread would cost each of them the bounded join
-    SPEC-030 FR-003 built, and it would do so silently -- the call still compiles, the close
-    still happens, and only the wait disappears. So the assertion is on the returned value being
-    bound, not merely on the call being made.
+    This is an AST assertion about the **call sites**, and on its own it is worth less than it
+    looks: a helper that stopped returning the thread leaves every call site byte-identical, so
+    this test cannot see it -- measured, `release` mutated to `_start_closer(sink); return None`
+    passed all seven lints here. The other half of AC-8 is therefore behavioural and lives in
+    the two tests below, one per caller.
     """
     bound: set[tuple[str, str]] = set()
     for stem, tree in _modules():
@@ -472,6 +509,79 @@ def test_the_detached_requesters_still_receive_a_thread_to_join() -> None:
             if any(kw.arg == "detached" for kw in node.value.keywords):
                 bound.add((stem, _qualified(fn, cls)))
     assert bound == _EXPECTED_REQUESTERS
+
+
+class _CountingSink:
+    """Counts closes and can take a measurable time over one, so a skipped join is visible."""
+
+    def __init__(self, close_seconds: float = 0.0) -> None:
+        self.closed = 0
+        self._close_seconds = close_seconds
+        self.entered = threading.Event()
+        self.may_finish = threading.Event()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Accepts a batch and keeps nothing; these tests assert on closes, not deliveries."""
+
+    def close(self) -> None:
+        """Records the close, optionally taking long enough for a missing join to show."""
+        self.entered.set()
+        if self._close_seconds:
+            time.sleep(self._close_seconds)
+        self.closed += 1
+
+
+def test_a_detached_release_hands_back_the_thread_running_the_close() -> None:
+    """The helper's half of AC-8: the return value is a live handle to an outstanding close.
+
+    Asserted while the close is *provably* still running -- the sink is parked inside `close()`
+    and `closed` is still zero -- so this cannot pass against a helper that closed inline and
+    returned `None`, nor against one that returned a thread which had already finished.
+    """
+    sink = _CountingSink()
+    sink.may_finish.clear()
+
+    def _park() -> None:
+        sink.entered.set()
+        sink.may_finish.wait(10.0)
+        sink.closed += 1
+
+    sink.close = _park  # type: ignore[method-assign]
+    closer = _lifecycle.release(sink, detached=True)
+
+    assert closer is not None, "a detached release returns the thread it started"
+    assert sink.entered.wait(5.0), "and that thread is actually running the close"
+    assert sink.closed == 0, "which is still outstanding, so the release did not close inline"
+
+    sink.may_finish.set()
+    closer.join(5.0)
+    assert sink.closed == 1, "and joining the returned thread is what waits for it"
+
+
+def test_the_worker_waits_for_the_swapped_out_close_it_started() -> None:
+    """`Worker._close_swapped_out`'s bounded wait, which no test covered (FR-002 AC-8).
+
+    The AST lint above cannot see a helper that stops returning the thread, and when that
+    mutation was run the only test in the whole suite that died covered
+    `decorator._swap_sink` -- this caller's wait had nothing asserting it at all.
+
+    The close takes measurable time on purpose: an instant one completes before the assertion
+    whether or not anything joined it, so the elapsed floor is what distinguishes waiting from
+    firing and forgetting. A floor rather than a window, so load can only make it more true.
+    """
+    close_seconds = 0.4
+    old = _CountingSink(close_seconds=close_seconds)
+    new = _CountingSink()
+    worker = Worker(old, batch_size=1000, flush_interval=100.0)
+    try:
+        start = time.monotonic()
+        assert worker.swap_sink(new, timeout=5.0) is True
+        elapsed = time.monotonic() - start
+
+        assert old.closed == 1, "a close that fits the budget has completed when the swap returns"
+        assert elapsed >= close_seconds, "so the worker waited rather than firing and forgetting"
+    finally:
+        worker.shutdown(2.0)
 
 
 def test_the_closer_roster_has_not_collapsed() -> None:
@@ -519,40 +629,98 @@ def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
 def test_a_transport_that_is_not_a_sink_is_out_of_scope() -> None:
     """`SocketTransport` has `send_all` and `close` and no `emit`, so it is not a sink here.
 
-    The reused roster admits it, and a discriminator that stopped at roster membership would
-    claim `LogstashSink`'s and `SyslogSink`'s socket closes -- ten sites, not eight, and two of
-    them transports the sink built and owns outright. The exclusion is derived from the same
-    scan rather than carved out by name, so a future `SocketTransport` that grows an `emit`
-    comes into scope on its own.
+    The reused roster admits it, and the exclusion is derived from the same scan rather than
+    carved out by name, so a future `SocketTransport` that grows an `emit` comes into scope on
+    its own.
     """
     assert "SocketTransport" not in _sink_type_names()
     assert {"MultiSink", "HTTPSink", "FileSink", "Sink"} <= _sink_type_names()
 
 
+def test_the_unrefined_rule_really_would_claim_both_socket_closes() -> None:
+    """The amendment's evidence, measured here rather than asserted in prose.
+
+    A rationale for changing an acceptance criterion has to reproduce, and this one did not when
+    it was first written: the resolver could not read `SyslogSink`'s `self._socket =
+    SocketTransport(...)`, so only one of the two sites was actually claimed. Pinning the
+    measurement is what stops the docstrings above drifting back into a story.
+    """
+    unrefined = {"Sink"} | {node.name for _, node in _sink_classes_with_an_emit()}
+    sink_names = _sink_type_names()
+    all_sites: list[tuple[str, str, frozenset[str]]] = []
+    for stem, tree in _modules():
+        globals_ = _module_globals(tree)
+        for node, fn, cls in _walk_scopes(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "close"
+            ):
+                names = frozenset(_resolve(node.func.value, fn, cls, globals_))
+                if names & unrefined:
+                    all_sites.append((stem, _qualified(fn, cls), names))
+
+    under_unrefined = {(stem, scope) for stem, scope, _ in all_sites}
+    under_refined = {(stem, scope) for stem, scope, names in all_sites if names & sink_names}
+
+    assert under_unrefined - under_refined == {
+        ("sinks/logstash", "LogstashSink.close"),
+        ("sinks/syslog", "SyslogSink.close"),
+    }, "the amendment's evidence: both socket closes, and only they, are what the clause removes"
+    assert under_refined == {("_lifecycle", "release")}
+    assert under_refined == {(stem, scope) for stem, scope, _line, _names in _sink_close_sites()}, (
+        "and the refined set is what the shipped collector actually returns"
+    )
+
+
 def test_a_ninth_direct_close_is_caught(tmp_path: pathlib.Path) -> None:
     """The lint fails against the thing it forbids, rather than only passing today.
 
-    Written as an end-to-end scan of a real module on disk: a synthetic AST node would exercise
-    the resolver while proving nothing about the walk that feeds it.
+    An end-to-end scan of real modules on disk through `_sink_close_sites` itself -- not a
+    reimplementation of its filter, which is a second copy of the rule free to drift from the
+    one that ships. Both the annotated-parameter shape and the `self._x = Concrete(...)` shape
+    are here, the second because it is the one that was missed.
     """
-    module = tmp_path / "ninth.py"
-    module.write_text(
-        "from log_foundry.sinks.base import Sink\n"
-        "\n"
-        "\n"
-        "def retire(sink: Sink) -> None:\n"
+    (tmp_path / "ninth.py").write_text(
+        "from log_foundry.sinks.base import Sink\n\n\ndef retire(sink: Sink) -> None:\n"
         "    sink.close()\n",
         encoding="utf-8",
     )
-    tree = ast.parse(module.read_text(encoding="utf-8"))
-    sink_names = _sink_type_names()
-    globals_ = _module_globals(tree)
-    caught = [
-        node.lineno
-        for node, fn, cls in _walk_scopes(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "close"
-        and _resolve(node.func.value, fn, cls, globals_) & sink_names
-    ]
-    assert caught == [5]
+    (tmp_path / "tenth.py").write_text(
+        "from log_foundry.sinks.http import HTTPSink\n\n\nclass Wrapper:\n"
+        "    def __init__(self, url: str) -> None:\n"
+        "        self._inner = HTTPSink(url)\n\n"
+        "    def close(self) -> None:\n"
+        "        self._inner.close()\n",
+        encoding="utf-8",
+    )
+    caught = {(stem, scope) for stem, scope, _line, _names in _sink_close_sites(tmp_path)}
+    assert caught == {("ninth", "retire"), ("tenth", "Wrapper.close")}
+
+
+def test_the_resolver_blind_spots_are_the_stated_ones(tmp_path: pathlib.Path) -> None:
+    """What the lint waves through, pinned so the module docstring stays honest.
+
+    Phase 2's ownership guard is exactly as complete as this resolver, so an unstated blind spot
+    is a hole in the guard nobody knows about. None of these shapes occurs in `src/` today --
+    all sixteen `.close()` calls were enumerated -- and this test is what turns "none today"
+    into something that fails the day one appears, rather than the day it causes a defect.
+
+    A shape that starts being *caught* fails here too, which is the point: that is a resolver
+    improvement somebody should notice and move out of this list.
+    """
+    shapes = {
+        "comprehension": "def f(sinks: list[Sink]) -> None:\n    [s.close() for s in sinks]\n",
+        "closure": "def f(sink: Sink) -> None:\n    def inner() -> None:\n        sink.close()\n",
+        "getattr": "def f(sink: Sink) -> None:\n    getattr(sink, 'close')()\n",
+        "unannotated_global": "SINK = None\n\n\ndef f() -> None:\n    SINK.close()\n",
+        "unpacking": "def f(pair: tuple[Sink, Sink]) -> None:\n    a, b = pair\n    a.close()\n",
+        "subscript": "def f(sinks: list[Sink]) -> None:\n    sinks[0].close()\n",
+    }
+    for name, body in shapes.items():
+        (tmp_path / f"{name}.py").write_text(
+            f"from log_foundry.sinks.base import Sink\n\n\n{body}", encoding="utf-8"
+        )
+    assert _sink_close_sites(tmp_path) == [], (
+        "a shape here is now caught -- move it out of the list"
+    )

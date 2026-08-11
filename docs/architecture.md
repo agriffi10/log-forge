@@ -989,18 +989,18 @@ constraint — never by being deleted quietly.
 
 - **A diagnostic can be written while `_worker_lock` is held (SPEC-035 FR-006).** The
   process-wide lock in `decorator.py` is released before anything that blocks on a destination —
-  `owed.close()` runs outside it, and `close_detached` only starts a thread — with one exception:
+  `_lifecycle.release(owed)` runs outside it, and a detached release only starts a thread — with one exception:
   three sites can reach `_diag` while still holding it, so a wedged stderr stalls every orphan
   emit and every first `@trace` in the process behind it.
 
   - `_note_orphan_emit` → `_offer_orphan_signal` → `_lifecycle.offer_stop_signal` → `_diag.absorbed`
   - `_adopt_declined_swap` → the same path (this site arrived with SPEC-035 FR-003)
-  - `_swap_sink` → that path, **and** `_lifecycle.close_detached`, which writes on a thread-start
+  - `_swap_sink` → that path, **and** `_lifecycle.release(..., detached=True)`, which writes on a thread-start
     failure, also under the lock
 
   `_close_orphan_sink` is deliberately not one — its `_diag` write sits outside the `with`.
   It is an **error path only**: `offer_stop_signal` writes just when a sink's `log_foundry_stop_signal`
-  setter objects, and `close_detached` just when the interpreter refuses a thread. The fix —
+  setter objects, and a detached release just when the interpreter refuses a thread. The fix —
   returning a flag and writing after the release — spreads one diagnostic decision across two
   functions at all three sites to save a write that happens only then, so it is **recorded rather
   than taken**. `Worker.submit` is the counter-example and is deliberately inconsistent with
@@ -1066,7 +1066,7 @@ constraint — never by being deleted quietly.
   swap paths close it**, not just the worker's: `Worker.swap_sink` drains, installs, *fences with
   a second drain* and then closes — the fence being what makes the close safe within one process
   and, provably, does nothing across two — while `decorator._swap_sink`'s no-worker branch hands
-  the old sink to `_lifecycle.close_detached` with neither drain. A process that only ever logged
+  the old sink to `_lifecycle.release(..., detached=True)` with neither drain. A process that only ever logged
   outside a span takes the second, so "there is no worker here" is not an escape.
 
   That is why §9's remedy is "do not build a connection-holding sink before the fork" rather than

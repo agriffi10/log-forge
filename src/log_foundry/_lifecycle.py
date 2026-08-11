@@ -34,12 +34,11 @@ def release(sink: Sink, *, detached: bool = False) -> threading.Thread | None:
     library closer through one function is what gives the ownership question one home.
 
     **The guard moves here; the error handling does not.** This propagates whatever ``close()``
-    raises, because the eight callers do not agree today and must not be made to: three absorb
-    with three different ``_diag`` texts (SPEC-029 wants the site named), ``MultiSink`` absorbs
-    *and* increments its ``failed`` counter, and ``FilteringSink``/``TransformSink`` propagate
-    under a documented ``Raises:``. Folding the ``try/except`` in here would drop absorbed close
-    failures out of ``Health.sink.failed`` — a SPEC-026 regression — and falsify two of those
-    clauses.
+    raises, because the callers do not agree today and must not be made to: four absorb, under
+    three distinct ``_diag`` texts naming the site (SPEC-029), ``MultiSink`` also increments its
+    ``failed`` counter, and ``FilteringSink``/``TransformSink`` propagate under a documented
+    ``Raises:``. Folding the ``try/except`` in here would drop absorbed close failures out of
+    ``Health.sink.failed`` — a SPEC-026 regression — and falsify two of those clauses.
 
     Args:
       sink: The sink to close.
