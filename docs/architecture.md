@@ -1073,9 +1073,11 @@ constraint — never by being deleted quietly.
   "rebuild it in the child": the obvious phrasing of the advice performs the damage sooner and
   more completely than the hazard it was meant to avoid. Whether the library should instead
   **disown** an inherited sink in the child is now **SPEC-042**, which settles it on the
-  distinction this record could not draw: a child may release only a transport it *re-acquired*,
-  which after FR-004's reopen is exactly what the file sinks did and what a connection sink did
-  not — measured, the child's `FileSink` holds its own descriptor, fd 4 against the parent's fd 3.
+  distinction this record could not draw: a child may release only a transport it acquired **in
+  this process** — by being handed the sink here, or by re-acquiring it through FR-004's hook,
+  which after the reopen is exactly what the file sinks did and what a connection sink did not
+  (measured: the child's `FileSink` holds a different descriptor from the parent's, while a
+  socket-holding sink holds the same one).
   It is not SPEC-040's: that one is a pure refactor whose Out of Scope forbids behaviour change
   and directs this kind of finding elsewhere, so it records the defect as evidence for its own
   motivation and nothing more. What stays true either way is the residual SPEC-042 accepts — a
