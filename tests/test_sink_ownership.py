@@ -1253,3 +1253,61 @@ def test_health_reports_an_inherited_sink_through_the_worker_too() -> None:
 
     child = run_in_child(in_child)
     assert child.output == "True,True", child.output
+
+
+def test_the_reacquired_roster_does_not_survive_into_the_next_fork(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The roster holds sinks, so `_fork`'s walk must not treat it as live state either.
+
+    This is `_owned`'s hazard reached by a second route: a new module global holding sinks,
+    added without an opt-out. Measured before the fix — a child's repair walk collected a sink
+    two `configure()` calls out of date, its hook ran, and the reclaim that follows stamped it
+    for the *grandchild's* pid, so a sink no descendant ever acquired read `releasable=True`.
+
+    A ratchet rather than a one-off: once a hook-implementing sink enters a roster, every
+    descendant's walk finds it again. Nothing referenced `reacquired_in_child` or `reclaim` by
+    name anywhere in the suite, which is how a docstring claiming the opposite survived.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    first = FileSink(str(tmp_path / "first.log"))
+    log_foundry.configure(service="own", sink=first)
+
+    def in_child() -> str:
+        log_foundry.configure(sink=FileSink(str(tmp_path / "second.log")))
+        log_foundry.configure(sink=FileSink(str(tmp_path / "third.log")))
+        collected = len(_fork._reinit_primitives())
+        grandchild = run_in_child(lambda: str(_lifecycle.releasable(first)))
+        return f"{collected},{grandchild.output}"
+
+    child = run_in_child(in_child, timeout=12)
+    assert child.output == "1,False", (
+        f"got {child.output!r}: the walk should reach only the live sink, and a grandchild must "
+        "not be able to claim one the parent configured and superseded"
+    )
+
+
+def test_a_marking_walk_that_fails_still_honours_a_re_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failed walk is no reason to refuse a sink that provably re-acquired its transport.
+
+    The exception path used to `return` before the reclaim loop while the ceiling path fell
+    through to it, so the two failure modes differed silently — and the exception one produced
+    exactly the outcome `reclaim` exists to prevent.
+    """
+    from log_foundry.sinks.file import FileSink
+
+    sink = FileSink(str(tmp_path / "reacquired.log"))
+    monkeypatch.setattr(_fork, "reacquired_in_child", [sink])
+    monkeypatch.setattr(
+        _lifecycle, "_inheritance_roots", lambda: (_ for _ in ()).throw(RuntimeError("no roots"))
+    )
+
+    _lifecycle._mark_inherited()
+    try:
+        assert _lifecycle._marking_failed is True, "the walk did fail"
+        assert _lifecycle.releasable(sink) is True, "and the re-acquisition still counted"
+    finally:
+        _lifecycle._marking_failed = False

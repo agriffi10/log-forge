@@ -104,9 +104,17 @@ class Sink(Protocol):
     hold different descriptors. That second half is what the library acts on, so a sink that
     merely dropped a buffer without re-acquiring would satisfy a name describing only the
     discard — which this member carried until SPEC-042 — while making a destructive close look
-    safe. A sink that
-    does **not** implement this keeps whatever it inherited, so a child will not release it; one
-    that raises is treated the same way, since a failed re-acquisition is not a claim.
+    safe. A sink that does **not** implement this keeps whatever it inherited, so a child will
+    not release it; one that raises is treated the same way, since a failed re-acquisition is
+    not a claim.
+
+    **Inheriting the hook claims the whole object, so a subclass that adds a transport must
+    override it.** ``class MySink(FileSink)`` that also holds a socket inherits a hook which
+    re-acquires only the *file*, returns normally, and thereby tells the library the child owns
+    everything — after which the child's ``close()`` runs against the parent's connection.
+    Measured. Returning normally is the claim; the library cannot check what was actually
+    re-acquired, which is why the obligation sits here. A subclass that cannot honour it should
+    define the member to raise, which is refused and therefore safe.
 
     **Which sinks are actually asked is narrower than "whichever define it", and the boundary is
     the same one every fork repair has.** The child's repair walks this package's own objects —

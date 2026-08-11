@@ -2544,7 +2544,7 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
     costs that sink a duplicated batch rather than costing the next sink its discard.
     """
 
-    class _RaisesOnDiscard(FileSink):
+    class _RaisesOnReacquire(FileSink):
         def reacquire_after_fork(self) -> None:
             raise RuntimeError("a-value-from-the-event-4321")
 
@@ -2556,7 +2556,7 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
         def reacquire_after_fork(self) -> None:
             self.ran.append("yes")
 
-    raising = _RaisesOnDiscard(str(tmp_path / "raising.ndjson"))
+    raising = _RaisesOnReacquire(str(tmp_path / "raising.ndjson"))
     recording = _RecordsItRan(str(tmp_path / "recording.ndjson"))
     log_foundry.configure(
         service="fork", version="0", env="test", sink=MultiSink(raising, recording)
@@ -2576,9 +2576,9 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
     ran, _, announced = child.output.partition("|")
     assert ran == "1", child.output
     assert "a-value-from-the-event-4321" not in announced
-    assert "absorbed a failure while discarding an inherited buffer after a fork" in announced
+    assert "absorbed a failure while re-acquiring a transport after a fork" in announced
     assert "(RuntimeError)" in announced
-    assert "_RaisesOnDiscard may write the parent's pending bytes again" in announced
+    assert "_RaisesOnReacquire may write the parent's pending bytes again" in announced
 
 
 class _BareSink:

@@ -37,13 +37,31 @@ and all three would have to import this module for it to reach them; instead the
 it, so this module imports nothing that imports it and there is no cycle to break later.
 """
 
+_FORK_SKIP = ("reacquired_in_child",)
+"""This module's own opt-out from the walk below (:data:`_SKIP_ATTRIBUTE`).
+
+:data:`reacquired_in_child` holds **sinks**, so without this the next fork's walk enters the
+previous fork's roster and re-collects every sink in it — including ones ``configure()``
+superseded in between. Measured: a child's walk collected a sink two ``configure()`` calls out
+of date, its hook was called, and the reclaim that follows then stamped it for the grandchild's
+pid, so a sink no descendant ever acquired read ``releasable``. A ratchet, not a one-off: once a
+hook-implementing sink enters a roster, every descendant's walk finds it again.
+
+Exactly the hazard ``_lifecycle._owned`` already declares an opt-out for, reached by adding a
+second global that holds sinks. The rebind below is the belt to this brace.
+"""
+
 reacquired_in_child: list[Any] = []
 """Sinks whose re-acquisition hook returned normally in this child (SPEC-042 FR-005).
 
 Published rather than acted on, because what it means is an *ownership* claim and ownership is
 ``_lifecycle``'s: a sink that returns from the hook holds a transport of its own, so a child may
-release it. Rebound — never mutated in place — at the start of every child repair, so a second
-fork cannot inherit the first one's roster.
+release it.
+
+Rebound — never mutated in place — **before the repair walk runs**, so a second fork cannot
+inherit the first one's roster even if the opt-out above were removed. The first version of this
+claimed the rebind happened "at the start of every child repair" while doing it in the middle,
+after the walk; both halves were false and nothing tested either.
 
 This module still imports nothing but ``_diag`` (SPEC-039 FR-006); the reader registers a
 handler and reads this, which is the same inversion :data:`_child_handlers` exists for.
@@ -343,7 +361,11 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
 
 
 _REACQUIRE_HOOK = "reacquire_after_fork"
-"""The optional sink member a forked child asks to strand the parent's pending bytes.
+"""The optional sink member a forked child asks to take its transport over.
+
+Named for the larger half of what it does (SPEC-042 FR-005): stranding the parent's pending
+bytes is one consequence, and re-acquiring the transport is the step — a sink that returns from
+it has claimed the transport as this process's own, which is what makes releasing it safe.
 
 Probed by name, as ``losses()`` and ``log_foundry_stop_signal`` are, so no existing sink stops
 satisfying ``Sink`` by not having it. ``sinks/base.py`` states the contract; this is the only
@@ -511,9 +533,10 @@ def _reacquire_transports(holders: list[Any]) -> list[Any]:
             reacquired.append(holder)
         except Exception as exc:
             _diag.absorbed(
-                "discarding an inherited buffer after a fork",
+                "re-acquiring a transport after a fork",
                 exc,
-                f"{type(holder).__name__} may write the parent's pending bytes again",
+                f"{type(holder).__name__} may write the parent's pending bytes again, and this "
+                f"child will not release it",
             )
     return reacquired
 
@@ -576,12 +599,13 @@ def _reinit_after_fork() -> None:
         registers another simply causes it to run — and :func:`register_child_handler` is the
         only writer, appending only.
     """
+    global reacquired_in_child
+    reacquired_in_child = []
     buffered: list[Any] = []
     try:
         buffered = _reinit_primitives()
     except Exception as exc:
         _diag.absorbed("repairing the library after a fork", exc, "this child may block or lose")
-    global reacquired_in_child
     reacquired_in_child = _reacquire_transports(buffered)
     for handler in _child_handlers:
         try:

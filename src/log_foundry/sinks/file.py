@@ -125,7 +125,7 @@ class FileSink:
             self._stream.flush()
 
     def reacquire_after_fork(self) -> None:
-        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+        """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
 
         ``emit`` writes a whole batch into a **buffered** stream and flushes once at the end, so
         a fork landing inside it leaves both processes holding the same pending bytes and both
@@ -291,7 +291,7 @@ class RotatingFileSink:
             self._stream.flush()
 
     def reacquire_after_fork(self) -> None:
-        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+        """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
 
         Identical to :meth:`FileSink.reacquire_after_fork` and measured on this class
         too, because the window is the same one: a whole batch written into a buffered stream
