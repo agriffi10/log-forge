@@ -101,12 +101,13 @@ class Sink(Protocol):
     **Which sinks are actually asked is narrower than "whichever define it", and the boundary is
     the same one every fork repair has.** The child's repair walks this package's own objects —
     a sink whose class is defined here or **inherits** one that is, ``Sink`` included, and the
-    sinks such an object holds, ``MultiSink``'s children among them. A third-party sink
-    satisfying this Protocol *structurally*, which is how all 34 shipped sinks satisfy it, is
-    outside that walk exactly as its locks are (SPEC-039 FR-005): its hook is never called, and
-    a fork mid-batch there can still duplicate. Inheriting from ``Sink`` or from a shipped sink
-    is what brings it inside. A **wrapper** sink the walk enters need do nothing, because the
-    sinks it holds are reached directly rather than through it.
+    **owned** sinks such an object holds, ``MultiSink``'s children among them. A third-party
+    sink satisfying this Protocol *structurally*, which is how every shipped sink satisfies it,
+    is outside that walk exactly as its locks are (SPEC-039 FR-005): its hook is never called,
+    and a fork mid-batch there can still duplicate — including when a wrapper this library owns
+    is holding it. Inheriting from ``Sink`` or from a shipped sink is what brings it inside. A
+    **wrapper** sink the walk enters need do nothing itself, because the owned sinks it holds
+    are reached directly rather than through it.
 
     **It runs in a child that has not yet returned from ``fork``, on that child's only thread,
     and must not block.** Nothing else is running there, so there is no holder a lock could be

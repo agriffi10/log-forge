@@ -2314,6 +2314,13 @@ def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) 
     which is exactly the state SPEC-035's predicate roster was built for, after three reviewers
     each named a different unenforced ordering site and a fourth shipped anyway. The probe
     records what it saw rather than asserting in the child, as the locks' order test does.
+
+    **The probe is registered first, and appending it is what this test was doing wrong.**
+    ``decorator``'s rebuild is the only other handler and is the one the contract is about, so a
+    probe on the end reads "the discard ran before the *last* handler" — green against a discard
+    slid to just after that rebuild, which is verbatim the hazard the contract names: a live
+    drain thread emitting into a sink whose buffer is still the parent's. From position 0 the
+    same mutant reports ``still-the-parents``.
     """
     sink, stream, _path = _buffered_sink(tmp_path, "file", name="ordering.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
@@ -2325,7 +2332,7 @@ def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) 
     def probe() -> None:
         seen.append("discarded" if sink._stream is not inherited else "still-the-parents")
 
-    _fork.register_child_handler(probe)
+    _fork._child_handlers.insert(0, probe)
     try:
         child = run_in_child(lambda: ",".join(seen), timeout=6)
     finally:
@@ -2660,11 +2667,18 @@ def test_the_hook_is_documented_where_an_implementer_reads_the_contract() -> Non
     A third-party sink owning a buffered stream has no other way to learn that the member
     exists, that it runs in a child that has not returned from ``fork``, or that blocking there
     produces a process no watchdog can end.
+
+    The **boundary** clause is asserted alongside them, because it is the one a reader acts on
+    and the one that was wrong: the first version of this paragraph said a sink defining the
+    hook is asked, and a review measured a structurally-satisfying third-party sink — which is
+    how every shipped sink satisfies this Protocol — being asked zero times. A claim about who
+    is *not* reached can be deleted with every other assertion here still green.
     """
     documented = " ".join((Sink.__doc__ or "").split())
     assert "discard_buffered_after_fork" in documented
     assert "must not block" in documented
     assert "SPEC-039 FR-004" in documented
+    assert "its hook is never called" in documented
 
 
 _DISCARD_HOOK = "discard_buffered_after_fork"
