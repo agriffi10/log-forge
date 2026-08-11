@@ -121,6 +121,13 @@ walk yields it from the container and then declines to enter it — measured). T
 in prior work 6. Two mechanisms with a shared blind spot are worse than one whose coverage a reader
 can state, so the mark is gone and the stamp reaches the whole graph.
 
+`_lifecycle` owns the record and therefore the walk, and it reuses `_fork`'s descent predicates
+rather than duplicating them — so this spec takes a **second** stated import arrow,
+`_lifecycle → _fork`. That is the permitted direction and it is precedented: `decorator` already
+imports `_fork`, and the inverted registry exists to stop `_fork` importing *them*, not the
+reverse. The sink-shape test stays on the `_lifecycle` side, where `Sink` is already imported and
+where `_fork`'s rule that it imports nothing but `_diag` is therefore untouched.
+
 Reaching the graph is a **descent** question, not an ownership one, and the distinction is what
 keeps this inside SPEC-039's boundary: the walk enters library objects and plain containers as it
 always has, and *records* any sink-shaped member it encounters even when it will not descend into
@@ -130,6 +137,10 @@ state" (SPEC-039 FR-003 AC-2) forbids mutating and traversing a foreign object, 
 
 Three properties, each load-bearing:
 
+- **Taken before the sink is published.** `configure()` assigns `_config.sink` and only then
+  installs it, so a stamp written after the assignment leaves a window in which a concurrent
+  orphan `info()` reaches an unrecorded sink — and a process exiting inside that window leaks it
+  at `atexit`. Narrow, on the safe side, and free to remove by ordering.
 - **Write-once per object.** `configure()` never overwrites a stamp naming another process; only
   FR-005's re-acquisition may re-stamp. That stops a child claiming an inherited sink by
   configuring its way back to it, and makes the answer survive a second fork.
@@ -164,15 +175,21 @@ Three properties, each load-bearing:
 - [ ] AC-9: The one blind spot is stated in the module docstring rather than left to be discovered:
       a sink the library was never handed carries no stamp, so it is refused — safe here, and the
       reason a wrapper mutated after `configure()` leaks.
-- [ ] AC-10: The stamp walk's cost is **measured and stated**, on the shape that makes it worst —
-      a sink holding caller data, as SPEC-039 measured 202 ms for a `MemorySink` with 100k events.
-      It runs once per `configure()` rather than per fork or per event, and if the number argues
-      for bounding the descent, that bound is chosen with the measurement in hand rather than
-      guessed.
-- [ ] AC-11: `_ensure_sink()` runs **under `decorator._worker_lock`** on the orphan path
-      (`config.py`), so the record takes its own lock and the order is stated and pinned:
-      `_worker_lock` → record lock, never the reverse. The repo's lock-ordering history is what
-      makes this an AC rather than a note.
+- [ ] AC-10: **The stamp is taken only where a sink is newly installed** — `configure(sink=…)` and
+      `_ensure_sink()`'s *construction* branch — and **never on `_ensure_sink()`'s fast-path
+      return**, which `api._log` calls once per orphan event and which SPEC-034 FR-003 AC-6 built
+      as a single unlocked read. Stamping there would put a graph walk and a lock acquisition on a
+      per-event path. Asserted by counting: N orphan `info()` calls perform **zero** stamp walks.
+- [ ] AC-11: The stamp walk's cost is **measured and stated**, on the shape that makes it worst —
+      a sink holding caller data, as SPEC-039 measured 202 ms for a `MemorySink` with 100k events,
+      whose list and dicts this descent enters for the same reason. If the number argues for
+      bounding the descent, that bound is chosen with the measurement in hand rather than guessed.
+- [ ] AC-12: The record takes its own lock, and the order is stated and pinned — `_worker_lock` →
+      record lock, never the reverse — because `_get_worker` calls `_ensure_sink()` **while holding
+      `_worker_lock`** (`decorator.py`). The orphan path is the opposite constraint and is covered
+      by AC-10: it calls `_ensure_sink()` under **no** lock, once per event, so nothing there may
+      acquire the record lock at all. The repo's lock-ordering history is why this is a criterion
+      rather than a note.
 
 ### FR-002: One release path, and every closer in the library uses it
 
@@ -325,8 +342,10 @@ has been *published*; a pre-release is not a compatibility promise, which is the
       in place rather than rewritten — they record what shipped, and editing a completed spec to
       erase a name it shipped is the deletion SPEC-021 forbids. `architecture.md`'s live mentions
       move to the new name.
-- [ ] AC-3: A sink that implements it and returns normally is **releasable** by the child; one that
-      does not implement it is not. Both directions have a test.
+- [ ] AC-3: **Of a sink the child inherited**, one that implements the hook and returns normally is
+      **releasable** there and one that does not is not. Both directions have a test, and both are
+      scoped to an inherited sink: a sink the child constructed itself is releasable with no hook
+      at all (FR-001 AC-3), so an unscoped reading of this criterion asserts the opposite.
 - [ ] AC-4: A hook that **raises** leaves the sink unreleasable, so a failed re-acquisition cannot
       make a destructive close look safe. SPEC-039 already absorbs the exception; this pins what
       the absorption means for ownership.
@@ -335,8 +354,14 @@ has been *published*; a pre-release is not a compatibility promise, which is the
 - [ ] AC-6: `FileSink` and `RotatingFileSink` need no behavioural change, only the rename; a test
       asserts the child's descriptor differs from the parent's, which is the claim the rename makes
       explicit.
-- [ ] AC-7: The ordering is stated where SPEC-039 states its own: the marks and stamps are in place
-      before any registered handler runs, since a handler may reach a release path.
+- [ ] AC-7: The ordering is stated where SPEC-039 states its own: the stamps are in place before
+      any registered handler runs, since a handler may reach a release path.
+- [ ] AC-8: **Re-acquisition re-stamps the sink that re-acquired, and nothing above it.** A child
+      inheriting `MultiSink(FileSink, FileSink)` re-stamps the two children — only they implement
+      the hook — while the wrapper keeps the parent's stamp and stays refused, which leaves the
+      re-acquired children reachable only through a wrapper nothing will release. That is a leak
+      and nothing is lost (`emit` flushes per batch), but it is stated rather than discovered:
+      FR-005 AC-6's descriptor test uses a bare `FileSink` and passes while this stands.
 
 ### FR-006: The boundary docs follow the behaviour, and the residual is handed on accurately
 
@@ -368,7 +393,12 @@ committing there writes into a transaction the parent may be mid-way through.
 - [ ] AC-5: The residual is recorded in §13 with the **measured** roster (Kafka, Pub/Sub, NATS,
       SQLite, Postgres) and what each loses, and **SPEC-036 is handed the widened roster on its own
       end** — its flush-hook roster names two of the five today.
-- [ ] AC-6: The third-party-wrapper hole is recorded in §13: a user's wrapper closes its children
+- [ ] AC-6: The two leaks default-refuse accepts are recorded in §13 beside the residual roster: a
+      sink the library was never handed (a wrapper mutated after `configure()` — no shipped sink
+      does this, an AST scan of `sinks/` finds no sink-typed assignment to `self.<attr>` outside
+      `__init__`), and a re-acquired child under a refused wrapper (FR-005 AC-8). Both cost a
+      handle in an exiting process and neither loses an event.
+- [ ] AC-7: The third-party-wrapper hole is recorded in §13: a user's wrapper closes its children
       directly and the library never sees the call, so the refusal cannot reach it. The remedy is
       the same one §9 already gives.
 
