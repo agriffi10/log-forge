@@ -124,7 +124,7 @@ class FileSink:
                 self._stream.write(json.dumps(event) + "\n")
             self._stream.flush()
 
-    def discard_buffered_after_fork(self) -> None:
+    def reacquire_after_fork(self) -> None:
         """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
 
         ``emit`` writes a whole batch into a **buffered** stream and flushes once at the end, so
@@ -290,10 +290,10 @@ class RotatingFileSink:
                 self._size += data
             self._stream.flush()
 
-    def discard_buffered_after_fork(self) -> None:
+    def reacquire_after_fork(self) -> None:
         """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
 
-        Identical to :meth:`FileSink.discard_buffered_after_fork` and measured on this class
+        Identical to :meth:`FileSink.reacquire_after_fork` and measured on this class
         too, because the window is the same one: a whole batch written into a buffered stream
         and flushed once at the end.
 

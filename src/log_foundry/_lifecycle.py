@@ -395,6 +395,37 @@ def _mark_inherited() -> None:
     with _owned_lock:
         for inherited in found:
             _owned.setdefault(id(inherited), (_FOREIGN, inherited))
+    for reacquired in _fork.reacquired_in_child:
+        reclaim(reacquired)
+
+
+def reclaim(sink: object) -> None:
+    """Records that a sink re-acquired its transport in this process (SPEC-042 FR-005).
+
+    The one write that **overrides** an existing record, and it has to be: :func:`_mark_inherited`
+    has already stamped everything inherited ``_FOREIGN`` by the time the hook roster is read, so
+    a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
+    forever.
+
+    **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
+    inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement
+    the hook — while the wrapper keeps the parent's mark and stays refused, which leaves the
+    re-acquired children reachable only through a wrapper nothing will release. That is a leak
+    and loses nothing, since ``FileSink.emit`` flushes at the end of every batch, but it is
+    stated rather than discovered.
+
+    Args:
+      sink: The sink whose hook returned normally.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    pid = os.getpid()
+    with _owned_lock:
+        _owned[id(sink)] = (pid, sink)
 
 
 def stamp(sink: object) -> None:

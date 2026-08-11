@@ -90,13 +90,23 @@ class Sink(Protocol):
     accident, and the cost is one verbose attribute on the sinks that want interruptibility.
 
     A fifth is optional in the same way and exists for one event only:
-    ``discard_buffered_after_fork() -> None``. A sink that owns a **buffered** stream — one it
+    ``reacquire_after_fork() -> None``. A sink that owns a **buffered** stream — one it
     opened itself, rather than the process's ``sys.stdout`` — inherits the parent's unflushed
-    bytes in a forked child, and both processes then write them (SPEC-039 FR-004). Defining this
-    method is how a sink says it can strand what it inherited; a sink holding no buffer of its
-    own needs nothing here. It is *called* rather than assigned, which is why it carries no
-    ``log_foundry_`` prefix: the collision the fourth member's name guards against is an
-    attribute the library writes onto an object it does not own.
+    bytes in a forked child, and both processes then write them (SPEC-039 FR-004). It is
+    *called* rather than assigned, which is why it carries no ``log_foundry_`` prefix: the
+    collision the fourth member's name guards against is an attribute the library writes onto an
+    object it does not own.
+
+    **The contract has two halves and the name says the larger one** (SPEC-042 FR-005). Strand
+    what you inherited — the parent's pending bytes are not yours to write — *and*, by returning
+    normally, **claim the transport as this process's own**. ``FileSink`` satisfies both in one
+    step, because reopening the path is what strands the buffer: measured, parent and child then
+    hold different descriptors. That second half is what the library acts on, so a sink that
+    merely dropped a buffer without re-acquiring would satisfy a name describing only the
+    discard — which this member carried until SPEC-042 — while making a destructive close look
+    safe. A sink that
+    does **not** implement this keeps whatever it inherited, so a child will not release it; one
+    that raises is treated the same way, since a failed re-acquisition is not a claim.
 
     **Which sinks are actually asked is narrower than "whichever define it", and the boundary is
     the same one every fork repair has.** The child's repair walks this package's own objects —

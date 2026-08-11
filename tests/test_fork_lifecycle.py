@@ -2282,16 +2282,16 @@ def test_the_same_child_duplicates_when_the_discard_is_taken_away(
     decorator._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
 
-    original = _fork._discard_buffers
+    original = _fork._reacquire_transports
 
     def keep_the_parents_buffer(holders: list[Any]) -> None:
         pass
 
-    _fork._discard_buffers = keep_the_parents_buffer  # type: ignore[assignment]
+    _fork._reacquire_transports = keep_the_parents_buffer  # type: ignore[assignment]
     try:
         child = run_in_child(_log_in_child, timeout=6)
     finally:
-        _fork._discard_buffers = original  # type: ignore[assignment]
+        _fork._reacquire_transports = original  # type: ignore[assignment]
         gate.release.set()
 
     assert child.output == "logged", child.output
@@ -2355,7 +2355,7 @@ def test_the_reopened_stream_keeps_the_encoding_it_was_given(tmp_path: pathlib.P
     sink = FileSink(str(path), encoding="utf-16")
     try:
         sink.emit([{"msg": "before"}])
-        sink.discard_buffered_after_fork()
+        sink.reacquire_after_fork()
         sink.emit([{"msg": "after"}])
     finally:
         sink.close()
@@ -2388,7 +2388,7 @@ def test_a_hostile_attribute_read_does_not_abort_the_lock_repair(tmp_path: pathl
 
     class _Hostile(MemorySink):
         def __getattr__(self, name: str) -> Any:
-            if name == "discard_buffered_after_fork":
+            if name == "reacquire_after_fork":
                 raise RuntimeError("this attribute is not yours to ask about")
             raise AttributeError(name)
 
@@ -2431,7 +2431,7 @@ def test_a_member_of_that_name_which_is_not_callable_is_not_the_hook(
     class _NotAHook(FileSink):
         pass
 
-    _NotAHook.discard_buffered_after_fork = value  # type: ignore[assignment]
+    _NotAHook.reacquire_after_fork = value  # type: ignore[assignment]
     sink = _NotAHook(str(tmp_path / "notahook.ndjson"))
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
 
@@ -2509,10 +2509,10 @@ def test_discarding_a_buffer_leaks_no_descriptor(tmp_path: pathlib.Path) -> None
     """
     sink = FileSink(str(tmp_path / "descriptors.ndjson"))
     try:
-        sink.discard_buffered_after_fork()
+        sink.reacquire_after_fork()
         before = _open_descriptors()
         for _ in range(20):
-            sink.discard_buffered_after_fork()
+            sink.reacquire_after_fork()
         assert _open_descriptors() == before, "the discard leaked a descriptor per call"
     finally:
         sink.close()
@@ -2529,7 +2529,7 @@ def test_a_closed_sink_is_asked_for_nothing(tmp_path: pathlib.Path, build: type)
     """
     sink = build(str(tmp_path / "closed.ndjson"))
     sink.close()
-    sink.discard_buffered_after_fork()
+    sink.reacquire_after_fork()
 
 
 def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
@@ -2545,7 +2545,7 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
     """
 
     class _RaisesOnDiscard(FileSink):
-        def discard_buffered_after_fork(self) -> None:
+        def reacquire_after_fork(self) -> None:
             raise RuntimeError("a-value-from-the-event-4321")
 
     class _RecordsItRan(FileSink):
@@ -2553,7 +2553,7 @@ def test_one_hooks_failure_is_absorbed_and_does_not_stop_the_others(
             super().__init__(path)
             self.ran: list[str] = []
 
-        def discard_buffered_after_fork(self) -> None:
+        def reacquire_after_fork(self) -> None:
             self.ran.append("yes")
 
     raising = _RaisesOnDiscard(str(tmp_path / "raising.ndjson"))
@@ -2675,13 +2675,13 @@ def test_the_hook_is_documented_where_an_implementer_reads_the_contract() -> Non
     is *not* reached can be deleted with every other assertion here still green.
     """
     documented = " ".join((Sink.__doc__ or "").split())
-    assert "discard_buffered_after_fork" in documented
+    assert "reacquire_after_fork" in documented
     assert "must not block" in documented
     assert "SPEC-039 FR-004" in documented
     assert "its hook is never called" in documented
 
 
-_DISCARD_HOOK = "discard_buffered_after_fork"
+_REACQUIRE_HOOK = "reacquire_after_fork"
 
 
 def _opens_a_stream_into_self(cls: ast.ClassDef) -> bool:
@@ -2754,7 +2754,7 @@ def _has_the_discard_hook(cls: ast.ClassDef, nodes: dict[str, ast.ClassDef]) -> 
         current = queue.pop()
         if any(
             isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
-            and member.name == _DISCARD_HOOK
+            and member.name == _REACQUIRE_HOOK
             for member in current.body
         ):
             return True
@@ -2814,7 +2814,7 @@ def test_every_sink_that_owns_a_buffered_stream_discards_it_after_a_fork() -> No
     missing = _sinks_missing_the_discard_hook(roster)
     assert not missing, (
         "these sinks open a buffered stream of their own but cannot discard what a fork leaves "
-        f"pending in it — implement {_DISCARD_HOOK}(): {missing}"
+        f"pending in it — implement {_REACQUIRE_HOOK}(): {missing}"
     )
 
 
@@ -2857,7 +2857,7 @@ def test_the_buffer_lint_reads_the_shapes_it_claims_to() -> None:
         "FixedSink",
         '    def __init__(self, path):\n        self._stream = open(path, "a")\n'
         "    def emit(self, batch): ...\n"
-        f"    def {_DISCARD_HOOK}(self): ...\n",
+        f"    def {_REACQUIRE_HOOK}(self): ...\n",
     )
     inheriting = _synthetic_sink(
         "InheritingSink",

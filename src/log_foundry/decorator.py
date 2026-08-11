@@ -12,7 +12,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from log_foundry import _diag, _fork, _lifecycle, context
-from log_foundry.config import _ensure_sink
+from log_foundry.config import _ensure_sink, _live_config
 from log_foundry.ids import (
     is_valid_span_id,
     is_valid_trace_id,
@@ -728,6 +728,37 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         return FlushResult(ok=False, reason="thread-died")
 
 
+def _delivering_to_an_inherited_sink() -> bool:
+    """Whether the sink this process would deliver to now is one it may not release (FR-004).
+
+    Answerable with **no worker**, which is what makes it truthful in a process that only ever
+    logs outside a span — the same refusal :func:`_worker_health` already makes for ``retired``,
+    and for the same reason: standing up a thread to answer ``health()`` is forbidden.
+
+    The three candidates are asked in delivery order, because SPEC-033 measured them
+    disagreeing: the worker's sink if a worker exists, else the sink an orphan emit reached,
+    else the configured one. With no sink resolved at all there is nothing to deliver to and
+    nothing inherited, so the answer is ``False`` rather than a guess.
+
+    Args:
+      None.
+
+    Returns:
+      Whether that one sink carries another process's ownership record.
+
+    Raises:
+      None. ``health()`` is a diagnostic and must not be the reason a caller fails; an
+        unanswerable question reports ``False``, the same direction as a process that never
+        forked.
+    """
+    try:
+        worker = _worker
+        sink = worker.sink if worker is not None else (_orphan_sink or _live_config().sink)
+        return sink is not None and not _lifecycle.releasable(sink)
+    except Exception:
+        return False
+
+
 def _worker_health() -> Health:
     """Snapshots the process worker's counters, or zeros if none was ever created.
 
@@ -772,6 +803,7 @@ def _worker_health() -> Health:
             failed_batches=0,
             retired=_orphan_retired,
             closing_sinks=_lifecycle.closing_count(),
+            inherited_sink=_delivering_to_an_inherited_sink(),
         )
     health = worker.health()
     if _orphan_retired and not health.retired:

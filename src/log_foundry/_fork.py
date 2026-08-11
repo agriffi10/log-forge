@@ -37,6 +37,18 @@ and all three would have to import this module for it to reach them; instead the
 it, so this module imports nothing that imports it and there is no cycle to break later.
 """
 
+reacquired_in_child: list[Any] = []
+"""Sinks whose re-acquisition hook returned normally in this child (SPEC-042 FR-005).
+
+Published rather than acted on, because what it means is an *ownership* claim and ownership is
+``_lifecycle``'s: a sink that returns from the hook holds a transport of its own, so a child may
+release it. Rebound — never mutated in place — at the start of every child repair, so a second
+fork cannot inherit the first one's roster.
+
+This module still imports nothing but ``_diag`` (SPEC-039 FR-006); the reader registers a
+handler and reads this, which is the same inversion :data:`_child_handlers` exists for.
+"""
+
 _installed = False
 """Whether :func:`install` has already registered the child handler in this process.
 
@@ -330,7 +342,7 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
     return fresh
 
 
-_DISCARD_HOOK = "discard_buffered_after_fork"
+_REACQUIRE_HOOK = "reacquire_after_fork"
 """The optional sink member a forked child asks to strand the parent's pending bytes.
 
 Probed by name, as ``losses()`` and ``log_foundry_stop_signal`` are, so no existing sink stops
@@ -339,7 +351,7 @@ place the name is read.
 """
 
 
-def _offers_discard(holder: object) -> bool:
+def _offers_reacquire(holder: object) -> bool:
     """Whether this object carries FR-004's buffer hook, without letting the question raise.
 
     Every other read the walk makes is guarded individually, and this one has to be too: an
@@ -361,7 +373,7 @@ def _offers_discard(holder: object) -> bool:
       None.
     """
     try:
-        return callable(getattr(holder, _DISCARD_HOOK, None))
+        return callable(getattr(holder, _REACQUIRE_HOOK, None))
     except Exception:
         return False
 
@@ -428,7 +440,7 @@ def _reinit_primitives() -> list[Any]:
       None.
 
     Returns:
-      The owned instances carrying :data:`_DISCARD_HOOK`, in the order the walk reached them.
+      The owned instances carrying :data:`_REACQUIRE_HOOK`, in the order the walk reached them.
 
     Raises:
       None.
@@ -452,7 +464,7 @@ def _reinit_primitives() -> list[Any]:
         if not isinstance(holder, types.ModuleType | type):
             if not _is_owned(holder):
                 continue
-            if _offers_discard(holder):
+            if _offers_reacquire(holder):
                 buffered.append(holder)
         skip = _skipped_names(holder)
         for name, value in _namespace_items(holder):
@@ -466,19 +478,25 @@ def _reinit_primitives() -> list[Any]:
     return buffered
 
 
-def _discard_buffers(holders: list[Any]) -> None:
-    """Asks each sink that owns a buffered stream to strand what it inherited (FR-004).
+def _reacquire_transports(holders: list[Any]) -> list[Any]:
+    """Asks each sink that owns a buffered stream to re-acquire it in this child (FR-004).
 
     A fork landing inside ``emit`` — after the write loop, before the flush — leaves the child
     holding the parent's unflushed bytes, which both processes then write: measured, the event
     at the fork point appeared on disk twice. Without a ``before`` handler there is nowhere to
-    empty the buffer from (FR-001), so the child throws its copy away instead.
+    empty the buffer from (FR-001), so the child re-opens instead, which strands the copy.
+
+    **Which hooks returned normally is published rather than acted on** (SPEC-042 FR-005). A
+    sink that returns from the hook has claimed the transport as this process's own, which is an
+    ownership fact — but ownership lives in ``_lifecycle``, and this module imports nothing but
+    ``_diag``. So the roster is handed back and the handler ``_lifecycle`` registers re-stamps
+    it.
 
     Args:
       holders: What :func:`_reinit_primitives` collected on its walk.
 
     Returns:
-      None.
+      The holders whose hook returned normally, in the order they were called.
 
     Raises:
       None. One sink's failure is absorbed separately from the rest, so a hook that cannot
@@ -486,15 +504,18 @@ def _discard_buffers(holders: list[Any]) -> None:
         sink its repair — and the consequence is named, because an absorbed failure is
         invisible apart from that line.
     """
+    reacquired: list[Any] = []
     for holder in holders:
         try:
-            getattr(holder, _DISCARD_HOOK)()
+            getattr(holder, _REACQUIRE_HOOK)()
+            reacquired.append(holder)
         except Exception as exc:
             _diag.absorbed(
                 "discarding an inherited buffer after a fork",
                 exc,
                 f"{type(holder).__name__} may write the parent's pending bytes again",
             )
+    return reacquired
 
 
 def register_child_handler(fn: Callable[[], None]) -> None:
@@ -560,7 +581,8 @@ def _reinit_after_fork() -> None:
         buffered = _reinit_primitives()
     except Exception as exc:
         _diag.absorbed("repairing the library after a fork", exc, "this child may block or lose")
-    _discard_buffers(buffered)
+    global reacquired_in_child
+    reacquired_in_child = _reacquire_transports(buffered)
     for handler in _child_handlers:
         try:
             handler()

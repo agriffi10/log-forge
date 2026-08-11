@@ -355,7 +355,7 @@ class Sink(Protocol):
     # optional, each probed by name — never required, so no sink stops satisfying this:
     # def losses(self) -> SinkLosses | None: ...      # cumulative loss absorbed (SPEC-026)
     # log_foundry_stop_signal: threading.Event | None # interruptible backoff (SPEC-027)
-    # def discard_buffered_after_fork(self) -> None:  # strand a forked child's inherited
+    # def reacquire_after_fork(self) -> None:  # strand a forked child's inherited
     #                                                 # buffer (SPEC-039)
 ```
 
@@ -503,7 +503,7 @@ decorated call ends
   2. **Discard inherited buffered writes.** A fork landing inside `emit`, after the write loop
      and before the flush, leaves both processes holding the same pending bytes; the child
      strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
-     optional `discard_buffered_after_fork()` hook `sinks/base.py` documents (§8).
+     optional `reacquire_after_fork()` hook `sinks/base.py` documents (§8).
   3. **Run the registered handlers**, `decorator`'s worker rebuild among them. The worker is
      rebuilt **in place** with a fresh queue and zeroed counters, so ownership guards keyed on
      `_worker.sink is X` survive; a retired parent forks a retired child, since a fork does not
@@ -1018,7 +1018,7 @@ constraint — never by being deleted quietly.
     batch and `GooglePubSubSink` holds unresolved futures, so a fork mid-batch there can still
     duplicate what the parent had queued or strand it in a child that never resolves it. This is
     a *different* hazard from the shared handle below — that one is the caller's object, this is
-    a buffer nobody in this process can address — and the `discard_buffered_after_fork()` hook
+    a buffer nobody in this process can address — and the `reacquire_after_fork()` hook
     cannot help, because there is no descriptor to redirect.
   - **`StdoutSink` carries the file sinks' duplication hazard and is deliberately not fixed.**
     It flushes once per batch exactly as they do, so the window is identical — but `sys.stdout`

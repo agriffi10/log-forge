@@ -769,6 +769,7 @@ def test_health_gains_no_field() -> None:
         "submitted_after_shutdown",
         "incomplete_swaps",
         "closing_sinks",
+        "inherited_sink",
     ]
 
 
