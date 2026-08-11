@@ -15,23 +15,29 @@
 - **`_fork._SKIP_ATTRIBUTE`** — a general opt-out a module declares for state that holds objects
   but is not live state to repair. `_lifecycle._owned` and `_fork.reacquired_in_child` use it.
 
-**Four deviations from the spec, each on measured evidence:**
+**One deviation, two clarifications and a choice the spec left open** — the distinction matters,
+because only the first changes what a criterion asked for:
 
-1. **FR-001's "no record means refused" became a wrapper-inheritance rule** (escalated and
-   approved). Every lifecycle path stamps, so the flat default only ever fired where a *user*
-   closed a wrapper the library never saw — silently no-op'ing `FilteringSink(inner).close()`,
-   a documented public API. An unrecorded sink now inherits the answer from the wrapper
-   releasing it: neither recorded → the caller's, so close; a recorded wrapper may not release
-   an unrecorded member, which keeps FR-001 AC-6.
-2. **FR-002 AC-1's discriminator needs a defines-or-inherits-`emit` clause.** The roster it
+1. *The deviation.* **FR-001's "no record means refused" became a wrapper-inheritance rule**
+   (escalated to the maintainer and approved before implementing). FR-001's Description and Data
+   Model still state the original rule; they are left as written and annotated in the spec,
+   since what shipped is recorded here and in `architecture.md` §9.
+   Every lifecycle path stamps, so the flat default only ever fired where a *user* closed a
+   wrapper the library never saw — silently no-op'ing `FilteringSink(inner).close()`, a
+   documented public API. An unrecorded sink now inherits the answer from the wrapper releasing
+   it: neither recorded → the caller's, so close; a recorded wrapper may not release an
+   unrecorded member, which keeps FR-001 AC-6.
+2. *Clarification.* **FR-002 AC-1's discriminator needs a defines-or-inherits-`emit` clause.** The roster it
    reuses triggers on `emit`/`send_all`/`close`, so it contains `SocketTransport`; without the
    clause the lint claims two socket closes and the roster is ten, not eight.
-3. **FR-001 AC-12's lock order is three terms**: `_worker_lock` → `_config_lock` → `_owned_lock`.
-   `_get_worker` holds the first across `_ensure_sink()`.
-4. **FR-001 AC-11's bound was needed and is larger than anticipated.** Measured 1,109 ms naive
-   on a 100k-event `MemorySink` (the criterion expected ~202 ms), 279 ms with an exact-type
-   builtin pre-filter, 2 ms with the container descent bounded to one level. `_mark_inherited`
-   measures separately: 0.0 / 0.3 / 117 ms.
+3. *Clarification.* **FR-001 AC-12's lock order is three terms**, not two:
+   `_worker_lock` → `_config_lock` → `_owned_lock`, because `_get_worker` holds the first across
+   `_ensure_sink()`. AC-12's version is true and skips the middle term.
+4. *A choice AC-11 left open, settled with the measurement it asked for.* Not a deviation — the
+   criterion says the bound "is chosen with the measurement in hand rather than guessed". The
+   number was larger than it anticipated: 1,109 ms naive on a 100k-event `MemorySink` against the
+   ~202 ms cited, 279 ms with an exact-type builtin pre-filter, 2 ms with the container descent
+   bounded to one level. `_mark_inherited` measures separately: 0.0 / 0.3 / 117 ms.
 
 ## What changed from earlier specs?
 
@@ -54,7 +60,8 @@ four PRs (#158–#161); no existing test's assertions changed except three invar
 purpose. Every fix was mutation-tested, which mattered: **five separate assertions were caught
 passing against the defect they named**, including two that survived the entire suite.
 
-Five review rounds found 2, 4, 4, 1 and 0 blocking defects. The one worth recording: after
+Eight review rounds across the four PRs found 2, 0, 4, 4, 0, 1, 0 and 1 blocking defects. The
+one worth recording: after
 phase 2 first landed, *unrecorded* was a **claimable** state rather than a terminal one —
 `setdefault` defends only a record that already exists, so a child could `configure()` its way
 into genuine ownership of a sink the parent never recorded and close the parent's transport

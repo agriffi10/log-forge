@@ -317,9 +317,11 @@ SPEC-039 exists for — one worker's routine startup could take down the transpo
 worker logs through. SPEC-039 documented its way around it ("do not build a connection-holding
 sink before the fork"); that advice is now the recommendation rather than an "or else". Four PRs:
 one release path → the record and the refusal → the hook's contract and `Health.inherited_sink` →
-the docs. Five review rounds found 2, 4, 4, 1 and 0 blocking defects, and **five separate
-assertions were caught passing against the defect they named**, two of which survived the whole
-suite.
+the docs. Eight review rounds found 2, 0, 4, 4, 0, 1, 0 and 1 blocking defects, and **five
+separate assertions were caught passing against the defect they named**, two of which survived
+the whole suite. One residual is recorded rather than fixed and is undecidable inside FR-001's
+rule: a parent that builds a connection sink in application state and never hands it over, whose
+child is then the first process to `configure()` it.
 
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 

@@ -537,8 +537,14 @@ decorated call ends
   The deployment advice survives as the **recommendation** rather than as an "or else": build a
   connection-holding sink in the worker process. Call `configure()` from gunicorn's `post_fork`
   rather than at preload, or give the master a sink whose `close()` costs nothing to share.
-  `README.md` says the same where a user deploying prefork will find it. Reconfiguring in the
-  child is no longer harmful; it is simply one process fewer sharing a connection. Third-party state is out of scope by construction — a driver's locks, threads
+  `README.md` says the same where a user deploying prefork will find it.
+
+  Reconfiguring in the child is no longer harmful **for a sink the library was handed in this
+  process** — the child refuses it, and the swap is one process fewer sharing a connection. The
+  qualifier is load-bearing: a master that *builds* a connection sink and never configures it
+  leaves the child as the first process to hand it over, so the child acquires it legitimately
+  and closes it. That is §13's first residual and the reason the advice above is still the
+  advice. Third-party state is out of scope by construction — a driver's locks, threads
   and descriptors are not the library's to swap, and reaching into them would be a fork fix
   that breaks a driver (§13).
 
@@ -1150,12 +1156,14 @@ constraint — never by being deleted quietly.
   the old sink to `_lifecycle.release(..., detached=True)` with neither drain. A process that only ever logged
   outside a span takes the second, so "there is no worker here" is not an escape.
 
-  §9's remedy stayed "do not build a connection-holding sink before the fork" rather than
-  "rebuild it in the child" *because* the obvious phrasing of the advice performed the damage
-  sooner and more completely than the hazard it avoided. **That is no longer true** — SPEC-042
-  made reconfiguring in the child harmless — so the advice survives as the better deployment
-  rather than as an "or else". Whether the library should **disown** an inherited sink in the
-  child was **SPEC-042**, which settled it on the
+  §9's remedy stayed "build a connection-holding sink in the worker process" rather than "rebuild
+  it in the child" *because* the obvious phrasing of the advice performed the damage sooner and
+  more completely than the hazard it avoided. **That is no longer true of a sink the library was
+  handed here** — SPEC-042 makes the child refuse it — so the advice survives as the better
+  deployment rather than as an "or else". It is still an "or else" for the one case the record
+  cannot decide, which is residual #1 above: a sink the parent built and never configured.
+  Whether the library should **disown** an inherited sink in the child was **SPEC-042**, which
+  settled it on the
   distinction this record could not draw: a child may release only a transport it acquired **in
   this process** — by being handed the sink here, or by re-acquiring it through FR-004's hook,
   which after the reopen is exactly what the file sinks did and what a connection sink did not

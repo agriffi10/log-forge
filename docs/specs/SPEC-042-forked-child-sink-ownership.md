@@ -147,6 +147,14 @@ Three properties, each load-bearing:
 - **No record means refused.** The default is the whole point of the spec: every gap must fail
   toward the leak, never toward the destructive close. A sink the library was never handed was
   never its to release.
+  **Amended in delivery, escalated and approved:** every *lifecycle* path stamps, so this flat
+  default only ever fired where a **user** closed a wrapper the library had never been handed —
+  silently turning `FilteringSink(inner).close()` into a no-op, which is the failure mode this
+  arc exists to remove. What shipped: an unrecorded sink inherits the answer from the wrapper
+  releasing it, so neither-recorded is the caller's own graph and closes, while a *recorded*
+  wrapper may not release an unrecorded member (which keeps AC-6). What makes the relaxation
+  safe is that a forked child marks everything it inherited **before any handler runs**, so
+  "unrecorded" is unclaimable there rather than merely unreleasable. See the delivery doc.
 - **A strong reference beside the id**, since an id is reusable once its object dies, and a
   garbage-collected sink closes itself — the same destructive close by another route.
   `_fork._fresh_primitive` already uses that pairing for the same reason.
