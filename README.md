@@ -491,18 +491,26 @@ A few conventions hold across every sink below:
   open for you to manage.
 - **Forking.** A forked child repairs the library automatically — it rebuilds the worker so it keeps
   delivering, re-initialises every lock (without which the child's *first* log call can deadlock),
-  and throws away any buffered bytes it inherited so they are not written twice. What it does **not**
-  do is give the child a sink of its own: the child inherits the same object, so one socket, one
-  SQLite handle or one file is now written by two processes — and *closed* by both, each at its own
-  exit. That is fine for an append-only file or a queue client and wrong for a connection with
-  transaction scope, where a close is protocol-visible. **Under gunicorn, uWSGI or Celery, build a
-  connection-holding sink only in the worker process** — `configure()` from gunicorn's `post_fork`
-  hook, never under preload, and don't log from the master. Reconfiguring in the child is *not* the
-  remedy and is worse than the problem: `configure(sink=...)` closes the sink it replaces, which
-  there is the parent's live connection. A master that must log should use a sink whose `close()`
-  costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote yourself is repaired
-  only if it subclasses `Sink` or a shipped sink; one that satisfies the protocol structurally is
-  outside the repair, along with any third-party client's own locks and buffers.
+  and re-opens any buffered stream it inherited so the parent's pending bytes are not written twice.
+  What it does **not** do is give the child a sink of its own: the child inherits the same object, so
+  one socket, one SQLite handle or one file is now written by two processes. It will generally not
+  be *closed* by both — the library records which process it was handed each sink in, and a child
+  refuses to close one it inherited — but a shared connection is still a shared connection, and
+  there are two exceptions below.
+  **Under gunicorn, uWSGI or Celery, build a connection-holding sink in the worker process:**
+  `configure()` from gunicorn's `post_fork` hook rather than under preload, and don't log from the
+  master. Reconfiguring in the child is harmless **for a sink the library was handed in this
+  process** — but if the master *built* a connection sink and never called `configure()` with it,
+  a child that then does is the first process to hand it over, so it owns it and closes it at exit.
+  That is the one case the record cannot decide, and it is the case this advice avoids. A master
+  that must log should use a
+  sink whose `close()` costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote
+  yourself is repaired only if it subclasses `Sink` or a shipped sink; one that satisfies the
+  protocol structurally is outside the repair, along with any third-party client's own locks and
+  buffers. The second exception: if you subclass a shipped sink **and add a transport of your
+  own**, override `reacquire_after_fork()` — inheriting it claims the whole object on the strength
+  of re-opening only the part the parent class knows about, after which the child *will* close
+  your connection.
 - **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
   delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
