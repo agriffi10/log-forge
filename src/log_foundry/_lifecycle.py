@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import threading
 import time
+import types
+from itertools import islice
 
 from log_foundry import _diag, _fork
 from log_foundry.sinks.base import Sink
@@ -43,6 +45,25 @@ defends only a record that already exists, so a child could ``configure()`` its 
 a sink the parent never recorded and then close it entirely legitimately. Measured before this
 existed — a child claimed a connection sink held behind a third-party wrapper and closed it,
 destroying the parent's transport. Unrecorded has to be unclaimable, not merely unreleasable.
+"""
+
+_MARKING_CEILING = 100_000
+"""Objects the child's marking walk may visit before it gives up and refuses everything.
+
+**A cap is right here where SPEC-039 rejected one, and the difference is the fallback.** That
+spec declined to bound its repair walk because an unfound lock is a child that hangs with no
+safe degradation — a cap would trade a certain hazard for an uncertain one. This walk has
+:data:`_marking_failed`, built for exactly "it did not finish, so trust nothing unrecorded", so
+tripping the cap degrades to a leaked handle: the direction FR-001 requires.
+
+The exposure is also larger than that walk's. ``_reinit_primitives`` enters containers only from
+owned holders; this one enters every container reachable through arbitrary third-party objects,
+and a ``list`` subclass with a non-terminating ``__iter__`` took a child to **5.7 GB RSS in nine
+minutes**, unkillable by its parent because the parent was being starved. Exhausting memory in a
+child that has not returned from ``fork`` is worse than the leak the cap causes.
+
+Set far above any real graph — a sink's is on the order of hundreds — and above the ~24,000 the
+module escape used to reach before :func:`_mark_inherited` stopped descending into modules.
 """
 
 _marking_failed = False
@@ -114,6 +135,42 @@ def _may_be_a_sink(value: object) -> bool:
     return type(value) not in _PLAIN_TYPES
 
 
+def _bounded_children(container: object) -> list[object]:
+    """Reads at most :data:`_MARKING_CEILING` members of one container, without materialising it.
+
+    **The per-object ceiling in the walk cannot save a walk stuck inside one call**, which is
+    where ``_fork._container_children`` puts it: that helper does ``list(container)``, and a
+    ``list`` subclass with a non-terminating ``__iter__`` never returns from it. Measured — a
+    child reached 5.7 GB RSS in nine minutes and its parent's own timeout could not kill it,
+    because the parent was being starved. So the bound has to be on the *read*, not only on the
+    loop around it.
+
+    Args:
+      container: Any value ``_fork._is_container`` accepted.
+
+    Returns:
+      Its members, keys included for a mapping, truncated at the ceiling.
+
+    Raises:
+      None. A container that raises while being read contributes nothing, as it does in
+        ``_fork``; what it holds is then unmarked, therefore unrecorded, therefore refused.
+    """
+    try:
+        if isinstance(container, dict):
+            return [
+                *islice(container.keys(), _MARKING_CEILING),
+                *islice(container.values(), _MARKING_CEILING),
+            ]
+        return list(islice(container, _MARKING_CEILING))  # type: ignore[call-overload]
+    except Exception as exc:
+        _diag.absorbed(
+            "reading a container while marking a forked child's sinks",
+            exc,
+            "what it holds is not marked, so this child will refuse to close it",
+        )
+        return []
+
+
 def _reachable_sinks(root: object) -> list[object]:
     """Returns every sink reachable from one object handed to the library (FR-001).
 
@@ -150,6 +207,13 @@ def _reachable_sinks(root: object) -> list[object]:
     container branch. A plain ``tuple`` or ``list`` is not sink-shaped, so the wrapper case still
     takes the container branch as it must.
 
+    **The order is a trade, not a free win.** A value satisfying *both* tests is now pushed as a
+    holder, and this walk's holder loop has no container branch, so an owned non-sink container
+    subclass and a container-subclass sink's own members both lose reach. Neither is a
+    destructive close — ``_mark_inherited`` descends unboundedly and compensates in the child —
+    and no shipped sink holds either shape; the residual is an own-process leak, which is the
+    direction FR-001 permits, taken in exchange for closing a live silent one.
+
     Args:
       root: The object ``configure()`` or ``_ensure_sink()`` was handed.
 
@@ -177,7 +241,7 @@ def _reachable_sinks(root: object) -> list[object]:
                 stack.append(value)
             elif _fork._is_container(value):
                 stack.extend(
-                    member for member in _fork._container_children(value) if _is_candidate(member)
+                    member for member in _bounded_children(value) if _is_candidate(member)
                 )
     return found
 
@@ -284,8 +348,11 @@ def _mark_inherited() -> None:
         already absorbed one level down in ``_fork``, which returns empty and announces, so the
         common failure is a *partial* walk that raises nothing and leaves the flag clear. Sinks
         it did not reach are then unrecorded rather than marked. The outer guard is for a fault
-        in this function's own frame — resolving the roots, or a hostile metaclass answering
-        ``isinstance`` — and the partial-walk residual is recorded in §13.
+        in this function's own frame — resolving the roots, or an object whose ``__class__``
+        property raises, which makes ``isinstance`` raise here. Not a hostile *metaclass*: a
+        value's ``__instancecheck__`` is never consulted, since ``Sink``'s own ``_ProtocolMeta``
+        runs. Tripping :data:`_MARKING_CEILING` sets the flag too, by the same route and for the
+        same reason. The partial-walk residual is recorded in §13.
     """
     global _marking_failed
     try:
@@ -293,14 +360,24 @@ def _mark_inherited() -> None:
         found: list[object] = []
         stack: list[object] = _inheritance_roots()
         while stack:
+            if len(seen) >= _MARKING_CEILING:
+                _marking_failed = True
+                _diag.lost(
+                    "object",
+                    len(stack),
+                    f"the walk marking a forked child's inherited sinks passed "
+                    f"{_MARKING_CEILING} objects and stopped; this child will refuse to close "
+                    f"any sink it has no record of",
+                )
+                break
             holder = stack.pop()
-            if id(holder) in seen:
+            if id(holder) in seen or isinstance(holder, types.ModuleType):
                 continue
             seen.add(id(holder))
             if _may_be_a_sink(holder) and isinstance(holder, Sink):
                 found.append(holder)
             if _fork._is_container(holder):
-                stack.extend(_fork._container_children(holder))
+                stack.extend(_bounded_children(holder))
                 continue
             if not _may_be_a_sink(holder):
                 continue

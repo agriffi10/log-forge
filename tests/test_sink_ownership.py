@@ -17,6 +17,7 @@ from __future__ import annotations
 import gc
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -450,6 +451,85 @@ def test_a_sink_subclassing_a_builtin_container_is_still_recorded(build: object)
 
     wrapper.close()
     assert inner.closed == 1, "and its wrapper still closes it"
+
+
+def test_the_marking_walk_does_not_escape_through_a_module_reference() -> None:
+    """A sink holding a module must not send the walk through the whole interpreter.
+
+    Measured before the skip: 24,021 objects visited and 29 marked, among them nine class
+    objects and a `logging` handler -- objects the library has no business pinning for the life
+    of the child.
+
+    **The real damage was not the retention.** The escape sometimes marked the very sinks the
+    application-state residual says are unreachable, so the same scenario refused or destroyed
+    depending on whether the parent's sink class happened to keep a module reference. A residual
+    that holds by luck cannot be documented honestly, and §13 has to record this one.
+    """
+    import json
+
+    class ModuleHolding(MemorySink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.helper = json
+
+    holder = ModuleHolding()
+    log_foundry.configure(service="own", sink=holder)
+
+    def in_child() -> str:
+        with _lifecycle._owned_lock:
+            marked = sum(1 for pid, _ref in _lifecycle._owned.values() if pid == _lifecycle._FOREIGN)
+        return str(marked)
+
+    child = run_in_child(in_child)
+    assert child.output is not None
+    assert int(child.output) <= 4, (
+        f"the walk marked {child.output} objects from a sink holding one module -- it escaped "
+        "into the import graph, which is how the residual became conditional"
+    )
+
+
+def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
+    """The walk is bounded, and tripping the bound degrades the safe way.
+
+    SPEC-039 declined to bound its repair walk because an unfound lock is a hang with no safe
+    degradation. This walk has one: `_marking_failed` means "did not finish, trust nothing
+    unrecorded", so a trip costs a leaked handle rather than a destructive close. The exposure
+    is also wider -- a `list` subclass with a non-terminating `__iter__` reachable through any
+    third-party object took a child to 5.7 GB RSS in nine minutes, unkillable by its parent.
+    """
+
+    class Endless(list):  # type: ignore[type-arg]
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            """Never terminates, which is the shape the ceiling exists for."""
+            while True:
+                yield object()
+
+    class Holder(MemorySink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runaway = Endless()
+
+    unrecorded = RecordingSink()
+
+    started = time.monotonic()
+    log_foundry.configure(service="own", sink=Holder())
+    configured = time.monotonic() - started
+
+    assert configured < 10.0, (
+        "the *parent's* stamp walk is bounded too. It reads containers through the same helper, "
+        "and before that it called `_fork._container_children`, whose `list(container)` never "
+        "returns here -- so `configure()` itself hung, with no fork involved"
+    )
+
+    _lifecycle._mark_inherited()
+    assert _lifecycle._marking_failed is True, "the ceiling tripped rather than the walk running on"
+    assert _lifecycle.releasable(unrecorded) is False, "and it degraded toward refusing"
+
+    # Driven in-process rather than through `run_in_child`: a real child never reaches this code,
+    # because `_fork._reinit_primitives` reads the same container with an unbounded
+    # `list(container)` and hangs first. That is SPEC-039's walk and its recorded hazard, not
+    # this spec's to change -- measured, the child was killed at its 30 s watchdog. What is
+    # asserted here is the bound on the two walks SPEC-042 owns; §13 records the other.
 
 
 def test_the_marking_handler_runs_before_the_worker_rebuild() -> None:
