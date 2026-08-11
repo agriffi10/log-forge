@@ -15,7 +15,6 @@ a same-process double cannot exhibit it.
 from __future__ import annotations
 
 import gc
-import os
 import socket
 import threading
 from typing import TYPE_CHECKING
@@ -23,11 +22,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
-from log_foundry import _lifecycle, config, decorator
+from log_foundry import _fork, _lifecycle, config, decorator
 from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.sinks.stdout import StdoutSink
+from log_foundry.sinks.transform import TransformSink
 from test_fork_lifecycle import run_in_child
 
 if TYPE_CHECKING:
@@ -180,6 +180,73 @@ def test_a_sink_added_to_a_wrapper_after_configure_is_refused() -> None:
     assert late.closed == 0, "so through the wrapper it leaks rather than being closed on a guess"
 
 
+def _logstash_wrapping(inner: object) -> object:
+    """Builds a `LogstashSink` whose HTTP backend is the given sink.
+
+    The class picks its backend from the URL scheme, so the child is substituted afterwards --
+    what is under test is that `close()` forwards its own identity, not how it was constructed.
+    """
+    from log_foundry.sinks.logstash import LogstashSink
+
+    wrapper = LogstashSink(url="http://example.invalid/_bulk")
+    wrapper._http = inner  # type: ignore[assignment]
+    return wrapper
+
+
+def _sentry_wrapping(inner: object) -> object:
+    """Builds a `SentrySink` whose HTTP fallback is the given sink, for the same reason."""
+    from log_foundry.sinks.sentry import SentrySink
+
+    wrapper = SentrySink(dsn="https://key@example.invalid/1")
+    wrapper._http = inner  # type: ignore[assignment]
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda inner: MultiSink(inner), id="MultiSink"),
+        pytest.param(lambda inner: FilteringSink(inner), id="FilteringSink"),
+        pytest.param(lambda inner: TransformSink(inner, lambda event: event), id="TransformSink"),
+        pytest.param(_logstash_wrapping, id="LogstashSink"),
+        pytest.param(_sentry_wrapping, id="SentrySink"),
+    ],
+)
+def test_every_wrapper_forwards_its_own_identity_as_the_owner(build: object) -> None:
+    """FR-001 AC-6 is decided by `owner=`, and it is hand-written at five sites.
+
+    Four of the five were caught being tested by nothing: dropping `owner=self` from
+    `FilteringSink`, `TransformSink`, `LogstashSink` or `SentrySink` survived the entire suite.
+    That is this repo's recurring shape -- "a roster in prose is not a roster the tests check"
+    -- so each wrapper is asserted individually rather than through the one that happened to
+    have coverage.
+
+    The assertion is on the *argument*, observed at the helper, because the behavioural
+    consequence needs a child the wrapper holds but the library has no record of, and building
+    that per wrapper would test the record rather than the forwarding.
+    """
+    seen: list[object] = []
+    inner = RecordingSink()
+    wrapper = build(inner)  # type: ignore[operator]
+    original = _lifecycle.release
+
+    def spy(sink: object, *, detached: bool = False, owner: object = None) -> object:
+        seen.append(owner)
+        return original(sink, detached=detached, owner=owner)  # type: ignore[arg-type]
+
+    _lifecycle.release = spy  # type: ignore[assignment]
+    try:
+        wrapper.close()
+    finally:
+        _lifecycle.release = original  # type: ignore[assignment]
+
+    assert seen, "the wrapper routed its child's close through the release helper at all"
+    assert all(owner is wrapper for owner in seen), (
+        f"{type(wrapper).__name__} must pass itself as owner=, or an unrecorded child of a "
+        f"wrapper the library holds is closed on a guess (FR-001 AC-6); got {seen}"
+    )
+
+
 def test_a_wrapper_the_library_never_saw_still_closes_its_children() -> None:
     """The other half of AC-6's default, and the reason it is not a flat "no record refuses".
 
@@ -194,6 +261,112 @@ def test_a_wrapper_the_library_never_saw_still_closes_its_children() -> None:
     a, b = RecordingSink(), RecordingSink()
     MultiSink(a, b).close()
     assert (a.closed, b.closed) == (1, 1)
+
+
+class ThirdPartyWrapper:
+    """A wrapper the library does not own, holding a sink the library therefore cannot see.
+
+    `README.md`'s documented shape. The bounded stamp walk records *this object* and then
+    declines to descend into it, so whatever it holds is invisible to the parent's record --
+    which is what made the child able to claim it.
+    """
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Forwards the batch."""
+        self._inner.emit(batch)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        """Forwards the close."""
+        self._inner.close()  # type: ignore[attr-defined]
+
+
+class BuriedHolder(MemorySink):
+    """A library-owned sink holding another two container hops down, past the AC-11 bound."""
+
+    def __init__(self, inner: object) -> None:
+        super().__init__()
+        self.buried = [[inner]]
+
+
+@pytest.mark.parametrize(
+    "hide",
+    [
+        pytest.param(lambda inner: MultiSink(ThirdPartyWrapper(inner)), id="third-party-wrapper"),
+        pytest.param(lambda inner: BuriedHolder(inner), id="two-container-hops"),
+    ],
+)
+def test_a_child_cannot_claim_a_sink_the_parent_never_recorded(hide: object) -> None:
+    """The claiming-side hole, and the reason `_mark_inherited` exists (FR-001).
+
+    Write-once defends a record that **already exists**, so where the parent's bounded walk
+    recorded nothing there was nothing to defend: a child re-wrapping the inherited object in a
+    `MultiSink` of its own reached it, stamped it with its own pid, and closed it. Measured on a
+    real socket -- `claimed=True parent_conn_closed=1`, and the parent's next write raised
+    `OSError: Socket is not connected`.
+
+    Both shapes here are ones the parent provably cannot record: one hidden behind a wrapper the
+    library may not descend into, one below the container bound AC-11 chose. The fix is not to
+    record them -- it cannot -- but to make *unrecorded* terminal in a child, which is what the
+    fork-time marking walk does.
+    """
+    conn = RecordingSink()
+    log_foundry.configure(service="own", sink=hide(conn))  # type: ignore[operator]
+
+    with _lifecycle._owned_lock:
+        assert id(conn) not in _lifecycle._owned, (
+            "the precondition: the parent's walk genuinely cannot see this sink, so the test "
+            "exercises the claiming hole rather than the ordinary recorded path"
+        )
+
+    def in_child() -> str:
+        log_foundry.configure(sink=MultiSink(conn))
+        log_foundry.info("child event")
+        log_foundry.shutdown(3.0)
+        return f"{_lifecycle.releasable(conn)},{conn.closed}"
+
+    child = run_in_child(in_child)
+    assert child.output == "False,0", child.output
+
+
+def test_the_marking_walk_leaves_a_childs_own_sinks_alone() -> None:
+    """Marking everything inherited must not become marking everything.
+
+    The counterpart to the test above: "refuse in a child" is trivially safe and useless, and
+    FR-001 AC-3 requires a child's own sink to close normally. Asserted after the marking walk
+    has run, which is the moment it could over-reach.
+    """
+    log_foundry.configure(service="own", sink=RecordingSink())
+
+    def in_child() -> str:
+        own = RecordingSink()
+        log_foundry.configure(sink=own)
+        log_foundry.info("child event")
+        log_foundry.shutdown(3.0)
+        return f"{_lifecycle.releasable(own)},{own.closed}"
+
+    child = run_in_child(in_child)
+    assert child.output == "True,1", child.output
+
+
+def test_a_marking_walk_that_fails_refuses_everything_unrecorded() -> None:
+    """If the walk could not finish, an unrecorded sink may be one it missed.
+
+    Refusing then costs a leaked handle, which is the direction FR-001 requires. The flag is the
+    only thing standing between a partial walk and the destructive close it exists to prevent.
+    """
+    unrecorded = RecordingSink()
+    assert _lifecycle.releasable(unrecorded) is True, "the baseline: unrecorded is the caller's"
+
+    _lifecycle._marking_failed = True
+    try:
+        assert _lifecycle.releasable(unrecorded) is False
+        assert _lifecycle.release(unrecorded) is None
+        assert unrecorded.closed == 0, "and the refusal is a skip, not a raise"
+    finally:
+        _lifecycle._marking_failed = False
 
 
 def _configure_without_keeping_a_reference() -> int:
@@ -378,7 +551,15 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
             walk(child, here)
 
     walk(ast.parse(source), False)
-    assert set(under_lock) <= {"_owned.get", "_owned.setdefault", "_owned.clear", "id"}, (
+    permitted = {
+        "_owned.get",
+        "_owned.setdefault",
+        "_owned.clear",
+        "_owned.values",
+        "roots.extend",
+        "id",
+    }
+    assert set(under_lock) <= permitted, (
         f"new work under the record lock: {sorted(set(under_lock))}. It is the last lock in the "
         "order, so anything here that calls out can only invert it -- and anything that "
         "re-enters deadlocks outright, since it is a Lock and not an RLock."
@@ -627,6 +808,11 @@ def test_the_stamp_is_taken_before_the_sink_is_published(
     Written first as two threads racing 200 `configure()` calls, which is how not to do it -- the
     reader was starved to a single observation out of fifty, so `all(seen)` was passing on an
     empty-ish sample. Only its own "did you observe anything" precondition caught that.
+
+    Then written a second time asking `releasable(published)`, which was worse: `releasable`
+    answers `True` for an unrecorded sink by design, so the probe could not tell "stamped" from
+    "never stamped" and moving the stamp *after* `_rebind` survived the whole suite. The
+    question has to be about the **record**, which is the thing being ordered.
     """
     observed: list[bool] = []
     original = config._rebind
@@ -634,36 +820,60 @@ def test_the_stamp_is_taken_before_the_sink_is_published(
     def spy(**changed: object) -> None:
         published = changed.get("sink")
         if published is not None:
-            observed.append(_lifecycle.releasable(published))
+            with _lifecycle._owned_lock:
+                observed.append(id(published) in _lifecycle._owned)
         original(**changed)
 
     monkeypatch.setattr(config, "_rebind", spy)
     log_foundry.configure(service="own", sink=RecordingSink())
 
     assert observed == [True], (
-        "the sink was already recorded at the instant it became visible in the config"
+        "the sink already carried a record at the instant it became visible in the config"
     )
 
 
-def test_the_fork_walk_does_not_reach_a_superseded_sink() -> None:
+def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
     """The record pins every sink ever acquired, and `_fork` must not treat that as live state.
 
     Measured before `_FORK_SKIP` existed: a child announced a buffer discard for a sink two
     `configure()` calls out of date, and a `FileSink` there would be reopened on every fork for
     the life of the process.
+
+    This drives `_fork._reinit_primitives` -- the **repair** walk, the only one that consults
+    `_FORK_SKIP`. A first version called `_lifecycle._reachable_sinks(_lifecycle)` instead, which
+    is the *ownership* walk and cannot even enter a module (`_is_owned` is `False` for a
+    `ModuleType`, so it returns `[]` for any module). That assertion was true for every possible
+    input and disabling `_FORK_SKIP` left it passing.
     """
     hooked: list[str] = []
 
-    class Hooked(RecordingSink):
-        def reacquire_after_fork(self) -> None:
-            """Records that the walk reached this sink in the child."""
-            hooked.append("yes")
+    class Hooked(MemorySink):
+        """Subclasses a **library** sink on purpose: `_fork`'s walk descends by ownership.
+
+        Written first against a plain test double, whose class is defined in this module -- so
+        `_fork._is_owned` was `False`, the walk declined to enter it, and the assertion below
+        held for a reason that had nothing to do with `_FORK_SKIP`. Disabling the skip left it
+        passing.
+        """
+
+        def discard_buffered_after_fork(self) -> None:
+            """The hook `_fork` collects; named as it is on `main` until FR-005 renames it."""
+            hooked.append(type(self).__name__)
 
     superseded = Hooked()
     log_foundry.configure(service="own", sink=superseded)
     log_foundry.configure(sink=RecordingSink())
 
     assert "_owned" in _lifecycle._FORK_SKIP
-    reached = _lifecycle._reachable_sinks(_lifecycle)
-    assert superseded not in reached, "the record is bookkeeping, not a graph to repair"
-    assert os.getpid() > 0
+    with _lifecycle._owned_lock:
+        assert id(superseded) in _lifecycle._owned, (
+            "the record still pins it, which is the precondition that makes this test mean "
+            "something -- without the pin there would be nothing for the walk to over-reach to"
+        )
+
+    collected = _fork._reinit_primitives()
+    assert superseded not in collected, (
+        "the repair walk reached a sink two configure() calls out of date and would have called "
+        "its fork hook"
+    )
+    assert hooked == [], "and it did not call the hook either"

@@ -31,6 +31,28 @@ there would be reopened on every fork forever. A sink that is still live is reac
 config and the worker, so nothing the repair needs is lost.
 """
 
+_FOREIGN = -1
+"""The pid a record carries when the sink belongs to some earlier process.
+
+Never a real pid, so it can never match :func:`os.getpid`. Laid down by
+:func:`_mark_inherited` in a forked child over everything the child inherited, which is what
+gives "this process did not acquire it" a **terminal** state.
+
+Without it the record protects nothing where it is empty: ``stamp`` is write-once, and write-once
+defends only a record that already exists, so a child could ``configure()`` its way into *owning*
+a sink the parent never recorded and then close it entirely legitimately. Measured before this
+existed — a child claimed a connection sink held behind a third-party wrapper and closed it,
+destroying the parent's transport. Unrecorded has to be unclaimable, not merely unreleasable.
+"""
+
+_marking_failed = False
+"""Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
+
+The walk is what makes an inherited sink recorded; if it did not complete, an unrecorded sink in
+this child may be one it missed rather than one this process built. Refusing every unrecorded
+sink then costs a leaked handle, which is the direction FR-001 requires a gap to fail in.
+"""
+
 _owned: dict[int, tuple[int, object]] = {}
 """Which sinks this process acquired, keyed by ``id`` and holding the pid that acquired them.
 
@@ -165,6 +187,103 @@ def _is_candidate(value: object) -> bool:
     return _may_be_a_sink(value) and (isinstance(value, Sink) or _fork._is_owned(value))
 
 
+def _inheritance_roots() -> list[object]:
+    """Returns everything a forked child may have inherited a sink through.
+
+    The live delivery targets and every sink already recorded, which together are the only
+    handles the library itself holds. A sink reachable from none of them is one no library path
+    can reach either, so it is nothing this process could destroy.
+
+    Args:
+      None.
+
+    Returns:
+      The objects :func:`_mark_inherited` starts its walk from.
+
+    Raises:
+      None. A root that cannot be read is skipped; a partial roster marks less and therefore
+        refuses more, which is the safe direction.
+    """
+    from log_foundry import config, decorator
+
+    worker = decorator._worker
+    candidates = (
+        config._live_config().sink,
+        None if worker is None else worker.sink,
+        decorator._orphan_sink,
+        decorator._orphan_closed_sink,
+    )
+    roots: list[object] = [found for found in candidates if found is not None]
+    with _owned_lock:
+        roots.extend([reference for _pid, reference in _owned.values()])
+    return roots
+
+
+def _mark_inherited() -> None:
+    """Marks every sink this child inherited as foreign, before anything can claim it (FR-001).
+
+    Registered with ``_fork`` and run in the child, which is why it may take the library's locks:
+    they were re-initialised moments earlier. It must run **before** any handler that could reach
+    a release path, which registration order provides and a test pins.
+
+    **This walk descends further than :func:`_reachable_sinks` deliberately, including into
+    third-party objects.** That is the whole point: a connection sink held inside a wrapper the
+    library does not own is invisible to the bounded stamp walk, so the parent never recorded it
+    — and a child that re-wraps that same object in a ``MultiSink`` of its own then reaches it,
+    claims it, and closes the parent's transport. Reproduced. The read is
+    ``_fork._namespace_items``, the same one the fork repair uses: instance ``__dict__`` and slot
+    descriptors only, so no property is triggered, nothing is mutated, and nothing is called.
+    SPEC-039 FR-003 AC-2 forbids mutating and traversing foreign state to *repair* it; noticing
+    what a wrapper holds so as to leave it alone is the opposite obligation, and FR-001 already
+    draws that line for recording.
+
+    The cost is one-off per fork and of the same order as the repair walk beside it — the exact
+    type pre-filter keeps the per-object test off the caller data that dominates, which measured
+    1,109 ms against 279 ms for a ``MemorySink`` holding 100k events.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None. A failure sets :data:`_marking_failed`, after which every unrecorded sink in this
+        child is refused rather than trusted — a leaked handle instead of a destructive close.
+    """
+    global _marking_failed
+    try:
+        seen: set[int] = set()
+        found: list[object] = []
+        stack: list[object] = _inheritance_roots()
+        while stack:
+            holder = stack.pop()
+            if id(holder) in seen:
+                continue
+            seen.add(id(holder))
+            if _may_be_a_sink(holder) and isinstance(holder, Sink):
+                found.append(holder)
+            if _fork._is_container(holder):
+                stack.extend(_fork._container_children(holder))
+                continue
+            if not _may_be_a_sink(holder):
+                continue
+            for _name, value in _fork._namespace_items(holder):
+                if _fork._is_container(value) or _may_be_a_sink(value):
+                    stack.append(value)
+    except Exception as exc:
+        _marking_failed = True
+        _diag.absorbed(
+            "marking the sinks a forked child inherited",
+            exc,
+            "this child will refuse to close any sink it has no record of",
+        )
+        return
+    with _owned_lock:
+        for inherited in found:
+            _owned.setdefault(id(inherited), (_FOREIGN, inherited))
+
+
 def stamp(sink: object) -> None:
     """Records that this process acquired a sink, and everything reachable from it (FR-001).
 
@@ -219,12 +338,19 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     The wrapper is what makes the two distinguishable, so it is asked:
 
     - Neither recorded — a graph the library never saw. The caller owns it; honour the close.
-    - The child recorded elsewhere — the inherited sink. Refused however it was reached, which
-      is what closes the wrapper route (FR-002 AC-3).
+    - The child recorded elsewhere — the inherited sink, or one :func:`_mark_inherited` marked
+      ``_FOREIGN``. Refused however it was reached, which is what closes the wrapper route
+      (FR-002 AC-3).
     - The wrapper recorded, the child not — the sink added to a wrapper *after* ``configure()``
       walked it. Refused, per FR-001 AC-6: the library holds this graph, so a member it has no
       record of is one it must not assume is this process's. The consequence is a leak, recorded
       in §13.
+
+    **"Unrecorded is the caller's" is only sound because a fork makes it false first.** In a
+    child, :func:`_mark_inherited` records everything inherited as ``_FOREIGN`` *before* any
+    handler runs, so an unrecorded sink there is one built after the fork. If that walk could
+    not finish, :data:`_marking_failed` withdraws the assumption entirely and every unrecorded
+    sink is refused.
 
     Identity is re-checked against the strong reference rather than trusting the ``id``. The
     reference is what makes an id collision impossible while a record stands, so this can only
@@ -247,7 +373,7 @@ def releasable(sink: object, *, owner: object = None) -> bool:
         owner_record = None if owner is None else _owned.get(id(owner))
     if record is not None:
         return record[1] is sink and record[0] == pid
-    return owner_record is None
+    return owner_record is None and not _marking_failed
 
 
 def release(sink: Sink, *, detached: bool = False, owner: object = None) -> threading.Thread | None:
@@ -455,3 +581,6 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
             sink.log_foundry_stop_signal = stop
     except Exception as exc:
         _diag.absorbed("handing the sink its stop signal", exc, "its backoff stays uninterruptible")
+
+
+_fork.register_child_handler(_mark_inherited)
