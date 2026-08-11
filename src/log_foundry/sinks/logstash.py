@@ -140,7 +140,7 @@ class LogstashSink:
           Exception: Whatever the backend raises on close.
         """
         if self._http is not None:
-            _lifecycle.release(self._http)
+            _lifecycle.release(self._http, owner=self)
         elif self._socket is not None:
             self._socket.close()
 

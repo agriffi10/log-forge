@@ -142,7 +142,7 @@ class SentrySink:
           None.
         """
         if self._http is not None:
-            _lifecycle.release(self._http)
+            _lifecycle.release(self._http, owner=self)
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:

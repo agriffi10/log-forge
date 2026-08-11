@@ -195,7 +195,7 @@ class MultiSink:
         """
         for sink in self._sinks:
             try:
-                _lifecycle.release(sink)
+                _lifecycle.release(sink, owner=self)
             except Exception as err:
                 with self._counter_lock:
                     self.failed += 1

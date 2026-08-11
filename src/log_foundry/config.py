@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from log_foundry import _lifecycle
+
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
 
@@ -169,6 +171,9 @@ def configure(
         )
         if value is not None
     }
+    if sink is not None:
+        _lifecycle.stamp(sink)
+
     _rebind(**changed)
 
     _ensure_sink()
@@ -316,7 +321,9 @@ def _ensure_sink() -> Sink:
 
     with _config_lock:
         if _config.sink is None:
-            _config = replace(_config, sink=StdoutSink())
+            default = StdoutSink()
+            _lifecycle.stamp(default)
+            _config = replace(_config, sink=default)
         resolved = _config.sink
     if resolved is None:  # pragma: no cover - unreachable; the branch above just set it
         raise RuntimeError("the default sink could not be resolved")
