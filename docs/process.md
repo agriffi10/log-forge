@@ -39,9 +39,11 @@ is deliberately small and **must not regrow**.
 Specs move **Draft → In Progress → Completed** (the status in each spec's header is authoritative; the
 `INDEX.md` row mirrors it).
 
-- **Draft** — written and refined, but **do not build until told.** Specs are often authored well
-  ahead of implementation. A Draft spec sitting in the repo is not a signal to start it. A spec is not
-  Draft-ready while it still has unresolved questions (see §4).
+- **Draft** — written, **reviewed by a fresh-context reviewer (§3, *The reviewer contract*)** and
+  refined, but **do not build until told.** Specs are often authored well ahead of implementation. A
+  Draft spec sitting in the repo is not a signal to start it. A spec is not Draft-ready while it still
+  has unresolved questions (see §4), and a spec that has not been through the gate is not Draft-ready,
+  whatever its header says.
 - **In Progress** — exactly one spec at a time is in flight. Set when you branch to build it.
 - **Completed** — merged on green CI, delivery doc written (see §5).
 
@@ -63,17 +65,20 @@ This is the operating loop, start to finish. CLAUDE.md's *Session Workflow* is t
 4. **Branch from fresh `main`.**
 5. **Generate and validate a plan before writing code.** Turn the spec's Implementation Phases into a
    concrete implementation plan, then validate it against the spec — every FR + acceptance criterion is
-   covered, reuse from `component-inventory.md` is used, and nothing out of scope crept in. Confirm the
-   plan before building. The validated plan — not per-phase checkpoints baked into the spec — is what
-   gates the work.
+   covered, reuse from `component-inventory.md` is used, and nothing out of scope crept in. The plan —
+   not per-phase checkpoints baked into the spec — is what gates the work.
+6. **Put the plan through the reviewer gate before the first line of code** (*The reviewer contract*,
+   below). A plan is reviewed for the same reason a PR is: the author cannot see what they assumed.
+   Confirm the reviewed plan with the user, then build.
 
 **During the build — one spec, in phases**
 - Every file-changing task is done on its **own branch** and opened as a **PR** — automatically, without
   waiting to be asked. Never commit to `main` directly.
 - Before opening a PR, run the project's **formatter, linter, and unit tests** locally and get them
   green. These quality gates are a pre-PR step — don't push red and leave CI to discover it.
-- Work the validated plan's phases in order. After each phase, **stop and summarize** what was built and
-  how it maps back to the plan before continuing.
+- Work the **reviewed** plan's phases in order. After each phase, **stop and summarize** what was built
+  and how it maps back to the plan before continuing. Re-review the plan only if the phase changed it —
+  a phase that revises the plan has produced a new artifact, and it goes through the gate as one.
 - Before writing Python, route through `docs/best-practices/INDEX.md` → `python/python.md` and load only
   the relevant section(s). Apply the rules as you write; flag (don't silently break) any that conflict
   with existing code or the repo's `ruff`/`mypy` config.
@@ -87,12 +92,41 @@ This is the operating loop, start to finish. CLAUDE.md's *Session Workflow* is t
     options with a recommendation. Auto-deciding these is how an autonomous run drifts away from what
     was actually wanted.
 
-**Reviewing the work — in a fresh context**
-- Code review and verification run in a **fresh context** (a new session or a subagent), **never the
-  session that wrote the code.** A self-reviewing agent assumes its own output was intended and rubber-
-  stamps it; a clean reviewer catches what the author can't see. The reviewer checks the diff against
-  the spec's acceptance criteria **and the relevant `best-practices/` rules** (route via its INDEX),
-  not just "does it look fine."
+**The reviewer contract — three artifacts, one gate**
+
+Nothing reaches the next stage on its author's own judgement. A **spec**, an **implementation plan**
+and a **diff** each go to a reviewer in a **fresh context** — a subagent or a new session, never the
+context that produced the artifact. An author reviewing their own work assumes its output was
+intended and rubber-stamps it; that is as true of a plan as of code, and a wrong plan is the more
+expensive of the two because the code that follows will faithfully implement it.
+
+- **The gate is blocking.** A spec is not Draft-ready, and a plan does not start code, until it has
+  been through a review round and every finding is either **fixed** or **explicitly rejected in
+  writing** — in the spec/plan itself, or in the session summary, saying which finding and why. A
+  finding that is silently dropped is a finding that was not reviewed.
+- **The reviewer gets the artifact and its sources, never the author's reasoning.** For a spec: the
+  spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
+  and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. Handing
+  over the authoring rationale tells the reviewer what to conclude.
+- **What each review is for.** A **spec** review asks: is every FR testable and binary; does any
+  acceptance criterion pass vacuously; is anything in Out of Scope actually required by an FR; does
+  it contradict a settled decision or silently supersede one without saying so; are there Open
+  Questions wearing declarative clothes. A **plan** review asks: does every FR and acceptance
+  criterion have a phase that delivers it; is existing reuse used rather than re-built; has
+  out-of-scope work crept in; is a phase resting on a premise nobody has checked. A **diff** review is
+  the rules below.
+- **Cap same-frame rounds at two, then rotate the frame** — the rule the next block earns, and it
+  applies to specs and plans as much as to code. A second round of the same reviewer on the same
+  artifact converges on wording. Rotate instead: for a spec, a reviewer briefed only on the
+  *dependencies* it claims, or one asked to build the thing from the spec alone and report what it
+  could not determine; for a plan, one asked to find the phase that will be discovered impossible.
+- **Exit on a new frame finding nothing**, never on a round count.
+- **A reviewer finding is not an instruction.** The author decides; the record of the decision is
+  what the gate requires. A rejected finding that turns out right is a cheap lesson with a written
+  trail; a fixed finding that was wrong is a silent regression.
+
+**What a diff review checks.** The spec's acceptance criteria **and the relevant `best-practices/`
+rules** (route via its INDEX) — not just "does it look fine."
 
 **Rotating the frame — why round count is the wrong exit criterion**
 
@@ -146,6 +180,76 @@ each was fixed, and a fourth site shipped broken.
   right, but the widening arrives late, gets the least scrutiny, and inherits confidence it has
   not earned. Two of SPEC-033's regressions were in scope added during its own review.
 
+**Briefing the reviewer — four lines that change what comes back**
+
+Measured on a sibling repo (`s3-upload-portal`, SPEC-205, 2026-08-18) over four rounds on one spec:
+two adversarial-audit rounds, then two implementer rounds. The frame decides the *class* of finding;
+the briefing decides whether the answer is honest.
+
+- **Say that "this is sound" is a valid verdict.** A reviewer that infers it is expected to produce
+  findings will produce them. The round that returned the most useful report was the one told
+  explicitly that a short "implementable as written, here is what I built" was a valuable outcome —
+  and it still returned real defects, so the line costs nothing.
+- **Require it to cite where it looked** before declaring something missing — the spec line it read
+  before concluding the spec is silent. That separates a genuine gap from a miss, and it is the
+  cheapest way to keep a long report's false-positive rate down.
+- **Tell round N+1 what round N fixed, and forbid re-auditing it.** Otherwise the second pass
+  re-derives the first pass's findings and never reaches the new work.
+- **Withhold the history from a frame that is testing self-sufficiency.** The opposite of the line
+  above, and both are right: a pass asking *"is this spec buildable by someone who wasn't here"* must
+  be given it cold.
+
+**A rewrite under review pressure is the highest-risk artifact in the loop**
+
+Adjacent to *scope added mid-review restarts the clock*, and stronger. When a finding causes a
+substantial **replacement** rather than a widening, the replacement is written quickly, confidently,
+and with nobody having reviewed it. On the sibling repo's SPEC-205 the second round found **four
+blockers, all of them inside machinery the first round's fixes introduced** — two of which
+independently broke a path the spec had a requirement to preserve. Budget a round for the fix, aimed
+at the fix. This repo has the same shape on record: rounds 5–8 of SPEC-035 FR-002 all found defects
+in the lint added at round 4, never in the roster it guards.
+
+And **when the same area is wrong twice, the signal is about the area, not the draft.** Both SPEC-205
+drafts were wrong about the same thing. A repeat in one place is where to spend the next frame, ahead
+of anything the reviewer ranked higher.
+
+**The implementer frame must actually build, and every frame must run the gates**
+
+*The build-it-from-the-spec rotation named above, made concrete — it earns its own block because it
+yields a different class of finding than any reading-based frame.*
+
+- **Have it write real code, off-repo, and run the suites.** What it found by running that no reader
+  found: nine existing tests that invert (a list the spec claimed was four, including one in a
+  *different* suite from the one the spec's list implied), fixtures across two suites that silently
+  become the new failure case, a hard-coded count in an unrelated coverage test, and a fake whose
+  signature diverges from the real client.
+- **Its output class is contradictions, unspecified shapes and sequencing** — two requirements that
+  cannot both hold; a return type nobody named; a phase boundary that leaves `main` exposed. An
+  adversarial reader finds defects and does not find these; the implementer finds these and is worse
+  at defects. Run both, not one twice.
+- **Every reviewer runs the repo's gates against the branch** — `ruff check`, `mypy`, `pytest`, and
+  `scripts/spec-lint.sh` on any spec it touched. Four rounds reviewed SPEC-205 and none ran the
+  sibling repo's doc-layout gate; the branch was red on it throughout, for a reason unrelated to the
+  spec, and it took an agent that *built* the change to notice. A review of a change touching gated
+  files runs the gates.
+
+**Exit on the trajectory of the findings, not on an empty round**
+
+*Refines "exit on a new frame finding nothing".* In practice a fresh frame rarely finds literally
+nothing — it finds something smaller. The honest signal is the **class** changing round over round:
+on SPEC-205, blockers → machinery introduced by the fixes → sequencing and contradictions →
+coin-flips no test would catch. Stop when a new frame's worst finding is one that would not change
+the built result, and say which finding that was.
+
+**An Open Question can wear a declarative sentence**
+
+`CLAUDE.md` forbids a spec carrying Open Questions, and `spec-lint.sh` fails an "Open Questions"
+heading — and the check is easy to pass while failing. SPEC-205 shipped the sentence *"either the
+exception moves to a shared location or the call returns a refusal the caller raises. The spec states
+which"* — and then did not. A sentence that **promises a decision** is an Open Question with a
+declarative shape; so is an acceptance criterion demanding a **computed** bound while supplying none
+of its inputs. Both were caught by an implementer who had to pick, and neither by a reader.
+
 **Landing the spec — watch PRs and watch `main`**
 - **Every PR is watched to completion and merged as soon as CI is green** — never open a PR and walk
   away. A spec's PR merges only on green.
@@ -174,7 +278,12 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
   bake per-phase checkpoints into the spec.
 - **No Open Questions.** Resolve every decision while authoring — a spec doesn't reach Draft-ready with
   unanswered questions. Issues that only surface during the build are handled in-session (§3), not
-  parked in the spec.
+  parked in the spec. A sentence that *promises* a decision is an Open Question in declarative
+  clothes (§3).
+- **Then the reviewer gate** (§3, *The reviewer contract*). A freshly-authored spec goes to a
+  fresh-context reviewer before it is Draft-ready, and its findings are fixed or rejected in writing.
+  The commonest thing this catches is not a wrong requirement — it is an acceptance criterion that
+  cannot fail, and an Out of Scope bullet that an FR quietly needs.
 
 **An acceptance criterion is a pass/fail test, not an argument for itself.** Measured on this
 repo: SPEC-029 and SPEC-030 carried 19–25 criteria averaging ~20 words and took 2–3 review rounds;
