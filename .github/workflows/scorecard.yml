@@ -62,6 +62,6 @@ jobs:
       # This upload coexists with CodeQL default setup: default setup only rejects uploads in the
       # CodeQL category, and zizmor already proves third-party SARIF is accepted on this repository.
       - name: Upload results to code scanning
-        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: results.sarif
