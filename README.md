@@ -377,14 +377,22 @@ def enqueue_check(location: str) -> None:
 
 ```python
 @lf.trace
-def handler(event, context):
+def _handler(event, context):
     lf.continue_trace(event.get("traceparent"), baggage=event.get("baggage"))
     lf.info("inspecting")          # same trace_id as the producer; parent is its span
+    return inspect(event)
+
+
+def handler(event, context):       # the entry point, deliberately not decorated
     try:
-        return inspect(event)
+        return _handler(event, context)
     finally:
-        lf.flush()
+        lf.flush()                 # the span has closed, so its events are drained
 ```
+
+`flush()` goes **outside** the traced function, not in its `finally`. An in-span event lives on the
+span until the span *closes*, and `flush()` drains the queue — so a `flush()` inside the span has
+nothing to drain yet.
 
 | Call | Does |
 |---|---|
@@ -917,6 +925,7 @@ if (
     h.dropped or h.failed_batches or h.stopped_reason or h.incomplete_swaps
     or (h.sink and (h.sink.dropped or h.sink.failed))
     or (h.retired and h.submitted_after_shutdown)
+    or h.orphan_lost or h.in_span_lost
 ):
     ...  # logs were silently lost — worth an alert
 ```
@@ -938,7 +947,13 @@ They tell you different things, and they want different responses:
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
 | `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
+| `orphan_lost` | An event logged **with no active span** never reached the sink. That call emits on your own thread with no worker behind it, so no other field here can carry it — it is not a batch, there was no retry, and there may be no worker at all. Covers a sink that failed to *construct* as well as one that raised. | Fix the destination, or the data. The stderr line names the exception type. If a process logs this way at all, this is the field to alert on: nothing else describes that path. |
+| `in_span_lost` | An event logged **inside a span** could not be built — a value that could not be turned into an event. Always the data, never the destination: the in-span path cannot fail at delivery, which is `failed_batches`. | Fix the call site. Passing a non-string message (an exception object, say) is the common cause. |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter, and the only field that falls as well as rises. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
+
+`orphan_lost` and `in_span_lost` are deliberately two fields and their sum is deliberately not
+reported. They aggregate different failure populations — one can mean the destination *or* the
+data, the other can only mean the data — so a single number would hide which fix applies.
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
 the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
@@ -960,14 +975,21 @@ logged, and after a clean `shutdown()`, so a plain truthiness check is safe. Wit
 thread showed up only indirectly, as `dropped` climbing once the queue filled — the wrong signal,
 pointing at the wrong fix.
 
+`orphan_lost` climbing is on its own a reason to look: unlike `dropped`, it is never
+backpressure and never transient. Each increment is one event that reached no destination, and on
+a process that logs only outside a span it is the *only* field that can say so.
+
 `retired` is deliberately **not** alerted on by itself. A process that shuts down and then stops
 logging is doing the right thing; it is the *pair* — retired, and still being handed events — that
 means every log line since the shutdown has gone nowhere. That state used to read as perfectly
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
-`retired` is also the one field reported for a process that has **no worker at all**. A program
-that only ever calls `info()`/`error()` outside a span emits synchronously and builds no background
-worker, so every other field describes something that does not exist and reads zero. Its
+`retired`, `orphan_lost` and `in_span_lost` are the fields reported for a process that has **no
+worker at all**. A program that only ever calls `info()`/`error()` outside a span emits
+synchronously and builds no background worker, so the rest describe something that does not exist
+and read zero — which is why that path needs counters of its own. Until it had them, such a process
+reported `queued=0 dropped=0 failed_batches=0 stopped_reason=None` over total, permanent loss, and
+the only thing that said otherwise was a line on stderr. Its
 `shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
 `True` afterwards rather than staying vacuously `False`. `submitted_after_shutdown` stays `0` there
 by design: a later level call is *refused* at the closed sink and announced on stderr — if the sink
@@ -1088,19 +1110,28 @@ from log_foundry.sinks.sqs import SQSSink
 lf.configure(service="billing-api", env="prod", sink=SQSSink(queue_url=QUEUE_URL))
 
 @lf.trace
-def handler(event, context):
+def _handler(event, context):
     lf.info("received", records=len(event["Records"]))
+    return do_work(event)
+
+
+def handler(event, context):
+    # NOT decorated, so the span closes when `_handler` returns and its events reach the queue
+    # before `flush()` runs. A `flush()` *inside* the traced function has nothing to drain yet.
     try:
-        return do_work(event)
+        return _handler(event, context)
     finally:
         # In `finally`: the failed invocation is the one worth logging. NEVER shutdown() here —
         # the worker does not come back, and every later invocation on this warm container
         # would log nothing.
         drained = lf.flush()
         h = lf.health()
-        if not drained or h.failed_batches or h.dropped or h.stopped_reason or h.retired:
+        if (not drained or h.failed_batches or h.dropped or h.stopped_reason or h.retired
+                or h.orphan_lost or h.in_span_lost):
             # `drained` covers this invocation's tail; the counters cover anything the worker
             # lost earlier — a batch its own interval trigger already gave up on, for instance.
+            # `orphan_lost`/`in_span_lost` cover the two paths no worker field can describe: a
+            # log made outside any span, and an event that could not be built.
             # `h.retired` catches the mistake above: inside a handler it can only mean something
             # called shutdown(), and from here on this container logs nothing.
             # Emitting this through your platform's own logger keeps it outside the pipeline

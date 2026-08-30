@@ -129,6 +129,16 @@ The decorator is **non-swallowing**: exceptions are recorded and re-raised uncha
   records are never silently dropped. It mints that `trace_id` unconditionally, so an orphan
   log never joins a context adopted via `continue_trace` — the adoption waits for the next
   root span. A caller on this path releases both values with `reset_context()` (SPEC-024).
+- **A task that outlives its span** takes that same orphan path (SPEC-036 FR-004). `contextvars`
+  copies the *same* `Span` object into every task created inside a span, so a fire-and-forget
+  `create_task` can log after its parent has returned and its buffer has been handed to the
+  worker. The span carries a `closed` flag set at close, and `api._log` reads it **at append
+  time** — the only place that can, since nothing in the library looks at a span again once
+  `_close_span` returns. The event is therefore delivered as a standalone one-event span rather
+  than appended to a buffer nothing will emit, and it is counted in `orphan_lost` if the emit
+  fails. What it gives up is its correlation: a fresh `trace_id`, so it leaves the trace and not
+  just the span, and no ordering guarantee relative to the `span.end` that preceded it. Await the
+  task inside the span if its logs must stay in the trace.
 
 ### 5.1 Baggage — trace-scoped dynamic context
 
@@ -719,7 +729,13 @@ constraint — never by being deleted quietly.
   shipped in **SPEC-002**. A level call with no active span builds a complete event with a fresh
   `trace_id` and emits it synchronously on the caller's thread. Dropping it would make the emitters
   silently conditional on decorator placement, which is the opposite of what a logging call should
-  promise. That synchronous path is also why `sanitize` must be total (SPEC-017).
+  promise. That synchronous path is also why `sanitize` must be total (SPEC-017), and why it needs
+  a loss counter of its own: `Health` describes a worker and this path has none, so until
+  **SPEC-036 FR-003** a process logging only this way reported all zeros over total, permanent
+  loss. `orphan_lost` covers everything inside that guard — a sink that fails to construct as well
+  as one that raises — and `in_span_lost` is its counterpart for an event that could not be *built*
+  inside a span. Two fields, because one can mean the destination or the data and the other can
+  only mean the data.
 - **Console echo defaults** (destination, line format, an `echo_level` threshold) → **shipped in
   SPEC-002**: ~~`console.py` echoes to **stdout**~~ — **corrected by SPEC-031 FR-003**, which
   found the claim false against the code: `ConsoleWriter` has defaulted to **stderr** since it
@@ -755,6 +771,23 @@ constraint — never by being deleted quietly.
 
 ### Known constraints
 
+- **An event logged from a task that outlives its span leaves its trace.** `contextvars` copies the
+  same `Span` object into every task created inside a span, so a fire-and-forget `create_task` can
+  log after its parent returned. Since **SPEC-036 FR-004** the span's buffer is detached at submit
+  and the span carries a `closed` flag, so that append is routed to the orphan path at append time
+  rather than landing in a buffer nothing will emit — it is delivered, and counted in `orphan_lost`
+  if it is not. **One window is narrower but not closed:** `api._log` reads the flag, then builds
+  the event, then appends, and that sequence is not atomic against the close. A thread sharing the
+  span (via `copy_context().run`, since a bare thread starts with a fresh context) can be inside
+  `build_event` when the span closes, and its append then lands in the post-swap list — lost, with
+  neither counter moving. Two asyncio *tasks* cannot reach it, because they cannot interleave
+  inside a synchronous `_log`. It is recorded rather than closed because the fix is a per-span lock
+  on the hottest path in the library, and the exposure is a shared-span thread logging at the exact
+  instant of close. What it cannot keep is its correlation: it becomes a standalone one-event span with
+  a **fresh `trace_id`**, so it leaves the trace it was logically part of, not merely the span.
+  `contextvars` offers no way to recover the parent once the span is gone, and the choice is
+  against losing the event outright. Ordering is not promised either. A task whose logs must stay
+  in the trace should be awaited inside the span.
 - **An orphan log can wait on the sink lock.** A sink holding mutable transport state serializes
   `emit` for the whole operation (§9, SPEC-028), so a level call made with no active span — which
   emits on the caller's own thread — can block behind an in-flight emit, including its retry

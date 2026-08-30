@@ -144,6 +144,23 @@ class Health:
         ``shutdown()``, and it is the signal that a deployment shares a sink across a fork at
         all. ``True`` for a shared ``StdoutSink`` too, whose ``close()`` only flushes — so a
         ``True`` is not by itself evidence that anything is held.
+      orphan_lost: Events lost on the **synchronous** path — a level call made with no active
+        span, which emits on the caller's own thread with no worker between it and the sink
+        (SPEC-036 FR-003). Until this field existed that loss was counted nowhere: ``health()``
+        describes a worker, and this path has none, so a process logging only this way read all
+        zeros over total loss. Not ``failed_batches``, which means batches a worker abandoned
+        after spending a retry budget and kept running past; there is no batch, no retry and no
+        worker here. Not ``SinkLosses`` either — the sink did not absorb anything, it raised,
+        which is what SPEC-026 requires of it. It covers everything inside the orphan guard, a
+        sink that failed to *construct* included, so it climbing means **the destination or the
+        data**.
+      in_span_lost: Events lost while being built *inside* a span (SPEC-037 AC-5c, deferred to
+        SPEC-036 FR-003 so the pair was designed together). The in-span path cannot lose an
+        event at ``emit`` — that is ``failed_batches`` — so this climbing means **the data**,
+        always: a value that could not be built into an event. Two fields rather than one
+        because they aggregate different failure populations and so fail SPEC-026's test,
+        *would one number hide which fix applies*. Their sum is deliberately not reported: with
+        different populations it is a number nobody can act on.
     """
 
     queued: int
@@ -156,6 +173,8 @@ class Health:
     incomplete_swaps: int = 0
     closing_sinks: int = 0
     inherited_sink: bool = False
+    orphan_lost: int = 0
+    in_span_lost: int = 0
 
 
 class _FlushMarker:

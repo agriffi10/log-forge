@@ -458,7 +458,11 @@ unconfirmed drain, which this must not be read as forbidding.
       on its own unconfirmed drain, and a test pins that it still does.
 - [ ] AC-4: `Health`'s docstring states that `incomplete_swaps` describes the worker's drain and does
       not cover the orphan path.
-- [ ] AC-5: No field is added to `Health`.
+- [ ] ~~AC-5: No field is added to `Health`.~~ — **superseded by SPEC-036 FR-003**, which
+      appends `orphan_lost` and `in_span_lost`. This spec's own finding still needs no field:
+      the orphan-path sink handoff reports through `incomplete_swaps`. What SPEC-036 adds is a
+      different finding on the same path — the synchronous emit's own loss, which no existing
+      field can carry, because every one of them describes a worker and this path has none.
 
 ### FR-007: Record the resolution
 

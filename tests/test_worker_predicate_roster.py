@@ -316,7 +316,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         EXISTENCE,
         "health() creates no worker; the zeros describe a process that never logged.",
     ),
-    ("_worker_health", "_orphan_retired and (not health.retired)", 0): (
+    ("_worker_health", "_orphan_retired or health.retired", 0): (
         LIVENESS,
         (
             "reporting rather than deciding: this synthesizes `retired` for a process that shut "
@@ -324,7 +324,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "even though one operand is a module flag, because `health.retired` is the worker's "
             "own retirement read off its snapshot. A draft filed it under a fifth category, "
             "not-a-worker-question, which was an unbounded escape hatch: a site nobody wanted "
-            "to think about could be filed there and pass both tests."
+            "to think about could be filed there and pass both tests. "
+            "Was `_orphan_retired and (not health.retired)`, guarding an early `replace()`; "
+            "SPEC-036 FR-003 made the field set unconditional (two loss counters are merged on "
+            "this branch whether or not `retired` needs correcting), so the same question is now "
+            "asked as a value rather than as a branch. The category is unchanged, which is the "
+            "point of filing a binding by the question it feeds rather than by its shape."
         ),
     ),
 }

@@ -753,11 +753,21 @@ def test_the_worker_still_records_its_own_unconfirmed_drain() -> None:
 
 
 def test_health_gains_no_field() -> None:
-    """AC-5, rewritten for the frozen dataclass (SPEC-034 FR-008 AC-2b).
+    """~~SPEC-033 FR-006 AC-5: no field is added to `Health`.~~ — **superseded by SPEC-036 FR-003.**
 
-    It read `Health._fields`, which a `NamedTuple` has and a dataclass does not. The property it
-    pins is unchanged and is about *names*, never positions — the tuple protocol was only ever
-    how it reached them.
+    The name of this function is the superseded claim and is kept deliberately, struck here
+    rather than renamed (SPEC-021: a superseded decision is marked in place, never deleted).
+    SPEC-033's AC and SPEC-036 FR-003 AC-10 both refer to it by name, and a rename would send
+    both nowhere while the claim it encodes went unrecorded.
+
+    What SPEC-033 settled was that *its own* finding needed no new field — the orphan-path sink
+    handoff reports through `incomplete_swaps`, which describes the worker's drain. SPEC-036
+    FR-003 is a different finding on the same path: the synchronous emit's own loss, which no
+    existing field can carry, since every one of them describes a worker and this path has none.
+
+    ~~rewritten for the frozen dataclass (SPEC-034 FR-008 AC-2b) … it read `Health._fields`~~ —
+    that rewrite stands, and is why this is a two-name append rather than an index proof. The
+    property pinned is still about *names*, never positions.
     """
     assert [f.name for f in dataclasses.fields(worker_mod.Health)] == [
         "queued",
@@ -770,6 +780,8 @@ def test_health_gains_no_field() -> None:
         "incomplete_swaps",
         "closing_sinks",
         "inherited_sink",
+        "orphan_lost",
+        "in_span_lost",
     ]
 
 

@@ -52,11 +52,20 @@ class MultiSink:
         """
         self._sinks = sinks
         self.failed = 0
+        self._silent_failed = 0
         self._counter_lock = threading.Lock()
         self._stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Forwards the batch to every child in construction order, isolating failures (FR-002).
+
+        A failing child that reports **nothing** of its own is counted here, in events, because
+        otherwise it is invisible: ``losses()`` sums only children with a ``losses()``, so a
+        destination that has delivered nothing since the process started reported zero loss
+        forever (SPEC-036 FR-005). Which children are silent is decided by ``read_losses`` per
+        call, the same probe the aggregate uses, so a child that gains a ``losses()`` later moves
+        categories on its own — at the cost that the aggregate can then *fall*, which is why the
+        counter is per child rather than a single total.
 
         Partial success stays isolated: a retry there would re-deliver the batch to the children
         that already took it, and duplicates are worse than the one failure already counted on
@@ -84,8 +93,11 @@ class MultiSink:
             try:
                 sink.emit(batch)
             except Exception as err:
+                silent = read_losses(sink) is None
                 with self._counter_lock:
                     self.failed += 1
+                    if silent:
+                        self._silent_failed += len(batch)
                 if first_error is None:
                     first_error = err
                 _diag.absorbed(
@@ -147,18 +159,32 @@ class MultiSink:
         """Sums the children's losses so a fan-out reports the whole tree (SPEC-026 FR-002).
 
         Nesting is handled for free, since a child ``MultiSink`` is just another sink with a
-        ``losses()``. ``MultiSink.failed`` is deliberately absent from the total: it counts
+        ``losses()``. ~~``MultiSink.failed`` is deliberately absent from the total: it counts
         child calls that raised, not events, so adding it to a per-event figure would produce a
-        number with no unit, and the children already report their own loss in events.
+        number with no unit, and the children already report their own loss in events.~~ —
+        superseded in part by SPEC-036 FR-005. ``failed`` is still absent, and still for that
+        reason. What was wrong was concluding that the fan-out therefore reports nothing: a child
+        with no ``losses()`` contributed nothing to the total, so a permanently dead destination
+        was invisible with ``health()`` reading all zeros. ``_silent_failed`` is the same loss in
+        the **right unit** — events from failing children that report nothing — so a reporting
+        child is still left to report itself and nothing is counted twice.
+
+        The figure is a **total**, not a breakdown: it cannot say which child is failing. The
+        per-batch stderr line names the class (:meth:`emit`), which is where that lives.
+
+        ``close()`` deliberately does not move ``_silent_failed``. Its failure path has no batch,
+        so there is no event count to add, and a ``+1`` there would mix units in exactly the way
+        that keeps ``failed`` out of this sum. A client buffer lost to a failed close is of
+        unknown size, and an invented number is worse than an absent one.
 
         Args:
           None.
 
         Returns:
-          The summed losses, or ``None`` when no child reported anything, including an empty
-          fan-out. FR-003 separates "reports nothing" from "reports no loss", and a tree of
-          silent children has not given a clean bill of health; one reporting child is enough to
-          make the total meaningful, since the silent ones contribute zero.
+          The summed losses, or ``None`` when no child reported anything **and** no silent child
+          has lost a batch. FR-003 separates "reports nothing" from "reports no loss", and a tree
+          of silent children that has lost nothing has still not given a clean bill of health —
+          but one that *has* lost something now says so, which is the whole of FR-005.
 
         Raises:
           None. A child without ``losses()`` contributes zero, and a child whose accessor raises
@@ -167,11 +193,13 @@ class MultiSink:
         """
         children = [read_losses(sink) for sink in self._sinks]
         reported = [child for child in children if child is not None]
-        if not reported:
+        with self._counter_lock:
+            silent_failed = self._silent_failed
+        if not reported and not silent_failed:
             return None
         return SinkLosses(
             dropped=sum(child.dropped for child in reported),
-            failed=sum(child.failed for child in reported),
+            failed=sum(child.failed for child in reported) + silent_failed,
         )
 
     def close(self) -> None:
