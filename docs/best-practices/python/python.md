@@ -33,7 +33,7 @@
 ## §1 Tooling & the "foolish consistency" rule
 Every file is auto-formatted, linted, and type-checked — style is not hand-argued.
 
-- ✅ Run the **formatter** (`ruff format`, Black-compatible) and **linter** (`ruff check`) on every file; let them own the §2/§3 mechanics. Keep both green before a **push** (the repo's format/lint/test gates CI). ✅ Run **`mypy --strict`** over `src` (§8) — no untyped defs; ship the `py.typed` marker.
+- ✅ Run the **formatter** (`ruff format`, Black-compatible) and **linter** (`ruff check`) on every file; let them own the §2/§3 mechanics. Keep **`ruff check`** green before a push — it is a CI gate. **`ruff format` is not a gate in this repo** and the tree is not clean under it: format only the files you edited, never a directory (see `docs/process.md` §6). ✅ Run **`mypy --strict`** over `src` (§8) — no untyped defs; ship the `py.typed` marker.
 - ✅ Suppress a warning **narrowly and with a reason** — a line-level `# noqa: <rule>` / `# type: ignore[<code>]` with a short explanation when the rule name isn't self-explanatory. Searchable suppressions can be revisited.
 - 🔴 Don't blanket-disable rules for a whole file to dodge one line, and don't leave an unexplained `# noqa`. ✅ Fix the issue or justify the exception.
 - ✅ For an unused-but-required argument (callback/interface signature), delete it at the top (`del unused_arg  # Unused.`) or prefix `unused_`.
