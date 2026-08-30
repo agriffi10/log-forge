@@ -1,7 +1,7 @@
 # Spec: Flush and Buffer Visibility
 
 **ID:** SPEC-036  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-30  
 **Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037
 
