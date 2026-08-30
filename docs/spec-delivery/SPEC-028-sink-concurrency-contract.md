@@ -161,8 +161,15 @@ exactly as before.
 ## Second review round (pre-merge, PR #116)
 
 The first two PRs merged on green CI without an independent review; that was the process error
-behind everything above, and `CLAUDE.md` now states that green CI is not a review and does not
-authorize a merge. A third review, run *before* merging the corrections, returned DO NOT MERGE with
+behind everything above, and `CLAUDE.md` now states that green CI is not a review.
+
+> **Superseded, 2026-08-30:** this spec's finding originally moved the review gate to *before the
+> merge*. The gate has since moved earlier still — the diff is reviewed **before the push**, so a
+> branch reaches the remote already reviewed rather than collecting fixes in public. The reason is
+> unchanged and this spec is still the evidence for it; only the point it binds has moved. See
+> `docs/process.md` §3 → *The reviewer contract*.
+
+A third review, run *before* merging the corrections, returned DO NOT MERGE with
 13 findings. The ones that changed code:
 
 - **The daemon-thread close was a net regression** (above). Reverted.
