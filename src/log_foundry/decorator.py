@@ -60,6 +60,19 @@ shutdown's event has every backoff collapsed to zero.
 """
 _orphan_retired = False
 
+_loss_lock = threading.Lock()
+"""Guards the two loss counters, and deliberately not ``_worker_lock`` (SPEC-036 FR-003 AC-5).
+
+SPEC-028's ordering rule: a counter takes its own lock, because the orphan path runs on arbitrary
+application threads and ``_worker_lock`` is held across ``Worker(_ensure_sink())`` in
+:func:`_get_worker` — a blocking build a counter increment must never queue behind. It cannot
+deadlock here either: the increment sits in ``api._log``'s ``except``, where
+:func:`_note_orphan_emit` has already released ``_worker_lock`` and the propagating exception has
+released any sink lock.
+"""
+_orphan_lost = 0
+_in_span_lost = 0
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -728,6 +741,64 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         return FlushResult(ok=False, reason="thread-died")
 
 
+def _note_orphan_loss() -> None:
+    """Counts one event lost on the synchronous path (SPEC-036 FR-003).
+
+    Called from ``api._log``'s orphan ``except``, which wraps the span construction, the event
+    build, ``_ensure_sink`` and the emit — so a sink that failed to *construct* is counted here
+    too, which an increment placed after ``sink.emit`` would miss.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    global _orphan_lost
+    with _loss_lock:
+        _orphan_lost += 1
+
+
+def _note_in_span_loss() -> None:
+    """Counts one event lost while being built inside a span (SPEC-036 FR-003).
+
+    Separate from :func:`_note_orphan_loss` because the two aggregate different failure
+    populations: this path cannot fail at ``emit``, so a non-zero count here always means the
+    data, never the destination.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    global _in_span_lost
+    with _loss_lock:
+        _in_span_lost += 1
+
+
+def _read_losses() -> tuple[int, int]:
+    """Reads both loss counters under the lock they are written under.
+
+    Args:
+      None.
+
+    Returns:
+      The orphan and in-span loss counts, in that order.
+
+    Raises:
+      None.
+    """
+    with _loss_lock:
+        return _orphan_lost, _in_span_lost
+
+
 def _delivering_to_an_inherited_sink() -> bool:
     """Whether the sink this process last installed for delivery is one it may not release.
 
@@ -786,6 +857,12 @@ def _worker_health() -> Health:
     defines that count as submissions queued where nothing will drain them, and a later orphan
     log is refused at the closed sink and announced instead. The two are not the same claim.
 
+    The two loss counters are synthesized on **both** branches, for the reason ``retired`` is on
+    one: they describe the caller's own path, not the worker's, and ``Worker`` cannot report them
+    because it does not know they exist — ``worker.py`` imports nothing from this module, and the
+    reverse read would be a cycle. A process that only ever logged outside a span has no worker
+    and is exactly the process whose loss they exist to show (SPEC-036 FR-003 AC-7).
+
     The synthesis also survives a worker built *after* that shutdown, which is why it is an
     ``or`` rather than a fallback. An orphan-only ``shutdown()`` leaves ``_worker`` unset, so a
     later ``@trace`` constructs a fresh worker whose own ``retired`` is ``False`` — and reading
@@ -806,6 +883,7 @@ def _worker_health() -> Health:
       None.
     """
     worker = _worker
+    orphan_lost, in_span_lost = _read_losses()
     if worker is None:
         return Health(
             queued=0,
@@ -814,11 +892,14 @@ def _worker_health() -> Health:
             retired=_orphan_retired,
             closing_sinks=_lifecycle.closing_count(),
             inherited_sink=_delivering_to_an_inherited_sink(),
+            orphan_lost=orphan_lost,
+            in_span_lost=in_span_lost,
         )
     health = worker.health()
-    if _orphan_retired and not health.retired:
-        return replace(health, retired=True)
-    return health
+    retired = _orphan_retired or health.retired
+    return replace(
+        health, retired=retired, orphan_lost=orphan_lost, in_span_lost=in_span_lost
+    )
 
 
 def _flush(span: Span) -> None:
@@ -827,6 +908,16 @@ def _flush(span: Span) -> None:
     The worker is resolved or created via :func:`_get_worker`, whose sink comes from
     ``_ensure_sink``, so a zero-config ``@trace`` still falls back to ``StdoutSink`` rather
     than crashing.
+
+    **The buffer is detached, not handed over** (SPEC-036 FR-004). ``submit`` used to take the
+    live list, so a task outliving its parent span appended to a list the worker already owned:
+    under the flush interval the event was delivered but ordered after ``span.end``, and over it
+    silently lost — a pure race on a timer. The swap gives the worker the old list and leaves the
+    span a fresh one, so the outcome stops depending on timing. A copy would do the same and
+    allocates a second list per span on the hottest path in the library; the swap is free.
+
+    The late append is now landing in a buffer nothing will emit, which is *also* loss — that
+    half is ``api._log``'s, keyed on :attr:`Span.closed`.
 
     Args:
       span: The finished span whose buffered events are submitted.
@@ -837,7 +928,8 @@ def _flush(span: Span) -> None:
     Raises:
       Exception: Whatever creating the worker or submitting raises; :func:`_end` is the guard.
     """
-    _get_worker().submit(span.events)
+    events, span.events = span.events, []
+    _get_worker().submit(events)
 
 
 type _SpanScope = tuple[
@@ -947,6 +1039,12 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
     baggage known at their construction, empty for ``span.start``, so SPEC-015 completes them
     from the baggage live now, while the batch is still ours.
 
+    ``closed`` is set **before** the flush, not after (SPEC-036 FR-004). ``_flush`` can raise —
+    building the worker, or the queue path — and :func:`_end`'s guard absorbs it, so setting the
+    flag afterwards would leave it ``False`` on exactly the runs where a later append most needs
+    the orphan route. ``sinks/base.py`` settles the general form of this: set it before releasing
+    anything.
+
     Args:
       span: The span being closed.
       status: The span outcome, ``"ok"`` or ``"error"``.
@@ -961,6 +1059,7 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
     """
     span.events.append(end_event(span, status, exc))
     backfill_baggage(span, context._live_baggage())
+    span.closed = True
     _flush(span)
 
 

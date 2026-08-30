@@ -71,6 +71,24 @@ class DeadSink(QuietSink):
         raise SinkDeliveryError("delivered none")
 
 
+class FailingReporter(QuietSink):
+    """Fails *and* counts its own loss — what a sink satisfying SPEC-026 FR-001 does.
+
+    The case `MultiSink`'s per-child probe exists for: charging its events to the fan-out as
+    well would report every one of them twice.
+    """
+
+    def __init__(self) -> None:
+        self._failed = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        self._failed += len(batch)
+        raise SinkDeliveryError("delivered none")
+
+    def losses(self) -> SinkLosses | None:
+        return SinkLosses(dropped=0, failed=self._failed)
+
+
 def _span(name: str) -> list[dict[str, object]]:
     return [{"event": name}]
 
@@ -214,20 +232,202 @@ def test_multisink_aggregation_nests() -> None:
 
 
 def test_multisink_excludes_its_own_call_counter() -> None:
-    """``MultiSink.failed`` counts child *calls*; adding it to a per-event sum has no unit."""
+    """``MultiSink.failed`` still stays out of the sum, but the silent child no longer does.
+
+    ~~adding it to a per-event sum has no unit~~ — the half of this that was right, kept
+    (SPEC-036 FR-005 AC-4/AC-4a). ``failed`` counts child *calls*, so it is still excluded.
+    What was wrong was the consequence: this test asserted ``failed=6``, the reporting child's
+    figure alone, over a fan-out where a second destination had taken nothing at all. The dead
+    child is now counted in the unit the field actually has — events — so the total is 7.
+    """
     multi = MultiSink(DeadSink(), CountingSink(dropped=0, failed=6))
     multi.emit([{"a": 1}])  # a sibling took it, so a partial fan-out failure does not raise
-    assert multi.failed == 1, "the child call that raised was counted"
-    assert multi.losses() == SinkLosses(dropped=0, failed=6), "and excluded from the aggregate"
+    assert multi.failed == 1, "the child call that raised is still counted, in calls"
+    assert multi.losses() == SinkLosses(dropped=0, failed=7), (
+        "6 from the reporting child, 1 event from the silent one — not 6, and not 6 + a call"
+    )
 
 
 def test_a_fan_out_whose_children_all_report_nothing_reports_nothing() -> None:
-    """A tree of silent children has not given a clean bill of health (FR-003)."""
+    """A tree of silent children has not given a clean bill of health (FR-003).
+
+    Unchanged by SPEC-036 FR-005: this pins the case where nothing has been *lost*, and the
+    ``None`` there is still right. It is a silent child that has lost a batch which now reports,
+    which is the test below.
+    """
     assert MultiSink().losses() is None
     assert MultiSink(QuietSink(), QuietSink()).losses() is None
     assert MultiSink(QuietSink(), CountingSink()).losses() == SinkLosses(dropped=0, failed=0), (
         "one reporting child makes the total meaningful"
     )
+
+
+# --- SPEC-036 FR-005: a permanently dead child is visible ---------------------------------
+
+
+def test_a_permanently_dead_silent_child_reports_its_loss() -> None:
+    """AC-1. Measured before the fix: 9 events on the good child, 0 on the dead one, all zeros.
+
+    ``MultiSink.emit`` isolates the failing child and returns normally, which is right, so the
+    worker never retried and ``flush()`` read truthy. The only channel that said anything was a
+    stderr line per batch — the one surface this arc has repeatedly shown is not a monitor.
+    """
+    multi = MultiSink(QuietSink(), DeadSink())
+    for _ in range(3):
+        multi.emit([{"a": 1}, {"b": 2}])
+
+    losses = multi.losses()
+    assert losses is not None, "a fan-out losing every event to one child must not report None"
+    assert losses.failed == 6, "three batches of two events, all lost at the silent child"
+
+
+def test_a_healthy_fan_out_still_reports_zero() -> None:
+    """AC-6. The counter must not move on the success path."""
+    multi = MultiSink(QuietSink(), CountingSink(dropped=0, failed=0))
+    multi.emit([{"a": 1}, {"b": 2}])
+    assert multi.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_a_child_that_gains_losses_is_categorised_at_the_time_of_each_failure() -> None:
+    """AC-3. Silence is decided per call by ``read_losses``, not cached at construction.
+
+    The accrual happens at **emit** time, not when the aggregate is read, so what a child
+    *gaining* a ``losses()`` does is make the total **rise** — the events it lost while silent
+    stay charged to the fan-out, and it now adds its own on top. The spec's AC-3 was written
+    expecting a decision at aggregate time and recorded the consequence as a fall; that is the
+    wrong direction for this implementation, and the fall is reachable the other way, by a child
+    that *stops* reporting (see below). Caching the category at construction would be worse
+    still: a child would be permanently miscategorised.
+    """
+
+    class LateReporter(QuietSink):
+        """Silent until ``reporting`` is set, like a wrapper with no inner sink yet."""
+
+        reporting = False
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            raise SinkDeliveryError("delivered none")
+
+        def losses(self) -> SinkLosses | None:
+            return SinkLosses(dropped=0, failed=1) if self.reporting else None
+
+    child = LateReporter()
+    multi = MultiSink(QuietSink(), child)
+    multi.emit([{"a": 1}, {"b": 2}, {"c": 3}])
+
+    silent_total = multi.losses()
+    assert silent_total is not None and silent_total.failed == 3, "counted while silent"
+
+    child.reporting = True
+    reporting_total = multi.losses()
+    assert reporting_total is not None
+    assert reporting_total.failed == 4, (
+        "3 already accrued while it was silent, plus the 1 it now reports itself — a rise"
+    )
+
+
+def test_the_aggregate_can_fall_when_a_child_stops_reporting() -> None:
+    """AC-3's recorded consequence, in the direction it is actually reachable.
+
+    ``SinkLosses`` documents itself as cumulative for the sink's lifetime, and this total is not:
+    a child that stops reporting takes its own figure out of the sum. Recorded rather than
+    prevented, because the alternative is a category cached at construction.
+    """
+
+    class StopsReporting(QuietSink):
+        reporting = True
+
+        def losses(self) -> SinkLosses | None:
+            return SinkLosses(dropped=0, failed=4) if self.reporting else None
+
+    child = StopsReporting()
+    multi = MultiSink(child, CountingSink(dropped=0, failed=1))
+    before = multi.losses()
+    assert before is not None and before.failed == 5, "4 from the child, 1 from its sibling"
+
+    child.reporting = False
+    after = multi.losses()
+    assert after is not None and after.failed == 1, (
+        "5 -> 1: the child took its own figure out of the sum, so a total that documents itself "
+        "as cumulative for the sink's lifetime fell"
+    )
+
+
+def test_the_aggregate_does_not_double_count_a_reporting_child() -> None:
+    """AC-2. The exact total, with one reporting child and one silent one.
+
+    ``FailingReporter`` is the case the guard exists for and the one a first draft of this file
+    did not have: a child that **both fails and reports its own loss**. Every other child here
+    either succeeds (`CountingSink`) or fails while reporting ``None``, and against those the
+    per-child probe is unobservable — deleting it (`silent = True`) left the whole suite green.
+    Measured against a real `SyslogSink` on a closed port: 6 lost events read as 12.
+    """
+    multi = MultiSink(QuietSink(), FailingReporter(), DeadSink())
+    multi.emit([{"a": 1}, {"b": 2}, {"c": 3}, {"d": 4}])  # a sibling took it, so no total failure
+
+    assert multi.losses() == SinkLosses(dropped=0, failed=8), (
+        "4 the reporting child counted itself + 4 events at the silent one — not 12, which is "
+        "what charging the reporting child's events to the fan-out as well would give"
+    )
+    assert multi.failed == 2, "and the call counter still counts calls, both of them"
+
+
+def test_a_reporting_child_that_fails_is_never_charged_twice() -> None:
+    """AC-2 at the boundary: the fan-out must add **nothing** for a child that reports itself."""
+    multi = MultiSink(QuietSink(), FailingReporter())
+    multi.emit([{"a": 1}, {"b": 2}, {"c": 3}])
+
+    assert multi.losses() == SinkLosses(dropped=0, failed=3), (
+        "the child's own 3, and not a second 3 from the fan-out"
+    )
+
+
+def test_a_reporting_child_that_does_not_self_count_stays_invisible() -> None:
+    """The premise FR-005 rests on, made explicit rather than assumed.
+
+    The fix leaves a reporting child to report itself, which is only safe because a sink that
+    raises also counts. A child implementing ``losses()`` that raises *without* self-counting is
+    therefore invisible — it is not silent, so the fan-out adds nothing, and it reports zero.
+    That is a defect in such a child, not in the fan-out. The obligation is written down —
+    SinkLosses's own docstring in sinks/base.py requires the counter to move before the
+    total-failure raise, and every shipped sink with a losses() does increment first — but
+    Sink.losses's wording ("loss it absorbed") read alone would excuse a raising sink from
+    counting, so which sentence wins is exactly what this test depends on. Pinned here so a later
+    reader meets it as a decision rather than discovering it as a surprise.
+    """
+
+    class ReportsNothingUseful(QuietSink):
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            raise SinkDeliveryError("delivered none, and counts nothing")
+
+        def losses(self) -> SinkLosses | None:
+            return SinkLosses(dropped=0, failed=0)
+
+    multi = MultiSink(QuietSink(), ReportsNothingUseful())
+    multi.emit([{"a": 1}, {"b": 2}])
+
+    assert multi.losses() == SinkLosses(dropped=0, failed=0), (
+        "not a number this fan-out can invent: the child said it lost nothing"
+    )
+
+
+def test_a_failed_close_moves_no_event_counter() -> None:
+    """AC-2, the other direction: ``close()`` has no batch, so it cannot move an events counter.
+
+    A ``+1`` here would mix units in exactly the way that keeps ``failed`` out of the sum, and a
+    client buffer lost to a failed close is of unknown size. Recorded as a decision because the
+    obvious reading of "apply FR-005 to every failure path" gets this wrong.
+    """
+
+    class UncloseableSink(QuietSink):
+        def close(self) -> None:
+            raise SinkDeliveryError("close refused")
+
+    multi = MultiSink(UncloseableSink())
+    multi.close()
+
+    assert multi.failed == 1, "the failed close is counted, in calls"
+    assert multi.losses() is None, "but it invents no event count"
 
 
 # --- FR-004: the contract is on the interface --------------------------------------------

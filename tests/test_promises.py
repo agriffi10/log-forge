@@ -142,11 +142,16 @@ async def test_a_non_mapping_fields_argument_never_reaches_the_caller(path: str)
 # -- Promise 2: loss is visible ---------------------------------------------------------------
 # README "Reliability": "Silence is not success anywhere."
 
-P2_BROKEN = {
-    "orphan": "audit L6 / SPEC-034 FR-004 — the synchronous path has no worker to report "
-    "through, so health() reads all zeros over total loss",
-    "post_shutdown": "audit L6 — same synchronous path, after the worker is retired",
-}
+# ~~P2_BROKEN = {"orphan": "audit L6 / SPEC-034 FR-004 — the synchronous path has no worker to
+# report through, so health() reads all zeros over total loss", "post_shutdown": "audit L6 — same
+# synchronous path, after the worker is retired"}~~
+# Closed by SPEC-036 FR-003 on both paths: `Health` gains `orphan_lost`, which the synchronous
+# emit's own guard increments before it announces. Removing the markers was not enough — the
+# assertion below named the worker's three counters and a sink term, none of which a visible
+# `orphan_lost` satisfies, so both cells stayed red with the loss plainly reported. That is the
+# shape AC-16 exists to catch: a promise harness whose *predicate* has not learned the new
+# evidence still reads a fixed defect as broken.
+P2_BROKEN: dict[str, str] = {}
 
 
 @pytest.mark.parametrize("path", [_xfail(p, P2_BROKEN) for p in PATHS])
@@ -156,9 +161,14 @@ async def test_lost_events_are_visible_in_health(path: str) -> None:
     log_foundry.flush(timeout=2.0)
 
     h = log_foundry.health()
-    assert h.failed_batches or h.dropped or h.stopped_reason or (h.sink and h.sink.failed), (
-        f"events were lost on the {path} path and health() reports nothing: {h}"
-    )
+    assert (
+        h.failed_batches
+        or h.dropped
+        or h.stopped_reason
+        or h.orphan_lost
+        or h.in_span_lost
+        or (h.sink and h.sink.failed)
+    ), f"events were lost on the {path} path and health() reports nothing: {h}"
 
 
 # -- Promise 3: every emitted event is valid JSON ---------------------------------------------

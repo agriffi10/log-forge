@@ -110,6 +110,12 @@ def _reset_worker() -> None:
     later test's sink backing off not at all. ``_lifecycle._closers`` is now process-global, so a
     hung closer from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
+
+    SPEC-036 FR-003 adds the two loss counters. They are cumulative for the life of the process
+    and ``health()`` synthesizes them whether or not a worker exists, so a single test that loses
+    an event would otherwise leave every later test reading a non-zero ``orphan_lost`` — the exact
+    failure this fixture's first paragraph describes, on a field whose whole purpose is to be
+    believed.
     """
     try:
         from log_foundry import decorator
@@ -126,6 +132,9 @@ def _reset_worker() -> None:
         decorator._orphan_retired = False
     if hasattr(decorator, "_orphan_stop"):
         decorator._orphan_stop = threading.Event()
+    for counter in ("_orphan_lost", "_in_span_lost"):
+        if hasattr(decorator, counter):
+            setattr(decorator, counter, 0)
     try:
         from log_foundry import _lifecycle
     except ImportError:

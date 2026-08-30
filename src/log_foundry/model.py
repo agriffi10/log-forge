@@ -30,6 +30,12 @@ class Span:
     ``start_ts`` is a ``time.monotonic()`` reading rather than wall-clock, so
     ``duration_ms`` can never go negative across a clock change. ``defaults`` are per-
     decorator field overrides, and ``events`` is the queue flushed together at span end.
+
+    ``closed`` marks a span whose events have already been handed to the worker (SPEC-036
+    FR-004). ``contextvars`` copies the *same* ``Span`` object into every task created inside a
+    span, so a fire-and-forget ``create_task`` can outlive its parent and append to a buffer
+    nothing will emit again. It is read by ``api._log`` at append time, which is the only place
+    that can notice: nothing in the library looks at a span after ``_close_span`` returns.
     """
 
     trace_id: str
@@ -39,6 +45,7 @@ class Span:
     start_ts: float
     defaults: dict[str, object] = field(default_factory=dict)
     events: list[dict[str, object]] = field(default_factory=list)
+    closed: bool = False
 
 
 def _iso_now() -> str:

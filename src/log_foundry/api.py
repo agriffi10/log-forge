@@ -8,7 +8,7 @@ from log_foundry import _diag, context
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
 from log_foundry.context import set_baggage
-from log_foundry.decorator import _note_orphan_emit
+from log_foundry.decorator import _note_in_span_loss, _note_orphan_emit, _note_orphan_loss
 from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
 
@@ -71,6 +71,30 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     A guard that reads "this cannot fail" is a guard that stops being true when the code under
     it changes, and this one had already stopped.
 
+    **An append to a span that has already closed takes the orphan route** (SPEC-036 FR-004).
+    ``contextvars`` copies the same ``Span`` object into every task created inside a span, so a
+    fire-and-forget ``create_task`` can log after its parent returned — and since ``_flush``
+    detaches at submit, that append lands in a buffer nothing will ever emit. This is the only
+    place that can notice, because nothing in the library reads a span again after it closes; a
+    post-hoc check of the buffer has no observer. A span that has closed is not a span, so the
+    event becomes a fresh one-event span and inherits the orphan path's accounting entire —
+    delivered on success, ``orphan_lost`` on failure. The flag is read before the event is built
+    and the append happens after, so a thread *sharing* the span can still slip between the two and
+    strand its event in the post-swap list; that window is recorded in ``architecture.md`` §13
+    rather than closed, since closing it costs a per-span lock on the hottest path. That is why FR-004 adds no ``Health`` field
+    of its own, and why the destination is named here rather than left implied.
+
+    The cost is stated rather than hidden: the event gets a **fresh** ``trace_id``, so it leaves
+    its trace, not merely its span. ``contextvars`` cannot deliver the alternative once the span
+    is gone, and the choice is against losing the event outright.
+
+    **Both losses are counted, and counted apart** (SPEC-036 FR-003). Each guard records before it
+    announces, so the stderr line SPEC-025 already writes is unchanged and this adds a counter
+    rather than a second announcement. The orphan increment sits in the ``except`` rather than
+    after ``sink.emit``, which is what makes a sink that fails to *construct* count too. They stay
+    two fields because the populations differ: this branch can fail at the destination, the
+    in-span branch can only fail at the data.
+
     The echo runs after the emit, so a closed or redirected stream never costs the event itself.
 
     Args:
@@ -89,11 +113,12 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     baggage = context._live_baggage()
     span = context.current_span()
     event: dict[str, object] | None = None
-    if span is not None:
+    if span is not None and not span.closed:
         try:
             event = build_event(span, level, message, fields=fields, baggage=baggage)
             span.events.append(event)
         except Exception as exc:
+            _note_in_span_loss()
             _diag.absorbed("building an in-span log", exc, "the event was lost")
     else:
         try:
@@ -109,6 +134,7 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             _note_orphan_emit(sink)
             sink.emit([event])
         except Exception as exc:
+            _note_orphan_loss()
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")
     if echo and event is not None:
         try:
