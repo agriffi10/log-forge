@@ -1,7 +1,8 @@
 # log-foundry — Project Memory
 
-Loaded every session — keep it lean. Deep docs live in `docs/` and are pulled **on demand**:
-- `@docs/process.md` — how we work: spec lifecycle, session rhythm, completion ritual (read once)
+Loaded every session — keep it lean. Deep docs live in `docs/` and are pulled **on demand**, except
+`process.md`, which is the contract this file summarises:
+- `@docs/process.md` — how we work: spec lifecycle, session rhythm, completion ritual (**read every session**)
 - `@docs/architecture.md` — system design + Known Constraints / Non-goals (read the section you need)
 - `@docs/implementation-guide.md` — phase-by-phase build guide that mirrors architecture.md (reference)
 - `@docs/specs/INDEX.md` — the spec index + status (one row per spec)
@@ -754,6 +755,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 
 **Doc-size guardrail:** this is the always-loaded file — if an edit pushes a section past a few lines,
 the detail belongs in a `docs/` file behind a pointer. Same for `INDEX.md` (status rows only) and the
-component inventory. **Key Decisions is grouped by AREA and carries fences, not history** — it is not
-a per-spec changelog, and `## Specs` is not one either; both regrow by being appended to, one
-completion at a time. Full rule set: `@docs/process.md` §5 → *Anti-regrowth & doc hygiene*.
+component inventory. **Key Decisions should carry fences grouped by AREA, not history** — and today it
+does not: it and `## Specs` are both spec-ordered narrative, which is the changelog shape the rule
+forbids. Until they are regrouped, a completion **replaces or extends the clause for its area** rather
+than appending another entry. Full rule set: `@docs/process.md` §5 → *Anti-regrowth & doc hygiene*.

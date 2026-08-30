@@ -131,7 +131,9 @@ expensive of the two because the code that follows will faithfully implement it.
   finding has been either **fixed** or **flagged** — said out loud, so the call is visible and can be
   argued with. A finding silently dropped is a finding that was not reviewed; a finding rejected in
   one sentence is a finding that was. **Write a rejection down only when it carries a lesson worth
-  keeping** — then it belongs in the register or the spec, as reasoning, not as a paper trail.
+  keeping** — then it belongs in the spec, its delivery doc, or CLAUDE.md's Key Decisions, as
+  reasoning, not as a paper trail. (This repo has no separate `decisions.md`; Key Decisions is the
+  register, and `architecture.md` holds the reasoning behind it.)
 - **The reviewer gets the artifact and its sources, never the author's reasoning.** For a spec: the
   spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
   and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. For a
@@ -412,8 +414,11 @@ this way).
 - **A register is grouped by AREA; ordering it by spec number turns it into a changelog.** The
   question a reader arrives with is "what has been settled about X", never "what did SPEC-033
   decide". A register is the only home of the rejected alternatives and the fences, so a shape that
-  reads as disposable gets treated as disposable. Key Decisions and any decisions register **group by
-  the same areas**, so a reader who finds an area in one finds it in the other.
+  reads as disposable gets treated as disposable. **This is an obligation this repo has not yet
+  paid:** CLAUDE.md's Key Decisions is a flat spec-ordered list and `## Specs` is a paragraph per
+  completed spec, which is the changelog shape this rule names. Until they are regrouped, a
+  completion **replaces or extends the clause for its area** rather than appending another entry —
+  appending is what took the sibling repo's digest to its own byte ceiling and forced the regroup.
 - **When a doc moves, the pointers that rot unseen are in SOURCE files** — `.py` docstrings, `.toml`
   comments, `.yml` steps. A markdown-only sweep reports the tree clean. Grep the path, not the
   filename, and fix the Draft specs too: a Draft is an unbuilt instruction, and pointing one at a
@@ -424,8 +429,9 @@ this way).
 - **Status never appears in the heading of a doc whose status can change** — an arc, an
   `architecture.md` section, a register entry. It rots the day the next spec lands, and a reader who
   greps the heading gets an answer that was true once. Status lives in `INDEX.md` and the spec
-  header, which are the two places gated to agree. (A delivery doc's `# Completed Spec — …` title is
-  not this: it names a finished record whose status cannot change.)
+  header — the two places the completion ritual keeps in step **by hand**, since `spec-lint.sh` does
+  not compare them. (A delivery doc's `# Completed Spec — …` title is not this: it names a finished
+  record whose status cannot change.)
 - **A heading in a doc read by SUBJECT names the subject, not the spec that produced it** — that is
   `architecture.md` and the rulebooks, where a reader arrives asking "how does the worker shut down",
   never "what did SPEC-030 decide". The scope is deliberate and stops there: a decisions entry IS a
@@ -441,7 +447,8 @@ this way).
   other docs must match a greppable heading — "read the entry for your area" must be a jump, not a
   full-file read.
 - **Live findings and obligations never live in historical or cancelled narrative** — rehome them to
-  an active register and leave a pointer behind.
+  CLAUDE.md's Key Decisions or the relevant `architecture.md` section, and leave a pointer behind.
+  `docs/audits/` is history: a live obligation parked in a handoff doc is one nobody will read.
 
 ---
 
