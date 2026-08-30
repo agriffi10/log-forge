@@ -197,6 +197,15 @@ is FIFO, everything submitted before the call is necessarily ahead of that marke
 exactly why the guarantee is "events submitted before this call", and why concurrent
 submissions from other threads may or may not be included.
 
+**`flush()` also empties the sink's own client buffer**, when the sink has one. A sink that
+buffers in a driver rather than writing through — `KafkaSink` hands to librdkafka, `PubSubSink`
+appends an unresolved future, `SentrySink` hands to the SDK's background transport — used to be
+unreachable this way, so `flush()` could return truthy with events sitting in a client. If that
+client cannot be emptied the result is falsy with `reason="sink-flush"`, which is distinct from
+`"abandoned"`: the events are past this library and inside a driver. A **custom sink** that
+buffers should implement `flush()` — it is optional, probed by name, and a sink without one is
+unaffected.
+
 **`flush()` also sweeps the spans that are still open**, so an in-span event does not have to wait
 for its span to close to be delivered. The span stays open and usable afterwards: its events go
 now and its `span.end` arrives later, in its own batch. Two consequences worth knowing. Boundary

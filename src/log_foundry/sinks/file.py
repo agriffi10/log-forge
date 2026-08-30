@@ -71,6 +71,10 @@ class FileSink:
     concurrently (SPEC-028 FR-002) — this module claimed a single worker thread until that spec
     measured the orphan path emitting on application threads at the same time. Cross-*process*
     coordination remains out of scope: two processes appending to one path are on their own.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` flushes the stream before it
+    returns, so nothing of this sink's is left pending between calls.
     """
 
     def __init__(self, path: str, *, encoding: str = "utf-8") -> None:
@@ -211,6 +215,10 @@ class RotatingFileSink:
     damage: a second thread mid-``emit`` could write to the handle rotation had just closed, or
     to the pre-rotation file it had already renamed away. Both are serialized on a lock
     (SPEC-028 FR-002).
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` flushes the stream before it
+    returns, so nothing of this sink's is left pending between calls.
     """
 
     def __init__(

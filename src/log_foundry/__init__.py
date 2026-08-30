@@ -44,7 +44,8 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
       A :class:`FlushResult`. Truthy when the events submitted before this call reached the
       sink — so a truthy result means they were delivered, not merely that a drain took place.
       Falsy carries a ``reason`` naming which outcome occurred: ``"timed-out"``, ``"retired"``,
-      ``"thread-died"``, ``"queue-full"`` or ``"abandoned"``. It is falsy rather than ``False``:
+      ``"thread-died"``, ``"queue-full"``, ``"abandoned"`` or ``"sink-flush"`` — the last meaning
+      the queue drained but the sink could not empty its own client buffer (SPEC-036 FR-002). It is falsy rather than ``False``:
       ``if flush():`` is unchanged, but ``flush() is True`` can no longer hold, which is why the
       type had to change before ``1.0.0`` rather than after (SPEC-034 FR-007). Events submitted
       concurrently by another thread may or may not be included, since the caller cannot have

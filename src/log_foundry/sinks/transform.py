@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
-from log_foundry.sinks.base import read_losses
+from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
     import threading
@@ -27,6 +27,13 @@ class TransformSink:
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
     belong to the inner sink. A guard here would refuse batches the inner sink would have taken.
+
+
+    It holds **no** client buffer of its own, but it **forwards** ``flush()`` to what it wraps
+    (SPEC-036 FR-002). Holding nothing is not the same as having nothing to do: a wrapper that
+    did not forward would leave a buffering child unreachable through ``log_foundry.flush()``
+    while looking fine — the SPEC-027 lesson about ``log_foundry_stop_signal``, that a signal
+    stopped at a wrapper reaches nothing and moves the defect rather than fixing it.
     """
 
     def __init__(
@@ -114,6 +121,25 @@ class TransformSink:
                 err,
                 f"{type(self._inner).__name__} stays uninterruptible",
             )
+
+    def flush(self) -> None:
+        """Forwards the flush to the wrapped sink (SPEC-036 FR-002).
+
+        This wrapper holds nothing itself, but a wrapper that did not forward would leave a
+        buffering inner sink unreachable through ``log_foundry.flush()`` while looking fine —
+        the SPEC-027 lesson that a signal stopped at a wrapper reaches nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the wrapped sink raises, so the failure reaches the caller as a
+            ``FlushResult`` reason rather than being swallowed here.
+        """
+        flush_sink(self._inner)
 
     def losses(self) -> SinkLosses | None:
         """Reports the inner sink's losses (SPEC-026 FR-002).

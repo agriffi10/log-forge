@@ -34,6 +34,10 @@ class _RedisSink:
     command, so a batch emitted after ``shutdown()`` opened a connection nothing would ever
     reap — the same leak SPEC-028's review found in ``RabbitMQSink``, whose ``_active_channel``
     reopened whatever ``close()`` had released.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
     """
 
     def __init__(self, *, client: Any, url: str | None, max_retries: int) -> None:
@@ -172,7 +176,11 @@ class _RedisSink:
 
 
 class RedisStreamsSink(_RedisSink):
-    """Appends each event to a Redis stream via ``XADD``, pipelined per batch (FR-005)."""
+    """Appends each event to a Redis stream via ``XADD``, pipelined per batch (FR-005).
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
+    """
 
     def __init__(
         self,
@@ -235,7 +243,11 @@ class RedisStreamsSink(_RedisSink):
 
 
 class RedisListSink(_RedisSink):
-    """Pushes each event onto a Redis list via ``RPUSH``, pipelined per batch (FR-005)."""
+    """Pushes each event onto a Redis list via ``RPUSH``, pipelined per batch (FR-005).
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
+    """
 
     def __init__(
         self,

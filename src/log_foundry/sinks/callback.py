@@ -22,6 +22,11 @@ class CallbackSink:
     (SPEC-032 FR-003). Both decisions belong to the callable: this class holds nothing, and what
     a hook releases is not knowable from here — a callable needing either guarantee must provide
     it, exactly as a hand-written ``Sink`` implementation would.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): it hands each event to a *function*, which
+    has returned by the time ``emit`` does. Unlike the three wrapper sinks it wraps no sink, so
+    there is nothing to forward a flush to.
     """
 
     def __init__(

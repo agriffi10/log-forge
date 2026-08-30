@@ -201,6 +201,10 @@ class HTTPSink:
     And it **adds no post-close guard** (SPEC-032 FR-003), because ``close()`` releases nothing —
     a batch emitted afterwards still reaches the endpoint, and refusing it would be loss the
     library invented rather than loss it reported.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = DEFAULT_MAX_BATCH_COUNT

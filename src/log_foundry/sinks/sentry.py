@@ -122,6 +122,45 @@ class SentrySink:
                 f"SentrySink delivered none of {attempted} qualifying event(s)"
             )
 
+    def flush(self) -> None:
+        """Pushes the Sentry SDK's own transport queue, which nothing else here ever does.
+
+        SPEC-036 FR-002, and a case SPEC-042's measured roster of five did not reach: that roster
+        was derived from what a *refused close* costs, and :meth:`close` releases nothing here, so
+        this sink never appeared in it. ``capture_event`` hands to the SDK's **background
+        transport** and returns, so without this hook an event accepted by Sentry's client was
+        unreachable through ``log_foundry.flush()`` and went out only when the SDK's own timer or
+        interpreter exit got to it.
+
+        Only the injected-or-imported SDK client has a queue. The ``urllib`` fallback posts an
+        envelope per event and holds nothing, so with no client this is correctly a no-op.
+
+        ``Client.flush`` is probed by name, as every optional member the library calls on an object
+        it does not own is: a stand-in ``client=`` satisfying only ``capture_event`` stays valid,
+        which is what the injected-client tests use.
+
+        **It cannot report a failure, and that is the SDK's shape rather than a choice here.**
+        ``sentry_sdk.Client.flush`` logs a warning and returns ``None`` when its own timeout
+        expires, so a queue the SDK just gave up on is indistinguishable from one it drained, and
+        ``log_foundry.flush()`` reports success either way. Recorded rather than worked around: the
+        alternatives are reading a private attribute or timing the call, and both would invent a
+        verdict the SDK declines to give.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the SDK raises while flushing.
+        """
+        if self.client is None:
+            return
+        flush = getattr(self.client, "flush", None)
+        if callable(flush):
+            flush()
+
     def close(self) -> None:
         """Forwards to the HTTP fallback, whose own close releases nothing (FR-012).
 

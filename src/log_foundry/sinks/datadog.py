@@ -28,6 +28,10 @@ class DatadogSink(HTTPSink):
         sink in the family whose per-event limit is stricter than its request limit, so without
         it a 2 MB event passes the 5 MB request budget and is rejected by a limit the budget
         cannot see. All three are the vendor's own figures, from the Logs API's send-logs limits.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = 1000

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+from log_foundry import _diag
+
 __all__ = ["LoggingSink"]
 
 _LEVELS = {
@@ -41,6 +43,14 @@ class LoggingSink:
     and this sink holds nothing else. And it **adds no post-close guard** (SPEC-032 FR-003) —
     ``close()`` is a no-op by design, since tearing down handlers this sink did not configure is
     not its to do, so a later batch still reaches the framework.
+
+
+    Its transport is the **handler chain**, and it forwards ``flush()`` onto it (SPEC-036
+    FR-002). A first pass filed this alongside ``MemorySink`` and ``NullSink`` as having nothing
+    underneath, which is wrong: ``logging.Handler.flush`` exists precisely because handlers
+    buffer, ``logging.handlers.MemoryHandler`` does nothing else, and ``QueueHandler`` and most
+    third-party handlers are the same shape. Measured against a ``MemoryHandler``: three events
+    emitted, nothing on the stream, and everything on it after one ``flush()``.
     """
 
     def __init__(
@@ -78,6 +88,47 @@ class LoggingSink:
         """
         for event in batch:
             self._logger.handle(self._to_record(event))
+
+    def flush(self) -> None:
+        """Flushes the logger's handlers, and its ancestors' unless propagation is off.
+
+        The handler chain is this sink's transport, so this walks it the way ``logging`` itself
+        dispatches a record — the current logger's handlers, then each ancestor's, stopping where
+        ``propagate`` is ``False``. Anything else would flush a handler the events never reached,
+        or miss the one they did.
+
+        Every handler is attempted before anything is raised, and then the first failure is —
+        ``MultiSink.flush``'s rule, for its reason: one broken handler must not leave a healthy
+        one downstream of it unflushed. Failures are **not** absorbed, because a handler that
+        could not flush is a client buffer that did not go out, which ``log_foundry.flush()``
+        reports as ``reason="sink-flush"``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: The first handler's exception, when any handler could not be flushed.
+        """
+        first_error: Exception | None = None
+        logger: logging.Logger | None = self._logger
+        while logger is not None:
+            for handler in logger.handlers:
+                try:
+                    handler.flush()
+                except Exception as err:
+                    if first_error is None:
+                        first_error = err
+                    _diag.absorbed(
+                        "flushing a logging handler",
+                        err,
+                        f"{type(handler).__name__} still holds records",
+                    )
+            logger = logger.parent if logger.propagate else None
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
         """Does nothing, since the sink does not own the user's logging configuration (FR-005).

@@ -147,6 +147,11 @@ def test_flush_is_unchanged_on_the_orphan_path() -> None:
     A process whose only loss was synchronous has nothing outstanding to drain, so `flush()` is
     truthy and *should* be. Cumulative loss is `health()`'s job, which is why FR-003 added a
     counter rather than changing this. Pinned so a later reader does not "fix" it.
+
+    Qualified by SPEC-036 FR-002, which is the one thing that can now make this call falsy on the
+    orphan path: a sink with a client buffer of its own is flushed here too, and if *that* fails
+    the result carries `reason="sink-flush"`. `Exploding` has no `flush`, so the claim above still
+    holds exactly as written for it — the qualifier is about which sink, not about the loss.
     """
     log_foundry.configure(service="t", sink=Exploding())
     log_foundry.info("lost synchronously")

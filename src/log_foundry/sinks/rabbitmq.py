@@ -33,6 +33,12 @@ class RabbitMQSink:
     event is published as a persistent message to the configured exchange and routing key, and a
     dropped or closed connection is re-established within a bounded retry. The worst-case delay
     (SPEC-027 FR-005) is ``max_retries`` interruptible waits per message, 0.7 s at the defaults.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``basic_publish`` writes the frame
+    before it returns, so nothing is queued locally between emits. This sink does not enable
+    publisher confirms, so "written" is not "acknowledged" — but that is a delivery-guarantee
+    question, not a buffer a flush could empty.
     """
 
     def __init__(

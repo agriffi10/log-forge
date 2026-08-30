@@ -28,6 +28,10 @@ class SplunkHECSink(HTTPSink):
         it is ``max_content_length`` on the receiving instance, so there is no vendor figure to
         cite and the default is chosen rather than documented. Raise it with
         ``max_batch_bytes=`` to match your deployment.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = 1000

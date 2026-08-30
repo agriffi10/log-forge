@@ -6,7 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
-from log_foundry.sinks.base import SinkLosses, read_losses
+from log_foundry.sinks.base import SinkLosses, flush_sink, read_losses
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
@@ -36,6 +36,13 @@ class MultiSink:
     ``close()`` here only forwards, so a guard added at this level would refuse batches the
     children would have taken, while a child that must refuse already does and is counted here
     like any other failure.
+
+
+    It holds **no** client buffer of its own, but it **forwards** ``flush()`` to what it wraps
+    (SPEC-036 FR-002). Holding nothing is not the same as having nothing to do: a wrapper that
+    did not forward would leave a buffering child unreachable through ``log_foundry.flush()``
+    while looking fine — the SPEC-027 lesson about ``log_foundry_stop_signal``, that a signal
+    stopped at a wrapper reaches nothing and moves the defect rather than fixing it.
     """
 
     def __init__(self, *sinks: Sink) -> None:
@@ -154,6 +161,44 @@ class MultiSink:
                     err,
                     f"{type(sink).__name__} stays uninterruptible",
                 )
+
+    def flush(self) -> None:
+        """Forwards the flush to every child, so a buffering one is actually reached.
+
+        SPEC-036 FR-002. Without this a ``MultiSink(StdoutSink(), KafkaSink(...))`` — the
+        composition the README itself shows — left every Kafka message in librdkafka's buffer
+        while ``log_foundry.flush()`` reported success: measured, 0 on the wire and 3 in the
+        client. That is the SPEC-027 shape exactly, where a stop signal set on a wrapper reached
+        nothing.
+
+        Every child is attempted before anything is raised, so one failing child cannot stop a
+        healthy sibling being drained — the isolation :meth:`emit` applies, for the same reason.
+        The raise rule is **different** from ``emit``'s, and deliberately: ``emit`` raises only on
+        total failure because the worker retries a raised batch and a partial retry duplicates.
+        Nothing retries a flush, and the caller asked whether everything is out, so **any** child
+        that could not be drained makes the answer no.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: The first child's exception, when any child could not be flushed.
+        """
+        first_error: Exception | None = None
+        for sink in self._sinks:
+            try:
+                flush_sink(sink)
+            except Exception as err:
+                if first_error is None:
+                    first_error = err
+                _diag.absorbed(
+                    "flushing a MultiSink child", err, f"{type(sink).__name__} still holds events"
+                )
+        if first_error is not None:
+            raise first_error
 
     def losses(self) -> SinkLosses | None:
         """Sums the children's losses so a fan-out reports the whole tree (SPEC-026 FR-002).

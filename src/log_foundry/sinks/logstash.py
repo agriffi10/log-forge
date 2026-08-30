@@ -44,6 +44,11 @@ class LogstashSink:
     ``SinkDeliveryError`` and reopens nothing, while in HTTP mode ``close()`` released nothing
     and the batch still ships. Both are the backend's answer, correctly, rather than one this
     class invents on top.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` hands its bytes to the
+    socket before it returns, and no client object outlives it holding data. What the *network*
+    then does with a datagram is not something a flush could hurry.
     """
 
     def __init__(

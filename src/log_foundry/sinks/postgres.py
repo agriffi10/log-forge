@@ -32,6 +32,11 @@ class PostgresSink:
     ``commit`` publishes the other's half-written batch, and its ``rollback`` on a failure
     discards rows the other had already inserted and is about to report as delivered. A lock
     gives the sequence the exclusivity it was written for.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` commits its own transaction, so
+    nothing is uncommitted once it returns. The commit in ``close`` is belt and braces, not a
+    buffer.
     """
 
     def __init__(

@@ -118,6 +118,10 @@ class SocketTransport:
       failed: Messages abandoned past the reconnect-retry bound.
       dropped_oversized: UDP datagrams discarded before any send for exceeding
         ``max_datagram_bytes``.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``send_all`` puts the bytes on the
+    socket before it returns, and no client object outlives it holding data.
     """
 
     def __init__(

@@ -6,7 +6,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-__all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "read_losses"]
+__all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "flush_sink", "read_losses"]
 
 
 class SinkDeliveryError(Exception):
@@ -142,6 +142,24 @@ class Sink(Protocol):
     the call an operator makes when a destination is already hanging, and sharing one lock
     would make that poll wait for an in-flight emit and its retry backoff. Where a sink holds
     both, the order is always transport then counter, never the reverse.
+    A sixth is optional in the same way: ``flush() -> None``, which drains whatever the sink is
+    holding in its **client** without closing it (SPEC-036 FR-002). A sink that buffers in a
+    driver rather than writing through — ``KafkaSink`` hands to librdkafka, ``GooglePubSubSink``
+    appends an unresolved future — is unreachable through ``log_foundry.flush()`` without it:
+    measured against a stand-in with that shape, ``flush() -> True``, on the wire 0, in the
+    client buffer 3, ``health()`` all zeros. It is called **after** the queue drain, so the
+    queue's events have reached the client buffer before it is emptied.
+
+    It is **not a close**, and the difference is the whole point: the sink keeps its transport and
+    goes on accepting events afterwards. Like :meth:`emit` it must tolerate being called
+    concurrently with an emit (SPEC-028), and like :meth:`emit` it must **raise** when it could
+    not deliver what it was holding — that is the only channel by which ``log_foundry.flush()``
+    can report ``reason="sink-flush"`` instead of success. :func:`flush_sink` is the probe, and it
+    deliberately does **not** behave like :func:`read_losses`: that one swallows a raising
+    accessor because a broken reporter must not take ``health()`` down, while this one propagates,
+    because a swallowed flush failure is exactly the "sink the worker believes" this file exists
+    to prevent.
+
     """
 
     @abstractmethod
@@ -260,3 +278,32 @@ def read_losses(sink: object) -> SinkLosses | None:
     except Exception:
         return None
     return losses if isinstance(losses, SinkLosses) else None
+
+
+def flush_sink(sink: object) -> bool:
+    """Calls a sink's optional ``flush()``, letting any failure propagate (SPEC-036 FR-002).
+
+    The sibling of :func:`read_losses`, written here for the same reason — the probe and its
+    guarantees belong in one place — and with the **opposite** failure rule, which is the part
+    worth reading twice. ``read_losses`` swallows a raising accessor because a broken reporter
+    must not take ``health()`` down with it. This one must not swallow anything: a sink's flush
+    failure reaches the caller only through ``log_foundry.flush()``'s result, so absorbing it here
+    would produce the exact "sink the worker believes" this module exists to prevent — a
+    ``flush()`` reporting success over a client buffer that never went out.
+
+    Args:
+      sink: The sink to probe, of any type.
+
+    Returns:
+      Whether the sink had a ``flush`` to call. ``False`` means it holds nothing of its own, and
+      the queue drain was the whole of the flush.
+
+    Raises:
+      Exception: Whatever the sink's ``flush`` raises, deliberately unguarded. The caller turns
+        it into a ``FlushResult`` reason; see ``decorator._flush_live_sink``.
+    """
+    accessor = getattr(sink, "flush", None)
+    if not callable(accessor):
+        return False
+    accessor()
+    return True

@@ -19,6 +19,10 @@ class NullSink:
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): there is no transport and ``close()`` releases nothing, so discarding a
     batch after close is the same operation as discarding one before it.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): there is no transport under it for a flush
+    to push anything onto.
     """
 
     def __init__(self) -> None:

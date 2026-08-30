@@ -38,6 +38,10 @@ class ElasticsearchSink(HTTPSink):
         bulk guidance is to find a working size by experiment rather than to send the largest
         request the server will accept, and a 100 MB bulk is a poor default for a log shipper.
         Raise it with ``max_batch_bytes=``.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = 1000
@@ -201,4 +205,8 @@ class OpenSearchSink(ElasticsearchSink):
     """OpenSearch reuses the Elasticsearch ``_bulk`` protocol verbatim (FR-003).
 
     Endpoint and auth differ only by configuration, so this is a straight reuse.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """

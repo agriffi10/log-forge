@@ -22,6 +22,7 @@ from log_foundry.ids import (
 )
 from log_foundry.model import Span, backfill_baggage, end_event, start_event
 from log_foundry.results import ContinueResult, FlushResult
+from log_foundry.sinks.base import flush_sink
 from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health, Worker
 
 if TYPE_CHECKING:
@@ -836,6 +837,44 @@ def _sweep_open_spans() -> None:
             worker.submit(buffered)
 
 
+def _flush_live_sink() -> bool:
+    """Drains whatever the delivering sink holds in its own client (SPEC-036 FR-002).
+
+    Called **after** the queue drain, because the queue's events have to reach the client buffer
+    before it is emptied. A sink with no ``flush`` of its own is unaffected, which is what keeps
+    every pre-SPEC-036 sink satisfying the protocol.
+
+    Which sink is asked follows the ownership rule the rest of this module uses (SPEC-033): a
+    live worker's sink if there is one, otherwise the sink an orphan emit actually **reached**.
+    Not "a sink has been resolved" — ``configure()`` runs ``_ensure_sink()`` unconditionally, so a
+    bare ``configure(service=...)`` has already built a ``StdoutSink`` that nothing was ever
+    written to, and materialising a flush against it is the cost SPEC-031 FR-006 declined for the
+    close path for the same reason. So a ``flush()`` in a process that has never logged touches
+    no sink, which is what FR-001 AC-6 needs to stay true.
+
+    Args:
+      None.
+
+    Returns:
+      Whether the sink's own flush succeeded. ``True`` also when there was no sink to ask, or
+      when it holds nothing of its own.
+
+    Raises:
+      None. A failure is reported as a ``FlushResult`` reason by the caller, never raised: a
+        flush is the call most likely to be made in a ``finally``.
+    """
+    worker = _worker
+    sink = worker.sink if worker is not None and not worker.retired else _orphan_sink
+    if sink is None:
+        return True
+    try:
+        flush_sink(sink)
+    except Exception as exc:
+        _diag.absorbed("flushing the sink's own buffer", exc, "its client still holds events")
+        return False
+    return True
+
+
 def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     """Drains the process worker without retiring it, backing ``flush()`` (SPEC-013 FR-003).
 
@@ -859,6 +898,12 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
       exact shape the spec was written to remove. The drain still runs, so whatever was
       submitted before the failure is not held back by it.
 
+    The sink's own buffer is drained **whichever way the earlier steps went**, and the failure
+    reasons are decided afterwards. A draft returned early on a failed sweep or a dead drain
+    thread, which skipped it — and by then ``worker.flush`` had already pushed the queue *into*
+    that buffer, so the events most worth saving before a freeze were the ones left there. The
+    reason reported is the most upstream failure, because that is the one to fix.
+
     Raises:
       None. A flush is the call most likely to be made in a ``finally``, so the library must
         never be the reason a caller's function fails; a failure is reported by the return
@@ -871,15 +916,21 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
         swept = False
     worker = _worker
-    if worker is None:
-        return FlushResult(ok=True) if swept else FlushResult(ok=False, reason="abandoned")
-    try:
-        if swept:
-            return worker.flush(timeout)
-        worker.flush(timeout)
-    except Exception:
+    drained: FlushResult = FlushResult(ok=True)
+    thread_died = False
+    if worker is not None:
+        try:
+            drained = worker.flush(timeout)
+        except Exception:
+            thread_died = True
+    sink_drained = _flush_live_sink()
+    if not swept:
+        return FlushResult(ok=False, reason="abandoned")
+    if thread_died:
         return FlushResult(ok=False, reason="thread-died")
-    return FlushResult(ok=False, reason="abandoned")
+    if not sink_drained:
+        return FlushResult(ok=False, reason="sink-flush")
+    return drained
 
 
 def _note_orphan_loss() -> None:
