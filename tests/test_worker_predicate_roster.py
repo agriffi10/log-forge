@@ -316,6 +316,22 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         EXISTENCE,
         "health() creates no worker; the zeros describe a process that never logged.",
     ),
+    ("_sweep_open_spans", "_get_worker()", 0): (
+        LIVENESS,
+        (
+            "who *performs* the submit of a swept buffer. It is a binding rather than a "
+            "predicate, filed by the question it feeds: `worker.submit(buffered)`. Deliberately "
+            "not existence — `_get_worker` answers that by construction, building one when none "
+            "exists, which is SPEC-036 FR-001 narrowing SPEC-013's refusal for a sweep that "
+            "found events. A retired worker still performs nothing here and the submission is "
+            "counted in `submitted_after_shutdown` (SPEC-030), which is the documented "
+            "behaviour for logging after shutdown rather than a case this site decides. It is "
+            "bound rather than called inline because it must be resolved **before** the buffer "
+            "is detached: `_get_worker` can raise out of `Thread.start()`, and a detach that "
+            "already happened leaves the events in a discarded local — measured, 3 of 4 "
+            "destroyed with `flush()` reporting success and every counter zero."
+        ),
+    ),
     ("_worker_health", "_orphan_retired or health.retired", 0): (
         LIVENESS,
         (

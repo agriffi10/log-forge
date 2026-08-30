@@ -60,6 +60,13 @@ shutdown's event has every backoff collapsed to zero.
 """
 _orphan_retired = False
 
+_sweep_lock = threading.Lock()
+"""Serializes the span sweep, so two threads cannot deliver one span's buffer twice.
+
+The detach is a load and a store, and ``contextvars`` copies the same ``Span`` object into every
+task and into any ``copy_context()`` thread, so the two-reader case is ordinary rather than exotic
+(SPEC-036 FR-001 AC-10). A flush is not a hot path; a sink lock it is not competing with.
+"""
 _loss_lock = threading.Lock()
 """Guards the two loss counters, and deliberately not ``_worker_lock`` (SPEC-036 FR-003 AC-5).
 
@@ -197,6 +204,14 @@ def continue_trace(
         _diag.rejected("parent_span_id given with no trace_id to join", parent_span_id)
         announced = True
 
+    if adopted is not None and _current_span_was_swept():
+        _diag.rejected(
+            "the current span has already been flushed; trace context refused",
+            traceparent if traceparent is not None else str(trace_id),
+        )
+        adopted = None
+        announced = True
+
     if adopted is not None:
         context.set_adopted_context(*adopted)
         _reparent_current_span(*adopted)
@@ -212,6 +227,32 @@ def continue_trace(
     if adopted is not None:
         return ContinueResult(ok=True)
     return ContinueResult(ok=False, reason="rejected" if announced else "nothing-supplied")
+
+
+def _current_span_was_swept() -> bool:
+    """Reports whether an in-span ``flush()`` has already shipped this span's events.
+
+    Read from ``context.current_span()`` — what :func:`_reparent_current_span` itself reads —
+    **and only when that span is a root**, which is the other half of that function's own guard.
+    A swept *child* is not a reason to refuse: the re-parent would have returned early on it and
+    rewritten nothing, so a refusal there prevents no corruption. It would still be wrong to
+    refuse — the two guards must agree, or the refusal fires where the thing it guards does not
+    run — though the adoption it spares reaches less than it appears to: SPEC-024 clears the
+    adopted context at the **root** span's close, so one made inside a child does not survive to
+    the next root span either. ``continue_trace``'s documented placement on the entry
+    point's first line is untouched either way: nothing has been swept that early.
+
+    Args:
+      None.
+
+    Returns:
+      Whether the current span is a root that has been swept.
+
+    Raises:
+      None.
+    """
+    span = context.current_span()
+    return span is not None and span.parent_span_id is None and span.swept
 
 
 def _reparent_current_span(trace_id: str, parent_span_id: str | None) -> None:
@@ -712,33 +753,133 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
         _orphan_sink = new_sink
 
 
+def _sweep_open_spans() -> None:
+    """Hands the worker every event buffered on an open span in this context (SPEC-036 FR-001).
+
+    An in-span event lives on ``span.events`` until the span *closes*, and ``Worker.flush``
+    drains the *queue* — so a ``flush()`` called inside a ``@trace``d function, which is where
+    the README's serverless recipe put it, had by construction nothing to drain. Measured: zero
+    of two events delivered, every counter clean, and ``FlushResult`` reporting ``reason=None``.
+
+    The span stays **open**: its events go now and its ``span.end`` arrives later in its own
+    batch. Closing and reopening was rejected — it would emit a ``span.end`` the function never
+    reached, with a fabricated ``duration_ms`` and ``status``.
+
+    Two things must happen before the events leave, and both are why this is not a one-liner.
+    The boundary events are backfilled **first**, because SPEC-015 completes them at close by
+    iterating ``span.events`` and a swept buffer would ship ``span.start`` with ``fields={}`` —
+    the very defect that spec exists to fix, recreated by any in-span flush. They therefore carry
+    the baggage as of the flush rather than as of the close, which is a real semantic change and
+    the alternative is mutating an event the worker already owns (SPEC-028). And the buffer is
+    **detached by swap**, never cleared: ``clear()`` empties the same list object the worker was
+    handed.
+
+    The worker is created when there is something to submit, and **resolved before the buffer is
+    detached**. That ordering is the whole of the difference between a lost batch and a delivered
+    one: ``_get_worker`` can raise — it ends in ``Thread.start()`` — and a detach that has already
+    happened leaves the events in a discarded local while the span reads empty and ``flush()``
+    reports success. Measured with the failure injected: 3 of 4 events destroyed, every counter
+    zero, on a span that was still open and would have delivered them at its close.
+    ``Worker.submit`` raises nothing, so once it is reached the batch is safe. Creating the worker
+    at all narrows SPEC-013's refusal rather than contradicting it — that exists so an *empty*
+    flush does not stand up a thread, and a sweep that found buffered events is not an empty
+    flush. A cold-start Lambda flushing before it returns is exactly this case: the worker is
+    built when the first span *closes*, so inside the first traced call there is none.
+
+    Concurrent sweeps are serialized on ``_sweep_lock``. The detach is a load and a store with a
+    real gap between them, and two threads sharing one ``Span`` — which ``contextvars`` makes
+    ordinary — can both read the same buffer and deliver it twice: measured, all 8 events
+    duplicated with the window held open, and 9 of 25 runs with only a GIL yield between them.
+    Rarely preempted on today's build is not a guarantee, and the floor is ``>=3.12`` where a
+    free-threading build removes even that. A flush is not a hot path, so a single lock is the
+    right cost.
+
+    **The detach stays one statement, and the two orderings above are not in tension.** A draft
+    hoisted the load to the top of the loop so a test could park on it — which put
+    ``_get_worker()``, and therefore ``Thread.start()``, *inside* the load-to-store gap: measured,
+    a sweep racing a close then delivered the whole batch twice, two ``span.end`` events among
+    them, in 67 of 100 unforced trials against 0 before.
+
+    One statement makes that gap **narrow, not closed**, and the difference matters. It compiles
+    to ``LOAD_ATTR … STORE_ATTR`` with no ``CALL`` between, so CPython's eval breaker never runs
+    there and today's GIL cannot switch inside it — 0 of 500 unforced trials. Forced with an
+    opcode-level preemption it reproduces 10 of 10, and a free-threaded build removes the
+    accident entirely while ``requires-python`` has no upper bound. So :func:`_flush` takes this
+    same lock rather than relying on the width of a window: that is the *detach-vs-detach* race,
+    and a process-global lock is the right instrument for it. The **append** race
+    (``api._log`` versus a detach) is a different window needing a per-span lock, and
+    ``architecture.md`` §13 declines it on cost.
+
+    It reaches only the calling context's spans. ``contextvars`` offers no way to enumerate
+    another thread's or task's context, so a ``flush()`` in a handler that fanned out does not
+    reach what those tasks buffered.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      Exception: Whatever building the worker raises. :func:`_flush_worker` guards it, because a
+        flush is the call most likely to be made in a ``finally``.
+    """
+    with _sweep_lock:
+        for span in context._live_span_stack():
+            if not span.events:
+                span.swept = True
+                continue
+            worker = _get_worker()
+            backfill_baggage(span, context._live_baggage())
+            span.swept = True
+            buffered, span.events = span.events, []
+            worker.submit(buffered)
+
+
 def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     """Drains the process worker without retiring it, backing ``flush()`` (SPEC-013 FR-003).
 
-    This deliberately does not call :func:`_get_worker`: a process that never logged has
-    nothing to drain, and building a worker — with the thread and ``atexit`` registration
-    that brings — in order to flush nothing would be pure cost.
+    ~~This deliberately does not call :func:`_get_worker`~~ — narrowed by SPEC-036 FR-001. The
+    refusal still holds for an *empty* flush: a process that never logged has nothing to drain,
+    and building a worker — with the thread and ``atexit`` registration that brings — in order to
+    flush nothing would be pure cost. What changed is that :func:`_sweep_open_spans`, which runs
+    first, does build one when it finds buffered events on an open span, because submitting them
+    into a worker that does not exist delivers nothing and still reports success.
 
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
     Returns:
       A :class:`FlushResult`, truthy when everything outstanding was delivered and when no
-      worker exists — a process that never logged has nothing to drain, so it has lost
-      nothing.
+      worker exists — a process that never logged has nothing to drain, so it has lost nothing.
+      A sweep that could not hand its buffers over reports ``"abandoned"``, the existing token
+      for "this call did not deliver them" (SPEC-036 FR-001): the events are still on their open
+      spans and their close may yet carry them, but the caller asked *now*, and on the
+      cold-start path this exists for there may be no close — reporting success there is the
+      exact shape the spec was written to remove. The drain still runs, so whatever was
+      submitted before the failure is not held back by it.
 
     Raises:
       None. A flush is the call most likely to be made in a ``finally``, so the library must
         never be the reason a caller's function fails; a failure is reported by the return
         value instead (FR-003).
     """
+    swept = True
+    try:
+        _sweep_open_spans()
+    except Exception as exc:
+        _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
+        swept = False
     worker = _worker
     if worker is None:
-        return FlushResult(ok=True)
+        return FlushResult(ok=True) if swept else FlushResult(ok=False, reason="abandoned")
     try:
-        return worker.flush(timeout)
+        if swept:
+            return worker.flush(timeout)
+        worker.flush(timeout)
     except Exception:
         return FlushResult(ok=False, reason="thread-died")
+    return FlushResult(ok=False, reason="abandoned")
 
 
 def _note_orphan_loss() -> None:
@@ -919,6 +1060,14 @@ def _flush(span: Span) -> None:
     The late append is now landing in a buffer nothing will emit, which is *also* loss — that
     half is ``api._log``'s, keyed on :attr:`Span.closed`.
 
+    It takes ``_sweep_lock`` for the detach, because :func:`_sweep_open_spans` performs the same
+    detach on the same attribute and a span can be swept and closed concurrently — measured, the
+    whole batch delivered twice with two ``span.end`` events among them. The hold covers one
+    statement and not the submit; ``Worker.submit`` is a ``put_nowait`` that never blocks, and the
+    cost of the lock on the traced path measured within noise (+0.4% single-threaded, +0.9% across
+    eight threads, 20,000 spans each). The **append** window this does not close is a different
+    one, needs a per-span lock, and is declined in ``architecture.md`` §13.
+
     Args:
       span: The finished span whose buffered events are submitted.
 
@@ -928,7 +1077,8 @@ def _flush(span: Span) -> None:
     Raises:
       Exception: Whatever creating the worker or submitting raises; :func:`_end` is the guard.
     """
-    events, span.events = span.events, []
+    with _sweep_lock:
+        events, span.events = span.events, []
     _get_worker().submit(events)
 
 

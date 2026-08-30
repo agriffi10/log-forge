@@ -417,6 +417,26 @@ know about spans or context.
 
 *(Decision: background, non-blocking flush.)*
 
+**An explicit `flush()` drains two places, not one** (SPEC-036 FR-001): the worker's queue, and
+the events still buffered on spans open in the **calling context**. Without the second, a
+`flush()` made inside a `@trace`d function had by construction nothing to drain — an in-span
+event lives on `span.events` until the span closes — so the serverless recipe the README
+published delivered nothing while every counter read clean.
+
+The sweep leaves each span open, hands its buffer to the worker by **swap** (clearing would empty
+the same list object the worker was just handed), and completes the boundary events' baggage
+*before* they leave, because SPEC-015 does that at close by iterating `span.events`. A swept
+`span.start` therefore carries the baggage as of the flush rather than as of the close, which is a
+real semantic change and the alternative is mutating an event the worker already owns (§9.2,
+SPEC-028). It builds the worker when it has something to submit, which narrows SPEC-013's
+"a process that never logged has nothing to drain" rather than contradicting it.
+
+Its bound is the calling context, and that is honest rather than incidental: `contextvars` offers
+no way to enumerate another thread's or task's context. A span swept this way is marked, and a
+later `continue_trace()` on it refuses the trace context rather than re-parenting a buffer whose
+events have already left — otherwise one span carries two trace ids, which is the SPEC-024
+category of wrong data rather than lost data.
+
 ```
 decorated call ends
    │  enqueue finished span's events  (fast, in-process handoff)
@@ -783,7 +803,33 @@ constraint — never by being deleted quietly.
   neither counter moving. Two asyncio *tasks* cannot reach it, because they cannot interleave
   inside a synchronous `_log`. It is recorded rather than closed because the fix is a per-span lock
   on the hottest path in the library, and the exposure is a shared-span thread logging at the exact
-  instant of close. What it cannot keep is its correlation: it becomes a standalone one-event span with
+  instant of the detach.
+
+  **SPEC-036 FR-001 widens this from the close to any flush.** The sweep performs the same detach
+  on an **open** span, so `span.closed` is `False` and the orphan route the paragraph above relies
+  on never engages — a racing append lands in the post-swap buffer and is delivered only if that
+  span is swept or closed again. The character of the exposure changes with it: a close happens
+  once per span, while FR-001 exists precisely so a long-lived span can be flushed in a loop. The
+  window is still load-then-store on one attribute.
+
+  **Two windows are involved and they take different fixes, which an earlier note conflated.** The
+  *detach-vs-detach* race — a sweep and a close both rebinding `span.events` — is closed:
+  `_sweep_lock` is taken by both `_sweep_open_spans` and `_flush`. One statement made that gap
+  narrow rather than closed (no `CALL` between the load and the store, so today's GIL cannot switch
+  inside it: 0 of 500 unforced trials, 10 of 10 with an opcode-level preemption), and
+  `requires-python` has no upper bound, so a free-threaded build removes the accident. The lock
+  costs +0.4% single-threaded and +0.9% across eight threads on the traced path, which is noise.
+  The *append* race above — `api._log` reading the flag, building, then appending — is the one that
+  stays open: closing it needs a **per-span** lock on the hottest path in the library, which is a
+  different instrument and a real cost, and it is declined here rather than in passing.
+
+  `Span.swept` is not a synchronization primitive either, and the guarantee it carries is
+  single-threaded. `continue_trace` reads it and then re-parents across an ordinary function call,
+  so a sweep landing in that gap still splits one span across two trace ids — reproduced 10 of 10
+  when forced, 0 of 400 unforced, and reachable only with a shared span plus a concurrent
+  `continue_trace` and `flush()`. The flag is now set *before* the detach, which narrows the
+  reader's window and errs toward refusing, but only a lock held across the guard and the re-parent
+  would close it. What it cannot keep is its correlation: it becomes a standalone one-event span with
   a **fresh `trace_id`**, so it leaves the trace it was logically part of, not merely the span.
   `contextvars` offers no way to recover the parent once the span is gone, and the choice is
   against losing the event outright. Ordering is not promised either. A task whose logs must stay
