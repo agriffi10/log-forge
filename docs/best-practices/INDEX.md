@@ -2,12 +2,12 @@
 
 Domain coding rulebooks for agents. **Read this index first**, then open only the one doc — and only
 the section(s) — your task needs. Each doc is a token-efficient, self-contained agent reference with
-its **own internal index**; never load a whole doc you don't need. This index is a **router, not
-content** — keep it to one screen.
+its **own internal index** — open the doc and read that, rather than trusting a section range
+repeated here, which rots silently. This index is a **router, not content** — keep it to one screen.
 
-| Domain | Doc | Load when you are… | Internal index |
-|---|---|---|---|
-| Python (3.13; PEP 8 + PEP 257/484/526 + Google Python Style Guide) | `python/python.md` | writing or refactoring any Python — style, naming, types, exceptions, docstrings, threading/`contextvars` | §1–§15 (Tooling → Modules & power features; §14 docstrings are the primary source of context, keep inline comments sparse) |
+| Domain | Doc | Load when you are… |
+|---|---|---|
+| Python (3.13; PEP 8 + PEP 257/484/526 + Google Python Style Guide) | `python/python.md` | writing or refactoring any Python — style, naming, types, exceptions, docstrings, threading/`contextvars` |
 
 ## How to use
 
