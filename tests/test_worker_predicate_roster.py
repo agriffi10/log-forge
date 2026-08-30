@@ -193,6 +193,28 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "counted only predicates would not notice."
         ),
     ),
+    ("_delivering_to_an_inherited_sink", "_worker", 0): (
+        EXISTENCE,
+        (
+            "which of the three delivery targets to ask about, for Health.inherited_sink "
+            "(SPEC-042 FR-004 AC-3). Existence, not liveness, and the distinction bites: a "
+            "*retired* worker still holds the sink this process last delivered through, and "
+            "whether that sink was inherited is exactly what the field reports. Answering it "
+            "with liveness would fall through to the orphan record after shutdown() and "
+            "describe a different object than the one the events went to. No worker is created "
+            "to answer it, the same refusal _worker_health and _flush_worker already make."
+        ),
+    ),
+    ("_delivering_to_an_inherited_sink", "worker.sink if worker is not None else _orphan_sink or _live_config().sink", 0): (
+        EXISTENCE,
+        (
+            "the same question, consuming the snapshot the row above took rather than "
+            "re-reading the global - a re-read could see _get_worker assign between the two "
+            "and report on a sink that is not the one the first branch selected. The three "
+            "candidates are in delivery order because SPEC-033 measured them disagreeing, and "
+            "AC-1 requires the field to name which one it describes."
+        ),
+    ),
     ("_swap_sink", "worker is not None", 0): (
         LIVENESS,
         (

@@ -273,6 +273,15 @@ satisfies the protocol.
 - [ ] AC-3: `KafkaSink` and `GooglePubSubSink` implement it; `KafkaSink.flush` passes a timeout
       and **counts the remainder it returns** (which is the exact number still queued), and
       `GooglePubSubSink.flush` resolves its outstanding futures and counts failures.
+- [ ] AC-3a (**handed over by SPEC-042 FR-006 AC-5**): the roster is **five**, not the two named
+      above. SPEC-042 measured what a *refused* close costs from the shipped `close()` bodies —
+      `KafkaSink` and `GooglePubSubSink` do not deliver their buffer, `NATSSink` does not drain
+      its loop, and `SQLiteSink` and `PostgresSink` do not **commit**. A forked child now refuses
+      to close a sink it inherited, so for those five the child's pending work has no route out
+      at all until this hook exists; the last two leave inserts uncommitted on a connection the
+      parent also holds, which is the safer of the two outcomes but not a good one. Whether all
+      five implement the hook or only some is this spec's decision — what SPEC-042 hands over is
+      the measured roster, so the choice is not made against a list of two.
 - [ ] AC-4: A `sink.flush()` that fails follows the SPEC-026 rule — total failure raises so
       `log_foundry.flush()` reports `False`; absorbed partial loss goes to `losses()`.
 - [ ] AC-5: `sinks/base.py` documents it beside `losses()`, including that it must be safe to
@@ -511,7 +520,8 @@ class Sink(Protocol):
     def emit(self, batch: list[dict[str, object]]) -> None: ...
     def close(self) -> None: ...
     # optional, probed by name: losses(), log_foundry_stop_signal, flush(), and
-    # discard_buffered_after_fork() (SPEC-039 FR-004)
+    # reacquire_after_fork() (SPEC-039 FR-004; renamed and its contract restated by
+    #   SPEC-042 FR-005 — returning from it claims the transport as this process's own)
 ```
 
 ## Implementation Phases

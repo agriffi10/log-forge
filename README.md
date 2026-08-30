@@ -491,18 +491,26 @@ A few conventions hold across every sink below:
   open for you to manage.
 - **Forking.** A forked child repairs the library automatically — it rebuilds the worker so it keeps
   delivering, re-initialises every lock (without which the child's *first* log call can deadlock),
-  and throws away any buffered bytes it inherited so they are not written twice. What it does **not**
-  do is give the child a sink of its own: the child inherits the same object, so one socket, one
-  SQLite handle or one file is now written by two processes — and *closed* by both, each at its own
-  exit. That is fine for an append-only file or a queue client and wrong for a connection with
-  transaction scope, where a close is protocol-visible. **Under gunicorn, uWSGI or Celery, build a
-  connection-holding sink only in the worker process** — `configure()` from gunicorn's `post_fork`
-  hook, never under preload, and don't log from the master. Reconfiguring in the child is *not* the
-  remedy and is worse than the problem: `configure(sink=...)` closes the sink it replaces, which
-  there is the parent's live connection. A master that must log should use a sink whose `close()`
-  costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote yourself is repaired
-  only if it subclasses `Sink` or a shipped sink; one that satisfies the protocol structurally is
-  outside the repair, along with any third-party client's own locks and buffers.
+  and re-opens any buffered stream it inherited so the parent's pending bytes are not written twice.
+  What it does **not** do is give the child a sink of its own: the child inherits the same object, so
+  one socket, one SQLite handle or one file is now written by two processes. It will generally not
+  be *closed* by both — the library records which process it was handed each sink in, and a child
+  refuses to close one it inherited — but a shared connection is still a shared connection, and
+  there are two exceptions below.
+  **Under gunicorn, uWSGI or Celery, build a connection-holding sink in the worker process:**
+  `configure()` from gunicorn's `post_fork` hook rather than under preload, and don't log from the
+  master. Reconfiguring in the child is harmless **for a sink the library was handed in this
+  process** — but if the master *built* a connection sink and never called `configure()` with it,
+  a child that then does is the first process to hand it over, so it owns it and closes it at exit.
+  That is the one case the record cannot decide, and it is the case this advice avoids. A master
+  that must log should use a
+  sink whose `close()` costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote
+  yourself is repaired only if it subclasses `Sink` or a shipped sink; one that satisfies the
+  protocol structurally is outside the repair, along with any third-party client's own locks and
+  buffers. The second exception: if you subclass a shipped sink **and add a transport of your
+  own**, override `reacquire_after_fork()` — inheriting it claims the whole object on the strength
+  of re-opening only the part the parent class knows about, after which the child *will* close
+  your connection.
 - **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
   delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
@@ -915,6 +923,8 @@ if (
 
 `closing_sinks` is deliberately not a term here: it is briefly non-zero during a perfectly healthy
 sink swap, so a single reading is not a fault. Watch it over time instead — see the table below.
+`inherited_sink` is not a term either, for a different reason: it reports a *state* the process is
+in rather than a loss it took, and in a prefork deployment it is `True` on every worker by design.
 
 They tell you different things, and they want different responses:
 
@@ -927,6 +937,7 @@ They tell you different things, and they want different responses:
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
+| `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter, and the only field that falls as well as rises. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
 
 `h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when

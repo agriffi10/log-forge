@@ -12,7 +12,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from log_foundry import _diag, _fork, _lifecycle, context
-from log_foundry.config import _ensure_sink
+from log_foundry.config import _ensure_sink, _live_config
 from log_foundry.ids import (
     is_valid_span_id,
     is_valid_trace_id,
@@ -504,7 +504,7 @@ def _close_orphan_sink() -> None:
         _orphan_sink = None
         _orphan_closed_sink = owed
     try:
-        owed.close()
+        _lifecycle.release(owed)
     except Exception as exc:
         _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
@@ -637,7 +637,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             _offer_orphan_signal(new_sink)
             if _worker is None or _worker.sink is not old:
                 _orphan_closed_sink = old
-                closer = _lifecycle.close_detached(old)
+                closer = _lifecycle.release(old, detached=True)
     if worker is not None:
         try:
             worker_holds_sink = worker.swap_sink(new_sink, timeout)
@@ -728,6 +728,47 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         return FlushResult(ok=False, reason="thread-died")
 
 
+def _delivering_to_an_inherited_sink() -> bool:
+    """Whether the sink this process last installed for delivery is one it may not release.
+
+    Answerable with **no worker**, which is what makes it truthful in a process that only ever
+    logs outside a span — the same refusal :func:`_worker_health` already makes for ``retired``,
+    and for the same reason: standing up a thread to answer ``health()`` is forbidden.
+
+    The three candidates are asked in delivery order: the worker's sink if a worker exists,
+    else the sink an orphan emit reached, else the configured one. SPEC-033's measured
+    disagreement is worker-versus-config, which the **first** term already covers — and the
+    second cannot currently produce a distinct answer, because with no worker ``_orphan_sink``
+    is either ``None`` or the same object the config holds (``_swap_sink`` re-points both, and
+    where it returns early the record is ``None``). It is kept rather than removed, and recorded
+    rather than tested: every other orphan-path read in this module treats ``_orphan_sink`` as
+    the authority on which sink an emit reached, and dropping it here would make one site read
+    the config while its neighbours read the record — resting on a property of ``_swap_sink``'s
+    current body that nothing states as an invariant. A test would have to arrange an
+    unreachable state by hand, which is the fixture-built vacuity this repo keeps finding.
+
+    With no sink resolved at all there is nothing installed and nothing inherited, so the answer
+    is ``False`` rather than a guess.
+
+    Args:
+      None.
+
+    Returns:
+      Whether that one sink carries another process's ownership record.
+
+    Raises:
+      None. ``health()`` is a diagnostic and must not be the reason a caller fails; an
+        unanswerable question reports ``False``, the same direction as a process that never
+        forked.
+    """
+    try:
+        worker = _worker
+        sink = worker.sink if worker is not None else (_orphan_sink or _live_config().sink)
+        return sink is not None and not _lifecycle.releasable(sink)
+    except Exception:
+        return False
+
+
 def _worker_health() -> Health:
     """Snapshots the process worker's counters, or zeros if none was ever created.
 
@@ -772,6 +813,7 @@ def _worker_health() -> Health:
             failed_batches=0,
             retired=_orphan_retired,
             closing_sinks=_lifecycle.closing_count(),
+            inherited_sink=_delivering_to_an_inherited_sink(),
         )
     health = worker.health()
     if _orphan_retired and not health.retired:

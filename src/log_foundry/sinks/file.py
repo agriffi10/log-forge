@@ -124,8 +124,8 @@ class FileSink:
                 self._stream.write(json.dumps(event) + "\n")
             self._stream.flush()
 
-    def discard_buffered_after_fork(self) -> None:
-        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+    def reacquire_after_fork(self) -> None:
+        """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
 
         ``emit`` writes a whole batch into a **buffered** stream and flushes once at the end, so
         a fork landing inside it leaves both processes holding the same pending bytes and both
@@ -137,6 +137,11 @@ class FileSink:
         one thread here by construction, and the lock was re-initialised moments earlier, so
         taking it could only wait on a holder that cannot exist. A hook that blocks here blocks a
         child that has not yet returned from ``fork``, where no watchdog can reach it.
+
+        A **closed** sink returns without re-acquiring anything, which is a trivially true claim
+        rather than an empty one: there is no transport left to hold, so nothing a later close
+        could destroy. Stated because ``sinks/base.py`` says returning normally *is* the claim,
+        and this is the one shipped sink that can return having done nothing.
 
         Args:
           None.
@@ -290,10 +295,10 @@ class RotatingFileSink:
                 self._size += data
             self._stream.flush()
 
-    def discard_buffered_after_fork(self) -> None:
-        """Throws away the parent's unflushed bytes in a forked child (SPEC-039 FR-004).
+    def reacquire_after_fork(self) -> None:
+        """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
 
-        Identical to :meth:`FileSink.discard_buffered_after_fork` and measured on this class
+        Identical to :meth:`FileSink.reacquire_after_fork` and measured on this class
         too, because the window is the same one: a whole batch written into a buffered stream
         and flushed once at the end.
 

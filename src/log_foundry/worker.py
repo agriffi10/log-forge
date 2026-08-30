@@ -128,6 +128,22 @@ class Health:
         still holds its resources. It is deliberately a live read rather than a count of expired
         joins: a slow close and a stuck one are indistinguishable at the moment a join expires,
         and SPEC-028 reverted a design that guessed.
+      inherited_sink: Whether the sink this process **last installed for delivery** is one it
+        may not release — one it inherited across a ``fork`` (SPEC-042 FR-004). "Last
+        installed", not "would deliver to now": after ``shutdown()`` the process delivers
+        nowhere, and reporting ``True`` there is the point rather than a wrinkle, since an
+        inherited sink left open at exit is exactly what this explains. **The referent is one
+        object, named
+        here because SPEC-033 measured three candidates disagreeing**: the worker's sink if a
+        worker exists, else the sink the orphan path recorded, else the configured one. It
+        describes that object and *not* the graph beneath it, so a child that wraps an
+        inherited sink in a ``MultiSink`` of its own reads ``False`` here while the wrapper's
+        child is still refused — stated because the opposite reading is the natural one.
+        It is a **state, not a fault**, and deliberately not a term in the documented alert
+        idiom, which is the call ``closing_sinks`` got. It explains a handle still open after
+        ``shutdown()``, and it is the signal that a deployment shares a sink across a fork at
+        all. ``True`` for a shared ``StdoutSink`` too, whose ``close()`` only flushes — so a
+        ``True`` is not by itself evidence that anything is held.
     """
 
     queued: int
@@ -139,6 +155,7 @@ class Health:
     submitted_after_shutdown: int = 0
     incomplete_swaps: int = 0
     closing_sinks: int = 0
+    inherited_sink: bool = False
 
 
 class _FlushMarker:
@@ -543,6 +560,7 @@ class Worker:
             submitted_after_shutdown=submitted_after_shutdown,
             incomplete_swaps=incomplete_swaps,
             closing_sinks=_lifecycle.closing_count(),
+            inherited_sink=not _lifecycle.releasable(self.sink),
         )
 
     def _sink_losses(self) -> SinkLosses | None:
@@ -790,7 +808,7 @@ class Worker:
             wait this method exists to remove, in the one situation where the process is
             already under resource pressure.
         """
-        closer = _lifecycle.close_detached(sink)
+        closer = _lifecycle.release(sink, detached=True)
         if closer is not None:
             closer.join(timeout)
 
@@ -1009,7 +1027,7 @@ class Worker:
           None.
         """
         try:
-            self.sink.close()
+            _lifecycle.release(self.sink)
         except Exception as exc:
             _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 

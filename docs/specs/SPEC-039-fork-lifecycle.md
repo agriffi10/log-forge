@@ -231,7 +231,9 @@ which is the caller's sink to share, where this is the library's own sink duplic
 bytes.
 
 The mechanism is measurement 3: `os.dup2(devnull_fd, stream.fileno())` then reopen the path in
-append mode. The hook is probed by name (`discard_buffered_after_fork`) and documented next to
+append mode. The hook is probed by name (`discard_buffered_after_fork` — renamed to
+`reacquire_after_fork` by SPEC-042 FR-005, which restated its contract as a claim of ownership;
+the name here is what this spec shipped and is kept per SPEC-021) and documented next to
 `read_losses` in `sinks/base.py` — the same optional-protocol shape as `losses()`, so no existing
 sink stops satisfying `Sink`.
 
@@ -321,6 +323,7 @@ def register_child_handler(fn: Callable[[], None]) -> None: ...
 
 # src/log_foundry/sinks/base.py — one more optional member, probed by name
 #   optional: losses(), log_foundry_stop_signal, flush() (SPEC-036), discard_buffered_after_fork() (FR-004)
+#   ^ renamed reacquire_after_fork() by SPEC-042 FR-005; kept here as shipped
 ```
 
 ## Implementation Phases

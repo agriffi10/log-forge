@@ -1,7 +1,7 @@
 # Spec: Forked-Child Sink Ownership
 
 **ID:** SPEC-042  
-**Status:** Draft  
+**Status:** Completed  
 **Last Updated:** 2026-08-11  
 **Depends On:** SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039
 
@@ -147,6 +147,14 @@ Three properties, each load-bearing:
 - **No record means refused.** The default is the whole point of the spec: every gap must fail
   toward the leak, never toward the destructive close. A sink the library was never handed was
   never its to release.
+  **Amended in delivery, escalated and approved:** every *lifecycle* path stamps, so this flat
+  default only ever fired where a **user** closed a wrapper the library had never been handed —
+  silently turning `FilteringSink(inner).close()` into a no-op, which is the failure mode this
+  arc exists to remove. What shipped: an unrecorded sink inherits the answer from the wrapper
+  releasing it, so neither-recorded is the caller's own graph and closes, while a *recorded*
+  wrapper may not release an unrecorded member (which keeps AC-6). What makes the relaxation
+  safe is that a forked child marks everything it inherited **before any handler runs**, so
+  "unrecorded" is unclaimable there rather than merely unreleasable. See the delivery doc.
 - **A strong reference beside the id**, since an id is reusable once its object dies, and a
   garbage-collected sink closes itself — the same destructive close by another route.
   `_fork._fresh_primitive` already uses that pairing for the same reason.
@@ -169,6 +177,10 @@ Three properties, each load-bearing:
 - [ ] AC-6: A sink with **no record at all** is refused, and a test names the case — one added to a
       wrapper after `configure()` ran. The consequence is a leak and is recorded in §13 (FR-006);
       a default of releasable is what this criterion exists to forbid.
+      **Amended in delivery** (see the FR-001 note above): the criterion's *named case* holds
+      exactly as written — a wrapper the library holds may not release an unrecorded member — but
+      the general sentence does not. A sink no wrapper of the library's is releasing is the
+      caller's own object and closes; refusing there was the silent no-op the amendment removes.
 - [ ] AC-7: The record holds a strong reference: a test proves an inherited sink is not
       garbage-collected in the child while the record stands.
 - [ ] AC-8: The parent's records are untouched, asserted by identity (SPEC-039 FR-001 AC-3).
@@ -408,11 +420,21 @@ committing there writes into a transaction the parent may be mid-way through.
 
 ```python
 # src/log_foundry/_lifecycle.py — process-global, as the closer registry already is
+# As shipped. `owner=` and `_mark_inherited` are the FR-001 amendment recorded above; the
+# original block said `releasable(sink) -> bool  # no record means False`, which is kept in that
+# note rather than left here, since this is the most copyable statement of the contract.
 def stamp(sink: object) -> None: ...          # configure()/_ensure_sink(), over the reachable
                                               # sink graph; never overwrites another pid's stamp
 def reclaim(sink: object) -> None: ...        # FR-005: the hook returned, so it is ours now
-def releasable(sink: object) -> bool: ...     # stamped for this pid; **no record means False**
-def release(sink: object, *, detached: bool = False) -> threading.Thread | None: ...
+def _mark_inherited() -> None: ...            # a fork handler; marks everything inherited
+                                              # _FOREIGN so "no record" is unclaimable in a child
+def releasable(sink: object, *, owner: object = None) -> bool: ...
+    # Stamped for this pid. An *unrecorded* sink inherits the answer from the wrapper releasing
+    # it — no wrapper, or an unrecorded one, means the caller's own object — and only while the
+    # child's marking walk completed: the shipped test is
+    # `owner_record is None and not _marking_failed`, and that second term is what makes the
+    # relaxation safe when the walk could not finish.
+def release(sink: Sink, *, detached: bool = False, owner: object = None) -> threading.Thread | None: ...
     # The one close path (FR-002). Returns the closer thread for a detached release, and
     # None both when the release was refused and when an inline close completed —
     # the two are distinguished by `releasable`, which callers already have to consult.
