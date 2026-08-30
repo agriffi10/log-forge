@@ -55,6 +55,27 @@ def current_span() -> Span | None:
     return stack[-1] if stack else None
 
 
+def _live_span_stack() -> tuple[Span, ...]:
+    """Returns every span open on this context, outermost first (SPEC-036 FR-001).
+
+    The library's non-copying read, named as :func:`_live_baggage` is and distinguished from the
+    public accessors for the same reason (SPEC-034 FR-003): a caller gets a copy, the library
+    reads the live object. There is nothing to copy here in any case — the stack is a tuple, so
+    handing it out cannot let anyone mutate it. :func:`current_span` returns only the innermost,
+    which is what an event needs and not what a sweep does.
+
+    Args:
+      None.
+
+    Returns:
+      Every span open on this context, outermost first. Empty when none is.
+
+    Raises:
+      None.
+    """
+    return _span_stack.get()
+
+
 def push_span(span: Span) -> contextvars.Token[tuple[Span, ...]]:
     """Pushes a span onto the stack.
 

@@ -197,6 +197,15 @@ is FIFO, everything submitted before the call is necessarily ahead of that marke
 exactly why the guarantee is "events submitted before this call", and why concurrent
 submissions from other threads may or may not be included.
 
+**`flush()` also sweeps the spans that are still open**, so an in-span event does not have to wait
+for its span to close to be delivered. The span stays open and usable afterwards: its events go
+now and its `span.end` arrives later, in its own batch. Two consequences worth knowing. Boundary
+events swept this way carry the baggage as of the **flush** rather than as of the close, since
+that completion has to happen before they leave. And the sweep reaches only the **calling
+context's** spans — `contextvars` offers no way to enumerate another thread's or task's context,
+so a `flush()` in a handler that fanned out to tasks does not reach what those tasks have
+buffered; their events arrive when their own spans close.
+
 ## Usage
 
 ### `configure(...)`

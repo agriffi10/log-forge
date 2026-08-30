@@ -547,8 +547,15 @@ documentation commit that stops the wrong recipe being copied.
 
 ### Phase 1: FR-003, then FR-004 **entire**
 
-The detach comes **first of the sweep work**, not fourth: FR-001's sweep is unsafe without it,
-because clearing a buffer the worker was handed by reference destroys the events. FR-003 rides with
+The detach comes **first of the sweep work**, not fourth. ~~FR-001's sweep is unsafe without it,
+because clearing a buffer the worker was handed by reference destroys the events.~~ — corrected
+while building Phase 2: that overstates a hazard as a dependency. The sweep detaches at **its own**
+submit site (`events, span.events = span.events, []`), so it needs nothing from FR-004; what is
+true is that writing it as `submit(span.events)` then `.clear()` destroys the events, which is a
+hazard of one phrasing rather than a missing prerequisite. The order still holds for a different
+reason: FR-004 settles who may take a span's buffer and when, and landing it first means the
+sweep's detach is written against a settled rule rather than inventing a second one in the same
+diff. FR-003 rides with
 it — the orphan counter carried from SPEC-034 and already reviewed, together with SPEC-037's
 `in_span_lost`, designed as a pair here — and clears the last two `xfail` cells, proving the
 harness's `strict=True` mechanism end to end.

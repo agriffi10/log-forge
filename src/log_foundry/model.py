@@ -36,6 +36,18 @@ class Span:
     span, so a fire-and-forget ``create_task`` can outlive its parent and append to a buffer
     nothing will emit again. It is read by ``api._log`` at append time, which is the only place
     that can notice: nothing in the library looks at a span after ``_close_span`` returns.
+
+    ``swept`` marks a span whose buffered events an in-span ``flush()`` has already handed to the
+    worker (SPEC-036 FR-001). Nothing in the delivery path needs it — the sweep is correct without
+    it — but ``continue_trace`` does: ``_reparent_current_span`` adopts a context by rewriting the
+    events still *buffered* on the open root span, and swept events have left that buffer, so an
+    adoption after a sweep would leave one span carrying two trace ids. That is the SPEC-024
+    category, wrong data rather than lost data, so the flag lets the adoption refuse instead.
+
+    The guarantee is **single-threaded**. The flag is not a synchronization primitive:
+    ``continue_trace`` reads it and then re-parents across an ordinary function call, so a sweep
+    arriving in that gap still splits the span. It is set before the detach so a concurrent reader
+    errs toward refusing, and the residual is recorded in ``architecture.md`` §13.
     """
 
     trace_id: str
@@ -46,6 +58,7 @@ class Span:
     defaults: dict[str, object] = field(default_factory=dict)
     events: list[dict[str, object]] = field(default_factory=list)
     closed: bool = False
+    swept: bool = False
 
 
 def _iso_now() -> str:
