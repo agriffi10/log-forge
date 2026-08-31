@@ -45,7 +45,7 @@ to status only — no prose.
 | [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Completed | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
 | [SPEC-039](SPEC-039-fork-lifecycle.md) | Fork Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035 |
 | [SPEC-040](SPEC-040-lifecycle-ownership.md) | Lifecycle Ownership — One Owner for the Worker and the Sink | Draft | SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039 |
-| [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | Draft | SPEC-026, SPEC-027, SPEC-038 |
+| [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | In Progress | SPEC-026, SPEC-027, SPEC-038 |
 | [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039 |
 
 ## Arcs (build order)
