@@ -40,7 +40,7 @@ to status only — no prose.
 | [SPEC-033](SPEC-033-orphan-path-sink-handoff.md) | Orphan-Path Sink Handoff | Completed | SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031 |
 | [SPEC-034](SPEC-034-public-api-freeze.md) | The Public API Freeze | Completed | SPEC-026, SPEC-030, SPEC-033 |
 | [SPEC-035](SPEC-035-shutdown-and-fork-lifecycle.md) | Shutdown Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033 |
-| [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | In Progress | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037 |
+| [SPEC-036](SPEC-036-flush-and-buffer-visibility.md) | Flush and Buffer Visibility | Completed | SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037 |
 | [SPEC-037](SPEC-037-caller-safety-and-serialization.md) | Caller Safety and Serialization | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-034 |
 | [SPEC-038](SPEC-038-sink-correctness.md) | Sink Correctness | Completed | SPEC-018, SPEC-026, SPEC-027, SPEC-032 |
 | [SPEC-039](SPEC-039-fork-lifecycle.md) | Fork Lifecycle | Completed | SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035 |
@@ -165,7 +165,8 @@ Group related specs and record the order to build them in. Delete this section i
   audited in parallel while preparing the `v1.0.0` tag — public API, silent data loss,
   concurrency, and the sink family — and the tag was held. SPEC-035 shipped first and is done.
 
-  **Build order: 034 → 037 → 038 → 036 → 039 → 041 → 040.** It is not the numbering, and it is
+  **Build order: 034 → 037 → 038 → 036 → 039 → 041 → 040.** Everything but **041** and **040**
+  has shipped. It is not the numbering, and it is
   **not** the order first recorded here (035 → 036 → 037 → 034 → 038). The reversal is deliberate
   and its reasoning is in SPEC-034's header:
 

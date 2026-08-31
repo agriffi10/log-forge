@@ -417,8 +417,15 @@ know about spans or context.
 
 *(Decision: background, non-blocking flush.)*
 
-**An explicit `flush()` drains two places, not one** (SPEC-036 FR-001): the worker's queue, and
-the events still buffered on spans open in the **calling context**. Without the second, a
+**An explicit `flush()` drains three places, not one** (SPEC-036): the worker's queue, the events
+still buffered on spans open in the **calling context** (FR-001), and whatever the sink is holding
+in its own **client** (FR-002 — `KafkaSink` hands to librdkafka, `GooglePubSubSink` to an
+unresolved future, `SentrySink` to the SDK's background transport, `LoggingSink` to a handler
+chain). The third runs **after** the queue drain, because the queue's events have to reach the
+client buffer before it is emptied, and it is an optional `flush()` probed by `sinks.base.flush_sink`
+— which **propagates** a failure where `read_losses` swallows one, since a swallowed flush failure
+is a sink the worker believes. A wrapper sink forwards it, or a buffering child is unreachable
+behind it (the SPEC-027 lesson about the stop signal, repeated). Without the second, a
 `flush()` made inside a `@trace`d function had by construction nothing to drain — an in-span
 event lives on `span.events` until the span closes — so the serverless recipe the README
 published delivered nothing while every counter read clean.
@@ -1202,8 +1209,13 @@ constraint — never by being deleted quietly.
   `SQLiteSink` and `PostgresSink` do not **commit** — for those two the child's inserts are left
   uncommitted on a connection the parent also holds, which is nonetheless the safer outcome,
   since committing there writes into a transaction the parent may be mid-way through. A
-  flush-without-release hook is SPEC-036's subject, and that spec is handed this roster of five;
-  its own names two.
+  flush-without-release hook **shipped in SPEC-036 FR-002**, which was handed this roster of five
+  rather than the two its own FR named. Of the five, three implement it — `KafkaSink`,
+  `GooglePubSubSink` and `NATSSink` — while `SQLiteSink` and `PostgresSink` do not, because both
+  commit inside `emit`, so nothing is outstanding once one returns and the commit in their `close`
+  is belt and braces rather than a buffer. That qualifies what this roster measured from the close
+  bodies alone. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
+  the three wrapper sinks, which forwarded no flush at all.
 
 - **`_fork._reinit_primitives` can exhaust memory, not merely hang** (SPEC-039, measured under
   SPEC-042). Its container read is `list(container)`, so a `list` subclass with a
@@ -1264,8 +1276,9 @@ constraint — never by being deleted quietly.
   It is not SPEC-040's: that one is a pure refactor whose Out of Scope forbids behaviour change
   and directs this kind of finding elsewhere, so it records the defect as evidence for its own
   motivation and nothing more. What stays true either way is the residual SPEC-042 accepts — a
-  shared sink whose `close()` performs delivery loses whatever the child had buffered in it, which
-  is SPEC-036's roster.
+  shared sink whose `close()` performs delivery loses whatever the child had buffered in it. Those
+  sinks now have a flush that delivers without releasing (SPEC-036 FR-002), so a child can push its
+  own buffer before it exits; what the residual costs is unchanged for a sink that has none.
 
 - **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
   (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one
