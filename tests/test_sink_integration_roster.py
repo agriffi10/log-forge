@@ -13,7 +13,8 @@ also **silently excludes `logstash`**, which is one of AC-1's named minimum four
 subject of FR-003, because that sink reaches Logstash over stdlib HTTP and imports no third-party
 client at all. The same hole hides `syslog`, `elasticsearch`, `loki` and the four SaaS sinks. So
 the population is that set **union** the modules that reach a network destination through
-`HTTPSink` or `SocketTransport`: "needs an optional extra" and "talks to something real" are
+`HTTPSink` or `SocketTransport` -- or that **define** one, which is what admits `sinks/http.py`
+itself, the module holding the public generic HTTP sink: "needs an optional extra" and "talks to something real" are
 different questions, and AC-4 asks the second.
 
 **What this file certifies is a name, not a run.** It asserts an integration module exists for
@@ -124,6 +125,42 @@ AWS and SaaS entries there is no obstacle beyond a decision -- an official image
 """
 
 
+def _compose_services() -> set[str]:
+    """Returns the service names the compose file declares.
+
+    Scoped to the `services:` block and to keys that look like identifiers. A first version took
+    every 2-space-indented line ending in a colon, which is a guess that reads a top-level
+    `volumes:` entry or a 2-space comment ending in a colon as a service -- both demonstrated,
+    and this file already carries several blocks of indented prose.
+
+    Args:
+      None.
+
+    Returns:
+      The declared service names.
+
+    Raises:
+      None.
+    """
+    services: set[str] = set()
+    in_block = False
+    for raw in (_INTEGRATION / "docker-compose.yml").read_text(encoding="utf-8").splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if not raw.startswith(" "):
+            in_block = raw.rstrip() == "services:"
+            continue
+        if not in_block:
+            continue
+        stripped = raw[2:]
+        if raw.startswith("    ") or not stripped.endswith(":"):
+            continue
+        name = stripped[:-1]
+        if name.isidentifier():
+            services.add(name)
+    return services
+
+
 def test_every_sink_that_talks_to_something_real_is_verified_or_says_why_not() -> None:
     population = set().union(*_population().values())
     answered = set(VERIFIED) | set(UNVERIFIED)
@@ -160,11 +197,7 @@ def test_the_service_rosters_agree_with_each_other() -> None:
     # the trigger and once on the base spelling.
     from integration.conftest import MODULE_FLOORS, SERVICES
 
-    compose = (_INTEGRATION / "docker-compose.yml").read_text(encoding="utf-8")
-    declared = {
-        line[2:-1] for line in compose.splitlines() if line.startswith("  ") and line.endswith(":")
-        and not line.startswith("    ")
-    }
+    declared = _compose_services()
     # BOTH directions. The first version asserted only that every SERVICES key was in the compose
     # file, so a service added with no readiness probe and no module floor went unnoticed --
     # confirmed by appending an `elasticsearch:` entry and watching all five tests stay green.
@@ -179,6 +212,21 @@ def test_the_service_rosters_agree_with_each_other() -> None:
         f"integration modules on disk {sorted(on_disk)} do not match the roster "
         f"{sorted(VERIFIED.values())}"
     )
+    # Comparing sets collapses duplicates, so two sinks CAN claim one module -- which is right
+    # for `http`/`logstash` (one is the other's backend) and wrong for anything else, since it
+    # would let a sink claim evidence from a module that does not exercise it. Sanction the one
+    # case rather than the pattern.
+    shared: dict[str, list[str]] = {}
+    for sink, module in VERIFIED.items():
+        shared.setdefault(module, []).append(sink)
+    assert {
+        module: sorted(sinks) for module, sinks in shared.items() if len(sinks) > 1
+    } == {"test_logstash": ["http", "logstash"]}, (
+        "a sink may only share an integration module where one is the other's backend"
+    )
+    # And a sink may not be recorded as both verified and unverified.
+    both = set(VERIFIED) & set(UNVERIFIED)
+    assert not both, f"recorded as verified AND unverified: {sorted(both)}"
 
 
 def test_the_roster_has_not_collapsed() -> None:

@@ -77,13 +77,19 @@ def test_only_jetstream_mode_notices_a_subject_no_stream_is_bound_to(stream) -> 
     url, _, _ = stream
     unbound = "lf.no.stream.here"
 
+    # Each NATSSink owns an `asyncio.new_event_loop()`, so both are closed in a `finally`: a
+    # failing assertion would otherwise leak a loop and its fd out of the test.
     core = NATSSink(unbound, servers=url)
-    core.emit([{"n": 1}])          # fire-and-forget: nobody is listening and that is not an error
-    core.close()
-    assert core.losses().failed == 0
+    try:
+        core.emit([{"n": 1}])      # fire-and-forget: nobody is listening, and that is not an error
+        assert core.losses().failed == 0
+    finally:
+        core.close()
 
     acked = NATSSink(unbound, servers=url, jetstream=True)
-    with pytest.raises(SinkDeliveryError):
-        acked.emit([{"n": 1}])
-    assert acked.losses().failed == 1
-    acked.close()
+    try:
+        with pytest.raises(SinkDeliveryError):
+            acked.emit([{"n": 1}])
+        assert acked.losses().failed == 1
+    finally:
+        acked.close()

@@ -138,7 +138,7 @@ def _tcp_ready(endpoint: Endpoint) -> bool:
 
 
 def _kafka_ready(endpoint: Endpoint) -> bool:
-    """Reports whether the broker answers the Kafka protocol *and* advertises a usable address.
+    """Reports whether the broker is serving and advertises the **port** this probe dialled.
 
     Two things a TCP connect cannot tell you, and they are separate.
 
@@ -152,6 +152,10 @@ def _kafka_ready(endpoint: Endpoint) -> bool:
     every connect succeeding and every produce failing. A metadata call alone does **not** catch
     that either: it completes on the bootstrap connection and never dials the advertised address.
     So the probe compares them, which is the only part of this that actually checks the trap.
+
+    **Only the port is compared, and that is a constraint rather than an oversight.** The
+    endpoint's host defaults to `127.0.0.1` while the broker advertises `localhost`, so a host
+    comparison would fail on every run. Do not "tighten" this to compare the host.
 
     Args:
       endpoint: The broker to probe.
@@ -168,7 +172,14 @@ def _kafka_ready(endpoint: Endpoint) -> bool:
         metadata = AdminClient({"bootstrap.servers": endpoint.url_host}).list_topics(timeout=2.0)
     except Exception:
         return False
-    return any(broker.port == endpoint.port for broker in metadata.brokers.values())
+    if any(broker.port == endpoint.port for broker in metadata.brokers.values()):
+        return True
+    advertised = sorted({broker.port for broker in metadata.brokers.values()})
+    raise RuntimeError(
+        f"kafka is running and answering, but advertises port(s) {advertised} while this suite "
+        f"connects on {endpoint.port}. `KAFKA_ADVERTISED_LISTENERS` and `ports:` in "
+        "docker-compose.yml have to name the same host-published port."
+    )
 
 
 _PROBES: dict[str, Callable[[Endpoint], bool]] = {"kafka": _kafka_ready}
@@ -201,23 +212,31 @@ def services_are_up() -> dict[str, Endpoint]:
     endpoints = {name: _endpoint(name, port) for name, port in SERVICES.items()}
     deadline = time.monotonic() + _READY_DEADLINE
 
-    def wait(item: tuple[str, Endpoint]) -> tuple[str, bool]:
+    def wait(item: tuple[str, Endpoint]) -> tuple[str, str | None]:
+        """Returns the service's name and its failure reason, or None once it is ready."""
         name, endpoint = item
         probe = _PROBES.get(name, _tcp_ready)
         while time.monotonic() < deadline:
-            if probe(endpoint):
-                return name, True
+            try:
+                if probe(endpoint):
+                    return name, None
+            except Exception as err:
+                # A probe that RAISES has diagnosed something retrying cannot fix -- a broker
+                # that is up but advertising the wrong port, say. Reporting that as "unreachable
+                # after 90s, start the containers" would send a developer to fix a container
+                # that is already running.
+                return name, str(err)
             time.sleep(_PROBE_INTERVAL)
-        return name, False
+        return name, "not reachable"
 
     with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
         results = dict(pool.map(wait, endpoints.items()))
-    missing = sorted(name for name, ok in results.items() if not ok)
-    if missing:
+    problems = sorted((name, why) for name, why in results.items() if why is not None)
+    if problems:
+        detail = "; ".join(f"{name}: {why}" for name, why in problems)
         raise RuntimeError(
-            f"integration services unreachable after {_READY_DEADLINE:.0f}s: {', '.join(missing)}"
-            " -- start them with"
-            " `docker compose -f tests/integration/docker-compose.yml up -d`"
+            f"integration services not usable after {_READY_DEADLINE:.0f}s -- {detail}. Start "
+            "them with `docker compose -f tests/integration/docker-compose.yml up -d`."
         )
     return endpoints
 
@@ -348,7 +367,9 @@ def _ours(reporter: pytest.TerminalReporter, outcome: str) -> list[pytest.TestRe
       outcome: The stats key to read.
 
     Returns:
-      The reports for that outcome whose node id is under this directory.
+      The reports for that outcome whose node id is under this directory. An entry carrying no
+      node id at all is **kept**, not dropped: this is a guard against silent vacuity, so the
+      unknown case has to fail loudly rather than quietly leave the tally.
 
     Raises:
       None.
@@ -356,18 +377,22 @@ def _ours(reporter: pytest.TerminalReporter, outcome: str) -> list[pytest.TestRe
     return [
         report
         for report in reporter.stats.get(outcome, [])
-        if getattr(report, "nodeid", "").startswith(_HERE)
+        if getattr(report, "nodeid", _HERE).startswith(_HERE)
     ]
 
 
 def _collected_here(reporter: pytest.TerminalReporter) -> bool:
     """Reports whether this session ran any integration test at all.
 
-    The gate variable being set is not the same as this session being the integration run. A
-    developer who exports it in a shell -- which this module's own docstring tells them to do --
-    then runs the ordinary suite, whose `tests/integration/conftest.py` import registers this
-    hook; without this check the repo's two unconditional skips in `test_fork_lifecycle.py` are
-    reported as absent services and a green suite exits 1.
+    **This is not the guard that keeps the ordinary suite green** -- `_ours` is, by scoping
+    every term to this directory. An earlier revision claimed that job for this function and
+    was measured wrong: neutralising it and replaying the case it named (the gate variable
+    exported, a whole-suite run, `test_fork_lifecycle.py`'s skips) still exits 0.
+
+    What it does cover is the one shape `_ours` cannot: a whole-suite-shaped invocation that
+    collected **no** integration tests, such as `pytest tests --ignore=tests/integration` with
+    the gate exported. `_is_whole_suite` reports True there, so without this every one of the
+    nine per-module floors fires against a session that was never asked to run them.
 
     Args:
       reporter: The terminal reporter holding the session's outcomes.

@@ -90,7 +90,7 @@ def test_the_current_body_loses_every_field_into_message(
     )
 
 
-def test_a_json_array_body_arrives_as_one_event_per_line(
+def test_a_json_array_body_arrives_as_one_event_per_element(
     services_are_up: dict[str, Endpoint], parsed
 ) -> None:
     # The other half of FR-003 AC-1's measurement, and the reason the finding is actionable
