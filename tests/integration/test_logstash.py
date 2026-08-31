@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pytest
 import redis as redis_mod
 
+from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 
 if TYPE_CHECKING:
@@ -87,3 +88,28 @@ def test_the_current_body_loses_every_field_into_message(
     assert '"case": "k10"' in str(only.get("message", "")) or '"case":"k10"' in str(
         only.get("message", "")
     )
+
+
+def test_a_json_array_body_arrives_as_one_event_per_line(
+    services_are_up: dict[str, Endpoint], parsed
+) -> None:
+    # The other half of FR-003 AC-1's measurement, and the reason the finding is actionable
+    # rather than merely true: the SAME stock input parses a JSON array correctly. Without this
+    # the two tests above establish only that something is wrong, not that anything better
+    # exists -- and the audit called K10 the one finding where a wrong analysis would make the
+    # fix worse than the defect.
+    #
+    # It drives `HTTPSink` directly rather than `LogstashSink`, because on this branch the sink
+    # still hardcodes `body_format="ndjson"` and forwarding `body_format=` through its
+    # `**http_kwargs` raises `TypeError: got multiple values`. That is itself part of what
+    # FR-003 has to fix; here it just means the comparison is made one layer down.
+    sink = HTTPSink(
+        f"http://{services_are_up['logstash'].url_host}", body_format="json_array"
+    )
+    sink.emit([{"case": "array", "n": 1}, {"case": "array", "n": 2}, {"case": "array", "n": 3}])
+
+    events = parsed(3)
+
+    assert len(events) == 3, f"a JSON array should parse per element, got {len(events)}"
+    assert sorted(event["n"] for event in events) == [1, 2, 3]
+    assert all(event["case"] == "array" for event in events)

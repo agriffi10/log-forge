@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import nats
 import pytest
 
+from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.nats import NATSSink
 
 if TYPE_CHECKING:
@@ -65,3 +66,24 @@ def test_jetstream_mode_publishes_with_acknowledgement(stream) -> None:
 
     assert count() == 2
     assert sink.losses().failed == 0
+
+
+def test_only_jetstream_mode_notices_a_subject_no_stream_is_bound_to(stream) -> None:
+    # Counting messages at the stream cannot tell the two modes apart -- the core-publish test
+    # above does exactly that and passes -- so `jetstream=True` could be ignored entirely and
+    # both would stay green. This is the observable difference: JetStream waits for an ack and
+    # gets "no responders" for an unbound subject, while a core publish is fire-and-forget and
+    # succeeds against nothing at all.
+    url, _, _ = stream
+    unbound = "lf.no.stream.here"
+
+    core = NATSSink(unbound, servers=url)
+    core.emit([{"n": 1}])          # fire-and-forget: nobody is listening and that is not an error
+    core.close()
+    assert core.losses().failed == 0
+
+    acked = NATSSink(unbound, servers=url, jetstream=True)
+    with pytest.raises(SinkDeliveryError):
+        acked.emit([{"n": 1}])
+    assert acked.losses().failed == 1
+    acked.close()

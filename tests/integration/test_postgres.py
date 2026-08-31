@@ -12,6 +12,8 @@ import pytest
 from log_foundry.sinks.postgres import PostgresSink
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from integration.conftest import Endpoint
 
 
@@ -33,7 +35,7 @@ def event(n: int) -> dict[str, object]:
 
 
 @pytest.fixture
-def table(services_are_up: dict[str, Endpoint]) -> str:
+def table(services_are_up: dict[str, Endpoint]) -> Iterator[str]:
     name = f"lf_{uuid.uuid4().hex[:12]}"
     yield name
     with psycopg.connect(dsn(services_are_up["postgres"])) as conn, conn.cursor() as cur:

@@ -138,19 +138,26 @@ def _tcp_ready(endpoint: Endpoint) -> bool:
 
 
 def _kafka_ready(endpoint: Endpoint) -> bool:
-    """Reports whether the broker answers a metadata request.
+    """Reports whether the broker answers the Kafka protocol *and* advertises a usable address.
 
-    **Not a TCP connect, and the difference is a real trap.** The broker advertises the
-    *host-published* port from `KAFKA_ADVERTISED_LISTENERS`, and a client follows whatever
-    address the metadata response names. If that value and the compose port mapping disagree,
-    a connect succeeds and every later produce fails on the advertised address -- so the probe
-    has to ask the question a client asks.
+    Two things a TCP connect cannot tell you, and they are separate.
+
+    The first is protocol readiness: the container accepts connections well before KRaft has
+    elected a controller, so a bare connect goes green on a broker that will refuse the next
+    produce. A metadata request is the earliest call that proves the broker is actually serving.
+
+    The second is the compose file's stated trap. `KAFKA_ADVERTISED_LISTENERS` names the
+    *host-published* port, and a client follows whatever address metadata gives it rather than
+    the one it dialled -- so a `ports:` mapping changed without the environment variable leaves
+    every connect succeeding and every produce failing. A metadata call alone does **not** catch
+    that either: it completes on the bootstrap connection and never dials the advertised address.
+    So the probe compares them, which is the only part of this that actually checks the trap.
 
     Args:
       endpoint: The broker to probe.
 
     Returns:
-      True when metadata came back.
+      True when metadata came back and names the port this probe connected to.
 
     Raises:
       None.
@@ -158,10 +165,10 @@ def _kafka_ready(endpoint: Endpoint) -> bool:
     try:
         from confluent_kafka.admin import AdminClient
 
-        AdminClient({"bootstrap.servers": endpoint.url_host}).list_topics(timeout=2.0)
+        metadata = AdminClient({"bootstrap.servers": endpoint.url_host}).list_topics(timeout=2.0)
     except Exception:
         return False
-    return True
+    return any(broker.port == endpoint.port for broker in metadata.brokers.values())
 
 
 _PROBES: dict[str, Callable[[Endpoint], bool]] = {"kafka": _kafka_ready}
@@ -242,8 +249,8 @@ MODULE_FLOORS: dict[str, int] = {
     "test_postgres": 2,
     "test_redis": 2,
     "test_kafka": 2,
-    "test_logstash": 2,
-    "test_nats": 2,
+    "test_logstash": 3,
+    "test_nats": 3,
     "test_pubsub": 2,
     "test_mongo": 1,
     "test_rabbitmq": 1,
@@ -295,12 +302,14 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     reporter = session.config.pluginmanager.getplugin("terminalreporter")
     if reporter is None:
         return
+    if not _collected_here(reporter):
+        return
     problems: list[str] = []
     for outcome in ("skipped", "xfailed", "error"):
-        count = len(reporter.stats.get(outcome, []))
+        count = len(_ours(reporter, outcome))
         if count:
             problems.append(f"{count} {outcome} -- an absent service must fail, not skip")
-    passed = reporter.stats.get("passed", [])
+    passed = _ours(reporter, "passed")
     if _is_whole_suite(session):
         per_module: dict[str, int] = {}
         for report in passed:
@@ -315,6 +324,64 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         for problem in problems:
             reporter.write_line(f"INTEGRATION FLOOR: {problem}", red=True)
         session.exitstatus = 1
+
+
+_HERE = "tests/integration/"
+
+
+def _ours(reporter: pytest.TerminalReporter, outcome: str) -> list[pytest.TestReport]:
+    """Returns only this directory's reports for one outcome.
+
+    **Every term is scoped to this directory, and the alternative was measured wrong.** The rule
+    "nothing may skip" is about integration tests, where a skip means an absent service. Applied
+    to the whole session it also judges the ordinary suite, which legitimately skips: with the
+    gate variable exported in a shell -- which this module's docstring tells a developer to do --
+    a whole-suite run in the extras environment reported `1780 passed, 3 skipped` and then failed
+    it with "3 skipped -- an absent service must fail".
+
+    A first fix guarded on the session having collected anything here at all, and that was aimed
+    at the wrong mechanism: in the case that actually bites, the integration tests *were*
+    collected and ran fine, and the skips came from `test_fork_lifecycle.py` next door.
+
+    Args:
+      reporter: The terminal reporter holding the session's outcomes.
+      outcome: The stats key to read.
+
+    Returns:
+      The reports for that outcome whose node id is under this directory.
+
+    Raises:
+      None.
+    """
+    return [
+        report
+        for report in reporter.stats.get(outcome, [])
+        if getattr(report, "nodeid", "").startswith(_HERE)
+    ]
+
+
+def _collected_here(reporter: pytest.TerminalReporter) -> bool:
+    """Reports whether this session ran any integration test at all.
+
+    The gate variable being set is not the same as this session being the integration run. A
+    developer who exports it in a shell -- which this module's own docstring tells them to do --
+    then runs the ordinary suite, whose `tests/integration/conftest.py` import registers this
+    hook; without this check the repo's two unconditional skips in `test_fork_lifecycle.py` are
+    reported as absent services and a green suite exits 1.
+
+    Args:
+      reporter: The terminal reporter holding the session's outcomes.
+
+    Returns:
+      True when at least one report came from this directory.
+
+    Raises:
+      None.
+    """
+    return any(
+        _ours(reporter, outcome)
+        for outcome in ("passed", "failed", "skipped", "xfailed", "error")
+    )
 
 
 def _is_whole_suite(session: pytest.Session) -> bool:

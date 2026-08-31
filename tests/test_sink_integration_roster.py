@@ -7,7 +7,8 @@ watched rot (SPEC-028's roster missed three sinks; SPEC-038's two rosters drifte
 
 **The population is derived from two markers, and the second one is the correction.** The obvious
 derivation -- modules carrying a lazy third-party import (`# type: ignore[import-not-found]`) --
-is what an optional extra looks like, and it yields the fourteen the spec's Overview counts. It
+is what an optional extra looks like, and it yields fourteen modules behind the eleven optional
+extras the spec's Overview counts (`aws` alone covers four of them). It
 also **silently excludes `logstash`**, which is one of AC-1's named minimum four *and* the entire
 subject of FR-003, because that sink reaches Logstash over stdlib HTTP and imports no third-party
 client at all. The same hole hides `syslog`, `elasticsearch`, `loki` and the four SaaS sinks. So
@@ -42,27 +43,53 @@ Kept as (module suffix, name) pairs rather than matched on the module alone: imp
 *else* from `sinks.http` -- `merge_headers`, say -- does not make a sink a network client.
 """
 
+_NETWORK_CORE_NAMES = {name for _, name in _NETWORK_CORES}
+"""The same cores by bare name, for the module that *defines* one instead of importing it."""
+
 
 def _population() -> dict[str, set[str]]:
-    """Returns the sink modules that reach a real destination, by how they were detected."""
+    """Returns the sink modules that reach a real destination, by how they were detected.
+
+    A module qualifies as `network` by **importing** a network core or by **defining** one that
+    is itself a sink. Importing alone was the first version and left a hole: `sinks/http.py`
+    defines `HTTPSink` rather than importing it, so the module holding the one directly
+    constructible generic HTTP sink -- public, and documented in `README.md` -- was outside the
+    population and could not be given a roster answer at all. "Defines a class with an `emit`"
+    is what keeps `_socket.SocketTransport` out on the same pass: it is a transport a sink owns,
+    not a sink, which is the distinction `test_sink_release_roster.py` had to draw too.
+    """
     marker: set[str] = set()
     network: set[str] = set()
     for path in sorted(_SINKS.glob("*.py")):
         text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
         if "import-not-found" in text or "import-untyped" in text:
             marker.add(path.stem)
-        for node in ast.walk(ast.parse(text)):
-            if not isinstance(node, ast.ImportFrom) or not node.module:
-                continue
-            for alias in node.names:
-                for suffix, name in _NETWORK_CORES:
-                    if node.module.endswith(suffix) and alias.name == name:
-                        network.add(path.stem)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    for suffix, name in _NETWORK_CORES:
+                        if node.module.endswith(suffix) and alias.name == name:
+                            network.add(path.stem)
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name in _NETWORK_CORE_NAMES
+                and any(
+                    isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and child.name == "emit"
+                    for child in node.body
+                )
+            ):
+                network.add(path.stem)
     return {"marker": marker, "network": network}
 
 
 VERIFIED: dict[str, str] = {
     "clickhouse": "test_clickhouse",
+    # `LogstashSink(url=...)` IS an `HTTPSink` -- it builds one and delegates to it -- so
+    # `test_logstash` drives this module against a real HTTP destination. Two sink modules
+    # legitimately share one integration module; the cross-check below compares sets.
+    "http": "test_logstash",
     "kafka": "test_kafka",
     "logstash": "test_logstash",
     "mongodb": "test_mongo",
@@ -85,15 +112,15 @@ UNVERIFIED: dict[str, str] = {
     "splunk": "SaaS; no local ingest.",
     "newrelic": "SaaS; no local ingest.",
     "honeycomb": "SaaS; no local ingest.",
-    "elasticsearch": "A container exists and none is run; AC-1's minimum does not include it.",
-    "loki": "A container exists and none is run; AC-1's minimum does not include it.",
+    "elasticsearch": "An official image exists upstream; none is run here. Not in AC-1's minimum.",
+    "loki": "An official image exists upstream; none is run here. Not in AC-1's minimum.",
     "syslog": "No container is run; the socket transport is covered by a local listener fake.",
 }
 """Sink modules NOT executed against a real service, each with the reason.
 
-The two `elasticsearch`/`loki` entries are deliberately honest rather than flattering: unlike the
-AWS and SaaS entries there is no obstacle beyond a decision, and a reader deciding what to add
-next should be able to see that at a glance.
+The `elasticsearch`/`loki` entries are deliberately honest rather than flattering: unlike the
+AWS and SaaS entries there is no obstacle beyond a decision -- an official image exists for each
+-- and a reader deciding what to add next should be able to see that at a glance.
 """
 
 
@@ -134,8 +161,16 @@ def test_the_service_rosters_agree_with_each_other() -> None:
     from integration.conftest import MODULE_FLOORS, SERVICES
 
     compose = (_INTEGRATION / "docker-compose.yml").read_text(encoding="utf-8")
-    for service in sorted(SERVICES):
-        assert f"\n  {service}:\n" in compose, f"{service} is in SERVICES but not in compose"
+    declared = {
+        line[2:-1] for line in compose.splitlines() if line.startswith("  ") and line.endswith(":")
+        and not line.startswith("    ")
+    }
+    # BOTH directions. The first version asserted only that every SERVICES key was in the compose
+    # file, so a service added with no readiness probe and no module floor went unnoticed --
+    # confirmed by appending an `elasticsearch:` entry and watching all five tests stay green.
+    assert declared == set(SERVICES), (
+        f"compose declares {sorted(declared)} but SERVICES names {sorted(SERVICES)}"
+    )
     assert set(MODULE_FLOORS) == set(VERIFIED.values()), (
         "the conftest's per-module floors and the roster's verified modules have drifted"
     )
@@ -151,5 +186,5 @@ def test_the_roster_has_not_collapsed() -> None:
     # `emit`s into a base class dropped five classes out of two lints in one commit, 34 to 29,
     # with the suite green, and only the roster that had a floor noticed.
     population = set().union(*_population().values())
-    assert len(population) >= 22, f"population collapsed to {len(population)}"
-    assert len(VERIFIED) >= 9, f"verified set collapsed to {len(VERIFIED)}"
+    assert len(population) >= 23, f"population collapsed to {len(population)}"
+    assert len(VERIFIED) >= 10, f"verified set collapsed to {len(VERIFIED)}"

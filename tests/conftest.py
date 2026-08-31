@@ -210,7 +210,12 @@ def sentry_http_fallback(monkeypatch):
     running the existing suite in the extras environment for the first time: `sink._http is None`,
     `DID NOT RAISE SinkDeliveryError`, `assert 2 == 1`, `(5, 0) == (4, 1)`. They were passing only
     because CI never installs that extra.
+
+    A plain import rather than `importorskip`: this module needs no extra, so the guard could
+    never fire -- and if it somehow did it would silently delete the four tests in exactly the
+    environment they exist for, which is the failure this fixture was written to end.
     """
-    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    from log_foundry.sinks import sentry
+
     monkeypatch.setattr(sentry, "_import_sdk", lambda: None)
     return sentry

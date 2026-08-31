@@ -62,10 +62,17 @@ def test_a_batch_is_published_and_can_be_pulled_back(topic_and_subscription) -> 
 
 def test_flush_resolves_the_pending_futures(topic_and_subscription) -> None:
     publisher, subscriber, topic, subscription = topic_and_subscription
-    sink = GooglePubSubSink(topic, client=publisher)
-    sink.emit([{"n": 1}])
-    # SPEC-036 FR-002: `emit` appends an unresolved future, and before the flush hook existed
-    # nothing but `close()` ever called `result()` on one.
+    sink = GooglePubSubSink(topic, client=publisher, max_pending=1000)
+    sink.emit([{"n": n} for n in range(20)])
+
+    # The property under test is that `flush()` RESOLVES the pending futures (SPEC-036 FR-002:
+    # `emit` appends an unresolved future and, before the hook existed, nothing but `close()`
+    # ever called `result()` on one). Asserting only that the messages arrive would stay green
+    # with the flush deleted, since the client publishes on its own 10 ms batch latency anyway.
+    # So the assertion is on the sink's own pending list, which only `flush()` empties.
+    assert sink._futures, "precondition: emit must leave unresolved futures for flush to resolve"
     sink.flush()
-    assert pull(subscriber, subscription, 1)
+    assert sink._futures == [], "flush returned with publishes still pending"
+
+    assert len(pull(subscriber, subscription, 20)) == 20
     sink.close()
