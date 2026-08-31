@@ -433,7 +433,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
             worker.shutdown()
 
 
-def test_sentry_forwards_to_its_http_fallback() -> None:
+def test_sentry_forwards_to_its_http_fallback(sentry_http_fallback) -> None:
     from log_foundry.sinks.sentry import SentrySink
 
     sink = SentrySink("http://k@sentry.local/1", opener=FakeOpener())

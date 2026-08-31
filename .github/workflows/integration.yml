@@ -1,0 +1,90 @@
+name: Integration
+
+# The extras-backed sinks, executed against real services (SPEC-041 FR-001).
+#
+# Eleven of this library's sinks talk to a third-party service through an optional extra, and
+# before this job not one of them was ever executed — not locally and not in CI, where the
+# no-extras environment is deliberately the contract (`CLAUDE.md`: `mypy --strict`'s
+# `type: ignore[import-not-found]` comments depend on it). That is right for the type gate and
+# wrong for correctness, so this is a SECOND job rather than a change to `ci.yml`: the gating
+# leg's environment is untouched (FR-001 AC-3).
+#
+# NOT A REQUIRED CHECK (FR-001 AC-2). Nine service containers, an image-pull path and a broker
+# that has to elect itself a controller are a flakiness budget, and a new job of that shape
+# blocking every PR is a job that gets disabled. It earns the gate by being green first: after
+# four consecutive green weekly scheduled runs on `main`, Andrew decides whether to add it to the
+# `main` ruleset — a branch-protection change no agent can make.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * 1"    # Mondays, offset off the hour and away from pip-audit and Scorecard
+  pull_request:
+    # Only paths that can change the answer. Deliberately NOT a blanket `tests/**`: from this
+    # workflow's merge onward the filter spins nine containers on every matching PR, and a
+    # change to an unrelated unit test is not evidence about a sink's real destination. The
+    # weekly run covers everything else.
+    paths:
+      - "src/log_foundry/sinks/**"
+      - "tests/integration/**"
+      - ".github/workflows/integration.yml"
+      - "pyproject.toml"
+      - "poetry.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: sinks against real services
+    runs-on: ubuntu-latest
+    # A ceiling well above the observed runtime (the suite itself is seconds; the image pulls and
+    # Logstash's JVM start are the cost), so a hung service fails rather than burning an hour.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # nothing here runs git; don't leave a token on disk
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The floor, not the newest: this job exists to exercise the driver code paths a
+          # consumer on the oldest supported runtime will hit.
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      # `--all-extras` rather than only the extras the nine services need. The point of the job
+      # is the environment as a consumer has it, and the narrower install would silently drop
+      # the lazy import lines of every sink without a container — which is most of them.
+      - name: Install dependencies and every extra
+        run: poetry install --with dev --all-extras
+
+      - name: Start the services
+        run: docker compose -f tests/integration/docker-compose.yml up -d
+
+      # Readiness is the harness's job (tests/integration/conftest.py): all nine are probed
+      # concurrently against one shared deadline, and an unreachable service FAILS rather than
+      # skipping. A skipped integration test is a green job that verified nothing.
+      - name: Run the integration suite
+        env:
+          LOG_FOUNDRY_INTEGRATION: "1"
+        run: poetry run pytest tests/integration
+
+      # The existing suite, with the extras PRESENT. Its 20-odd `test_sinks_*.py` modules run
+      # only in the no-extras leg today, where every lazy import raises ImportError and the real
+      # import line is never executed. Four `SentrySink` tests were green there and red here
+      # until SPEC-041 pinned the backend they select.
+      - name: Run the unit suite in the extras environment
+        run: poetry run pytest tests
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose -f tests/integration/docker-compose.yml logs --tail 100
+
+      - name: Stop the services
+        if: always()
+        run: docker compose -f tests/integration/docker-compose.yml down -v
