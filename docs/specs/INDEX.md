@@ -51,7 +51,8 @@ to status only — no prose.
 
 ## Arcs (build order)
 
-Group related specs and record the order to build them in. Delete this section if you don't use arcs.
+Group related specs and record the order to build them in. Keep this section: a spec split for size
+(`process.md` §4) always records its order here, even if you group nothing else.
 
 - **Core logging pipeline:** SPEC-001 → SPEC-002 → SPEC-003 → SPEC-004 → SPEC-005
 - **Sink expansion (pluggable destinations):** SPEC-006 → SPEC-007 → SPEC-008 → SPEC-009 → SPEC-010 → SPEC-011.
