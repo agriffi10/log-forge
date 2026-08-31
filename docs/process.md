@@ -161,7 +161,8 @@ not free picks. One starts from the **change** and reads it against what it is s
 satisfy; the other starts from **something other than the change** — the system it lands in, or
 the document it claims to implement. On a code diff those are: the spec's acceptance criteria plus
 the `best-practices/` rules for the domains it touches, and a pass that **builds** the thing and
-runs the suites rather than reading it. On a diff with no code in it — a spec, a plan, a docs change — they are:
+runs the suites rather than reading it. On a diff with no code in it — a spec, a plan, a docs
+change — they are:
 the artifact against its own sources, and the artifact against every *other* place the same rule
 is stated. Both land **before** the push; a review that only happens once the branch is public
 does not count toward the two.
@@ -210,8 +211,10 @@ that rewrites the plan sends the new plan through again.
   considered rejection from a finding that was never read. A fixed finding that was wrong is a
   silent regression, which is the same failure in the other direction.
 
-**What a diff review checks.** The spec's acceptance criteria **and the relevant `best-practices/`
-rules** (route via its INDEX) — not just "does it look fine."
+**What a diff review checks.** That is the *first* of the two frames a diff gets (§3, *The reviewer
+contract*): the spec's acceptance criteria **and the relevant `best-practices/` rules** (route via
+its INDEX) — not just "does it look fine." The second starts from the system rather than the
+diff, and on code it builds the thing and runs the suites.
 
 **Rotating the frame — why round count is the wrong exit criterion**
 
@@ -356,7 +359,10 @@ yields a different class of finding than any reading-based frame.*
 nothing — it finds something smaller. The honest signal is the **class** changing round over round:
 on SPEC-205, blockers → machinery introduced by the fixes → sequencing and contradictions →
 coin-flips no test would catch. Stop when a new frame's worst finding is one that would not change
-the built result, and say which finding that was.
+the built result, and say which finding that was. **This governs the ceiling, never the floor** —
+it says when to stop *above* the counts in §3's reviewer contract, not that a count can be
+skipped, so a diff still gets its two frames when the first comes back with nothing that would
+change the built result.
 
 **An Open Question can wear a declarative sentence**
 
@@ -396,10 +402,12 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
   **Acceptance Criteria** covering happy path, error path, and edges. Sequential IDs so a prompt can
   say "implement FR-001 through FR-003 only."
 - **Size: aim for 3–6 FRs, and split above 8.** A spec is one coherent slice of behavior, not a
-  feature's whole surface. Across this repo's 43 specs the median carries 5 FRs and nearly nine in
-  ten carry 8 or fewer, so a spec past eight is not a big spec — it is a spec that should have been
-  two. Growing one spec is the wrong repair; the right one is a second spec beside it, with the
-  pair's build order recorded in `INDEX.md` as an **arc** (§2). Splitting keeps paying off past the
+  feature's whole surface, and a spec past eight is not a big spec — it is a spec that should have
+  been two. (Measured once, when this rule landed on 2026-08-31: the median spec carried 5 FRs and
+  nearly nine in ten carried 8 or fewer. A dated observation, not a standing claim about the
+  corpus — §5 forbids a rule resting on a number that rots.) Growing one spec is the wrong repair;
+  the right one is a second spec beside it, with the pair's build order recorded in `INDEX.md` as
+  an **arc** (§2). Splitting keeps paying off past the
   first cut — a three-spec arc reads better than one twelve-FR spec, and each piece earns its own
   reviewed plan, its own review gate and its own delivery doc. Cut along a seam the system already
   has — a layer, a surface, a switchover, the point where something inert goes live — never at
