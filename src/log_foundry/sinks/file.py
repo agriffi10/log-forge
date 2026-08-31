@@ -137,7 +137,7 @@ class FileSink:
         ``before`` handler there is nowhere to empty the buffer from (FR-001), so the child
         strands it instead — the parent's copy is untouched and still reaches disk exactly once.
 
-        No lock is taken, for the reason ``decorator._rebuild_worker_after_fork`` gives: there is
+        No lock is taken, for the reason ``_lifecycle._rebuild_worker_after_fork`` gives: there is
         one thread here by construction, and the lock was re-initialised moments earlier, so
         taking it could only wait on a holder that cannot exist. A hook that blocks here blocks a
         child that has not yet returned from ``fork``, where no watchdog can reach it.

@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
-from log_foundry import _fork, _lifecycle, config, decorator
+from log_foundry import _fork, _lifecycle, config
 from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
@@ -587,9 +587,9 @@ def test_the_record_holds_a_strong_reference() -> None:
 
     def in_child() -> str:
         config._config = config.Config()
-        decorator._worker = None
-        decorator._orphan_sink = None
-        decorator._orphan_closed_sink = None
+        _lifecycle._state._worker = None
+        _lifecycle._state._orphan_sink = None
+        _lifecycle._state._orphan_closed_sink = None
         gc.collect()
         with _lifecycle._owned_lock:
             record = _lifecycle._owned.get(sink_id)
@@ -777,7 +777,7 @@ def test_the_refusal_holds_at_the_orphan_exit_close() -> None:
 
     def in_child() -> str:
         log_foundry.info("orphan")
-        decorator._close_orphan_sink()
+        _lifecycle._close_orphan_sink()
         return f"{sink.closed},{len(sink.events)}"
 
     child = run_in_child(in_child)
@@ -1200,11 +1200,11 @@ def test_health_answers_the_inherited_question_with_no_worker() -> None:
     """FR-004 AC-3. Synthesized as `retired` already is; no worker is created to answer it."""
     log_foundry.configure(service="own", sink=RecordingSink())
     log_foundry.info("orphan only")
-    assert decorator._worker is None, "the precondition: nothing built a worker"
+    assert _lifecycle._state._worker is None, "the precondition: nothing built a worker"
 
     def in_child() -> str:
         log_foundry.info("child orphan")
-        return f"{log_foundry.health().inherited_sink},{decorator._worker is None}"
+        return f"{log_foundry.health().inherited_sink},{_lifecycle._state._worker is None}"
 
     child = run_in_child(in_child)
     assert child.output == "True,True", child.output
@@ -1244,12 +1244,12 @@ def test_health_reports_an_inherited_sink_through_the_worker_too() -> None:
         log_foundry.info("in-span")
 
     work()
-    assert decorator._worker is not None, "the precondition: this test is about the worker path"
+    assert _lifecycle._state._worker is not None, "the precondition: this test is about the worker path"
     assert log_foundry.health().inherited_sink is False
 
     def in_child() -> str:
         work()
-        return f"{decorator._worker is not None},{log_foundry.health().inherited_sink}"
+        return f"{_lifecycle._state._worker is not None},{log_foundry.health().inherited_sink}"
 
     child = run_in_child(in_child)
     assert child.output == "True,True", child.output

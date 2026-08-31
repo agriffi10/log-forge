@@ -9,7 +9,7 @@ that shape: ``flush() -> True``, on the wire 0, in the client buffer 3, ``health
 from __future__ import annotations
 
 import log_foundry
-from log_foundry import decorator
+from log_foundry import _lifecycle, decorator
 from log_foundry.sinks.base import Sink, flush_sink
 from log_foundry.worker import Worker
 
@@ -60,7 +60,7 @@ def test_flush_reaches_the_client_buffer_after_draining_the_queue() -> None:
     """
     sink = Buffering()
     log_foundry.configure(service="t", sink=sink)
-    decorator._worker = Worker(sink, batch_size=1000, flush_interval=100.0)
+    _lifecycle._state._worker = Worker(sink, batch_size=1000, flush_interval=100.0)
 
     @log_foundry.trace
     def work() -> None:
@@ -152,7 +152,7 @@ def test_an_orphan_only_process_still_reaches_its_client_buffer() -> None:
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("outside any span")
 
-    assert decorator._worker is None, "precondition: no worker was ever built"
+    assert _lifecycle._state._worker is None, "precondition: no worker was ever built"
     assert log_foundry.flush(timeout=5.0)
     assert [e.get("message") for e in sink.wire] == ["outside any span"]
 
@@ -169,7 +169,7 @@ def test_a_flush_in_a_process_that_never_logged_touches_no_sink() -> None:
 
     assert log_foundry.flush(timeout=5.0)
     assert sink.flushes == 0, "nothing was ever logged, so there is nothing to flush"
-    assert decorator._worker is None
+    assert _lifecycle._state._worker is None
 
 
 def test_a_closed_sink_refuses_a_flush() -> None:

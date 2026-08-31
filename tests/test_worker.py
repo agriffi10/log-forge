@@ -18,6 +18,7 @@ import pytest
 log_foundry_mod = pytest.importorskip("log_foundry")
 FlushResult = log_foundry_mod.FlushResult
 worker_mod = pytest.importorskip("log_foundry.worker")
+_lifecycle = pytest.importorskip("log_foundry._lifecycle")
 Worker = worker_mod.Worker
 _SHUTDOWN_SENTINEL = worker_mod._SHUTDOWN
 
@@ -294,19 +295,18 @@ def test_shutdown_is_idempotent() -> None:
 
 def test_decorator_worker_is_lazy_and_single() -> None:
     import log_foundry
-    from log_foundry import decorator
 
     log_foundry.configure(service="t", version="0", env="t", sink=RecordingSink())
-    decorator._worker = None  # ensure a clean lazy creation for this assertion
+    _lifecycle._state._worker = None  # ensure a clean lazy creation for this assertion
 
-    w1 = decorator._get_worker()
-    w2 = decorator._get_worker()
+    w1 = _lifecycle._get_worker()
+    w2 = _lifecycle._get_worker()
     try:
         assert w1 is w2, "one worker per process, reused"
         assert w1.sink is log_foundry.get_config().sink, "worker built from the configured sink"
     finally:
         w1.shutdown()
-        decorator._worker = None
+        _lifecycle._state._worker = None
 
 
 # -- SPEC-013 FR-002: flush() drains without retiring the worker ------------------------
@@ -525,22 +525,20 @@ def test_flush_with_timeout_none_returns_true_on_a_healthy_worker() -> None:
 
 def test_module_flush_is_a_no_op_when_nothing_was_ever_logged() -> None:
     import log_foundry
-    from log_foundry import decorator
 
-    decorator._worker = None
+    _lifecycle._state._worker = None
     start = time.monotonic()
     assert log_foundry.flush(), "no worker means nothing to drain"
     assert time.monotonic() - start < 1.0
     # Building a worker here would start a thread and register atexit purely to flush nothing.
-    assert decorator._worker is None, "flush must not create a worker"
+    assert _lifecycle._state._worker is None, "flush must not create a worker"
 
 
 def test_module_flush_after_shutdown_returns_false_promptly() -> None:
     import log_foundry
-    from log_foundry import decorator
 
     log_foundry.configure(service="t", version="0", env="t", sink=RecordingSink())
-    decorator._get_worker()
+    _lifecycle._get_worker()
     log_foundry.shutdown()
 
     start = time.monotonic()
@@ -551,13 +549,12 @@ def test_module_flush_after_shutdown_returns_false_promptly() -> None:
 def test_module_flush_delivers_a_traced_call_and_logging_continues() -> None:
     """The Lambda pattern: drain before returning, then be invoked again on the same worker."""
     import log_foundry
-    from log_foundry import decorator
 
     sink = RecordingSink()
     log_foundry.configure(service="t", version="0", env="t", sink=sink)
-    decorator._worker = None
+    _lifecycle._state._worker = None
     # Neither batching trigger can fire in the life of this test.
-    decorator._worker = worker_mod.Worker(sink, batch_size=1000, flush_interval=100.0)
+    _lifecycle._state._worker = worker_mod.Worker(sink, batch_size=1000, flush_interval=100.0)
 
     @log_foundry.trace
     def handler() -> str:
@@ -575,8 +572,8 @@ def test_module_flush_delivers_a_traced_call_and_logging_continues() -> None:
         assert log_foundry.flush(timeout=5.0)
         assert [e["message"] for e in sink.events].count("invoked") == 2
     finally:
-        decorator._worker.shutdown()
-        decorator._worker = None
+        _lifecycle._state._worker.shutdown()
+        _lifecycle._state._worker = None
 
 
 def test_flush_is_exported() -> None:
@@ -637,9 +634,8 @@ def test_module_health_returns_zeros_without_creating_a_worker() -> None:
     import threading
 
     import log_foundry
-    from log_foundry import decorator
 
-    decorator._worker = None
+    _lifecycle._state._worker = None
     before = threading.active_count()
 
     h = log_foundry.health()
@@ -648,7 +644,7 @@ def test_module_health_returns_zeros_without_creating_a_worker() -> None:
     # advertised way to read a snapshot has always been by attribute.
     assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
     assert h.stopped_reason is None
-    assert decorator._worker is None, "health() must not create a worker"
+    assert _lifecycle._state._worker is None, "health() must not create a worker"
     assert threading.active_count() == before, "health() must not start a thread"
 
 
@@ -817,7 +813,6 @@ def test_callers_are_unaffected_after_the_worker_dies() -> None:
 def test_a_decorated_function_is_unaffected_after_the_worker_dies() -> None:
     """The clause of FR-001 that reaches user code: @trace still returns normally (arch §4)."""
     import log_foundry
-    from log_foundry import decorator
 
     log_foundry.configure(service="t", sink=TerminalSink(SystemExit(1)))
 
@@ -827,7 +822,7 @@ def test_a_decorated_function_is_unaffected_after_the_worker_dies() -> None:
 
     assert work() == "ok"
     log_foundry.flush(timeout=2.0)  # force the drain that kills the thread
-    w = decorator._worker
+    w = _lifecycle._state._worker
     assert w is not None
     assert _wait_until(lambda: not w._thread.is_alive())
 
@@ -1383,7 +1378,6 @@ def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
     """FR-004's criterion names `log_foundry.shutdown()`, whose delegate is deliberately
     unguarded — it relies entirely on `Worker.shutdown()` being total."""
     log_foundry = pytest.importorskip("log_foundry")
-    decorator = pytest.importorskip("log_foundry.decorator")
     sink = _CloseFailsSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -1397,7 +1391,7 @@ def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
 
     assert sink.close_calls == 1
     assert [e["message"] for batch in sink.batches for e in batch] == ["span.start", "span.end"]
-    monkeypatch.setattr(decorator, "_worker", None)
+    monkeypatch.setattr(_lifecycle._state, "_worker", None)
 
 
 _ATEXIT_PROGRAM = """
@@ -1635,13 +1629,12 @@ def test_a_worker_that_was_never_shut_down_reports_false_and_zero() -> None:
 def test_a_process_that_never_logged_reports_the_zeroed_lifecycle_snapshot() -> None:
     """No worker means nothing was retired — and asking must not build one to say so."""
     import log_foundry
-    from log_foundry import decorator
 
-    decorator._worker = None
+    _lifecycle._state._worker = None
     h = log_foundry.health()
 
     assert (h.retired, h.submitted_after_shutdown, h.incomplete_swaps) == (False, 0, 0)
-    assert decorator._worker is None, "health() must not create a worker"
+    assert _lifecycle._state._worker is None, "health() must not create a worker"
 
 
 def test_decorated_calls_after_a_module_shutdown_are_counted() -> None:
@@ -1771,7 +1764,7 @@ _HUNG_SWAP_CLOSE_PROGRAM = """
 import faulthandler
 import threading
 import log_foundry as lf
-from log_foundry import worker as _worker
+from log_foundry import _lifecycle, worker as _worker
 
 # A wedged child would otherwise fail as a bare 60s subprocess timeout with no stdout and no
 # clue where it stopped -- the exact symptom the non-daemon design produces, so the failure

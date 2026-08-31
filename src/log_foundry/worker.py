@@ -18,22 +18,21 @@ __all__ = ["Health", "Worker"]
 
 _SHUTDOWN = object()
 
-DEFAULT_SHUTDOWN_TIMEOUT = 30.0
-"""Seconds :meth:`Worker.shutdown` will wait for the drain thread (SPEC-027 FR-004).
+DEFAULT_SHUTDOWN_TIMEOUT = _lifecycle.DEFAULT_SHUTDOWN_TIMEOUT
+"""Re-exported from ``_lifecycle``, which owns it (SPEC-040 FR-001).
 
-Generous, because the ordinary case is a fast drain and expiring early would abandon events
-that were about to be delivered. Bounded at all, because ``shutdown()`` runs from ``atexit``
-and an unbounded join there is a hung process.
+It moved because the lifecycle owner binds it as a **def-time** default and cannot import this
+module at module scope. Re-exported rather than relocated outright so that
+``log_foundry.worker.DEFAULT_SHUTDOWN_TIMEOUT`` — which ``__init__`` re-exports publicly and
+SPEC-034 froze — keeps naming the same object.
 """
 
 _DROP_WARN_EVERY = 1000
 
-DEFAULT_SWAP_TIMEOUT = 5.0
-"""Seconds a late ``configure(sink=...)`` will spend draining the previous sink (FR-003).
+DEFAULT_SWAP_TIMEOUT = _lifecycle.DEFAULT_SWAP_TIMEOUT
+"""Re-exported from ``_lifecycle``, which owns it (SPEC-040 FR-001).
 
-Shorter than the shutdown budget on purpose: this runs on the caller's thread inside a
-configuration call, where a long stall is a startup that appears to hang, and what is at risk
-is a sink swap rather than the tail of the whole process.
+Moved and re-exported for the reason :data:`DEFAULT_SHUTDOWN_TIMEOUT` was.
 """
 
 
@@ -64,7 +63,7 @@ class Health:
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
     ``stopped_reason``, ``sink``, and SPEC-030's three are defaulted and appended in that
-    order, so the zeroed snapshot in ``decorator._worker_health`` — and any third-party
+    order, so the zeroed snapshot in ``_lifecycle._worker_health`` — and any third-party
     construction — keeps working, and attribute and index access to every earlier field stays
     as it was.
 
@@ -95,7 +94,7 @@ class Health:
         read ``False`` for a process that never logged, and that objection does not apply to a
         field which is simply ``False`` until someone calls ``shutdown()`` (SPEC-030 FR-001).
         On its own it is not a fault: a process that shuts down and stops logging is correct.
-        It is the one field ``decorator._worker_health`` synthesizes rather than zeroing, so
+        It is the one field ``_lifecycle._worker_health`` synthesizes rather than zeroing, so
         that a process which only ever logged outside a span — and therefore has no worker at
         all — still reports its own shutdown truthfully (SPEC-031 FR-006).
       submitted_after_shutdown: Submissions accepted after ``shutdown()`` and queued where

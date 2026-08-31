@@ -300,7 +300,7 @@ def flush_sink(sink: object) -> bool:
 
     Raises:
       Exception: Whatever the sink's ``flush`` raises, deliberately unguarded. The caller turns
-        it into a ``FlushResult`` reason; see ``decorator._flush_live_sink``.
+        it into a ``FlushResult`` reason; see ``_lifecycle._flush_live_sink``.
     """
     accessor = getattr(sink, "flush", None)
     if not callable(accessor):

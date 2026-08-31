@@ -2,6 +2,8 @@
 
 import pytest
 
+from log_foundry import _lifecycle
+
 config = pytest.importorskip("log_foundry.config")
 
 
@@ -181,7 +183,7 @@ def _worker_with(sink) -> "worker_mod.Worker":
     something.
     """
     worker = worker_mod.Worker(sink, batch_size=1000, flush_interval=100.0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     return worker
 
 
@@ -324,11 +326,11 @@ def test_configure_without_a_sink_never_rebuilds_anything() -> None:
 
 def test_configure_before_any_logging_creates_no_worker(capsys) -> None:
     """Pre-first-log behaviour is unchanged — there is no captured sink to disagree with."""
-    decorator._worker = None
+    _lifecycle._state._worker = None
 
     config.configure(sink=SwapSink())
 
-    assert decorator._worker is None, "a swap must not build a worker to have nothing to drain"
+    assert _lifecycle._state._worker is None, "a swap must not build a worker to have nothing to drain"
     assert capsys.readouterr().err == "", "and must not absorb a fault it caused itself"
 
 
@@ -340,7 +342,7 @@ def test_a_late_swap_after_shutdown_does_not_resurrect_the_worker() -> None:
 
     config.configure(sink=new)
 
-    assert decorator._worker is worker, "no new worker"
+    assert _lifecycle._state._worker is worker, "no new worker"
     assert worker.sink is old, "a retired worker is not retargeted"
     assert old.closed == 1
     assert new.closed == 0
@@ -357,7 +359,7 @@ def test_an_unconfirmable_drain_is_bounded_counted_and_leaves_the_old_sink_open(
     """A hung sink must not make ``configure()`` hang, and must not be closed under its writer."""
     wedged, new = WedgedSink(), SwapSink()
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=100.0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     try:
         worker.submit(_span("stuck"))
         assert wedged.in_emit.wait(5.0), "the drain thread must be inside emit"
@@ -388,7 +390,7 @@ def test_the_swap_budget_is_the_documented_default(monkeypatch) -> None:
 
     seen: list[float | None] = []
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 1.25)
-    monkeypatch.setattr(decorator, "_swap_sink", lambda sink, timeout: seen.append(timeout))
+    monkeypatch.setattr(_lifecycle, "_swap_sink", lambda sink, timeout: seen.append(timeout))
 
     config.configure(sink=SwapSink())
 
@@ -459,7 +461,7 @@ def test_the_swap_budget_bounds_the_previous_sinks_close() -> None:
     _worker_with(slow)
     try:
         start = time.monotonic()
-        decorator._swap_sink(SwapSink(), timeout=budget)
+        _lifecycle._swap_sink(SwapSink(), timeout=budget)
         elapsed = time.monotonic() - start
 
         assert slow.in_close.is_set(), "the close was started"
@@ -491,7 +493,7 @@ def test_the_swap_waits_for_a_close_that_fits_inside_the_budget() -> None:
     _worker_with(old)
 
     start = time.monotonic()
-    decorator._swap_sink(SwapSink(), timeout=5.0)
+    _lifecycle._swap_sink(SwapSink(), timeout=5.0)
     elapsed = time.monotonic() - start
 
     assert old.closed == 1, "a close that fits in the budget has completed on return"
@@ -509,7 +511,7 @@ def test_shutdown_gives_an_outstanding_close_a_bounded_grace_to_finish() -> None
     """
     slow = SlowCloseSink()
     worker = _worker_with(slow)
-    decorator._swap_sink(SwapSink(), timeout=0.3)
+    _lifecycle._swap_sink(SwapSink(), timeout=0.3)
     assert slow.in_close.wait(5.0), "the close is outstanding when shutdown begins"
     assert slow.closed == 0
 
@@ -533,7 +535,7 @@ def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkey
     hung = SlowCloseSink()
     worker = _worker_with(hung)
     try:
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
         start = time.monotonic()
@@ -565,7 +567,7 @@ def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> Non
     hung = SlowCloseSink()
     worker = _worker_with(hung)
     try:
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
         order: list[str] = []
@@ -592,13 +594,13 @@ def test_an_expired_first_shutdown_still_grants_the_grace_on_the_next_call() -> 
     # batch_size=1 here rather than the shared helper's 1000: this test needs one submission to
     # reach the sink, because wedging the drain thread is how the first shutdown is made to expire.
     worker = worker_mod.Worker(slow, batch_size=1, flush_interval=100.0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     wedge = threading.Event()
     wedged = _WedgedEmitSink(wedge)
     try:
         # First leave a close outstanding, then wedge the drain thread — in the other order the
         # swap's own drain either unwedges it or races the reassignment of ``worker.sink``.
-        decorator._swap_sink(wedged, timeout=0.3)
+        _lifecycle._swap_sink(wedged, timeout=0.3)
         assert slow.in_close.wait(5.0), "slow's close is outstanding"
         worker.submit([{"message": "stuck"}])
         assert wedged.in_emit.wait(5.0), "and the drain thread is now wedged"
@@ -623,8 +625,8 @@ def test_the_grace_is_shared_across_every_outstanding_close() -> None:
     worker = _worker_with(hung[0])
     try:
         for nxt in hung[1:]:
-            decorator._swap_sink(nxt, timeout=0.05)
-        decorator._swap_sink(SwapSink(), timeout=0.05)
+            _lifecycle._swap_sink(nxt, timeout=0.05)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.05)
         assert all(sink.in_close.wait(5.0) for sink in hung), "four closes are outstanding"
 
         start = time.monotonic()
@@ -648,7 +650,7 @@ def test_an_unbounded_shutdown_still_caps_the_grace() -> None:
     worker = _worker_with(hung)
     elapsed: list[float] = []
     try:
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
         # On its own thread deliberately: a regression that joins forever here would otherwise
@@ -678,7 +680,7 @@ def test_health_does_not_block_behind_the_grace() -> None:
     hung = SlowCloseSink()
     worker = _worker_with(hung)
     try:
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
         joining = threading.Thread(target=worker._join_closers, args=(2.0,))
@@ -705,7 +707,7 @@ def test_finished_closers_are_not_retained_between_swaps() -> None:
     _worker_with(SwapSink())  # the roster is process-global now, not this worker's (SPEC-033)
 
     for _ in range(50):
-        decorator._swap_sink(SwapSink(), timeout=5.0)
+        _lifecycle._swap_sink(SwapSink(), timeout=5.0)
 
     assert len(lifecycle._closers) <= 2, (
         f"finished closers accumulated: {len(lifecycle._closers)} retained across 50 swaps"
@@ -724,7 +726,7 @@ def test_an_expired_close_is_neither_abandoned_nor_reported(capsys) -> None:
     _worker_with(slow)
     try:
         capsys.readouterr()
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert slow.in_close.wait(5.0)
         assert log_foundry.health().incomplete_swaps == 0, "a slow close is not a failed swap"
         assert capsys.readouterr().err == "", "and is not announced either — no line, no counter"
@@ -747,7 +749,7 @@ def test_a_close_still_running_is_visible_in_health_while_it_runs() -> None:
     try:
         assert log_foundry.health().closing_sinks == 0, "nothing is closing yet"
 
-        decorator._swap_sink(SwapSink(), timeout=0.3)
+        _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert slow.in_close.wait(5.0)
         assert log_foundry.health().closing_sinks == 1, "the hung close is visible"
 
@@ -774,7 +776,7 @@ def test_a_closer_thread_that_cannot_start_is_announced_not_run_inline(monkeypat
     monkeypatch.setattr(threading.Thread, "start", refuse)
 
     start = time.monotonic()
-    decorator._swap_sink(SwapSink(), timeout=0.3)
+    _lifecycle._swap_sink(SwapSink(), timeout=0.3)
     elapsed = time.monotonic() - start
 
     assert elapsed < 5.0, "the close must not have been run inline as a fallback"
@@ -799,7 +801,7 @@ def test_the_closer_thread_is_a_daemon(monkeypatch) -> None:
 
     monkeypatch.setattr(threading, "Thread", RecordingThread)
     _worker_with(SwapSink())
-    decorator._swap_sink(SwapSink())
+    _lifecycle._swap_sink(SwapSink())
 
     closers = [t for t in started if t.name == "log-foundry-sink-close"]
     assert closers, "the close ran on its own thread"

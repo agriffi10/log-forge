@@ -54,7 +54,7 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
     Raises:
       None.
     """
-    from log_foundry.decorator import _flush_worker
+    from log_foundry._lifecycle import _flush_worker
 
     return _flush_worker(timeout)
 
@@ -121,7 +121,7 @@ def health() -> Health:
     Raises:
       None.
     """
-    from log_foundry.decorator import _worker_health
+    from log_foundry._lifecycle import _worker_health
 
     return _worker_health()
 
@@ -165,7 +165,7 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     Raises:
       None.
     """
-    from log_foundry.decorator import _shutdown_worker
+    from log_foundry._lifecycle import _shutdown_worker
 
     _shutdown_worker(timeout)
 

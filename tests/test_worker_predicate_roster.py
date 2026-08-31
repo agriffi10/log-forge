@@ -50,7 +50,7 @@ import pytest
 
 # A plain import, not `importorskip`: a roster whose value is that it cannot be bypassed must
 # not skip itself when the module it walks is renamed or fails to import.
-from log_foundry import decorator
+from log_foundry import _lifecycle, decorator
 
 # Tokens that make an expression a question about the worker. Every one names the worker, and
 # that is load-bearing rather than incidental: SPEC-035 FR-003 answers "who owns the new sink"
@@ -81,7 +81,7 @@ OWNERSHIP_AND_MOMENT = "ownership ∧ moment — whose stop event the sink shoul
 # Keyed by (function, expression, occurrence index within that function): two textually
 # identical guards in one function ask two questions and get two rows.
 ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
-    ("_get_worker", "_worker_exists()", 0): (
+    ("_get_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the double-checked build, outer half, and deliberately **unlocked** - this is the "
@@ -98,7 +98,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "which would rebuild a worker on every call once one retired."
         ),
     ),
-    ("_get_worker", "_worker_exists()", 1): (
+    ("_get_worker", "_state.worker_exists()", 1): (
         EXISTENCE,
         (
             "the second half of the double-check, re-read under the lock. Two bindings for one "
@@ -127,7 +127,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "`return _worker` after the lock could never have handed back a different object."
         ),
     ),
-    ("_rebuild_worker_after_fork", "_worker_exists()", 0): (
+    ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the two questions below read, taken once. The existence question "
@@ -163,7 +163,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "deliberately not ownership: nothing here is deciding who closes a sink."
         ),
     ),
-    ("_live_worker", "_worker", 0): (
+    ("_Lifecycle.live_worker", "self._worker", 0): (
         LIVENESS,
         (
             "the snapshot the helper's own test reads. A binding is classified by the question "
@@ -171,11 +171,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "because rebinding is how a guard changes category without its text changing."
         ),
     ),
-    ("_live_worker", "worker is None or worker.retired", 0): (
+    ("_Lifecycle.live_worker", "worker is None or worker.retired", 0): (
         LIVENESS,
         "the definition of the liveness helper itself, rather than a consumer of it.",
     ),
-    ("_worker_owns_now", "_worker", 0): (
+    ("_Lifecycle.worker_owns_now", "self._worker", 0): (
         OWNERSHIP_AND_MOMENT,
         (
             "the snapshot the conjunction below reads, now inside the question rather than at "
@@ -186,7 +186,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "that there is now one such line in the module instead of one per caller."
         ),
     ),
-    ("_worker_owns_now", "worker is not None and worker.sink is sink and worker.draining", 0): (
+    ("_Lifecycle.worker_owns_now", "worker is not None and worker.sink is sink and worker.draining", 0): (
         OWNERSHIP_AND_MOMENT,
         (
             "SPEC-035 FR-001, stated once. Ownership alone skips for a worker whose shutdown has "
@@ -197,7 +197,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "the category names both terms."
         ),
     ),
-    ("_worker_owns", "_worker", 0): (
+    ("_Lifecycle.worker_owns", "self._worker", 0): (
         OWNERSHIP,
         (
             "the snapshot the ownership test below reads. Filed for the reason every binding "
@@ -207,7 +207,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "two call sites that used to compose it."
         ),
     ),
-    ("_worker_owns", "worker is not None and worker.sink is sink", 0): (
+    ("_Lifecycle.worker_owns", "worker is not None and worker.sink is sink", 0): (
         OWNERSHIP,
         (
             "the definition of the ownership question itself. A retired worker still owns its "
@@ -217,7 +217,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "live writer on an expired one, both measured (SPEC-033 FR-002)."
         ),
     ),
-    ("_offer_orphan_signal", "_worker_owns_now(sink)", 0): (
+    ("_offer_orphan_signal", "_state.worker_owns_now(sink)", 0): (
         OWNERSHIP_AND_MOMENT,
         (
             "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
@@ -228,14 +228,14 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "nobody will set. Both were measured; only the conjunction is right."
         ),
     ),
-    ("_close_orphan_sink", "_worker_owns(owed)", 0): (
+    ("_close_orphan_sink", "_state.worker_owns(owed)", 0): (
         OWNERSHIP,
         (
             "a retired worker still owns its sink's close, and deliberately declines it when its "
             "shutdown expired, because the drain thread may still be inside emit (SPEC-027 FR-004)."
         ),
     ),
-    ("_shutdown_worker", "_worker_exists()", 0): (
+    ("_shutdown_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "which exit path to take. A worker that exists drains first, and only then is the "
@@ -254,7 +254,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
         ),
     ),
-    ("_swap_sink", "_live_worker()", 0): (
+    ("_swap_sink", "_state.live_worker()", 0): (
         LIVENESS,
         (
             "the call that answers who performs. What is classified here is the *call*, not a "
@@ -265,7 +265,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "counted only predicates would not notice."
         ),
     ),
-    ("_delivering_to_an_inherited_sink", "_worker_exists()", 0): (
+    ("_delivering_to_an_inherited_sink", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "which of the three delivery targets to ask about, for Health.inherited_sink "
@@ -277,7 +277,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "to answer it, the same refusal _worker_health and _flush_worker already make."
         ),
     ),
-    ("_delivering_to_an_inherited_sink", "worker.sink if worker is not None else _orphan_sink or _live_config().sink", 0): (
+    ("_delivering_to_an_inherited_sink", "worker.sink if worker is not None else _state._orphan_sink or _live_config().sink", 0): (
         EXISTENCE,
         (
             "the same question, consuming the snapshot the row above took rather than "
@@ -316,7 +316,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and a reason copied rather than thought about is the failure AC-2 exists to stop."
         ),
     ),
-    ("_swap_sink", "not _worker_owns(old)", 0): (
+    ("_swap_sink", "not _state.worker_owns(old)", 0): (
         OWNERSHIP,
         (
             "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
@@ -346,7 +346,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "second reason to decline; today that is a design argument, not a measured one."
         ),
     ),
-    ("_flush_worker", "_worker_exists()", 0): (
+    ("_flush_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the existence test below reads. Deliberately the existence question "
@@ -359,7 +359,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "test_module_flush_after_shutdown_returns_false_promptly."
         ),
     ),
-    ("_worker_health", "_worker_exists()", 0): (
+    ("_worker_health", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the existence test below reads. The existence question again, and for "
@@ -413,7 +413,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "drain, which is false against LIVENESS's own definition."
         ),
     ),
-    ("_flush_live_sink", "_live_worker()", 0): (
+    ("_flush_live_sink", "_state.live_worker()", 0): (
         LIVENESS,
         (
             "who is *being delivered to*, asked once here rather than composed in the "
@@ -435,7 +435,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_flush_live_sink",
-        "worker.sink if worker is not None else _orphan_sink",
+        "worker.sink if worker is not None else _state._orphan_sink",
         0,
     ): (
         LIVENESS,
@@ -448,7 +448,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "sink a retired worker still owns while events were going somewhere else."
         ),
     ),
-    ("_sweep_open_spans", "_get_worker()", 0): (
+    ("_sweep_open_spans", "_lifecycle._get_worker()", 0): (
         LIVENESS,
         (
             "who *performs* the submit of a swept buffer. It is a binding rather than a "
@@ -464,7 +464,36 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "destroyed with `flush()` reporting success and every counter zero."
         ),
     ),
-    ("_worker_health", "_orphan_retired or health.retired", 0): (
+    ("_inheritance_roots", "_state.worker_exists()", 0): (
+        EXISTENCE,
+        (
+            "which sinks a forked child must mark _FOREIGN before any other handler runs "
+            "(SPEC-042 FR-001). Existence rather than liveness, deliberately: a retired "
+            "worker's sink is still a transport this process inherited and must not release, "
+            "and resolving liveness here would leave it unmarked and therefore claimable. "
+            "This site is **new to the roster** rather than new to the code - it read "
+            "`decorator._worker` directly and composed the question on it, one module away "
+            "from a roster that walked only `decorator.py`, so it passed silently for two "
+            "specs. That is the gap SPEC-040 FR-004 widens the scope to close."
+        ),
+    ),
+    (
+        "_inheritance_roots",
+        (
+            "(config._live_config().sink, None if worker is None else worker.sink, "
+            "_state._orphan_sink, _state._orphan_closed_sink)"
+        ),
+        0,
+    ): (
+        EXISTENCE,
+        (
+            "the three delivery targets plus the superseded one, filed by the question the "
+            "conditional inside it asks. It is one site and not four: the tuple is a single "
+            "filed expression, and the only worker question in it is the existence test that "
+            "chooses between `worker.sink` and nothing."
+        ),
+    ),
+    ("_worker_health", "_state._orphan_retired or health.retired", 0): (
         LIVENESS,
         (
             "reporting rather than deciding: this synthesizes `retired` for a process that shut "
@@ -511,7 +540,37 @@ def _is_boolean_expr(node: ast.AST | None) -> bool:
         return True
     if isinstance(node, ast.IfExp):
         return _is_boolean_expr(node.body) or _is_boolean_expr(node.orelse)
-    return isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_live_worker"
+    return _is_liveness_call(node)
+
+
+def _is_liveness_call(node: ast.AST) -> bool:
+    """Whether a node is a call to the liveness question, in either spelling.
+
+    The question is a *value* rather than a comparison, so nothing else in the walker would
+    recognise it: `worker = _state.live_worker()` has no sentinel-bearing boolean in it, and
+    SPEC-033's whole defect was a site answering with the wrong one of these.
+
+    Both spellings are matched deliberately. SPEC-040 made it a method, so every shipped site is
+    now `_state.live_worker()` — an `ast.Attribute` callee — and a rule keyed only on the old
+    free-function `ast.Name` went dead in that commit while staying green, because the walker's
+    own fixture still exercised the dead form. The `ast.Name` arm is kept so that reintroducing a
+    module-level `_live_worker()` cannot slip past, and the `ast.Attribute` arm is what covers
+    the code as it now ships.
+
+    Args:
+      node: The node to test.
+
+    Returns:
+      Whether it is a liveness call.
+
+    Raises:
+      None.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name):
+        return node.func.id == "_live_worker"
+    return isinstance(node.func, ast.Attribute) and node.func.attr == "live_worker"
 
 
 def _boolean_positions(node: ast.AST) -> list[ast.AST]:
@@ -775,10 +834,7 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
         filed: set[int] = set()
         hits: list[tuple[int, int, str]] = []
         for inner in _own_nodes(scope):
-            if isinstance(inner, ast.Call) and getattr(inner.func, "id", None) == "_live_worker":
-                candidates = [inner]
-            else:
-                candidates = _boolean_positions(inner)
+            candidates = [inner] if _is_liveness_call(inner) else _boolean_positions(inner)
             for expr in candidates:
                 if id(expr) in filed:
                     continue
@@ -796,8 +852,32 @@ def _sites(tree: ast.AST) -> list[tuple[str, str, int]]:
     return found
 
 
+_WALKED = (_lifecycle, decorator)
+"""The modules the roster is complete about (SPEC-040 FR-004 AC-1).
+
+`_lifecycle` first, because that is where the state and the four questions now live. `decorator`
+stays in scope rather than being dropped: it still reaches the worker through
+`_lifecycle._get_worker()` in `_flush` and `_sweep_open_spans`, and a roster pointed only at the
+new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
+"""
+
+_SITE_FLOOR = {"log_foundry._lifecycle": 37, "log_foundry.decorator": 1}
+"""The floor each walked module must still meet, by name.
+
+A refactor that relocates guards can shrink a derived roster silently, which is the one failure
+a roster cannot catch about itself. **Per module, and keyed by name, because a single total is
+not enough**: with one number, dropping `decorator` from `_WALKED` left 37 sites against a floor
+of 36 and passed — the exact scenario the test below is named for, measured. A name-keyed
+mapping fails instead, because the dropped module's entry has nothing to satisfy it.
+
+The counts are measured and may rise; either may fall only in a change that deliberately removes
+guards and says so here. `decorator`'s 1 is `_sweep_open_spans`'s `worker = _lifecycle._get_worker()`
+— small, and that is the point: it is the site that makes walking both modules necessary.
+"""
+
+
 def _numbered() -> set[tuple[str, str, int]]:
-    """The roster derived from the real `decorator.py`.
+    """The roster derived from the real modules named in :data:`_WALKED`.
 
     Args:
       None.
@@ -808,7 +888,64 @@ def _numbered() -> set[tuple[str, str, int]]:
     Raises:
       None.
     """
-    return set(_sites(ast.parse(textwrap.dedent(inspect.getsource(decorator)))))
+    found: set[tuple[str, str, int]] = set()
+    for module in _WALKED:
+        found |= set(_sites(ast.parse(textwrap.dedent(inspect.getsource(module)))))
+    return found
+
+
+def _per_module_sites() -> dict[str, int]:
+    """Returns how many sites each walked module contributes, by module name.
+
+    Args:
+      None.
+
+    Returns:
+      One entry per module in :data:`_WALKED`.
+
+    Raises:
+      None.
+    """
+    return {
+        module.__name__: len(_sites(ast.parse(textwrap.dedent(inspect.getsource(module)))))
+        for module in _WALKED
+    }
+
+
+def test_the_roster_covers_at_least_as_many_sites_as_before_the_move() -> None:
+    """FR-004 AC-2. A roster walking the wrong module is the vacuous case, and it passes.
+
+    Asserted **per module against a name-keyed floor**, not against a total. A total is the
+    version that fails to catch its own scenario: `_WALKED = (_lifecycle,)` yields 37 sites,
+    clears a total floor of 36, and passes while every site in `decorator` has stopped being
+    checked. Measured, which is why this test is written the way it is rather than the obvious
+    way.
+    """
+    counted = _per_module_sites()
+    assert set(counted) == set(_SITE_FLOOR), (
+        f"the walked module set changed: expected {sorted(_SITE_FLOOR)}, got {sorted(counted)}"
+    )
+    for name, floor in _SITE_FLOOR.items():
+        assert counted[name] >= floor, (
+            f"{name} shrank to {counted[name]} sites, under its floor of {floor}"
+        )
+
+
+def test_no_scope_name_is_shared_across_the_walked_modules() -> None:
+    """The three-part key has no module term, so a shared scope name would merge two sites.
+
+    Keying by module instead would be the other fix and costs every row a rewrite; this asserts
+    the property that makes the cheaper key sound, rather than assuming it.
+    """
+    scopes = {
+        module.__name__: {
+            scope for scope, _, _ in _sites(ast.parse(textwrap.dedent(inspect.getsource(module))))
+        }
+        for module in _WALKED
+    }
+    for (left, right) in itertools.combinations(sorted(scopes), 2):
+        shared = scopes[left] & scopes[right]
+        assert not shared, f"{left} and {right} share these scopes, which would collide: {shared}"
 
 
 def test_every_worker_predicate_is_classified() -> None:

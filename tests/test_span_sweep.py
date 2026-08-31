@@ -20,7 +20,7 @@ import threading
 
 import log_foundry
 from conftest import run_concurrently
-from log_foundry import context, decorator
+from log_foundry import _lifecycle, context, decorator
 from log_foundry.model import Span
 
 
@@ -197,13 +197,13 @@ def test_a_flush_with_no_span_open_creates_no_worker() -> None:
     log_foundry.configure(service="t", sink=Recorder())
 
     assert log_foundry.flush(timeout=5.0), "a process that never logged has lost nothing"
-    assert decorator._worker is None, "and no worker was built to tell us so"
+    assert _lifecycle._state._worker is None, "and no worker was built to tell us so"
 
 
 def test_a_sweep_that_finds_events_creates_the_worker() -> None:
     """AC-7. The cold-start path AC-1 exercises, and without it AC-1 cannot pass.
 
-    Inside the *first* traced call `decorator._worker is None` — the worker is built when a span
+    Inside the *first* traced call `_lifecycle._state._worker is None` — the worker is built when a span
     *closes* — so a sweep that submits into a worker that does not exist delivers nothing and
     still reports success.
     """
@@ -213,7 +213,7 @@ def test_a_sweep_that_finds_events_creates_the_worker() -> None:
 
     @log_foundry.trace
     def handler() -> None:
-        seen["worker_before"] = decorator._worker
+        seen["worker_before"] = _lifecycle._state._worker
         log_foundry.info("cold start")
         log_foundry.flush(timeout=5.0)
         seen["delivered"] = sink.messages()
@@ -360,7 +360,7 @@ def test_a_sweep_racing_a_span_close_delivers_each_event_once() -> None:
     """
     def one_trial() -> Recorder:
         """One span whose close races a sweep on a thread sharing the very same Span object."""
-        decorator._worker = None
+        _lifecycle._state._worker = None
         sink = Recorder()
         log_foundry.configure(service="t", sink=sink)
         barrier = threading.Barrier(2)
@@ -462,14 +462,14 @@ def test_a_sweep_whose_worker_cannot_be_built_destroys_nothing() -> None:
     def refuse() -> object:
         raise RuntimeError("can't start new thread")
 
-    real = decorator._get_worker
-    decorator._get_worker = refuse  # type: ignore[assignment]
+    real = _lifecycle._get_worker
+    _lifecycle._get_worker = refuse  # type: ignore[assignment]
     token = context.push_span(span)
     try:
         result = log_foundry.flush(timeout=5.0)
     finally:
         context.pop_span(token)
-        decorator._get_worker = real  # type: ignore[assignment]
+        _lifecycle._get_worker = real  # type: ignore[assignment]
 
     assert [e["message"] for e in span.events] == ["e0", "e1", "e2", "e3"], (
         f"the span must still hold its events, so its close can deliver them: {span.events}"

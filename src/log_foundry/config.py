@@ -61,9 +61,9 @@ rather than lost data.
 
 It does **not** cover reads. :func:`_live_config` is one atomic global read and stays lock-free,
 so the per-event path pays nothing (SPEC-034 FR-003 AC-6). Lock ordering is one-way and stays
-that way: ``_ensure_sink`` is called with ``decorator._worker_lock`` held, and ``configure()``
+that way: ``_ensure_sink`` is called with ``_lifecycle._state._lock`` held, and ``configure()``
 releases this lock before ``_swap_live_sink`` takes that one, so nothing acquires
-``_worker_lock`` underneath this.
+the lifecycle lock underneath this.
 """
 
 
@@ -185,8 +185,9 @@ def configure(
 def _swap_live_sink(sink: Sink) -> None:
     """Points an already-running worker at a newly configured sink (SPEC-030 FR-003).
 
-    The import is local for the reason ``_ensure_sink``'s is: ``decorator`` imports this module
-    at module scope, so reaching back the other way at import time would be a cycle. It also
+    The import is local for the reason ``_ensure_sink``'s is: ``_lifecycle`` reaches this
+    module at call time and this module reaches back, so an import at module scope in either
+    direction at import time would be a cycle. It also
     keeps the dependency to the one call that needs it — ``configure()`` without a ``sink=``
     never touches the worker at all.
 
@@ -204,7 +205,7 @@ def _swap_live_sink(sink: Sink) -> None:
     Raises:
       None.
     """
-    from log_foundry.decorator import _swap_sink
+    from log_foundry._lifecycle import _swap_sink
     from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
 
     _swap_sink(sink, DEFAULT_SWAP_TIMEOUT)

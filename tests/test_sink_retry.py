@@ -14,6 +14,7 @@ import time
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
+from log_foundry import _lifecycle
 from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
 from log_foundry.worker import Worker
@@ -696,7 +697,6 @@ def test_the_public_shutdown_takes_a_timeout() -> None:
 def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
     """An unbounded join in an atexit handler is a process that will not exit."""
     import log_foundry
-    from log_foundry import decorator
     from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT
 
     seen: list[float | None] = []
@@ -705,9 +705,9 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
         def shutdown(self, timeout: float | None = None) -> None:
             seen.append(timeout)
 
-    monkeypatch.setattr(decorator, "_worker", SpyWorker())
+    monkeypatch.setattr(_lifecycle._state, "_worker", SpyWorker())
 
-    decorator._shutdown_worker()  # what atexit calls: no argument
+    _lifecycle._shutdown_worker()  # what atexit calls: no argument
     log_foundry.shutdown()  # and what a caller gets by default
     log_foundry.shutdown(timeout=None)  # None is still available on request
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, context
+from log_foundry._lifecycle import _note_orphan_emit
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
 from log_foundry.context import set_baggage
-from log_foundry.decorator import _note_in_span_loss, _note_orphan_emit, _note_orphan_loss
+from log_foundry.decorator import _note_in_span_loss, _note_orphan_loss
 from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
 
