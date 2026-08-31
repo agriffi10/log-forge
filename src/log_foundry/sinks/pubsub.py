@@ -403,6 +403,79 @@ class GooglePubSubSink:
             _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}")
         return True
 
+    def flush(self) -> None:
+        """Resolves the outstanding publish futures without closing the sink (SPEC-036 FR-002).
+
+        ``emit`` appends an unresolved future and returns; before this hook existed nothing but
+        ``close()`` ever called ``result()`` on them, so ``log_foundry.flush()`` could not reach a
+        single one — the call whose whole purpose is delivery before a freeze.
+
+        **It is :meth:`_await_overflow` applied to the whole pending list, and the three rules it
+        obeys are that method's, each earned by a measured defect.** One ``deadline`` covers the
+        list rather than a timeout per future: at the shipped ``max_pending`` a per-future wait is
+        not a bound at all, and a stalled destination would hold ``log_foundry.flush()`` for
+        hours. ``_Unboundable`` is **caught**, because a future whose ``result()`` takes no
+        ``timeout`` cannot be waited on within one — and letting it escape here would abandon the
+        entire list, which has already been swapped out and is referenced by nothing else. And
+        ``_futures_lock`` is **not** held across a ``result()``, because ``emit`` takes it per
+        event and an application thread on the orphan path would block behind it.
+
+        A future that did not settle is put back rather than dropped: the sink stays open, so it
+        is unfinished, not unconfirmed, and the next flush or the close waits on it again. It
+        **raises** when any remained, which is what makes ``log_foundry.flush()`` report
+        ``reason="sink-flush"``. A future that settled *failed* is already counted by
+        :meth:`_resolve` and reported through ``losses()``, per SPEC-026.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The sink is closed, or a publish was still in flight afterwards.
+        """
+        if self._closed:
+            raise SinkDeliveryError("GooglePubSubSink cannot flush: the sink is closed")
+        with self._futures_lock:
+            pending, self._futures = self._futures, []
+        if not pending:
+            return
+
+        deadline = time.monotonic() + self.overflow_timeout
+        unresolved: list[Any] = []
+        for index, future in enumerate(pending):
+            settled = False
+            while not self._out_of_time(deadline):
+                began = time.monotonic()
+                slice_ = min(deadline - began, _POLL_INTERVAL)
+                try:
+                    settled = self._resolve(future, slice_)
+                except _Unboundable:
+                    break
+                if settled:
+                    break
+                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
+            if settled:
+                continue
+            unresolved.append(future)
+            if self._out_of_time(deadline):
+                unresolved.extend(pending[index + 1 :])
+                break
+
+        if not unresolved:
+            return
+        with self._futures_lock:
+            closed = self._closed
+            if not closed:
+                self._futures[:0] = unresolved
+        if closed:
+            for future in unresolved:
+                self._resolve(future)
+        raise SinkDeliveryError(
+            f"GooglePubSubSink flushed with {len(unresolved)} publish(es) still in flight"
+        )
+
     def close(self) -> None:
         """Resolves all pending publish futures, counting and logging errors (FR-008).
 

@@ -857,6 +857,49 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
     )
 
 
+def test_every_sink_records_a_client_buffering_decision() -> None:
+    """Every sink either implements ``flush()`` or says, in its class docstring, why it need not.
+
+    SPEC-036 FR-002 AC-6. The same shape as the concurrency lint above and for the same reason:
+    **whether a driver buffers in its client is the vendor's contract, not something derivable
+    from syntax**, so this does not try to decide. It makes the decision mandatory and visible
+    per class.
+
+    The population is the shared roster, imported rather than re-derived — `test_fork_lifecycle`
+    does the same — because a second roster over one package is a fork with no merge, and this
+    file has already paid for that once: it shrank 34 to 29 silently while its sibling caught the
+    identical loss because only that one had a floor.
+
+    SPEC-042 FR-006 AC-5 handed this spec a **measured** roster of five candidates rather than
+    the two FR-002 named, which is what stopped the decision being made against a list of two.
+    Of those five: ``KafkaSink`` (librdkafka's local buffer), ``GooglePubSubSink`` (unresolved
+    publish futures) and ``NATSSink`` (core ``publish`` writes to the client's outbound buffer)
+    implement it. ``SQLiteSink`` and ``PostgresSink`` do **not**, and reading their code is what
+    settles it: both commit inside ``emit`` — `with connection` for one, an explicit ``commit()``
+    for the other — so nothing is outstanding once an emit returns. The final commit in their
+    ``close`` is belt and braces, not a buffer, which qualifies what SPEC-042 measured from the
+    close bodies alone.
+    """
+    undecided: list[str] = []
+    for stem, cls in _sink_classes_with_an_emit():
+        defines = {
+            m.name
+            for m in cls.body
+            if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        if "flush" in defines:
+            continue
+        documented = _decision_doc(cls)
+        if "**no** client buffer" in documented and "SPEC-036 FR-002" in documented:
+            continue
+        undecided.append(f"{stem}.{cls.name}")
+
+    assert not undecided, (
+        "these sinks neither implement flush() nor record, in the class docstring, why they hold "
+        f"nothing of their own that a flush() would have to reach: {undecided}"
+    )
+
+
 @pytest.mark.parametrize("build", ["file", "rotating", "sqlite"])
 def test_close_waits_for_an_in_flight_emit_on_every_locked_sink(
     build: str, tmp_path: Path

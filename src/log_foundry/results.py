@@ -50,7 +50,13 @@ class FlushResult(_Result):
     """What :func:`log_foundry.flush` returns.
 
     ``reason`` is ``None`` on success. The tokens it can carry today are ``"timed-out"``,
-    ``"retired"``, ``"thread-died"``, ``"queue-full"`` and ``"abandoned"``.
+    ``"retired"``, ``"thread-died"``, ``"queue-full"``, ``"abandoned"`` and ``"sink-flush"``.
+
+    ``"sink-flush"`` is the one SPEC-036 added (FR-002 AC-8) and it is worth distinguishing: the
+    queue drained cleanly and the **sink's own client buffer** did not, so the events are past
+    this library and inside a driver. ``"abandoned"`` is the neighbouring case where this call
+    could not hand them over at all. New tokens may appear in any release, which is what this
+    type exists for — branch on ``bool()``.
     """
 
 

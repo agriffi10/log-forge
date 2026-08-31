@@ -35,6 +35,10 @@ class MongoDBSink:
     Attributes:
       failed: Documents the server rejected, or a whole batch abandoned past the retry bound.
       dropped_oversized: Documents dropped for exceeding MongoDB's 16 MB per-document limit.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
     """
 
     def __init__(

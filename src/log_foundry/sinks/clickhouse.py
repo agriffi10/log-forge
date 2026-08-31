@@ -47,6 +47,10 @@ class ClickHouseSink:
     default auto-generated session, so it is squarely in that case and the lock is required
     rather than merely prudent. One client per thread would be the alternative, and that is the
     connection-pool design FR-002 puts out of scope.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
     """
 
     def __init__(

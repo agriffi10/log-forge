@@ -23,6 +23,10 @@ class AzureEventHubsSink:
     1 MB per-batch limit, which the SDK signals by raising ``ValueError`` from ``add``. The
     worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per batch, 0.7 s at
     the defaults.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
     """
 
     def __init__(

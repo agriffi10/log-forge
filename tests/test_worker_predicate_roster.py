@@ -286,13 +286,6 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "test_module_flush_after_shutdown_returns_false_promptly."
         ),
     ),
-    ("_flush_worker", "worker is None", 0): (
-        EXISTENCE,
-        (
-            "a process that never logged has nothing to drain, and building a thread to prove it "
-            "would be pure cost (SPEC-013)."
-        ),
-    ),
     ("_worker_health", "_worker", 0): (
         EXISTENCE,
         (
@@ -315,6 +308,59 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_worker_health", "worker is None", 0): (
         EXISTENCE,
         "health() creates no worker; the zeros describe a process that never logged.",
+    ),
+    ("_flush_worker", "worker is not None", 0): (
+        EXISTENCE,
+        (
+            "is there a queue to drain at all. Was `worker is None` guarding an early return; "
+            "SPEC-036 FR-002 inverted it because the sink's own flush must still run in a "
+            "process that has no worker — an orphan-only process with a client-buffering sink "
+            "would otherwise never reach its buffer, the shape SPEC-031 FR-006 and SPEC-033 each "
+            "found on the close path. Not liveness: a retired worker's queue is still drained "
+            "here, and `Worker.flush` reports `retired` itself. ~~`worker is None`: a process "
+            "that never logged has nothing to drain, and building a thread to prove it would be "
+            "pure cost (SPEC-013)~~ — the same reason, inverted: that half is now the `is not "
+            "None` branch, and the fall-through still builds nothing."
+        ),
+    ),
+    ("_flush_worker", "worker.flush(timeout)", 0): (
+        LIVENESS,
+        (
+            "who *performs* the drain, and a retired worker performs nothing — `Worker.flush` "
+            "returns a falsy result with reason `retired` as its first statement, before the "
+            "liveness check and before any queue work. It is a **binding** because SPEC-036 "
+            "FR-002 sequences the sink's own flush *after* the drain, so the drain's verdict has "
+            "to be held while that runs; it was `return worker.flush(timeout)`, which the walker "
+            "does not file because a Return is filed only for a boolean-shaped value. The "
+            "precedent is `(\"_worker_health\", \"worker.health()\", 0)` — a method-call binding "
+            "on the worker, filed here. SPEC-036 FR-002 AC-9 settles this rather than leaving it "
+            "to be discovered at build time against a red test, and settles it as a category that "
+            "already exists: an earlier draft claimed none of the four described performing a "
+            "drain, which is false against LIVENESS's own definition."
+        ),
+    ),
+    ("_flush_live_sink", "_worker", 0): (
+        EXISTENCE,
+        (
+            "the raw global, filed by the first question the conditional below asks. Reading it "
+            "through a liveness helper here would collapse the two branches this function exists "
+            "to distinguish."
+        ),
+    ),
+    (
+        "_flush_live_sink",
+        "worker.sink if worker is not None and (not worker.retired) else _orphan_sink",
+        0,
+    ): (
+        LIVENESS,
+        (
+            "which sink is *being delivered to*, which is the sink whose own client buffer a "
+            "flush must drain. A retired worker performs no further delivery, so its sink is not "
+            "the live target and the orphan record is — the definition of this category, applied "
+            "to a target rather than to an action. Deliberately not ownership: nothing here "
+            "decides who *closes* a sink, and answering that question instead would flush the "
+            "sink a retired worker still owns while events were going somewhere else."
+        ),
     ),
     ("_sweep_open_spans", "_get_worker()", 0): (
         LIVENESS,

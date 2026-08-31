@@ -40,6 +40,10 @@ class FirehoseSink:
     It also **adds no post-close guard** (SPEC-032 FR-003): ``close()`` is a documented no-op,
     because the client is the caller's to release or the SDK's to reap, so a batch emitted
     afterwards still reaches the delivery stream.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
+    destination has the batch, so nothing is queued locally between emits.
     """
 
     MAX_RECORDS = 500

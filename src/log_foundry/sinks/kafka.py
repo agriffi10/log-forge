@@ -228,6 +228,41 @@ class KafkaSink:
             self._closed = True
             self._flush_bounded()
 
+    def flush(self) -> None:
+        """Drains the producer's local buffer without closing the sink (SPEC-036 FR-002).
+
+        ``emit`` hands to librdkafka and returns; only ``flush()`` drains it. Before this hook
+        existed the buffer was unreachable through ``log_foundry.flush()`` — the whole point of
+        that call in a process about to be frozen — and went out only at ``close()``.
+
+        It **raises** when the producer still holds messages after ``flush_timeout``, which is what
+        makes ``log_foundry.flush()`` report ``reason="sink-flush"`` rather than success. Nothing
+        is counted as lost: unlike the close path those messages are still queued and the next
+        flush or the close may yet deliver them, so booking them against ``failed`` would report a
+        loss that has not happened. The remainder is named in the error instead.
+
+        Refuses after ``close()`` on SPEC-032's rule — the producer has been flushed and released.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The sink is closed, or the producer could not be drained inside
+            ``flush_timeout``.
+          Exception: Whatever the producer raises.
+        """
+        if self._closed:
+            raise SinkDeliveryError("KafkaSink cannot flush: the sink is closed")
+        remaining = self.producer.flush(self.flush_timeout)
+        if type(remaining) is int and remaining > 0:
+            raise SinkDeliveryError(
+                f"KafkaSink flushed within {self.flush_timeout}s with {remaining} "
+                "message(s) still queued"
+            )
+
     def _flush_bounded(self) -> None:
         """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
 

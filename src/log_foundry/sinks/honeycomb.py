@@ -24,6 +24,10 @@ class HoneycombSink(HTTPSink):
         maximum event count for the batch endpoint.
       MAX_BATCH_BYTES: 1,000,000 — Honeycomb's documented 1 MB of uncompressed JSON for the
         Create Events endpoint.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = 1000

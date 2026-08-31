@@ -38,6 +38,10 @@ class LokiSink(HTTPSink):
         (``distributor.max_recv_msg_size``, 100 MB for the compressed body), but that is an
         operator-tunable server setting and a hosted Loki is routinely configured well below it,
         so the default here is the conservative one. Raise it with ``max_batch_bytes=``.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
+    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_BATCH_COUNT = 1000

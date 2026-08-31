@@ -16,6 +16,10 @@ class MemorySink:
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): there is no transport, and ``close()`` releases nothing — a test that
     closes the sink and then asserts on a later batch still sees it in ``.events``.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): there is no transport under it for a flush
+    to push anything onto.
     """
 
     def __init__(self, maxlen: int | None = None) -> None:

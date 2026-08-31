@@ -51,6 +51,11 @@ class SyslogSink:
     post-close refusal comes from there too (SPEC-032 FR-004) — a batch emitted after
     ``close()`` reaches ``send_all`` and is refused with ``SinkDeliveryError`` without the
     socket being reopened, so a guard here would only duplicate one that already holds.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` hands its bytes to the
+    socket before it returns, and no client object outlives it holding data. What the *network*
+    then does with a datagram is not something a flush could hurry.
     """
 
     def __init__(

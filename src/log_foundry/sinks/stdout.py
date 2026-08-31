@@ -26,6 +26,10 @@ class StdoutSink:
 
     It **adds no post-close guard** (SPEC-032 FR-003), because ``close()`` only flushes — the
     stream belongs to the process, not to this sink, so a later batch still lands.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` flushes the stream before it
+    returns, so nothing of this sink's is left pending between calls.
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:
@@ -84,6 +88,10 @@ class StderrSink(StdoutSink):
     It writes each event as one ``json.dumps`` line and flushes, exactly like ``StdoutSink`` —
     only the default stream differs, following the twelve-factor convention of logs on stderr
     and app output on stdout.
+
+
+    It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` flushes the stream before it
+    returns, so nothing of this sink's is left pending between calls.
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:

@@ -152,6 +152,53 @@ class NATSSink:
         if batch and not published:
             raise SinkDeliveryError(f"NATSSink published none of {len(batch)} event(s)")
 
+    def flush(self) -> None:
+        """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
+
+        Core ``publish()`` writes into the client's own outbound buffer and returns; the network
+        write happens on the driver's flusher task. That is why :meth:`close` drains, and why
+        ``log_foundry.flush()`` could not reach a published-but-unwritten event before this hook.
+        Under JetStream ``publish()`` awaits an ack, so there is nothing pending and this costs a
+        round trip at worst.
+
+        Takes the same lock :meth:`emit` does, for the reason recorded there: an ``asyncio`` loop
+        is single-entry, and a second thread calling ``run_until_complete`` on a running loop can
+        leave a thread never returning at all.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The sink is closed.
+          Exception: Whatever the driver raises while flushing.
+        """
+        with self._lock:
+            if self._loop.is_closed():
+                raise SinkDeliveryError("NATSSink cannot flush: the sink is closed")
+            self._loop.run_until_complete(self._flush_client())
+
+    async def _flush_client(self) -> None:
+        """Flushes the client if the driver offers one, mirroring :meth:`_drain`'s probe.
+
+        Probed by name for the same reason ``drain`` is: the sink is written against a driver it
+        does not own, and a client without the method has nothing buffered to push.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the driver raises while flushing.
+        """
+        flush = getattr(self._client, "flush", None)
+        if flush is not None:
+            await flush()
+
     async def _drain(self) -> None:
         """Drains the client if the driver offers a drain.
 
