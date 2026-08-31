@@ -573,12 +573,14 @@ def test_an_empty_http_batch_never_raises() -> None:
 # --- FR-001 / FR-002: SentrySink sends one envelope per event -----------------------------
 
 
-def test_sentry_absorbs_a_per_event_failure_when_something_landed(sentry_http_fallback) -> None:
+def test_sentry_absorbs_a_per_event_failure_when_something_landed() -> None:
     from log_foundry.sinks.sentry import SentrySink
     from test_sinks_http import FakeOpener, FakeResponse
 
     opener = FakeOpener([FakeResponse(500, b""), FakeResponse(200, b"{}")])
-    sink = SentrySink("http://k@sentry.local/1", max_retries=0, opener=opener)
+    sink = SentrySink(
+        "http://k@sentry.local/1", backend="http", max_retries=0, opener=opener
+    )
 
     sink.emit([{"level": "ERROR"}, {"level": "ERROR"}])  # second one lands
 
@@ -586,12 +588,13 @@ def test_sentry_absorbs_a_per_event_failure_when_something_landed(sentry_http_fa
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
 
 
-def test_sentry_raises_when_no_envelope_landed(sentry_http_fallback) -> None:
+def test_sentry_raises_when_no_envelope_landed() -> None:
     from log_foundry.sinks.sentry import SentrySink
     from test_sinks_http import FakeOpener, FakeResponse
 
     sink = SentrySink(
         "http://k@sentry.local/1",
+        backend="http",
         max_retries=0,
         opener=FakeOpener([FakeResponse(500, b"")]),
     )
@@ -599,11 +602,11 @@ def test_sentry_raises_when_no_envelope_landed(sentry_http_fallback) -> None:
         sink.emit([{"level": "ERROR"}, {"level": "ERROR"}])
 
 
-def test_sentry_skipping_every_event_is_a_successful_emit(sentry_http_fallback) -> None:
+def test_sentry_skipping_every_event_is_a_successful_emit() -> None:
     from log_foundry.sinks.sentry import SentrySink
     from test_sinks_http import FakeOpener
 
-    sink = SentrySink("http://k@sentry.local/1", opener=FakeOpener())
+    sink = SentrySink("http://k@sentry.local/1", backend="http", opener=FakeOpener())
     sink.emit([{"level": "INFO"}, {"level": "DEBUG"}])  # below min_level: never meant for Sentry
     assert (sink.skipped, sink.sent) == (2, 0)
     assert sink.losses() == SinkLosses(dropped=0, failed=0), "a filter is not a loss"
@@ -795,14 +798,16 @@ class _RaisingOpener:
         return FakeResponse(200, b"{}")
 
 
-def test_sentry_absorbs_a_response_error_http_sink_does_not_retry(sentry_http_fallback) -> None:
+def test_sentry_absorbs_a_response_error_http_sink_does_not_retry() -> None:
     """``HTTPSink`` catches (URLError, OSError); ``IncompleteRead`` is neither."""
     import http.client
 
     from log_foundry.sinks.sentry import SentrySink
 
     opener = _RaisingOpener(3, http.client.IncompleteRead(b""))
-    sink = SentrySink("http://k@sentry.local/1", max_retries=0, opener=opener)
+    sink = SentrySink(
+        "http://k@sentry.local/1", backend="http", max_retries=0, opener=opener
+    )
 
     sink.emit([{"level": "ERROR"}] * 5)  # two already accepted: must not propagate
 

@@ -670,7 +670,7 @@ lf.configure(sink=ElasticsearchSink("https://es.internal:9200", index="app-logs"
 #### SaaS platforms
 
 Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers the `sentry-sdk`
-(the `sentry` extra) and falls back to raw HTTP envelopes when it isn't installed.
+(the `sentry` extra) and falls back to raw HTTP envelopes when it cannot deliver through one.
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
@@ -678,11 +678,27 @@ Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers 
 | `SplunkHECSink` | `log_foundry.sinks.splunk` | — | `SplunkHECSink(url, token, *, host=None, source="log-foundry")` — HTTP Event Collector |
 | `NewRelicSink` | `log_foundry.sinks.newrelic` | — | `NewRelicSink(api_key, *, region="US")` — `region` is `"US"` or `"EU"` |
 | `HoneycombSink` | `log_foundry.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` |
-| `SentrySink` | `log_foundry.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR")` — sends only `min_level`+ events |
+| `SentrySink` | `log_foundry.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR", backend="auto")` — sends only `min_level`+ events |
 
-With the `sentry` extra installed, `SentrySink` captures via `sentry_sdk.capture_event` (initialize
-the SDK yourself with `sentry_sdk.init(...)`); without it, pass `dsn=` and events are POSTed as
-Sentry envelopes over HTTP.
+`SentrySink` captures via `sentry_sdk.capture_event` when the SDK can deliver — you initialize it
+yourself with `sentry_sdk.init(...)` — and POSTs Sentry envelopes over HTTP to `dsn=` otherwise.
+`backend=` decides:
+
+| `backend=` | What it uses |
+|---|---|
+| `"auto"` (default) | the SDK when it can deliver, otherwise the HTTP fallback; re-decided on every batch, so an `init(...)` that arrives after the sink was built is picked up |
+| `"sdk"` | the SDK only. A client that cannot deliver **refuses the batch** rather than quietly switching transport |
+| `"http"` | the HTTP fallback only. No SDK is held, consulted or flushed |
+
+"Can deliver" means the SDK's client reports itself active *and* holds a transport. An
+uninitialized process, an `init()` with no DSN, and a `close()`d client all fail that — the first
+reports itself inactive, the other two report themselves active with nothing to send through, and
+all three drop events silently.
+
+An argument the chosen backend can never use is a `ValueError` rather than a silent ignore:
+`opener=` where no HTTP fallback is built, `client=` under `backend="http"`. Before `1.0`, `opener=`
+was accepted and then ignored whenever the SDK happened to import — including when it was installed
+as somebody else's transitive dependency.
 
 #### AWS — the durable-buffer path (`aws` extra)
 
