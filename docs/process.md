@@ -486,6 +486,21 @@ list project-specific; seed it the first time a trap bites and never again.
 - **`ruff format` is not a CI gate, and this repo is not clean under it.** Running it over a
   directory rewrites files your change never touched (and it reformats code blocks inside `.md`).
   Format only the files you edited, and check `git status` before committing.
+- **`poetry run <tool>` silently falls back to a global tool when the worktree's `.venv` is
+  unpopulated.** It reports failures that belong to a *different* interpreter's site-packages —
+  in a fresh worktree it produced this project's most-warned-about symptom, eight
+  `Unused "type: ignore"` mypy errors, while `poetry run python -c "import boto3"` in the same
+  venv raised `ModuleNotFoundError`. It also writes `.mypy_cache`, so the correct mypy then reads
+  a cache built by another version and keeps failing. Run `poetry install --with dev` in every new
+  worktree first, confirm with `poetry run which mypy`, and `rm -rf .mypy_cache` after any
+  suspected fallback. A `pytest` fallback is worse than noisy: it means a "no-extras gate" run was
+  never no-extras. Bit in SPEC-041.
+- **A service that has bound its port has not necessarily begun serving.** Logstash's `http` input
+  accepts TCP connections before its pipeline runs, so a connect-based readiness probe goes green
+  and the first real request is met with `ConnectionResetError`. It passed on a laptop for weeks
+  of container uptime and failed on the integration job's first CI run. A readiness probe asks the
+  question a client asks — a real request, or Kafka's metadata call, never a bare connect. Bit in
+  SPEC-041.
 - _(add your own as they bite — one line each, with the fix.)_
 
 ---

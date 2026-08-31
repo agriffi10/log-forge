@@ -97,3 +97,11 @@ def test_http_mode_ignores_the_datagram_limit(monkeypatch) -> None:
     """It is a named parameter, so it no longer falls into `**http_kwargs` and raises."""
     sink = LogstashSink(url="http://lh:8080", max_datagram_bytes=200)
     assert sink is not None
+
+
+def test_an_unrecognised_body_format_is_refused_rather_than_shipped() -> None:
+    # `HTTPSink._body` treats anything that is not "json_array" as NDJSON, so a typo would
+    # silently ship the exact body FR-003 exists to stop shipping, to a destination that cannot
+    # parse it. A parameter documented as taking one of two values refuses the third.
+    with pytest.raises(ValueError, match="body_format"):
+        LogstashSink(url="http://ls:8080", body_format="json-array")

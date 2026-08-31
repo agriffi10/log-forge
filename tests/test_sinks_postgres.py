@@ -10,7 +10,7 @@ from typing import Self
 import pytest
 
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.postgres import PostgresSink
+from log_foundry.sinks.postgres import DEFAULT_CONNECT_TIMEOUT, PostgresSink
 
 
 class FakeCursor:
@@ -325,16 +325,48 @@ def test_a_broken_owned_connection_is_reopened_on_the_next_attempt(monkeypatch) 
 
 
 def test_a_broken_borrowed_connection_is_never_reopened(monkeypatch) -> None:
-    borrowed = BreakableConnection()
-    # No psycopg at all: reaching for one would raise ImportError rather than fail quietly.
-    monkeypatch.delitem(sys.modules, "psycopg", raising=False)
+    borrowed, replacement = BreakableConnection(), FakeConnection()
+    # A reconnect must be able to SUCCEED here, or the test proves nothing: an earlier version
+    # removed `psycopg` from sys.modules so a reconnect would raise, be absorbed, and leave
+    # `sink._conn` pointing at the borrowed object either way -- it passed against its own
+    # mutation. The signal only exists when the guard is the reason nothing happened.
+    seen = _psycopg_stub(monkeypatch, [replacement])
     sink = PostgresSink("logs", connection=borrowed, max_retries=0)
+    assert seen == [], "an injected connection must not open one at construction"
 
     borrowed.kill()
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
 
     assert sink._conn is borrowed, "a caller's connection is theirs (arch §13)"
+    # The harm the identity assertion alone does not catch: closing the caller's object out from
+    # under them. Measured against the unguarded version -- `borrowed.closed` went True.
+    assert borrowed.closed is False, "a borrowed connection must not be closed by this sink"
+    assert not replacement.executemany_calls, "and nothing may be routed to a replacement"
+
+
+def test_a_broken_owned_connection_is_closed_before_it_is_replaced(monkeypatch) -> None:
+    # Without this, a flapping server leaves one abandoned psycopg connection -- and its fd --
+    # behind per reconnect, unbounded. The mutant (deleting the close) survived the whole module.
+    first, second = BreakableConnection(), FakeConnection()
+    _psycopg_stub(monkeypatch, [first, second])
+    sink = PostgresSink("logs", dsn="postgresql://x", max_retries=0)
+
+    first.kill()
+    sink.emit([{"a": 1}])
+
+    assert sink._conn is second
+    assert first.closed is True, "the dead connection must be released, not abandoned"
+
+
+def test_the_documented_default_connect_timeout_is_the_one_used(monkeypatch) -> None:
+    # The default is quoted in the class docstring's worst case ("20 s more at the defaults"),
+    # so it is pinned rather than left to drift with the constant.
+    seen = _psycopg_stub(monkeypatch, [FakeConnection()])
+    PostgresSink("logs", dsn="postgresql://x")
+
+    assert seen == [{"connect_timeout": DEFAULT_CONNECT_TIMEOUT}]
+    assert DEFAULT_CONNECT_TIMEOUT == 5
 
 
 def test_the_connect_timeout_is_passed_and_floored(monkeypatch) -> None:
@@ -359,3 +391,44 @@ def test_close_does_not_raise_when_the_connection_is_already_broken(monkeypatch)
     sink.close()                   # must not raise out of a release path
 
     assert conn.closed is True, "the connection is still released"
+
+
+def test_a_failing_reconnect_is_announced_once_per_outage_not_per_attempt(
+    monkeypatch, capsys
+) -> None:
+    # Unthrottled this fires on every attempt of every batch: a down server turned one stderr
+    # line into five per batch, indefinitely.
+    conn = BreakableConnection()
+
+    def connect(dsn, **kwargs):
+        if getattr(connect, "opened", False):
+            raise RuntimeError("server is down")
+        connect.opened = True
+        return conn
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    sink = PostgresSink("logs", dsn="postgresql://x", max_retries=3)
+    conn.kill()
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 2}])
+
+    lines = capsys.readouterr().err.splitlines()
+    assert sum("PostgresSink.reconnect" in line for line in lines) == 1, lines
+
+
+def test_either_broken_signal_alone_triggers_the_reconnect(monkeypatch) -> None:
+    # The docstring argues for probing BOTH `closed` and `broken`. psycopg3 defines them in terms
+    # of the same underlying status, so the redundancy is for the "psycopg-shaped" objects this
+    # sink also accepts -- an injected double may publish only one. Pinned so the claim is not
+    # merely asserted: dropping either probe reddens one of these.
+    for attribute in ("closed", "broken"):
+        conn, replacement = FakeConnection(), FakeConnection()
+        conn._fail_times = -1
+        setattr(conn, attribute, True)
+        _psycopg_stub(monkeypatch, [conn, replacement])
+        sink = PostgresSink("logs", dsn="postgresql://x", max_retries=0)
+        sink.emit([{"a": 1}])
+        assert sink._conn is replacement, f"a connection reporting {attribute} must be replaced"

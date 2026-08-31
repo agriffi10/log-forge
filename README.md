@@ -658,7 +658,7 @@ completed, not that every chunk of it landed.
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
-| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per line; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
+| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per element; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
 | `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
 
 ```python
@@ -794,7 +794,7 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
 | `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…")` |
-| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False)` — JSONB `event` column + extracted columns |
+| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=5)` — JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
 | `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False)` — MergeTree, columnar insert |
 
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set

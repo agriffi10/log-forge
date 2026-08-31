@@ -39,11 +39,15 @@ class PostgresSink:
 
     Each event is stored as a ``JSONB`` ``event`` column plus a few extracted columns for
     indexing. ``psycopg`` v3 is the optional ``postgres`` extra, imported lazily. The sink is
-    write-only. The worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per
-    batch — 0.7 s at the defaults — plus, on a connection the server has closed, up to
-    ``max_retries + 1`` reconnects of ``connect_timeout`` each, so 20 s more at the defaults. The
-    reconnects sit inside the existing retry budget rather than a loop of their own, which is
-    what bounds them (FR-002 AC-3).
+    write-only. The worst-case delay (SPEC-027 FR-005) has two halves, and only one of them is
+    interruptible. The backoffs are ``max_retries`` waits per batch — 0.7 s at the defaults —
+    taken through ``_retry.wait`` on the worker's stop event, so a shutdown cuts them short. The
+    reconnects are up to ``max_retries + 1`` connects of ``connect_timeout`` each, 20 s more at
+    the defaults, and they are **bounded but not interruptible**: the wait is inside libpq, which
+    consults nothing. That is the settled line rather than a gap — a shutdown shortens a *wait*
+    and never skips *work*, and a reconnect is the work an in-flight batch needs (SPEC-038
+    FR-001 AC-4a). Both halves sit inside the existing retry budget rather than a loop of their
+    own, which is what bounds them (FR-002 AC-3).
 
     The driver requirement satisfied (SPEC-028 FR-002): a ``psycopg`` connection carries one
     transaction, and this sink's unit of work is a ``cursor`` / ``commit`` / ``rollback`` sequence
@@ -81,10 +85,13 @@ class PostgresSink:
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned having attempted no insert at all, and
             reported success.
-          connect_timeout: Seconds libpq may spend opening a connection, floored at 2
-            (:data:`DEFAULT_CONNECT_TIMEOUT`). It is passed explicitly and therefore **overrides
-            any ``connect_timeout`` in the DSN**; set it here to choose a different bound. It
-            applies to the connection opened at construction and to every reconnect.
+          connect_timeout: Seconds libpq may spend opening a connection. Defaults to
+            :data:`DEFAULT_CONNECT_TIMEOUT` (5) and is floored at libpq's own minimum of 2, since
+            ``0`` means "wait forever" and would reinstate the unbounded connect this argument
+            exists to remove. It is passed explicitly and therefore **overrides any
+            ``connect_timeout`` in the DSN** — a DSN asking for 30 gets this value instead, so
+            set it here rather than there. Applies to the connection opened at construction and
+            to every reconnect.
 
         Returns:
           None.
@@ -107,6 +114,7 @@ class PostgresSink:
         if connection is None:
             connection = self._connect()
         self._conn = connection
+        self._reconnect_announced = False
         columns = ", ".join((*_COLUMNS, "event"))
         placeholders = ", ".join(["%s"] * len(_COLUMNS) + ["%s::jsonb"])
         self._insert_sql = f"INSERT INTO {self._table} ({columns}) VALUES ({placeholders})"
@@ -194,7 +202,11 @@ class PostgresSink:
                     "event",
                     len(batch),
                     f"PostgresSink, {self.max_retries + 1} attempts, {type(err).__name__}"
-                    + ("" if self._owns_connection else ", borrowed connection is not reopened"),
+                    + (
+                        ", borrowed connection is broken and this sink may not reopen it"
+                        if not self._owns_connection and self._is_broken()
+                        else ""
+                    ),
                 )
                 raise SinkDeliveryError(
                     f"PostgresSink inserted none of {len(batch)} event(s)"
@@ -242,13 +254,27 @@ class PostgresSink:
         **A borrowed connection is never reopened**, per ``architecture.md`` §13's borrowed-client
         constraint: the caller owns that object and its lifetime, and replacing it here would
         leak theirs and reconnect a session they may be sharing. The exhausted batch's existing
-        ``_diag.lost`` line says so rather than a new stderr site, so an operator can tell this
-        case from an unreachable server.
+        ``_diag.lost`` line gains a clause rather than a new stderr site, and it is conditioned on
+        the connection actually being broken — appending it to every borrowed-connection failure
+        would put "not reopened" on a constraint violation, where reopening was never the
+        question.
 
         The state is read from the connection rather than inferred: ``closed`` and ``broken`` are
         both ``False`` before the first failure and both ``True`` after it, so an ordinary SQL
         error — a constraint violation, a full disk — does not churn the connection. Both are
         probed by name because this sink accepts any ``psycopg``-shaped object it does not own.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        A failed reconnect is **announced once per outage, not once per attempt**. Unthrottled it
+        fires on every attempt of every batch, so a down server turned one stderr line into five
+        per batch, indefinitely — a diagnostic that floods is one an operator stops reading, and
+        the batch's own ``_diag.lost`` line already records the loss. The flag clears on a
+        successful reconnect, so a later outage is announced again.
 
         Args:
           None.
@@ -264,14 +290,17 @@ class PostgresSink:
         """
         if not self._owns_connection or not self._is_broken():
             return
+        announced, self._reconnect_announced = self._reconnect_announced, True
         try:
             self._conn.close()
         except Exception as err:
             _diag.absorbed("PostgresSink.close of a broken connection", err)
         try:
             self._conn = self._connect()
+            self._reconnect_announced = False
         except Exception as err:
-            _diag.absorbed("PostgresSink.reconnect", err)
+            if not announced:
+                _diag.absorbed("PostgresSink.reconnect", err)
 
     def _is_broken(self) -> bool:
         """Reports whether the held connection can no longer be used.

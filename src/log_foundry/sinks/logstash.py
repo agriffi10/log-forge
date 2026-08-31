@@ -15,6 +15,15 @@ from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["LogstashSink"]
 
+_BODY_FORMATS = frozenset({"json_array", "ndjson"})
+"""The two HTTP wire forms, validated rather than passed through.
+
+``HTTPSink._body`` branches on ``== "json_array"`` and treats everything else as NDJSON, so a
+typo -- ``"json-array"`` -- would silently ship the exact body FR-003 exists to stop shipping,
+against a destination that cannot parse it. A parameter documented as taking one of two values
+refuses the third.
+"""
+
 
 class LogstashSink:
     """A :class:`~log_foundry.sinks.base.Sink` that ships JSON lines to Logstash (FR-005).
@@ -105,8 +114,14 @@ class LogstashSink:
           None.
 
         Raises:
-          ValueError: If neither a URL nor a host and port were given.
+          ValueError: If neither a URL nor a host and port were given, or if ``body_format`` is
+            neither ``"json_array"`` nor ``"ndjson"``.
         """
+        if body_format not in _BODY_FORMATS:
+            raise ValueError(
+                f"LogstashSink body_format must be one of {sorted(_BODY_FORMATS)}, "
+                f"not {body_format!r}"
+            )
         if url is not None:
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
