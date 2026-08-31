@@ -174,11 +174,16 @@ def test_the_fallback_is_built_even_when_the_sdk_is_held() -> None:
 
 
 def test_the_default_prefers_a_usable_sdk() -> None:
-    """AC-1. `auto` must keep today's behaviour for a caller who passes nothing."""
-    client = UsableClient()
-    sink = SentrySink(DSN, client=FakeModule(client))
+    """AC-1. `auto` must keep today's behaviour for a caller who passes nothing.
+
+    Through the opener helper, so the SDK preference is read off a fallback that recorded
+    nothing rather than off a real request to sentry.io failing.
+    """
+    module = FakeModule(UsableClient())
+    sink, opener = _fallback(client=module)
     sink.emit([dict(ERROR)])
-    assert len(client.events) == 0
+    assert len(module.events) == 1
+    assert opener.calls == [], "a usable SDK must not be sent to the HTTP fallback"
     assert sink.sent == 1
 
 
@@ -221,7 +226,7 @@ def test_the_http_refusal_names_the_selection_not_the_environment() -> None:
     ("kwargs", "argument"),
     [
         ({"dsn": DSN, "backend": "http", "client": BareClient()}, "client="),
-        ({"backend": "sdk", "client": BareClient(), "opener": FakeOpener()}, "opener="),
+        ({"dsn": DSN, "backend": "sdk", "client": BareClient(), "opener": FakeOpener()}, "opener="),
         ({"backend": "http", "opener": FakeOpener()}, "opener="),
     ],
 )
@@ -235,6 +240,64 @@ def test_an_argument_conflict_is_reported_ahead_of_the_refusal() -> None:
     """AC-3 precedence: both fire here, and the conflict names the argument to drop."""
     with pytest.raises(ValueError, match="opener="):
         SentrySink(backend="sdk", opener=FakeOpener())
+
+
+def test_explicit_sdk_with_no_client_available_raises() -> None:
+    """AC-2's third refusal, and the second message that must name the selection.
+
+    Reachable only where the extra is genuinely absent, so it asks the production function which
+    leg it is in and asserts the complement -- a question, not a pin (FR-004 AC-2). Without the
+    raise, `SentrySink(backend="sdk")` on a host without the extra constructs happily and then
+    refuses every batch at emit: a startup misconfiguration deferred into runtime.
+    """
+    from log_foundry.sinks.sentry import _import_sdk
+
+    if _import_sdk() is None:
+        with pytest.raises(ValueError, match=r"backend='sdk'"):
+            SentrySink(backend="sdk")
+    else:
+        assert SentrySink(backend="sdk").client is not None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dsn": DSN, "backend": "http", "client": BareClient()},
+        {"backend": "http", "client": BareClient()},
+        {"backend": "sdk", "client": BareClient(), "opener": FakeOpener()},
+    ],
+    ids=["conflict only", "conflict and refusal", "conflict and no-fallback"],
+)
+def test_a_conflict_is_reported_ahead_of_any_refusal(kwargs: dict) -> None:
+    """AC-3 precedence, across the constructions where both rules fire.
+
+    The conflict wins because it names an argument the caller can drop; the refusal only says
+    the selection cannot be built. Asserted here rather than left to the `__init__` docstring,
+    which is the only other place the ordering is written down.
+    """
+    with pytest.raises(ValueError, match=r"client=|opener="):
+        SentrySink(**kwargs)
+
+
+def test_a_get_client_returning_none_leaves_the_held_object_as_the_target() -> None:
+    """The descent's failure mode: we asked for a client and got none, so probe what we have."""
+    module = FakeModule(None)
+    sink, opener = _fallback(client=module)
+    sink.emit([dict(ERROR)])
+    assert len(module.events) == 1
+    assert opener.calls == []
+
+
+def test_a_non_callable_is_active_is_treated_as_absent() -> None:
+    """Absence means usable, and a bare attribute is not the method the predicate calls."""
+
+    class OddClient(BareClient):
+        is_active = False
+        transport = object()
+
+    sink, opener = _fallback(client=OddClient())
+    sink.emit([dict(ERROR)])
+    assert opener.calls == []
 
 
 def test_max_retries_is_outside_the_conflict_rule() -> None:
@@ -272,6 +335,24 @@ def test_the_class_docstring_states_the_selection() -> None:
     documented = " ".join((SentrySink.__doc__ or "").split())
     for name in ("``auto``", "``sdk``", "``http``"):
         assert name in documented, name
+
+
+def test_flush_still_pushes_a_client_the_predicate_reads_as_unusable() -> None:
+    """The Data Model's flush() line: it may become usable before the next batch.
+
+    Without this the claim is prose no test checks -- and an early return keyed on the predicate
+    leaves the rest of the suite green, because every other flush test holds a client that
+    publishes neither probe member and so reads as usable either way.
+    """
+    flushed = []
+
+    class FlushingModule(FakeModule):
+        def flush(self) -> None:
+            flushed.append(True)
+
+    sink, _ = _fallback(client=FlushingModule(InactiveClient()))
+    sink.flush()
+    assert flushed == [True]
 
 
 # --- FR-003: neither backend able to deliver is reported, not absorbed -------------------
@@ -358,27 +439,36 @@ def test_the_real_uninitialised_sdk_is_not_a_usable_backend() -> None:
     assert len(opener.calls) == 1
 
 
-def test_the_real_sdk_initialised_without_a_dsn_is_not_a_usable_backend() -> None:
-    """AC-7. `init()` with SENTRY_DSN unset reports itself active and drops every event.
+def _in_a_fresh_interpreter(setup: str, why: str) -> None:
+    """Builds a real client per `setup`, then asserts the sink routed around it.
 
-    In a subprocess because `init()` replaces `sys.excepthook` and registers `atexit` callbacks
-    that restoring the global client does not undo, and this repo has `atexit`-ordering-sensitive
+    In a subprocess because both ways of getting a real client -- `init()` and a direct
+    `Client(...)` -- replace `sys.excepthook` and register `atexit` callbacks, measured, and
+    neither is undone by restoring the global client. This repo has `atexit`-ordering-sensitive
     tests sharing the process.
+
+    Args:
+      setup: Statements binding `client` to the real client under test.
+      why: What the assertion failure should say about the state being built.
+
+    Returns:
+      None.
+
+    Raises:
+      AssertionError: If the subprocess did not route around the client.
     """
-    _real_sdk()
     program = textwrap.dedent(
         f"""
         import sys
         sys.path.insert(0, {str(_ROOT / "tests")!r})
         import sentry_sdk
-        sentry_sdk.init()
-        client = sentry_sdk.get_client()
-        assert client.is_active(), "this case needs an SDK that reports itself active"
-        assert client.transport is None, "this case needs an SDK with nowhere to send"
+        {setup}
+        assert client.is_active(), {why!r}
+        assert client.transport is None, {why!r}
         from test_sinks_http import FakeOpener
         from log_foundry.sinks.sentry import SentrySink
         opener = FakeOpener()
-        sink = SentrySink({DSN!r}, client=sentry_sdk, opener=opener)
+        sink = SentrySink({DSN!r}, client=client, opener=opener)
         sink.emit([{{"level": "ERROR", "message": "boom"}}])
         assert len(opener.calls) == 1, opener.calls
         print("ok")
@@ -393,3 +483,25 @@ def test_the_real_sdk_initialised_without_a_dsn_is_not_a_usable_backend() -> Non
     )
     assert done.returncode == 0, done.stderr
     assert "ok" in done.stdout
+
+
+def test_the_real_sdk_initialised_without_a_dsn_is_not_a_usable_backend() -> None:
+    """AC-7 + AC-2. `init()` with SENTRY_DSN unset reports itself active and drops every event."""
+    _real_sdk()
+    _in_a_fresh_interpreter(
+        "sentry_sdk.init()\n        client = sentry_sdk.get_client()",
+        "init() with no dsn should be active with no transport",
+    )
+
+
+def test_a_real_closed_client_is_not_a_usable_backend() -> None:
+    """AC-7 + AC-2's third state, which no double can demonstrate is what the SDK really does.
+
+    A caller who shuts the SDK down before this library's `atexit` drain leaves exactly this
+    behind: `is_active()` still true, transport gone, every event dropped in silence.
+    """
+    _real_sdk()
+    _in_a_fresh_interpreter(
+        f"client = sentry_sdk.Client(dsn={DSN!r})\n        client.close()",
+        "a closed client should be active with no transport",
+    )

@@ -19,6 +19,9 @@ Backend = Literal["auto", "sdk", "http"]
 
 _BACKENDS: Final = get_args(Backend)
 
+_Selected = Literal["sdk", "http"]
+"""A backend actually chosen for one batch -- never ``"auto"``, which selects rather than is."""
+
 _ABSENT: Final = object()
 """Sentinel telling an absent member from one whose value is ``None`` (SPEC-043 FR-001)."""
 
@@ -340,7 +343,7 @@ class SentrySink:
         with self._counter_lock:
             return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
 
-    def _capture(self, event: dict[str, object], backend: str | None) -> bool:
+    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool:
         """Sends one event by the backend ``emit`` resolved for this batch.
 
         A ``None`` backend is refused here, before the ``try``, and moves nothing. Letting it fall
@@ -391,7 +394,7 @@ class SentrySink:
             return False
         return True
 
-    def _select_backend(self) -> str | None:
+    def _select_backend(self) -> _Selected | None:
         """Picks the transport for one batch, or ``None`` when nothing can deliver.
 
         An explicit selection is honoured rather than substituted (SPEC-043 FR-002): ``"sdk"``

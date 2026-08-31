@@ -682,6 +682,7 @@ Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers 
 
 `SentrySink` captures via `sentry_sdk.capture_event` when the SDK can deliver — you initialize it
 yourself with `sentry_sdk.init(...)` — and POSTs Sentry envelopes over HTTP to `dsn=` otherwise.
+With neither a deliverable SDK nor a `dsn=`, a batch is **refused** rather than silently dropped.
 `backend=` decides:
 
 | `backend=` | What it uses |
@@ -696,9 +697,9 @@ reports itself inactive, the other two report themselves active with nothing to 
 all three drop events silently.
 
 An argument the chosen backend can never use is a `ValueError` rather than a silent ignore:
-`opener=` where no HTTP fallback is built, `client=` under `backend="http"`. Before `1.0`, `opener=`
-was accepted and then ignored whenever the SDK happened to import — including when it was installed
-as somebody else's transitive dependency.
+`opener=` where no HTTP fallback is built, `client=` under `backend="http"`. Until this release
+`opener=` was accepted and then ignored whenever the SDK happened to import — including when it was
+installed as somebody else's transitive dependency.
 
 #### AWS — the durable-buffer path (`aws` extra)
 
