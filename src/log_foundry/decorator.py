@@ -309,13 +309,16 @@ def _get_worker() -> Worker:
       Exception: Whatever constructing the sink or worker raises.
     """
     global _worker, _orphan_sink
-    if _worker is None:
+    worker = _worker_exists()
+    if worker is None:
         with _worker_lock:
-            if _worker is None:
+            worker = _worker_exists()
+            if worker is None:
                 _register_exit_handler()
-                _worker = Worker(_ensure_sink())
+                worker = Worker(_ensure_sink())
+                _worker = worker
                 _orphan_sink = None
-    return _worker
+    return worker
 
 
 def _register_exit_handler() -> None:
@@ -414,7 +417,7 @@ def _rebuild_worker_after_fork() -> None:
       None. ``_fork`` absorbs and announces a handler's failure, so a child whose worker cannot
         be rebuilt still has working locks.
     """
-    worker = _worker
+    worker = _worker_exists()
     if worker is None:
         return
     resume = not worker.retired
@@ -424,8 +427,103 @@ def _rebuild_worker_after_fork() -> None:
 _fork.register_child_handler(_rebuild_worker_after_fork)
 
 
+def _worker_exists() -> Worker | None:
+    """Existence — is there a worker at all, and therefore anything to do (arch §9.2).
+
+    The first of the four questions a guard may ask, and the weakest: it says only that this
+    process built a worker, never that the worker still delivers or that it owns any particular
+    sink. A retired worker is still the process worker, which is why rebuilding one here would
+    fight a process trying to exit (SPEC-019) and why :func:`_shutdown_worker`,
+    :func:`_flush_worker` and :func:`_worker_health` all answer from it rather than from
+    :func:`_live_worker`.
+
+    **No lock is taken**, and callers must not assume one. Four of this module's guards ask a
+    question with ``_worker_lock`` already held (:func:`_get_worker`'s inner check,
+    :func:`_close_orphan_sink`, :func:`_swap_sink`, and :func:`_offer_orphan_signal` through all
+    three of its callers), so acquiring a non-reentrant lock here would deadlock them; and
+    :func:`_get_worker`'s **outer** check is deliberately unlocked on the ``@trace`` hot path,
+    where a lock would serialize every span flush in the process. The read is a single reference
+    load, which is atomic — a caller needing consistency across two reads takes ``_worker_lock``
+    itself, exactly as it does today.
+
+    Its own definition is the one of the four the roster does not file, because the body is a
+    bare ``return _worker`` and ``_boolean_positions`` excludes a plain ``Name`` return by
+    design. That is not a hole: every rewrite that would change the category introduces a
+    boolean the walker does see — an ``IfExp`` test, or a call to :func:`_live_worker`.
+
+    Args:
+      None.
+
+    Returns:
+      The process worker if one was ever built, retired or not, otherwise ``None``.
+
+    Raises:
+      None.
+    """
+    return _worker
+
+
+def _worker_owns(sink: Sink) -> bool:
+    """Ownership — who *owns* a close, which a retired worker still does (arch §9.2).
+
+    The third question, and the one three reviewers each named a different site for. It is not
+    liveness: :meth:`Worker.swap_sink` returns early once ``_shutdown_done``, so a retired worker
+    keeps its old sink forever, and answering "who closes this" with :func:`_live_worker` closes
+    it a second time on a clean shutdown and closes it **under a live writer** on an expired one
+    — both measured (SPEC-033 FR-002).
+
+    Takes no lock, for the reason :func:`_worker_exists` states; :func:`_close_orphan_sink` and
+    :func:`_swap_sink` both ask it under ``_worker_lock``, which is where the consistency they
+    need comes from.
+
+    Args:
+      sink: The sink whose owner is in question.
+
+    Returns:
+      Whether the process worker holds that sink, retired or not.
+
+    Raises:
+      None.
+    """
+    worker = _worker
+    return worker is not None and worker.sink is sink
+
+
+def _worker_owns_now(sink: Sink) -> bool:
+    """Ownership ∧ moment — whose stop event the sink should be holding *now* (arch §9.2).
+
+    The fourth question, and a **conjunction** rather than a new subject, which is why it is named
+    for both terms. It exists because neither of its halves is right alone at
+    :func:`_offer_orphan_signal`, the one site that asks it: bare ownership skips the offer for a
+    worker whose shutdown has *finished*, leaving a live sink holding a set event that can never
+    clear, while liveness alone un-skips for the whole drain and hands the drain thread a fresh
+    event nobody will set — ``retired`` latches on **entry** to :meth:`Worker.shutdown`, not at
+    its completion. Both were measured (SPEC-035 FR-001), and the identity term is what stops an
+    orphan log to sink Y being skipped merely because a live worker is draining into sink X.
+
+    Takes no lock. Its one caller is :func:`_offer_orphan_signal`, which does not acquire
+    ``_worker_lock`` itself — all three of *its* callers hold it, and that is the obligation a
+    fourth caller would have to satisfy.
+
+    Args:
+      sink: The sink about to be offered a stop signal.
+
+    Returns:
+      Whether the process worker holds that sink *and* is still draining into it.
+
+    Raises:
+      None.
+    """
+    worker = _worker
+    return worker is not None and worker.sink is sink and worker.draining
+
+
 def _live_worker() -> Worker | None:
-    """Returns the process worker only while it is still delivering (SPEC-033 FR-002).
+    """Liveness — who *performs* an action, and a retired worker performs nothing (arch §9.2).
+
+    The second of the four questions (SPEC-033 FR-002). Reading ``retired`` in order to *report*
+    it — as :func:`_worker_health` does — is this same question asked for a different purpose,
+    not a fifth category.
 
     Three guards ask who owns a sink, and two of them mean a *live* owner. A retired worker holds
     its sink forever — :meth:`Worker.swap_sink` returns early once shut down — so keying on a
@@ -438,6 +536,10 @@ def _live_worker() -> Worker | None:
     :func:`_close_orphan_sink` deliberately does **not** use this: there a retired worker's
     ownership is exactly what must make it decline, since an expired shutdown leaves the drain
     thread possibly still inside that sink's ``emit``.
+
+    Takes no lock, for the reason :func:`_worker_exists` states. :func:`_swap_sink` asks it
+    under ``_worker_lock``; :func:`_flush_live_sink` asks it under no lock at all, which is
+    sound because it consumes the answer immediately and holds nothing across it.
 
     Args:
       None.
@@ -501,8 +603,7 @@ def _offer_orphan_signal(sink: Sink) -> None:
       None.
     """
     global _orphan_stop
-    worker = _worker
-    if worker is not None and worker.sink is sink and worker.draining:
+    if _worker_owns_now(sink):
         return
     if _orphan_stop.is_set():
         _orphan_stop = threading.Event()
@@ -554,7 +655,7 @@ def _close_orphan_sink() -> None:
         owed = _orphan_sink
         if owed is None:
             return
-        if _worker is not None and _worker.sink is owed:
+        if _worker_owns(owed):
             return
         _orphan_sink = None
         _orphan_closed_sink = owed
@@ -605,8 +706,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     _orphan_retired = True
     _orphan_stop.set()
     deadline = None if timeout is None else monotonic() + timeout
-    if _worker is not None:
-        _worker.shutdown(timeout)
+    worker = _worker_exists()
+    if worker is not None:
+        worker.shutdown(timeout)
         _close_orphan_sink()
         return
     _close_orphan_sink()
@@ -690,7 +792,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 return
             _orphan_sink = new_sink
             _offer_orphan_signal(new_sink)
-            if _worker is None or _worker.sink is not old:
+            if not _worker_owns(old):
                 _orphan_closed_sink = old
                 closer = _lifecycle.release(old, detached=True)
     if worker is not None:
@@ -863,8 +965,8 @@ def _flush_live_sink() -> bool:
       None. A failure is reported as a ``FlushResult`` reason by the caller, never raised: a
         flush is the call most likely to be made in a ``finally``.
     """
-    worker = _worker
-    sink = worker.sink if worker is not None and not worker.retired else _orphan_sink
+    worker = _live_worker()
+    sink = worker.sink if worker is not None else _orphan_sink
     if sink is None:
         return True
     try:
@@ -915,7 +1017,7 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     except Exception as exc:
         _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
         swept = False
-    worker = _worker
+    worker = _worker_exists()
     drained: FlushResult = FlushResult(ok=True)
     thread_died = False
     if worker is not None:
@@ -1025,7 +1127,7 @@ def _delivering_to_an_inherited_sink() -> bool:
         forked.
     """
     try:
-        worker = _worker
+        worker = _worker_exists()
         sink = worker.sink if worker is not None else (_orphan_sink or _live_config().sink)
         return sink is not None and not _lifecycle.releasable(sink)
     except Exception:
@@ -1074,7 +1176,7 @@ def _worker_health() -> Health:
     Raises:
       None.
     """
-    worker = _worker
+    worker = _worker_exists()
     orphan_lost, in_span_lost = _read_losses()
     if worker is None:
         return Health(
