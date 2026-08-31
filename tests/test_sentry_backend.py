@@ -188,9 +188,18 @@ def test_the_default_prefers_a_usable_sdk() -> None:
 
 
 def test_explicit_http_never_consults_the_client() -> None:
-    """AC-1. And it holds none, so `flush()` cannot push an application's own SDK transport."""
+    """AC-1. And it holds none, so `flush()` cannot push an application's own SDK transport.
+
+    `client is None` alone cannot tell "did not hold the SDK" from "there was no SDK to hold",
+    so the environment supplies the complement (FR-004 AC-2): only where `_import_sdk()` returns
+    something is the assertion evidence about this backend rather than about the install.
+    """
+    from log_foundry.sinks.sentry import _import_sdk
+
     sink, opener = _fallback(backend="http")
     assert sink.client is None
+    if _import_sdk() is not None:
+        assert sink.client is None, "an importable SDK must still not be held under backend=http"
     sink.emit([dict(ERROR)])
     assert len(opener.calls) == 1
 
@@ -204,15 +213,20 @@ def test_explicit_sdk_refuses_rather_than_diverting_to_http() -> None:
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "why"),
+    ("kwargs", "message"),
     [
-        ({"backend": "postgres"}, "an unknown backend name"),
-        ({"backend": "http"}, "http with no dsn"),
+        ({"backend": "postgres"}, "must be one of"),
+        ({"backend": "http"}, "backend='http'"),
     ],
+    ids=["an unknown backend name", "http with no dsn"],
 )
-def test_a_selection_that_cannot_be_built_raises(kwargs: dict, why: str) -> None:
-    """AC-2. Silent substitution is what this spec exists to remove."""
-    with pytest.raises(ValueError):
+def test_a_selection_that_cannot_be_built_raises(kwargs: dict, message: str) -> None:
+    """AC-2. Each row matches its own message, or the wrong guard satisfies the assertion.
+
+    Without `match=`, the unknown-backend row was answered by the *no-DSN* refusal below it and
+    stayed green with the name check deleted -- in the gating environment, which is the contract.
+    """
+    with pytest.raises(ValueError, match=re.escape(message)):
         SentrySink(**kwargs)
 
 
@@ -269,23 +283,52 @@ def test_explicit_sdk_with_no_client_available_raises() -> None:
     ids=["conflict only", "conflict and refusal", "conflict and no-fallback"],
 )
 def test_a_conflict_is_reported_ahead_of_any_refusal(kwargs: dict) -> None:
-    """AC-3 precedence, across the constructions where both rules fire.
+    """AC-3 precedence. Only the middle row has both rules firing; the others are its controls.
 
-    The conflict wins because it names an argument the caller can drop; the refusal only says
-    the selection cannot be built. Asserted here rather than left to the `__init__` docstring,
-    which is the only other place the ordering is written down.
+    The conflict wins because it names an argument the caller can drop, where the refusal only
+    says the selection cannot be built. Asserted here rather than left to the `__init__`
+    docstring, which is the only other place the ordering is written down.
     """
     with pytest.raises(ValueError, match=r"client=|opener="):
         SentrySink(**kwargs)
 
 
 def test_a_get_client_returning_none_leaves_the_held_object_as_the_target() -> None:
-    """The descent's failure mode: we asked for a client and got none, so probe what we have."""
-    module = FakeModule(None)
+    """The descent's failure mode: we asked for a client and got none, so probe what we have.
+
+    The held object reports itself inactive, which is what makes the two possible outcomes
+    distinguishable -- probing `None` instead would find no members and call it usable.
+    """
+
+    class InactiveModule(FakeModule):
+        transport = None
+
+        def is_active(self) -> bool:
+            return False
+
+    module = InactiveModule(None)
     sink, opener = _fallback(client=module)
     sink.emit([dict(ERROR)])
-    assert len(module.events) == 1
-    assert opener.calls == []
+    assert module.events == []
+    assert len(opener.calls) == 1
+
+
+def test_the_backend_is_chosen_once_per_batch_not_once_per_event() -> None:
+    """The `emit` docstring's claim, which nothing else holds in place.
+
+    A per-event choice would let one batch split across transports partway through, and would
+    probe the client once per event on the hot path.
+    """
+    probes = []
+
+    class CountingModule(FakeModule):
+        def get_client(self):
+            probes.append(True)
+            return self._client
+
+    sink, _ = _fallback(client=CountingModule(UsableClient()))
+    sink.emit([dict(ERROR), dict(ERROR), dict(ERROR)])
+    assert len(probes) == 1, f"the client was probed {len(probes)} times for one batch"
 
 
 def test_a_non_callable_is_active_is_treated_as_absent() -> None:

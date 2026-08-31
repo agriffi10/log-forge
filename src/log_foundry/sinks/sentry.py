@@ -94,10 +94,10 @@ class SentrySink:
         """Selects the SDK or the HTTP-envelope fallback and sets the level floor.
 
         The order is deliberate: an unknown ``backend`` is rejected first, then the arguments the
-        selection cannot use, then the selections nothing can build. Three constructions trip a
-        conflict *and* a refusal — ``"http"`` with a client and no DSN, ``"sdk"`` with an opener
-        and no client, ``"auto"`` with an opener and neither — and each raises ``ValueError``
-        either way, so the conflict is reported because it names the argument the caller can drop.
+        selection cannot use, then the selections nothing can build. Several constructions trip a
+        conflict *and* a refusal — any of them with no DSN, for instance — and each raises
+        ``ValueError`` either way, so the conflict is reported first because it names an argument
+        the caller can drop, where the refusal only says the selection cannot be built.
 
         Both backends this construction can select are built here rather than on first use. A
         fallback built lazily would miss the worker's one-shot ``log_foundry_stop_signal`` offer
@@ -130,9 +130,10 @@ class SentrySink:
                 "select a backend that can use it"
             )
         if opener is not None and (backend == "sdk" or dsn is None):
+            remedy = "drop backend='sdk'" if backend == "sdk" else "pass a dsn"
             raise ValueError(
                 "SentrySink builds no HTTP fallback for this construction, so opener= would "
-                "never be called; pass a dsn, or drop backend='sdk'"
+                f"never be called; {remedy}"
             )
         self._dsn = dsn
         self._backend = backend
