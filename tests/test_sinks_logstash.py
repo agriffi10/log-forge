@@ -31,10 +31,28 @@ def test_http_mode_is_a_sink() -> None:
     assert isinstance(LogstashSink(url="http://ls:8080"), Sink)
 
 
-def test_http_mode_sends_ndjson() -> None:
+def test_http_mode_sends_a_json_array_by_default() -> None:
+    # SPEC-041 FR-003. The old default was NDJSON as `application/x-ndjson`, which a stock
+    # Logstash `http` input maps to the `plain` codec -- measured, a batch of three arrived as
+    # ONE event with the payload as text in `message`. A JSON array is what a stock input parses
+    # per element, so it is the default; the content type moves with the body format.
     opener = FakeOpener()
     LogstashSink(url="http://ls:8080", opener=opener).emit([{"a": 1}, {"b": 2}])
+    assert opener.calls[0]["body"].decode("utf-8") == '[{"a": 1},{"b": 2}]'
+    assert opener.calls[0]["headers"]["content-type"] == "application/json"
+
+
+def test_http_mode_ndjson_remains_reachable_for_a_configured_input() -> None:
+    # Not legacy support: `additional_codecs => {"application/x-ndjson" => "json_lines"}`
+    # REPLACES the default map rather than merging with it, so an input configured with the
+    # documented workaround parses this body correctly and a JSON array incorrectly. The two
+    # configurations are mutually exclusive, which is why this is a parameter and not a
+    # silent change of wire form.
+    opener = FakeOpener()
+    sink = LogstashSink(url="http://ls:8080", body_format="ndjson", opener=opener)
+    sink.emit([{"a": 1}, {"b": 2}])
     assert opener.calls[0]["body"].decode("utf-8") == '{"a": 1}\n{"b": 2}\n'
+    assert opener.calls[0]["headers"]["content-type"] == "application/x-ndjson"
 
 
 def test_tcp_socket_mode_sends_json_lines(monkeypatch) -> None:
@@ -79,3 +97,11 @@ def test_http_mode_ignores_the_datagram_limit(monkeypatch) -> None:
     """It is a named parameter, so it no longer falls into `**http_kwargs` and raises."""
     sink = LogstashSink(url="http://lh:8080", max_datagram_bytes=200)
     assert sink is not None
+
+
+def test_an_unrecognised_body_format_is_refused_rather_than_shipped() -> None:
+    # `HTTPSink._body` treats anything that is not "json_array" as NDJSON, so a typo would
+    # silently ship the exact body FR-003 exists to stop shipping, to a destination that cannot
+    # parse it. A parameter documented as taking one of two values refuses the third.
+    with pytest.raises(ValueError, match="body_format"):
+        LogstashSink(url="http://ls:8080", body_format="json-array")

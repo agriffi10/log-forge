@@ -21,6 +21,31 @@ class NATSSink:
     completion from the synchronous ``emit``, which therefore returns only after the batch is
     handed off. With JetStream enabled it publishes through JetStream for durable
     acknowledgement.
+
+    **Retry and the worst-case delay** (SPEC-041 FR-004). This sink adds no retry loop and needs
+    none: a core ``publish()`` writes into the client's outbound buffer and returns without
+    waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's single
+    drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee is met
+    because there is no wait, not because a wait is bounded. Under JetStream ``publish()`` awaits
+    an ack bounded by the driver's own timeout (5 s by default) and does not retry.
+
+    **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
+    is exactly what made this sink report success for events that had not left the process: with
+    the server stopped, five successive emits each returned in 0.00 s with ``losses()`` reading
+    all zeros, and when the client's reconnect budget (60 attempts × 2 s by default) ran out
+    first, **one of six events reached the destination with every counter still at zero**. That
+    is SPEC-026 FR-001's shape — a sink the worker believes, so its retry never engages and
+    ``failed_batches`` never moves. ``emit`` now refuses a batch while the client reports itself
+    disconnected.
+
+    The limit is stated rather than overclaimed: ``is_connected`` does not flip the instant the
+    server dies, so the first batch in the window before the client notices is still accepted and
+    still buffered — measured, one of five emits landed in that window. It is the same
+    check-then-act window ``MongoDBSink`` and ``KafkaSink`` already document for their own flags;
+    what the guard ends is the far larger case of an outage that has been going on for any
+    appreciable time. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
+    *reported* to the worker rather than one absorbed, and counting both would report one loss
+    twice.
     """
 
     def __init__(
@@ -86,7 +111,37 @@ class NATSSink:
                 raise SinkDeliveryError(
                     f"NATSSink published none of {len(batch)} event(s): the sink is closed"
                 )
+            if not self._is_connected():
+                raise SinkDeliveryError(
+                    f"NATSSink published none of {len(batch)} event(s): "
+                    "the client is disconnected"
+                )
             self._loop.run_until_complete(self._publish_all(batch))
+
+    def _is_connected(self) -> bool:
+        """Reports whether the client can currently put anything on the wire (FR-004 AC-5).
+
+        Probed by name, as ``drain`` and ``flush`` are, because this sink is written against a
+        driver it does not own and accepts an injected ``client=``. A client that does not
+        publish the attribute is assumed connected: the guard exists to convert a *known*
+        non-delivery into a reported one, and inventing a refusal for a client that never
+        claimed to be disconnected would fail batches that were going to succeed.
+
+        Args:
+          None.
+
+        Returns:
+          True when the client reports itself connected, or says nothing about it.
+
+        Raises:
+          None. A driver whose attribute access raises is treated as connected, so a probe can
+            never be the reason a batch fails.
+        """
+        try:
+            connected = getattr(self._client, "is_connected", True)
+        except Exception:
+            return True
+        return bool(connected)
 
     def losses(self) -> SinkLosses:
         """Reports events whose publish raised (SPEC-026 FR-002).

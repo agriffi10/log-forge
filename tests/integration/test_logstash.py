@@ -1,10 +1,10 @@
-"""SPEC-041 FR-003 — what a *stock* Logstash makes of what `LogstashSink` currently sends.
+"""SPEC-041 FR-003 — what a *stock* Logstash makes of what `LogstashSink` sends.
 
-**These tests characterize the defect, not the fix.** FR-003 AC-1 requires the analysis to be
-verified against a real Logstash *before changing anything*, and this is that evidence: the audit
-called K10 the lowest-confidence finding it had, and the one where a wrong analysis would make the
-fix worse than the defect. So the assertions below record today's behaviour, and the spec's Phase 3
-inverts them once the body format changes.
+The audit called K10 its lowest-confidence finding, and the one where a wrong analysis would make
+the fix worse than the defect, so FR-003 AC-1 required verifying it against a real Logstash
+*before changing anything*. It was verified, it was right, and these tests now hold **both** ends
+of that measurement: the default parses per event, and the old wire form still collapses a whole
+batch into one -- which is why the old form remains reachable rather than deleted.
 
 The observation route matters as much as the assertion. Logstash outputs to Redis
 (`tests/integration/logstash.conf`), so a test reads back **what Logstash parsed** rather than
@@ -22,7 +22,6 @@ import pytest
 import redis as redis_mod
 
 from integration.conftest import READINESS_MARKER
-from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 
 if TYPE_CHECKING:
@@ -65,59 +64,36 @@ def parsed(services_are_up: dict[str, Endpoint]):
     client.delete(PARSED_KEY)
 
 
-def test_the_current_ndjson_body_arrives_as_one_event(
+def test_the_default_body_arrives_as_one_event_per_log_line(
     services_are_up: dict[str, Endpoint], parsed
 ) -> None:
     sink = LogstashSink(url=f"http://{services_are_up['logstash'].url_host}")
+    sink.emit([{"case": "fixed", "n": 1}, {"case": "fixed", "n": 2}, {"case": "fixed", "n": 3}])
+
+    events = parsed(3)
+
+    # Against a STOCK `http` input -- no `codec`, no `additional_codecs` (see logstash.conf).
+    assert len(events) == 3, f"expected one event per log line, got {len(events)}"
+    assert sorted(event["n"] for event in events) == [1, 2, 3]
+    assert all(event["case"] == "fixed" for event in events)
+
+
+def test_the_ndjson_escape_hatch_still_produces_the_old_wire_form(
+    services_are_up: dict[str, Endpoint], parsed
+) -> None:
+    # K10 itself, still reproducible on demand. This is not nostalgia: an input configured
+    # `additional_codecs => {"application/x-ndjson" => "json_lines"}` -- the documented
+    # workaround for the defect -- parses THIS body correctly and the new default incorrectly,
+    # because that setting replaces the default map rather than merging with it. So the old form
+    # has to stay reachable, and this test is what stops it being quietly dropped.
+    sink = LogstashSink(
+        url=f"http://{services_are_up['logstash'].url_host}", body_format="ndjson"
+    )
     sink.emit([{"case": "k10", "n": 1}, {"case": "k10", "n": 2}, {"case": "k10", "n": 3}])
 
     events = parsed(1)
 
-    # The whole batch collapses into a single Logstash event. `application/x-ndjson` is not in
-    # the `http` input's default `additional_codecs` map, so the body falls through to the
-    # `plain` codec.
-    assert len(events) == 1, f"expected the K10 defect, got {len(events)} events"
-
-
-def test_the_current_body_loses_every_field_into_message(
-    services_are_up: dict[str, Endpoint], parsed
-) -> None:
-    sink = LogstashSink(url=f"http://{services_are_up['logstash'].url_host}")
-    sink.emit([{"case": "k10", "n": 1}, {"case": "k10", "n": 2}])
-
-    events = parsed(1)
-    assert len(events) == 1
+    assert len(events) == 1, "the old wire form collapses the batch against a stock input"
     only = events[0]
-
-    # This is the half that makes K10 a data defect rather than a cosmetic one: the structured
-    # fields do not exist at the destination at all. They are text inside `message`.
-    assert "case" not in only
-    assert "n" not in only
-    assert '"case": "k10"' in str(only.get("message", "")) or '"case":"k10"' in str(
-        only.get("message", "")
-    )
-
-
-def test_a_json_array_body_arrives_as_one_event_per_element(
-    services_are_up: dict[str, Endpoint], parsed
-) -> None:
-    # The other half of FR-003 AC-1's measurement, and the reason the finding is actionable
-    # rather than merely true: the SAME stock input parses a JSON array correctly. Without this
-    # the two tests above establish only that something is wrong, not that anything better
-    # exists -- and the audit called K10 the one finding where a wrong analysis would make the
-    # fix worse than the defect.
-    #
-    # It drives `HTTPSink` directly rather than `LogstashSink`, because on this branch the sink
-    # still hardcodes `body_format="ndjson"` and forwarding `body_format=` through its
-    # `**http_kwargs` raises `TypeError: got multiple values`. That is itself part of what
-    # FR-003 has to fix; here it just means the comparison is made one layer down.
-    sink = HTTPSink(
-        f"http://{services_are_up['logstash'].url_host}", body_format="json_array"
-    )
-    sink.emit([{"case": "array", "n": 1}, {"case": "array", "n": 2}, {"case": "array", "n": 3}])
-
-    events = parsed(3)
-
-    assert len(events) == 3, f"a JSON array should parse per element, got {len(events)}"
-    assert sorted(event["n"] for event in events) == [1, 2, 3]
-    assert all(event["case"] == "array" for event in events)
+    assert "case" not in only and "n" not in only, "the fields survive only as text"
+    assert '"case": "k10"' in str(only.get("message", ""))

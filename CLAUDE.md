@@ -336,6 +336,18 @@ at all. `tests/test_promises.py` now has **zero `xfail` cells**, so the 2026-08-
 harness is clean. Its own acceptance criteria were right-sized first (51 -> 58, mean 48 -> 24
 words), which is how the build found the phase plan would have put a fresh regression on `main`.
 
+**SPEC-041 (sink integration verification) is Completed** — the first spec here that could only be
+half-verified by reading. Fourteen sink modules reach a third party through one of eleven optional extras, and CI's
+no-extras environment is deliberately the contract, so none had ever been executed. Adds a second,
+non-gating job running nine services in containers, a vacuity floor (an absent service fails
+rather than skips), and a derived roster of what is still only read. Its three inherited findings
+were each reproduced first: `PostgresSink` never reset a broken connection (fixed, with the
+75-second unbounded `psycopg.connect()` the review then found underneath it), `LogstashSink` sent
+a content type a stock Logstash cannot parse (default now a JSON array; breaking for anyone on the
+`json_lines` workaround, who passes `body_format="ndjson"`), and NATS reported success for events
+that never left the process (now refuses while disconnected). It also found four `SentrySink`
+tests green only because CI never installs that extra.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -749,6 +761,23 @@ words), which is how the build found the phase plan would have put a fresh regre
   ownership, which is why a subclass adding a transport must override it. The residual — a sink
   the parent held only in application state, first handed over by the child — is undecidable
   inside the rule and recorded in §13, not asserted away. (SPEC-042, arch §9, §13)
+- **A read-only finding is not closed until it has been run, and the job that runs it needs a
+  floor rather than an exit code** — fourteen sink modules reach a third party through one of eleven
+  optional extras and none was ever executed, so the sinks most likely to be in production were the ones least
+  verified. All three of SPEC-041's inherited "read-only" findings held up, and each was
+  *reproduced before being fixed*: one `pg_terminate_backend` ended `PostgresSink` delivery for
+  the process, a stock Logstash turned a batch of three into **one** event with every field as
+  text in `message`, and NATS delivered **one of six** with every counter at zero. The guard on
+  such a job is the repo's roster idiom, not `pytest`'s exit 5: exit 5 catches only a forgotten
+  gate variable, while a fixture that skips on an absent service exits **0** — measured, a dropped
+  module reads `13 passed` and a skip reads `15 passed, 1 skipped`. So an absent service **fails**,
+  and a per-module floor makes a silent shrink loud. What stays unverified is a **derived** roster
+  (`tests/test_sink_integration_roster.py`), and its population is the lazy-import modules ∪ those
+  importing *or defining* `HTTPSink`/`SocketTransport`, because the obvious single-marker
+  derivation silently omits `logstash` — the spec's own named minimum. **The job earned itself on
+  its first run**, failing three tests no local run could: a service that has bound its port has
+  not necessarily begun serving, so readiness is a real request, never a connect. (SPEC-041,
+  arch §8)
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from
   `log_forge` in `v0.2.0` so it matches the distribution name. Breaking for `0.1.x` users; no
   compatibility shim was shipped. Historical `log-forge` mentions survive only where they name
