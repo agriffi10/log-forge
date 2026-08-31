@@ -79,6 +79,13 @@ jobs:
       # import line is never executed. Four `SentrySink` tests were green there and red here
       # until SPEC-041 pinned the backend they select.
       - name: Run the unit suite in the extras environment
+        # `LOG_FOUNDRY_EXTRAS` says the extras are EXPECTED, so a test needing one fails rather
+        # than skipping (SPEC-043 FR-001 AC-8). A bare `importorskip` is right for the gating
+        # leg and silently wrong here: it would skip just as quietly if this install regressed,
+        # which is the four-green-tests failure above, recurring. Deliberately not
+        # `LOG_FOUNDRY_INTEGRATION` — that one gates `tests/integration` and its name would lie.
+        env:
+          LOG_FOUNDRY_EXTRAS: "1"
         run: poetry run pytest tests
 
       - name: Service logs on failure

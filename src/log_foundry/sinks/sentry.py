@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from typing import Any
+from typing import Any, Final, Literal, get_args
 from urllib.parse import urlparse
 
 from log_foundry import _diag, _lifecycle
@@ -13,6 +13,17 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
 __all__ = ["SentrySink"]
+
+Backend = Literal["auto", "sdk", "http"]
+"""Which transport a :class:`SentrySink` uses. Not exported: callers pass the literals."""
+
+_BACKENDS: Final = get_args(Backend)
+
+_Selected = Literal["sdk", "http"]
+"""A backend actually chosen for one batch -- never ``"auto"``, which selects rather than is."""
+
+_ABSENT: Final = object()
+"""Sentinel telling an absent member from one whose value is ``None`` (SPEC-043 FR-001)."""
 
 _LEVEL_RANK = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _SENTRY_LEVEL = {
@@ -23,12 +34,39 @@ _SENTRY_LEVEL = {
 class SentrySink:
     """A :class:`~log_foundry.sinks.base.Sink` that captures qualifying events to Sentry (FR-011).
 
-    It uses the ``sentry-sdk`` when the optional extra is installed, imported lazily inside the
-    sink so importing this module never requires it. Without the SDK it falls back to POSTing a
-    Sentry envelope over HTTP to the DSN's ingest URL. Only events at or above the configured
-    minimum level are sent.
+    It uses the ``sentry-sdk`` when one is installed *and able to deliver*, imported lazily inside
+    the sink so importing this module never requires it. Otherwise it POSTs a Sentry envelope over
+    HTTP to the DSN's ingest URL. Only events at or above the configured minimum level are sent.
+
+    ``backend`` selects explicitly and ``"auto"`` is the default (SPEC-043 FR-002). An explicit
+    selection is honoured rather than substituted: under ``"sdk"`` a client that cannot deliver is
+    refused, never diverted to HTTP, and under ``"http"`` no client is held, consulted or flushed.
+    What is built, and what each ``emit`` then does:
+
+    ===========  ==========  ======  ==============  ===========  ==================================
+    ``backend``  client?     DSN?    ``self.client`` ``_http``    Per emit
+    ===========  ==========  ======  ==============  ===========  ==================================
+    ``auto``     yes         yes     the client      built        SDK if it can deliver, else HTTP
+    ``auto``     yes         no      the client      ``None``     SDK if it can deliver, else refuse
+    ``auto``     no          yes     ``None``        built        HTTP
+    ``auto``     no          no      —               —            ``ValueError`` at construction
+    ``sdk``      yes         either  the client      ``None``     SDK if it can deliver, else refuse
+    ``sdk``      no          either  —               —            ``ValueError`` at construction
+    ``http``     rejected    yes     ``None``        built        HTTP
+    ``http``     rejected    no      —               —            ``ValueError`` at construction
+    ===========  ==========  ======  ==============  ===========  ==================================
+
+    "Can deliver" is judged once per ``emit``, so an application that initialises the SDK after
+    building this sink starts using it without rebuilding one. An argument whose only consumer is
+    a backend this construction will never select is a ``ValueError`` rather than a silent
+    ignore — ``opener`` where no HTTP fallback is built, ``client`` under ``"http"``. That is the
+    defect this rule comes from: ``opener`` used to be accepted and then ignored whenever the SDK
+    imported. ``max_retries`` is deliberately outside the rule, since its default cannot be told
+    from an explicit pass of the same value.
 
     Attributes:
+      client: The SDK object this sink captures through, or ``None`` when the HTTP fallback is
+        the only backend it can select.
       sent: Events captured or sent to Sentry.
       skipped: Events below the minimum level, or without a usable level, that were not sent.
       transport_errors: Events whose send raised something other than an already-counted
@@ -48,16 +86,29 @@ class SentrySink:
         dsn: str | None = None,
         *,
         min_level: str = "ERROR",
+        backend: Backend = "auto",
         client: Any = None,
         opener: Any = None,
         max_retries: int = 3,
     ) -> None:
         """Selects the SDK or the HTTP-envelope fallback and sets the level floor.
 
+        The order is deliberate: an unknown ``backend`` is rejected first, then the arguments the
+        selection cannot use, then the selections nothing can build. Several constructions trip a
+        conflict *and* a refusal — any of them with no DSN, for instance — and each raises
+        ``ValueError`` either way, so the conflict is reported first because it names an argument
+        the caller can drop, where the refusal only says the selection cannot be built.
+
+        Both backends this construction can select are built here rather than on first use. A
+        fallback built lazily would miss the worker's one-shot ``log_foundry_stop_signal`` offer
+        and stop being interruptible (SPEC-027), and it would rebind transport state inside
+        ``emit``, contradicting this class's SPEC-028 exemption.
+
         Args:
           dsn: The Sentry DSN. It is required for the fallback, which needs it to know where to
             POST.
           min_level: The lowest level worth sending.
+          backend: Which transport to use — ``"auto"``, ``"sdk"`` or ``"http"``.
           client: A ``sentry_sdk``-shaped object to use instead of importing one.
           opener: A ``urlopen``-shaped callable for the fallback, for tests.
           max_retries: Retries the fallback's HTTP transport makes.
@@ -66,22 +117,51 @@ class SentrySink:
           None.
 
         Raises:
-          ValueError: If no SDK is available and no DSN was given.
+          ValueError: If ``backend`` is not one of the three names; if an argument cannot be used
+            by any backend this construction can select; or if the selection cannot be built —
+            ``"sdk"`` with no client available, ``"http"`` with no DSN, or the default with
+            neither.
         """
+        if backend not in _BACKENDS:
+            raise ValueError(f"SentrySink backend must be one of {_BACKENDS!r}, not {backend!r}")
+        if client is not None and backend == "http":
+            raise ValueError(
+                "SentrySink(backend='http') never captures through a client; drop client= or "
+                "select a backend that can use it"
+            )
+        if opener is not None and (backend == "sdk" or dsn is None):
+            remedy = "drop backend='sdk'" if backend == "sdk" else "pass a dsn"
+            raise ValueError(
+                "SentrySink builds no HTTP fallback for this construction, so opener= would "
+                f"never be called; {remedy}"
+            )
         self._dsn = dsn
+        self._backend = backend
         self._min_rank = _LEVEL_RANK.get(min_level.upper(), _LEVEL_RANK["ERROR"])
         self.sent = 0
         self.skipped = 0
         self.transport_errors = 0
         self._counter_lock = threading.Lock()
-        self.client = client if client is not None else _import_sdk()
+        self.client: Any = None if backend == "http" else (
+            client if client is not None else _import_sdk()
+        )
         self._http: HTTPSink | None = None
         self._auth_header = ""
-        if self.client is None:
-            if dsn is None:
+        if backend == "sdk":
+            if self.client is None:
+                raise ValueError(
+                    "SentrySink(backend='sdk') requires the sentry extra or an injected client="
+                )
+        elif dsn is None:
+            if backend == "http":
+                raise ValueError(
+                    "SentrySink(backend='http') requires a dsn for the HTTP-envelope fallback"
+                )
+            if self.client is None:
                 raise ValueError(
                     "SentrySink without sentry-sdk requires a dsn for the HTTP-envelope fallback"
                 )
+        else:
             ingest_url, self._auth_header = _parse_dsn(dsn)
             self._http = HTTPSink(ingest_url, opener=opener, max_retries=max_retries)
         self._stop_signal: threading.Event | None = None
@@ -94,6 +174,9 @@ class SentrySink:
         FR-001). Letting the first failure propagate would hand the worker a batch whose earlier
         events Sentry had already accepted, and the retry would duplicate them.
 
+        The backend is chosen once, before the loop, so one batch cannot split across transports
+        partway through and so the client is probed once rather than per event.
+
         Args:
           batch: The events to consider.
 
@@ -101,10 +184,12 @@ class SentrySink:
           None.
 
         Raises:
-          SinkDeliveryError: If every qualifying event failed to land. An event below the
-            minimum level is skipped rather than lost, so a batch of nothing but skipped events
-            is a successful emit — there was never anything to deliver.
+          SinkDeliveryError: If every qualifying event failed to land, which includes the case
+            where no backend can deliver at all (SPEC-043 FR-003). An event below the minimum
+            level is skipped rather than lost, so a batch of nothing but skipped events is a
+            successful emit — there was never anything to deliver.
         """
+        backend = self._select_backend()
         attempted = delivered = 0
         for event in batch:
             if not self._qualifies(event):
@@ -112,7 +197,7 @@ class SentrySink:
                     self.skipped += 1
                 continue
             attempted += 1
-            if not self._capture(event):
+            if not self._capture(event, backend):
                 continue
             with self._counter_lock:
                 self.sent += 1
@@ -133,7 +218,12 @@ class SentrySink:
         interpreter exit got to it.
 
         Only the injected-or-imported SDK client has a queue. The ``urllib`` fallback posts an
-        envelope per event and holds nothing, so with no client this is correctly a no-op.
+        envelope per event and holds nothing, so with no client this is correctly a no-op — and
+        ``backend="http"`` holds none, which is what keeps this from pushing an application's own
+        Sentry transport on behalf of a sink that never captures through it.
+
+        A client the per-emit predicate currently reads as unable to deliver is still flushed: it
+        may become usable before the next batch, and flushing one that cannot is a no-op anyway.
 
         ``Client.flush`` is probed by name, as every optional member the library calls on an object
         it does not own is: a stand-in ``client=`` satisfying only ``capture_event`` stays valid,
@@ -254,8 +344,20 @@ class SentrySink:
         with self._counter_lock:
             return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
 
-    def _capture(self, event: dict[str, object]) -> bool:
-        """Sends one event by whichever transport is configured.
+    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool:
+        """Sends one event by the backend ``emit`` resolved for this batch.
+
+        A ``None`` backend is refused here, before the ``try``, and moves nothing. Letting it fall
+        into the envelope branch instead would reach ``_post_envelope``'s assertion, whose
+        ``AssertionError`` the guard below counts as a ``transport_errors`` and announces through
+        ``_diag`` — both forbidden for a refusal (SPEC-043 FR-003), because the caller is told by
+        the ``SinkDeliveryError`` ``emit`` raises and counting it here would report one loss twice.
+        The refusal stays inside the per-event loop so the level filter keeps running ahead of it
+        and the raise names the qualifying count.
+
+        The branch is on the resolved name rather than on ``self.client is not None``: that
+        condition is still true under ``"auto"`` when the client cannot deliver, so it would take
+        the SDK branch anyway and preserve the very defect this selection exists to fix.
 
         One guard covers both branches, catching ``Exception`` rather than an enumerated set.
         Anything escaping here propagates mid-batch and hands the worker a batch Sentry has
@@ -267,6 +369,7 @@ class SentrySink:
 
         Args:
           event: The event to send.
+          backend: The backend ``emit`` resolved, or ``None`` when nothing can deliver.
 
         Returns:
           True when it landed, False when it did not.
@@ -276,8 +379,10 @@ class SentrySink:
             has already counted and announced it, and counting it again would double-report.
             Only the exception type is ever written (arch §6).
         """
+        if backend is None:
+            return False
         try:
-            if self.client is not None:
+            if backend == "sdk":
                 self.client.capture_event(self._sentry_event(event))
             else:
                 self._post_envelope(event)
@@ -289,6 +394,76 @@ class SentrySink:
             _diag.lost("event", 1, f"SentrySink, {type(err).__name__}")
             return False
         return True
+
+    def _select_backend(self) -> _Selected | None:
+        """Picks the transport for one batch, or ``None`` when nothing can deliver.
+
+        An explicit selection is honoured rather than substituted (SPEC-043 FR-002): ``"sdk"``
+        against a client that cannot deliver returns ``None`` so the batch is refused, because a
+        caller who named a backend and got a different one is this sink's original defect in a
+        new place. ``"http"`` never consults the client, which is what keeps a held-but-unusable
+        SDK out of the decision entirely.
+
+        Args:
+          None.
+
+        Returns:
+          ``"sdk"``, ``"http"``, or ``None`` when neither backend can deliver.
+
+        Raises:
+          None.
+        """
+        if self._backend == "http":
+            return "http"
+        if self.client is not None and self._client_can_deliver():
+            return "sdk"
+        if self._backend == "sdk":
+            return None
+        return "http" if self._http is not None else None
+
+    def _client_can_deliver(self) -> bool:
+        """Reports whether the held client has somewhere to send, not merely that it exists.
+
+        Three states cannot deliver and only one of them reports itself inactive: an
+        uninitialised process holds a ``NonRecordingClient`` (``is_active()`` false), while
+        ``init()`` without a DSN and a client that has been ``close()``d both report themselves
+        active with a ``None`` transport and drop every event silently. So the predicate takes
+        both members, and it is the transport that binds — ``is_active()`` is a hardcoded class
+        discriminator, kept because it is the SDK's documented answer and a future client may
+        diverge, not because anything here can distinguish it from the transport alone.
+
+        It descends first: ``__init__`` holds the ``sentry_sdk`` **module**, which publishes
+        neither member, so a probe that read the held object would call the defective path usable
+        and leave the defect in place. ``is_active`` is *called* rather than read, since a bound
+        method is truthy and reading one yields a guard that can never fail; a non-callable
+        ``is_active`` is treated as absent instead. Absence means usable throughout, which is what
+        keeps an injected double, a pre-SPEC-043 client and a pre-2.0 SDK working — hence the
+        sentinel, since an absent ``transport`` and a ``None`` one are opposite answers.
+
+        Args:
+          None.
+
+        Returns:
+          True when the client is worth capturing through.
+
+        Raises:
+          None. A probe may never be the reason a batch fails (SPEC-025), so a client that raises
+            while being questioned is treated as usable and the fault is announced by type.
+        """
+        try:
+            target = self.client
+            descend = getattr(target, "get_client", None)
+            if callable(descend):
+                descended = descend()
+                if descended is not None:
+                    target = descended
+            is_active = getattr(target, "is_active", None)
+            if callable(is_active) and not is_active():
+                return False
+            return getattr(target, "transport", _ABSENT) is not None
+        except Exception as err:
+            _diag.absorbed("probing the Sentry client", err, "it is treated as usable")
+            return True
 
     def _qualifies(self, event: dict[str, object]) -> bool:
         """Reports whether an event is at or above the configured level floor.
@@ -334,7 +509,9 @@ class SentrySink:
         """POSTs one event as a Sentry envelope over the HTTP fallback.
 
         The assertion narrows the type for mypy rather than checking at runtime: the HTTP
-        transport is set in the constructor whenever the path that reaches here is in use.
+        transport is set in the constructor whenever the path that reaches here is in use, which
+        is true because ``_capture`` refuses a ``None`` backend before reaching this branch and
+        ``_select_backend`` only answers ``"http"`` where one was built.
 
         Args:
           event: The event to send.

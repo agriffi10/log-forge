@@ -125,10 +125,16 @@ def test_sentry_sdk_path_with_level_gating() -> None:
     assert fake.events[0]["extra"]["message"] == "boom"
 
 
-def test_sentry_http_envelope_fallback_when_sdk_absent(monkeypatch) -> None:
-    monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
+def test_sentry_http_envelope_fallback() -> None:
+    """The envelope's shape, on the backend the caller selected rather than the one CI has.
+
+    It used to be pinned by patching `_import_sdk`, which made the assertion depend on whether
+    the optional extra happened to be installed (SPEC-043 FR-004).
+    """
     opener = FakeOpener()
-    sink = SentrySink(dsn="https://pubkey@o123.ingest.sentry.io/456", opener=opener)
+    sink = SentrySink(
+        dsn="https://pubkey@o123.ingest.sentry.io/456", backend="http", opener=opener
+    )
     assert sink.client is None
     sink.emit([{"level": "ERROR", "message": "boom"}, {"level": "DEBUG", "message": "skip"}])
     assert sink.sent == 1
@@ -142,10 +148,22 @@ def test_sentry_http_envelope_fallback_when_sdk_absent(monkeypatch) -> None:
     assert json.loads(lines[2])["level"] == "error"
 
 
-def test_sentry_without_sdk_or_dsn_raises(monkeypatch) -> None:
-    monkeypatch.setattr("log_foundry.sinks.sentry._import_sdk", lambda: None)
-    with pytest.raises(ValueError):
-        SentrySink()
+def test_sentry_with_no_dsn_and_no_sdk_raises() -> None:
+    """The `auto`/no-client/no-DSN row, which no `backend=` value can reach (SPEC-043 FR-004 AC-2).
+
+    Converting this one to `backend="http"` would move it to a different row and leave this one
+    uncovered, so it asks the production function which environment it is in and asserts the
+    complement -- a question, not a pin, so the FR-004 sweep is satisfied and neither leg is
+    vacuous. With the extra installed, `SentrySink()` is instead the row that constructs and then
+    refuses at emit, which FR-002 AC-5 requires.
+    """
+    from log_foundry.sinks.sentry import _import_sdk
+
+    if _import_sdk() is None:
+        with pytest.raises(ValueError):
+            SentrySink()
+    else:
+        assert SentrySink().client is not None
 
 
 # --- SPEC-038 FR-001: every platform sink chunks through HTTPSink.emit -------------------
