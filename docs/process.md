@@ -371,9 +371,11 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
   cannot fail, and an Out of Scope bullet that an FR quietly needs.
 
 **An acceptance criterion is a pass/fail test, not an argument for itself.** Measured on this
-repo: SPEC-029 and SPEC-030 carried 19–25 criteria averaging ~20 words and took 2–3 review rounds;
-SPEC-033 and SPEC-036 carry 48–57 averaging ~95 and took 8 and 11. The extra prose did not buy
-correctness — SPEC-033 shipped two regressions to `main` after eight rounds. So:
+repo: the specs with short criteria took 2–3 review rounds, and the two with the longest took 8 and
+11. The extra prose did not buy correctness — SPEC-033 shipped two regressions to `main` after
+eight rounds. ~~SPEC-029 and SPEC-030 carried 19–25 criteria averaging ~20 words … SPEC-033 and
+SPEC-036 carry 48–57 averaging ~95~~ — struck: a standing rule must not cite volatile numbers (§5),
+and these rotted the moment SPEC-036 was right-sized before its build. So:
 
 - **Keep the criterion itself to a sentence or two.** If a decision needs a paragraph to justify,
   the paragraph belongs in the FR's Description, where a reader meets it once, not inside a

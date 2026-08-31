@@ -1,7 +1,7 @@
 # Spec: Flush and Buffer Visibility
 
 **ID:** SPEC-036  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-08-30  
 **Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037
 
@@ -329,7 +329,11 @@ not (AC-8). Adding a token is what `FlushResult` was built for and is additive b
       refuses rather than touching it, and the post-close roster gains a `flush` arm.
 - [ ] AC-10a: The roster's exemption gate resolves its strongest fact from `emit`/`send_all`, so a
       sink whose `flush` holds transport state while its `emit` does not could still claim
-      `ACCEPTS_AFTER_CLOSE`. The gate learns `flush`.
+      `ACCEPTS_AFTER_CLOSE`. The gate learns `flush`. — **OWED at completion.** The gate was not
+      widened; the per-class refusals are asserted directly in
+      `tests/test_sink_flush_hook.py::test_the_buffering_sinks_refuse_a_flush_after_close`, which
+      says so in its docstring. Recorded here rather than only in the delivery doc, per SPEC-021:
+      an open item is marked at the site that states it.
 
 ### FR-003: The synchronous path reports its loss
 

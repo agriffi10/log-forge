@@ -324,6 +324,18 @@ the whole suite. One residual is recorded rather than fixed and is undecidable i
 rule: a parent that builds a connection sink in application state and never hands it over, whose
 child is then the first process to `configure()` it.
 
+**SPEC-036 (flush and buffer visibility) is Completed** — `flush()` reported success over
+undelivered events in three places. In-span events lived on `span.events` until the span *closed*
+while `Worker.flush` drained the *queue*, so the README's own serverless recipe delivered **zero of
+two** with every counter clean; a sink buffering in its driver was unreachable at all; and the
+synchronous path's own loss was counted nowhere, because every `Health` field describes a worker
+and that path has none. Three PRs, grouped by review frame rather than by phase. Eight review
+rounds found real vacuity **eight times**, FR-001 AC-4 among them — the criterion the spec calls
+the one most likely to catch a wrong implementation, which passed against a sweep that did nothing
+at all. `tests/test_promises.py` now has **zero `xfail` cells**, so the 2026-08-07 audit
+harness is clean. Its own acceptance criteria were right-sized first (51 -> 58, mean 48 -> 24
+words), which is how the build found the phase plan would have put a fresh regression on `main`.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -393,7 +405,16 @@ child is then the first process to `configure()` it.
   ran. A marker that finds nothing pending inherits the outcome of the emit that carried what was
   ahead of it in the FIFO — otherwise a second concurrent flush reports success for events the
   first one just abandoned. It is not a verdict on every batch ever sent; `health().failed_batches`
-  is the cumulative record. (SPEC-021)
+  is the cumulative record. (SPEC-021) **What it reports *over* is three places, not one**
+  (SPEC-036): the queue, the buffers on spans still **open** in the calling context, and the
+  sink's own **client** buffer. Each was a place `flush()` returned success while events sat
+  undelivered — the in-span case zero of two events on the README's own recipe. A span is swept
+  and left open, its boundary events backfilled first (so they carry the baggage as of the flush,
+  not the close) and its buffer detached by swap, never cleared; a swept span then makes
+  `continue_trace()` refuse, or one span carries two trace ids. The bound is the calling context,
+  because `contextvars` cannot enumerate another thread's. A sink that buffers in a driver
+  implements the optional `flush()`, probed by `flush_sink` — which **propagates** where
+  `read_losses` swallows, since a swallowed flush failure is a sink the worker believes.
 - **An open item is closed by being fixed, settled, or recorded as a constraint — never deleted** —
   a note that is merely removed takes its reasoning with it, and a reader cannot tell a live defect
   from a decision that reads like one. Superseded notes are struck through in place and marked with
@@ -485,7 +506,13 @@ child is then the first process to `configure()` it.
   rejected, a byte-identical re-send can only fail again), and an oversized event (nothing to retry).
   The first is suppressed batch-wide and the second only when nothing *recoverable* was also lost:
   "unknown" and "rejected" are not the same claim. `losses().failed` is an upper bound on loss, not
-  a count of it. (SPEC-026, arch §8, §9)
+  a count of it. (SPEC-026, arch §8, §9) **The same test decides where a loss with no worker
+  behind it is counted** (SPEC-036 FR-003): `Health.orphan_lost` and `in_span_lost` are two fields
+  because the orphan path can fail at the destination *or* the data while the in-span path can only
+  fail at the data — and every other field describes a worker, so a process logging only outside a
+  span read all zeros over total loss. A `MultiSink` child that reports nothing is charged to the
+  fan-out in **events**, the unit `SinkLosses.failed` has, which is why `MultiSink.failed` — child
+  *calls* — still stays out of the sum.
 - **A sink's wait is bounded, interruptible, and never taken on a destination's word** — one
   drain thread means a sink's backoff pauses *all* delivery, and it spans `shutdown()`, so
   `time.sleep` is the wrong primitive: every sink waits on the worker's stop event, pushed onto it
