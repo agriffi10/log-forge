@@ -1,0 +1,115 @@
+# The nine services the integration suite runs against (SPEC-041 FR-001).
+#
+# ONE definition, used by BOTH `.github/workflows/integration.yml` and a developer on a laptop,
+# so what CI runs and what can be reproduced locally cannot drift. Compose rather than a GitHub
+# `services:` block for three reasons, two of them forced: a `services:` entry accepts no
+# `command:`, which the Pub/Sub emulator needs; service containers are created *before* any step
+# runs, so a repo-held Logstash pipeline config cannot be mounted into one; and the default `nats`
+# image is FROM scratch, so a `--health-cmd` would have no shell to run in and GitHub fails a job
+# whose service never becomes healthy.
+#
+#   docker compose -f tests/integration/docker-compose.yml up -d
+#   LOG_FOUNDRY_INTEGRATION=1 poetry run pytest tests/integration
+#   docker compose -f tests/integration/docker-compose.yml down -v
+#
+# READINESS IS THE HARNESS'S JOB, NOT THE CONTAINER'S. There are deliberately no `healthcheck:`
+# blocks: `conftest.py` probes all nine concurrently against one shared deadline and FAILS rather
+# than skips. Per-container health probes would be nine images' worth of trivia duplicated here,
+# and `up --wait` treats a service with no healthcheck as ready the moment it is running, which
+# is not the same claim as "the broker will answer a metadata request".
+#
+# EVERY IMAGE IS PINNED BY MANIFEST DIGEST (FR-001 AC-5), and the tag beside it is what the digest
+# was resolved from. THESE PINS ARE MAINTAINED BY HAND. That is a real asymmetry with the `uses:`
+# pins in `.github/workflows/`, which CLAUDE.md's Key Decision says are affordable *because*
+# Dependabot moves them: Dependabot's `github-actions` ecosystem updates action references only,
+# and its `docker` ecosystem reads Dockerfiles, compose files it is configured for, and Kubernetes
+# manifests — not this one. Recorded as an accepted constraint rather than left to look like
+# parity it does not have. Refresh with:
+#   docker pull <tag> && docker inspect --format '{{index .RepoDigests 0}}' <tag>
+
+services:
+  postgres:
+    image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73 # 17-alpine
+    environment:
+      POSTGRES_PASSWORD: logfoundry
+      POSTGRES_DB: logs
+    ports: ["55432:5432"]
+
+  redis:
+    image: redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf # 7-alpine
+    ports: ["56379:6379"]
+
+  # KRaft, single node, configured entirely by environment.
+  #
+  # KAFKA_ADVERTISED_LISTENERS NAMES THE HOST-PUBLISHED PORT, NOT THE CONTAINER PORT, because the
+  # test process connects from the host and then follows whatever address the broker's metadata
+  # response gives it. Change the `ports:` mapping below and this must change with it — a plain
+  # TCP-connect readiness probe cannot see that mismatch (the connect succeeds and the client
+  # fails later on the metadata address), which is why conftest.py probes Kafka with a real
+  # metadata request instead.
+  kafka:
+    image: apache/kafka@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed # 3.9.1
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:59092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    ports: ["59092:9092"]
+
+  # LOGSTASH WRITES WHAT IT PARSED INTO REDIS, which is how a test observes it (FR-003 AC-1).
+  # The alternatives were worse: a bind-mounted `file` output makes the runner's uid fight the
+  # image's uid 1000, and `stdout` needs the docker CLI inside a test. `logstash-output-redis`
+  # ships in the image, and the suite already has a Redis client for its own sinks.
+  #
+  # The pipeline config is a bind mount, which is the reason this file is compose rather than a
+  # GitHub `services:` entry at all. Note `create_host_path` semantics: a mistyped source path
+  # mounts an empty directory rather than failing, so a broken mount looks like a Logstash with
+  # no pipeline.
+  logstash:
+    image: docker.elastic.co/logstash/logstash@sha256:35a566a2c4d3be55451443d76d9f5977982d8413e5edb02e383f658c06bab087 # 8.15.3
+    environment:
+      XPACK_MONITORING_ENABLED: "false"
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports: ["55044:5044"]
+    depends_on: [redis]
+
+  nats:
+    image: nats@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 # 2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports: ["54222:4222"]
+
+  # Needs a `command:`, which is the second reason this is not a GitHub `services:` block.
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:d343049a5b3fc0c880a51412ba0c53a3f6a3fc727978cef52931ea5f6fda5b9f # emulators
+    command:
+      - gcloud
+      - beta
+      - emulators
+      - pubsub
+      - start
+      - --project=log-foundry-integration
+      - --host-port=0.0.0.0:8085
+    ports: ["58085:8085"]
+
+  mongo:
+    image: mongo@sha256:b6421fd6d1c5ded6377b397d8983e2f82e2100dc5123332dcfda2065a472be5b # 7
+    ports: ["57017:27017"]
+
+  rabbitmq:
+    image: rabbitmq@sha256:d7af1c87c5f1eda13fcfca06db452bf3aeab6619fc3358b68535c0c02c4e52bc # 3-alpine
+    ports: ["55672:5672"]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:82499fdb60e5bfaefb1e8f06f00a8857d61643fd6081c3f476ab6c7ff6d78766 # 24-alpine
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports: ["58123:8123"]

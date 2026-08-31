@@ -195,3 +195,27 @@ def lf(fake_sink: FakeSink, monkeypatch):
 
     monkeypatch.setattr(decorator, "_flush", _sync_flush)
     return log_foundry
+
+
+@pytest.fixture
+def sentry_http_fallback(monkeypatch):
+    """Forces `SentrySink` onto its HTTP-envelope backend regardless of what is installed.
+
+    `SentrySink.__init__` calls `_import_sdk()` whenever no `client=` is given, so which backend
+    a test gets is decided by whether the optional `sentry` extra happens to be present. Every
+    test that passes `opener=` wants the fallback -- and `opener` is silently ignored on the SDK
+    branch, so with the extra installed those tests assert against a sink they did not build.
+
+    Four of them were green in CI and red under `--all-extras`, found by SPEC-041 FR-001's job
+    running the existing suite in the extras environment for the first time: `sink._http is None`,
+    `DID NOT RAISE SinkDeliveryError`, `assert 2 == 1`, `(5, 0) == (4, 1)`. They were passing only
+    because CI never installs that extra.
+
+    A plain import rather than `importorskip`: this module needs no extra, so the guard could
+    never fire -- and if it somehow did it would silently delete the four tests in exactly the
+    environment they exist for, which is the failure this fixture was written to end.
+    """
+    from log_foundry.sinks import sentry
+
+    monkeypatch.setattr(sentry, "_import_sdk", lambda: None)
+    return sentry
