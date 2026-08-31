@@ -146,7 +146,9 @@ def test_close_commits_injected_but_does_not_close() -> None:
 
 def test_owned_connection_is_closed(monkeypatch) -> None:
     conn = FakeConnection()
-    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=lambda dsn: conn))
+    monkeypatch.setitem(
+        sys.modules, "psycopg", types.SimpleNamespace(connect=lambda dsn, **kwargs: conn)
+    )
     sink = PostgresSink("logs", dsn="postgresql://x")
     sink.close()
     assert conn.closed is True
@@ -281,3 +283,79 @@ def test_a_healthy_rollback_path_is_unchanged() -> None:
     sink = PostgresSink("logs", connection=conn, max_retries=2)
     sink.emit([{"i": 1}])
     assert conn.rollbacks == 1 and conn.commits == 1 and sink.failed == 0
+
+
+# -- SPEC-041 FR-002: a broken connection is replaced, and only when this sink owns it --------
+
+
+class BreakableConnection(FakeConnection):
+    """A connection that reports itself broken once the server has "closed" it."""
+
+    def __init__(self, fail_times: int = 0) -> None:
+        super().__init__(fail_times)
+        self.broken = False
+
+    def kill(self) -> None:
+        self.broken = True
+        self._fail_times = -1   # every later insert fails, as a dead handle's does
+
+
+def _psycopg_stub(monkeypatch, connections):
+    """Installs a fake `psycopg` handing out `connections` in order, recording the kwargs."""
+    seen: list[dict] = []
+
+    def connect(dsn, **kwargs):
+        seen.append(kwargs)
+        return connections.pop(0)
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    return seen
+
+
+def test_a_broken_owned_connection_is_reopened_on_the_next_attempt(monkeypatch) -> None:
+    first, second = BreakableConnection(), FakeConnection()
+    _psycopg_stub(monkeypatch, [first, second])
+    sink = PostgresSink("logs", dsn="postgresql://x", max_retries=0)
+
+    first.kill()
+    sink.emit([{"a": 1}])          # max_retries=0: one attempt, and it must still recover
+
+    assert sink._conn is second, "a broken owned connection must be replaced"
+    assert second.executemany_calls, "the batch must land on the new connection"
+
+
+def test_a_broken_borrowed_connection_is_never_reopened(monkeypatch) -> None:
+    borrowed = BreakableConnection()
+    # No psycopg at all: reaching for one would raise ImportError rather than fail quietly.
+    monkeypatch.delitem(sys.modules, "psycopg", raising=False)
+    sink = PostgresSink("logs", connection=borrowed, max_retries=0)
+
+    borrowed.kill()
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+
+    assert sink._conn is borrowed, "a caller's connection is theirs (arch §13)"
+
+
+def test_the_connect_timeout_is_passed_and_floored(monkeypatch) -> None:
+    seen = _psycopg_stub(monkeypatch, [FakeConnection(), FakeConnection()])
+    PostgresSink("logs", dsn="postgresql://x", connect_timeout=30)
+    # Zero means "wait forever" to libpq, which is the unbounded connect this argument exists to
+    # remove, so it is floored rather than honoured.
+    PostgresSink("logs", dsn="postgresql://x", connect_timeout=0)
+
+    assert [kwargs["connect_timeout"] for kwargs in seen] == [30, 2]
+
+
+def test_close_does_not_raise_when_the_connection_is_already_broken(monkeypatch) -> None:
+    conn = BreakableConnection()
+    _psycopg_stub(monkeypatch, [conn])
+    sink = PostgresSink("logs", dsn="postgresql://x")
+
+    def explode() -> None:
+        raise RuntimeError("the server closed this session")
+
+    conn.commit = explode
+    sink.close()                   # must not raise out of a release path
+
+    assert conn.closed is True, "the connection is still released"

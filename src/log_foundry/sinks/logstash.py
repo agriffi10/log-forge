@@ -19,11 +19,30 @@ __all__ = ["LogstashSink"]
 class LogstashSink:
     """A :class:`~log_foundry.sinks.base.Sink` that ships JSON lines to Logstash (FR-005).
 
-    Two mutually-exclusive modes are chosen at construction: with a URL the batch goes as JSON
-    lines over HTTP, reusing the ``HTTPSink`` core, and with a host and port each event goes as
-    one newline-terminated line over a raw TCP or UDP socket, reusing
+    Two mutually-exclusive modes are chosen at construction: with a URL the batch goes over HTTP,
+    reusing the ``HTTPSink`` core, and with a host and port each event goes as one
+    newline-terminated line over a raw TCP or UDP socket, reusing
     :class:`~log_foundry.sinks._socket.SocketTransport`. Either backend handles its own bounded
     retry and raises on total failure of its own accord, so ``emit`` needs no rule of its own.
+
+    **What the Logstash side must be configured as** (SPEC-041 FR-003). In HTTP mode the default
+    ``body_format="json_array"`` posts a JSON array as ``application/json``, which a **stock**
+    ``http`` input parses into one event per element with no configuration at all. That is a
+    change: this sink used to post NDJSON as ``application/x-ndjson``, which the ``http`` input's
+    default ``additional_codecs`` map (``{"application/json" => "json"}``) does not cover, so the
+    body fell through to the ``plain`` codec. Measured against Logstash 8.15 — a batch of three
+    arrived as **one** event with the whole payload as text in ``message`` and every structured
+    field gone.
+
+    ``body_format="ndjson"`` restores the old wire form, and it is not merely legacy: an input
+    configured ``additional_codecs => {"application/x-ndjson" => "json_lines"}`` -- the documented
+    workaround for the behaviour above -- needs it. That setting **replaces** the default map
+    rather than merging with it, so such an input parses NDJSON correctly and a JSON array
+    incorrectly. The two configurations are mutually exclusive unless the input lists both, which
+    is why the wire form is a parameter rather than a silent change.
+
+    Socket mode is unaffected: it is newline-delimited either way, and a ``tcp``/``udp`` input
+    uses the ``line``/``json_lines`` codec rather than ``additional_codecs``.
 
     In socket mode both IPv4 and IPv6 destinations are supported, over either transport
     (SPEC-031 FR-002): the UDP socket's address family is resolved from ``host`` rather than
@@ -58,6 +77,7 @@ class LogstashSink:
         host: str | None = None,
         port: int | None = None,
         transport: str = "tcp",
+        body_format: str = "json_array",
         timeout: float = 5.0,
         max_retries: int = 3,
         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
@@ -70,6 +90,10 @@ class LogstashSink:
           host: The destination host, selecting socket mode.
           port: The destination port, selecting socket mode.
           transport: ``"tcp"`` or ``"udp"``, in socket mode.
+          body_format: In HTTP mode, ``"json_array"`` (the default) or ``"ndjson"``. Ignored in
+            socket mode, which is always newline-delimited. See the class docstring for what
+            each one requires of the Logstash side; ``"ndjson"`` is the escape hatch for an
+            input already configured with ``additional_codecs``.
           timeout: Seconds allowed per request or connection.
           max_retries: Retries the chosen backend makes.
           max_datagram_bytes: In UDP socket mode, the largest datagram to attempt; a frame over
@@ -85,7 +109,7 @@ class LogstashSink:
         """
         if url is not None:
             self._http: HTTPSink | None = HTTPSink(
-                url, body_format="ndjson", timeout=timeout, max_retries=max_retries,
+                url, body_format=body_format, timeout=timeout, max_retries=max_retries,
                 **http_kwargs,  # type: ignore[arg-type]
             )
             self._socket: SocketTransport | None = None

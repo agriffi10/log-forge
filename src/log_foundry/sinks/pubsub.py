@@ -59,6 +59,14 @@ class GooglePubSubSink:
     imported lazily. ``publish()`` returns a future that resolves asynchronously, so the sink
     accumulates the batch's futures and resolves them on :meth:`close`.
 
+    **Retry (SPEC-041 FR-004).** The client's own retry is bounded and runs on the client's
+    threads, never the worker's drain thread: the generated ``publish`` carries
+    ``Retry(initial=0.1, maximum=60.0, multiplier=4, deadline=600.0)`` with a 60 s per-call
+    timeout, so a publish gives up after ten minutes at the outside. What this sink contributes
+    is the only wait the drain thread ever takes — :meth:`_await_overflow`'s
+    ``overflow_timeout``, bounded and interruptible per SPEC-027. Measured with the destination
+    stopped and ``overflow_timeout=5.0``: every over-bound emit returned in 5.00 s exactly.
+
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport lock —
     the publisher client owns its own batching and threading, and ``publish()`` is a local
     hand-off. What it does hold is the pending-futures list, which is genuinely shared between

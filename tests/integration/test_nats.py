@@ -8,17 +8,33 @@ instrument* shares the failure mode under test cannot distinguish the two.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import pathlib
+import socket
+import subprocess
+import time
 import uuid
 from typing import TYPE_CHECKING
 
 import nats
 import pytest
 
-from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import NATSSink
 
 if TYPE_CHECKING:
     from integration.conftest import Endpoint
+
+COMPOSE = pathlib.Path(__file__).parent / "docker-compose.yml"
+
+
+def _tcp_up(url: str) -> bool:
+    host, _, port = url.removeprefix("nats://").partition(":")
+    try:
+        with socket.create_connection((host, int(port)), timeout=1.0):
+            return True
+    except OSError:
+        return False
 
 
 @pytest.fixture
@@ -93,3 +109,43 @@ def test_only_jetstream_mode_notices_a_subject_no_stream_is_bound_to(stream) -> 
         assert acked.losses().failed == 1
     finally:
         acked.close()
+
+
+def test_a_disconnected_client_reports_non_delivery(stream) -> None:
+    # FR-004 AC-5, against a real outage. Before the guard, five emits with the server stopped
+    # each returned in 0.00 s with losses() reading all zeros, and one of six events reached the
+    # destination -- the SPEC-026 shape that makes the worker's retry and failed_batches inert.
+    url, subject, count = stream
+    sink = NATSSink(subject, servers=url)
+    sink.emit([{"n": 0}])
+    assert count() == 1
+
+    subprocess.run(["docker", "compose", "-f", str(COMPOSE), "stop", "nats"], check=True,
+                   capture_output=True)
+    try:
+        deadline = time.monotonic() + 30
+        refused = 0
+        while time.monotonic() < deadline and refused == 0:
+            try:
+                sink.emit([{"n": 99}])
+            except SinkDeliveryError:
+                refused += 1
+            else:
+                time.sleep(0.5)
+        assert refused, "a sustained outage must be reported, not absorbed"
+        # SPEC-032: a refusal is reported to the worker, not absorbed here, so no counter moves.
+        assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    finally:
+        subprocess.run(["docker", "compose", "-f", str(COMPOSE), "start", "nats"], check=True,
+                       capture_output=True)
+        for _ in range(60):
+            if _tcp_up(url):
+                break
+            time.sleep(1)
+        # Close inside the restored window, not while the client is still reconnecting: the
+        # driver's `drain()` raises `ConnectionReconnectingError` then, and `close()` shuts the
+        # loop down regardless, leaving the client's reader task to be garbage-collected against
+        # a closed loop -- which surfaces as a PytestUnraisableExceptionWarning rather than a
+        # failure, so it would have gone unnoticed.
+        with contextlib.suppress(Exception):
+            sink.close()

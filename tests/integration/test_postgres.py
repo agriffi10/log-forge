@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import psycopg
 import pytest
 
+from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.postgres import PostgresSink
 
 if TYPE_CHECKING:
@@ -74,3 +75,56 @@ def test_a_batch_larger_than_one_chunk_lands_whole(
     with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {table}")
         assert cur.fetchone()[0] == 50
+
+
+def terminate(endpoint: Endpoint, pid: int) -> None:
+    with psycopg.connect(dsn(endpoint)) as admin, admin.cursor() as cur:
+        cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        admin.commit()
+
+
+def test_delivery_resumes_after_the_server_closes_an_owned_connection(
+    services_are_up: dict[str, Endpoint], table: str
+) -> None:
+    # FR-002 AC-4: the proof that needs a real server. A psycopg connection is permanently
+    # unusable once the backend goes away, so before this fix one failover ended delivery for
+    # the life of the process -- measured here as three lost batches and one row.
+    endpoint = services_are_up["postgres"]
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
+    sink.emit([event(1)])
+
+    terminate(endpoint, sink._conn.info.backend_pid)
+
+    delivered = 0
+    for n in range(2, 5):
+        try:
+            sink.emit([event(n)])
+            delivered += 1
+        except SinkDeliveryError:
+            pass
+    sink.close()
+
+    # max_retries=0 is deliberate: the reconnect sits at the top of each ATTEMPT, so it must
+    # recover on the next emit even when no retry remains -- the setting at which a reconnect
+    # placed in the retry branch would never run at all.
+    assert delivered >= 2, "delivery must resume after the connection is replaced"
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {table}")
+        assert cur.fetchone()[0] >= 3
+
+
+def test_a_borrowed_connection_is_left_to_its_owner(
+    services_are_up: dict[str, Endpoint], table: str
+) -> None:
+    # arch §13's borrowed-client constraint, against a real server: the sink must not reconnect
+    # an object the caller owns, so delivery stays broken and the caller's handle is untouched.
+    endpoint = services_are_up["postgres"]
+    borrowed = psycopg.connect(dsn(endpoint))
+    sink = PostgresSink(table, connection=borrowed, create_table=True, max_retries=0)
+    sink.emit([event(1)])
+
+    terminate(endpoint, borrowed.info.backend_pid)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([event(2)])
+    assert sink._conn is borrowed

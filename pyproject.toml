@@ -185,6 +185,12 @@ ignore = [
 # interpolates something it did not generate should still trip it.
 "tests/integration/test_postgres.py" = ["S608"]
 "tests/integration/test_clickhouse.py" = ["S608"]
+# The NATS outage test stops and restarts its own compose service, because "the server went
+# away" is the condition under test and no fake reproduces what the real client does about it.
+# Every argument is a literal or a path this module derives from `__file__`; there is no shell
+# and no caller input. `docker` is resolved from PATH deliberately -- CI and a developer laptop
+# put it in different places.
+"tests/integration/test_nats.py" = ["S603", "S607"]
 # make-sbom.py exists to drive two virtualenvs it creates itself, so subprocess is the whole job.
 # Every argv element is either a literal, a path under a `tempfile.TemporaryDirectory` this script
 # just made, or a value read from the repository's own pyproject.toml / poetry.lock. There is no

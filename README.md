@@ -658,7 +658,7 @@ completed, not that every chunk of it landed.
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`) |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
-| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket |
+| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per line; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
 | `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
 
 ```python
@@ -761,7 +761,16 @@ Two things worth knowing:
 
 #### Queue & stream
 
-Each needs its own extra (lazy-imported). All publish + retry within a bound and close cleanly.
+Each needs its own extra (lazy-imported). All publish within a bound and close cleanly. **Where the
+retry lives differs, and it was measured rather than assumed** (SPEC-041 FR-004): the Redis,
+RabbitMQ and Event Hubs sinks retry through `sinks/_retry`, so their backoff is bounded *and* cut
+short by a shutdown. `KafkaSink`, `NATSSink` and `GooglePubSubSink` add no retry loop and need
+none — each hands off locally and returns without waiting, so nothing of theirs holds the single
+drain thread. Their clients retry on their own threads within their own bounds:
+`message.timeout.ms` (5 min default) for Kafka, a 600 s deadline for Pub/Sub, and for NATS a
+JetStream publish bounded by its 5 s ack timeout with no retry at all. `NATSSink` refuses a batch
+outright while its client reports itself disconnected, so a sustained outage moves
+`health().failed_batches` instead of being absorbed.
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
