@@ -13,9 +13,11 @@ level would therefore fail the run this whole design exists to leave untouched.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -182,7 +184,51 @@ def _kafka_ready(endpoint: Endpoint) -> bool:
     )
 
 
-_PROBES: dict[str, Callable[[Endpoint], bool]] = {"kafka": _kafka_ready}
+READINESS_MARKER = "__log_foundry_readiness_probe__"
+"""Field marking the event a Logstash readiness probe necessarily injects.
+
+The probe has to POST a real request (see :func:`_logstash_ready`), and every accepted request
+becomes an event at the destination. Marking it is what lets a test filter it out rather than
+race it: the pipeline may deliver the probe's event *after* a test has cleared the key.
+"""
+
+
+def _logstash_ready(endpoint: Endpoint) -> bool:
+    """Reports whether Logstash's ``http`` input is actually serving requests.
+
+    **A TCP connect is not enough, and this was measured in CI rather than reasoned.** The input
+    binds its port well before the pipeline is ready, so a connect succeeds and the first real
+    POST is met with a reset — three Logstash tests failed on the first run of this job with
+    ``ConnectionResetError errno=104`` while every local run passed, because a laptop's
+    containers had been up for minutes. It is the same shape as the Kafka probe above: the only
+    proof a service is serving is asking it the question a client asks.
+
+    Args:
+      endpoint: The HTTP input to probe.
+
+    Returns:
+      True when a request was accepted.
+
+    Raises:
+      None.
+    """
+    request = urllib.request.Request(
+        f"http://{endpoint.url_host}",
+        data=json.dumps({READINESS_MARKER: True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2.0) as response:  # noqa: S310
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+_PROBES: dict[str, Callable[[Endpoint], bool]] = {
+    "kafka": _kafka_ready,
+    "logstash": _logstash_ready,
+}
 """Per-service readiness probes, where a TCP connect is not the right question.
 
 Everything else answers a connect honestly enough: the client's own first call is the real test,

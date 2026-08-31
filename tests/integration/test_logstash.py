@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pytest
 import redis as redis_mod
 
+from integration.conftest import READINESS_MARKER
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 
@@ -39,6 +40,11 @@ def parsed(services_are_up: dict[str, Endpoint]):
     def drain(at_least: int, settle: float = 12.0) -> list[dict[str, object]]:
         # Wait for `at_least`, then keep draining briefly: a test asserting "only one event
         # arrived" is worthless if it stops reading the moment the first one lands.
+        #
+        # The readiness probe POSTs a real request, because binding the port is not the same as
+        # serving (see `_logstash_ready`), and every accepted request becomes an event. That
+        # event is filtered rather than raced: the pipeline may deliver it after this fixture
+        # has cleared the key, and it would otherwise land in a test's count.
         deadline = time.monotonic() + settle
         out: list[dict[str, object]] = []
         while time.monotonic() < deadline:
@@ -50,7 +56,9 @@ def parsed(services_are_up: dict[str, Endpoint]):
                         break
                 time.sleep(0.3)
                 continue
-            out.append(json.loads(item))
+            event = json.loads(item)
+            if READINESS_MARKER not in event:
+                out.append(event)
         return out
 
     yield drain
