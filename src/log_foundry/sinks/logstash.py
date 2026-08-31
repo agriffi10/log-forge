@@ -99,9 +99,11 @@ class LogstashSink:
           host: The destination host, selecting socket mode.
           port: The destination port, selecting socket mode.
           transport: ``"tcp"`` or ``"udp"``, in socket mode.
-          body_format: In HTTP mode, ``"json_array"`` (the default) or ``"ndjson"``. Ignored in
-            socket mode, which is always newline-delimited. See the class docstring for what
-            each one requires of the Logstash side; ``"ndjson"`` is the escape hatch for an
+          body_format: ``"json_array"`` (the default) or ``"ndjson"``. It selects the HTTP wire
+            form and has **no effect** in socket mode, which is always newline-delimited — but it
+            is *validated* in both, because a value this class silently ignores in one mode and
+            silently misreads in the other is worse than a refusal. See the class docstring for
+            what each one requires of the Logstash side; ``"ndjson"`` is the escape hatch for an
             input already configured with ``additional_codecs``.
           timeout: Seconds allowed per request or connection.
           max_retries: Retries the chosen backend makes.

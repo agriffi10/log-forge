@@ -215,9 +215,11 @@ class PostgresSink:
     def _connect(self) -> Any:
         """Opens a connection to the configured DSN, bounded by :attr:`connect_timeout`.
 
-        The bound is passed as a keyword rather than left to the DSN, so it holds whatever the
-        caller's connection string says. See :data:`DEFAULT_CONNECT_TIMEOUT` for why an unbounded
-        connect on this path is the defect rather than the default.
+        The bound is passed as a keyword rather than left to the DSN, so it holds **regardless of**
+        what the caller's connection string says — which is the same fact ``__init__`` states from
+        the caller's side, that this argument overrides a ``connect_timeout`` in the DSN. See
+        :data:`DEFAULT_CONNECT_TIMEOUT` for why an unbounded connect here is the defect rather
+        than the default.
 
         Args:
           None.
@@ -264,17 +266,13 @@ class PostgresSink:
         error — a constraint violation, a full disk — does not churn the connection. Both are
         probed by name because this sink accepts any ``psycopg``-shaped object it does not own.
 
-        Args:
-          None.
-
-        Returns:
-          None.
-
-        A failed reconnect is **announced once per outage, not once per attempt**. Unthrottled it
-        fires on every attempt of every batch, so a down server turned one stderr line into five
-        per batch, indefinitely — a diagnostic that floods is one an operator stops reading, and
-        the batch's own ``_diag.lost`` line already records the loss. The flag clears on a
-        successful reconnect, so a later outage is announced again.
+Both diagnostics here are **announced once per outage, not once per attempt**. Unthrottled
+        they fire on every attempt of every batch, so a down server turned one stderr line into
+        five per batch, indefinitely — a diagnostic that floods is one an operator stops reading,
+        and the batch's own ``_diag.lost`` line already records the loss. The flag covers the
+        failed ``close()`` as well as the failed connect, because a failed reconnect leaves the
+        old object in place and the next attempt closes it again. It clears on a successful
+        reconnect, so a later outage is announced again.
 
         Args:
           None.
@@ -294,7 +292,8 @@ class PostgresSink:
         try:
             self._conn.close()
         except Exception as err:
-            _diag.absorbed("PostgresSink.close of a broken connection", err)
+            if not announced:
+                _diag.absorbed("PostgresSink.close of a broken connection", err)
         try:
             self._conn = self._connect()
             self._reconnect_announced = False

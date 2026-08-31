@@ -432,3 +432,62 @@ def test_either_broken_signal_alone_triggers_the_reconnect(monkeypatch) -> None:
         sink = PostgresSink("logs", dsn="postgresql://x", max_retries=0)
         sink.emit([{"a": 1}])
         assert sink._conn is replacement, f"a connection reporting {attribute} must be replaced"
+
+
+def test_a_later_outage_is_announced_again_after_a_successful_reconnect(
+    monkeypatch, capsys
+) -> None:
+    # The half of the throttle that fails SILENTLY. Without the reset, the first outage announces
+    # once and every later one for the life of the process is silent -- no counter moves, nothing
+    # reddens. Deleting the reset survived the entire 1779-test suite before this test existed.
+    connections = [BreakableConnection(), BreakableConnection()]
+    state = {"down": False}
+
+    def connect(dsn, **kwargs):
+        if state["down"]:
+            raise RuntimeError("server is down")
+        return connections.pop(0)
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    sink = PostgresSink("logs", dsn="postgresql://x", max_retries=0)
+
+    # First outage: the reconnect fails and is announced.
+    sink._conn.kill()
+    state["down"] = True
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+    assert capsys.readouterr().err.count("PostgresSink.reconnect") == 1
+
+    # Recovery, then a second, distinct outage: it must be announced too.
+    state["down"] = False
+    sink._conn.kill()
+    sink.emit([{"a": 2}])
+    capsys.readouterr()
+    sink._conn.kill()
+    state["down"] = True
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 3}])
+
+    assert capsys.readouterr().err.count("PostgresSink.reconnect") == 1, (
+        "a new outage after a recovery must be announced again"
+    )
+
+
+def test_the_borrowed_clause_appears_only_when_the_connection_is_broken(
+    monkeypatch, capsys
+) -> None:
+    # The clause tells an operator why delivery stopped. Appending it to every borrowed-connection
+    # failure puts "may not reopen it" on a constraint violation, where reopening was never the
+    # question. Reverting the condition survived the whole suite before this test existed.
+    monkeypatch.delitem(sys.modules, "psycopg", raising=False)
+
+    ordinary = FakeConnection(fail_times=-1)          # fails, but the connection is fine
+    with pytest.raises(SinkDeliveryError):
+        PostgresSink("logs", connection=ordinary, max_retries=0).emit([{"a": 1}])
+    assert "may not reopen it" not in capsys.readouterr().err
+
+    broken = BreakableConnection()
+    broken.kill()
+    with pytest.raises(SinkDeliveryError):
+        PostgresSink("logs", connection=broken, max_retries=0).emit([{"a": 1}])
+    assert "may not reopen it" in capsys.readouterr().err

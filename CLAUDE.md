@@ -337,7 +337,7 @@ harness is clean. Its own acceptance criteria were right-sized first (51 -> 58, 
 words), which is how the build found the phase plan would have put a fresh regression on `main`.
 
 **SPEC-041 (sink integration verification) is Completed** — the first spec here that could only be
-half-verified by reading. Eleven sinks talk to a third party through an optional extra and CI's
+half-verified by reading. Fourteen sink modules reach a third party through one of eleven optional extras, and CI's
 no-extras environment is deliberately the contract, so none had ever been executed. Adds a second,
 non-gating job running nine services in containers, a vacuity floor (an absent service fails
 rather than skips), and a derived roster of what is still only read. Its three inherited findings
@@ -762,8 +762,8 @@ tests green only because CI never installs that extra.
   the parent held only in application state, first handed over by the child — is undecidable
   inside the rule and recorded in §13, not asserted away. (SPEC-042, arch §9, §13)
 - **A read-only finding is not closed until it has been run, and the job that runs it needs a
-  floor rather than an exit code** — eleven sinks reach a third party through an optional extra and
-  none was ever executed, so the sinks most likely to be in production were the ones least
+  floor rather than an exit code** — fourteen sink modules reach a third party through one of eleven
+  optional extras and none was ever executed, so the sinks most likely to be in production were the ones least
   verified. All three of SPEC-041's inherited "read-only" findings held up, and each was
   *reproduced before being fixed*: one `pg_terminate_backend` ended `PostgresSink` delivery for
   the process, a stock Logstash turned a batch of three into **one** event with every field as
