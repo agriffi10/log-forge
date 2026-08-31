@@ -97,7 +97,8 @@ four before the first push.
   waiting to be asked. Never commit to `main` directly.
 - **The diff reviews run BEFORE the push, not before the merge — and there are two of them.** Commit
   locally, run the gates, send the diff to **two** fresh-context reviewers in **different frames**,
-  fix or explicitly reject every finding — *then* push and open the PR. Pushing first and reviewing after inverts the gate: the branch is already public, the fixes
+  fix or explicitly reject every finding — *then* push and open the PR. Pushing first and reviewing
+  after inverts the gate: the branch is already public, the fixes
   arrive as follow-up commits, and the review reads as commentary on something that has already
   happened rather than as the thing that decides whether it should. Rotating the frame (below) happens
   in the same window. A push is the point of no return for the review, the same way the merge is the
@@ -159,8 +160,8 @@ The two are **two frames, not two rounds** — the same frame run twice buys wor
 not free picks. One starts from the **change** and reads it against what it is supposed to
 satisfy; the other starts from **something other than the change** — the system it lands in, or
 the document it claims to implement. On a code diff those are: the spec's acceptance criteria plus
-the rules for the domains it touches, and a pass that **builds** the thing and runs the suites
-rather than reading it. On a diff with no code in it — a spec, a plan, a docs change — they are:
+the `best-practices/` rules for the domains it touches, and a pass that **builds** the thing and
+runs the suites rather than reading it. On a diff with no code in it — a spec, a plan, a docs change — they are:
 the artifact against its own sources, and the artifact against every *other* place the same rule
 is stated. Both land **before** the push; a review that only happens once the branch is public
 does not count toward the two.
@@ -201,7 +202,9 @@ that rewrites the plan sends the new plan through again.
   artifact converges on wording. Rotate instead: for a spec, a reviewer briefed only on the
   *dependencies* it claims, or one asked to build the thing from the spec alone and report what it
   could not determine; for a plan, one asked to find the phase that will be discovered impossible.
-- **Exit on a new frame finding nothing**, never on a round count.
+- **Exit on a new frame finding nothing**, never on a round count — and never below the counts
+  above. The exit rules say when to stop *above* a floor, not that a floor can be skipped: a
+  diff still gets its two frames when the first comes back clean.
 - **A reviewer finding is not an instruction.** The author decides. Rejecting one is ordinary and
   costs a sentence; the thing to avoid is deciding silently, because then nobody can tell a
   considered rejection from a finding that was never read. A fixed finding that was wrong is a
