@@ -37,9 +37,16 @@ permissions:
 # The most valuable place in this repository to supersede a stale run: nine service containers,
 # an image-pull path and a JVM start make this the longest job here (~296 s against CI's ~155 s),
 # so a pull request pushed to twice would otherwise hold two full sets of containers at once.
-# `cancel-in-progress` is an expression for the same reason as in `ci.yml` — a scheduled run on
-# `main` must never be cancelled by a pull request, and the weekly run is the one that decides
-# whether this job has earned its way into the ruleset.
+# `cancel-in-progress` is an expression, but NOT for the reason it would be easy to write here: a
+# scheduled run on `main` and a pull request are already in different groups (`...-refs/heads/main`
+# against `...-refs/pull/N/merge`), so the expression is not what keeps a pull request from
+# cancelling the weekly run. What it actually prevents is a `workflow_dispatch` on `main`
+# displacing a schedule on `main`, which DO share a group — and that weekly run is the one
+# deciding whether this job has earned its way into the ruleset, so it should not be discardable
+# by someone clicking Run workflow.
+#
+# The caller-context trap that forced `ci.yml`'s group to be rewritten does not reach here: this
+# workflow has no `workflow_call` trigger, so `github.workflow` and `github.ref` are its own.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

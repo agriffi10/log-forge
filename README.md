@@ -1286,10 +1286,10 @@ part of the contract:
 
 On a push to `main` the full `ci.yml` matrix still runs, but as the first job of
 [`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it is
-allowed to publish — so the check appears there as `Release / test / test (py3.12)`. `ci.yml`
-deliberately carries no `push` trigger of its own; it had one, and the result was that every
-merge ran the identical matrix twice. A `v*` tag is gated the same way, by that same reusable
-call.
+allowed to publish — so on main the checks are listed under the *Release* workflow, named
+`test / test (py3.12)` and `test / test (py3.13)`. `ci.yml` deliberately carries no `push`
+trigger of its own; it had one, and the result was that every merge ran the identical matrix
+twice. A `v*` tag is gated the same way, by that same reusable call.
 
 CodeQL runs as GitHub's **default setup** — a repository setting, not a workflow file, which is
 why there is no `codeql.yml` here (adding one would disable the default setup and silently stop

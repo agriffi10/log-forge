@@ -5,29 +5,41 @@ name: Zizmor
 # `id-token: write` against PyPI Trusted Publishing, so a defect in a workflow file is a defect
 # upstream of every consumer's `pip install` (SPEC-022 FR-006).
 
-# Path-filtered on both triggers, because this audit reads workflow files and nothing else: a
-# pull request that touches only `src/` or `docs/` cannot change its verdict, and re-running it
-# on the push that merges a tree already audited on the pull request answers the same question
-# twice. Measured over the two weeks to 2026-09-01: 29 pull-request runs and 21 push runs, the
-# overwhelming majority against trees with no workflow change at all.
+# Path-filtered on both triggers: a pull request that touches none of the files this audit reads
+# cannot change its verdict, and re-running it on the push that merges a tree already audited on
+# the pull request answers the same question twice. Measured over the two weeks to 2026-09-01:
+# 29 pull-request runs and 21 push runs, the overwhelming majority against trees with no auditable
+# file changed at all.
+#
+# THE LIST IS EVERY INPUT ZIZMOR READS, NOT JUST THE WORKFLOWS — and getting that wrong is
+# unrecoverable here, because unlike scorecard.yml and pip-audit.yml this workflow has NO
+# schedule: a run the filter skips is not deferred a week, it never happens. zizmor also audits
+# `.github/dependabot.yml` (the `dependabot-cooldown` rule) and `.pre-commit-config.yaml`. The
+# dependabot file is the one that bites: this repository's cooldown settings are load-bearing —
+# `CLAUDE.md` names them and names that rule — so a pull request dropping a `cooldown` block
+# would otherwise merge entirely unaudited.
 #
 # The filter does not let a new zizmor release go unapplied. The action is SHA-pinned, so the
 # analyzer only ever changes by an edit to a file under `.github/workflows/` — which is exactly
-# what re-triggers this. There is no schedule to lose.
+# what re-triggers this.
 #
-# `.github/actions/**` is listed although no composite action exists here yet; zizmor audits
-# action definitions too, and a filter that silently stops covering a directory the moment one is
-# added is the failure mode worth pre-empting.
+# `.github/actions/**` and `.pre-commit-config.yaml` are listed although neither exists here yet:
+# a filter that silently stops covering an input the moment one is added is the failure mode worth
+# pre-empting, and it is the same failure mode `.github/dependabot.yml` had been an instance of.
 on:
   pull_request:
     paths:
       - ".github/workflows/**"
       - ".github/actions/**"
+      - ".github/dependabot.yml"
+      - ".pre-commit-config.yaml"
   push:
     branches: [main]
     paths:
       - ".github/workflows/**"
       - ".github/actions/**"
+      - ".github/dependabot.yml"
+      - ".pre-commit-config.yaml"
 
 permissions:
   contents: read

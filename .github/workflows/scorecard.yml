@@ -15,15 +15,32 @@ on:
   # configuration, not of the library. Re-scoring on a merge that changed only `src/` or `docs/`
   # spends a run to recompute the same score: 21 such runs over the two weeks to 2026-09-01.
   #
+  # This filter DEFERS coverage rather than being lossless, and the paths below are chosen to keep
+  # what it defers small. Scorecard scores several things outside `.github/`: License reads the
+  # root `LICENSE`, Pinned-Dependencies also reads download-and-run shell scripts under
+  # `scripts/`, and Vulnerabilities follows the resolved dependency set from `poetry.lock`. Those
+  # are listed. What is still deferred — Binary-Artifacts, which scores any file anywhere — falls
+  # to the weekly run, so the honest bound is "at most 7 days late", not "no coverage lost". That
+  # is acceptable only because this workflow is non-gating by design; it would not be for
+  # `dependency-review` or `pip-audit`.
+  #
   # The weekly schedule above is what keeps the published score and the badge current, and it is
   # also what satisfies the OpenSSF API's requirement that `publish_results` come from a run on
-  # the default branch. `branch_protection_rule` below still catches a rule change the moment it
-  # happens. So what this filter drops is duplication, not coverage.
+  # the default branch.
+  #
+  # Do NOT count `branch_protection_rule` below as the live safety net for a rules change: that
+  # event fires for CLASSIC branch protection, and this repository has none —
+  # `GET /branches/main/protection` returns 404. Protection here is a RULESET (17871200), whose
+  # edits emit `repository_ruleset`, an event this workflow does not subscribe to. So a ruleset
+  # change is picked up by the weekly run like anything else.
   push:
     branches: [main]
     paths:
       - ".github/**"
       - "SECURITY.md"
+      - "LICENSE"
+      - "poetry.lock"
+      - "scripts/**"
   # Scorecard's documented trigger for re-scoring when branch protection changes. Without it the
   # Branch-Protection score only refreshes on the weekly run.
   branch_protection_rule:
