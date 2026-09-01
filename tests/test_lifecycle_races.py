@@ -18,17 +18,22 @@ import os
 import pathlib
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 import log_foundry
 from log_foundry import _fork, _lifecycle
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 api = pytest.importorskip("log_foundry.api")
 retry = pytest.importorskip("log_foundry.sinks._retry")
 stdout_sink = pytest.importorskip("log_foundry.sinks.stdout")
 
 _LIFECYCLE_SRC = pathlib.Path(_lifecycle.__file__)
+_DRAIN_NAME = "log-foundry-worker"
 
 
 class CountingSink:
@@ -108,9 +113,34 @@ class _PreemptInGetWorker:
         self.go.set()
 
 
+_PRE_EXISTING_DRAINS: set[int] = set()
+
+
+@pytest.fixture(autouse=True)
+def _ignore_drain_threads_this_file_did_not_start() -> Iterator[None]:
+    """Snapshots the drain threads already running, so this file's census counts only its own.
+
+    A process-global `threading.enumerate()` census is a census of the whole session, not of the
+    worker the test built — and another file leaking a worker makes these assertions fail with a
+    message pointing at the library. Measured: `test_span_sweep.py` discarded thirty workers
+    without shutting them down, so the three FR-001 tests passed only because file names sort
+    `l` before `s`. That leak is fixed at source too, but a test that depends on another file's
+    hygiene is passing for the wrong reason either way.
+    """
+    _PRE_EXISTING_DRAINS.clear()
+    _PRE_EXISTING_DRAINS.update(
+        id(thread) for thread in threading.enumerate() if thread.name == _DRAIN_NAME
+    )
+    yield
+
+
 def _drain_threads() -> list[str]:
-    """Returns the names of every live worker drain thread, so a leak is legible."""
-    return [t.name for t in threading.enumerate() if t.name == "log-foundry-worker"]
+    """Returns the live drain threads this test started, so a leak of its own is legible."""
+    return [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name == _DRAIN_NAME and id(thread) not in _PRE_EXISTING_DRAINS
+    ]
 
 
 # --------------------------------------------------------------------------- FR-001
@@ -784,6 +814,56 @@ def test_a_swap_that_hands_a_sink_to_the_worker_latches_it(
     log_foundry.shutdown(timeout=5.0)
     _lifecycle.join_closers(5.0)
     assert a.closes == 1, f"the swapped-out sink was closed {a.closes} times: {a}"
+
+
+def test_a_swap_releases_a_third_sink_the_record_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-002's second site, and the branch a mutation sweep found had no behavioural cover.
+
+    `_swap_sink`'s worker branch clears the orphan record too, so the FR-002 rule applies there
+    as well: where the record names a sink that is neither the worker's nor the one being
+    installed, nothing else would ever close it. Reaching that state needs a preempted orphan
+    emit to re-arm across an earlier swap, which is why the branch had survived every test —
+    deleting it outright left `tests/test_lifecycle_races.py` fully green.
+
+    What it does **not** pin is the closer join's budget arithmetic — that the join is against
+    the swap's remaining deadline rather than a fresh `timeout`. Reverting that survives this
+    test, and separating the two costs a drain slow enough to consume most of the budget and a
+    close slower still, which makes the assertion a load-sensitive 0.6-vs-1.0 second margin. A
+    flaky bound is worse than an unpinned one-line expression, so it is flagged here rather than
+    tested. The bound below is the honest weaker claim: the swap returns bounded at all.
+    """
+    third, first, second = CountingSink("third"), CountingSink("first"), CountingSink("second")
+    log_foundry.configure(service="t", sink=first)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()  # a worker on `first`
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and worker.sink is first
+
+    # Re-arm the record on a sink the worker does not hold, the way a preempted emit would.
+    with _lifecycle._state._lock:
+        _lifecycle._state._orphan_sink = third
+    _lifecycle.stamp(third)
+
+    started = time.monotonic()
+    log_foundry.configure(sink=second)
+    swap_seconds = time.monotonic() - started
+    _lifecycle.join_closers(5.0)
+
+    assert worker.sink is second, "the worker adopted the newly configured sink"
+    assert third.closes == 1, (
+        f"the sink the record named is neither the worker's nor the new one, so this swap owns "
+        f"its close and nothing else would perform it: {third}"
+    )
+    assert _lifecycle._state._orphan_closed_sink is not None, "and it is latched against a re-arm"
+    assert swap_seconds < _lifecycle.DEFAULT_SWAP_TIMEOUT, (
+        "a swap that starts a detached close still returns inside its own budget"
+    )
 
 
 # --------------------------------------------------------------------------- FR-005

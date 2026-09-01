@@ -933,6 +933,14 @@ constraint — never by being deleted quietly.
   tolerable. Tracking every sink ever closed would pin them all against garbage collection to fix
   what the sibling path does not fix either.
 
+  **Two concurrent `configure(sink=…)` calls can still double-close a sink**, and SPEC-044 did
+  not change that: a randomised-preemption harness measured 18 of 60 trials on that branch
+  against 21 of 60 on the tree before it, with a single `configure` thread at 0 of 40 and 1 of
+  40. The rate is the same either side, so it is neither introduced nor closed there — it is the
+  documented "not thread-safe" of `configure()` reaching the close path, and it wants its own
+  spec rather than a note that reads like a fix. What SPEC-044 *did* close is the single-thread
+  shape below.
+
   Two further shapes need a concurrent emit during `configure()`, which that call's documented
   "not thread-safe" already covers, and are recorded because the single slot is what permits
   them. An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the

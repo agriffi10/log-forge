@@ -120,8 +120,10 @@ class _Lifecycle:
     both, and a ``FileSink`` in A's place would have its file re-opened on every fork forever.
 
     A **class** attribute deliberately. ``_fork._namespace_items`` reads ``vars(holder)``, the
-    instance ``__dict__`` only, so this is found by the lookup and is not itself walked as state
-    to repair. The module-level tuple is unchanged and still needed; neither is the whole rule.
+    instance ``__dict__`` only, so a plain ``getattr`` finds this while the walk over
+    :data:`_state` does not see it. The walk does reach it once, through the class itself, and
+    harmlessly: it is a tuple of strings, which holds no primitive to replace and no sink to
+    hook. The module-level tuple is unchanged and still needed; neither is the whole rule.
 
     Marking is not narrowed: :func:`_inheritance_roots` reads the slot directly, so a child still
     marks an inherited superseded sink foreign and still refuses to close it (SPEC-042 FR-001).
