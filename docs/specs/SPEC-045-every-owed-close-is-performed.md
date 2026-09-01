@@ -90,6 +90,9 @@ survive a mutation that truncates them to the most recently armed sink.
       is the regression this spec exists to prevent.
 - [ ] A swap closes **every** superseded sink, not only the last armed.
 - [ ] Building the worker releases **every** owed sink it did not adopt, not only the last armed.
+- [ ] A swap with a **live worker** closes every superseded sink too — the swap has two branches
+      and each needs its own test, since truncating the worker branch's loop passed the whole
+      suite while the no-worker branch's test was in place.
 
 ### FR-002: A sink written to after its close is owed another
 
@@ -144,8 +147,10 @@ one sink and takes the most recently armed, which is the one an emit reached las
       only if it did.
 - [ ] A forked child refuses to close **every** sink the parent had owed, not only the last
       armed — an unmarked one is claimable and its transport destroyable (SPEC-042 FR-001).
-- [ ] `health().inherited_sink` still answers from the most recently armed sink where there is no
-      worker.
+- [ ] `health().inherited_sink` still answers from the record's most recently armed entry where
+      there is no worker, asserted so that both taking the *first* entry and dropping the reader
+      entirely fail — with every sink owned by this process the answer is constant and neither
+      does.
 - [ ] The record needs no `_FORK_SKIP` entry, asserted while it is populated: it drops a sink the
       moment its close is decided, so unlike `_owned` and `_orphan_closed_sink` it never holds a
       superseded one.
@@ -258,6 +263,11 @@ docs/
   the trade rather than choosing a side: nothing is stranded and nothing is closed that had
   nothing to flush. Verified against a lifecycle fuzz that finds 0 undelivered events over 4×80
   seeded runs plus 80 runs of the two seeds that had caught the earlier designs, matching `main`.
-- Two of the three consuming transitions were found by **mutation**, not by review: truncating
-  `_swap_sink`'s and `_get_worker`'s handling to the most recently armed sink passed the entire
-  suite. One test per reader, not one test for the record.
+- Three of the four consuming loops were found by **mutation**, not by review: truncating
+  `_swap_sink`'s two branches and `_get_worker`'s handling passed the entire suite each time,
+  and the swap's *worker* branch still did so after its no-worker sibling had a test. One test
+  per loop, not one per function and not one for the record.
+- Two limits are recorded rather than repaired, both consequences of the record holding several
+  sinks: the exit close runs them inline and in sequence, so one slow close delays the rest; and
+  `health().inherited_sink` reads the record's last entry, which is not necessarily the installed
+  sink. Both are in `architecture.md` §13.

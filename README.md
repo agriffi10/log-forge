@@ -282,8 +282,9 @@ either. The grace is what recovers the slow-close case that the daemon flag alon
 
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
 thread mid-swap may land on either sink. The **closes** are the exception: every sink you pass
-here is closed, however many swaps are outstanding and whatever races the call, so a sink whose
-`close()` is its delivery never loses its buffer to a reconfiguration (SPEC-045).
+here is closed, however many swaps are outstanding and whatever races the call (SPEC-045). That
+is a guarantee about closes, not about buffers — an event still in flight when a `configure()`
+lands can arrive at a sink whose close has already run, and nothing owes that sink another.
 
 ### `@trace`
 

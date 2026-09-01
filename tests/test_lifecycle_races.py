@@ -667,6 +667,10 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
 
     `take_orphan_owed` is the one sanctioned emptying, and it reads and clears under the lock in
     one step so two callers cannot both take the same sink.
+
+    The collector gathers `ast.Assign` only, so `__init__`'s annotated declaration is not a
+    rebind it can see — an earlier draft carried a disjunct exempting that line, which read as
+    covering a case the walk never reaches.
     """
     tree = ast.parse(_LIFECYCLE_SRC.read_text())
     rebinds = [
@@ -676,7 +680,7 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
         for target in node.targets
         if isinstance(target, ast.Attribute) and target.attr == "_orphan_owed"
     ]
-    assert rebinds == ["self._orphan_owed: dict[int, Sink] = {}"] or not rebinds, (
+    assert not rebinds, (
         "the owed-close record is rebound rather than mutated, which drops whatever another "
         f"thread armed in between: {rebinds}"
     )

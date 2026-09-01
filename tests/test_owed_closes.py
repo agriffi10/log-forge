@@ -13,6 +13,7 @@ before anything changed.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -291,6 +292,43 @@ def test_building_the_worker_releases_every_sink_it_did_not_adopt() -> None:
     )
 
 
+def test_a_swap_with_a_live_worker_closes_every_superseded_sink() -> None:
+    """FR-001 AC-7. The fourth loop the change created, and the one no test could see fail.
+
+    `_swap_sink` has two branches and only the no-worker one was exercised with more than one
+    owed sink. Truncating the **worker** branch's loop to the first stale sink passed the entire
+    suite while stranding a buffer — the same mutation the no-worker branch already dies on.
+    A consumer of the record needs its own test per branch, not per function.
+    """
+    adopted = BufferingSink("adopted")
+    stale_one, stale_two = BufferingSink("stale-1"), BufferingSink("stale-2")
+    replacement = BufferingSink("replacement")
+    log_foundry.configure(service="t", sink=adopted)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and worker.sink is adopted, "the worker holds the adopted sink"
+
+    for stale in (stale_one, stale_two):
+        _lifecycle._note_orphan_emit(stale)
+        stale.emit([{"message": f"to {stale.name}"}])
+    assert len(_lifecycle._state._orphan_owed) == 2, "two stale sinks are owed, or this is vacuous"
+
+    log_foundry.configure(sink=replacement)
+
+    assert _eventually(lambda: (stale_one.closes, stale_two.closes) == (1, 1)), (
+        "the worker branch closes every sink the record named that it does not hold — "
+        f"got {stale_one!r} {stale_two!r}"
+    )
+    assert (stale_one.buffered, stale_two.buffered) == (0, 0), (
+        f"so neither is left holding its buffer — got {stale_one!r} {stale_two!r}"
+    )
+
+
 def test_the_record_holds_more_than_one_sink_at_a_time() -> None:
     """FR-001 AC-4. The structural half: a slot cannot hold two, and this is what a set buys.
 
@@ -501,18 +539,32 @@ def test_the_record_needs_no_fork_opt_out() -> None:
     )
 
 
-def test_health_reports_an_inherited_sink_from_the_record() -> None:
-    """FR-004 AC-4. The last reader of the slot, kept truthful.
+def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
+    """FR-004 AC-4. Both halves are discriminating, and the first draft was neither.
 
-    `health().inherited_sink` asks whether what this process is delivering to carries another
-    process's ownership record. With no worker it consults the owed record, which now holds
-    several, so it takes the most recently armed — the one an emit reached last.
+    `health().inherited_sink` asks whether the sink this process is delivering to is one it may
+    not release. With no worker it consults the owed record. A first draft armed two sinks this
+    process owned and asserted `False`, which is true whichever end the reader picks and true
+    with the reader deleted outright — measured, both mutants passed the whole suite.
+
+    So: the second sink is stamped as another process's, the way a `fork` marks everything
+    inherited. Reading `True` then requires the reader to consult the record at all — the
+    configured sink is the *first* one and is this process's — and to take the **last** entry.
     """
     first, second = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=first)
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(second)
+    with _lifecycle._owned_lock:
+        _lifecycle._owned[id(second)] = (_lifecycle._FOREIGN, second)
 
+    assert log_foundry.health().inherited_sink is True, (
+        "the reader consults the record's last entry: the configured sink is A, which this "
+        "process owns, so answering from the config or from the record's first entry reads False"
+    )
+
+    with _lifecycle._owned_lock:
+        _lifecycle._owned[id(second)] = (os.getpid(), second)
     assert log_foundry.health().inherited_sink is False, (
-        "both sinks were acquired here, so nothing reads as inherited"
+        "and the answer follows the record rather than being constant"
     )

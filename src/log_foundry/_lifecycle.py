@@ -1784,12 +1784,15 @@ def _delivering_to_an_inherited_sink() -> bool:
     else the sink an orphan emit reached most recently, else the configured one. SPEC-033's
     measured disagreement is worker-versus-config, which the **first** term already covers.
 
-    The middle term takes the **last** entry of ``_state._orphan_owed`` because that record now
-    holds every sink owed a close rather than one (SPEC-045 FR-004), while this question is about
-    a single sink — the one being delivered to. Arming order is emit order, so the last armed is
-    the one an emit reached most recently; the earlier entries are sinks this process has stopped
-    delivering to and still owes a close for, which is a different question from the one asked
-    here.
+    The middle term takes the **last** entry of ``_state._orphan_owed``, and that is continuity
+    with the single slot it replaced rather than a claim that the last entry is the sink being
+    delivered to. It is not: ``_swap_sink`` inserts the new sink into a freshly emptied record and
+    a preempted emit then appends the *superseded* one, so in this spec's own primary scenario the
+    order is ``[live, superseded]``. Neither end of the record is authoritative for "installed" —
+    arming order is emit order, which is a different question — and the config is. The answer is
+    therefore unchanged from before SPEC-045 and can still name a superseded sink; that limit is
+    recorded in ``architecture.md`` §13 rather than quietly fixed here, because correcting it
+    changes a documented ``Health`` field on a path this spec does not otherwise touch.
 
     With no sink resolved at all there is nothing installed and nothing inherited, so the answer
     is ``False`` rather than a guess.

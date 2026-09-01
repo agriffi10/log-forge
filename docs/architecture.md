@@ -971,6 +971,17 @@ constraint — never by being deleted quietly.
   latches what it hands to `Worker.swap_sink`, so the orphan branch's refusal to re-arm a closed
   sink reaches it too — which is what the orphan branch's equivalent already had.
 
+  **Two consequences of the record holding several sinks, recorded rather than repaired.** The
+  exit close now runs them **inline and in sequence**, so one slow close delays every other owed
+  close and one that never returns takes the rest with it — measured, a 5 s close made
+  `shutdown(timeout=1.0)` return after 5.01 s with the second sink's close finishing at 5.01 s
+  too. That is the same unbounded-`Sink.close` limit recorded below for the live sink, now
+  spanning the set. And `health().inherited_sink` reads the record's **last** entry, which is not
+  necessarily the sink being delivered to: `_swap_sink` inserts the new sink into a freshly
+  emptied record and a preempted emit then appends the superseded one, so the order can be
+  `[live, superseded]`. The answer is unchanged from before SPEC-045 and can name a superseded
+  sink; the config is the authority for "installed", and correcting the field is its own change.
+
   **What stays open, and is recorded rather than repaired:** a sink released while it is still
   live inside the graph that replaced it — `configure(A)` then `configure(MultiSink(A, B))`, or
   the reverse. The swap closes A as the outgoing sink while A is a child of the new one. It
