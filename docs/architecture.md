@@ -348,7 +348,8 @@ tolerate a concurrent `emit` (§9, SPEC-028).
 
 `configure()` remains a startup call and is not thread-safe. A span finishing on another thread
 during a swap may land on either sink; what is guaranteed is that everything submitted *before* the
-call reached the old one. The `_worker` read that selects between the two paths *is* taken under
+call reached the old one — and, since SPEC-045, that the sink is closed exactly once per time it
+was handed over, which is a property of the *close* and buys the routing nothing. The `_worker` read that selects between the two paths *is* taken under
 the process lock, because it decides whether this call may close a sink at all — unlocked, a first
 `@trace` mid-construction on another thread would have its sink closed underneath it.
 
@@ -923,7 +924,7 @@ constraint — never by being deleted quietly.
   `incomplete_swaps` is untouched throughout — it records a drain that could not be confirmed,
   and there is no drain here.
 
-- **A sink handed back after being swapped out is closed twice, on both paths.** The orphan
+- ~~**A sink handed back after being swapped out is closed twice, on both paths.** The orphan
   path's closed-sink latch (SPEC-033) is a **single slot**, so it is the latch *moving* to a
   second sink that re-admits the first: `configure(A)` → `info()` → `configure(B)` →
   `configure(A)` closes A again. The **worker path behaves identically** — measured
@@ -931,21 +932,47 @@ constraint — never by being deleted quietly.
   "must not be handed back to a later call", so this is a documented user error rather than a
   divergence. `sinks/base.py` requires `close()` to be idempotent, which is what makes it
   tolerable. Tracking every sink ever closed would pin them all against garbage collection to fix
-  what the sibling path does not fix either.
+  what the sibling path does not fix either.~~ — **three claims corrected by SPEC-045**, and the
+  entry is struck rather than deleted because each was believed and acted on.
 
-  **Two concurrent `configure(sink=…)` calls can still double-close a sink**, and SPEC-044 did
+  **The hand-back is not a double close.** Its two closes are one per acquisition, and both are
+  required: the first releases A as the sink being swapped out, the second closes A as the
+  **live** sink, after a further event has reached it. Measured on both paths, with A's event
+  count rising between them. A fix that made it one close would have lost that flush, and the
+  criterion demanding one was caught in this spec's own review before any code was written.
+  `configure()` no longer forbids the hand-back; it is supported, and the docstring says so.
+
+  **`sinks/base.py` asks for an idempotent release, it does not make one a guarantee to rely on**
+  — which is what the library's own docstrings have said since SPEC-032, so idempotency never
+  made anything "tolerable". The library performs one `close()` per acquisition and does not
+  depend on what a third-party sink does with a second.
+
+  **The pinning objection was already paid.** `_owned` holds a strong reference to every sink the
+  library was ever handed and, by its own docstring, "grows by one entry per sink ever handed to
+  the library and never shrinks". `_lifecycle._released` keys off that record and holds `int` ids
+  only, so it pins nothing the process was not already pinning — which is what made the fix
+  affordable and is why the objection had been costing more than it saved.
+
+  ~~**Two concurrent `configure(sink=…)` calls can still double-close a sink**, and SPEC-044 did
   not change that: a randomised-preemption harness measured 18 of 60 trials on that branch
   against 21 of 60 on the tree before it, with a single `configure` thread at 0 of 40 and 1 of
-  40. The rate is the same either side, so it is neither introduced nor closed there — it is the
-  documented "not thread-safe" of `configure()` reaching the close path, and it wants its own
-  spec rather than a note that reads like a fix. What SPEC-044 *did* close is the single-thread
-  shape below.
+  40.~~ — **fixed by SPEC-045 FR-001/FR-003.** It also was not really about `configure()`'s
+  documented "not thread-safe": the same double close reproduces **deterministically** with every
+  `configure()` call made sequentially on one thread, the only concurrent party an ordinary
+  `info()` — measured `A.closes == 2` with `C.closes == 0`, so the live sink was closed by
+  nobody. A configure-serializing lock was built and measured before being rejected on that
+  evidence. `release()` now performs one close per acquisition, and being handed a sink again
+  through `stamp()` restores it.
 
-  Two further shapes need a concurrent emit during `configure()`, which that call's documented
-  "not thread-safe" already covers, and are recorded because the single slot is what permits
-  them. An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the
+  ~~An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the
   latch on B, re-arms A, and orphans the live sink — the single slot's own bound, which is why
-  FR-004's "every close" means the most recent one. ~~And an emit that resolved the old sink and
+  FR-004's "every close" means the most recent one.~~ — **fixed by SPEC-045 FR-003.** The two
+  arming sites that could re-admit a stale sink now consult the released record instead of only
+  the single slot, and a derived roster over every site assigning `_state._orphan_sink` makes a
+  third one a decision somebody writes down. `_orphan_closed_sink` is unchanged and is **not**
+  merged with the released record: SPEC-044 FR-004 sets it for a sink the swap deliberately
+  leaves *open*, which is a different claim from one that was closed.
+  ~~And an emit that resolved the old sink and
   arrives after the *worker* branch cleared the record re-arms it, so `Worker.swap_sink` closes
   that sink and the ownership guard — finding `_worker.sink` is now the new one — closes it
   again at exit.~~ — **fixed by SPEC-044 FR-004.** It was measured (`A.closed == 2`, with a
@@ -953,6 +980,15 @@ constraint — never by being deleted quietly.
   before SPEC-033, because the worker branch had never recorded a closed sink. That branch now
   latches what it hands to `Worker.swap_sink`, so the orphan branch's refusal to re-arm a closed
   sink reaches it too — which is what the orphan branch's equivalent already had.
+
+  **What SPEC-045 does not fix, and records instead:** a sink simultaneously reachable from
+  another graph the library is releasing — `configure(MultiSink(A, B))` → `configure(A)`, or the
+  reverse — is released by the wrapper's close while it is live. Measured today as `A.closes == 2`
+  with A already closed mid-life, so the case is broken before that change and is not repaired by
+  it; the refused second close discards nothing, because a released sink refuses work afterwards
+  (SPEC-032). And the **misrouting** the same reproductions show — `configure(sink=B)` returning
+  while every event goes to C — is untouched. `configure()` is still not thread-safe; only its
+  close is now unconditional.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

@@ -479,6 +479,33 @@ The orphan logging path is the opposite constraint and takes **no** lock at all:
 ``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
 """
 
+_released: set[int] = set()
+"""Ids of the sinks this process has already released, guarded by :data:`_owned_lock`.
+
+The library performs one ``close()`` per time it was **handed** a sink, not one per object
+(SPEC-045 FR-001). Without this record it performs one per *arming*, and an arming can be
+repeated: an ordinary ``info()`` that resolved a sink and was preempted re-arms it after the
+close, so a later ``shutdown()`` closes it again — measured ``A.closes == 2`` with every
+``configure()`` call sequential on one thread, which is what makes it a defect rather than the
+documented "not thread-safe" of :func:`~log_foundry.config.configure`.
+
+Only ids :data:`_owned` holds a strong reference for are ever added, which is what makes an
+``int`` sufficient: the reference stops the object dying, so the id cannot be reused while the
+mark stands. That is the same invariant :data:`_owned` states for its own keys, and it is why
+tracking this costs no pinning the process was not already paying.
+
+An **unrecorded** sink is never marked. It is the caller's own object, released on the caller's
+say-so every time (see :func:`releasable`), and recording it would start pinning graphs the
+library was never handed.
+
+It holds no sink, so it needs no :data:`_FORK_SKIP` entry and gives ``_fork``'s repair walk
+nothing to write back — the shape :data:`_closing_now` already has. It also needs no equivalent
+of :func:`_clear_closing_after_fork`: that registry brackets a call no thread in the child will
+finish, while this one records a completed fact, and every id a child inherits belongs to a sink
+:func:`_mark_inherited` has already marked ``_FOREIGN`` — refused on ownership before this record
+is ever consulted.
+"""
+
 _PLAIN_TYPES = frozenset(
     {dict, list, tuple, set, frozenset, str, bytes, int, float, bool, type(None)}
 )
@@ -786,6 +813,11 @@ def reclaim(sink: object) -> None:
     a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
     forever.
 
+    It clears the sink's :data:`_released` mark with the re-stamp (SPEC-045 FR-002). Returning
+    from ``reacquire_after_fork()`` is a claim of ownership, and a transport this process now
+    holds is one it owes a close for; leaving the parent's mark in place would refuse that close
+    forever.
+
     **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
     inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement
     the hook — while the wrapper keeps the parent's mark and stays refused, which leaves the
@@ -805,6 +837,7 @@ def reclaim(sink: object) -> None:
     pid = os.getpid()
     with _owned_lock:
         _owned[id(sink)] = (pid, sink)
+        _released.discard(id(sink))
 
 
 def stamp(sink: object) -> None:
@@ -821,6 +854,15 @@ def stamp(sink: object) -> None:
 
     The walk runs **outside** the lock and only the record write takes it, so an arbitrary
     object graph is never traversed while holding a process-wide lock.
+
+    **Being handed a sink again restores its release** (SPEC-045 FR-002). The library performs one
+    ``close()`` per acquisition, not one per object, so this clears :data:`_released` for every
+    reachable sink whose record ends up naming *this* process — which is what keeps
+    ``configure(A)`` -> ``configure(B)`` -> ``configure(A)`` closing A twice, both of them right:
+    once as the sink being swapped out and once as the live sink, after a further event reached
+    it. The clear is guarded by the record's own pid rather than by reachability, so write-once
+    still holds and a forked child cannot configure its way back to closing an inherited sink.
+    It is a second record write inside the acquire the loop already takes, not a second acquire.
 
     Args:
       sink: The sink being installed, whose reachable graph is acquired with it.
@@ -841,6 +883,95 @@ def stamp(sink: object) -> None:
     with _owned_lock:
         for found in reachable:
             _owned.setdefault(id(found), (pid, found))
+            record = _owned[id(found)]
+            if record[0] == pid and record[1] is found:
+                _released.discard(id(found))
+
+
+def _releasable_locked(sink: object, owner: object, pid: int) -> bool:
+    """Answers :func:`releasable`'s question with :data:`_owned_lock` already held.
+
+    It exists so that :func:`_claim_release` can decide ownership, test the released mark and set
+    it under **one** acquire. ``_owned_lock`` is a plain ``Lock`` and deliberately not an
+    ``RLock`` (SPEC-028), so a claim that called :func:`releasable` inside its own critical
+    section would deadlock rather than be hidden.
+
+    Two reads sit inside the lock here that :func:`releasable` used to make outside it — the
+    comparison against ``pid`` and the read of :data:`_marking_failed`. Both answers are
+    unchanged: ``record`` and ``owner_record`` were already local snapshots, and
+    ``_marking_failed`` is a plain flag written by :func:`_mark_inherited` under no lock at all,
+    on the single thread of a forked child.
+
+    Args:
+      sink: The sink a caller is about to close.
+      owner: The wrapper forwarding the close, when one is.
+      pid: This process's id, read by the caller before the acquire so no syscall runs under the
+        process's last lock.
+
+    Returns:
+      Whether this process may close it.
+
+    Raises:
+      None.
+    """
+    record = _owned.get(id(sink))
+    owner_record = None if owner is None else _owned.get(id(owner))
+    if record is not None:
+        return record[1] is sink and record[0] == pid
+    return owner_record is None and not _marking_failed
+
+
+def _claim_release(sink: object, *, owner: object = None) -> bool:
+    """Whether this process may close a sink **now**, marking it released if so (FR-001).
+
+    One acquire covers the ownership question, the released test and the mark, so two threads
+    calling :func:`release` on one sink perform one close between them rather than racing between
+    a check and a set.
+
+    A sink with no :data:`_owned` record is granted and **not** marked. That is the caller's own
+    object — the ``FilteringSink(inner).close()`` case :func:`releasable` describes — and marking
+    it would both police closes the library was never asked to own and start pinning graphs it
+    was never handed.
+
+    Args:
+      sink: The sink to be closed.
+      owner: The wrapper forwarding this close, when one is.
+
+    Returns:
+      Whether the caller may proceed to ``close()``.
+
+    Raises:
+      None.
+    """
+    pid = os.getpid()
+    with _owned_lock:
+        if not _releasable_locked(sink, owner, pid):
+            return False
+        if id(sink) not in _owned:
+            return True
+        if id(sink) in _released:
+            return False
+        _released.add(id(sink))
+        return True
+
+
+def _was_released(sink: object) -> bool:
+    """Whether this process has already performed this sink's close (FR-003).
+
+    Read by the two sites that arm the orphan path's owed close, so a sink that has been released
+    cannot take the record from the sink events are actually going to.
+
+    Args:
+      sink: The sink about to be armed.
+
+    Returns:
+      Whether its close has already been performed by this process.
+
+    Raises:
+      None.
+    """
+    with _owned_lock:
+        return id(sink) in _released
 
 
 def releasable(sink: object, *, owner: object = None) -> bool:
@@ -892,11 +1023,7 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     """
     pid = os.getpid()
     with _owned_lock:
-        record = _owned.get(id(sink))
-        owner_record = None if owner is None else _owned.get(id(owner))
-    if record is not None:
-        return record[1] is sink and record[0] == pid
-    return owner_record is None and not _marking_failed
+        return _releasable_locked(sink, owner, pid)
 
 
 def release(sink: Sink, *, detached: bool = False, owner: object = None) -> threading.Thread | None:
@@ -927,6 +1054,22 @@ def release(sink: Sink, *, detached: bool = False, owner: object = None) -> thre
     Only the *release* is refused. Every **drain** is untouched (FR-003), so a child still gets
     its own events out through the sink it inherited.
 
+    **A release this process already performed is skipped too** (SPEC-045 FR-001), and for the
+    same reason in the other direction: the library performs one ``close()`` per time it was
+    handed a sink, and an arming can be repeated where an acquisition cannot. The skip is the
+    same shape as the one above — nothing counted, nothing announced, control flow unchanged —
+    and being handed the sink again through :func:`stamp` restores it, so a sink passed to
+    ``configure()`` twice is still closed twice.
+
+    The claim is taken **where the close happens**, not where it is requested. A detached release
+    spawns its closer without claiming and the thread body claims through this same function, so
+    a detached close racing an inline one performs exactly one close — whichever claims first —
+    and never zero. All four detached call sites pass no ``owner``, which is what makes the
+    thread body's question identical to the requester's. The cost is a thread that is started and
+    then skips; the requesters are :func:`_swap_sink`, :func:`_get_worker` and
+    ``Worker._close_swapped_out``, none on a hot path, and consulting the record at dispatch as
+    well would put the rule in two places.
+
     Args:
       sink: The sink to close.
       detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
@@ -945,10 +1088,10 @@ def release(sink: Sink, *, detached: bool = False, owner: object = None) -> thre
         neither does a detached one: its thread body absorbs, since there is no caller left to
         hand it to.
     """
-    if not releasable(sink, owner=owner):
-        return None
     if detached:
-        return _start_closer(sink)
+        return _start_closer(sink) if releasable(sink, owner=owner) else None
+    if not _claim_release(sink, owner=owner):
+        return None
     with _closing_now_lock:
         _closing_now.add(id(sink))
     try:
@@ -1246,6 +1389,8 @@ def _note_orphan_emit(sink: Sink) -> None:
     with _state._lock:
         _offer_orphan_signal(sink)
         if sink is _state._orphan_sink or sink is _state._orphan_closed_sink:
+            return
+        if _was_released(sink):
             return
         _register_exit_handler()
         _state._orphan_sink = sink
@@ -1637,6 +1782,8 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
     with _state._lock:
         _offer_orphan_signal(new_sink)
         if new_sink is _state._orphan_sink or new_sink is _state._orphan_closed_sink:
+            return
+        if _was_released(new_sink):
             return
         _register_exit_handler()
         _state._orphan_sink = new_sink

@@ -580,6 +580,36 @@ def test_a_worker_that_did_adopt_the_recorded_sink_leaves_one_close() -> None:
     assert sink.closes == 1, f"a mixed process closes once, in either order: {sink}"
 
 
+def _orphan_record_sites() -> dict[tuple[str, str], ast.FunctionDef]:
+    """Every site that assigns `_state._orphan_sink`, keyed by (function, assigned expression).
+
+    One walker, used by both properties asserted over this population — the disposition table
+    below and SPEC-045's released-record consultation. Two walkers over one population drift, as
+    SPEC-038 FR-001 AC-1a/AC-1b had to write a cross-check to catch.
+
+    Args:
+      None.
+
+    Returns:
+      A mapping from `(enclosing function, assigned expression)` to that function's AST node.
+
+    Raises:
+      None.
+    """
+    tree = ast.parse(_LIFECYCLE_SRC.read_text())
+    found: dict[tuple[str, str], ast.FunctionDef] = {}
+    for scope in ast.walk(tree):
+        if not isinstance(scope, ast.FunctionDef):
+            continue
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == "_orphan_sink":
+                    found[(scope.name, ast.unparse(node.value))] = scope
+    return found
+
+
 def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> None:
     """FR-002 AC-5. Derived, because a hand-written list of sites rots (SPEC-028, SPEC-035).
 
@@ -599,22 +629,44 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
         ("_note_orphan_emit", "sink"): "armed — the emit that landed owns the close",
         ("_adopt_declined_swap", "new_sink"): "armed — the worker refused it mid-swap",
     }
-    tree = ast.parse(_LIFECYCLE_SRC.read_text())
-    found: set[tuple[str, str]] = set()
-    for scope in ast.walk(tree):
-        if not isinstance(scope, ast.FunctionDef):
-            continue
-        for node in ast.walk(scope):
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Attribute) and target.attr == "_orphan_sink":
-                    found.add((scope.name, ast.unparse(node.value)))
+    found = set(_orphan_record_sites())
     assert found == set(dispositions), (
         "a site writing _state._orphan_sink is a close-ownership decision — add it to the table "
         f"with its disposition. missing: {sorted(set(dispositions) - found)}; "
         f"undeclared: {sorted(found - set(dispositions))}"
     )
+
+
+def test_every_site_that_arms_the_orphan_record_declares_its_released_disposition() -> None:
+    """SPEC-045 FR-003, over the same derived population as the table above.
+
+    A site that *arms* `_orphan_sink` decides which sink is owed a close, and arming one this
+    process has already released takes that from the sink events are actually going to —
+    measured `A.closes == 2` with `C.closes == 0`. Two of the three arming sites must therefore
+    consult `_was_released`; the third must not, and its exemption is written down here rather
+    than inferred from its absence.
+    """
+    consultation = {
+        ("_note_orphan_emit", "sink"): True,
+        ("_adopt_declined_swap", "new_sink"): True,
+        ("_swap_sink", "new_sink"): False,
+    }
+    arming = {site: scope for site, scope in _orphan_record_sites().items() if site[1] != "None"}
+    assert set(arming) == set(consultation), (
+        "a site arming _state._orphan_sink decides whether a released sink may take the owed "
+        f"close — declare it. missing: {sorted(set(consultation) - set(arming))}; "
+        f"undeclared: {sorted(set(arming) - set(consultation))}"
+    )
+    for site, must_consult in consultation.items():
+        source = ast.unparse(arming[site])
+        assert ("_was_released" in source) is must_consult, (
+            f"{site[0]} {'must' if must_consult else 'must not'} consult the released record. "
+            "_swap_sink is the exemption: what it arms is the sink configure() just installed — "
+            "the caller's chosen live target, not a stale one — so refusing there would leave "
+            "the record naming the sink that was just closed, which is strictly worse. That the "
+            "sink can be both freshly configured and already released is the misrouting "
+            "SPEC-045 puts out of scope; FR-001 still bounds it to one close."
+        )
 
 
 # --------------------------------------------------------------------------- FR-003

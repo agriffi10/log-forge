@@ -79,13 +79,33 @@ def _clear_ownership_record() -> Iterator[None]:
 
     It is write-once and holds a strong reference for the life of the process, which is correct
     in an application and would otherwise carry one test's sinks into the next.
+
+    `_released` is cleared **with** it, never separately (SPEC-045 FR-001). That record keys on
+    `id`, and what makes an `id` sufficient is that `_owned` pins the object so the id cannot be
+    recycled. Dropping the pins without dropping the marks breaks exactly that invariant here,
+    where nowhere else does: a later test's sink landing on a freed address would be refused its
+    first close, and the symptom is a close that silently does not happen.
+    """
+    _clear_records()
+    yield
+    _clear_records()
+
+
+def _clear_records() -> None:
+    """Empties both halves of the ownership record together.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
     """
     with _lifecycle._owned_lock:
         _lifecycle._owned.clear()
-    _lifecycle._marking_failed = False
-    yield
-    with _lifecycle._owned_lock:
-        _lifecycle._owned.clear()
+        _lifecycle._released.clear()
     _lifecycle._marking_failed = False
 
 
@@ -711,6 +731,15 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
     That is the hazard this asserts is absent from the library, and it is a real one because the
     lock is deliberately **not** reentrant -- SPEC-028 chose `Lock` over `RLock` precisely so a
     function re-entering its own critical section fails loudly instead of being hidden.
+
+    SPEC-045 adds three names, and each is permitted for a stated reason rather than to make the
+    assertion pass. `_released.add` and `_released.discard` are `set` operations on a module
+    global that call nothing out and cannot re-enter. `_releasable_locked` is the lock-free inner
+    the same spec factored out of `releasable` so that `_claim_release` can decide ownership,
+    test the released mark and set it under one acquire: it takes no lock, calls only
+    `_owned.get`, and exists *because* calling `releasable` under this lock is the deadlock the
+    paragraph above describes. `os.getpid` is deliberately **not** here -- both callers read the
+    pid before the acquire, so no syscall runs under the process's last lock.
     """
     import ast
     import pathlib
@@ -737,6 +766,9 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "_owned.values",
         "roots.extend",
         "id",
+        "_released.add",
+        "_released.discard",
+        "_releasable_locked",
     }
     assert set(under_lock) <= permitted, (
         f"new work under the record lock: {sorted(set(under_lock))}. It is the last lock in the "
