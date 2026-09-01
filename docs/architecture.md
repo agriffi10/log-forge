@@ -923,7 +923,7 @@ constraint — never by being deleted quietly.
   `incomplete_swaps` is untouched throughout — it records a drain that could not be confirmed,
   and there is no drain here.
 
-- **A sink handed back after being swapped out is closed twice, on both paths.** The orphan
+- ~~**A sink handed back after being swapped out is closed twice, on both paths.** The orphan
   path's closed-sink latch (SPEC-033) is a **single slot**, so it is the latch *moving* to a
   second sink that re-admits the first: `configure(A)` → `info()` → `configure(B)` →
   `configure(A)` closes A again. The **worker path behaves identically** — measured
@@ -931,21 +931,38 @@ constraint — never by being deleted quietly.
   "must not be handed back to a later call", so this is a documented user error rather than a
   divergence. `sinks/base.py` requires `close()` to be idempotent, which is what makes it
   tolerable. Tracking every sink ever closed would pin them all against garbage collection to fix
-  what the sibling path does not fix either.
+  what the sibling path does not fix either.~~ — **the whole entry was wrong, and SPEC-045
+  corrects it in place rather than deleting it, because it was believed and acted on.**
 
-  **Two concurrent `configure(sink=…)` calls can still double-close a sink**, and SPEC-044 did
-  not change that: a randomised-preemption harness measured 18 of 60 trials on that branch
-  against 21 of 60 on the tree before it, with a single `configure` thread at 0 of 40 and 1 of
-  40. The rate is the same either side, so it is neither introduced nor closed there — it is the
-  documented "not thread-safe" of `configure()` reaching the close path, and it wants its own
-  spec rather than a note that reads like a fix. What SPEC-044 *did* close is the single-thread
-  shape below.
+  **The hand-back is not a double close, and neither is the concurrent shape.** Both closes are
+  real: the first releases A as the sink being swapped out, the second closes A as a sink that
+  has taken further events, and it flushes them. A design that refused the second was built and
+  measured — it stranded 2 of 3 events on a wrapper-graph shape and lost events on 31 of 80
+  lifecycle-fuzz seeds against 0 before it. A sink whose `close()` *is* its delivery has released
+  nothing and correctly keeps accepting, which `sinks/base.py` permits and nineteen shipped sink
+  modules do.
 
-  Two further shapes need a concurrent emit during `configure()`, which that call's documented
+  **The real defect was the opposite one: the live sink closed by nobody.** The record of which
+  sinks the orphan path owes a close for was a single slot, so arming a second discarded the
+  first. Measured deterministically, with every `configure()` call sequential on one thread and
+  only an ordinary `info()` racing: `C.closes == 0` on the sink every event was going to, its
+  buffer never delivered, while a superseded sink was closed twice. It is therefore not the
+  documented "not thread-safe" of `configure()` — no lock around that call reaches it — and it
+  cost data rather than tidiness.
+
+  **`_orphan_owed` is a record of every owed sink** (SPEC-045 FR-001), mutated in place and
+  emptied by one `take_orphan_owed()` transition, so nothing is discarded and nothing is closed
+  that had nothing to flush. Tracking it needs no new record of *closed* sinks, so the pinning
+  objection above never applied. Two of the three transitions that consume it were found by
+  mutation rather than review: truncating them to the most recently armed sink passed the entire
+  suite.
+
+  ~~Two further shapes need a concurrent emit during `configure()`, which that call's documented
   "not thread-safe" already covers, and are recorded because the single slot is what permits
   them. An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the
   latch on B, re-arms A, and orphans the live sink — the single slot's own bound, which is why
-  FR-004's "every close" means the most recent one. ~~And an emit that resolved the old sink and
+  FR-004's "every close" means the most recent one.~~ — **fixed by SPEC-045 FR-001**; that is the
+  measured reproduction above. ~~And an emit that resolved the old sink and
   arrives after the *worker* branch cleared the record re-arms it, so `Worker.swap_sink` closes
   that sink and the ownership guard — finding `_worker.sink` is now the new one — closes it
   again at exit.~~ — **fixed by SPEC-044 FR-004.** It was measured (`A.closed == 2`, with a
@@ -953,6 +970,25 @@ constraint — never by being deleted quietly.
   before SPEC-033, because the worker branch had never recorded a closed sink. That branch now
   latches what it hands to `Worker.swap_sink`, so the orphan branch's refusal to re-arm a closed
   sink reaches it too — which is what the orphan branch's equivalent already had.
+
+  **Two consequences of the record holding several sinks, recorded rather than repaired.** The
+  exit close now runs them **inline and in sequence**, so one slow close delays every other owed
+  close and one that never returns takes the rest with it — measured, a 5 s close made
+  `shutdown(timeout=1.0)` return after 5.01 s with the second sink's close finishing at 5.01 s
+  too. That is the same unbounded-`Sink.close` limit recorded below for the live sink, now
+  spanning the set. And `health().inherited_sink` reads the record's **last** entry, which is not
+  necessarily the sink being delivered to: `_swap_sink` inserts the new sink into a freshly
+  emptied record and a preempted emit then appends the superseded one, so the order can be
+  `[live, superseded]`. The answer is unchanged from before SPEC-045 and can name a superseded
+  sink; the config is the authority for "installed", and correcting the field is its own change.
+
+  **What stays open, and is recorded rather than repaired:** a sink released while it is still
+  live inside the graph that replaced it — `configure(A)` then `configure(MultiSink(A, B))`, or
+  the reverse. The swap closes A as the outgoing sink while A is a child of the new one. It
+  predates SPEC-045 and that spec's criteria pin only that it must not become a *loss*: A keeps
+  taking events through the wrapper, is owed a further close, and delivers everything. Repairing
+  it means not releasing a sink reachable from the graph just handed over, which is decidable
+  only against a live config read and so is its own piece of work.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

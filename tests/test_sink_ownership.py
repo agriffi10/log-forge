@@ -588,7 +588,7 @@ def test_the_record_holds_a_strong_reference() -> None:
     def in_child() -> str:
         config._config = config.Config()
         _lifecycle._state._worker = None
-        _lifecycle._state._orphan_sink = None
+        _lifecycle._state._orphan_owed.clear()
         _lifecycle._state._orphan_closed_sink = None
         gc.collect()
         with _lifecycle._owned_lock:

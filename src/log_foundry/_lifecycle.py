@@ -64,11 +64,11 @@ class _Lifecycle:
 
     **The states.** A process is in exactly one of these, and the field that decides is named:
 
-    - **cold** — ``_worker is None`` and ``_orphan_sink is None``. Nothing has been logged, no
+    - **cold** — ``_worker is None`` and ``_orphan_owed`` is empty. Nothing has been logged, no
       thread exists, no sink is owed a close. ``configure()`` alone does not leave this state:
       it runs ``_ensure_sink()`` unconditionally, so a resolved sink is not evidence anything
       was written to it (SPEC-031 FR-006).
-    - **orphan-only** — ``_orphan_sink`` names the sink a level call with no span actually
+    - **orphan-only** — ``_orphan_owed`` names every sink a level call with no span actually
       reached, and ``_worker`` is still ``None``. The close is owed to this path, and the
       ``atexit`` handler is armed by the emit that landed rather than by the sink existing.
     - **worker-backed** — ``_worker`` holds the process worker. It owns the drain, the sink's
@@ -149,12 +149,34 @@ class _Lifecycle:
         self._worker: Worker | None = None
         self._lock = threading.Lock()
         self._atexit_registered = False
-        self._orphan_sink: Sink | None = None
+        self._orphan_owed: dict[int, Sink] = {}
         self._orphan_closed_sink: Sink | None = None
         self._orphan_stop = threading.Event()
         self._orphan_retired = False
         self._shutdown_running = 0
         self._late_worker: Worker | None = None
+
+    def take_orphan_owed(self) -> list[Sink]:
+        """Empties the owed-close record and returns what it held, in arming order.
+
+        A **transition**, not one of the four questions (arch §9.2): every caller that clears the
+        record is deciding who performs the closes it was holding, and reading-and-clearing in
+        one step is what stops two of them deciding the same sink is theirs.
+
+        Callers hold ``_lock``.
+
+        Args:
+          None.
+
+        Returns:
+          The sinks that were owed a close, oldest first.
+
+        Raises:
+          None.
+        """
+        owed = list(self._orphan_owed.values())
+        self._orphan_owed.clear()
+        return owed
 
     def worker_exists(self) -> Worker | None:
         """Existence — is there a worker at all, and therefore anything to do (arch §9.2).
@@ -676,7 +698,7 @@ def _inheritance_roots() -> list[object]:
     candidates = (
         config._live_config().sink,
         None if worker is None else worker.sink,
-        _state._orphan_sink,
+        *_state._orphan_owed.values(),
         _state._orphan_closed_sink,
     )
     roots: list[object] = [found for found in candidates if found is not None]
@@ -1180,11 +1202,11 @@ def _get_worker() -> Worker:
                 _state._worker = worker
                 if _state._shutdown_running > 0:
                     _state._late_worker = worker
-                owed = _state._orphan_sink
-                _state._orphan_sink = None
-                if owed is not None and owed is not worker.sink:
-                    _state._orphan_closed_sink = owed
-                    release(owed, detached=True)
+                owed = _state.take_orphan_owed()
+                for stale in owed:
+                    if stale is not worker.sink:
+                        _state._orphan_closed_sink = stale
+                        release(stale, detached=True)
     return worker
 def _register_exit_handler() -> None:
     """Registers the one ``atexit`` handler that covers both delivery paths (SPEC-031 FR-006).
@@ -1241,14 +1263,16 @@ def _note_orphan_emit(sink: Sink) -> None:
     Raises:
       None.
     """
-    if (sink is _state._orphan_sink or sink is _state._orphan_closed_sink) and not _state._orphan_stop.is_set():
+    if (
+        id(sink) in _state._orphan_owed or sink is _state._orphan_closed_sink
+    ) and not _state._orphan_stop.is_set():
         return
     with _state._lock:
         _offer_orphan_signal(sink)
-        if sink is _state._orphan_sink or sink is _state._orphan_closed_sink:
+        if id(sink) in _state._orphan_owed or sink is _state._orphan_closed_sink:
             return
         _register_exit_handler()
-        _state._orphan_sink = sink
+        _state._orphan_owed[id(sink)] = sink
 def _rebuild_worker_after_fork() -> None:
     """Gives a forked child a drain thread of its own, or a retired worker (SPEC-039 FR-002).
 
@@ -1382,17 +1406,17 @@ def _close_orphan_sink() -> None:
         itself. ``Exception``, never ``BaseException`` (SPEC-025 FR-004).
     """
     with _state._lock:
-        owed = _state._orphan_sink
-        if owed is None:
-            return
-        if _state.worker_owns(owed):
-            return
-        _state._orphan_sink = None
-        _state._orphan_closed_sink = owed
-    try:
-        release(owed)
-    except Exception as exc:
-        _diag.absorbed("closing the sink", exc, "it may still hold its resources")
+        owed: list[Sink] = [
+            sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
+        ]
+        for sink in owed:
+            del _state._orphan_owed[id(sink)]
+            _state._orphan_closed_sink = sink
+    for sink in owed:
+        try:
+            release(sink)
+        except Exception as exc:
+            _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 
@@ -1525,7 +1549,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     reports nothing at all, by the decision that made the bounded close available.
 
     **The worker branch latches what it hands over, and decides the close before clearing**
-    (SPEC-044 FR-004, FR-002). It used to clear ``_state._orphan_sink`` and record nothing: an
+    (SPEC-044 FR-004, FR-002). It used to clear the orphan record and record nothing: an
     orphan emit that resolved the old sink before the swap and resumed after it then re-armed a
     sink :meth:`Worker.swap_sink` had already closed, and the exit close performed a second
     ``close()`` on it — measured ``A.closed == 2`` with a preemption point injected at
@@ -1563,27 +1587,33 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         rejected ceiling, and a sink swap that fails must not become the reason an application
         cannot start.
     """
-    closer = None
+    closers: list[threading.Thread] = []
     deadline = None if timeout is None else monotonic() + timeout
     with _state._lock:
         worker = _state.live_worker()
         if worker is not None:
-            owed = _state._orphan_sink
-            _state._orphan_sink = None
-            if owed is not None and owed is not new_sink and owed is not worker.sink:
-                _state._orphan_closed_sink = owed
-                closer = release(owed, detached=True)
+            for stale in _state.take_orphan_owed():
+                if stale is not new_sink and stale is not worker.sink:
+                    _state._orphan_closed_sink = stale
+                    closer = release(stale, detached=True)
+                    if closer is not None:
+                        closers.append(closer)
             if worker.sink is not new_sink:
                 _state._orphan_closed_sink = worker.sink
         else:
-            old = _state._orphan_sink
-            if old is None or old is new_sink:
+            if not _state._orphan_owed:
                 return
-            _state._orphan_sink = new_sink
+            superseded = [
+                sink for sink in _state.take_orphan_owed() if sink is not new_sink
+            ]
+            _state._orphan_owed[id(new_sink)] = new_sink
             _offer_orphan_signal(new_sink)
-            if not _state.worker_owns(old):
-                _state._orphan_closed_sink = old
-                closer = release(old, detached=True)
+            for stale in superseded:
+                if not _state.worker_owns(stale):
+                    _state._orphan_closed_sink = stale
+                    closer = release(stale, detached=True)
+                    if closer is not None:
+                        closers.append(closer)
     if worker is not None:
         try:
             worker_holds_sink = worker.swap_sink(new_sink, timeout)
@@ -1594,13 +1624,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         else:
             if not worker_holds_sink:
                 _adopt_declined_swap(new_sink)
-    if closer is not None:
+    for closer in closers:
         closer.join(None if deadline is None else max(0.0, deadline - monotonic()))
 def _adopt_declined_swap(new_sink: Sink) -> None:
     """Takes ownership of a sink a worker refused mid-swap (SPEC-035 FR-003).
 
     ``Worker.swap_sink`` re-checks retirement after its first ``flush()`` and returns early once
-    ``_shutdown_done`` latched, but :func:`_swap_sink` had already cleared ``_state._orphan_sink`` on the
+    ``_shutdown_done`` latched, but :func:`_swap_sink` had already taken the orphan record on the
     strength of a worker being live a few instructions earlier. The new sink then sat in the
     config, installed nowhere and recorded nowhere: measured, ``config.sink is B`` was ``True``,
     ``B`` was never closed, and ``health()`` read entirely clean — for a sink whose ``close()``
@@ -1616,7 +1646,7 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
 
     **A sink already recorded as closed is refused re-arming**, the guard
     :func:`_note_orphan_emit` carries and for its reason. Without it, an orphan log arming
-    ``_state._orphan_sink`` while this thread is inside ``swap_sink``'s first drain, followed by a
+    ``_state._orphan_owed`` while this thread is inside ``swap_sink``'s first drain, followed by a
     ``shutdown()`` that closes it, lets this re-arm a closed sink for a second ``close()`` at
     exit — reproduced. ``sinks/base.py`` asks an implementation to make its release idempotent,
     but the library does not rely on it, for the reason :func:`_swap_sink` states.
@@ -1636,10 +1666,10 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
     """
     with _state._lock:
         _offer_orphan_signal(new_sink)
-        if new_sink is _state._orphan_sink or new_sink is _state._orphan_closed_sink:
+        if id(new_sink) in _state._orphan_owed or new_sink is _state._orphan_closed_sink:
             return
         _register_exit_handler()
-        _state._orphan_sink = new_sink
+        _state._orphan_owed[id(new_sink)] = new_sink
 def _flush_live_sink() -> bool:
     """Drains whatever the delivering sink holds in its own client (SPEC-036 FR-002).
 
@@ -1669,15 +1699,21 @@ def _flush_live_sink() -> bool:
     from log_foundry.sinks.base import flush_sink
 
     worker = _state.live_worker()
-    sink = worker.sink if worker is not None else _state._orphan_sink
-    if sink is None:
+    if worker is not None:
+        pending = [worker.sink]
+    else:
+        with _state._lock:
+            pending = list(_state._orphan_owed.values())
+    if not pending:
         return True
-    try:
-        flush_sink(sink)
-    except Exception as exc:
-        _diag.absorbed("flushing the sink's own buffer", exc, "its client still holds events")
-        return False
-    return True
+    drained = True
+    for sink in pending:
+        try:
+            flush_sink(sink)
+        except Exception as exc:
+            _diag.absorbed("flushing the sink's own buffer", exc, "its client still holds events")
+            drained = False
+    return drained
 def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     """Drains the process worker without retiring it, backing ``flush()`` (SPEC-013 FR-003).
 
@@ -1745,16 +1781,18 @@ def _delivering_to_an_inherited_sink() -> bool:
     and for the same reason: standing up a thread to answer ``health()`` is forbidden.
 
     The three candidates are asked in delivery order: the worker's sink if a worker exists,
-    else the sink an orphan emit reached, else the configured one. SPEC-033's measured
-    disagreement is worker-versus-config, which the **first** term already covers — and the
-    second cannot currently produce a distinct answer, because with no worker ``_state._orphan_sink``
-    is either ``None`` or the same object the config holds (``_swap_sink`` re-points both, and
-    where it returns early the record is ``None``). It is kept rather than removed, and recorded
-    rather than tested: every other orphan-path read in this module treats ``_state._orphan_sink`` as
-    the authority on which sink an emit reached, and dropping it here would make one site read
-    the config while its neighbours read the record — resting on a property of ``_swap_sink``'s
-    current body that nothing states as an invariant. A test would have to arrange an
-    unreachable state by hand, which is the fixture-built vacuity this repo keeps finding.
+    else the sink an orphan emit reached most recently, else the configured one. SPEC-033's
+    measured disagreement is worker-versus-config, which the **first** term already covers.
+
+    The middle term takes the **last** entry of ``_state._orphan_owed``, and that is continuity
+    with the single slot it replaced rather than a claim that the last entry is the sink being
+    delivered to. It is not: ``_swap_sink`` inserts the new sink into a freshly emptied record and
+    a preempted emit then appends the *superseded* one, so in this spec's own primary scenario the
+    order is ``[live, superseded]``. Neither end of the record is authoritative for "installed" —
+    arming order is emit order, which is a different question — and the config is. The answer is
+    therefore unchanged from before SPEC-045 and can still name a superseded sink; that limit is
+    recorded in ``architecture.md`` §13 rather than quietly fixed here, because correcting it
+    changes a documented ``Health`` field on a path this spec does not otherwise touch.
 
     With no sink resolved at all there is nothing installed and nothing inherited, so the answer
     is ``False`` rather than a guess.
@@ -1774,7 +1812,8 @@ def _delivering_to_an_inherited_sink() -> bool:
 
     try:
         worker = _state.worker_exists()
-        sink = worker.sink if worker is not None else (_state._orphan_sink or _live_config().sink)
+        owed = next(reversed(_state._orphan_owed.values()), None)
+        sink = worker.sink if worker is not None else (owed or _live_config().sink)
         return sink is not None and not releasable(sink)
     except Exception:
         return False

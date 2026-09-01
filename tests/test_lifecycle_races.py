@@ -532,7 +532,9 @@ def test_a_worker_that_did_not_adopt_the_recorded_sink_does_not_discard_its_clos
     a, b = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=a)
     log_foundry.info("to A")
-    assert _lifecycle._state._orphan_sink is a, "the record is armed by the emit that landed"
+    assert _lifecycle._state._orphan_owed.get(id(a)) is a, (
+        "the record is armed by the emit that landed"
+    )
 
     preempt = _PreemptInGetWorker(monkeypatch)
 
@@ -580,40 +582,118 @@ def test_a_worker_that_did_adopt_the_recorded_sink_leaves_one_close() -> None:
     assert sink.closes == 1, f"a mixed process closes once, in either order: {sink}"
 
 
+def _orphan_record_sites() -> dict[tuple[str, str], ast.FunctionDef]:
+    """Every site that assigns `_state._orphan_sink`, keyed by (function, assigned expression).
+
+    One walker, used by both properties asserted over this population — the disposition table
+    below and SPEC-045's released-record consultation. Two walkers over one population drift, as
+    SPEC-038 FR-001 AC-1a/AC-1b had to write a cross-check to catch.
+
+    Args:
+      None.
+
+    Returns:
+      A mapping from `(enclosing function, assigned expression)` to that function's AST node.
+
+    Raises:
+      None.
+    """
+    tree = ast.parse(_LIFECYCLE_SRC.read_text())
+    found: dict[tuple[str, str], ast.FunctionDef] = {}
+    for scope in ast.walk(tree):
+        if not isinstance(scope, ast.FunctionDef):
+            continue
+        for node in ast.walk(scope):
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                writes = [ast.unparse(target) for target in node.targets]
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                writes = [ast.unparse(node.value.func)]
+            else:
+                continue
+            for write in writes:
+                if "_orphan_owed" in write:
+                    value = (
+                        ast.unparse(node.value)
+                        if isinstance(node, ast.Assign)
+                        else write
+                    )
+                    found[(scope.name, value)] = scope
+    return found
+
+
 def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> None:
     """FR-002 AC-5. Derived, because a hand-written list of sites rots (SPEC-028, SPEC-035).
 
-    A transition may clear `_orphan_sink` only after deciding who performs the close it was
-    holding, and this enumerates the sites that clear or re-point it so that a new one is a
-    decision somebody takes rather than a default.
+    A transition may drop a sink from the owed-close record only after deciding who performs the
+    close it was holding, and this enumerates the sites that arm or drop one so that a new one is
+    a decision somebody takes rather than a default.
+
+    SPEC-045 made the record a `dict` rather than a single slot, which collapsed three separate
+    clears into `take_orphan_owed`. The three that remain are the two armings and the per-sink
+    removal that pairs with a close.
 
     The set equality **is** the floor: an exact comparison against a hand-written table cannot
     shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
     while being strictly implied. Stated rather than asserted twice, as the sibling roster does.
     """
     dispositions = {
-        ("_get_worker", "None"): "cleared — the worker adopted it, or this branch closes it",
-        ("_close_orphan_sink", "None"): "cleared — this function performs the close itself",
-        ("_swap_sink", "None"): "cleared — the worker holds it, or this branch closes it",
-        ("_swap_sink", "new_sink"): "re-pointed — clearing would leak the new sink instead",
+        ("take_orphan_owed", "self._orphan_owed.clear"): (
+            "cleared — the one transition that empties the record, so a caller reads and clears "
+            "in a single step and two of them cannot both decide the same sink is theirs"
+        ),
+        ("_close_orphan_sink", "_state._orphan_owed[id(sink)]"): (
+            "removed per sink — this function performs that sink's close itself"
+        ),
+        ("_swap_sink", "new_sink"): "armed — the sink configure() just installed is owed a close",
         ("_note_orphan_emit", "sink"): "armed — the emit that landed owns the close",
         ("_adopt_declined_swap", "new_sink"): "armed — the worker refused it mid-swap",
     }
-    tree = ast.parse(_LIFECYCLE_SRC.read_text())
-    found: set[tuple[str, str]] = set()
-    for scope in ast.walk(tree):
-        if not isinstance(scope, ast.FunctionDef):
-            continue
-        for node in ast.walk(scope):
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Attribute) and target.attr == "_orphan_sink":
-                    found.add((scope.name, ast.unparse(node.value)))
+    found = set(_orphan_record_sites())
     assert found == set(dispositions), (
         "a site writing _state._orphan_sink is a close-ownership decision — add it to the table "
         f"with its disposition. missing: {sorted(set(dispositions) - found)}; "
         f"undeclared: {sorted(found - set(dispositions))}"
+    )
+
+
+def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
+    """SPEC-045. A rebind of the record is the single-slot defect, reintroduced.
+
+    The record was one slot, so arming a second sink discarded the first and its close went to
+    nobody — measured, the live sink closed zero times while a stale one was closed twice.
+    Making it a `dict` fixes that only while every site mutates it **in place**: any
+    `_orphan_owed = {...}` silently drops whatever another thread armed between the read and the
+    write, which is the same defect with a wider window.
+
+    `take_orphan_owed` is the one sanctioned emptying, and it reads and clears under the lock in
+    one step so two callers cannot both take the same sink.
+
+    The collector gathers `ast.Assign` only, so `__init__`'s annotated declaration is not a
+    rebind it can see — an earlier draft carried a disjunct exempting that line, which read as
+    covering a case the walk never reaches.
+    """
+    tree = ast.parse(_LIFECYCLE_SRC.read_text())
+    rebinds = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute) and target.attr == "_orphan_owed"
+    ]
+    assert not rebinds, (
+        "the owed-close record is rebound rather than mutated, which drops whatever another "
+        f"thread armed in between: {rebinds}"
+    )
+    clears = {
+        scope.name
+        for scope in ast.walk(tree)
+        if isinstance(scope, ast.FunctionDef)
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("_orphan_owed.clear")
+    }
+    assert clears == {"take_orphan_owed"}, (
+        "emptying the record wholesale is one transition's job, so a caller cannot take sinks "
+        f"it has not decided the close for: {sorted(clears)}"
     )
 
 
@@ -789,7 +869,7 @@ def test_a_swap_that_hands_a_sink_to_the_worker_latches_it(
         return 1
 
     work()  # builds the worker on A
-    assert _lifecycle._state._orphan_sink is None, "the build cleared the record"
+    assert not _lifecycle._state._orphan_owed, "the build cleared the record"
 
     resolved = threading.Event()
     release_it = threading.Event()
@@ -847,7 +927,7 @@ def test_a_swap_releases_a_third_sink_the_record_named(
 
     # Re-arm the record on a sink the worker does not hold, the way a preempted emit would.
     with _lifecycle._state._lock:
-        _lifecycle._state._orphan_sink = third
+        _lifecycle._state._orphan_owed[id(third)] = third
     _lifecycle.stamp(third)
 
     started = time.monotonic()

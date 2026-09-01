@@ -49,6 +49,7 @@ to status only — no prose.
 | [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039 |
 | [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | In Progress | SPEC-026, SPEC-032, SPEC-041 |
 | [SPEC-044](SPEC-044-lifecycle-races.md) | Lifecycle Races | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042 |
+| [SPEC-045](SPEC-045-every-owed-close-is-performed.md) | Every Owed Close Is Performed | In Progress | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
 
 ## Arcs (build order)
 
@@ -237,3 +238,12 @@ Group related specs and record the order to build them in. Keep this section: a 
   depends on it for *shape*, since the guards are now four methods on one owner rather than seven
   loose globals. Build it after SPEC-040 (done). It closes five and documents the sixth, which
   §13 records as a deliberate design limit rather than a defect.
+
+- **Every owed close is performed:** SPEC-045 — the residual SPEC-044 measured, recorded and
+  deliberately did not fix. Build it after SPEC-044, which owns `_orphan_closed_sink` and is what
+  makes the distinction this spec rests on legible: that slot answers "do not re-arm", not "this
+  was closed", and is left alone. The subject turned out to be narrower and worse than the note
+  that produced it — not a sink closed twice, but the **live** sink closed by nobody, because the
+  orphan path's owed-close record was a single slot. It reproduces with every `configure()` call
+  sequential on one thread, racing only an ordinary `info()`, so a lock around `configure()` is
+  not the fix and neither is refusing a repeat close: both were built and measured to lose data.

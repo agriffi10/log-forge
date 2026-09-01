@@ -974,7 +974,7 @@ def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     finally:
         api._ensure_sink = original  # type: ignore[assignment]
 
-    assert _lifecycle._state._orphan_sink is None
+    assert not _lifecycle._state._orphan_owed
 
 
 def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:

@@ -1020,7 +1020,7 @@ class Worker:
         after ``_run`` has returned, so the sink is provably out of use *by the worker*.
 
         **It records nothing in the closed-sink latch, and does not need to** (SPEC-044 FR-004):
-        ``_lifecycle._orphan_sink`` still names this sink where anything named it, and
+        ``_lifecycle._orphan_owed`` still names this sink where anything named it, and
         ``worker_owns`` answers ``True``, so ``_close_orphan_sink`` declines rather than re-arming
         it. The latch exists for a sink this worker has *stopped* holding.
 

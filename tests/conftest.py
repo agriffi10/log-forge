@@ -106,7 +106,7 @@ def _reset_worker() -> None:
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
     ``_orphan_retired`` is what ``health()`` synthesizes when there is no worker, so a test
     that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
-    ``_orphan_sink`` would make "nothing was ever logged, so nothing is closed"
+    ``_orphan_owed`` would make "nothing was ever logged, so nothing is closed"
     untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
     handler really is registered for the life of the interpreter, and re-arming the flag would
     have the next worker register a second one.
@@ -139,7 +139,7 @@ def _reset_worker() -> None:
     if worker is not None:
         worker.shutdown()
         _lifecycle._state._worker = None
-    _lifecycle._state._orphan_sink = None
+    _lifecycle._state._orphan_owed.clear()
     _lifecycle._state._orphan_closed_sink = None
     _lifecycle._state._orphan_retired = False
     _lifecycle._state._orphan_stop = threading.Event()

@@ -110,8 +110,14 @@ def configure(
     (arch §7). It **swaps the live delivery target**: the previous sink is closed and subsequent
     events go to the new one, so "repeated calls compose rather than reset" holds for the sink
     too, at the cost of one bounded wait. Passing the sink that is already live is a no-op: no
-    drain, no close. The previous sink is closed and must not be handed back to a later call —
-    doing so closes it twice.
+    drain, no close.
+
+    **Every sink this has been given is closed** (SPEC-045), whatever races the call and however
+    many are outstanding. Handing the previous sink back to a later call is therefore supported
+    rather than forbidden: it is closed again, because it took events again, and what it took
+    after the hand-back is flushed by that second close. The record of which sinks are owed a
+    close used to be a single slot, so an ordinary ``info()`` on another thread could leave the
+    **live** sink closed by nobody and its buffer undelivered.
 
     **What the swap promises differs by delivery path**, because the two have different work to
     do. With a background worker — anything using ``@trace`` — everything submitted so far is
@@ -129,8 +135,10 @@ def configure(
     on in the background. An expired join reports nothing, since a slow close and a stuck one
     cannot be told apart at that moment; ``health().closing_sinks`` reports the live fact instead.
 
-    This is still a startup call. It is not thread-safe, and a span finishing on another thread
-    during a swap may land on either sink.
+    This is still a startup call, and it is **not thread-safe**. A span finishing on another
+    thread during a swap may land on either sink, and two threads calling this at once can leave
+    the config naming one sink while delivery goes to another. What is unconditional is that
+    every sink involved is closed; where its events went is not.
 
     Args:
       service: The service name stamped onto every event.
