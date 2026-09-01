@@ -336,6 +336,13 @@ child set its own ``_orphan_stop`` that sink was handed the **set** event and ba
 all, permanently.
 """
 _closing_now_lock = threading.Lock()
+"""Guards :data:`_closing_now`, and sits **last** in the lock order.
+
+``_state._lock`` -> ``_config_lock`` -> ``_owned_lock`` is the order :data:`_owned_lock` states;
+this one is taken under ``_state._lock`` (through :func:`_offer_orphan_signal`) and is never
+nested with either of the other two, so there is no cycle. It is held only across a set
+membership test or a single mutation, never across a ``close()``.
+"""
 
 
 def _closing(sink: Sink) -> bool:
@@ -363,8 +370,13 @@ def _clear_closing_after_fork() -> None:
     permanent one: once the child sets its own ``_orphan_stop``, that sink is handed the set
     event and every backoff collapses to zero, which is SPEC-033 FR-004's tight retry loop.
 
-    Registered with ``_fork`` rather than reached for by it, the shape FR-006 requires. It takes
-    the registry's own lock, which the repair walk re-initialised moments earlier.
+    Registered with ``_fork`` rather than reached for by it, the inversion SPEC-039 FR-006
+    requires so that ``_fork`` imports nothing but ``_diag``. It takes the registry's own lock,
+    which the repair walk re-initialised moments earlier.
+
+    It runs **after** :func:`_mark_inherited` and before :func:`_rebuild_worker_after_fork`, and
+    the placement is free rather than load-bearing: the registry holds ``int`` ids and no handler
+    reads it.
 
     Args:
       None.
@@ -1160,11 +1172,11 @@ def _get_worker() -> Worker:
                 sink = _ensure_sink()
                 worker = Worker(
                     sink,
-                    sink_released=bool(_state._shutdown_running)
+                    sink_released=_state._shutdown_running > 0
                     and _state._orphan_closed_sink is sink,
                 )
                 _state._worker = worker
-                if _state._shutdown_running:
+                if _state._shutdown_running > 0:
                     _state._late_worker = worker
                 owed = _state._orphan_sink
                 _state._orphan_sink = None
@@ -1447,11 +1459,13 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         worker.shutdown(timeout)
         _close_orphan_sink()
         return
-    _close_orphan_sink()
-    with _state._lock:
-        late_worker = _state._late_worker
-        _state._late_worker = None
-        _state._shutdown_running -= 1
+    try:
+        _close_orphan_sink()
+    finally:
+        with _state._lock:
+            late_worker = _state._late_worker
+            _state._late_worker = None
+            _state._shutdown_running -= 1
     if late_worker is not None:
         late_worker.shutdown(None if deadline is None else max(0.0, deadline - monotonic()))
         return
@@ -1513,7 +1527,9 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     orphan emit that resolved the old sink before the swap and resumed after it then re-armed a
     sink :meth:`Worker.swap_sink` had already closed, and the exit close performed a second
     ``close()`` on it — measured ``A.closed == 2`` with a preemption point injected at
-    ``_ensure_sink``, and ``Sink.close`` promises no idempotency (SPEC-032).
+    ``_ensure_sink``. ``sinks/base.py`` asks an implementation to make its release idempotent,
+    but the library does not *rely* on that — it cannot enforce what a third-party sink does — so
+    it performs one close (SPEC-032).
 
     The latch is keyed on ``worker.sink``, **not** on the orphan record. The sink
     ``Worker.swap_sink`` is about to close is the one the worker holds, and in the reproduced case
@@ -1600,7 +1616,8 @@ def _adopt_declined_swap(new_sink: Sink) -> None:
     :func:`_note_orphan_emit` carries and for its reason. Without it, an orphan log arming
     ``_state._orphan_sink`` while this thread is inside ``swap_sink``'s first drain, followed by a
     ``shutdown()`` that closes it, lets this re-arm a closed sink for a second ``close()`` at
-    exit — reproduced, and ``Sink.close`` promises no idempotency.
+    exit — reproduced. ``sinks/base.py`` asks an implementation to make its release idempotent,
+    but the library does not rely on it, for the reason :func:`_swap_sink` states.
 
     ``incomplete_swaps`` is deliberately not moved. It counts an unconfirmed *drain*, and this
     swap had no drain to confirm — the worker declined before reassigning anything — so counting

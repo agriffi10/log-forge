@@ -88,7 +88,8 @@ later worker born retired would supersede that decision and lose events that lan
 
 The sink is the one thing both branches can claim. Where the orphan branch already closed it,
 `_get_worker` constructs the late worker over a sink recorded as released, so the exit close does
-not perform a second `close()` on it — `sinks/base.py` promises no idempotency (SPEC-032). Where
+not perform a second `close()` on it — the library performs one close and does not rely on a
+sink's release being idempotent, which `sinks/base.py` asks for but cannot enforce (SPEC-032). Where
 the worker was registered first, `_close_orphan_sink`'s existing ownership guard declines and the
 worker performs the only close.
 
@@ -175,7 +176,8 @@ orphan close, the worker's `_close_if_owed`, the swap's detached closer and ever
 `_swap_sink`'s worker branch clears `_state._orphan_sink` without setting
 `_state._orphan_closed_sink`, so an orphan emit that resolved the old sink before the swap and
 resumes after it re-arms a sink `Worker.swap_sink` has already closed. The exit close then performs
-a second `close()` on it, and `Sink.close` promises no idempotency. It needs an injected preemption
+a second `close()` on it, which the library must not rely on a sink surviving. It needs an injected
+preemption
 point — 0/120 without one — which is why it is a latch defect rather than a rate to argue about.
 
 The orphan branch already latches, and `_note_orphan_emit` and `_adopt_declined_swap` both refuse to

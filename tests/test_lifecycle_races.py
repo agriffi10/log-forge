@@ -143,7 +143,8 @@ def test_a_shutdown_racing_a_first_trace_stops_the_worker_it_built(
 
     shutdown = threading.Thread(target=lambda: log_foundry.shutdown(timeout=5.0))
     shutdown.start()
-    time.sleep(0.2)  # it is now blocked on the lock, having read no worker
+    shutdown.join(0.5)
+    assert shutdown.is_alive(), "the shutdown must be queued on the lifecycle lock, not done"
     preempt.release()
     tracer.join(10.0)
     shutdown.join(20.0)
@@ -177,7 +178,8 @@ def test_the_racing_shutdown_closes_the_sink_once_when_the_worker_registers_firs
     preempt.wait_until_held()
     shutdown = threading.Thread(target=lambda: log_foundry.shutdown(timeout=5.0))
     shutdown.start()
-    time.sleep(0.2)
+    shutdown.join(0.5)
+    assert shutdown.is_alive(), "the shutdown must be queued on the lifecycle lock, not done"
     preempt.release()
     tracer.join(10.0)
     shutdown.join(20.0)
@@ -305,39 +307,126 @@ def test_a_worker_built_after_the_shutdown_returned_owns_its_sinks_close() -> No
     )
 
 
-def test_the_racing_shutdown_returns_within_its_own_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """FR-001 AC-6. The late drain is charged against this call's deadline, not a fresh one."""
-    sink = CountingSink("A")
-    log_foundry.configure(service="t", sink=sink)
+def test_the_racing_shutdown_returns_within_its_own_timeout() -> None:
+    """FR-001 AC-6. The late worker's drain is charged against this call's deadline.
+
+    It has to be driven the way the orphan-branch-closes-first test is. Parking inside
+    `_get_worker` leaves the shutdown queued on the lifecycle lock, so it finds a worker and
+    takes the **worker** branch — the late-worker drain never runs and the deadline arithmetic
+    is never exercised. Measured: with that shape, replacing the late drain with a `raise` left
+    the test green, and making it fully unbounded left the whole suite green.
+
+    Here the shutdown is parked inside the orphan sink's own `close()`, past its first critical
+    section, and the late worker is given a sink whose `emit` outlasts the budget — so a drain
+    charged against a fresh deadline would visibly overrun.
+    """
+    budget = 1.0
+    blocking = 6.0
+    let_emit_finish = threading.Event()
+
+    class SlowEmitSink:
+        """Takes longer over one emit than the shutdown's whole budget.
+
+        It blocks on an `Event` rather than sleeping a fixed span so the test can release it at
+        the end: an expired `shutdown()` leaves the drain thread running by design, and a thread
+        still inside a six-second sleep outlives this test and breaks the next one's
+        `_drain_threads()` assertion. Found exactly that way.
+        """
+
+        log_foundry_stop_signal: threading.Event | None = None
+
+        def __init__(self) -> None:
+            self.closes = 0
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Blocks past the budget, so an uncharged drain cannot hide."""
+            let_emit_finish.wait(blocking)
+
+        def close(self) -> None:
+            """Counts the close; the assertion here is on elapsed time."""
+            self.closes += 1
+
+    orphan = CountingSink("orphan")
+    orphan.may_finish = threading.Event()
+    log_foundry.configure(service="t", sink=orphan)
     log_foundry.info("arm the orphan record")
-
-    preempt = _PreemptInGetWorker(monkeypatch)
-
-    @log_foundry.trace
-    def work() -> int:
-        return 1
-
-    tracer = threading.Thread(target=work)
-    tracer.start()
-    preempt.wait_until_held()
 
     elapsed: list[float] = []
 
     def timed_shutdown() -> None:
         start = time.monotonic()
-        log_foundry.shutdown(timeout=2.0)
+        log_foundry.shutdown(timeout=budget)
         elapsed.append(time.monotonic() - start)
 
     shutdown = threading.Thread(target=timed_shutdown)
     shutdown.start()
-    time.sleep(0.2)
-    preempt.release()
-    tracer.join(10.0)
-    shutdown.join(20.0)
+    assert orphan.in_close.wait(5.0), "the shutdown is inside the orphan close, past its latch"
 
-    assert elapsed and elapsed[0] < 4.0, f"shutdown(timeout=2.0) took {elapsed}"
+    log_foundry.configure(sink=SlowEmitSink())
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()  # the late worker, registered for the running shutdown, on the slow sink
+    assert _lifecycle._state._late_worker is not None, "the late worker was registered"
+
+    orphan.may_finish.set()
+    shutdown.join(30.0)
+
+    try:
+        assert elapsed, "the shutdown returned"
+        assert elapsed[0] < blocking, (
+            f"shutdown(timeout={budget}) took {elapsed[0]:.2f}s against a {blocking}s emit — the "
+            "late worker's drain must be charged against this call's deadline, not a fresh one"
+        )
+    finally:
+        let_emit_finish.set()  # the expired shutdown left that drain thread running
+
+
+def test_two_concurrent_shutdowns_both_fence_the_worker_they_race() -> None:
+    """FR-001: the depth counter, reproduced rather than asserted in prose.
+
+    A boolean is not nestable. Two threads in `_shutdown_worker` both raise it, and the first to
+    reach the last critical section lowers it while the second is still running — so a worker
+    built at that instant is registered nowhere and the second call returns having stopped
+    nothing, which is the original defect verbatim. Two concurrent `shutdown()` calls are
+    documented as normal: `Worker._close_if_owed`'s docstring names `atexit` plus a caller's own
+    cleanup as the case it exists for.
+
+    Both shutdowns are parked inside the orphan sink's `close()` — the first close parks, the
+    second passes straight through — and the worker is built while both are outstanding.
+    """
+    orphan = CountingSink("orphan")
+    orphan.may_finish = threading.Event()
+    log_foundry.configure(service="t", sink=orphan)
+    log_foundry.info("arm the orphan record")
+
+    first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=10.0))
+    first.start()
+    assert orphan.in_close.wait(5.0), "the first shutdown is inside the orphan close"
+    assert _lifecycle._state._shutdown_running >= 1, "and has raised the counter"
+
+    second = threading.Thread(target=lambda: log_foundry.shutdown(timeout=10.0))
+    second.start()
+    second.join(0.5)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()  # built while at least one shutdown is still outstanding
+    assert _lifecycle._state._late_worker is not None, (
+        "a worker built while any shutdown is running must be registered for it — with a "
+        "boolean the first call to finish lowers the flag and this one is registered nowhere"
+    )
+
+    orphan.may_finish.set()
+    first.join(20.0)
+    second.join(20.0)
+
+    assert _lifecycle._state._shutdown_running == 0, "both calls lowered what they raised"
+    assert not _drain_threads(), "and neither returned leaving a live drain thread"
 
 
 def test_a_worker_built_after_shutdown_returned_still_delivers() -> None:
@@ -467,6 +556,10 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
     A transition may clear `_orphan_sink` only after deciding who performs the close it was
     holding, and this enumerates the sites that clear or re-point it so that a new one is a
     decision somebody takes rather than a default.
+
+    The set equality **is** the floor: an exact comparison against a hand-written table cannot
+    shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
+    while being strictly implied. Stated rather than asserted twice, as the sibling roster does.
     """
     dispositions = {
         ("_get_worker", "None"): "cleared — the worker adopted it, or this branch closes it",
@@ -492,7 +585,6 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
         f"with its disposition. missing: {sorted(set(dispositions) - found)}; "
         f"undeclared: {sorted(found - set(dispositions))}"
     )
-    assert len(found) >= 6, "the floor: a site may not leave this roster unnoticed"
 
 
 # --------------------------------------------------------------------------- FR-003
@@ -578,6 +670,43 @@ def test_a_sink_adopted_after_the_shutdown_returned_still_backs_off() -> None:
     start = time.monotonic()
     retry.wait(0.3, signal)
     assert time.monotonic() - start >= 0.25, "so it still backs off"
+
+
+def test_a_release_that_raises_still_drops_its_in_flight_registration() -> None:
+    """FR-003 AC-4's other half — the path a `try/finally` exists for.
+
+    `release()` propagates whatever `close()` raised, deliberately: the callers do not agree on
+    error handling and folding a `try/except` in would drop absorbed failures out of
+    `Health.sink.failed` (SPEC-042 FR-002). `FilteringSink`, `TransformSink` and `LogstashSink`
+    all propagate, so this path is reached by shipped code.
+
+    A leaked id is permanent and silent: every later `_offer_orphan_signal` for that object
+    returns early, so the sink keeps a stale — possibly set — stop event and backs off not at
+    all, which is the SPEC-033 FR-004 failure the in-flight discriminator was chosen to avoid.
+    """
+
+    class RaisingSink:
+        """Refuses its own close, the way a wrapper forwarding a child's failure does."""
+
+        log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Keeps nothing; this test asserts on the registration, not on delivery."""
+
+        def close(self) -> None:
+            """Raises, so `release` propagates and the `finally` is the only way back."""
+            raise RuntimeError("the transport refused to close")
+
+    sink = RaisingSink()
+    _lifecycle.stamp(sink)
+    with pytest.raises(RuntimeError):
+        _lifecycle.release(sink)
+    with _lifecycle._closing_now_lock:
+        registered = id(sink) in _lifecycle._closing_now
+    assert not registered, (
+        "a close that raised left its id registered — the sink is now permanently exempt from "
+        "the stop-signal refresh"
+    )
 
 
 def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -> None:
@@ -715,31 +844,50 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
 
 
 def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
-    """FR-005 AC-2. Narrowing the repair walk must not narrow SPEC-042's marking walk.
+    """FR-005 AC-2. Narrowing the repair walk must not cost the child its refusal.
 
-    `_inheritance_roots` reads `_orphan_closed_sink` **directly**, so the opt-out does not reach
-    it and an inherited superseded sink is still marked foreign and still unreleasable. Without
-    this, FR-005 could be "fixed" by making the child blind to the sink altogether, which would
-    let it close the parent's transport.
+    It does not, and the reason is worth stating because it is not the obvious one. The refusal
+    is grounded in `_owned`, where `configure()` stamped the sink with the **parent's** pid;
+    `_mark_inherited` uses `setdefault`, so it leaves that stamp alone, and `releasable` refuses
+    on `record[0] == pid`. `_inheritance_roots`' own docstring says the same from the other side
+    — `_owned.values()` is its load-bearing entry, and dropping any of the four live handles
+    "changes nothing, since each is itself stamped".
+
+    So this is a **regression guard, not a mutation target**, and saying so is the point: no edit
+    to FR-005's opt-out can break it, because `_FORK_SKIP` is read only by
+    `_fork._skipped_names` for the repair walk and the marking path never consults it. What it
+    does catch is a later change that reaches for the sink's record — clearing the slot, or
+    making `_mark_inherited` overwrite rather than `setdefault`. Both grounds are asserted, not
+    only the verdict, so a pass cannot come from the wrong place.
     """
     superseded, live = CountingSink("superseded"), CountingSink("live")
     log_foundry.configure(service="t", sink=superseded)
     log_foundry.info("to the sink that is about to be superseded")
     log_foundry.configure(sink=live)
     _lifecycle.join_closers(5.0)
+    assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
 
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
         os.close(read_fd)
-        verdict = _lifecycle.releasable(superseded)
-        os.write(write_fd, b"releasable" if verdict else b"refused")
+        with _lifecycle._owned_lock:
+            record = _lifecycle._owned.get(id(superseded))
+        answer = (
+            f"{'releasable' if _lifecycle.releasable(superseded) else 'refused'},"
+            f"{'recorded' if record is not None else 'unrecorded'},"
+            f"{'mine' if record is not None and record[0] == os.getpid() else 'not-mine'}"
+        )
+        os.write(write_fd, answer.encode())
         os._exit(0)
     os.close(write_fd)
     os.waitpid(pid, 0)
-    verdict = os.read(read_fd, 32).decode()
+    verdict = os.read(read_fd, 64).decode()
     os.close(read_fd)
-    assert verdict == "refused", "a child may release only a transport it acquired itself"
+    assert verdict == "refused,recorded,not-mine", (
+        f"the child answered {verdict!r}: it must refuse the inherited superseded sink, and "
+        "refuse it because the record says another process acquired it"
+    )
 
 
 def test_the_fork_opt_out_is_declared_where_the_walk_reads_it() -> None:
