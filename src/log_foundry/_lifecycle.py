@@ -1571,8 +1571,9 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     closer is not joined: the worker branch returns through :meth:`Worker.swap_sink`'s own
     deadline, ``join_closers`` grants the exit grace, and ``health().closing_sinks`` reports it
     live. The slot is single, so the worker's sink is latched **last** and wins: it is the case
-    that reproduces without a compound race, and the bound is the one ``architecture.md`` §13
-    already records for a latch that moves.
+    that reproduces without a compound race. The bound it had — the single slot's own — is gone:
+    SPEC-045 replaced that slot with a record of every owed sink, so ``architecture.md`` §13 no
+    longer states one, and the reasoning is in that spec's delivery doc.
 
     Args:
       new_sink: The sink already written to the config, to be made the live delivery target.

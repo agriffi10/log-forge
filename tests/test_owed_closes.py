@@ -384,7 +384,7 @@ def test_a_sink_shared_with_the_graph_that_replaces_it_is_not_stranded() -> None
     """FR-002 AC-3. `configure(A)` then `configure(MultiSink(A, B))`, A live inside the wrapper.
 
     The swap closes A while A is a child of the new live sink, which predates this spec and is
-    recorded in `architecture.md` §13. What must hold is that A is not left holding a buffer:
+    recorded in `architecture.md` §12. What must hold is that A is not left holding a buffer:
     it keeps taking events through the wrapper, so it is owed a further close. Measured at
     `A.LOST == 2` on a draft that vetoed the repeat close.
     """
