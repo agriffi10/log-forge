@@ -392,6 +392,18 @@ a content type a stock Logstash cannot parse (default now a JSON array; breaking
 that never left the process (now refuses while disconnected). It also found four `SentrySink`
 tests green only because CI never installs that extra.
 
+**SPEC-043 (Sentry backend selection) is Completed** — the behaviour those four pinned tests were
+hiding. `SentrySink` chose its backend on whether `sentry-sdk` *imports*, which is the wrong
+question in both directions: a caller passing `opener=` was silently given the SDK (measured
+`_http is None`, zero opener calls), and an installed-but-uninitialised SDK returned a
+`NonRecordingClient` whose no-op `capture_event` reported `sent=2` with nothing leaving the
+process. Selection is now `backend=` (`auto`/`sdk`/`http`), and the per-`emit` capability check
+runs under `sdk` too — there it makes an undeliverable client a refusal rather than choosing a
+backend. An argument no selectable backend can consume is a `ValueError`, and having no usable
+backend now routes into the total-failure raise it previously fell past. Its SDK path is verified
+against the real `sentry-sdk` in **SPEC-041's** extras leg of the unit suite, newly gated on
+`LOG_FOUNDRY_EXTRAS=1` so it **fails rather than skips** when the extras are expected.
+
 `docs/implementation-guide.md` remains the phase-level build reference behind the specs.
 
 ---
@@ -576,6 +588,22 @@ tests green only because CI never installs that extra.
   span read all zeros over total loss. A `MultiSink` child that reports nothing is charged to the
   fan-out in **events**, the unit `SinkLosses.failed` has, which is why `MultiSink.failed` — child
   *calls* — still stays out of the sum.
+  **And a backend is chosen on whether it can *deliver*, not on whether it imports** (SPEC-043).
+  `SentrySink` read an installed `sentry-sdk` as a working one, so an uninitialised process got a
+  `NonRecordingClient` whose no-op `capture_event` reported success — the same sink-the-worker-
+  believes shape, arriving through backend *selection* rather than through an absorbed failure.
+  The capability check runs **per `emit`**, because `sentry_sdk.init()` legitimately follows the
+  sink's construction and a once-at-construction answer would pin the wrong backend forever; it
+  reads **two** client members, since `is_active()` is a class discriminator and two of the three
+  undeliverable states report themselves active. `transport` is the member that binds, and **no
+  acceptance criterion can tell the pair from `transport` alone** — recorded in the spec so a
+  green AC is not read as evidence for `is_active()`. A client publishing neither member is
+  *usable*, so the check cannot break an injected double. Selection is otherwise the caller's:
+  `backend=` names it, an explicit `"sdk"` that cannot deliver is a refusal rather than a silent
+  diversion to HTTP — substituting a backend quietly is this defect in a new place — and an
+  argument no selectable backend can consume is a `ValueError`, not an ignore. That last rule
+  covers the two *injection* arguments only, since an explicit `max_retries=3` is
+  indistinguishable from the default. (SPEC-043)
 - **A sink's wait is bounded, interruptible, and never taken on a destination's word** — one
   drain thread means a sink's backoff pauses *all* delivery, and it spans `shutdown()`, so
   `time.sleep` is the wrong primitive: every sink waits on the worker's stop event, pushed onto it

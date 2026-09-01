@@ -1,7 +1,7 @@
 # Spec: Sentry Backend Selection
 
 **ID:** SPEC-043  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-08-31  
 **Depends On:** SPEC-026, SPEC-032, SPEC-041
 

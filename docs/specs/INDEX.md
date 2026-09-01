@@ -47,7 +47,7 @@ to status only — no prose.
 | [SPEC-040](SPEC-040-lifecycle-ownership.md) | Lifecycle Ownership — One Owner for the Worker and the Sink | Completed | SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039 |
 | [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | Completed | SPEC-026, SPEC-027, SPEC-038 |
 | [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039 |
-| [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | In Progress | SPEC-026, SPEC-032, SPEC-041 |
+| [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | Completed | SPEC-026, SPEC-032, SPEC-041 |
 | [SPEC-044](SPEC-044-lifecycle-races.md) | Lifecycle Races | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042 |
 | [SPEC-045](SPEC-045-every-owed-close-is-performed.md) | Every Owed Close Is Performed | Completed | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
 | [SPEC-046](SPEC-046-concurrent-owed-closes.md) | Concurrent Owed Closes | Completed | SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045 |
