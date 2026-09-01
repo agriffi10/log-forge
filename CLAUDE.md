@@ -335,6 +335,14 @@ named**; three of the four were caught by the review gate, one by a mutation swe
 corrected the repo's own contract, which mandated a reviewer gate on the PR grouping that does not
 exist.
 
+**SPEC-045 (every owed close is performed) is Completed** — the residual SPEC-044 measured,
+recorded and deliberately did not fix, which turned out to be recorded the wrong way round. Not a
+sink closed twice but the **live** sink closed by nobody: the orphan path's owed-close record was
+a single slot, so a preempted `info()` armed a superseded sink over the live one and its buffer
+was never delivered. `_orphan_sink` became `_orphan_owed` with one `take_orphan_owed()`
+transition. **Its own spec was rewritten mid-build after two reviews measured the first design
+losing data**, and both discarded designs are in its revision history rather than deleted.
+
 **SPEC-042 (forked-child sink ownership) is Completed** — a forked child closed transports it
 never opened: a `configure(sink=…)` sent a connection sink's protocol goodbye and the **parent's**
 next write failed with `ECONNRESET`, a `shutdown()` closed the inherited object, and at exit both
@@ -720,8 +728,21 @@ tests green only because CI never installs that extra.
   retirement fence would have superseded silently. What stays open and is recorded rather than
   half-fixed: `shutdown(timeout=)` does not bound the live sink's `close()` on either path (both
   bounding mechanisms were built and reverted; the third needs an interruptible `Sink.close`),
-  and two concurrent `configure(sink=…)` threads still double-close a sink at the same rate as
-  before. (SPEC-044, arch §13)
+  and ~~two concurrent `configure(sink=…)` threads still double-close a sink at the same rate as
+  before~~ — **SPEC-045 found that item was the wrong way round.** (SPEC-044, arch §13)
+  **The record of which sinks the orphan path owes a close for is a set, not a slot**, and the
+  defect was never a sink closed twice: it was the **live** sink closed by nobody. Arming a
+  second sink discarded the first, so an ordinary `info()` that resolved a sink and was preempted
+  armed a superseded sink over the live one — measured `C.closes == 0` with every `configure()`
+  call sequential on one thread, which is what rules out a lock around a call documented as not
+  thread-safe. A sink written to *after* its close has something new to flush, so a second close
+  is owed rather than spurious: refusing it was built and measured stranding 2 of 3 events on a
+  wrapper graph and losing on 31 of 80 fuzz seeds against 0 before, and two narrower variants
+  each still lost. The set removes the trade instead of choosing a side. `_orphan_closed_sink`
+  stays separate and unchanged — it names a sink a swap left *open*, which is a different claim
+  from one that was closed. **Every site that consumes the record needs its own test**: three of
+  the four consuming loops were found by mutation, not review, and the swap's worker branch
+  survived a truncating mutant even after its no-worker sibling had one. (SPEC-045, arch §13)
 - **A public accessor hands out a copy; the library reads the live object** — `get_config()` and
   `get_baggage()` copy, because a public getter documented "do not mutate" is a promise the
   caller's slip breaks silently, while `config._live_config()` and `context._live_baggage()` are
