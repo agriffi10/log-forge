@@ -5,10 +5,74 @@ name: Zizmor
 # `id-token: write` against PyPI Trusted Publishing, so a defect in a workflow file is a defect
 # upstream of every consumer's `pip install` (SPEC-022 FR-006).
 
+# Path-filtered on both triggers: a pull request that touches none of the files this audit reads
+# cannot change its verdict, and re-running it on the push that merges a tree already audited on
+# the pull request answers the same question twice. Measured over the two weeks to 2026-09-01:
+# 29 pull-request runs and 21 push runs, the overwhelming majority against trees with no auditable
+# file changed at all.
+#
+# THE WEEKLY SCHEDULE IS WHAT MAKES THE FILTER SAFE, and it is here because the list below was
+# got wrong twice. A first pass listed only workflows and actions, missing `.github/dependabot.yml`
+# — whose `cooldown` settings `CLAUDE.md` calls load-bearing, audited by zizmor's
+# `dependabot-cooldown` rule. A second pass, whose comment claimed to be every input zizmor reads,
+# still missed zizmor's OWN config file, which can `disable` an audit outright. With no schedule,
+# each of those was a permanent hole rather than a late run: a pull request adding
+# `.github/zizmor.yml` to disable `template-injection` would have matched no glob, been audited on
+# neither the PR nor the merge, and silently suppressed that audit for every run afterwards.
+#
+# So the list is no longer load-bearing on its own. It is the fast path — a real workflow change is
+# still audited on the pull request that makes it — and the Monday run is the backstop that bounds
+# any gap in it to seven days, which is exactly the trade `pip-audit.yml` and `scorecard.yml`
+# already make. A roster maintained by hand rots; this one now fails late instead of failing open.
+#
+# The schedule earns its keep a second way. Five audits are ONLINE — `known-vulnerable-actions`,
+# `impostor-commit`, `stale-action-refs`, `typosquat-uses`, `ref-confusion` — and consult GitHub
+# Advisories rather than the tree, so their verdict changes with no file changing at all. Before
+# this filter existed that was covered accidentally, by zizmor running on every push and pull
+# request. A path filter with no schedule would have removed it; Dependabot's `github-actions`
+# security updates are a backstop, but they are not this check.
+#
+# Paths that do not exist here yet are listed deliberately (`.github/actions/**`,
+# `.pre-commit-config.yaml`, the `zizmor.*` names, `action.yml` at any depth): a filter that
+# silently stops covering an input the moment one is added is the failure mode this file has now
+# been an instance of twice. `action.yml` is matched both bare and under `**/`, because a leading
+# `**/` does not match a path with no directory component.
 on:
+  # Monday, offset off the hour and away from pip-audit (05:23), scorecard (06:41) and
+  # integration (07:17), for the reason those three stagger: a scheduling stampede is served
+  # late and unpredictably.
+  schedule:
+    - cron: "53 4 * * 1"
+  workflow_dispatch:
   pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
+      - ".pre-commit-config.yaml"
+      - ".github/zizmor.yml"
+      - ".github/zizmor.yaml"
+      - "zizmor.yml"
+      - "zizmor.yaml"
+      - "action.yml"
+      - "action.yaml"
+      - "**/action.yml"
+      - "**/action.yaml"
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/dependabot.yml"
+      - ".pre-commit-config.yaml"
+      - ".github/zizmor.yml"
+      - ".github/zizmor.yaml"
+      - "zizmor.yml"
+      - "zizmor.yaml"
+      - "action.yml"
+      - "action.yaml"
+      - "**/action.yml"
+      - "**/action.yaml"
 
 permissions:
   contents: read

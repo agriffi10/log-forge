@@ -1272,15 +1272,24 @@ Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.m
 
 ### Continuous integration
 
-Every pull request and every push to `main` runs the same set of checks:
+Every pull request runs the checks below. A check whose verdict cannot change on the tree in
+front of it is path-filtered rather than run to the same answer twice, so the *When* column is
+part of the contract:
 
-| Check | Does | Fails the build |
-|---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | yes |
-| [`spec-lint.yml`](.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | yes |
-| [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | yes |
-| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | no — reports to code scanning |
-| CodeQL | `python` + `actions`, `extended` query suite; also weekly | no — reports to code scanning |
+| Check | Does | When | Fails the build |
+|---|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | every PR | yes |
+| [`spec-lint.yml`](.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | specs touched | yes |
+| [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | every PR | yes |
+| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflow, action, dependabot or zizmor config touched; also weekly | no — reports to code scanning |
+| CodeQL | `python` + `actions`, `extended` query suite; also weekly | every PR | no — reports to code scanning |
+
+On a push to `main` the full `ci.yml` matrix still runs, but as the first job of
+[`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it is
+allowed to publish — so on main the checks are listed under the *Release* workflow, named
+`test / test (py3.12)` and `test / test (py3.13)`. `ci.yml` deliberately carries no `push`
+trigger of its own; it had one, and the result was that every merge ran the identical matrix
+twice. A `v*` tag is gated the same way, by that same reusable call.
 
 CodeQL runs as GitHub's **default setup** — a repository setting, not a workflow file, which is
 why there is no `codeql.yml` here (adding one would disable the default setup and silently stop

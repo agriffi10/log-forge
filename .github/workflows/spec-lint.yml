@@ -6,8 +6,16 @@ on:
       - "docs/specs/**"
       - "scripts/spec-lint.sh"
       - ".github/workflows/spec-lint.yml"
+  # The same filter as the pull_request trigger above, which this one was missing: the lint reads
+  # `docs/specs/` and the script that lints it, so a merge touching neither cannot change its
+  # verdict. The asymmetry was the oversight — a filtered pull request and an unfiltered push mean
+  # every merge re-ran a lint that had already passed on the identical tree.
   push:
     branches: [main]
+    paths:
+      - "docs/specs/**"
+      - "scripts/spec-lint.sh"
+      - ".github/workflows/spec-lint.yml"
 
 permissions:
   contents: read

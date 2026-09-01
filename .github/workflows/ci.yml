@@ -1,15 +1,69 @@
 name: CI
 
+# Deliberately NOT `push: branches: [main]`. `release.yml` runs on that same push and its first
+# job is `uses: ./.github/workflows/ci.yml` — this identical gate, on the identical tree — so a
+# push trigger here ran the whole matrix a second time for no extra answer. Measured over the two
+# weeks to 2026-09-01: 21 merges, each firing a redundant 2-job matrix at ~155 s a leg.
+#
+# The gate is not weakened by dropping it. A merge to main is still fully tested, by the copy
+# release.yml calls before it is allowed to publish, and a `v*` tag was only ever covered by that
+# copy (this workflow never had a tag trigger). What changes is the check-run NAME on main: the
+# reusable call nests the job, so it is `test / test (py3.12)` (under the `Release` workflow)
+# rather than `test (py3.12)`. Verified against the check-runs API on `19d0593`, which carried
+# both spellings while the duplicate still existed.
+#
+# Safe today because the `main` ruleset (17871200) has no `required_status_checks` rule at all —
+# checked, rather than assumed from the review requirement, which is a separate rule and is in
+# fact `required_approving_review_count: 0`. If a check is ever made required, the string to
+# require on main is `test / test (py3.12)`, NOT a `Release /`-prefixed one: a ruleset matches the
+# check-run name, and the workflow name is only what the UI shows beside it.
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_call:   # allow release.yml to run this same gate before publishing
+  # Restores a side-effect-free way to re-run this gate on `main`. Without it, dropping the push
+  # trigger left re-running `Release` as the only option — and that job chain ends in
+  # `publish-dev`, holding `id-token: write` against PyPI. It is safe to re-run (`skip-existing`),
+  # but exercising the publish path to answer a test question is the wrong tool. The concurrency
+  # group below needs no change: a dispatch is not a `pull_request`, so it takes the unique
+  # `run_id` branch and cannot displace anything.
+  workflow_dispatch:
 
 # Least privilege, stated rather than inherited from the repository default. This gate only
 # reads the tree; release.yml, which calls it, requests id-token separately for its own jobs.
 permissions:
   contents: read
+
+# Supersede a pull request's own in-flight run when it is pushed to again — and give every other
+# invocation a group of its own.
+#
+# THE GROUP IS THE LOAD-BEARING PART, not `cancel-in-progress`. Under `workflow_call` the whole
+# `github` context is the CALLER's: `github.workflow` is "Release", not "CI", and `github.ref` is
+# `refs/heads/main`. So the obvious `${{ github.workflow }}-${{ github.ref }}` collapses every
+# merge to main into ONE group — and a queued run is not merely delayed, it is displaced: GitHub
+# cancels a `pending` run when a newer one arrives in its group. Merges A, B, C landing together
+# would cancel B's `test`, which skips `build` (`needs: test`) and therefore `publish-dev`, so B
+# would never be tested on main and never ship its `devN`. That would be this workflow cancelling
+# the very gate the dropped `push` trigger above delegates to.
+#
+# Hence the literal `ci-` prefix and the `run_id` fallback. A pull request keys on its own ref and
+# supersedes itself; every non-pull-request invocation keys on the caller's run id, which is
+# unique per release, so it can never queue behind or displace another. The prefix also keeps this
+# out of any group `release.yml` might later derive from `github.workflow`, which the GitHub docs
+# warn would cancel the caller.
+#
+# Two notes for a future editor, because the ternary keys on the EVENT rather than on this
+# workflow. If it ever regains a `push` trigger, every push gets a unique group and nothing
+# supersedes — that is the intent, but it is not obvious. And if another workflow ever calls this
+# one on a `pull_request` event, the nested run and this workflow's own direct run would both key
+# on `ci-refs/pull/N/merge` and cancel each other; that case needs the group to distinguish the
+# caller, not just the event.
+#
+# Honest accounting: this saved nothing over the sample window — 29 pull-request runs, zero
+# superseded — because the workflow here is one push watched to green. It is insurance against
+# the case where two pushes land close together, not a measured saving.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -32,6 +86,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Deliberately uncached, and the measurement is why. Installing Poetry and the dev group
+      # takes ~18 s of a ~166 s job; the tests take ~141 s. Caching the smaller half would also
+      # put a restorable cache into the workflow `release.yml` calls immediately before it
+      # publishes to PyPI with `id-token: write` — the cache-poisoning shape zizmor audits for.
+      # Not worth ~5 s on the one path where a poisoned input reaches consumers.
       - name: Install Poetry
         run: pipx install poetry
 
@@ -44,5 +103,29 @@ jobs:
       - name: Type check (mypy)
         run: poetry run mypy
 
+      # `-n 8 --dist load`, not the default serial run and not `-n auto`.
+      #
+      # The suite is sleep-bound rather than CPU-bound — 1,871 tests, ~116 s of wall clock at 7%
+      # CPU — because this library's promises ARE bounds, and a bound is proved by waiting for it.
+      # Two tests in test_orphan_sink_handoff.py block 30 s each on a deliberately wedged sink, so
+      # they alone are half the serial run. That shape is why the worker count is 8 on a 4-vCPU
+      # runner: the workers are overwhelmingly blocked, not computing, so `-n auto` (which reads
+      # the CPU count, giving 4) leaves most of the win on the table. Measured locally, same
+      # 1,871 passed / 5 skipped every time:
+      #
+      #     serial               125.9 s
+      #     -n 4  --dist load     75.7 s
+      #     -n 8  --dist load     40.8 s   <- chosen
+      #     -n 12 --dist load     38.6 s   (knee; the floor is the two 30 s tests)
+      #
+      # `--dist load` rather than `--dist loadfile`: loadfile keeps a module on one worker, which
+      # pins those two 30 s tests to the same process and floors the run at ~72 s regardless of
+      # worker count (measured at -n 8 and -n 12). Per-test distribution is what breaks them apart.
+      #
+      # Verified before adopting: the collected test-name sets are identical serial vs parallel
+      # (1,876 each, empty diff — a pass count alone would not have shown a test going missing),
+      # and five consecutive parallel runs were green at 40.78-41.06 s.
+      #
+      # To debug a failure serially, drop the flags: `poetry run pytest` is unchanged.
       - name: Test (pytest)
-        run: poetry run pytest
+        run: poetry run pytest -n 8 --dist load

@@ -34,6 +34,25 @@ on:
 permissions:
   contents: read
 
+# The most valuable place in this repository to supersede a stale run: nine service containers,
+# an image-pull path and a JVM start make this the longest job here (~296 s against CI's ~155 s),
+# so a pull request pushed to twice would otherwise hold two full sets of containers at once.
+# `cancel-in-progress` is an expression, but NOT for the reason it would be easy to write here: a
+# scheduled run on `main` and a pull request are already in different groups (`...-refs/heads/main`
+# against `...-refs/pull/N/merge`), so the expression is not what keeps a pull request from
+# cancelling the weekly run. What it actually prevents is a `workflow_dispatch` on `main`
+# displacing a schedule on `main`, which DO share a group — and that weekly run is the one
+# deciding whether this job has earned its way into the ruleset, so it should not be discardable
+# by someone clicking Run workflow. Note the protection is not total: `cancel-in-progress`
+# governs a RUNNING run, while a run still `pending` in a group is replaced by a newcomer
+# regardless — so a dispatch arriving while Monday's run is queued would still displace it.
+#
+# The caller-context trap that forced `ci.yml`'s group to be rewritten does not reach here: this
+# workflow has no `workflow_call` trigger, so `github.workflow` and `github.ref` are its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   integration:
     name: sinks against real services
@@ -86,7 +105,16 @@ jobs:
         # `LOG_FOUNDRY_INTEGRATION` — that one gates `tests/integration` and its name would lie.
         env:
           LOG_FOUNDRY_EXTRAS: "1"
-        run: poetry run pytest tests
+        # Parallel for the same measured reason as `ci.yml` (125.9 s -> 40.8 s): this is the whole
+        # unit suite a second time, and it is the same sleep-bound suite.
+        #
+        # Deliberately NOT applied to `tests/integration` above. Those tests share nine real
+        # services — one Kafka topic, one Postgres table, one syslog socket — so distributing them
+        # across processes would have them reading each other's writes, and a test that asserts a
+        # delivered count is exactly the kind that would then fail intermittently. The service
+        # suite is seconds; the win here is entirely in the unit re-run, so the parallelism goes
+        # only where it is both safe and worth something.
+        run: poetry run pytest tests -n 8 --dist load
 
       - name: Service logs on failure
         if: failure()

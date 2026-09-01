@@ -13,8 +13,23 @@ name: pip-audit
 on:
   schedule:
     - cron: "23 5 * * 1"    # Mondays, offset off the hour to avoid the scheduling stampede
+  # Path-filtered, for the reason stated just above: the unique value here is the SCHEDULED
+  # re-examination, and an advisory is published on the advisory database's clock rather than on
+  # this repository's. A merge that touches no dependency-defining file re-resolves the identical
+  # environment and re-asks the identical question — 21 such runs over the two weeks to
+  # 2026-09-01, nearly all of them docs and `src/` merges.
+  #
+  # What is kept is the case where a merge really can change the answer: the lockfile or the
+  # extras moved, or a suppression was added or withdrawn. `.github/pip-audit-ignores.txt` is in
+  # the list because removing an entry there is exactly how a previously-silenced advisory becomes
+  # a red build, and it must not need a week to surface.
   push:
     branches: [main]
+    paths:
+      - "poetry.lock"
+      - "pyproject.toml"
+      - ".github/pip-audit-ignores.txt"
+      - ".github/workflows/pip-audit.yml"
   workflow_dispatch:
 
 permissions:
