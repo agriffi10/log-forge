@@ -1374,9 +1374,11 @@ def _close_owed(sink: Sink) -> None:
     about itself. It is the same guard :func:`_close_guarded` applies for a swapped-out sink, with
     the ``_diag`` text of the site it actually is (SPEC-029).
 
-    It records nothing in the closed-sink latch. :func:`_close_orphan_sink` latches every owed
-    sink under ``_state._lock`` before any close starts, which is what stops a racing emit
-    re-arming one that is being closed.
+    It records nothing in the closed-sink latch. :func:`_close_orphan_sink` **empties the owed
+    record** under ``_state._lock`` before any close starts, which is what stops two callers
+    performing the same close. The closed-sink latch is a single slot and holds only the last of
+    them — unchanged by SPEC-046, and why a racing emit can still re-arm one of the others is
+    recorded in ``architecture.md`` §13.
 
     Args:
       sink: The sink to close.
@@ -1385,7 +1387,13 @@ def _close_owed(sink: Sink) -> None:
       None.
 
     Raises:
-      None.
+      None. ``Exception``, never ``BaseException`` — the SPEC-025 line. On the calling thread that
+        keeps a ``KeyboardInterrupt`` or ``SystemExit`` reaching the caller as that decision
+        requires; on a fan-out thread it cannot, because there is no caller to reach. CPython's
+        ``threading.excepthook`` announces an interrupt itself and discards a ``SystemExit``, so
+        one raised by a threaded close is reported by the runtime rather than by this library and
+        does not propagate. That is :func:`_close_guarded`'s shipped behaviour too; it is stated
+        here rather than left to be discovered.
     """
     try:
         release(sink)
@@ -1489,9 +1497,17 @@ def _close_orphan_sink() -> None:
     the §13 entry recording that a daemon close of *this* sink was built and reverted because
     exit can kill it inside ``SQLiteSink.commit()``. Joining every close avoids all three, and is
     strictly better than the sequential drain on both axes: the cost falls and the loss stays
-    zero. The threads are daemons only so that a ``BaseException`` escaping the join loop — which
-    SPEC-025 requires to reach the caller — cannot keep the interpreter alive; the join, not the
-    flag, is what guarantees each close completes.
+    zero. The threads are daemons only so that one which somehow outlives the join cannot keep the
+    interpreter alive; the join, not the flag, is what guarantees each close completes.
+
+    **The join is in a ``finally``**, so a ``BaseException`` — the ``KeyboardInterrupt`` SPEC-025
+    requires to reach the caller — waits for the started closes before it propagates. Without it,
+    a Ctrl-C during ``shutdown()`` returned with every fan-out close abandoned *mid-write*, where
+    the sequential drain abandoned one and had merely not started the rest: measured 4 killed
+    mid-write against 1, which trades a leaked resource for a corrupt one and is the wrong side
+    of the ordering §13 records for exactly this hazard. The interrupt still reaches the caller;
+    it is delayed by the closes already in flight, which is the same wait the inline close has
+    always imposed.
 
     A thread that will not start is closed **inline** instead, which is the opposite of
     :func:`_start_closer`'s refusal and deliberately so: that helper is spending a caller's
@@ -1521,24 +1537,28 @@ def _close_orphan_sink() -> None:
         return
     inline = _inline_close_choice(owed)
     started: list[threading.Thread] = []
-    for sink in owed:
-        if sink is inline:
-            continue
-        closer = threading.Thread(
-            target=_close_owed, args=(sink,), name="log-foundry-owed-close", daemon=True
-        )
-        try:
-            closer.start()
-        except Exception as exc:
-            _diag.absorbed(
-                "starting the thread that closes an owed sink", exc, "it is closed inline instead"
+    try:
+        for sink in owed:
+            if sink is inline:
+                continue
+            closer = threading.Thread(
+                target=_close_owed, args=(sink,), name="log-foundry-owed-close", daemon=True
             )
-            _close_owed(sink)
-        else:
-            started.append(closer)
-    _close_owed(inline)
-    for closer in started:
-        closer.join()
+            try:
+                closer.start()
+            except Exception as exc:
+                _diag.absorbed(
+                    "starting the thread that closes an owed sink",
+                    exc,
+                    "it is closed inline instead",
+                )
+                _close_owed(sink)
+            else:
+                started.append(closer)
+        _close_owed(inline)
+    finally:
+        for closer in started:
+            closer.join()
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 

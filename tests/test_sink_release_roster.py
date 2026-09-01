@@ -602,10 +602,10 @@ _LATCH_DISPOSITIONS = {
         "and latching here would overwrite that requester's more recent record"
     ),
     ("_lifecycle", "_close_owed"): (
-        "records nothing, and does not need to: `_close_orphan_sink` latches *every* owed sink "
-        "under _state._lock before any close starts, so a racing emit cannot re-arm one that is "
-        "being closed. The close moved out of that function into this helper when SPEC-046 made "
-        "the owed closes concurrent, and the latch stayed where the lock is"
+        "records nothing, and does not need to: `_close_orphan_sink` empties the owed record "
+        "under _state._lock before any close starts, so two callers cannot perform the same "
+        "close. The latch itself is a single slot holding only the last of them, unchanged by "
+        "SPEC-046 -- which moved the close out of that function into this helper"
     ),
     ("_lifecycle", "_get_worker"): (
         "latches: the transition owns this close because the worker it just built did not adopt "

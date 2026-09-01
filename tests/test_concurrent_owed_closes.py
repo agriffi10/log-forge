@@ -205,6 +205,11 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
     object that is not owed at all. The inline close would then run against a sink the record
     never armed and never latched, leaving every owed sink on a thread and admitting a second
     close of the impostor. No shipped sink is a dataclass, so nothing in-tree would catch it.
+
+    **Two owed sinks, not one.** There are two identity tests, and the second was unpinned: the
+    fan-out loop's `sink is inline`. Mutated to `==` it survives the whole suite with one owed
+    sink — `==` skips nothing there — and silently drops an owed close as soon as there are two.
+    Measured, then pinned.
     """
     import dataclasses
 
@@ -235,10 +240,14 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
             self.closes += 1
 
     owed_sink = EqualSink()
+    second_owed = EqualSink()
     twin = EqualSink()
-    assert owed_sink == twin and owed_sink is not twin, "the two compare equal but are not one"
+    assert owed_sink == twin == second_owed, "all three compare equal"
+    assert owed_sink is not twin and owed_sink is not second_owed, "and none is another"
+
 
     _arm(owed_sink)
+    _lifecycle._note_orphan_emit(second_owed)
     from log_foundry import config as config_module
 
     _lifecycle.stamp(twin)
@@ -246,10 +255,14 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
 
     log_foundry.shutdown(timeout=1.0)
 
-    assert owed_sink.closes == 1, f"the sink that was owed is the one closed, got {owed_sink!r}"
+    assert owed_sink.closes == 1 and second_owed.closes == 1, (
+        f"both owed sinks were closed — got {owed_sink!r} {second_owed!r}. Two of them is what "
+        "exercises the fan-out loop's own identity test: with one, `sink == inline` skips "
+        "nothing and the loss does not appear"
+    )
     assert twin.closes == 0, (
-        f"and the equal-but-distinct object the config names is not, got {twin!r} — membership "
-        "must be identity, since `in` is value equality"
+        f"and the equal-but-distinct object the config names is not closed, got {twin!r} — "
+        "membership must be identity, since `in` and `==` are value equality"
     )
 
 
