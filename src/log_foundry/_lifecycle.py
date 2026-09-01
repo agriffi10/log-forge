@@ -1061,6 +1061,13 @@ def release(sink: Sink, *, detached: bool = False, owner: object = None) -> thre
     and being handed the sink again through :func:`stamp` restores it, so a sink passed to
     ``configure()`` twice is still closed twice.
 
+    It reaches a caller's own ``close()`` too, wherever that forwards through here. A wrapper
+    the library was never handed is unrecorded and still forwards every time, but
+    ``configure(sink=A)`` followed by the caller closing ``A`` through a wrapper of its own
+    performs A's one close *there* — so the exit close is skipped rather than repeated. That is
+    the rule working, not an exception to it, and it is the one place a caller can observe the
+    change without having raced anything.
+
     The claim is taken **where the close happens**, not where it is requested. A detached release
     spawns its closer without claiming and the thread body claims through this same function, so
     a detached close racing an inline one performs exactly one close — whichever claims first —

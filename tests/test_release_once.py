@@ -74,6 +74,23 @@ class RefusingSink(CountingSink):
             self.events += len(batch)
 
 
+def _is_docstring(statement: object) -> bool:
+    """Whether a statement is a docstring, so a lint over calls does not read prose.
+
+    Args:
+      statement: A statement from a function body.
+
+    Returns:
+      Whether it is a bare string expression.
+
+    Raises:
+      None.
+    """
+    import ast
+
+    return isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+
+
 def _emit(build_worker: bool, message: str) -> None:
     """Logs one event down the path under test.
 
@@ -223,6 +240,8 @@ def test_concurrent_releases_of_one_sink_close_it_once() -> None:
     few instructions and no unforced rate reaches it. That is SPEC-028's finding repeated — a
     bare `+=` lost zero across 1.6M concurrent increments — and its answer applies here too, so
     the structural property is asserted by the test below rather than hoped for by this one.
+    Measured: the split mutant passed every behavioural test in this file and was killed only by
+    that structural one.
     """
     from conftest import run_concurrently
 
@@ -240,7 +259,7 @@ def test_the_claim_tests_and_marks_under_one_acquire() -> None:
 
     A `_claim_release` that tests `_released` under one acquire and sets it under another admits
     two threads past the test, and both then close. The behavioural test above cannot see it —
-    measured, the split mutant passed all thirteen tests in this file — so the invariant is
+    measured, the split mutant passed every behavioural test in this file — so the invariant is
     asserted where it is decidable: the function takes `_owned_lock` exactly **once**, and both
     the membership test and the mark live inside that block.
 
@@ -516,13 +535,28 @@ def test_the_unlocked_fast_path_takes_no_further_lock() -> None:
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef) and node.name == "_note_orphan_emit"
     )
-    before_lock = [stmt for stmt in note.body if not isinstance(stmt, ast.With)]
-    rendered = "\n".join(ast.unparse(stmt) for stmt in before_lock)
-    assert "_was_released" not in rendered, (
-        f"the released test is on the unlocked fast path, which takes _owned_lock per event:\n"
-        f"{rendered}"
+    before_lock = [
+        stmt
+        for stmt in note.body
+        if not isinstance(stmt, ast.With) and not _is_docstring(stmt)
+    ]
+    on_the_fast_path = {
+        ast.unparse(node.func)
+        for stmt in before_lock
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+    }
+    assert "_was_released" not in on_the_fast_path, (
+        "the released test is called on the unlocked fast path, which takes _owned_lock on "
+        f"every orphan event. Calls there: {sorted(on_the_fast_path)}"
     )
-    assert "_was_released" in ast.unparse(note), "and it is present somewhere in the function"
+    anywhere = {
+        ast.unparse(node.func) for node in ast.walk(note) if isinstance(node, ast.Call)
+    }
+    assert "_was_released" in anywhere, (
+        "and it is called somewhere in the function — a docstring mentioning it is not a guard, "
+        "which is how the first draft of this assertion could be satisfied by prose"
+    )
 
 
 # --------------------------------------------------------------------------- FR-004

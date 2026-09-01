@@ -348,8 +348,8 @@ tolerate a concurrent `emit` (§9, SPEC-028).
 
 `configure()` remains a startup call and is not thread-safe. A span finishing on another thread
 during a swap may land on either sink; what is guaranteed is that everything submitted *before* the
-call reached the old one — and, since SPEC-045, that the sink is closed exactly once per time it
-was handed over, which is a property of the *close* and buys the routing nothing. The `_worker` read that selects between the two paths *is* taken under
+call reached the old one — and, since SPEC-045, that the sink is closed exactly once per time
+it was handed over, which is a property of the *close* and buys the routing nothing. The `_worker` read that selects between the two paths *is* taken under
 the process lock, because it decides whether this call may close a sink at all — unlocked, a first
 `@trace` mid-construction on another thread would have its sink closed underneath it.
 

@@ -645,6 +645,11 @@ def test_every_site_that_arms_the_orphan_record_declares_its_released_dispositio
     measured `A.closes == 2` with `C.closes == 0`. Two of the three arming sites must therefore
     consult `_was_released`; the third must not, and its exemption is written down here rather
     than inferred from its absence.
+
+    It matches **call nodes**, not the unparsed source. The first draft substring-matched the
+    whole `FunctionDef`, docstring included, so removing both guards and adding the words
+    "see `_was_released`" to their docstrings passed — measured by a reviewer, not reasoned. A
+    lint whose subject is a call has to look at calls.
     """
     consultation = {
         ("_note_orphan_emit", "sink"): True,
@@ -658,8 +663,12 @@ def test_every_site_that_arms_the_orphan_record_declares_its_released_dispositio
         f"undeclared: {sorted(set(arming) - set(consultation))}"
     )
     for site, must_consult in consultation.items():
-        source = ast.unparse(arming[site])
-        assert ("_was_released" in source) is must_consult, (
+        calls = {
+            ast.unparse(node.func)
+            for node in ast.walk(arming[site])
+            if isinstance(node, ast.Call)
+        }
+        assert ("_was_released" in calls) is must_consult, (
             f"{site[0]} {'must' if must_consult else 'must not'} consult the released record. "
             "_swap_sink is the exemption: what it arms is the sink configure() just installed — "
             "the caller's chosen live target, not a stale one — so refusing there would leave "

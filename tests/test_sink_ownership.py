@@ -669,8 +669,7 @@ def test_an_orphan_log_performs_no_stamp_walk(monkeypatch: pytest.MonkeyPatch) -
 def test_the_lazy_default_is_stamped_and_the_fast_path_is_not() -> None:
     """AC-10's other half: the construction branch is an acquisition and must record one."""
     config._config = config.Config()
-    with _lifecycle._owned_lock:
-        _lifecycle._owned.clear()
+    _clear_records()
 
     default = config._ensure_sink()
     assert _lifecycle.releasable(default) is True, "the zero-config default is acquired here"
@@ -778,6 +777,20 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
 
     assert not isinstance(_lifecycle._owned_lock, type(threading.RLock())), (
         "a non-reentrant Lock is the choice (SPEC-028): an RLock would hide the re-entry above"
+    )
+
+    inner = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_releasable_locked"
+    )
+    inner_calls = {
+        ast.unparse(node.func) for node in ast.walk(inner) if isinstance(node, ast.Call)
+    }
+    assert inner_calls <= {"_owned.get", "id"}, (
+        f"_releasable_locked calls {sorted(inner_calls)}. Permitting a *function* above makes "
+        "this walk non-transitive -- anything added inside it runs under the record lock while "
+        "escaping the check entirely -- so the one function on that list carries its own"
     )
 
 
