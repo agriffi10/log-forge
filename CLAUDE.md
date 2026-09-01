@@ -149,8 +149,10 @@ a span. An over-long integer is now replaced by `<int: ~N digits>`, mapping keys
 the last hole in SPEC-017's own guarantee. Shipped in **`v0.7.1`**.
 **SPEC-021 (open-item cleanup) is Completed** — the 017..020 arc left 18 delivery-doc notes and
 `architecture.md` §12 had carried 3 open items since before the first line of code, two of them
-false by then. Every one is now fixed, settled, or recorded as a constraint, and §12 carries no
-open items. The real wart is gone: `flush()` returned `True` when the drain it forced was
+false by then. Every one is now fixed, settled, or recorded as a constraint, and ~~§12 carries no
+open items~~ — **superseded 2026-09-01**: §12 was emptied honestly then, but four unfinished
+items later accumulated in §13 among its constraints while the heading still read "None". §12
+holds them again, each naming what would close it. The real wart is gone: `flush()` returned `True` when the drain it forced was
 abandoned — a false success in the serverless path it was built for. It now reports whether
 anything was lost while the call was outstanding. Also: the terminal-failure line counts the queue,
 and the integer ceiling counts the minus sign.
@@ -463,8 +465,15 @@ tests green only because CI never installs that extra.
 - **An open item is closed by being fixed, settled, or recorded as a constraint — never deleted** —
   a note that is merely removed takes its reasoning with it, and a reader cannot tell a live defect
   from a decision that reads like one. Superseded notes are struck through in place and marked with
-  the spec that closed them; `architecture.md` §12 carries no open items and §13 states the
-  constraints. (SPEC-021)
+  the spec that closed them. ~~`architecture.md` §12 carries no open items and §13 states the
+  constraints.~~ — **superseded 2026-09-01.** The rule is one-way by construction: §13 grew from
+  68 lines to 640 over seventeen specs with nothing pruning it, and unfinished work accreted
+  there among the constraints while §12 read "None". **§12 is what is unfinished** — a defect
+  nobody scheduled or a question left open, each entry naming what would close it — and **§13 is
+  what the design will not do**, a limit it accepts and keeps accepting. A closed item is struck
+  in place with the spec that closed it and its reasoning is *not* repeated in §13: that lives
+  here in Key Decisions and in the delivery doc, and a third copy is a fork with no merge.
+  (SPEC-021, revised 2026-09-01)
 - **Every action is pinned to a commit SHA, and the pins are maintained, not frozen** — a mutable
   tag on a workflow holding `id-token: write` against PyPI is a silent path from a third-party
   repository to every consumer's `pip install`, so `pypa/gh-action-pypi-publish` is pinned away

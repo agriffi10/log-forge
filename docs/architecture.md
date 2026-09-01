@@ -767,8 +767,9 @@ stated constraint — never by being deleted quietly.
 **What belongs here rather than in §13.** §13 states what the design *will not* do — limits that
 are correct and permanent. This section holds what is genuinely unfinished: a defect nobody has
 scheduled, or a question deliberately left for later. The two had drifted together, and until
-SPEC-045's completion this heading read "**None.**" while §13 carried four such items — a register
-saying it was empty when it was not. Each entry below names what would close it.
+SPEC-045's completion this heading read "**None.**" while §13 carried six such items among its
+constraints — a register saying it was empty when it was not. Each entry below names what would
+close it.
 
 ### Open
 
@@ -780,18 +781,38 @@ saying it was empty when it was not. Each entry below names what would close it.
   over, which is decidable only against a live config read.
 - **The exit close runs the owed sinks inline and in sequence**, so one slow close delays every
   other owed close and one that never returns takes the rest with it — measured, a 5 s close made
-  `shutdown(timeout=1.0)` return after 5.01 s. Introduced by SPEC-045, which made the owed-close
+  `shutdown(timeout=1.0)` return after 5.01 s, with the second sink's close finishing at 5.01 s
+  too. Introduced by SPEC-045, which made the owed-close
   record a set without changing how the set is drained. **Closed by** bounding or parallelising
   that drain; it is not the same limit as the unbounded `Sink.close` in §13, which is a protocol
   constraint rather than a scheduling one.
+- **`_fork._reinit_primitives` can exhaust memory, not merely hang.** Its container read is
+  `list(container)`, so a `list` subclass with a non-terminating `__iter__` reachable from any
+  sink never returns — measured 5.7 GB RSS in nine minutes, with the parent unable to kill the
+  child because it was being starved. SPEC-039 declined to bound this walk because an unfound
+  lock is a child that hangs with no safe degradation, and SPEC-042 bounded its own two walks
+  and explicitly left this one. **Closed by** giving the repair walk the fallback the marking
+  walk has, so a cap degrades to a leaked handle rather than a hung child; it is SPEC-039's to
+  change. It sits here rather than in §13 because it has a named remedy nobody has scheduled,
+  which is this section's criterion.
+- **`health().inherited_sink` reads the owed record's last entry**, which arming order does not
+  make the installed sink: `_swap_sink` seeds the record with the new sink and a preempted emit
+  then appends the superseded one, so the order can be `[live, superseded]` and the field can
+  name a sink this process has stopped delivering to. The answer is unchanged from before
+  SPEC-045, which is why that spec did not treat it as a regression. **Closed by** answering
+  from the config, which is the authority for "installed" — a small change to one reader, left
+  out of SPEC-045 because it touches a published `Health` field on a path that spec did not
+  otherwise change.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` is ~1,500 lines policing what is now four methods, and
   roughly half of it is the seam lint guarding the prose in its own data table rather than the
   rule. The case for retiring it got *weaker* during SPEC-040: widening its scope immediately
   filed two sites that had gone unfiled for two specs. **Closed by** evidence a year of
   maintenance provides — whether any post-SPEC-040 defect was caught by it, or by nothing.
-- **`worker.py` (~1,370 lines) and `_lifecycle.py` (~1,610) are unsplit and unscheduled**
-  (SPEC-040 FR-005 AC-2). `Worker` owns the drain thread, the queue, the retry, the counters, the
+- **`worker.py` and `_lifecycle.py` are unsplit and unscheduled** (SPEC-040 FR-005 AC-2).
+  Measured 2026-09-01: 1,398 and 1,887 lines — the second has grown 262 lines since SPEC-040
+  stated it, which is the kind of drift that makes a size claim rot, so the date is part of the
+  entry rather than the number standing alone. `Worker` owns the drain thread, the queue, the retry, the counters, the
   swap and the shutdown; the questions *inside* it are one object's own state, which is why
   SPEC-035 FR-002 drew the roster's module boundary where it did. Neither is a defect; both are
   recorded so the next reader knows the split was considered. **Closed by** a spec that does it,
@@ -928,12 +949,6 @@ and a third copy is a fork with no merge.
   so the pinning objection this entry used to carry never applied.
   Full reasoning in [SPEC-045](spec-delivery/SPEC-045-every-owed-close-is-performed.md).
 
-  **The limit that remains:** `health().inherited_sink` reads the record's **last** entry,
-  which arming order does not make the installed sink — `_swap_sink` seeds the record with the
-  new sink and a preempted emit then appends the superseded one, so the order can be
-  `[live, superseded]`. The answer is unchanged from before SPEC-045; the config is the
-  authority for "installed", and correcting the field is its own change.
-
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
   to find the `flush()` markers still queued when nothing will ever read them again, so no
@@ -1000,7 +1015,7 @@ and a third copy is a fork with no merge.
   (SPEC-044 FR-006): a process that only ever logged outside a span closes through
   `_close_orphan_sink`, which calls `release(owed)` inline before `_shutdown_worker` consults its
   deadline at all. Measured 6.01 s against `shutdown(timeout=2.0)` on both paths, with a
-  6-second `close()` — the 30.01 s figure recorded below came from a 30-second one, and the
+  6-second `close()`, and 30.01 s against the same timeout with a 30-second one — the
   elapsed time tracks the close, never the timeout. A test now pins both paths, so a later change
   that bounds this close fails until the documentation moves with it. Running *this* close on a
   joinable daemon thread was built and
@@ -1228,16 +1243,6 @@ and a third copy is a fork with no merge.
   bodies alone. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
   the three wrapper sinks, which forwarded no flush at all.
 
-- **`_fork._reinit_primitives` can exhaust memory, not merely hang** (SPEC-039, measured under
-  SPEC-042). Its container read is `list(container)`, so a `list` subclass with a
-  non-terminating `__iter__` reachable from any sink never returns: measured **5.7 GB RSS in
-  nine minutes**, and the parent could not kill the child because the parent was being starved.
-  SPEC-042 bounded its own two walks — the stamp walk and the child's marking walk both read
-  through a capped helper, and tripping the cap sets `_marking_failed` and refuses everything
-  unrecorded, a leak rather than a destructive close. The repair walk is unbounded still, and it
-  is SPEC-039's to change: recorded as *exhausts memory* rather than *hangs*, because the two
-  call for different operator responses.
-
 - **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
   AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,
   so one socket, one SQLite handle or one file is now written by two processes — see §9 for the
@@ -1323,6 +1328,8 @@ and a third copy is a fork with no merge.
   The sixth is the `shutdown(timeout=…)` limit stated above and is not repeated here. What each
   race was, and the depth counter, close registry and latch that closed them, is in
   [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and CLAUDE.md's Key Decisions.
+
+---
 
 ## 14. Alignment with observability concepts
 

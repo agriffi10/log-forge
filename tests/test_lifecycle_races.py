@@ -1,9 +1,10 @@
 """SPEC-044 — the five lifecycle races, each pinned by the reproduction that found it.
 
 Every test here was first run against the tree *before* its fix and observed to fail. The
-harnesses that found them (`h17`, `h4`, `h2`, `h2b`, `h1`, `h11`) were scratch files named in
-`architecture.md` §13; committing the reproductions is what stops the next reader measuring a
-criterion against whatever they rebuild from its prose.
+harnesses that found them (`h17`, `h4`, `h2`, `h2b`, `h1`, `h11`) were scratch files, named in
+`architecture.md` §13 until SPEC-045 compressed that entry to its closure record; committing the
+reproductions here is what stops the next reader measuring a criterion against whatever they
+rebuild from its prose, and is why the entry no longer needs to name them.
 
 Four of the five need an **injected preemption point**, because the window is a few instructions
 wide: the idiom is `tests/test_orphan_sink_handoff.py`'s — patch a function the racing path calls
@@ -313,9 +314,12 @@ def test_a_worker_built_after_the_shutdown_returned_owns_its_sinks_close() -> No
     claim it has no right to. The spec's Out of Scope forbids reaching that path at all.
 
     Asserted on the flag rather than on a close count deliberately: the *observable* difference
-    in the sequential case is that A is closed twice today, which is the pre-existing double
-    close `architecture.md` §13 records for a sink handed back after being swapped out. Pinning
-    that count as correct would be worse than pinning the mechanism that must not change it.
+    in the sequential case is that A is closed twice today, which is the pre-existing behaviour
+    `architecture.md` §13 records for a sink handed back after being swapped out. SPEC-045 later
+    established that both closes are legitimate — one per period the sink took events — and
+    struck §13's reading of them as a defect, which is the stronger form of this docstring's own
+    point: pinning that count would have been worse than pinning the mechanism, and pinning it
+    as a *defect* would have been wrong outright.
     """
     sink = CountingSink("A")
     log_foundry.configure(service="t", sink=sink)
