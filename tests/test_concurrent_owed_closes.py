@@ -103,10 +103,20 @@ def test_four_owed_closes_cost_the_slowest_not_their_sum() -> None:
     Elapsed time alone is not the observable: a fan-out that never joins is *faster* still and
     abandons three of the four closes. So this asserts the cost fell, that every close completed,
     and that they overlapped — the mutant that drops the join fails the second.
+
+    The inline sink's close is deliberately **short**. With all four the same length, the inline
+    close is itself a 2 s wait that acts as an implicit join, and the dropped-join mutant passes
+    this test — measured. A 0.2 s inline close against 2 s threaded ones is what makes AC-2
+    load-bearing here rather than only in the two tests below.
     """
-    sinks = [SlowCloseSink(f"s{i}") for i in range(4)]
+    sinks = [SlowCloseSink("inline", seconds=0.2)] + [
+        SlowCloseSink(f"s{i}") for i in range(3)
+    ]
     _arm(*sinks)
     assert len(_lifecycle._state._orphan_owed) == 4, "four are owed, or this measures nothing"
+    assert _lifecycle._live_config_sink() is sinks[0], (
+        "the short close is the inline one, or a dropped join is hidden behind a 2 s wait"
+    )
 
     started = time.monotonic()
     log_foundry.shutdown(timeout=1.0)
@@ -114,7 +124,7 @@ def test_four_owed_closes_cost_the_slowest_not_their_sum() -> None:
 
     assert elapsed < 4.0, (
         f"the exit close costs the slowest owed close, not their sum — took {elapsed:.2f}s "
-        f"against {len(sinks) * CLOSE_SECONDS:.0f}s in sequence"
+        f"against {0.2 + 3 * CLOSE_SECONDS:.1f}s in sequence"
     )
     assert all(sink.closes == 1 for sink in sinks), (
         f"and every owed sink completed its close — got {sinks}"
@@ -123,7 +133,7 @@ def test_four_owed_closes_cost_the_slowest_not_their_sum() -> None:
         f"so nothing any of them held is stranded — got {sinks}"
     )
     starts = [sink.started_at for sink in sinks]
-    assert all(s is not None for s in starts)
+    assert all(s is not None for s in starts), f"every close began — got {sinks}"
     assert max(starts) - min(starts) < CLOSE_SECONDS, (  # type: ignore[type-var]
         f"the closes overlapped rather than queued — starts spanned "
         f"{max(starts) - min(starts):.2f}s"  # type: ignore[operator]
@@ -182,7 +192,10 @@ def test_the_last_armed_sink_closes_inline_when_the_config_is_not_owed() -> None
     assert last.closed_on == caller, (
         f"the most recently armed sink ran inline, got {last.closed_on!r}"
     )
-    assert first.closed_on != caller, f"and the earlier one did not, got {first.closed_on!r}"
+    assert first.closed_on is not None and first.closed_on != caller, (
+        f"and the earlier one ran on a thread — `!= caller` alone also passes when it was never "
+        f"closed at all. Got {first.closed_on!r}"
+    )
 
 
 def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one() -> None:
@@ -266,10 +279,10 @@ def test_a_close_longer_than_the_closer_grace_still_delivers() -> None:
 
 
 def test_a_raising_close_does_not_stop_the_others() -> None:
-    """FR-002 AC-3. Every close is guarded, on the calling thread and on the others.
+    """FR-002 AC-3, the inline half — the raising sink here is the configured one.
 
-    An exception escaping a thread body reaches CPython's bootstrap, which prints a traceback
-    carrying the message arch §6 keeps out of anything the library says about itself.
+    The fan-out half is the test below, and it is the one that is new in this change: this
+    behaviour was already guarded before it.
     """
 
     class RaisingSink(SlowCloseSink):
@@ -290,6 +303,55 @@ def test_a_raising_close_does_not_stop_the_others() -> None:
     assert raiser.closes == 1, "the failing close was attempted"
     assert survivor.closes == 1 and survivor.buffered == 0, (
         f"and the other owed sink was still closed and still delivered — got {survivor!r}"
+    )
+
+
+def test_a_close_that_raises_on_a_fan_out_thread_is_absorbed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-002 AC-3, the half that is new in this change — and the half nothing covered.
+
+    The sibling test above puts the raising sink on the calling thread, because `_arm` makes the
+    first sink the configured one and the configured one closes inline. So the guard that matters
+    here — the one inside a fan-out thread — was untested: a `_close_owed` that re-raises on a
+    thread and absorbs on the main one passed the **entire** suite, measured.
+
+    An exception escaping a thread body reaches CPython's bootstrap, which prints a traceback
+    carrying the exception's message. That is the arch §6 rule `_close_owed` was factored out to
+    satisfy, so the assertion is on **stderr**: counters alone still pass unguarded, since the
+    close happens before it raises.
+    """
+
+    class RaisingSink(SlowCloseSink):
+        """Fails its close with a message no diagnostic may reproduce."""
+
+        def close(self) -> None:
+            """Records the attempt and the thread, then fails."""
+            self.closed_on = threading.current_thread().name
+            self.closes += 1
+            raise RuntimeError("SECRET-user-data-in-the-message")
+
+    survivor = SlowCloseSink("survivor", seconds=0.1)
+    raiser = RaisingSink("raiser", seconds=0.0)
+    _arm(survivor, raiser)
+    assert _lifecycle._live_config_sink() is survivor, "the raiser is not the inline one"
+
+    caller = threading.current_thread().name
+    log_foundry.shutdown(timeout=1.0)
+
+    assert raiser.closed_on is not None and raiser.closed_on != caller, (
+        f"the failing close ran on a fan-out thread, got {raiser.closed_on!r}"
+    )
+    assert raiser.closes == 1, "and it was attempted"
+    assert survivor.closes == 1, f"while the other owed sink still closed, got {survivor!r}"
+
+    err = capsys.readouterr().err
+    assert "absorbed a failure while closing the sink" in err, (
+        f"the thread body absorbed and announced it through _diag — got {err!r}"
+    )
+    assert "Traceback" not in err and "SECRET-user-data" not in err, (
+        "and nothing printed the exception's message, which is what an unguarded thread body "
+        f"does through CPython's bootstrap — got {err!r}"
     )
 
 
@@ -318,3 +380,6 @@ def test_one_owed_sink_creates_no_thread() -> None:
     assert log_foundry.health().closing_sinks == 0, (
         "these closes are joined before shutdown() returns, so none is ever outstanding after it"
     )
+    # `closing_sinks` counts `_closers`, which this path never registers in — so the assertion
+    # above is structural rather than a live check, and it is here to fail if a later change
+    # routes these closes through `_start_closer` after all.

@@ -1480,10 +1480,12 @@ def _close_orphan_sink() -> None:
     each, so the cost is the slowest rather than the sum.
 
     **Joined, deliberately not detached.** Routing them through :func:`_start_closer` and
-    :func:`join_closers` is the obvious reuse and it loses data: that grace caps at
-    :data:`DEFAULT_CLOSER_GRACE`, so a sink whose ``close()`` outlasts it is abandoned and killed
-    at interpreter exit — measured completing **1 of 4**, and a 3-second close delivering nothing
-    where it delivers today. It also recharges the double grace SPEC-044 measured, and runs into
+    :func:`join_closers` is the obvious reuse and it loses data, in two independent ways. The
+    grace is what remains of the shutdown's budget, which a slow inline close can exhaust
+    entirely — measured completing **1 of 4** against a 1.0 s budget. And it caps at
+    :data:`DEFAULT_CLOSER_GRACE` regardless, so even inside a generous budget a sink whose
+    ``close()`` outlasts two seconds is abandoned and killed at interpreter exit — measured, a
+    3-second close delivered nothing where it delivers today. It also recharges the double grace SPEC-044 measured, and runs into
     the §13 entry recording that a daemon close of *this* sink was built and reverted because
     exit can kill it inside ``SQLiteSink.commit()``. Joining every close avoids all three, and is
     strictly better than the sequential drain on both axes: the cost falls and the loss stays
@@ -1492,9 +1494,10 @@ def _close_orphan_sink() -> None:
     flag, is what guarantees each close completes.
 
     A thread that will not start is closed **inline** instead, which is the opposite of
-    :func:`_start_closer`'s refusal and deliberately so: that helper has a bounded caller and a
-    sink something else will still close, while this is the exit path and nothing else ever
-    will.
+    :func:`_start_closer`'s refusal and deliberately so: that helper is spending a caller's
+    bounded budget, and falling back to an inline close there would reintroduce the unbounded
+    wait it exists to remove. This path has no budget left to protect — it is the exit — so the
+    choice is between closing inline and never closing at all.
 
     Args:
       None.

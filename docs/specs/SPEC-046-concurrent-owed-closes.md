@@ -100,11 +100,21 @@ kills. A sink whose `close()` *is* its delivery still delivers, however long it 
 - [ ] Every owed sink is closed exactly once across the whole shutdown, on the orphan path and the
       worker path.
 - [ ] A close that raises is absorbed and announced as it is today, and does not stop the other
-      owed sinks being closed or joined.
-- [ ] A forked child still refuses to close what it inherited, on the concurrent path as inline.
-- [ ] `tests/test_owed_closes.py`, `tests/test_orphan_sink_handoff.py` and
-      `tests/test_lifecycle_races.py` pass **unedited** — in particular the two that pin the live
-      sink's close as inline and unbounded.
+      owed sinks being closed or joined — asserted **on both the calling thread and a fan-out
+      thread**, and on stderr rather than only on counters. The thread half is the one this
+      change introduces, and a `_close_owed` that re-raises only there passes the whole suite
+      without it (measured); a close that raises still increments its own counters, so counters
+      alone cannot tell guarded from unguarded.
+- [ ] A forked child still refuses to close what it inherited. The refusal lives in
+      `releasable()`, which every close reaches through `release()` whichever thread it is on, and
+      `tests/test_owed_closes.py` already pins it; this criterion is satisfied by that test
+      continuing to pass rather than by a new one on the fan-out, and says so rather than
+      implying coverage it does not add.
+- [ ] `tests/test_owed_closes.py` and `tests/test_orphan_sink_handoff.py` pass **unedited**, in
+      particular the two that pin the live sink's close as inline and unbounded.
+      `tests/test_lifecycle_races.py` is edited in one direction only: its under-lock lint matches
+      call names and cannot see through a rename, so the new helper is added to the offender set.
+      A widening, never an accommodation — no assertion is relaxed.
 
 ### FR-003: One owed sink costs exactly what it costs today
 
@@ -118,7 +128,10 @@ change is invisible to every process that has only ever had one sink.
 
 - [ ] With one owed sink, no thread is created for the close — asserted on the thread count or on
       the close running on the calling thread, not inferred from timing.
-- [ ] With one owed sink, elapsed time is unchanged from today within measurement noise.
+- [ ] With one owed sink the code path is the same one as today — the close is performed by the
+      same call on the same thread, which AC-1 asserts. A wall-clock "unchanged within noise"
+      criterion is deliberately **not** used: it is satisfied by any implementation fast enough,
+      including a wrong one, and it is the flaky-bound shape this repo has reverted before.
 - [ ] `health().closing_sinks` is unchanged by this path: these closes are joined before
       `shutdown()` returns, so none is ever outstanding when it does.
 
