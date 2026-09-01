@@ -321,7 +321,19 @@ green over all three defects the reviews found: a 179 ns-vs-23 ns hot-path regre
 rules that went dead in the renaming commit, and a coverage floor that passed against the exact
 scenario its own docstring named. Its execution frame found **six lifecycle races that reproduce
 byte-identically on the pre-change tree**, so none is its doing and its own Out of Scope forbade
-fixing them; all six are recorded in `architecture.md` §13 with harnesses, and they want a spec.
+fixing them; all six were recorded in `architecture.md` §13 with harnesses, and became SPEC-044.
+
+**SPEC-044 (lifecycle races) is Completed** — the six SPEC-040 found and was forbidden to fix. All
+six were re-reproduced on `main` first, and each is now pinned by a committed reproduction rather
+than by a scratch harness. Five are closed: a `shutdown()` that returned having stopped a worker
+built one instruction later, a `configure()` that discarded an unclosed sink's close, a log call
+that cancelled the stop signal a close was waiting on, a swap that closed a sink without recording
+it, and a forked child hooking a superseded one. The sixth stands as documented behaviour — the
+live sink's `close()` is not bounded by `shutdown(timeout=)`, and the parameter's docstring had
+justified itself with that exact case. **Four of its own tests passed against the defect they
+named**; three of the four were caught by the review gate, one by a mutation sweep. It also
+corrected the repo's own contract, which mandated a reviewer gate on the PR grouping that does not
+exist.
 
 **SPEC-042 (forked-child sink ownership) is Completed** — a forked child closed transports it
 never opened: a `configure(sink=…)` sent a connection sink's protocol goodbye and the **parent's**
@@ -691,6 +703,25 @@ tests green only because CI never installs that extra.
   roster as silently as a deletion does** — two of this spec's own lint rules went dead in the
   commit that renamed their subject, with the file still green, and widening the scope
   immediately filed two SPEC-042 sites that had gone unfiled for two specs. (SPEC-040, arch §9.2)
+  **SPEC-044 then locked the reads that must stay consistent.** A question is a single atomic
+  load, but *acting* on one is not, and five races lived in that gap: a `shutdown()` that read
+  "no worker" and returned having stopped a worker built one instruction later (`health()`
+  reading `retired=True` over a live drain thread), a `_get_worker` that discarded an unclosed
+  sink's close record, a log call that cancelled the stop signal a close was waiting on
+  (8.01 s of an 8 s backoff, both paths), a swap that closed a sink without recording it, and a
+  forked child hooking a superseded one. The fences: a shutdown-in-progress **depth counter** —
+  a boolean is not nestable and two concurrent `shutdown()` calls are documented as normal, so
+  the first to finish lowered it while the second still ran, reproducing the defect verbatim; a
+  rule that **no transition clears the orphan close record without deciding who performs that
+  close**; and an in-flight-close registry keyed on the **moment**, not on retirement, because
+  retirement would reverse SPEC-033 FR-004's requirement that a sink adopted after `shutdown()`
+  still backs off. The fence is deliberately not permanent — a worker built after `shutdown()`
+  **returned** still delivers, which `_worker_health` had already settled and a permanent
+  retirement fence would have superseded silently. What stays open and is recorded rather than
+  half-fixed: `shutdown(timeout=)` does not bound the live sink's `close()` on either path (both
+  bounding mechanisms were built and reverted; the third needs an interruptible `Sink.close`),
+  and two concurrent `configure(sink=…)` threads still double-close a sink at the same rate as
+  before. (SPEC-044, arch §13)
 - **A public accessor hands out a copy; the library reads the live object** — `get_config()` and
   `get_baggage()` copy, because a public getter documented "do not mutate" is a promise the
   caller's slip breaks silently, while `config._live_config()` and `context._live_baggage()` are

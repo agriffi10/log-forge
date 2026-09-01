@@ -1,7 +1,7 @@
 # Spec: Lifecycle Races
 
 **ID:** SPEC-044  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-08-31  
 **Depends On:** SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042
 
