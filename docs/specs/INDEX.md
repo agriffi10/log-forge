@@ -50,6 +50,7 @@ to status only — no prose.
 | [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | In Progress | SPEC-026, SPEC-032, SPEC-041 |
 | [SPEC-044](SPEC-044-lifecycle-races.md) | Lifecycle Races | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042 |
 | [SPEC-045](SPEC-045-every-owed-close-is-performed.md) | Every Owed Close Is Performed | Completed | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
+| [SPEC-046](SPEC-046-concurrent-owed-closes.md) | Concurrent Owed Closes | In Progress | SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045 |
 
 ## Arcs (build order)
 
@@ -247,3 +248,13 @@ Group related specs and record the order to build them in. Keep this section: a 
   orphan path's owed-close record was a single slot. It reproduces with every `configure()` call
   sequential on one thread, racing only an ordinary `info()`, so a lock around `configure()` is
   not the fix and neither is refusing a repeat close: both were built and measured to lose data.
+
+- **Concurrent owed closes:** SPEC-046 — the one item SPEC-045 *introduced* rather than inherited,
+  and the reason it is a spec rather than a note: making the owed-close record a set stopped the
+  live sink going unclosed, but left `_close_orphan_sink` draining that set inline and in
+  sequence, so `shutdown()` now costs one slow close times the number of sinks owed one.
+  Build after SPEC-045. Its first design reused SPEC-030's detached closer and capped grace, and
+  the spec review built that and measured it losing 3 of 4 closes; the shipped design runs the
+  owed closes concurrently and joins every one, which is strictly better than today on both axes
+  — cost falls from `sum` to `max`, loss stays zero. It deliberately does **not** narrow the §13
+  constraint that a single `Sink.close` cannot be bounded at all.
