@@ -81,27 +81,58 @@ OWNERSHIP_AND_MOMENT = "ownership ∧ moment — whose stop event the sink shoul
 # Keyed by (function, expression, occurrence index within that function): two textually
 # identical guards in one function ask two questions and get two rows.
 ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
-    ("_get_worker", "_worker is None", 0): (
+    ("_get_worker", "_worker_exists()", 0): (
         EXISTENCE,
         (
-            "the double-checked build. Neither liveness nor ownership: a retired worker is still "
-            "the "
-            "process worker, and rebuilding one would fight a process trying to exit (SPEC-019)."
+            "the double-checked build, outer half, and deliberately **unlocked** - this is the "
+            "@trace hot path, so the question must not acquire anything (SPEC-040 FR-002). "
+            "Neither liveness nor ownership: a retired worker is still the process worker, and "
+            "rebuilding one would fight a process trying to exit (SPEC-019)."
         ),
     ),
-    ("_get_worker", "_worker is None", 1): (
+    ("_get_worker", "worker is None", 0): (
         EXISTENCE,
         (
-            "the second half of the double-check, re-read under the lock. Two rows for one "
+            "the test the unlocked binding above feeds. Filed apart from its binding because "
+            "the binding can be retargeted at a liveness helper without this line changing, "
+            "which would rebuild a worker on every call once one retired."
+        ),
+    ),
+    ("_get_worker", "_worker_exists()", 1): (
+        EXISTENCE,
+        (
+            "the second half of the double-check, re-read under the lock. Two bindings for one "
             "idiom is the honest count: each is a separate decision the compiler will not "
             "merge, and collapsing them hides that the outer one is deliberately unlocked."
         ),
     ),
-    ("_rebuild_worker_after_fork", "_worker", 0): (
+    ("_get_worker", "worker is None", 1): (
         EXISTENCE,
         (
-            "the snapshot the two questions below read, taken once. The raw global rather than "
-            "_live_worker(), because both of those questions have to be answered and a helper "
+            "the locked half's test, and the one that actually decides whether a worker is "
+            "built. Concurrent first-flushes both reach it; exactly one sees None."
+        ),
+    ),
+    ("_get_worker", "worker", 0): (
+        EXISTENCE,
+        (
+            "the **publication** of the newly built worker into the global, under the lock - the "
+            "right-hand side of `_worker = worker`, not the return, which the walker excludes "
+            "deliberately (`_boolean_positions`: a return hands the object to a caller who asks "
+            "their own question). It is a write rather than a question, and it is on the roster "
+            "as a stale-detector on the one line in `src/` that assigns `_worker`: any edit to "
+            "how the worker is published changes this text and forces a re-decision. No claim "
+            "is made that binding a local fixed anything - `_worker` is assigned in exactly one "
+            "place and only under `_worker_lock`, so it is monotone None -> W and the previous "
+            "`return _worker` after the lock could never have handed back a different object."
+        ),
+    ),
+    ("_rebuild_worker_after_fork", "_worker_exists()", 0): (
+        EXISTENCE,
+        (
+            "the snapshot the two questions below read, taken once. The existence question "
+            "rather than the liveness one, because both of those questions have to be "
+            "answered and a helper "
             "that folds retirement into None collapses them into one: a retired worker still "
             "needs its queue replaced, which is what stops the child's next submit blocking on "
             "an inherited queue.Queue mutex. **This is the first binding on the roster that "
@@ -144,17 +175,49 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         LIVENESS,
         "the definition of the liveness helper itself, rather than a consumer of it.",
     ),
-    ("_offer_orphan_signal", "_worker", 0): (
+    ("_worker_owns_now", "_worker", 0): (
         OWNERSHIP_AND_MOMENT,
         (
-            "the snapshot FR-001's conjunction below reads. Rebinding it to _live_worker() is "
-            "precisely the revert FR-001 exists to stop, and it is caught here rather than "
+            "the snapshot the conjunction below reads, now inside the question rather than at "
+            "its caller (SPEC-040 FR-002). Rebinding it to _live_worker() is precisely the "
+            "revert SPEC-035 FR-001 exists to stop, and it is still caught here rather than "
             "below: the conjunction's text does not change at all, so this row goes stale and "
-            "a new unclassified site appears, both about this line. A draft claimed the row "
-            "below moved too, which is false and was checked."
+            "a new unclassified site appears, both about this line. What moving it bought is "
+            "that there is now one such line in the module instead of one per caller."
         ),
     ),
-    ("_offer_orphan_signal", "worker is not None and worker.sink is sink and worker.draining", 0): (
+    ("_worker_owns_now", "worker is not None and worker.sink is sink and worker.draining", 0): (
+        OWNERSHIP_AND_MOMENT,
+        (
+            "SPEC-035 FR-001, stated once. Ownership alone skips for a worker whose shutdown has "
+            "finished, leaving a sink still being written to holding a set event - SPEC-033 "
+            "FR-004's tight retry loop. Liveness alone un-skips for the whole drain, handing the "
+            "drain thread a fresh event nobody will set. Both were measured; only the "
+            "conjunction is right. It is a conjunction and not a fifth subject, which is why "
+            "the category names both terms."
+        ),
+    ),
+    ("_worker_owns", "_worker", 0): (
+        OWNERSHIP,
+        (
+            "the snapshot the ownership test below reads. Filed for the reason every binding "
+            "here is: rebinding it to _live_worker() changes the category of the predicate "
+            "below without changing that predicate's text, which is SPEC-033's defect exactly "
+            "- and now it can only be made once, in this function, rather than at each of the "
+            "two call sites that used to compose it."
+        ),
+    ),
+    ("_worker_owns", "worker is not None and worker.sink is sink", 0): (
+        OWNERSHIP,
+        (
+            "the definition of the ownership question itself. A retired worker still owns its "
+            "sink's close - Worker.swap_sink returns early once _shutdown_done, so it keeps "
+            "that sink forever - which is why this deliberately does not consult retired. "
+            "Answering it with liveness closes the sink twice on a clean shutdown and under a "
+            "live writer on an expired one, both measured (SPEC-033 FR-002)."
+        ),
+    ),
+    ("_offer_orphan_signal", "_worker_owns_now(sink)", 0): (
         OWNERSHIP_AND_MOMENT,
         (
             "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
@@ -165,21 +228,30 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "nobody will set. Both were measured; only the conjunction is right."
         ),
     ),
-    ("_close_orphan_sink", "_worker is not None and _worker.sink is owed", 0): (
+    ("_close_orphan_sink", "_worker_owns(owed)", 0): (
         OWNERSHIP,
         (
             "a retired worker still owns its sink's close, and deliberately declines it when its "
             "shutdown expired, because the drain thread may still be inside emit (SPEC-027 FR-004)."
         ),
     ),
-    ("_shutdown_worker", "_worker is not None", 0): (
+    ("_shutdown_worker", "_worker_exists()", 0): (
         EXISTENCE,
         (
             "which exit path to take. A worker that exists drains first, and only then is the "
             "orphan sink considered. What the else branch adds is not the orphan close - that "
             "is attempted on both branches and declines under _close_orphan_sink's ownership "
             "guard (SPEC-033 FR-002) - but the closer grace, which the worker branch leaves to "
-            "Worker.shutdown so it is charged once rather than twice (SPEC-031 FR-006)."
+            "Worker.shutdown so it is charged once rather than twice (SPEC-031 FR-006). "
+            "Bound rather than read twice, so the branch and the shutdown it performs cannot "
+            "name two different workers."
+        ),
+    ),
+    ("_shutdown_worker", "worker is not None", 0): (
+        EXISTENCE,
+        (
+            "the test the binding above feeds, filed separately because the binding can be "
+            "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
         ),
     ),
     ("_swap_sink", "_live_worker()", 0): (
@@ -193,7 +265,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "counted only predicates would not notice."
         ),
     ),
-    ("_delivering_to_an_inherited_sink", "_worker", 0): (
+    ("_delivering_to_an_inherited_sink", "_worker_exists()", 0): (
         EXISTENCE,
         (
             "which of the three delivery targets to ask about, for Health.inherited_sink "
@@ -244,7 +316,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and a reason copied rather than thought about is the failure AC-2 exists to stop."
         ),
     ),
-    ("_swap_sink", "_worker is None or _worker.sink is not old", 0): (
+    ("_swap_sink", "not _worker_owns(old)", 0): (
         OWNERSHIP,
         (
             "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
@@ -274,11 +346,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "second reason to decline; today that is a design argument, not a measured one."
         ),
     ),
-    ("_flush_worker", "_worker", 0): (
+    ("_flush_worker", "_worker_exists()", 0): (
         EXISTENCE,
         (
-            "the snapshot the existence test below reads. Deliberately the raw global rather "
-            "than _live_worker(), and what that buys is the honest verdict, not a drain: "
+            "the snapshot the existence test below reads. Deliberately the existence question "
+            "rather than _live_worker(), and what that buys is the honest verdict, not a "
+            "drain: "
             "Worker.flush returns False immediately once _shutdown_done, so resolving liveness "
             "here would answer True for a queue nothing will ever read - SPEC-021's false "
             "success, in the call SPEC-013 built for a process that is not exiting. Measured "
@@ -286,11 +359,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "test_module_flush_after_shutdown_returns_false_promptly."
         ),
     ),
-    ("_worker_health", "_worker", 0): (
+    ("_worker_health", "_worker_exists()", 0): (
         EXISTENCE,
         (
-            "the snapshot the existence test below reads. The raw global again, and for the "
-            "same reason: a retired worker's counters are exactly what health() is asked for "
+            "the snapshot the existence test below reads. The existence question again, and for "
+            "the same reason: a retired worker's counters are exactly what health() is "
+            "asked for "
             "(SPEC-030 FR-001), so resolving liveness here reports zeros instead - measured, "
             "queued, failed_batches and submitted_after_shutdown all collapse to 0, which "
             "leaves SPEC-030's retired-plus-submitted pair with a term that can never fire."
@@ -339,17 +413,29 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "drain, which is false against LIVENESS's own definition."
         ),
     ),
-    ("_flush_live_sink", "_worker", 0): (
-        EXISTENCE,
+    ("_flush_live_sink", "_live_worker()", 0): (
+        LIVENESS,
         (
-            "the raw global, filed by the first question the conditional below asks. Reading it "
-            "through a liveness helper here would collapse the two branches this function exists "
-            "to distinguish."
+            "who is *being delivered to*, asked once here rather than composed in the "
+            "conditional below (SPEC-040 FR-002). It was the raw global with `not "
+            "worker.retired` spelled out at the call site, and the two forms are equivalent by "
+            "construction - _live_worker returns None exactly when the worker is absent or "
+            "retired - so the branches this function exists to distinguish are unchanged. The "
+            "row's category moves with the binding: it is the liveness question now, where it "
+            "used to be an existence binding feeding a liveness test.\n"
+            "**Nothing behavioural distinguishes the two categories at this site** (SPEC-040 "
+            "FR-003 AC-5), and it is recorded rather than accepted, as the "
+            "`not worker_holds_sink` row above records the same thing: replacing this call with "
+            "_worker_exists() leaves the whole behavioural suite green - measured twice, 1802 "
+            "passed with the roster excluded, and only the roster caught it. What would separate "
+            "them is a flush against a *retired* worker whose sink is not the orphan record, "
+            "which no test arranges. The liveness form is kept because it is the one that stays "
+            "correct: a retired worker delivers nothing, so its sink is not the live target."
         ),
     ),
     (
         "_flush_live_sink",
-        "worker.sink if worker is not None and (not worker.retired) else _orphan_sink",
+        "worker.sink if worker is not None else _orphan_sink",
         0,
     ): (
         LIVENESS,
@@ -784,9 +870,16 @@ def test_the_two_identical_swap_guards_keep_their_own_reasons() -> None:
 
 
 def test_the_roster_finds_the_bare_form_that_shipped_unseen() -> None:
-    """AC-1. `_worker is not None` on its own is the phrasing SPEC-033's docstrings warn about,
-    and a walk looking only for `_live_worker()` and `.sink is` comparisons would never see it."""
-    assert ("_shutdown_worker", "_worker is not None", 0) in _numbered()
+    """AC-1. A bare `is not None` on its own is the phrasing SPEC-033's docstrings warn about,
+    and a walk looking only for `_live_worker()` and `.sink is` comparisons would never see it.
+
+    The site moved from `_worker is not None` to `worker is not None` when SPEC-040 FR-002 made
+    `_shutdown_worker` bind the existence question rather than read the global twice. The
+    property under test is unchanged — a bare comparison in boolean position, named only by a
+    worker sentinel, is still found — and the local form is the *weaker* of the two for the
+    walker, since it rests on the bare `worker` sentinel rather than on `_worker`.
+    """
+    assert ("_shutdown_worker", "worker is not None", 0) in _numbered()
 
 
 def test_the_roster_finds_a_verdict_carried_by_a_return_value() -> None:

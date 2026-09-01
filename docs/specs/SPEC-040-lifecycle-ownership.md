@@ -1,7 +1,7 @@
 # Spec: Lifecycle Ownership — One Owner for the Worker and the Sink
 
 **ID:** SPEC-040  
-**Status:** Draft  
+**Status:** In Progress  
 **Last Updated:** 2026-08-11  
 **Depends On:** SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039
 
