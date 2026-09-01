@@ -49,6 +49,7 @@ to status only — no prose.
 | [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039 |
 | [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | In Progress | SPEC-026, SPEC-032, SPEC-041 |
 | [SPEC-044](SPEC-044-lifecycle-races.md) | Lifecycle Races | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042 |
+| [SPEC-045](SPEC-045-release-once-per-acquisition.md) | Release Once Per Acquisition | In Progress | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
 
 ## Arcs (build order)
 
@@ -237,3 +238,13 @@ Group related specs and record the order to build them in. Keep this section: a 
   depends on it for *shape*, since the guards are now four methods on one owner rather than seven
   loose globals. Build it after SPEC-040 (done). It closes five and documents the sixth, which
   §13 records as a deliberate design limit rather than a defect.
+
+- **Release once per acquisition:** SPEC-045 — the residual SPEC-044 measured, recorded and
+  deliberately did not fix: two concurrent `configure(sink=…)` calls double-close a sink. Build it
+  after SPEC-044, which owns `_orphan_closed_sink` and is what makes the distinction this spec
+  rests on legible — that slot answers "do not re-arm", not "this was closed", so the two records
+  are separate rather than one replacing the other. The fix is a record consulted by `release()`
+  rather than a lock around `configure()`, because the double close reproduces with every
+  `configure()` call sequential on one thread — the racing party is an ordinary `info()`, which
+  the library exists to support — and because the same re-arm leaves the live sink closed by
+  nobody, so FR-001 alone would trade a double close for a lost one.
