@@ -43,7 +43,9 @@ permissions:
 # cancelling the weekly run. What it actually prevents is a `workflow_dispatch` on `main`
 # displacing a schedule on `main`, which DO share a group — and that weekly run is the one
 # deciding whether this job has earned its way into the ruleset, so it should not be discardable
-# by someone clicking Run workflow.
+# by someone clicking Run workflow. Note the protection is not total: `cancel-in-progress`
+# governs a RUNNING run, while a run still `pending` in a group is replaced by a newcomer
+# regardless — so a dispatch arriving while Monday's run is queued would still displace it.
 #
 # The caller-context trap that forced `ci.yml`'s group to be rewritten does not reach here: this
 # workflow has no `workflow_call` trigger, so `github.workflow` and `github.ref` are its own.

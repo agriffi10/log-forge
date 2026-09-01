@@ -1281,7 +1281,7 @@ part of the contract:
 | [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | every PR | yes |
 | [`spec-lint.yml`](.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | specs touched | yes |
 | [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | every PR | yes |
-| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflows touched | no — reports to code scanning |
+| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflow, action, dependabot or zizmor config touched; also weekly | no — reports to code scanning |
 | CodeQL | `python` + `actions`, `extended` query suite; also weekly | every PR | no — reports to code scanning |
 
 On a push to `main` the full `ci.yml` matrix still runs, but as the first job of

@@ -20,6 +20,13 @@ name: CI
 on:
   pull_request:
   workflow_call:   # allow release.yml to run this same gate before publishing
+  # Restores a side-effect-free way to re-run this gate on `main`. Without it, dropping the push
+  # trigger left re-running `Release` as the only option — and that job chain ends in
+  # `publish-dev`, holding `id-token: write` against PyPI. It is safe to re-run (`skip-existing`),
+  # but exercising the publish path to answer a test question is the wrong tool. The concurrency
+  # group below needs no change: a dispatch is not a `pull_request`, so it takes the unique
+  # `run_id` branch and cannot displace anything.
+  workflow_dispatch:
 
 # Least privilege, stated rather than inherited from the repository default. This gate only
 # reads the tree; release.yml, which calls it, requests id-token separately for its own jobs.
@@ -44,8 +51,12 @@ permissions:
 # out of any group `release.yml` might later derive from `github.workflow`, which the GitHub docs
 # warn would cancel the caller.
 #
-# Note for a future editor: if this workflow ever regains a `push` trigger, every push gets a
-# unique group and nothing supersedes. That is the intent here, but it is not obvious.
+# Two notes for a future editor, because the ternary keys on the EVENT rather than on this
+# workflow. If it ever regains a `push` trigger, every push gets a unique group and nothing
+# supersedes — that is the intent, but it is not obvious. And if another workflow ever calls this
+# one on a `pull_request` event, the nested run and this workflow's own direct run would both key
+# on `ci-refs/pull/N/merge` and cancel each other; that case needs the group to distinguish the
+# caller, not just the event.
 #
 # Honest accounting: this saved nothing over the sample window — 29 pull-request runs, zero
 # superseded — because the workflow here is one push watched to green. It is insurance against
