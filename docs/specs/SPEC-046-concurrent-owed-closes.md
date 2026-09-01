@@ -1,7 +1,7 @@
 # Spec: Concurrent Owed Closes
 
 **ID:** SPEC-046
-**Status:** In Progress
+**Status:** Completed
 **Last Updated:** 2026-09-01
 **Depends On:** SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045
 
