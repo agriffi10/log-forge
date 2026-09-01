@@ -345,6 +345,15 @@ was never delivered. `_orphan_sink` became `_orphan_owed` with one `take_orphan_
 transition. **Its own spec was rewritten mid-build after two reviews measured the first design
 losing data**, and both discarded designs are in its revision history rather than deleted.
 
+**SPEC-046 (concurrent owed closes) is Completed** — the one item SPEC-045 *introduced* rather
+than inherited, and the reason it got a spec rather than a note. Draining the owed-close set in
+sequence made `shutdown()` cost one slow close times the number owed (8.02 s for four 2-second
+closes against a 1.0 s budget; 11.4 s at 200 sinks). They now run concurrently and every one is
+joined. **Its design was replaced by its own spec review**, which built the detached-closer
+version and measured it completing 1 of 4, and **each of its four reviews found something the
+previous could not** — value equality where identity was meant, an unguarded `Thread.start()`, a
+guard with no test, and a Ctrl-C abandoning every close mid-write.
+
 **SPEC-042 (forked-child sink ownership) is Completed** — a forked child closed transports it
 never opened: a `configure(sink=…)` sent a connection sink's protocol goodbye and the **parent's**
 next write failed with `ECONNRESET`, a `shutdown()` closed the inherited object, and at exit both
@@ -752,6 +761,17 @@ tests green only because CI never installs that extra.
   from one that was closed. **Every site that consumes the record needs its own test**: three of
   the four consuming loops were found by mutation, not review, and the swap's worker branch
   survived a truncating mutant even after its no-worker sibling had one. (SPEC-045, arch §13)
+  **The owed closes then run concurrently and are all joined** (SPEC-046), because draining a set
+  in sequence cost one slow close *times* the number owed — 8.02 s for four 2-second closes
+  against a 1.0 s budget, and 11.4 s at 200 sinks. Reusing SPEC-030's detached closer is the
+  obvious move and loses data twice over: the grace is what remains of the budget (completed 1 of
+  4) and caps at `DEFAULT_CLOSER_GRACE` regardless (a 3 s close delivered nothing). **Joining
+  beats detaching wherever there is no budget left to protect** — it is strictly better than the
+  sequential drain on both axes, cost falls and loss stays zero — which is the opposite of
+  `_start_closer`'s refusal to fall back inline, and the difference is whose budget is at stake.
+  The join is in a `finally`: without it a Ctrl-C abandoned every close *mid-write* where the
+  sequential drain abandoned one and had not started the rest, trading a leaked resource for a
+  corrupt one. A single `Sink.close` is still unbounded. (SPEC-046, arch §12, §13)
 - **A public accessor hands out a copy; the library reads the live object** — `get_config()` and
   `get_baggage()` copy, because a public getter documented "do not mutate" is a promise the
   caller's slip breaks silently, while `config._live_config()` and `context._live_baggage()` are
