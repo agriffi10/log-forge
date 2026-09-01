@@ -211,7 +211,7 @@ files = [
     {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
     {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
 ]
-markers = {main = "(extra == \"clickhouse\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") and (python_version <= \"3.14\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\")", security = "python_version < \"4.0\""}
+markers = {main = "(extra == \"clickhouse\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") and (python_version <= \"3.14\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "cffi"
@@ -442,7 +442,7 @@ files = [
     {file = "charset_normalizer-3.4.9-py3-none-any.whl", hash = "sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5"},
     {file = "charset_normalizer-3.4.9.tar.gz", hash = "sha256:673611bbd43f0810bec0b0f028ddeaaa501190339cac411f347ac76917c3ae7b"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "clickhouse-connect"
@@ -867,6 +867,21 @@ trio = ["trio (>=0.30)"]
 wmi = ["wmi (>=1.5.1) ; platform_system == \"Windows\""]
 
 [[package]]
+name = "execnet"
+version = "2.1.2"
+description = "execnet: rapid multi-Python deployment"
+optional = false
+python-versions = ">=3.8"
+groups = ["dev"]
+files = [
+    {file = "execnet-2.1.2-py3-none-any.whl", hash = "sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec"},
+    {file = "execnet-2.1.2.tar.gz", hash = "sha256:63d83bfdd9a23e35b9c6a3261412324f964c2ec8dcd8d3c6916ee9373e0befcd"},
+]
+
+[package.extras]
+testing = ["hatch", "pre-commit", "pytest", "tox"]
+
+[[package]]
 name = "filelock"
 version = "3.32.2"
 description = "A platform independent file lock."
@@ -1125,7 +1140,7 @@ files = [
     {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
     {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [package.extras]
 all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
@@ -2424,6 +2439,27 @@ pytest = ">=7"
 testing = ["process-tests", "pytest-xdist", "virtualenv"]
 
 [[package]]
+name = "pytest-xdist"
+version = "3.8.0"
+description = "pytest xdist plugin for distributed testing, most importantly across multiple CPUs"
+optional = false
+python-versions = ">=3.9"
+groups = ["dev"]
+files = [
+    {file = "pytest_xdist-3.8.0-py3-none-any.whl", hash = "sha256:202ca578cfeb7370784a8c33d6d05bc6e13b4f25b5053c30a152269fd10f0b88"},
+    {file = "pytest_xdist-3.8.0.tar.gz", hash = "sha256:7e578125ec9bc6050861aa93f2d59f1d8d085595d6551c2c90b6f4fad8d3a9f1"},
+]
+
+[package.dependencies]
+execnet = ">=2.1"
+pytest = ">=7.0.0"
+
+[package.extras]
+psutil = ["psutil (>=3.0)"]
+setproctitle = ["setproctitle"]
+testing = ["filelock"]
+
+[[package]]
 name = "python-dateutil"
 version = "2.9.0.post0"
 description = "Extensions to the standard Python datetime module"
@@ -2489,7 +2525,7 @@ files = [
     {file = "requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0"},
     {file = "requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [package.dependencies]
 certifi = ">=2023.5.7"
@@ -2916,7 +2952,7 @@ files = [
     {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
     {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\")", security = "python_version == \"3.12\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")", security = "python_version == \"3.12\""}
 
 [[package]]
 name = "tzdata"
@@ -2958,7 +2994,7 @@ files = [
     {file = "urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897"},
     {file = "urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c"},
 ]
-markers = {main = "(extra == \"clickhouse\" or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") and (python_version <= \"3.14\" or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\")", security = "python_version < \"4.0\""}
+markers = {main = "(extra == \"clickhouse\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") and (python_version <= \"3.14\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")", security = "python_version < \"4.0\""}
 
 [package.extras]
 brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.0) ; platform_python_implementation != \"CPython\""]
@@ -3108,4 +3144,4 @@ sentry = ["sentry-sdk"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12"
-content-hash = "58db242c8bc87dda43e1e40921ff23c596b610770e17447e6f5b943026427967"
+content-hash = "09a9108db749b7c3d63c9d528605b299affdbb69702726628fa78d0cc7eee3c7"

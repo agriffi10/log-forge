@@ -34,6 +34,16 @@ on:
 permissions:
   contents: read
 
+# The most valuable place in this repository to supersede a stale run: nine service containers,
+# an image-pull path and a JVM start make this the longest job here (~296 s against CI's ~155 s),
+# so a pull request pushed to twice would otherwise hold two full sets of containers at once.
+# `cancel-in-progress` is an expression for the same reason as in `ci.yml` — a scheduled run on
+# `main` must never be cancelled by a pull request, and the weekly run is the one that decides
+# whether this job has earned its way into the ruleset.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   integration:
     name: sinks against real services

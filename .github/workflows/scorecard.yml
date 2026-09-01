@@ -10,8 +10,20 @@ name: Scorecard
 on:
   schedule:
     - cron: "41 6 * * 1"    # Mondays, offset off the hour and away from pip-audit's slot
+  # Path-filtered. Scorecard measures repository POSTURE — pinned actions, least-privilege
+  # permissions, branch rules, a security policy — which is a slow-moving property of the
+  # configuration, not of the library. Re-scoring on a merge that changed only `src/` or `docs/`
+  # spends a run to recompute the same score: 21 such runs over the two weeks to 2026-09-01.
+  #
+  # The weekly schedule above is what keeps the published score and the badge current, and it is
+  # also what satisfies the OpenSSF API's requirement that `publish_results` come from a run on
+  # the default branch. `branch_protection_rule` below still catches a rule change the moment it
+  # happens. So what this filter drops is duplication, not coverage.
   push:
     branches: [main]
+    paths:
+      - ".github/**"
+      - "SECURITY.md"
   # Scorecard's documented trigger for re-scoring when branch protection changes. Without it the
   # Branch-Protection score only refreshes on the weekly run.
   branch_protection_rule:
