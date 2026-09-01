@@ -48,6 +48,7 @@ to status only — no prose.
 | [SPEC-041](SPEC-041-sink-integration-verification.md) | Sink Integration Verification | Completed | SPEC-026, SPEC-027, SPEC-038 |
 | [SPEC-042](SPEC-042-forked-child-sink-ownership.md) | Forked-Child Sink Ownership | Completed | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039 |
 | [SPEC-043](SPEC-043-sentry-backend-selection.md) | Sentry Backend Selection | In Progress | SPEC-026, SPEC-032, SPEC-041 |
+| [SPEC-044](SPEC-044-lifecycle-races.md) | Lifecycle Races | In Progress | SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042 |
 
 ## Arcs (build order)
 
@@ -229,3 +230,10 @@ Group related specs and record the order to build them in. Keep this section: a 
   review — but it makes the absence of a state machine survivable rather than removing it. Built
   after `1.0.0`: it is behaviour-preserving by construction, so it is the one thing here with no
   reason to be rushed.
+
+- **Lifecycle races:** SPEC-044 — the six races SPEC-040's execution frame found over its own diff
+  and its Out of Scope forbade it to fix. Each reproduces byte-identically on the pre-SPEC-040
+  tree, so the refactor is not their cause and SPEC-044 does not depend on it for correctness — it
+  depends on it for *shape*, since the guards are now four methods on one owner rather than seven
+  loose globals. Build it after SPEC-040 (done). It closes five and documents the sixth, which
+  §13 records as a deliberate design limit rather than a defect.

@@ -359,7 +359,16 @@ def test_a_sweep_racing_a_span_close_delivers_each_event_once() -> None:
     reproduced the defect in the first place.
     """
     def one_trial() -> Recorder:
-        """One span whose close races a sweep on a thread sharing the very same Span object."""
+        """One span whose close races a sweep on a thread sharing the very same Span object.
+
+        The discarded worker is shut down rather than dropped: dropping it orphaned a live
+        `log-foundry-worker` daemon thread per trial, thirty of which survived to the end of the
+        session and made a later file's process-global thread census read them as its own
+        (SPEC-044). Cheap here — the worker has nothing queued at this point.
+        """
+        previous = _lifecycle._state.worker_exists()
+        if previous is not None:
+            previous.shutdown(5.0)
         _lifecycle._state._worker = None
         sink = Recorder()
         log_foundry.configure(service="t", sink=sink)

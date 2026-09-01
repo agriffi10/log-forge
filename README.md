@@ -1060,13 +1060,23 @@ which one you want depends on whether the process is about to end:
 import log_foundry as lf
 
 lf.flush()      # drain to the sink and keep going; truthy when everything landed
-lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained (30s cap)
+lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained (30s cap on
+                # the drain — the sink's own close() is not bounded by it, see below)
 ```
 
-Both are bounded, because both can be called somewhere with a deadline. `flush(timeout=5.0)`
+Both take a deadline, because both can be called somewhere with one. `flush(timeout=5.0)`
 is falsy if the drain did not complete; `shutdown(timeout=30.0)` returns having stopped
 what it could, and reports `health().stopped_reason == "ShutdownTimeout"`. Passing `None` to
 either waits indefinitely, which is unsafe in any environment with an execution deadline.
+
+**What `shutdown()`'s timeout does not bound is the live sink's own `close()`**, which runs
+inline on either delivery path. A sink that blocks for a minute inside `close()` holds
+`shutdown()` — and the process — for that minute, whatever you passed. Measured 6.01 s against
+`shutdown(timeout=2.0)` with a 6-second close. This is deliberate rather than an oversight: both
+ways of bounding it were built and reverted (a daemon closer is killed at interpreter exit
+wherever it has reached, which for `SQLiteSink` can be inside `commit()`), and bounding it
+properly needs `close()` itself to be interruptible, which the sink contract does not require.
+If your sink's close can block, give it its own internal timeout.
 
 **What a broken destination can cost you.** There is one drain thread, so a sink's backoff pauses
 *all* log delivery, and it spans `shutdown()`. At the defaults (`max_retries=3`) that is 0.7 s of
@@ -1074,7 +1084,8 @@ backoff per batch for most sinks (per *message* for the socket-backed ones — ~
 100-message batch against a dead syslog host), and up to 90 s for an HTTP sink whose destination
 is sending
 `Retry-After` — clamped to `max_retry_after=30.0` per wait, which you can lower. Every wait is cut
-short by a shutdown, and `shutdown()`'s own timeout bounds the total either way. Each sink's class
+short by a shutdown, and `shutdown()`'s own timeout bounds the total either way — for the
+*drain*; a wait taken inside the sink's `close()` is not bounded by it (above). Each sink's class
 docstring states its own worst case.
 
 | | `flush()` | `shutdown()` |

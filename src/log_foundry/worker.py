@@ -238,6 +238,7 @@ class Worker:
         flush_interval: float = 1.0,
         max_queue: int = 10_000,
         max_retries: int = 3,
+        sink_released: bool = False,
     ) -> None:
         """Starts the drain thread and offers the sink this worker's stop signal.
 
@@ -245,12 +246,28 @@ class Worker:
         shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
         and user code.
 
+        ``sink_released`` says the close is **already discharged** by whoever released this sink,
+        never that the sink is unusable (SPEC-044 FR-001). Only ``_lifecycle._get_worker`` passes
+        it, and only for a worker built while a ``shutdown()`` was mid-flight over the very sink
+        that shutdown's orphan branch had just closed — without it the exit close performs a
+        second ``close()``. ``sinks/base.py`` requires an implementation to make its release
+        idempotent, but the library must not *rely* on that: it cannot enforce what a
+        third-party sink does, and a half-released transport is the failure SPEC-032 exists to
+        prevent. So the library performs one close and does not test whether a sink survived
+        two. This
+        worker still emits to that sink: one that guards its post-close state refuses and the
+        batch lands in ``failed_batches``, which is the documented signal on this path. The flag
+        describes **one** sink, so :meth:`swap_sink` clears it when it adopts another — otherwise
+        the claim would transfer to every sink this worker later held, and the next one would be
+        closed by nobody.
+
         Args:
           sink: The destination every batch is emitted to.
           batch_size: How many submissions accumulate before an emit is triggered.
           flush_interval: Seconds before a partial batch is emitted anyway.
           max_queue: Ceiling on buffered submissions, past which the newest is dropped.
           max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`.
+          sink_released: Whether ``sink``'s close has already been performed elsewhere.
 
         Returns:
           None.
@@ -273,7 +290,7 @@ class Worker:
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
         self._shutdown_done = False
-        self._sink_closed = False
+        self._sink_closed = sink_released
         self._lock = threading.Lock()
         self._offer_stop_signal()
         self._thread = threading.Thread(
@@ -742,6 +759,7 @@ class Worker:
             if old is new_sink:
                 return True
             self.sink = new_sink
+            self._sink_closed = False
         self._offer_stop_signal()
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not (drained and self.flush(remaining)):
@@ -787,6 +805,10 @@ class Worker:
         that read the old sink before ``configure()`` reassigned it can still be inside its
         ``emit`` — which is why ``sinks/base.py`` requires ``close()`` to tolerate exactly that
         (SPEC-028 FR-001), and why the sinks holding transport state take their lock in both.
+
+        **It records nothing in the closed-sink latch** (SPEC-044 FR-004): its caller is reached
+        through ``_lifecycle._swap_sink``, which latches this same sink before the swap begins,
+        and latching again here would only overwrite a record with itself.
 
         ``Sink.close`` takes no timeout, so the close is run on its own thread and joined for
         what is left of the swap's budget. **An expired join decides only who waits** — it moves
@@ -996,6 +1018,11 @@ class Worker:
 
         ``is_alive()`` is the safety condition rather than a heuristic: it reads ``False`` only
         after ``_run`` has returned, so the sink is provably out of use *by the worker*.
+
+        **It records nothing in the closed-sink latch, and does not need to** (SPEC-044 FR-004):
+        ``_lifecycle._orphan_sink`` still names this sink where anything named it, and
+        ``worker_owns`` answers ``True``, so ``_close_orphan_sink`` declines rather than re-arming
+        it. The latch exists for a sink this worker has *stopped* holding.
 
         The close runs to completion, inline, and is deliberately **not** bounded — which leaves
         one honest gap. SPEC-028 made ``close()`` take the sink's emit lock, so an application

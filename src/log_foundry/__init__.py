@@ -152,12 +152,16 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     Args:
       timeout: Seconds bounding the wait for the background thread and, carved from the same
         budget, a short grace for any sink still closing after a late ``configure(sink=...)``
-        (SPEC-027 FR-004, SPEC-030 FR-003). ``None``
-        waits indefinitely, which is what this did unconditionally before and is still
-        available on request, but is unsafe anywhere with an execution deadline — ``atexit`` is
-        one such place, where a sink blocked in a network call would hold the process open. An
-        expired shutdown reports a ``stopped_reason`` of ``"ShutdownTimeout"`` and leaves the
-        sink open, since the drain thread may still be inside ``emit``.
+        (SPEC-027 FR-004, SPEC-030 FR-003). It does **not** bound the live sink's own
+        ``close()``, which runs inline on either delivery path and is unbounded — so a sink
+        blocked in a network call inside ``close()`` holds this call, and the process, open for
+        as long as it blocks, whatever ``timeout`` says (measured 6.01 s against
+        ``timeout=2.0``; ``architecture.md`` §13). Bounding it needs ``Sink.close`` to be
+        interruptible, which the sink contract does not require. ``None`` waits indefinitely
+        for the parts that are bounded, which is what this did unconditionally before and is
+        still available on request. An expired shutdown reports a ``stopped_reason`` of
+        ``"ShutdownTimeout"`` and leaves the sink open, since the drain thread may still be
+        inside ``emit``.
 
     Returns:
       None.

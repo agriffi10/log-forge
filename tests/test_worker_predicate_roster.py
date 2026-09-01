@@ -127,6 +127,31 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "`return _worker` after the lock could never have handed back a different object."
         ),
     ),
+    ("_get_worker", "worker", 1): (
+        EXISTENCE,
+        (
+            "the registration of that same object as the **late worker** for a `shutdown()` "
+            "already running (SPEC-044 FR-001) - the right-hand side of `_late_worker = worker`. "
+            "Existence for the reason the publication above is: it is a write of the object just "
+            "built, not a question about it, and what decides whether it happens is "
+            "`_state._shutdown_running`, which names no worker and gets no row. Ordering matters "
+            "and was checked - `_state._worker = worker` stays **above** this line, so index 0 "
+            "keeps naming the publication and this one is index 1."
+        ),
+    ),
+    ("_get_worker", "owed is not None and owed is not worker.sink", 0): (
+        OWNERSHIP,
+        (
+            "who owns the close the orphan record was holding, at the moment the record is "
+            "cleared (SPEC-044 FR-002). Ownership, not existence: a worker exists by "
+            "construction three lines up, and what is undecided is whether it *adopted* the "
+            "recorded sink - `configure()` writes `_config.sink` before taking this lock, so a "
+            "`configure(sink=B)` blocked here leaves `_ensure_sink()` returning B while the "
+            "record still names A, which is the close that used to be discarded. Not liveness: "
+            "the worker was built moments ago and cannot be retired, so liveness answers the "
+            "same thing today and stops doing so the day a worker is built retired."
+        ),
+    ),
     ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
@@ -254,6 +279,40 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
         ),
     ),
+    ("_shutdown_worker", "worker is None", 0): (
+        EXISTENCE,
+        (
+            "whether to raise the shutdown-in-progress counter (SPEC-044 FR-001), asked in the "
+            "**same critical section** as the binding above so the retirement latch and the "
+            "worker read cannot straddle a `_get_worker`. Existence rather than liveness: the "
+            "counter exists to catch a worker that does not exist *yet*, and a retired worker "
+            "found here is still the process worker and takes the branch that drains it. A "
+            "second test of one binding rather than a re-read, which is what makes it safe to "
+            "file apart from `worker is not None`."
+        ),
+    ),
+    ("_shutdown_worker", "_state._late_worker", 0): (
+        EXISTENCE,
+        (
+            "the read of whatever `_get_worker` registered while this call was running, in the "
+            "last critical section - the right-hand side of `late_worker = _state._late_worker`, "
+            "taken together with lowering the counter so nothing can be registered into a gap "
+            "between the two. Existence: the question is only whether anything appeared. Bound "
+            "rather than read twice for the reason the rows above are, and the local is named "
+            "`late_worker` deliberately so that its test below is itself filed."
+        ),
+    ),
+    ("_shutdown_worker", "late_worker is not None", 0): (
+        EXISTENCE,
+        (
+            "the test the binding above feeds. Filed separately on the same rule as every other "
+            "binding/test pair here, and reachable only because the local carries a worker name: "
+            "`_accessor_names` runs its fixpoint over function returns, so a local bound from an "
+            "attribute read is a subject only when its **name** says so. Calling it `late` would "
+            "have hidden this guard from the walker with the file green - the shape SPEC-040 "
+            "recorded when a rename killed two of its own lint rules silently."
+        ),
+    ),
     ("_swap_sink", "_state.live_worker()", 0): (
         LIVENESS,
         (
@@ -330,6 +389,40 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "the call that produces the ownership verdict the row below reads. Filed because "
             "the roster files bindings positionally: a delegation retargeted at _worker rather "
             "than the live snapshot is the round-9 attack wearing a different value shape."
+        ),
+    ),
+    ("_swap_sink", "owed is not None and owed is not new_sink and (owed is not worker.sink)", 0): (
+        OWNERSHIP,
+        (
+            "whether the orphan record names a **third** sink - neither the one the worker holds "
+            "nor the one being installed - which nothing else would then close (SPEC-044 "
+            "FR-002). Ownership: it asks what the worker holds, not whether it is alive or "
+            "exists, and it is the same question `_get_worker` asks at the sibling site. Only a "
+            "preempted orphan emit re-arming across an earlier swap can make it true, which is "
+            "why it is a guard rather than the common path."
+        ),
+    ),
+    ("_swap_sink", "worker.sink is not new_sink", 0): (
+        OWNERSHIP,
+        (
+            "whether this swap actually hands a sink over, and therefore whether there is a "
+            "close for the latch to record (SPEC-044 FR-004). Ownership: `worker.sink` is the "
+            "sink `Worker.swap_sink` is about to close, and it is the **right** subject where "
+            "the orphan record is the wrong one - the record is `None` in the reproduced case, "
+            "because `_get_worker` cleared it when the worker was built, so a latch keyed on it "
+            "recorded nothing and left the double close exactly where it was."
+        ),
+    ),
+    ("_swap_sink", "worker.sink", 0): (
+        OWNERSHIP,
+        (
+            "the sink written into the latch - the right-hand side of "
+            "`_orphan_closed_sink = worker.sink`, filed for the reason `_get_worker`'s "
+            "publication row is: a write rather than a question, on the roster as a "
+            "stale-detector over the one line that decides which sink a later re-arm is refused "
+            "for. It is set even where the drain could not be confirmed and the swap therefore "
+            "leaves that sink **open**, because the reason is not `it was closed` but that a "
+            "racing emit must not re-arm a sink whose drain thread may still be inside `emit`."
         ),
     ),
     ("_swap_sink", "not worker_holds_sink", 0): (
@@ -861,7 +954,7 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 37, "log_foundry.decorator": 1}
+_SITE_FLOOR = {"log_foundry._lifecycle": 45, "log_foundry.decorator": 1}
 """The floor each walked module must still meet, by name.
 
 A refactor that relocates guards can shrink a derived roster silently, which is the one failure
