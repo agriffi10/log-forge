@@ -8,6 +8,8 @@ import time
 
 import pytest
 
+from log_foundry import _lifecycle
+
 log_foundry = pytest.importorskip("log_foundry")
 decorator = pytest.importorskip("log_foundry.decorator")
 worker_mod = pytest.importorskip("log_foundry.worker")
@@ -82,7 +84,7 @@ def test_the_offer_does_not_consult_liveness() -> None:
     docstring explaining the distinction, so a substring check over ``getsource`` asserts the
     prose and would fail against a correct implementation.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(decorator._offer_orphan_signal)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_lifecycle._offer_orphan_signal)))
     called = {
         node.func.id
         for node in ast.walk(tree)
@@ -97,7 +99,7 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
     sink = BackoffSink()
     log_foundry.configure(service="t", sink=sink)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
     assert sink.log_foundry_stop_signal is worker._stop, "the worker owns this sink's signal to begin with"
 
@@ -127,7 +129,7 @@ def test_an_orphan_log_during_the_drain_does_not_strand_the_backoff() -> None:
     sink = BackoffSink(backoff=20.0)
     log_foundry.configure(service="t", sink=sink)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     outcome: list[bool] = []
@@ -215,7 +217,7 @@ def test_a_second_shutdown_waits_for_the_drain_already_running() -> None:
     for _ in range(3):
         _trace_once()
 
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
     first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
     first.start()
@@ -275,7 +277,7 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait() -> None:
     sink = WedgedSink()
     log_foundry.configure(service="t", sink=sink)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     try:
@@ -357,7 +359,7 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None and worker.sink is old
 
     shutting_down = _shutdown_inside_the_first_flush(worker)
@@ -366,7 +368,7 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     shutting_down.join(60.0)
 
     assert worker.sink is old, "the swap really was declined, or this test proves nothing"
-    assert decorator._orphan_sink is new or new.closed == 1, (
+    assert _lifecycle._state._orphan_sink is new or new.closed == 1, (
         "the declined sink is neither closed nor armed for the exit handler — owned by nobody"
     )
 
@@ -376,7 +378,7 @@ def test_the_old_sink_is_not_closed_by_both_paths() -> None:
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     shutting_down = _shutdown_inside_the_first_flush(worker)
@@ -384,7 +386,7 @@ def test_the_old_sink_is_not_closed_by_both_paths() -> None:
     log_foundry.configure(service="t", sink=new)
     shutting_down.join(60.0)
 
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
     assert old.closed == 1, f"A was closed {old.closed} times, not once"
     assert new.closed == 1, f"B was closed {new.closed} times, not once"
 
@@ -399,7 +401,7 @@ def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> N
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     worker.flush = lambda timeout=None: False  # the drain cannot be confirmed
@@ -423,7 +425,7 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
     _trace_once()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     new = CountingSink("B")
@@ -433,14 +435,14 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
         result = real_flush(timeout)
         worker.flush = real_flush
         log_foundry.info("an orphan log that arms B while the swap is in flight")
-        assert decorator._orphan_sink is new, "the orphan log must have armed B"
+        assert _lifecycle._state._orphan_sink is new, "the orphan log must have armed B"
         log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
         return result
 
     worker.flush = flush_then_arm_and_shut_down
     log_foundry.configure(service="t", sink=new)  # declines, then must not re-arm B
 
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
     assert new.closed == 1, f"B was closed {new.closed} times, not once"
 
 
@@ -489,7 +491,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
         import sys, threading
         sys.path.insert(0, "src")
         import log_foundry
-        from log_foundry import decorator
+        from log_foundry import _lifecycle
 
         class S:
             def __init__(self, n): self.n = n; self.closed = 0; self.log_foundry_stop_signal = None
@@ -503,7 +505,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
         def w(): pass
         w()
 
-        worker = decorator._worker
+        worker = _lifecycle._state._worker
         real = worker.flush
         def flush_then_shut_down(timeout=None):
             r = real(timeout)

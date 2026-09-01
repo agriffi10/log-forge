@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import log_foundry
 from conftest import run_concurrently
-from log_foundry import decorator
+from log_foundry import _lifecycle, decorator
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink
@@ -129,7 +129,7 @@ def test_health_reports_the_counters_with_and_without_a_worker() -> None:
     log_foundry.configure(service="t", sink=Exploding())
     log_foundry.info("lost, and no worker has ever been built")
 
-    assert decorator._worker is None, "reading health must not stand up a thread"
+    assert _lifecycle._state._worker is None, "reading health must not stand up a thread"
     assert log_foundry.health().orphan_lost == 1, "the no-worker branch reports it"
 
     @log_foundry.trace
@@ -137,7 +137,7 @@ def test_health_reports_the_counters_with_and_without_a_worker() -> None:
         return None
 
     work()  # builds the worker
-    assert decorator._worker is not None
+    assert _lifecycle._state._worker is not None
     assert log_foundry.health().orphan_lost == 1, "and the worker branch still reports it"
 
 
@@ -166,7 +166,7 @@ def test_the_counter_lock_is_dedicated_and_not_the_worker_lock() -> None:
     `_worker_lock` is held across `Worker(_ensure_sink())` in `_get_worker`, a blocking build a
     counter increment on an arbitrary application thread must never queue behind.
     """
-    assert decorator._loss_lock is not decorator._worker_lock
+    assert decorator._loss_lock is not _lifecycle._state._lock
     assert isinstance(decorator._loss_lock, type(threading.Lock()))
 
 

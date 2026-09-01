@@ -900,10 +900,10 @@ def test_no_config_copy_is_allocated_per_event(monkeypatch) -> None:
 def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     """A new lock's real risk is what runs inside it, and that is what rots.
 
-    `_ensure_sink()` is called with `decorator._worker_lock` already held
-    (`decorator.py:235`), so the order is worker -> config and must stay one-way: anything under
-    `_config_lock` that reached back for `_worker_lock`, or blocked on I/O, would deadlock or
-    stall every configure and every zero-config log behind it. Today only `replace()` and
+    `_ensure_sink()` is called with `_lifecycle._state._lock` already held (inside
+    `_lifecycle._get_worker`), so the order is lifecycle -> config and must stay one-way:
+    anything under `_config_lock` that reached back for the lifecycle lock, or blocked on I/O,
+    would deadlock or stall every configure and every zero-config log behind it. Today only `replace()` and
     `StdoutSink()` run there, and `StdoutSink.__init__` is a single attribute assignment.
 
     Asserted as a whitelist rather than a search for the bad case: the set of things that would

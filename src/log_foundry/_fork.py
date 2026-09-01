@@ -32,7 +32,7 @@ _child_handlers: list[Callable[[], None]] = []
 """What runs in the child once its locks are its own again, in registration order.
 
 **An inverted registry, and that is what keeps the dependency arrow pointing one way**
-(FR-006). The work a child needs done belongs to ``decorator``, ``_lifecycle`` and the sinks,
+(FR-006). The work a child needs done belongs to ``_lifecycle`` and the sinks,
 and all three would have to import this module for it to reach them; instead they register with
 it, so this module imports nothing that imports it and there is no cycle to break later.
 """
@@ -547,7 +547,7 @@ def register_child_handler(fn: Callable[[], None]) -> None:
     A handler may take any of the library's locks, which is what the ordering in
     :func:`_reinit_after_fork` buys it and why registering is the only way in. What it must not
     assume is that it is alone: handlers run in registration order and an earlier one may have
-    started a thread — ``decorator``'s rebuild does exactly that — so only the *first* runs in a
+    started a thread — ``_lifecycle``'s worker rebuild does exactly that — so only the *first* runs in a
     genuinely single-threaded child. None of them may block, since nothing has returned from
     ``fork`` yet.
 
@@ -580,7 +580,7 @@ def _reinit_after_fork() -> None:
     takes it is a handler that hangs, and it hangs on the child's only thread with nothing to
     interrupt it. Work that must happen before *any* handler stays inline between the two steps
     rather than being registered — the discard is the case, and registering it would put it
-    after ``decorator``'s rebuild, which has started a live drain thread by then, emitting into
+    after ``_lifecycle``'s worker rebuild, which has started a live drain thread by then, emitting into
     the very sink whose buffer is still the parent's.
 
     Args:

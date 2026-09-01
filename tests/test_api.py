@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+from log_foundry import _lifecycle
+
 api = pytest.importorskip("log_foundry.api")
 
 LEVELS = ["debug", "info", "warning", "error", "critical"]
@@ -546,7 +548,6 @@ def test_a_close_that_raises_does_not_reach_the_caller(capsys) -> None:
 def test_configure_without_ever_logging_closes_nothing_and_creates_nothing() -> None:
     """AC-8. Not because the sink was never built — configure() always builds one."""
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
@@ -554,7 +555,7 @@ def test_configure_without_ever_logging_closes_nothing_and_creates_nothing() -> 
     lf.shutdown()
 
     assert sink.closes == 0, "no event ever reached it, so closing it is cost with no benefit"
-    assert decorator._worker is None
+    assert _lifecycle._state._worker is None
 
 
 def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
@@ -562,7 +563,6 @@ def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
     import threading
 
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     before = threading.active_count()
     sink = _CountingSink()
@@ -572,14 +572,13 @@ def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
     lf.shutdown()
 
     assert threading.active_count() == before
-    assert decorator._worker is None
+    assert _lifecycle._state._worker is None
     assert sink.closes == 1
 
 
 def test_health_reports_retired_after_an_orphan_only_shutdown() -> None:
     """AC-4/AC-5: `retired` stops being vacuous; `submitted_after_shutdown` keeps its meaning."""
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
@@ -594,7 +593,7 @@ def test_health_reports_retired_after_an_orphan_only_shutdown() -> None:
         "SPEC-030 defines that as queued-where-nothing-drains; this is refused-and-announced"
     )
     assert health.stopped_reason is None, "a clean shutdown is not a terminal failure (SPEC-019)"
-    assert decorator._worker is None, "health() must not create a worker to answer this"
+    assert _lifecycle._state._worker is None, "health() must not create a worker to answer this"
 
 
 def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys) -> None:
@@ -650,7 +649,6 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -
     an orphan-only test.
     """
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -662,7 +660,7 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -
         lf.info("inside the span")
 
     traced()
-    assert decorator._worker is not None, "the span built a worker"
+    assert _lifecycle._state._worker is not None, "the span built a worker"
 
     lf.shutdown()
 
@@ -676,7 +674,6 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -
 def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_span_first() -> None:
     """AC-3, the other order — the worker exists before anything arms the orphan close."""
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -691,7 +688,7 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_span_first() -> 
         lf.info("orphan second")
 
     contextvars.copy_context().run(body)
-    assert decorator._worker is not None
+    assert _lifecycle._state._worker is not None
 
     lf.shutdown()
 
@@ -871,7 +868,6 @@ def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() ->
     new worker just captured, so it is asserted directly rather than only through that caller.
     """
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -882,9 +878,9 @@ def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() ->
         return None
 
     traced()
-    assert decorator._worker is not None
+    assert _lifecycle._state._worker is not None
 
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
 
     assert sink.closes == 0, "the worker owns this sink; the orphan close must stand down"
 
@@ -897,13 +893,13 @@ def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> 
     acquiring `_worker_lock`, which is the interleaving a bare unlocked read admits.
     """
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
+    from log_foundry import worker as worker_mod
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
     lf.info("arms the close")
 
-    real_lock = decorator._worker_lock
+    real_lock = _lifecycle._state._lock
 
     class _PreemptingLock:
         """Publishes a worker while a caller is mid-acquire, as a real thread could."""
@@ -915,17 +911,17 @@ def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> 
             real_lock.acquire()
             if not self.fired:
                 self.fired = True
-                decorator._worker = decorator.Worker(sink)
+                _lifecycle._state._worker = worker_mod.Worker(sink)
             return self
 
         def __exit__(self, *exc: object) -> None:
             real_lock.release()
 
-    decorator._worker_lock = _PreemptingLock()  # type: ignore[assignment]
+    _lifecycle._state._lock = _PreemptingLock()  # type: ignore[assignment]
     try:
-        decorator._close_orphan_sink()
+        _lifecycle._close_orphan_sink()
     finally:
-        decorator._worker_lock = real_lock
+        _lifecycle._state._lock = real_lock
 
     assert sink.closes == 0, (
         "the worker was published under the lock, so the close must observe it and stand down"
@@ -961,7 +957,6 @@ def test_a_sink_that_raises_on_emit_is_still_closed() -> None:
 def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     """The other side of it: there is no sink, so there is nothing to close."""
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     lf.configure(service="t")
     original = api._ensure_sink
@@ -979,7 +974,7 @@ def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     finally:
         api._ensure_sink = original  # type: ignore[assignment]
 
-    assert decorator._orphan_sink is None
+    assert _lifecycle._state._orphan_sink is None
 
 
 def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:
@@ -990,7 +985,6 @@ def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None
     down — false, and it contradicts what `health()` reported one call earlier.
     """
     lf = pytest.importorskip("log_foundry")
-    from log_foundry import decorator
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -1003,7 +997,7 @@ def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None
         return None
 
     traced()
-    assert decorator._worker is not None, "a fresh worker really was built"
+    assert _lifecycle._state._worker is not None, "a fresh worker really was built"
 
     assert lf.health().retired is True, "shutdown() happened; a new worker cannot un-happen it"
 

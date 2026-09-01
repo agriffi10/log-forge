@@ -64,7 +64,7 @@ _SRC = pathlib.Path(log_foundry.__file__).parent
 
 _EXPECTED_CLOSERS = {
     ("_lifecycle", "_close_guarded"),
-    ("decorator", "_close_orphan_sink"),
+    ("_lifecycle", "_close_orphan_sink"),
     ("worker", "Worker._close_sink"),
     ("sinks/multi", "MultiSink.close"),
     ("sinks/filtering", "FilteringSink.close"),
@@ -75,7 +75,7 @@ _EXPECTED_CLOSERS = {
 """The eight sites that close a sink, named so a ninth is a decision somebody takes.
 
 The first is the *thread body* of a detached close rather than the two callers that start one:
-`decorator._swap_sink` and `Worker._close_swapped_out` request a close and hand the thread on to
+`_lifecycle._swap_sink` and `Worker._close_swapped_out` request a close and hand the thread on to
 a bounded join, and `_close_guarded` is where it is actually performed. Those two are
 `_EXPECTED_REQUESTERS` -- listed separately because a requester is not a place a guard has to
 sit, and folding them in here would make the roster read as ten closers when SPEC-042 counted
@@ -83,7 +83,7 @@ eight.
 """
 
 _EXPECTED_REQUESTERS = {
-    ("decorator", "_swap_sink"),
+    ("_lifecycle", "_swap_sink"),
     ("worker", "Worker._close_swapped_out"),
 }
 """The two sites that ask for a detached close and join the thread it returns.
@@ -287,23 +287,67 @@ def _is_self_attr(node: ast.expr, attr: str) -> bool:
 def _module_globals(tree: ast.Module) -> dict[str, set[str]]:
     """Returns the annotation names of every module-level annotated global.
 
-    This is the "local alias to a module global" route: `decorator._close_orphan_sink` reads
-    `owed = _orphan_sink`, and only the global carries `Sink | None`.
+    This is the "local alias to a module global" route: `_lifecycle._close_orphan_sink` reads
+    `owed = _state._orphan_sink`, and only the declaration carries `Sink | None`.
+
+    **Dotted keys are included**, because SPEC-040 moved the lifecycle state off the module and
+    onto one owner object: the sink a close is owed now reaches the call site as
+    `_state._orphan_sink` rather than as a bare annotated global. Without them exactly one site
+    stops resolving — `_lifecycle._close_orphan_sink` — and
+    `test_the_resolver_reaches_receivers_that_carry_no_annotation` fails rather than passing
+    quietly. Both numbers are measured by reverting the extension; an earlier draft of this
+    paragraph claimed two sites and a silent pass, and both halves were wrong.
 
     Args:
       tree: The parsed module.
 
     Returns:
-      One entry per annotated global.
+      One entry per annotated global, plus one per annotated attribute of a module-level
+      instance, keyed `"<global>.<attribute>"`.
 
     Raises:
       None.
     """
     found: dict[str, set[str]] = {}
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             found[node.target.id] = _annotation_names(node.annotation)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id in classes
+        ):
+            holder = node.targets[0].id
+            cls = classes[node.value.func.id]
+            for attr in _annotated_self_attributes(cls):
+                found[f"{holder}.{attr}"] = _self_attribute_names(cls, attr)
     return found
+
+
+def _annotated_self_attributes(cls: ast.ClassDef) -> set[str]:
+    """Returns every `self.<name>` a class annotates, so the caller can ask about each.
+
+    Args:
+      cls: The class to read.
+
+    Returns:
+      The attribute names.
+
+    Raises:
+      None.
+    """
+    return {
+        node.target.attr
+        for node in ast.walk(cls)
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Attribute)
+        and isinstance(node.target.value, ast.Name)
+        and node.target.value.id == "self"
+    }
 
 
 def _resolve(
@@ -337,6 +381,8 @@ def _resolve(
     if isinstance(receiver, ast.Attribute):
         if cls is not None and isinstance(receiver.value, ast.Name) and receiver.value.id == "self":
             return _self_attribute_names(cls, receiver.attr)
+        if isinstance(receiver.value, ast.Name):
+            return globals_.get(f"{receiver.value.id}.{receiver.attr}", set())
         return set()
     if not isinstance(receiver, ast.Name):
         return set()
@@ -442,6 +488,41 @@ def _sink_close_sites(
     return sites
 
 
+def _is_release_call(func: ast.expr, stem: str) -> bool:
+    """Whether a call's callee is the release helper, qualified or bare.
+
+    Both shapes are real and neither is optional: every other module reaches it as
+    `_lifecycle.release(...)`, while `_lifecycle`'s own functions call it unqualified. Before
+    SPEC-040 moved the two lifecycle closers into that module there were no bare call sites
+    outside `release` itself, so two of the checks below tested only the qualified shape and
+    silently stopped matching when the callers moved next to the helper.
+
+    It also **narrows** one of the three checks it replaces:
+    `test_the_detached_requesters_still_bind_the_thread_they_are_handed` previously matched any
+    `X.release(...)`, and now requires `X` to be `_lifecycle`. Nothing is lost today — no other
+    `.release(` exists in `src/` — and the narrowing matches what the roster is about, but it is
+    a real change and is stated rather than left in the diff.
+
+    Args:
+      func: The callee expression of the call.
+      stem: The module stem the call sits in.
+
+    Returns:
+      Whether this is a call to the release helper.
+
+    Raises:
+      None.
+    """
+    qualified = (
+        isinstance(func, ast.Attribute)
+        and func.attr == "release"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "_lifecycle"
+    )
+    bare = stem == "_lifecycle" and isinstance(func, ast.Name) and func.id == "release"
+    return qualified or bare
+
+
 def _release_call_sites() -> set[tuple[str, str]]:
     """Returns every scope in `src/` that calls the release helper.
 
@@ -463,14 +544,7 @@ def _release_call_sites() -> set[tuple[str, str]]:
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            qualified = (
-                isinstance(func, ast.Attribute)
-                and func.attr == "release"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "_lifecycle"
-            )
-            bare = stem == "_lifecycle" and isinstance(func, ast.Name) and func.id == "release"
-            if qualified or bare:
+            if _is_release_call(func, stem):
                 callers.add((stem, _qualified(fn, cls)))
     return callers
 
@@ -513,7 +587,7 @@ def test_the_detached_requesters_still_bind_the_thread_they_are_handed() -> None
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
                 continue
             func = node.value.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "release"):
+            if not _is_release_call(func, stem):
                 continue
             if any(kw.arg == "detached" for kw in node.value.keywords):
                 bound.add((stem, _qualified(fn, cls)))
@@ -572,7 +646,7 @@ def test_the_worker_waits_for_the_swapped_out_close_it_started() -> None:
 
     The AST lint above cannot see a helper that stops returning the thread, and when that
     mutation was run the only test in the whole suite that died covered
-    `decorator._swap_sink` -- this caller's wait had nothing asserting it at all.
+    `_lifecycle._swap_sink` -- this caller's wait had nothing asserting it at all.
 
     The close takes measurable time on purpose: an instant one completes before the assertion
     whether or not anything joined it, so the elapsed floor is what distinguishes waiting from
@@ -602,7 +676,7 @@ def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
     asserted to resolve, and asserted to resolve to `Sink` rather than to merely something.
     """
     indirect = {
-        ("decorator", "_close_orphan_sink", ast.Name),
+        ("_lifecycle", "_close_orphan_sink", ast.Name),
         ("worker", "Worker._close_sink", ast.Attribute),
         ("sinks/multi", "MultiSink.close", ast.Name),
     }
@@ -613,9 +687,7 @@ def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "release"):
-                continue
-            if not (isinstance(func.value, ast.Name) and func.value.id == "_lifecycle"):
+            if not _is_release_call(func, stem):
                 continue
             if not node.args:
                 continue

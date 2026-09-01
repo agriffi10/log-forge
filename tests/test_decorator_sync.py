@@ -445,9 +445,9 @@ def test_events_are_flushed_before_the_wrapper_returns(fake_sink) -> None:
 def test_a_sink_that_fails_to_construct_does_not_fail_the_caller(monkeypatch, capsys) -> None:
     """FR-001 as worded: the motivating case is a sink whose *construction* raises."""
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    config = pytest.importorskip("log_foundry.config")
     monkeypatch.setattr(
-        decorator, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("no sink"))
+        config, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("no sink"))
     )
 
     @log_foundry.trace(name="work")

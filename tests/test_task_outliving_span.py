@@ -18,7 +18,7 @@ import asyncio
 import pytest
 
 import log_foundry
-from log_foundry import decorator
+from log_foundry import _lifecycle, decorator
 from log_foundry.model import Span
 from log_foundry.worker import Worker
 
@@ -30,7 +30,7 @@ def _install_worker(sink: Recorder, interval: float) -> Worker:
     """
     log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1000, flush_interval=interval)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     return worker
 
 
@@ -193,12 +193,12 @@ def test_the_span_is_left_a_fresh_list_rather_than_a_cleared_one() -> None:
         events=[{"message": "one"}],
     )
     original = span.events
-    real_get_worker = decorator._get_worker
-    decorator._get_worker = lambda: Spy()  # type: ignore[assignment]
+    real_get_worker = _lifecycle._get_worker
+    _lifecycle._get_worker = lambda: Spy()  # type: ignore[assignment]
     try:
         decorator._flush(span)
     finally:
-        decorator._get_worker = real_get_worker  # type: ignore[assignment]
+        _lifecycle._get_worker = real_get_worker  # type: ignore[assignment]
 
     assert submitted == [[{"message": "one"}]], "the worker got the events"
     assert submitted[0] is original, "by reference — the old list itself"

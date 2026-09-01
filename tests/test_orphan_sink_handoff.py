@@ -6,6 +6,8 @@ import time
 
 import pytest
 
+from log_foundry import _lifecycle
+
 log_foundry = pytest.importorskip("log_foundry")
 config = pytest.importorskip("log_foundry.config")
 decorator = pytest.importorskip("log_foundry.decorator")
@@ -85,7 +87,7 @@ def test_the_recorded_sink_is_the_one_emitted_to_not_the_one_configured() -> Non
 
     config._rebind(sink=later)  # the config now names a sink nothing was written to
 
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
 
     assert written.closed == 1, "the sink the event reached is the one closed"
     assert later.closed == 0, "not whatever the config happens to name now"
@@ -96,10 +98,10 @@ def test_a_configured_but_never_written_sink_is_not_closed() -> None:
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
 
     assert sink.closed == 0
-    assert decorator._orphan_sink is None
+    assert _lifecycle._state._orphan_sink is None
 
 
 def test_a_sink_whose_emit_raised_is_still_closed() -> None:
@@ -109,8 +111,8 @@ def test_a_sink_whose_emit_raised_is_still_closed() -> None:
 
     log_foundry.info("this will raise inside the sink")  # absorbed by SPEC-025
 
-    assert decorator._orphan_sink is sink, "armed before the emit, not after it"
-    decorator._close_orphan_sink()
+    assert _lifecycle._state._orphan_sink is sink, "armed before the emit, not after it"
+    _lifecycle._close_orphan_sink()
     assert sink.closed == 1
 
 
@@ -123,7 +125,7 @@ def test_a_latched_sink_is_not_rearmed_and_so_is_not_closed_twice() -> None:
     assert sink.closed == 1
 
     log_foundry.info("after shutdown, against the closed sink")
-    decorator._close_orphan_sink()
+    _lifecycle._close_orphan_sink()
 
     assert sink.closed == 1, "a second close on a partially released sink is worse than none"
 
@@ -192,7 +194,7 @@ def test_reconfiguring_the_same_sink_is_a_no_op() -> None:
     log_foundry.configure(sink=sink)
 
     assert sink.closed == 0, "no close"
-    assert decorator._orphan_sink is sink, "and still armed for one at exit"
+    assert _lifecycle._state._orphan_sink is sink, "and still armed for one at exit"
 
 
 @pytest.mark.parametrize("orphan_first", [True, False])
@@ -239,7 +241,7 @@ def test_a_close_that_raises_is_absorbed_and_the_swap_stands(capsys) -> None:
 
     assert _eventually(lambda: old.closed == 1), "the close was attempted"
     assert config.get_config().sink is new, "and the swap still stands"
-    assert decorator._orphan_sink is new
+    assert _lifecycle._state._orphan_sink is new
     assert "absorbed a failure while closing a swapped-out sink" in capsys.readouterr().err
 
 
@@ -277,18 +279,18 @@ def test_a_swap_racing_a_first_trace_does_not_close_the_workers_sink() -> None:
             time.sleep(0.3)  # the window an unlocked reader would exploit
             super().__init__(sink, **kw)
 
-    decorator.Worker = SlowToBuild  # type: ignore[misc]
+    worker_mod.Worker = SlowToBuild  # type: ignore[misc]
     try:
-        tracer = threading.Thread(target=decorator._get_worker)
+        tracer = threading.Thread(target=_lifecycle._get_worker)
         tracer.start()
         assert building.wait(5.0), "the worker is mid-construction"
 
         log_foundry.configure(sink=new)  # must block on the lock, not close `old` underneath
         tracer.join(10.0)
     finally:
-        decorator.Worker = real_worker  # type: ignore[misc]
+        worker_mod.Worker = real_worker  # type: ignore[misc]
 
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
     # The locked read makes the swap wait for construction and then take the *worker* path, so
     # the worker legitimately ends up on `new` and closes `old` itself. What must not happen is
@@ -317,7 +319,7 @@ def test_a_concurrent_orphan_emit_is_not_blocked_for_the_swap_budget() -> None:
         # branch that takes `_worker_lock`. An emit to the recorded sink returns on the unlocked
         # fast path without acquiring anything, so timing that would measure nothing at all.
         start = time.monotonic()
-        decorator._note_orphan_emit(CountingSink("a different sink"))
+        _lifecycle._note_orphan_emit(CountingSink("a different sink"))
         elapsed.append(time.monotonic() - start)
     finally:
         hung.release.set()
@@ -348,7 +350,7 @@ def test_a_sink_adopted_after_a_retired_worker_is_still_closed() -> None:
 
     log_foundry.configure(sink=new)
     log_foundry.info("to the sink adopted after shutdown")
-    decorator._shutdown_worker()
+    _lifecycle._shutdown_worker()
 
     assert new.closed == 1, "closed by the orphan path, since the worker owns nothing further"
     assert new.delivered, "and its held events were delivered by that close"
@@ -377,12 +379,12 @@ def test_an_expired_shutdown_still_declines_to_close() -> None:
     log_foundry.info("orphan, arming the record")  # arms, and returns
 
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     try:
         worker.submit([{"message": "wedges the drain thread"}])
         assert wedged.in_emit.wait(5.0)
 
-        decorator._shutdown_worker(timeout=0.2)  # expires with the thread inside emit
+        _lifecycle._shutdown_worker(timeout=0.2)  # expires with the thread inside emit
 
         assert wedged.closed == 0, "the drain thread may still be using it (SPEC-027 FR-004)"
         assert worker.health().stopped_reason == "ShutdownTimeout"
@@ -438,7 +440,7 @@ def test_closing_sinks_is_reported_with_no_worker(monkeypatch) -> None:
     log_foundry.configure(service="t", sink=hung)
     log_foundry.info("to hung")
 
-    assert decorator._worker is None, "no worker anywhere in this process"
+    assert _lifecycle._state._worker is None, "no worker anywhere in this process"
     assert log_foundry.health().closing_sinks == 0, "nothing is closing yet"
 
     try:
@@ -558,7 +560,7 @@ def test_a_closer_that_cannot_start_leaves_the_sink_open_and_says_so(capsys, mon
     log_foundry.configure(sink=new)
 
     assert old.closed == 0, "left open rather than closed inline"
-    assert decorator._orphan_sink is new, "and the record still re-points (AC-8)"
+    assert _lifecycle._state._orphan_sink is new, "and the record still re-points (AC-8)"
     err = capsys.readouterr().err
     assert "starting the thread that closes a swapped-out sink" in err
     assert log_foundry.health().incomplete_swaps == 0
@@ -656,7 +658,7 @@ def test_the_worker_keeps_its_own_signal_on_the_sink_it_owns() -> None:
         pass
 
     work()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None
 
     log_foundry.info("an orphan emit against the sink the worker owns")
@@ -678,7 +680,7 @@ def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
     log_foundry.configure(sink=new)
     log_foundry.info("to the newly adopted sink")
 
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None and worker.sink is old, "the retired worker never swapped"
     assert isinstance(new.log_foundry_stop_signal, threading.Event), "yet the live sink has a signal"
     assert not new.log_foundry_stop_signal.is_set(), "and an unset one"
@@ -740,7 +742,7 @@ def test_the_worker_still_records_its_own_unconfirmed_drain() -> None:
 
     wedged, new = Wedged(), CountingSink("new")
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     try:
         worker.submit([{"message": "wedges the drain"}])
         assert wedged.in_emit.wait(5.0)
@@ -811,7 +813,7 @@ def test_a_swap_after_a_retired_worker_hands_off_on_the_orphan_path() -> None:
     log_foundry.info("to b")
     log_foundry.configure(sink=c)  # the swap a retired worker cannot perform
     log_foundry.info("to c")
-    decorator._shutdown_worker()
+    _lifecycle._shutdown_worker()
 
     assert (a.closed, b.closed, c.closed) == (1, 1, 1), "each closed exactly once"
     assert b.delivered, "and b's held event was delivered by its close"
@@ -833,7 +835,7 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
         pass
 
     work()
-    worker = decorator._worker
+    worker = _lifecycle._state._worker
     assert worker is not None and worker.sink is sink
     log_foundry.shutdown()
     assert worker._stop.is_set(), "the worker's own event is set and can never be cleared"
@@ -859,12 +861,12 @@ def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> No
 
     hung, live = SlowCloseSink("hung"), CountingSink("live")
     worker = worker_mod.Worker(hung, batch_size=1000, flush_interval=100.0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     try:
         log_foundry.configure(service="t", sink=live)  # worker swap; the close hangs
         assert hung.in_close.wait(5.0)
 
-        decorator._shutdown_worker(timeout=30.0)
+        _lifecycle._shutdown_worker(timeout=30.0)
 
         # The count is the property. Timing it would need a budget between one grace and two,
         # which on a loaded runner is a coin flip — and the grace is deliberately short.
@@ -896,7 +898,7 @@ def test_a_closer_started_before_the_worker_is_still_counted_after_one_exists(mo
 
         work()  # a worker now exists and health() comes from it
 
-        assert decorator._worker is not None
+        assert _lifecycle._state._worker is not None
         assert log_foundry.health().closing_sinks == 1, "still counted through the worker"
     finally:
         hung.release.set()
@@ -1003,12 +1005,12 @@ def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
     log_foundry.info("orphan, arming the record at a")
     log_foundry.shutdown()
     assert a.closed == 1
-    assert decorator._orphan_sink is a, "the record still names the worker's sink"
+    assert _lifecycle._state._orphan_sink is a, "the record still names the worker's sink"
 
     log_foundry.configure(sink=b)
 
     assert a.closed == 1, "the worker already closed it; the swap must not close it again"
-    assert decorator._orphan_sink is b, "but the record is still re-pointed"
+    assert _lifecycle._state._orphan_sink is b, "but the record is still re-pointed"
 
 
 def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
@@ -1039,11 +1041,11 @@ def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
     log_foundry.info("orphan, arming the record")
 
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     try:
         worker.submit([{"message": "wedges the drain thread"}])
         assert wedged.in_emit.wait(5.0)
-        decorator._shutdown_worker(timeout=0.2)
+        _lifecycle._shutdown_worker(timeout=0.2)
         assert wedged.closed == 0, "the expired shutdown left it open, as it must"
 
         log_foundry.configure(sink=new)
@@ -1086,7 +1088,7 @@ def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypa
         resume.set()
         emitter.join(15.0)
 
-    assert decorator._orphan_sink is new, "the stale emit must not re-arm the closed sink"
+    assert _lifecycle._state._orphan_sink is new, "the stale emit must not re-arm the closed sink"
     log_foundry.shutdown()
     assert old.closed == 1, "or the exit close makes it two"
     assert new.closed == 1

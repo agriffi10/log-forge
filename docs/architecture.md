@@ -627,18 +627,30 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
 
 ### 9.2 Four questions a guard can ask about the worker
 
-Every guard in `decorator.py` that mentions the worker is classified as exactly one of four
-categories, and answering with the wrong one is this codebase's most repeated defect: three
-reviewers told SPEC-033 "ownership, not liveness", each naming a different call site, each was
-fixed, and a fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a
-predicate that would have re-broken SPEC-033 in the opposite direction.
+Every guard that mentions the worker is classified as exactly one of four categories, and
+answering with the wrong one is this codebase's most repeated defect: three reviewers told
+SPEC-033 "ownership, not liveness", each naming a different call site, each was fixed, and a
+fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a predicate that
+would have re-broken SPEC-033 in the opposite direction.
 
-| Category | Predicate | What it decides |
+Since SPEC-040 each question is **one method on `_lifecycle._state`**, and a call site *selects*
+one rather than composing a predicate. The state and the guards live in `_lifecycle.py`;
+`decorator.py` keeps the decorator and the span machinery and reaches the worker only through
+`_lifecycle._get_worker()`.
+
+| Category | Method | What it decides |
 |---|---|---|
-| **Existence** | `_worker is None` | is there anything to do, or a worker to build |
-| **Liveness** | `_live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
-| **Ownership** | `_worker.sink is X` | who **owns** a close; a retired worker still owns its sink's |
-| **Ownership ∧ moment** | `worker is not None and worker.sink is sink and worker.draining` | whose stop event the sink should be holding **now** |
+| **Existence** | `_state.worker_exists()` | is there anything to do, or a worker to build |
+| **Liveness** | `_state.live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
+| **Ownership** | `_state.worker_owns(sink)` | who **owns** a close; a retired worker still owns its sink's |
+| **Ownership ∧ moment** | `_state.worker_owns_now(sink)` | whose stop event the sink should be holding **now** |
+
+**None of the four takes the lifecycle lock.** Four guards ask a question with it already held
+(`_get_worker`'s inner check, `_close_orphan_sink`, `_swap_sink`, and `_offer_orphan_signal`
+through all three of its callers), so a non-reentrant acquire inside a question would deadlock
+them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
+read is a single atomic reference load, and a caller needing consistency across two reads takes
+the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span.
 
 The fourth is a **conjunction**, not a new question, which is why it is named for both terms
 rather than for `Worker.draining` alone. A category named for the moment by itself would have no
@@ -656,7 +668,8 @@ adopted the sink, because the decline is taken between its two lock acquisitions
 outside observes it.
 
 The rule is enforced, not just written down: `tests/test_worker_predicate_roster.py` derives
-every expression **in boolean position** naming the worker from `decorator.py`'s AST and fails
+every expression **in boolean position** naming the worker from the ASTs of `_lifecycle.py`
+**and** `decorator.py` and fails
 unless each one is declared with a category and a reason. Position rather than node shape is
 load-bearing — `if _worker.retired:` asks exactly what `if not _worker.retired:` asks, and a
 draft that matched on shape recognised only the second, which let a real guard through with the
@@ -674,7 +687,8 @@ hand-maintained list rots.
 
 What it is complete about is guards that **name the worker**, which is narrower than the
 ownership question itself. The orphan path decides who owns a close with no worker in the
-expression — `_note_orphan_emit`'s `sink is _orphan_sink`, `_close_orphan_sink`'s `owed is None`,
+expression — `_note_orphan_emit`'s `sink is _state._orphan_sink`, `_close_orphan_sink`'s
+`owed is None`,
 `_adopt_declined_swap`'s re-arm guard, `_swap_sink`'s `old is None or old is new_sink` — and none
 is filed. SPEC-035 FR-003's own defect lived in that family, as an assignment rather than a
 predicate, so a green roster is not evidence about it. Widening the sentinels to reach it would
@@ -1093,8 +1107,8 @@ constraint — never by being deleted quietly.
   writes one stderr line stating what was held and what was still queued (SPEC-021 FR-002). The
   worker is not restarted: a thread that resurrects itself fights a process trying to exit.
 
-- **A diagnostic can be written while `_worker_lock` is held (SPEC-035 FR-006).** The
-  process-wide lock in `decorator.py` is released before anything that blocks on a destination —
+- **A diagnostic can be written while the lifecycle lock is held (SPEC-035 FR-006).** The
+  process-wide lock in `_lifecycle.py` is released before anything that blocks on a destination —
   `_lifecycle.release(owed)` runs outside it, and a detached release only starts a thread — with one exception:
   three sites can reach `_diag` while still holding it, so a wedged stderr stalls every orphan
   emit and every first `@trace` in the process behind it.
@@ -1254,7 +1268,7 @@ constraint — never by being deleted quietly.
   for itself** by logging before it reconfigures. Measured in all four combinations. **And both
   swap paths close it**, not just the worker's: `Worker.swap_sink` drains, installs, *fences with
   a second drain* and then closes — the fence being what makes the close safe within one process
-  and, provably, does nothing across two — while `decorator._swap_sink`'s no-worker branch hands
+  and, provably, does nothing across two — while `_lifecycle._swap_sink`'s no-worker branch hands
   the old sink to `_lifecycle.release(..., detached=True)` with neither drain. A process that only ever logged
   outside a span takes the second, so "there is no worker here" is not an escape.
 
@@ -1296,6 +1310,65 @@ constraint — never by being deleted quietly.
   deployment. `shutdown()` is the wrong tool per-invocation: it is terminal, so only the first
   invocation on a warm container would log. That mistake is no longer silent — `health().retired`
   with a non-zero `submitted_after_shutdown` is its signature (§9, SPEC-030).
+
+- **Whether the predicate roster still earns its weight is open, and deliberately not answered
+  here** (SPEC-040 FR-005 AC-1). `tests/test_worker_predicate_roster.py` is ~1,500 lines
+  policing what is now four methods, and roughly half of it is the seam lint guarding the prose
+  in its own data table rather than the rule. The case for retiring it got *weaker* during
+  SPEC-040, not stronger: widening its scope to `_lifecycle.py` immediately filed two sites in
+  `_inheritance_roots` that had asked an existence question on `decorator._worker` from one
+  module away, unfiled, for two specs. Revisit with evidence a year of maintenance provides —
+  specifically, whether any post-SPEC-040 defect was caught by it, or by nothing. Removing it in
+  the same change that removed its subject would have left nothing watching either.
+
+- **`worker.py` is ~1,370 lines and is the same shape one level down, unsplit and not
+  scheduled** (SPEC-040 FR-005 AC-2). `Worker` owns the drain thread, the queue, the retry, the
+  counters, the swap and the shutdown; the questions *inside* it are one object's own state, which
+  is why SPEC-035 FR-002 drew the roster's module boundary where it did. `_lifecycle.py` is now ~1,610 lines and has the same property. Neither is a defect; both are recorded so the next
+  reader knows the split was considered.
+
+- **A forked child closing a transport it never opened is fixed by ownership records, not by
+  this refactor** (SPEC-040 FR-005 AC-3). It was handed here by SPEC-039, is this spec's shape
+  exactly — ownership asked ad hoc, with no path able to ask "is this even mine?" — and is a
+  **behaviour** change, which SPEC-040 forbids itself. **SPEC-042 shipped the fix**, and its
+  release helper is now one of the functions that moved onto the owner's module. The two stayed
+  independent, as intended: 042 did not wait on this refactor, and this refactor absorbed none
+  of it.
+
+- **Six lifecycle races are open, reproduced, and deliberately unfixed** (SPEC-040 FR-005). They
+  were found by the execution frame over SPEC-040's own diff and each one **reproduces
+  byte-identically on the pre-SPEC-040 tree**, so none is caused by that refactor — which is why
+  they are recorded here rather than fixed in it: its Out of Scope forbids any behaviour change,
+  including improvements, precisely so a refactor cannot smuggle one in. They want their own spec.
+  Harnesses are named so the next spec starts from a reproduction rather than a description.
+
+  1. **`shutdown()` racing a first `@trace` leaves a live worker.** `_shutdown_worker` reads the
+     existence question *unlocked*; a worker built after that read sends it down the no-worker
+     branch, so the drain thread is never stopped and the sink never closed, while
+     `health()` reports `retired=True` and later logs still deliver with
+     `submitted_after_shutdown=0`. `atexit` recovers it at process exit — but a frozen serverless
+     container never exits, which is the deployment `flush()`/`shutdown()` exist for.
+     (`h17_shutdown_vs_first_trace.py`; confirmed independently.)
+  2. **`configure(sink=B)` racing a first `@trace` loses A's close.** `_get_worker` holds the lock
+     while `configure()` writes the config and queues on it; `_ensure_sink()` then returns B and
+     the orphan record for A is discarded. A has events, is never closed, `incomplete_swaps=0`.
+     Natural rate 6/400. (`h4_first_trace_vs_configure.py`.)
+  3. **A shutdown does not cut a backoff short if any log call lands during the close.**
+     `_offer_orphan_signal` replaces the *set* stop event with a fresh unset one, so
+     `shutdown()` measured 8.01 s against an 8 s backoff versus 0.00 s with no racing log. This
+     is SPEC-027's guarantee failing on a race, on both the orphan and worker paths.
+     (`h2_orphan_stop_signal.py`, `h2b_worker_path.py`.)
+  4. **Double `close()` on a swapped-out sink, worker path.** `_swap_sink`'s worker branch clears
+     the orphan record without setting `_orphan_closed_sink`, so a preempted orphan emit can
+     re-arm the sink the worker just closed. Needs an injected preemption point; 0/120 without
+     one. (`h1_swap_worker_double_close.py`, `h18_double_close_rate.py`.)
+  5. **A forked child runs `reacquire_after_fork` on the superseded, already-closed sink** pinned
+     by `_orphan_closed_sink` — the exact hazard `_fork._SKIP_ATTRIBUTE`'s docstring describes,
+     against a slot `_lifecycle._FORK_SKIP` does not name. (`h11_fork_supersedes.py`.)
+  6. **`shutdown(timeout=…)` does not bound the live sink's `close()`.** Measured 30.01 s against
+     `shutdown(timeout=2.0)`. Consistent with "shutdown()'s own close stays inline" (§9), but the
+     parameter's own docstring justifies itself with the case it does not cover, so this one is a
+     documentation defect rather than a behavioural one.
 
 ---
 

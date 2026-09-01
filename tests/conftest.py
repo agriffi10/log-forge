@@ -95,7 +95,13 @@ def _reset_worker() -> None:
     """Drain and clear the lazily-created process worker (SPEC-004), if present.
 
     Without this the first test's sink/thread would leak into later tests through the
-    module-global ``decorator._worker``. No-ops until the worker module exists.
+    module-global ``_lifecycle._state._worker``. No-ops until the worker module exists.
+
+    The names moved to ``_lifecycle._state`` in SPEC-040, and the reset is now **unconditional**
+    where it used to be guarded by ``hasattr``. A guard that stops matching stops resetting, and
+    the failure is diffuse: breaking one guard fails 2 tests, breaking every guard fails 74, all
+    of them somewhere other than here. An attribute that has moved should raise on this line,
+    naming itself.
 
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
     ``_orphan_retired`` is what ``health()`` synthesizes when there is no worker, so a test
@@ -118,27 +124,19 @@ def _reset_worker() -> None:
     believed.
     """
     try:
-        from log_foundry import decorator
+        from log_foundry import _lifecycle, decorator
     except ImportError:
         return
-    worker = getattr(decorator, "_worker", None)
+    worker = _lifecycle._state.worker_exists()
     if worker is not None:
         worker.shutdown()
-        decorator._worker = None
-    for flag in ("_orphan_sink", "_orphan_closed_sink"):
-        if hasattr(decorator, flag):
-            setattr(decorator, flag, None)
-    if hasattr(decorator, "_orphan_retired"):
-        decorator._orphan_retired = False
-    if hasattr(decorator, "_orphan_stop"):
-        decorator._orphan_stop = threading.Event()
-    for counter in ("_orphan_lost", "_in_span_lost"):
-        if hasattr(decorator, counter):
-            setattr(decorator, counter, 0)
-    try:
-        from log_foundry import _lifecycle
-    except ImportError:
-        return
+        _lifecycle._state._worker = None
+    _lifecycle._state._orphan_sink = None
+    _lifecycle._state._orphan_closed_sink = None
+    _lifecycle._state._orphan_retired = False
+    _lifecycle._state._orphan_stop = threading.Event()
+    decorator._orphan_lost = 0
+    decorator._in_span_lost = 0
     with _lifecycle._closers_lock:
         _lifecycle._closers.clear()
 

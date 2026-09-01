@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
-from log_foundry import _fork, decorator
+from log_foundry import _fork, _lifecycle
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
@@ -496,7 +496,7 @@ def test_the_childs_first_log_call_does_not_block(tmp_path: pathlib.Path) -> Non
     """
     sink, stream = _gated_file_sink(tmp_path)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
 
     blocked: list[int] = []
     for iteration in range(50):
@@ -526,7 +526,7 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     """
     sink, stream = _gated_file_sink(tmp_path)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_the_drain_thread(stream, worker, 0)
     inherited = sink._lock
 
@@ -562,7 +562,7 @@ def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) 
     sink._stream = stream  # type: ignore[assignment]
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_the_drain_thread(stream, worker, 0)
     try:
         child = run_in_child(_log_in_child, timeout=4)
@@ -579,8 +579,8 @@ def test_a_lock_that_was_never_held_is_replaced_too() -> None:
     answers by taking it — so re-initialising only the held ones is not implementable. Identity
     is what shows the unheld one moved.
     """
-    before = id(decorator._worker_lock)
-    child = run_in_child(lambda: str(id(decorator._worker_lock) != before))
+    before = id(_lifecycle._state._lock)
+    child = run_in_child(lambda: str(id(_lifecycle._state._lock) != before))
     assert child.output == "True", child.output
 
 
@@ -594,11 +594,11 @@ def test_two_holders_of_one_event_still_share_it_in_the_child() -> None:
     """
     sink = HTTPSink("http://127.0.0.1:1/ingest", opener=lambda *a, **k: None)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     assert sink.log_foundry_stop_signal is worker._stop
 
     def compare() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         return f"{sink.log_foundry_stop_signal is live._stop},{live._stop is not None}"
 
     child = run_in_child(compare)
@@ -608,14 +608,14 @@ def test_two_holders_of_one_event_still_share_it_in_the_child() -> None:
 def test_a_set_event_is_still_set_in_the_child() -> None:
     """FR-003 AC-5. An ``Event`` carries its set state across, or the child un-does a shutdown.
 
-    ``decorator._orphan_stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
+    ``_lifecycle._state._orphan_stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
     replacement that started unset would tell a child's sink to go on backing off for delivery
     that has already been retired, which is SPEC-033 FR-004's reasoning inherited by a fork.
     """
-    decorator._orphan_stop.set()
-    before = id(decorator._orphan_stop)
+    _lifecycle._state._orphan_stop.set()
+    before = id(_lifecycle._state._orphan_stop)
     child = run_in_child(
-        lambda: f"{decorator._orphan_stop.is_set()},{id(decorator._orphan_stop) != before}"
+        lambda: f"{_lifecycle._state._orphan_stop.is_set()},{id(_lifecycle._state._orphan_stop) != before}"
     )
     assert child.output == "True,True", child.output
 
@@ -683,7 +683,7 @@ def _idle_worker(sink: FileSink) -> Worker:
       None.
     """
     worker = Worker(sink, batch_size=1000, flush_interval=100.0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     return worker
 
 
@@ -732,7 +732,7 @@ def test_the_parents_backlog_is_not_delivered_twice(tmp_path: pathlib.Path) -> N
     path = tmp_path / "split.ndjson"
     sink, stream = _gated_file_sink(tmp_path, name="split.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_the_drain_thread(stream, worker, 0)
     for index in range(5):
         worker.submit([{"msg": f"backlog-{index}"}])
@@ -740,7 +740,7 @@ def test_the_parents_backlog_is_not_delivered_twice(tmp_path: pathlib.Path) -> N
 
     def work_in_child() -> str:
         queued = log_foundry.health().queued
-        decorator._worker.submit([{"msg": "child-0"}])
+        _lifecycle._state._worker.submit([{"msg": "child-0"}])
         return f"{queued},{bool(log_foundry.flush(timeout=5.0))}"
 
     try:
@@ -809,7 +809,7 @@ def test_the_childs_counters_describe_the_child(tmp_path: pathlib.Path) -> None:
     sink = _FailingSink()
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=1, max_retries=0)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     for index in range(200):
         worker.submit([{"msg": f"overflow-{index}"}])
     deadline = time.monotonic() + 5.0
@@ -866,7 +866,7 @@ def test_a_child_of_a_dead_drain_thread_reports_its_own_health(tmp_path: pathlib
     sink = _DiesOnce()
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     worker.submit([{"msg": "kills-the-thread"}])
     deadline = time.monotonic() + 5.0
     while worker.stopped_reason is None and time.monotonic() < deadline:
@@ -875,7 +875,7 @@ def test_a_child_of_a_dead_drain_thread_reports_its_own_health(tmp_path: pathlib
     assert not worker.draining, "the parent's drain never settled, so this proves nothing"
 
     def report() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         live.submit([{"msg": "child-lives"}])
         delivered = bool(log_foundry.flush(timeout=5.0))
         return f"{log_foundry.health().stopped_reason},{live.draining},{delivered}"
@@ -923,7 +923,7 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
     Worker._run = announcing_run  # type: ignore[method-assign]
 
     def report() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         live.submit([{"msg": "after-the-fork"}])
         health = log_foundry.health()
         drained = started.wait(1.0)
@@ -961,7 +961,7 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     """
     sink, stream = _gated_file_sink(tmp_path, name="mid-shutdown.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_the_drain_thread(stream, worker, 0)
 
     shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
@@ -972,7 +972,7 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
 
     def report() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         started = time.monotonic()
         log_foundry.shutdown(timeout=30.0)
         prompt = time.monotonic() - started < 5.0
@@ -1027,7 +1027,7 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     sink = _SignalGateSink()
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _Gate()
     sink.gate = gate
     worker.submit([{"msg": "parks the drain thread"}])
@@ -1051,7 +1051,7 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     def report() -> str:
         log_foundry.info("an orphan log in a retired child")
         live = sink.log_foundry_stop_signal
-        return f"{decorator._worker.draining},{live is not None and live.is_set()}"
+        return f"{_lifecycle._state._worker.draining},{live is not None and live.is_set()}"
 
     try:
         child = run_in_child(report, timeout=6)
@@ -1086,11 +1086,11 @@ def test_a_third_party_sink_is_handed_the_childs_own_stop_signal() -> None:
     sink = _ForeignSink()
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     assert sink.log_foundry_stop_signal is worker._stop
 
     def report() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         signal_now = sink.log_foundry_stop_signal
         return f"{signal_now is live._stop},{signal_now is not None and not signal_now.is_set()}"
 
@@ -1113,7 +1113,7 @@ def test_the_rebuilt_worker_is_the_same_object(tmp_path: pathlib.Path) -> None:
     queue_id = id(worker._queue)
 
     def report() -> str:
-        live = decorator._worker
+        live = _lifecycle._state._worker
         return f"{id(live) == worker_id},{id(live._queue) != queue_id},{live.sink is sink}"
 
     child = run_in_child(report, timeout=6)
@@ -1214,7 +1214,7 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
     sink = FileSink(str(tmp_path / "orphan.ndjson"))
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     log_foundry.info("no span, so no worker")
-    assert decorator._worker is None, "this test needs a process that never built a worker"
+    assert _lifecycle._state._worker is None, "this test needs a process that never built a worker"
 
     buffer = io.StringIO()
     saved = sys.stderr
@@ -1228,6 +1228,23 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
     assert child.output == "", f"the child announced something: {child.output!r}"
 
 
+def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
+    """SPEC-042 FR-001 requires everything inherited be marked `_FOREIGN` before any other
+    handler runs, and handler order is registration order.
+
+    The two registrations used to sit in different modules — `_mark_inherited` at the foot of
+    `_lifecycle`, the rebuild at the foot of `decorator` — and the order held only because
+    `decorator` imports `_lifecycle`. SPEC-040 put both in one module, where the order is now a
+    property of two adjacent lines and nothing else. A rebuild that ran first would repair the
+    worker while the sinks it holds were still unmarked, and an unmarked sink is claimable.
+    """
+    order = [handler.__name__ for handler in _fork._child_handlers]
+    assert "_mark_inherited" in order and "_rebuild_worker_after_fork" in order, order
+    assert order.index("_mark_inherited") < order.index("_rebuild_worker_after_fork"), (
+        f"the marking handler must be registered first, got {order}"
+    )
+
+
 def test_registering_the_same_handler_twice_is_a_no_op() -> None:
     """FR-006 AC-2's exposure at the registry rather than at ``os.register_at_fork``.
 
@@ -1237,7 +1254,7 @@ def test_registering_the_same_handler_twice_is_a_no_op() -> None:
     registration itself; this closes it for the handlers.
     """
     before = list(_fork._child_handlers)
-    _fork.register_child_handler(decorator._rebuild_worker_after_fork)
+    _fork.register_child_handler(_lifecycle._rebuild_worker_after_fork)
     assert _fork._child_handlers == before
 
     def fresh() -> None:
@@ -1315,7 +1332,7 @@ def test_a_child_that_cannot_start_a_thread_reports_it_rather_than_raising(
         # `queued` after the shutdown is what covers the drain events being set here: with
         # `_drain_finished` clear, `shutdown` queues its sentinel into a queue no thread will
         # ever read, and it stays counted for the life of the process.
-        return f"{health.stopped_reason},{decorator._worker.draining},{log_foundry.health().queued}"
+        return f"{health.stopped_reason},{_lifecycle._state._worker.draining},{log_foundry.health().queued}"
 
     threading.Thread.start = refusing  # type: ignore[method-assign]
     try:
@@ -1334,7 +1351,7 @@ def test_the_worker_rebuild_is_registered_rather_than_reached_for() -> None:
     than satisfied by a module that simply does nothing yet. A registry with no registrations
     would pass every import assertion ever written.
     """
-    assert decorator._rebuild_worker_after_fork in _fork._child_handlers
+    assert _lifecycle._rebuild_worker_after_fork in _fork._child_handlers
 
 
 # -- FR-003 AC-3: completeness is proved, not asserted ---------------------------------------
@@ -1434,7 +1451,7 @@ def _namespace_stores(tree: ast.AST) -> set[int]:
     threading.Lock()`` inside a function, and treating every ``Name`` as reachable made the rule
     accept a lock no walk could ever find. So the scope is carried down — module and class
     bodies write to a namespace, a function body does not unless the name is declared ``global``,
-    which is how ``decorator._offer_orphan_signal`` legitimately rebuilds ``_orphan_stop``.
+    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_orphan_stop``.
 
     Args:
       tree: The parsed module.
@@ -1661,7 +1678,13 @@ def test_the_shape_lint_rejects_the_shapes_it_claims_to() -> None:
 
 
 def test_a_module_global_reassigned_inside_a_function_still_counts() -> None:
-    """``decorator._orphan_stop`` is rebuilt inside ``_offer_orphan_signal`` under ``global``.
+    """``_orphan_stop`` is rebuilt as ``self._orphan_stop`` inside ``_Lifecycle.refresh_stop_signal``.
+
+    It was a ``global`` rebinding inside ``_offer_orphan_signal`` until SPEC-040 moved the state
+    onto one owner, so **no live site in ``src/`` takes the ``global`` branch any more**. The
+    branch is kept and exercised by the synthetic fixture below, because the walk must still
+    write back to a module global wherever one holds a primitive; what changed is that this
+    library no longer has such a site, not that the shape stopped mattering.
 
     A rule keyed on *module-level* assignment would reject that live, correct site, so the rule
     is the target's shape rather than its position — and this is what pins which of the two was
@@ -2103,7 +2126,7 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     sink = FileSink(str(path))
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
 
     queue_before = worker._queue
     lock_before = sink._lock
@@ -2112,7 +2135,7 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     child = run_in_child(lambda: "ok")
     assert child.finished, child.output
 
-    assert decorator._worker is worker
+    assert _lifecycle._state._worker is worker
     assert worker._queue is queue_before
     assert sink._lock is lock_before
     assert worker.dropped == dropped_before
@@ -2236,7 +2259,7 @@ def test_the_child_does_not_write_the_parents_buffered_bytes(
     """
     sink, stream, path = _buffered_sink(tmp_path, kind, name=f"{kind}.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
     at_the_fork = path.read_text(encoding="utf-8")
     assert _lines_holding(at_the_fork, "before-the-fork") == 1, at_the_fork
@@ -2279,7 +2302,7 @@ def test_the_same_child_duplicates_when_the_discard_is_taken_away(
     """
     sink, stream, path = _buffered_sink(tmp_path, "file", name="unrepaired.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
 
     original = _fork._reacquire_transports
@@ -2324,7 +2347,7 @@ def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) 
     """
     sink, stream, _path = _buffered_sink(tmp_path, "file", name="ordering.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
     inherited = sink._stream
     seen: list[str] = []
@@ -2463,7 +2486,7 @@ def test_the_inherited_buffer_can_only_reach_the_null_device(tmp_path: pathlib.P
     """
     sink, stream, path = _buffered_sink(tmp_path, "file", name="stranded.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    decorator._worker = worker
+    _lifecycle._state._worker = worker
     gate = _park_inside_a_buffered_batch(stream, worker)
 
     def flush_what_was_inherited() -> str:
