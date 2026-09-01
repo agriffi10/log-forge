@@ -78,19 +78,21 @@ session you notice it (two hand-synced copies of one procedure is how numbering 
    not per-phase checkpoints baked into the spec — is what gates the work.
 6. **Put the plan through the reviewer gate before the first line of code** (*The reviewer contract*,
    below). A plan is reviewed for the same reason a PR is: the author cannot see what they assumed.
-7. **Put the PR grouping through the same gate**, before the first push. Group consecutive phases
-   into as few PRs as the dependencies allow — a phase is a unit of work, not a unit of PR, and the
-   useful boundaries are inert-vs-live, either side of a switchover, a deletion following its last
-   caller, and a release step that must land before what depends on it.
+7. **Decide the PR grouping yourself, and say it in a sentence.** It is the implementer's call, not
+   a reviewer gate. Group consecutive phases into as few PRs as the dependencies allow — a phase is
+   a unit of work, not a unit of PR, and the useful boundaries are inert-vs-live, either side of a
+   switchover, a deletion following its last caller, and a release step that must land before what
+   depends on it.
 
-**These two reviews are the only ones that gate the START of the build**, and once the plan and the
-grouping have each been answered, the build runs to completion without checking in. The user
+**The plan review is the only one that gates the START of the build**, and once it has been
+answered, the build runs to completion without checking in. The user
 confirmed the work when they set the spec going; a per-phase check-in re-asks a question already
 answered, and on a twelve-phase spec it asks it twelve times. This does **not** retire the diff
 review — that one gates the push, at the other end of the build, and it is blocking too (*The
-reviewer contract*, below). Four reviews stand between a spec going In Progress and its PR merging:
-one on the plan before the first line of code, one on the PR grouping, and two on the diff — all
-four before the first push.
+reviewer contract*, below). Three reviews stand between a spec going In Progress and its PR
+merging: one on the plan before the first line of code, and two on the diff — all three before the
+first push. With the spec's own review that is **four artifacts that draw a reviewer** — spec,
+plan, diff, diff — and no fifth.
 
 **During the build — one spec, in phases**
 - Every file-changing task is done on its **own branch** and opened as a **PR** — automatically, without
@@ -147,8 +149,9 @@ intended and rubber-stamps it; that is as true of a plan as of code, and a wrong
 expensive one to leave *undetected*, because the code that follows will faithfully implement it.
 
 **How many reviewers, and where.** **One** on the spec when it is written, **one** on the
-implementation plan when the build actually starts, and **two** on the diff before it is pushed —
-plus the narrow pass on the PR grouping below. The diff gets two because it is the **widest**
+implementation plan when the build actually starts, and **two** on the diff before it is pushed.
+Those are the only artifacts that draw a reviewer — the PR grouping is the implementer's call, made
+in a sentence (§3, step 7). The diff gets two because it is the **widest**
 artifact and the last one before the branch goes public: a spec or a plan is one document a single
 reader can hold whole, while a diff spans code, tests and config *and* the criteria they are
 supposed to satisfy, and this repo's own measured history (*Rotating the frame*, below) is that the
@@ -187,10 +190,8 @@ that rewrites the plan sends the new plan through again.
   spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
   and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. For a
   diff: the diff, the spec's acceptance criteria, and the `best-practices/` rules for the domains it
-  touches (route via their INDEX). For a **PR grouping**: the reviewed plan and the phase list, and
-  nothing else — the question is only whether the split is the fewest the dependencies allow, and
-  whether any boundary leaves `main` in a half-built state. Handing over the authoring rationale
-  tells the reviewer what to conclude.
+  touches (route via their INDEX). Handing over the authoring rationale tells the reviewer what to
+  conclude.
 - **What each review is for.** A **spec** review asks: is every FR testable and binary; does any
   acceptance criterion pass vacuously; is anything in Out of Scope actually required by an FR; does
   it contradict a settled decision or silently supersede one without saying so; are there Open
