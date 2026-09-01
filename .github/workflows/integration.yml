@@ -96,7 +96,16 @@ jobs:
         # `LOG_FOUNDRY_INTEGRATION` — that one gates `tests/integration` and its name would lie.
         env:
           LOG_FOUNDRY_EXTRAS: "1"
-        run: poetry run pytest tests
+        # Parallel for the same measured reason as `ci.yml` (125.9 s -> 40.8 s): this is the whole
+        # unit suite a second time, and it is the same sleep-bound suite.
+        #
+        # Deliberately NOT applied to `tests/integration` above. Those tests share nine real
+        # services — one Kafka topic, one Postgres table, one syslog socket — so distributing them
+        # across processes would have them reading each other's writes, and a test that asserts a
+        # delivered count is exactly the kind that would then fail intermittently. The service
+        # suite is seconds; the win here is entirely in the unit re-run, so the parallelism goes
+        # only where it is both safe and worth something.
+        run: poetry run pytest tests -n 8 --dist load
 
       - name: Service logs on failure
         if: failure()
