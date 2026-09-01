@@ -368,7 +368,7 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     shutting_down.join(60.0)
 
     assert worker.sink is old, "the swap really was declined, or this test proves nothing"
-    assert _lifecycle._state._orphan_sink is new or new.closed == 1, (
+    assert _lifecycle._state._orphan_owed.get(id(new)) is new or new.closed == 1, (
         "the declined sink is neither closed nor armed for the exit handler — owned by nobody"
     )
 
@@ -435,7 +435,9 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
         result = real_flush(timeout)
         worker.flush = real_flush
         log_foundry.info("an orphan log that arms B while the swap is in flight")
-        assert _lifecycle._state._orphan_sink is new, "the orphan log must have armed B"
+        assert _lifecycle._state._orphan_owed.get(id(new)) is new, (
+            "the orphan log must have armed B"
+        )
         log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
         return result
 

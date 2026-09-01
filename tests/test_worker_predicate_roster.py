@@ -139,7 +139,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "keeps naming the publication and this one is index 1."
         ),
     ),
-    ("_get_worker", "owed is not None and owed is not worker.sink", 0): (
+    ("_get_worker", "stale is not worker.sink", 0): (
         OWNERSHIP,
         (
             "who owns the close the orphan record was holding, at the moment the record is "
@@ -253,7 +253,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "nobody will set. Both were measured; only the conjunction is right."
         ),
     ),
-    ("_close_orphan_sink", "_state.worker_owns(owed)", 0): (
+    (
+        "_close_orphan_sink",
+        "[sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)]",
+        0,
+    ): (
         OWNERSHIP,
         (
             "a retired worker still owns its sink's close, and deliberately declines it when its "
@@ -336,7 +340,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "to answer it, the same refusal _worker_health and _flush_worker already make."
         ),
     ),
-    ("_delivering_to_an_inherited_sink", "worker.sink if worker is not None else _state._orphan_sink or _live_config().sink", 0): (
+    (
+        "_delivering_to_an_inherited_sink",
+        "worker.sink if worker is not None else owed or _live_config().sink",
+        0,
+    ): (
         EXISTENCE,
         (
             "the same question, consuming the snapshot the row above took rather than "
@@ -375,7 +383,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and a reason copied rather than thought about is the failure AC-2 exists to stop."
         ),
     ),
-    ("_swap_sink", "not _state.worker_owns(old)", 0): (
+    ("_swap_sink", "not _state.worker_owns(stale)", 0): (
         OWNERSHIP,
         (
             "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
@@ -391,7 +399,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "than the live snapshot is the round-9 attack wearing a different value shape."
         ),
     ),
-    ("_swap_sink", "owed is not None and owed is not new_sink and (owed is not worker.sink)", 0): (
+    ("_swap_sink", "stale is not new_sink and stale is not worker.sink", 0): (
         OWNERSHIP,
         (
             "whether the orphan record names a **third** sink - neither the one the worker holds "
@@ -526,11 +534,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "correct: a retired worker delivers nothing, so its sink is not the live target."
         ),
     ),
-    (
-        "_flush_live_sink",
-        "worker.sink if worker is not None else _state._orphan_sink",
-        0,
-    ): (
+    ("_flush_live_sink", "worker is not None", 0): (
         LIVENESS,
         (
             "which sink is *being delivered to*, which is the sink whose own client buffer a "
@@ -539,6 +543,16 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "to a target rather than to an action. Deliberately not ownership: nothing here "
             "decides who *closes* a sink, and answering that question instead would flush the "
             "sink a retired worker still owns while events were going somewhere else."
+        ),
+    ),
+    ("_flush_live_sink", "[worker.sink]", 0): (
+        LIVENESS,
+        (
+            "which sinks hold a client buffer to drain. A live worker owns exactly one, so the "
+            "list is a singleton; with no worker every sink the orphan path still owes a close "
+            "for may hold one, since SPEC-045 made that record a set rather than a slot. "
+            "Liveness rather than existence: a retired worker delivers nothing, so flushing its "
+            "sink would drain a client nothing is filling while the live target went unflushed."
         ),
     ),
     ("_sweep_open_spans", "_lifecycle._get_worker()", 0): (
@@ -574,7 +588,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         "_inheritance_roots",
         (
             "(config._live_config().sink, None if worker is None else worker.sink, "
-            "_state._orphan_sink, _state._orphan_closed_sink)"
+            "*_state._orphan_owed.values(), _state._orphan_closed_sink)"
         ),
         0,
     ): (
@@ -954,7 +968,7 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 45, "log_foundry.decorator": 1}
+_SITE_FLOOR = {"log_foundry._lifecycle": 46, "log_foundry.decorator": 1}
 """The floor each walked module must still meet, by name.
 
 A refactor that relocates guards can shrink a derived roster silently, which is the one failure

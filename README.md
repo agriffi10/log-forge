@@ -281,9 +281,9 @@ drain from ever running — the live sink never drained, and your own `atexit` h
 either. The grace is what recovers the slow-close case that the daemon flag alone would lose.
 
 `configure()` is still a startup call. It is not thread-safe, and a span finishing on another
-thread mid-swap may land on either sink. The **close** is the exception: a sink is closed once per
-time you pass it here, whatever races the call, so passing the same sink again later is safe and
-closes it again — because you handed it over again (SPEC-045).
+thread mid-swap may land on either sink. The **closes** are the exception: every sink you pass
+here is closed, however many swaps are outstanding and whatever races the call, so a sink whose
+`close()` is its delivery never loses its buffer to a reconfiguration (SPEC-045).
 
 ### `@trace`
 

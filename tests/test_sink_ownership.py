@@ -79,33 +79,13 @@ def _clear_ownership_record() -> Iterator[None]:
 
     It is write-once and holds a strong reference for the life of the process, which is correct
     in an application and would otherwise carry one test's sinks into the next.
-
-    `_released` is cleared **with** it, never separately (SPEC-045 FR-001). That record keys on
-    `id`, and what makes an `id` sufficient is that `_owned` pins the object so the id cannot be
-    recycled. Dropping the pins without dropping the marks breaks exactly that invariant here,
-    where nowhere else does: a later test's sink landing on a freed address would be refused its
-    first close, and the symptom is a close that silently does not happen.
-    """
-    _clear_records()
-    yield
-    _clear_records()
-
-
-def _clear_records() -> None:
-    """Empties both halves of the ownership record together.
-
-    Args:
-      None.
-
-    Returns:
-      None.
-
-    Raises:
-      None.
     """
     with _lifecycle._owned_lock:
         _lifecycle._owned.clear()
-        _lifecycle._released.clear()
+    _lifecycle._marking_failed = False
+    yield
+    with _lifecycle._owned_lock:
+        _lifecycle._owned.clear()
     _lifecycle._marking_failed = False
 
 
@@ -608,7 +588,7 @@ def test_the_record_holds_a_strong_reference() -> None:
     def in_child() -> str:
         config._config = config.Config()
         _lifecycle._state._worker = None
-        _lifecycle._state._orphan_sink = None
+        _lifecycle._state._orphan_owed.clear()
         _lifecycle._state._orphan_closed_sink = None
         gc.collect()
         with _lifecycle._owned_lock:
@@ -669,7 +649,8 @@ def test_an_orphan_log_performs_no_stamp_walk(monkeypatch: pytest.MonkeyPatch) -
 def test_the_lazy_default_is_stamped_and_the_fast_path_is_not() -> None:
     """AC-10's other half: the construction branch is an acquisition and must record one."""
     config._config = config.Config()
-    _clear_records()
+    with _lifecycle._owned_lock:
+        _lifecycle._owned.clear()
 
     default = config._ensure_sink()
     assert _lifecycle.releasable(default) is True, "the zero-config default is acquired here"
@@ -730,15 +711,6 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
     That is the hazard this asserts is absent from the library, and it is a real one because the
     lock is deliberately **not** reentrant -- SPEC-028 chose `Lock` over `RLock` precisely so a
     function re-entering its own critical section fails loudly instead of being hidden.
-
-    SPEC-045 adds three names, and each is permitted for a stated reason rather than to make the
-    assertion pass. `_released.add` and `_released.discard` are `set` operations on a module
-    global that call nothing out and cannot re-enter. `_releasable_locked` is the lock-free inner
-    the same spec factored out of `releasable` so that `_claim_release` can decide ownership,
-    test the released mark and set it under one acquire: it takes no lock, calls only
-    `_owned.get`, and exists *because* calling `releasable` under this lock is the deadlock the
-    paragraph above describes. `os.getpid` is deliberately **not** here -- both callers read the
-    pid before the acquire, so no syscall runs under the process's last lock.
     """
     import ast
     import pathlib
@@ -765,9 +737,6 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "_owned.values",
         "roots.extend",
         "id",
-        "_released.add",
-        "_released.discard",
-        "_releasable_locked",
     }
     assert set(under_lock) <= permitted, (
         f"new work under the record lock: {sorted(set(under_lock))}. It is the last lock in the "
@@ -777,20 +746,6 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
 
     assert not isinstance(_lifecycle._owned_lock, type(threading.RLock())), (
         "a non-reentrant Lock is the choice (SPEC-028): an RLock would hide the re-entry above"
-    )
-
-    inner = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "_releasable_locked"
-    )
-    inner_calls = {
-        ast.unparse(node.func) for node in ast.walk(inner) if isinstance(node, ast.Call)
-    }
-    assert inner_calls <= {"_owned.get", "id"}, (
-        f"_releasable_locked calls {sorted(inner_calls)}. Permitting a *function* above makes "
-        "this walk non-transitive -- anything added inside it runs under the record lock while "
-        "escaping the check entirely -- so the one function on that list carries its own"
     )
 
 

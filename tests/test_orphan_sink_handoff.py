@@ -101,7 +101,7 @@ def test_a_configured_but_never_written_sink_is_not_closed() -> None:
     _lifecycle._close_orphan_sink()
 
     assert sink.closed == 0
-    assert _lifecycle._state._orphan_sink is None
+    assert not _lifecycle._state._orphan_owed
 
 
 def test_a_sink_whose_emit_raised_is_still_closed() -> None:
@@ -111,7 +111,9 @@ def test_a_sink_whose_emit_raised_is_still_closed() -> None:
 
     log_foundry.info("this will raise inside the sink")  # absorbed by SPEC-025
 
-    assert _lifecycle._state._orphan_sink is sink, "armed before the emit, not after it"
+    assert _lifecycle._state._orphan_owed.get(id(sink)) is sink, (
+        "armed before the emit, not after it"
+    )
     _lifecycle._close_orphan_sink()
     assert sink.closed == 1
 
@@ -194,7 +196,9 @@ def test_reconfiguring_the_same_sink_is_a_no_op() -> None:
     log_foundry.configure(sink=sink)
 
     assert sink.closed == 0, "no close"
-    assert _lifecycle._state._orphan_sink is sink, "and still armed for one at exit"
+    assert _lifecycle._state._orphan_owed.get(id(sink)) is sink, (
+        "and still armed for one at exit"
+    )
 
 
 @pytest.mark.parametrize("orphan_first", [True, False])
@@ -241,7 +245,7 @@ def test_a_close_that_raises_is_absorbed_and_the_swap_stands(capsys) -> None:
 
     assert _eventually(lambda: old.closed == 1), "the close was attempted"
     assert config.get_config().sink is new, "and the swap still stands"
-    assert _lifecycle._state._orphan_sink is new
+    assert _lifecycle._state._orphan_owed == {id(new): new}
     assert "absorbed a failure while closing a swapped-out sink" in capsys.readouterr().err
 
 
@@ -560,7 +564,9 @@ def test_a_closer_that_cannot_start_leaves_the_sink_open_and_says_so(capsys, mon
     log_foundry.configure(sink=new)
 
     assert old.closed == 0, "left open rather than closed inline"
-    assert _lifecycle._state._orphan_sink is new, "and the record still re-points (AC-8)"
+    assert _lifecycle._state._orphan_owed == {id(new): new}, (
+        "and the record still re-points (AC-8)"
+    )
     err = capsys.readouterr().err
     assert "starting the thread that closes a swapped-out sink" in err
     assert log_foundry.health().incomplete_swaps == 0
@@ -1005,12 +1011,16 @@ def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
     log_foundry.info("orphan, arming the record at a")
     log_foundry.shutdown()
     assert a.closed == 1
-    assert _lifecycle._state._orphan_sink is a, "the record still names the worker's sink"
+    assert _lifecycle._state._orphan_owed.get(id(a)) is a, (
+        "the record still names the worker's sink"
+    )
 
     log_foundry.configure(sink=b)
 
     assert a.closed == 1, "the worker already closed it; the swap must not close it again"
-    assert _lifecycle._state._orphan_sink is b, "but the record is still re-pointed"
+    assert _lifecycle._state._orphan_owed == {id(b): b}, (
+        "but the record is still re-pointed"
+    )
 
 
 def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
@@ -1088,7 +1098,9 @@ def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypa
         resume.set()
         emitter.join(15.0)
 
-    assert _lifecycle._state._orphan_sink is new, "the stale emit must not re-arm the closed sink"
+    assert _lifecycle._state._orphan_owed == {id(new): new}, (
+        "the stale emit must not re-arm the closed sink"
+    )
     log_foundry.shutdown()
     assert old.closed == 1, "or the exit close makes it two"
     assert new.closed == 1
