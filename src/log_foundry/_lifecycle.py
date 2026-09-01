@@ -1365,6 +1365,92 @@ def _offer_orphan_signal(sink: Sink) -> None:
     if _closing(sink):
         return
     offer_stop_signal(sink, _state.refresh_stop_signal())
+def _close_owed(sink: Sink) -> None:
+    """Closes one sink the orphan path owed, absorbing whatever the close raised (SPEC-046).
+
+    Factored out so the inline close and the threaded ones are provably the same call, and
+    because a thread body must not raise: an exception escaping one reaches CPython's bootstrap,
+    which prints a traceback carrying the message arch §6 keeps out of anything the library says
+    about itself. It is the same guard :func:`_close_guarded` applies for a swapped-out sink, with
+    the ``_diag`` text of the site it actually is (SPEC-029).
+
+    It records nothing in the closed-sink latch. :func:`_close_orphan_sink` **empties the owed
+    record** under ``_state._lock`` before any close starts, which is what stops two callers
+    performing the same close. The closed-sink latch is a single slot and holds only the last of
+    them — unchanged by SPEC-046, and why a racing emit can still re-arm one of the others is
+    recorded in ``architecture.md`` §13.
+
+    Args:
+      sink: The sink to close.
+
+    Returns:
+      None.
+
+    Raises:
+      None. ``Exception``, never ``BaseException`` — the SPEC-025 line. On the calling thread that
+        keeps a ``KeyboardInterrupt`` or ``SystemExit`` reaching the caller as that decision
+        requires; on a fan-out thread it cannot, because there is no caller to reach. CPython's
+        ``threading.excepthook`` announces an interrupt itself and discards a ``SystemExit``, so
+        one raised by a threaded close is reported by the runtime rather than by this library and
+        does not propagate. That is :func:`_close_guarded`'s shipped behaviour too; it is stated
+        here rather than left to be discovered.
+    """
+    try:
+        release(sink)
+    except Exception as exc:
+        _diag.absorbed("closing the sink", exc, "it may still hold its resources")
+
+
+def _live_config_sink() -> Sink | None:
+    """Returns the configured sink, for callers that must not import config at module scope.
+
+    Args:
+      None.
+
+    Returns:
+      The sink the config names, or None when none is set.
+
+    Raises:
+      None.
+    """
+    from log_foundry.config import _live_config
+
+    return _live_config().sink
+
+
+def _inline_close_choice(owed: list[Sink]) -> Sink:
+    """Picks the owed sink whose close stays on the calling thread (SPEC-046 FR-001).
+
+    The **configured** sink where it is among those owed, and otherwise the most recently armed.
+    The config is the authority for which sink is being delivered to, and keeping that one inline
+    is what preserves SPEC-030's decision that ``shutdown()``'s own close stays inline. The
+    fallback is what keeps the single-owed-sink case free of a thread it does not need.
+
+    Membership is by **identity**, never ``in``. ``list.__contains__`` is ``x is e or x == e``, so
+    a sink with a value ``__eq__`` — a dataclass, say, which ``Sink`` permits and no shipped sink
+    happens to be — would match an object the record never armed: the inline close would then run
+    against a sink that was never latched, and every genuinely owed sink would go to a thread.
+
+    This deliberately does not copy :func:`_delivering_to_an_inherited_sink`, which takes the
+    record's last entry and whose own docstring says neither end of the record is authoritative
+    for "installed".
+
+    Args:
+      owed: The sinks owed a close, in arming order and never empty.
+
+    Returns:
+      The one to close on the calling thread.
+
+    Raises:
+      None.
+    """
+    configured = _live_config_sink()
+    for sink in owed:
+        if sink is configured:
+            return sink
+    return owed[-1]
+
+
 def _close_orphan_sink() -> None:
     """Closes a sink only the orphan path ever wrote to, once (SPEC-031 FR-006).
 
@@ -1394,6 +1480,41 @@ def _close_orphan_sink() -> None:
     The once-only flag is set ahead of the close, as ``Worker.shutdown``'s is: a second
     ``close()`` on a sink that partially released its resources is worse than an unclosed one.
 
+    **The owed closes run concurrently and every one is joined** (SPEC-046). Draining the record
+    in sequence made this cost one slow close *times* the number owed — measured against
+    ``shutdown(timeout=1.0)`` with 2-second closes, one owed sink 2.00 s and four 8.02 s — which
+    is a multiplication SPEC-045 introduced when it made the record a set. One sink closes on the
+    calling thread (:func:`_inline_close_choice` picks which, and why) and the rest get a thread
+    each, so the cost is the slowest rather than the sum.
+
+    **Joined, deliberately not detached.** Routing them through :func:`_start_closer` and
+    :func:`join_closers` is the obvious reuse and it loses data, in two independent ways. The
+    grace is what remains of the shutdown's budget, which a slow inline close can exhaust
+    entirely — measured completing **1 of 4** against a 1.0 s budget. And it caps at
+    :data:`DEFAULT_CLOSER_GRACE` regardless, so even inside a generous budget a sink whose
+    ``close()`` outlasts two seconds is abandoned and killed at interpreter exit — measured, a
+    3-second close delivered nothing where it delivers today. It also recharges the double grace SPEC-044 measured, and runs into
+    the §13 entry recording that a daemon close of *this* sink was built and reverted because
+    exit can kill it inside ``SQLiteSink.commit()``. Joining every close avoids all three, and is
+    strictly better than the sequential drain on both axes: the cost falls and the loss stays
+    zero. The threads are daemons only so that one which somehow outlives the join cannot keep the
+    interpreter alive; the join, not the flag, is what guarantees each close completes.
+
+    **The join is in a ``finally``**, so a ``BaseException`` — the ``KeyboardInterrupt`` SPEC-025
+    requires to reach the caller — waits for the started closes before it propagates. Without it,
+    a Ctrl-C during ``shutdown()`` returned with every fan-out close abandoned *mid-write*, where
+    the sequential drain abandoned one and had merely not started the rest: measured 4 killed
+    mid-write against 1, which trades a leaked resource for a corrupt one and is the wrong side
+    of the ordering §13 records for exactly this hazard. The interrupt still reaches the caller;
+    it is delayed by the closes already in flight, which is the same wait the inline close has
+    always imposed.
+
+    A thread that will not start is closed **inline** instead, which is the opposite of
+    :func:`_start_closer`'s refusal and deliberately so: that helper is spending a caller's
+    bounded budget, and falling back to an inline close there would reintroduce the unbounded
+    wait it exists to remove. This path has no budget left to protect — it is the exit — so the
+    choice is between closing inline and never closing at all.
+
     Args:
       None.
 
@@ -1412,11 +1533,32 @@ def _close_orphan_sink() -> None:
         for sink in owed:
             del _state._orphan_owed[id(sink)]
             _state._orphan_closed_sink = sink
-    for sink in owed:
-        try:
-            release(sink)
-        except Exception as exc:
-            _diag.absorbed("closing the sink", exc, "it may still hold its resources")
+    if not owed:
+        return
+    inline = _inline_close_choice(owed)
+    started: list[threading.Thread] = []
+    try:
+        for sink in owed:
+            if sink is inline:
+                continue
+            closer = threading.Thread(
+                target=_close_owed, args=(sink,), name="log-foundry-owed-close", daemon=True
+            )
+            try:
+                closer.start()
+            except Exception as exc:
+                _diag.absorbed(
+                    "starting the thread that closes an owed sink",
+                    exc,
+                    "it is closed inline instead",
+                )
+                _close_owed(sink)
+            else:
+                started.append(closer)
+        _close_owed(inline)
+    finally:
+        for closer in started:
+            closer.join()
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 
@@ -1792,8 +1934,8 @@ def _delivering_to_an_inherited_sink() -> bool:
     order is ``[live, superseded]``. Neither end of the record is authoritative for "installed" —
     arming order is emit order, which is a different question — and the config is. The answer is
     therefore unchanged from before SPEC-045 and can still name a superseded sink; that limit is
-    recorded in ``architecture.md`` §13 rather than quietly fixed here, because correcting it
-    changes a documented ``Health`` field on a path this spec does not otherwise touch.
+    an open item in ``architecture.md`` §12 rather than quietly fixed here, because correcting it
+    changes a documented ``Health`` field on a path that spec did not otherwise touch.
 
     With no sink resolved at all there is nothing installed and nothing inherited, so the answer
     is ``False`` rather than a guess.

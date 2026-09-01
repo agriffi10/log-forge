@@ -490,6 +490,14 @@ def test_a_worker_built_after_shutdown_returned_still_delivers() -> None:
     )
 
 
+_UNDER_LOCK_OFFENDERS = frozenset({"_close_orphan_sink", "join_closers", "_close_owed"})
+"""Calls that must never appear inside a `with _state._lock` body.
+
+Every one performs or waits on a sink `close()`. A name is added here whenever a helper starts
+wrapping one, because this lint matches on the name and cannot see through a rename.
+"""
+
+
 def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
     """FR-001 AC-4 and FR-002 AC-4, as a lint rather than as prose.
 
@@ -498,6 +506,12 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
     `_close_orphan_sink` inside a `with _state._lock` body parks every concurrent emit and every
     first `@trace` in the process behind a destination. A **detached** release started under the
     lock is the existing shape (SPEC-033 FR-002) and is allowed: it only starts a thread.
+
+    The offender set is a **name** list, so a helper that wraps an inline release is invisible to
+    it until it is named — which is how a refactor shrinks a derived guard as silently as a
+    deletion. `_close_owed` is the case: SPEC-046 moved `_close_orphan_sink`'s inline
+    `release()` into it, and without the entry below this lint would pass against that call
+    reappearing under the lock.
     """
     tree = ast.parse(_LIFECYCLE_SRC.read_text())
     offenders: list[str] = []
@@ -513,7 +527,7 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
             if not isinstance(inner, ast.Call):
                 continue
             name = ast.unparse(inner.func)
-            if name in {"_close_orphan_sink", "join_closers"} or name.endswith(".shutdown"):
+            if name in _UNDER_LOCK_OFFENDERS or name.endswith(".shutdown"):
                 offenders.append(name)
             if name == "release" and not any(kw.arg == "detached" for kw in inner.keywords):
                 offenders.append("inline release()")
