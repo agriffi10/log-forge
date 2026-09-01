@@ -140,8 +140,10 @@ being true. `_lifecycle.py` also still points at §13 for the `inherited_sink` l
 - [ ] `_close_orphan_sink`'s docstring states the split, why the configured sink is the inline
       one, and why every close is joined rather than detached.
 - [ ] The stale `§13` pointer for the `inherited_sink` limit in `_lifecycle.py` names §12.
-- [ ] No doc left in the tree says the exit close runs the owed sinks in sequence — verified by
-      grepping the phrases SPEC-045 introduced, not from recollection.
+- [ ] No **live** doc says the exit close runs the owed sinks in sequence, verified by grepping
+      the phrases SPEC-045 introduced. SPEC-045's own spec and delivery doc keep the phrase: they
+      are records of what was true when written, which is the carve-out SPEC-021's rule implies
+      and this criterion states rather than leaves to judgement.
 
 ---
 

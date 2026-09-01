@@ -64,7 +64,7 @@ _SRC = pathlib.Path(log_foundry.__file__).parent
 
 _EXPECTED_CLOSERS = {
     ("_lifecycle", "_close_guarded"),
-    ("_lifecycle", "_close_orphan_sink"),
+    ("_lifecycle", "_close_owed"),
     ("worker", "Worker._close_sink"),
     ("sinks/multi", "MultiSink.close"),
     ("sinks/filtering", "FilteringSink.close"),
@@ -601,9 +601,11 @@ _LATCH_DISPOSITIONS = {
         "records nothing — it is the thread body of a close some requester already latched, "
         "and latching here would overwrite that requester's more recent record"
     ),
-    ("_lifecycle", "_close_orphan_sink"): (
-        "latches: it sets _orphan_closed_sink to the sink it is about to release, ahead of the "
-        "release, so a racing emit cannot re-arm what is being closed"
+    ("_lifecycle", "_close_owed"): (
+        "records nothing, and does not need to: `_close_orphan_sink` latches *every* owed sink "
+        "under _state._lock before any close starts, so a racing emit cannot re-arm one that is "
+        "being closed. The close moved out of that function into this helper when SPEC-046 made "
+        "the owed closes concurrent, and the latch stayed where the lock is"
     ),
     ("_lifecycle", "_get_worker"): (
         "latches: the transition owns this close because the worker it just built did not adopt "
@@ -778,7 +780,7 @@ def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
     asserted to resolve, and asserted to resolve to `Sink` rather than to merely something.
     """
     indirect = {
-        ("_lifecycle", "_close_orphan_sink", ast.Name),
+        ("_lifecycle", "_close_owed", ast.Name),
         ("worker", "Worker._close_sink", ast.Attribute),
         ("sinks/multi", "MultiSink.close", ast.Name),
     }

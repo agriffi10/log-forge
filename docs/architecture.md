@@ -779,13 +779,6 @@ close it.
   must not become a *loss* — A keeps taking events through the wrapper, is owed a further close,
   and delivers everything. **Closed by** not releasing a sink reachable from the graph just handed
   over, which is decidable only against a live config read.
-- **The exit close runs the owed sinks inline and in sequence**, so one slow close delays every
-  other owed close and one that never returns takes the rest with it — measured, a 5 s close made
-  `shutdown(timeout=1.0)` return after 5.01 s, with the second sink's close finishing at 5.01 s
-  too. Introduced by SPEC-045, which made the owed-close
-  record a set without changing how the set is drained. **Closed by** bounding or parallelising
-  that drain; it is not the same limit as the unbounded `Sink.close` in §13, which is a protocol
-  constraint rather than a scheduling one.
 - **`_fork._reinit_primitives` can exhaust memory, not merely hang.** Its container read is
   `list(container)`, so a `list` subclass with a non-terminating `__iter__` reachable from any
   sink never returns — measured 5.7 GB RSS in nine minutes, with the parent unable to kill the
@@ -819,6 +812,14 @@ close it.
   or by a decision that the shape is right.
 
 ### Resolved
+
+- **The exit close ran the owed sinks in sequence** — introduced by SPEC-045, which made the
+  owed-close record a set without changing how the set is drained → **fixed in SPEC-046**: the
+  closes run concurrently and every one is joined, so the cost is the slowest rather than their
+  sum, measured 8.02 s → under 4 s for four 2-second closes. Reusing SPEC-030's detached closer
+  was tried and reverted — its grace caps at `DEFAULT_CLOSER_GRACE`, which abandoned 3 of 4. What
+  remains is not this item but §13's: a *single* `Sink.close` is still unbounded, so one stuck
+  sink still holds the exit.
 
 - **Orphan logs** (emit standalone with a fresh `trace_id` vs warn-and-drop) → **emit standalone**,
   shipped in **SPEC-002**. A level call with no active span builds a complete event with a fresh
@@ -1011,7 +1012,9 @@ and a third copy is a fork with no merge.
   application thread parked on the orphan path inside a driver call with no timeout of its own
   delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and, since
   SPEC-030, the grace it grants a swapped-out sink's close — but not this close, the live sink's,
-  which stays inline and unbounded. **It reaches the orphan path as well as the worker's**
+  which stays inline and unbounded. **The cost does not multiply by the number of sinks owed a
+  close** (SPEC-046): they run concurrently and are all joined, so this limit is one close, not
+  their sum. **It reaches the orphan path as well as the worker's**
   (SPEC-044 FR-006): a process that only ever logged outside a span closes through
   `_close_orphan_sink`, which calls `release(owed)` inline before `_shutdown_worker` consults its
   deadline at all. Measured 6.01 s against `shutdown(timeout=2.0)` on both paths, with a
