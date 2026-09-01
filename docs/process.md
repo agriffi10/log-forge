@@ -92,7 +92,8 @@ review — that one gates the push, at the other end of the build, and it is blo
 reviewer contract*, below). Three reviews stand between a spec going In Progress and its PR
 merging: one on the plan before the first line of code, and two on the diff — all three before the
 first push. With the spec's own review that is **four artifacts that draw a reviewer** — spec,
-plan, diff, diff — and no fifth.
+plan, diff, diff — and no fifth, unless an artifact is **replaced** rather than revised after its
+gate has run (*A replaced artifact restarts its gate*, below).
 
 **During the build — one spec, in phases**
 - Every file-changing task is done on its **own branch** and opened as a **PR** — automatically, without
@@ -177,6 +178,24 @@ the exit rules below decide when to stop *above* two. **On a spec or a plan**, o
 the gate — a clean review there is an answer. What makes that count a floor is **re-entry**: a
 revised artifact is a new artifact and goes back through the gate as one, which is why a phase
 that rewrites the plan sends the new plan through again.
+
+**A replaced artifact restarts its gate; a revised one does not.** Fixing findings in place is a
+revision, and the gate that produced them is answered. Throwing the design away and writing a new
+one is a **replacement**, and the replacement has been reviewed by nobody — which is the shape
+*A rewrite under review pressure is the highest-risk artifact in the loop* warns about, stated as
+a counting rule rather than as advice. **Where it happens decides what is owed.** Replaced at the
+spec or plan gate, the later gates still see it fresh and nothing extra is due. Replaced *after*
+the diff reviews have run, those reviews examined something that no longer exists, so it owes one
+more — in the frame that would catch the replacement's own class of defect, which for a mechanism
+change is execution — and the fact that this exceeds the cycle's budget is said out loud rather
+than done quietly.
+
+Measured on the two specs that produced the rule. SPEC-045's design was replaced **late**, after
+both diff reviews; the extra reviewer found both remaining blocking gaps, each a mutant that
+passed the entire suite. SPEC-046's was replaced by its **spec** review, and the ordinary cycle
+absorbed it: the plan review found two correctness defects in the new design before a line of it
+was written — an identity test written as value equality, and an unguarded `Thread.start()` on a
+path documented `Raises: None` — and both diff reviews then found more, with no fifth spent.
 
 - **The gate is blocking, and what it asks for is an answer, not a filing.** A spec is not
   Draft-ready, a plan does not start code, and a branch does not reach the remote, until every
