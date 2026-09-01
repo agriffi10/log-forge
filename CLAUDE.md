@@ -308,7 +308,20 @@ spec's other five FRs shipped.
 is that scheduling `Health`'s NamedTuple→dataclass conversion *last* was what forced two later
 specs to append fields as tuple members and prove indices, and then forced the freeze spec to undo
 both — and that converting first makes the arc's remaining counters, hooks and reasons additive,
-so they are free in `1.x`.
+so they are free in `1.x`. **The arc is now fully shipped**, SPEC-040 last as planned.
+
+**SPEC-040 (lifecycle ownership) is Completed** — the only spec here that fixes no bug, and the
+arc's last. `decorator.py` owned the process's delivery lifecycle in seven loose globals with no
+state machine over them, and seven pieces of shipped work had come out of that one fact. The state
+and its fourteen functions now live on one `_Lifecycle` object in `_lifecycle.py`, the four §9.2
+questions are its methods, and `decorator.py` falls 1390 → 729 lines. Behaviour preservation was
+proved by **normalised AST comparison** — 12 of 13 moved functions identical, the one difference
+forced by the fork walk's shape lint — rather than by the suite, which was green throughout and
+green over all three defects the reviews found: a 179 ns-vs-23 ns hot-path regression, two lint
+rules that went dead in the renaming commit, and a coverage floor that passed against the exact
+scenario its own docstring named. Its execution frame found **six lifecycle races that reproduce
+byte-identically on the pre-change tree**, so none is its doing and its own Out of Scope forbade
+fixing them; all six are recorded in `architecture.md` §13 with harnesses, and they want a spec.
 
 **SPEC-042 (forked-child sink ownership) is Completed** — a forked child closed transports it
 never opened: a `configure(sink=…)` sent a connection sink's protocol goodbye and the **parent's**
@@ -668,6 +681,16 @@ tests green only because CI never installs that extra.
   derived too, to a fixpoint: a function whose return value names the worker is itself a worker
   name, or `worker = _snapshot()` rebinds a guard's category behind a neutral name with everything
   green. A roster that hand-lists anything — sites or tokens — rots. (SPEC-035, arch §9.2)
+  **SPEC-040 made each question a method on one owner** (`_lifecycle._state`), so a call site
+  *selects* a question instead of composing one, and the seven globals it read became that
+  object's state. **None of the four takes the lock** — four guards ask with it already held, so
+  a non-reentrant acquire inside a question deadlocks, and `_get_worker`'s outer check is
+  unlocked on the `@trace` hot path. The roster now walks **both** modules, and its floor is
+  **per module**: one total is cleared by one module alone while every site in the other stops
+  being checked (measured, 37 against a floor of 36, passing). **A refactor shrinks a derived
+  roster as silently as a deletion does** — two of this spec's own lint rules went dead in the
+  commit that renamed their subject, with the file still green, and widening the scope
+  immediately filed two SPEC-042 sites that had gone unfiled for two specs. (SPEC-040, arch §9.2)
 - **A public accessor hands out a copy; the library reads the live object** — `get_config()` and
   `get_baggage()` copy, because a public getter documented "do not mutate" is a promise the
   caller's slip breaks silently, while `config._live_config()` and `context._live_baggage()` are
