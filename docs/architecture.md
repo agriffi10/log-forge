@@ -936,13 +936,15 @@ constraint — never by being deleted quietly.
   Two further shapes need a concurrent emit during `configure()`, which that call's documented
   "not thread-safe" already covers, and are recorded because the single slot is what permits
   them. An emit that resolved sink A, was preempted, and resumes after **two** swaps finds the
-  latch on B, re-arms A, and orphans the live sink. And an emit that resolved the old sink and
+  latch on B, re-arms A, and orphans the live sink — the single slot's own bound, which is why
+  FR-004's "every close" means the most recent one. ~~And an emit that resolved the old sink and
   arrives after the *worker* branch cleared the record re-arms it, so `Worker.swap_sink` closes
   that sink and the ownership guard — finding `_worker.sink` is now the new one — closes it
-  again at exit. That one is **measured** (`A.closed == 2`, with a preemption point injected at
-  `_ensure_sink`) and is **pre-existing**: it reproduces identically before SPEC-033, because the
-  worker branch has never recorded a closed sink. The orphan branch's equivalent *is* closed, by
-  `_orphan_closed_sink`, and a test pins it.
+  again at exit.~~ — **fixed by SPEC-044 FR-004.** It was measured (`A.closed == 2`, with a
+  preemption point injected at `_ensure_sink`) and was **pre-existing**, reproducing identically
+  before SPEC-033, because the worker branch had never recorded a closed sink. That branch now
+  latches what it hands to `Worker.swap_sink`, so the orphan branch's refusal to re-arm a closed
+  sink reaches it too — which is what the orphan branch's equivalent already had.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
@@ -1006,7 +1008,14 @@ constraint — never by being deleted quietly.
   application thread parked on the orphan path inside a driver call with no timeout of its own
   delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and, since
   SPEC-030, the grace it grants a swapped-out sink's close — but not this close, the live sink's,
-  which stays inline and unbounded. Running *this* close on a joinable daemon thread was built and
+  which stays inline and unbounded. **It reaches the orphan path as well as the worker's**
+  (SPEC-044 FR-006): a process that only ever logged outside a span closes through
+  `_close_orphan_sink`, which calls `release(owed)` inline before `_shutdown_worker` consults its
+  deadline at all. Measured 6.01 s against `shutdown(timeout=2.0)` on both paths, with a
+  6-second `close()` — the 30.01 s figure recorded below came from a 30-second one, and the
+  elapsed time tracks the close, never the timeout. A test now pins both paths, so a later change
+  that bounds this close fails until the documentation moves with it. Running *this* close on a
+  joinable daemon thread was built and
   **reverted**: at
   interpreter exit that daemon is killed wherever it has reached — and for `SQLiteSink` that can
   be *inside* `commit()`, which is the partial write FR-004 exists to avoid rather than the
@@ -1335,40 +1344,58 @@ constraint — never by being deleted quietly.
   independent, as intended: 042 did not wait on this refactor, and this refactor absorbed none
   of it.
 
-- **Six lifecycle races are open, reproduced, and deliberately unfixed** (SPEC-040 FR-005). They
+- **Six lifecycle races were found by SPEC-040 and are closed by SPEC-044, bar the last.** They
   were found by the execution frame over SPEC-040's own diff and each one **reproduces
-  byte-identically on the pre-SPEC-040 tree**, so none is caused by that refactor — which is why
-  they are recorded here rather than fixed in it: its Out of Scope forbids any behaviour change,
-  including improvements, precisely so a refactor cannot smuggle one in. They want their own spec.
-  Harnesses are named so the next spec starts from a reproduction rather than a description.
+  byte-identically on the pre-SPEC-040 tree**, so none was caused by that refactor — which is why
+  they were recorded here rather than fixed in it: its Out of Scope forbids any behaviour change,
+  including improvements, precisely so a refactor cannot smuggle one in. **SPEC-044 fixed 1–5**
+  and each is now pinned by a committed reproduction in `tests/test_lifecycle_races.py` rather
+  than by the named harness; **6 stands**, as the documented limit the entry above states.
 
-  1. **`shutdown()` racing a first `@trace` leaves a live worker.** `_shutdown_worker` reads the
+  1. ~~**`shutdown()` racing a first `@trace` leaves a live worker.**~~ — **fixed by SPEC-044
+     FR-001**, with a shutdown-in-progress depth counter rather than a permanent retirement: a
+     worker built while `shutdown()` is still running is registered under the same lock and
+     drained by that call, while one built after it **returned** still delivers, which is the
+     separate decision `_worker_health`'s docstring settles. What it was: `_shutdown_worker` read the
      existence question *unlocked*; a worker built after that read sends it down the no-worker
      branch, so the drain thread is never stopped and the sink never closed, while
      `health()` reports `retired=True` and later logs still deliver with
      `submitted_after_shutdown=0`. `atexit` recovers it at process exit — but a frozen serverless
      container never exits, which is the deployment `flush()`/`shutdown()` exist for.
      (`h17_shutdown_vs_first_trace.py`; confirmed independently.)
-  2. **`configure(sink=B)` racing a first `@trace` loses A's close.** `_get_worker` holds the lock
+  2. ~~**`configure(sink=B)` racing a first `@trace` loses A's close.**~~ — **fixed by SPEC-044
+     FR-002**: a transition may clear the record only after deciding who performs the close it
+     held, and where the new worker did not adopt the sink the transition owns that close itself.
+     What it was: `_get_worker` held the lock
      while `configure()` writes the config and queues on it; `_ensure_sink()` then returns B and
      the orphan record for A is discarded. A has events, is never closed, `incomplete_swaps=0`.
      Natural rate 6/400. (`h4_first_trace_vs_configure.py`.)
-  3. **A shutdown does not cut a backoff short if any log call lands during the close.**
-     `_offer_orphan_signal` replaces the *set* stop event with a fresh unset one, so
+  3. ~~**A shutdown does not cut a backoff short if any log call lands during the close.**~~ —
+     **fixed by SPEC-044 FR-003**: the discriminator is the *moment*, not retirement. While a
+     release of a sink is in flight the signal it holds is not replaced; after `shutdown()` has
+     returned the refresh still happens, which is what SPEC-033 FR-004 requires. What it was:
+     `_offer_orphan_signal` replaced the *set* stop event with a fresh unset one, so
      `shutdown()` measured 8.01 s against an 8 s backoff versus 0.00 s with no racing log. This
      is SPEC-027's guarantee failing on a race, on both the orphan and worker paths.
      (`h2_orphan_stop_signal.py`, `h2b_worker_path.py`.)
-  4. **Double `close()` on a swapped-out sink, worker path.** `_swap_sink`'s worker branch clears
+  4. ~~**Double `close()` on a swapped-out sink, worker path.**~~ — **fixed by SPEC-044
+     FR-004**, and struck in place above where the same defect was recorded under the
+     closed-sink latch. What it was: `_swap_sink`'s worker branch cleared
      the orphan record without setting `_orphan_closed_sink`, so a preempted orphan emit can
      re-arm the sink the worker just closed. Needs an injected preemption point; 0/120 without
      one. (`h1_swap_worker_double_close.py`, `h18_double_close_rate.py`.)
-  5. **A forked child runs `reacquire_after_fork` on the superseded, already-closed sink** pinned
+  5. ~~**A forked child runs `reacquire_after_fork` on the superseded, already-closed sink**~~ —
+     **fixed by SPEC-044 FR-005**, by declaring the opt-out on the holder of the slot rather than
+     on the module. What it was: the hook ran on the sink pinned
      by `_orphan_closed_sink` — the exact hazard `_fork._SKIP_ATTRIBUTE`'s docstring describes,
      against a slot `_lifecycle._FORK_SKIP` does not name. (`h11_fork_supersedes.py`.)
-  6. **`shutdown(timeout=…)` does not bound the live sink's `close()`.** Measured 30.01 s against
-     `shutdown(timeout=2.0)`. Consistent with "shutdown()'s own close stays inline" (§9), but the
-     parameter's own docstring justifies itself with the case it does not cover, so this one is a
-     documentation defect rather than a behavioural one.
+  6. **`shutdown(timeout=…)` does not bound the live sink's `close()`** — the one that **stands**.
+     Measured 30.01 s against `shutdown(timeout=2.0)` with a 30-second close, and 6.01 s with a
+     6-second one: the elapsed time tracks the close, never the timeout. Consistent with
+     "shutdown()'s own close stays inline" (§9), and SPEC-044 FR-006 treated it as the
+     documentation defect it is — the parameter's docstring justified itself with the case it
+     does not cover, and now states the limit and that it reaches both delivery paths. Bounding
+     it needs an interruptible `Sink.close`, which is a change to the published sink contract.
 
 ---
 

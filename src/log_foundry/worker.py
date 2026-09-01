@@ -238,6 +238,7 @@ class Worker:
         flush_interval: float = 1.0,
         max_queue: int = 10_000,
         max_retries: int = 3,
+        sink_released: bool = False,
     ) -> None:
         """Starts the drain thread and offers the sink this worker's stop signal.
 
@@ -245,12 +246,24 @@ class Worker:
         shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
         and user code.
 
+        ``sink_released`` says the close is **already discharged** by whoever released this sink,
+        never that the sink is unusable (SPEC-044 FR-001). Only ``_lifecycle._get_worker`` passes
+        it, and only for a worker built while a ``shutdown()`` was mid-flight over the very sink
+        that shutdown's orphan branch had just closed — without it the exit close performs a
+        second ``close()``, which ``sinks/base.py`` does not promise to tolerate (SPEC-032). This
+        worker still emits to that sink: one that guards its post-close state refuses and the
+        batch lands in ``failed_batches``, which is the documented signal on this path. The flag
+        describes **one** sink, so :meth:`swap_sink` clears it when it adopts another — otherwise
+        the claim would transfer to every sink this worker later held, and the next one would be
+        closed by nobody.
+
         Args:
           sink: The destination every batch is emitted to.
           batch_size: How many submissions accumulate before an emit is triggered.
           flush_interval: Seconds before a partial batch is emitted anyway.
           max_queue: Ceiling on buffered submissions, past which the newest is dropped.
           max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`.
+          sink_released: Whether ``sink``'s close has already been performed elsewhere.
 
         Returns:
           None.
@@ -273,7 +286,7 @@ class Worker:
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
         self._shutdown_done = False
-        self._sink_closed = False
+        self._sink_closed = sink_released
         self._lock = threading.Lock()
         self._offer_stop_signal()
         self._thread = threading.Thread(
@@ -742,6 +755,7 @@ class Worker:
             if old is new_sink:
                 return True
             self.sink = new_sink
+            self._sink_closed = False
         self._offer_stop_signal()
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not (drained and self.flush(remaining)):

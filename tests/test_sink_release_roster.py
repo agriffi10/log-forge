@@ -93,6 +93,28 @@ gave each a bounded wait, and a helper that stopped returning the thread would t
 silently (FR-002 AC-8).
 """
 
+_EXPECTED_UNJOINED_REQUESTERS = {
+    ("_lifecycle", "_get_worker"),
+}
+"""The one site that asks for a detached close and deliberately does **not** join it.
+
+A written decision rather than a table edit (SPEC-044 FR-002). `_get_worker` closes a sink the
+worker it just built did not adopt, and it is the only requester with no deadline of its own to
+spend: `_swap_sink` and `Worker._close_swapped_out` are both given one by their caller, while
+this runs inside the double-checked build on the first traced call in the process. Joining there
+would put a whole sink `close()` -- with SPEC-028's emit lock and SPEC-027's backoff behind it --
+on that one call, for a close nobody is waiting on.
+
+What replaces the join is what SPEC-030 FR-003 built for exactly this: the thread is registered
+in `_closers`, `join_closers` grants it the capped grace at shutdown and at exit, and
+`health().closing_sinks` reports it live. So the close is still bounded and still visible; what
+it is not is *waited on here*.
+
+Kept as its own table rather than folded into `_EXPECTED_REQUESTERS`, whose stated invariant is
+that a requester joins. A third table is what makes a fourth requester a decision instead of a
+membership question, which is the property both rosters exist for.
+"""
+
 
 def _modules(root: pathlib.Path | None = None) -> Iterator[tuple[str, ast.Module]]:
     """Yields every module under one root, keyed by a path-shaped stem.
@@ -569,7 +591,9 @@ def test_every_library_closer_goes_through_the_release_helper() -> None:
     unnoticed. A separate `>= 8` assertion beside this one reads as a second safety net while
     being strictly implied by it, so it is stated here instead of asserted twice.
     """
-    assert _release_call_sites() == _EXPECTED_CLOSERS | _EXPECTED_REQUESTERS
+    assert _release_call_sites() == (
+        _EXPECTED_CLOSERS | _EXPECTED_REQUESTERS | _EXPECTED_UNJOINED_REQUESTERS
+    )
 
 
 def test_the_detached_requesters_still_bind_the_thread_they_are_handed() -> None:
@@ -580,8 +604,23 @@ def test_the_detached_requesters_still_bind_the_thread_they_are_handed() -> None
     this test cannot see it -- measured, `release` mutated to `_start_closer(sink); return None`
     passed all seven lints here. The other half of AC-8 is therefore behavioural and lives in
     the two tests below, one per caller.
+
+    It also asserts the **split** (SPEC-044 FR-002): every site asking for a detached close is in
+    one of the two requester tables, so a third one that quietly declines to join is a decision
+    somebody writes down rather than a row appearing in `_EXPECTED_CLOSERS`. Without that, the
+    only thing a non-joining requester breaks is an equality it can be added to.
     """
     bound: set[tuple[str, str]] = set()
+    detached: set[tuple[str, str]] = set()
+    for stem, tree in _modules():
+        for node, fn, cls in _walk_scopes(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not _is_release_call(node.func, stem):
+                continue
+            if not any(kw.arg == "detached" for kw in node.keywords):
+                continue
+            detached.add((stem, _qualified(fn, cls)))
     for stem, tree in _modules():
         for node, fn, cls in _walk_scopes(tree):
             if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
@@ -591,6 +630,10 @@ def test_the_detached_requesters_still_bind_the_thread_they_are_handed() -> None
                 continue
             if any(kw.arg == "detached" for kw in node.value.keywords):
                 bound.add((stem, _qualified(fn, cls)))
+    assert detached == _EXPECTED_REQUESTERS | _EXPECTED_UNJOINED_REQUESTERS, (
+        "a site asking for a detached close belongs in one of the two requester tables — "
+        "whether it joins is the decision, and _EXPECTED_CLOSERS is not where it is recorded"
+    )
     assert bound == _EXPECTED_REQUESTERS
 
 

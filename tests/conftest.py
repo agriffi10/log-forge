@@ -117,6 +117,14 @@ def _reset_worker() -> None:
     hung closer from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
 
+    SPEC-044 adds three more, and each would leak in a different direction. A
+    ``_shutdown_running`` left raised by a test that injected a preemption point makes the
+    **next** test's first ``@trace`` register a late worker for a shutdown that ended long ago,
+    and hand it a discharged close. A ``_late_worker`` left set pins a worker object and hands
+    the next ``shutdown()`` something to drain that it does not own. And ``_closing_now`` left
+    holding an id makes the next test's sink miss its stop-signal refresh — silently, since the
+    symptom is a backoff that does not happen rather than an error.
+
     SPEC-036 FR-003 adds the two loss counters. They are cumulative for the life of the process
     and ``health()`` synthesizes them whether or not a worker exists, so a single test that loses
     an event would otherwise leave every later test reading a non-zero ``orphan_lost`` — the exact
@@ -135,10 +143,14 @@ def _reset_worker() -> None:
     _lifecycle._state._orphan_closed_sink = None
     _lifecycle._state._orphan_retired = False
     _lifecycle._state._orphan_stop = threading.Event()
+    _lifecycle._state._shutdown_running = 0
+    _lifecycle._state._late_worker = None
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
     with _lifecycle._closers_lock:
         _lifecycle._closers.clear()
+    with _lifecycle._closing_now_lock:
+        _lifecycle._closing_now.clear()
 
 
 class FakeSink:
