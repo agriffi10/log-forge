@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Unpack
 
 if TYPE_CHECKING:
     import threading
@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 from log_foundry import _lifecycle
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink
 
 __all__ = ["LogstashSink"]
 
@@ -90,7 +90,7 @@ class LogstashSink:
         timeout: float = 5.0,
         max_retries: int = 3,
         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
-        **http_kwargs: object,
+        **http_kwargs: Unpack[HTTPAuthKwargs],
     ) -> None:
         """Selects and builds exactly one backend.
 
@@ -110,7 +110,11 @@ class LogstashSink:
           max_datagram_bytes: In UDP socket mode, the largest datagram to attempt; a frame over
             it is dropped and counted rather than sent, retried and abandoned (SPEC-038 FR-007).
             Ignored in HTTP mode and over TCP, which is a stream.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode,
+            typed as ``HTTPAuthKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+            ``body_format``, ``timeout`` and ``max_retries``, each a parameter of this sink's
+            own: the last two because socket mode uses them, and ``body_format`` because it is
+            validated in both modes and defaults differently here.
 
         Returns:
           None.
@@ -127,7 +131,7 @@ class LogstashSink:
         if url is not None:
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
-                **http_kwargs,  # type: ignore[arg-type]
+                **http_kwargs,
             )
             self._socket: SocketTransport | None = None
         elif host is not None and port is not None:

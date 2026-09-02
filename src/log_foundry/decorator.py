@@ -22,6 +22,7 @@ from log_foundry.results import ContinueResult
 
 if TYPE_CHECKING:
     import contextvars
+    from collections.abc import Mapping
 
 
 __all__ = ["continue_trace", "trace"]
@@ -631,7 +632,7 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
 def trace(func: F) -> F: ...
 @overload
 def trace(
-    *, name: str | None = ..., defaults: dict[str, object] | None = ...
+    *, name: str | None = ..., defaults: Mapping[str, object] | None = ...
 ) -> Callable[[F], F]: ...
 
 
@@ -639,14 +640,18 @@ def trace(
     func: F | None = None,
     *,
     name: str | None = None,
-    defaults: dict[str, object] | None = None,
+    defaults: Mapping[str, object] | None = None,
 ) -> F | Callable[[F], F]:
     """Traces a function call as a span, usable bare as ``@trace`` or with arguments.
 
     Args:
       func: The function being decorated when used bare, otherwise ``None``.
       name: Overrides the span name, which defaults to ``func.__qualname__``.
-      defaults: Per-decorator default fields added to every event on the span.
+      defaults: Per-decorator default fields added to every event on the span. Any
+        ``Mapping`` is accepted, and a copy is taken **once here**, at decoration — not per
+        call. Before SPEC-051 FR-002 the caller's own object was bound to every span and read
+        on the per-event path, so editing it after decoration changed later spans; that is
+        tolerable for a ``dict`` and is not for a ``Mapping`` whose ``keys()`` is user code.
 
     Returns:
       The wrapped function, or a decorator when called with arguments.
@@ -654,6 +659,7 @@ def trace(
     Raises:
       None.
     """
+    span_defaults = None if defaults is None else dict(defaults)
 
     def decorate(fn: F) -> F:
         """Wraps one function, selecting the sync or async wrapper at decoration time.
@@ -698,7 +704,7 @@ def trace(
                 Raises:
                   BaseException: Whatever the wrapped coroutine raises, unchanged.
                 """
-                span, token, scope = _begin(name or fn.__qualname__, defaults)
+                span, token, scope = _begin(name or fn.__qualname__, span_defaults)
                 status, error = "ok", None
                 try:
                     result = await fn(*args, **kwargs)
@@ -734,7 +740,7 @@ def trace(
             Raises:
               BaseException: Whatever the wrapped function raises, unchanged.
             """
-            span, token, scope = _begin(name or fn.__qualname__, defaults)
+            span, token, scope = _begin(name or fn.__qualname__, span_defaults)
             status, error = "ok", None
             try:
                 result = fn(*args, **kwargs)

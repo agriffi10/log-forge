@@ -83,14 +83,17 @@ def _bounded_seconds(timeout: float | None) -> str:
         return "?"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Health:
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
-    ``stopped_reason``, ``sink``, and SPEC-030's three are defaulted and appended in that
-    order, so the zeroed snapshot in ``_lifecycle._worker_health`` — and any third-party
-    construction — keeps working, and attribute and index access to every earlier field stays
-    as it was.
+    Construction is **keyword-only** (SPEC-051 FR-001), which is what makes appending a field
+    safe: order is not part of the contract, so a new counter can go anywhere and no third-party
+    construction can bind to a position. It was previously ordered — every field after
+    ``failed_batches`` is defaulted and was appended in the order the specs landed. The claim
+    that a caller could also subscript this, carried here from the ``NamedTuple`` SPEC-034
+    replaced, was false from the moment it became a dataclass: ``len(health())`` raises
+    ``TypeError``, and ``README.md`` said the opposite correctly throughout.
 
     Attributes:
       queued: Submissions currently buffered. Approximate by nature: it is read without
@@ -148,8 +151,10 @@ class Health:
       closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
         gauge rather than a counter, so it falls as well as rises. ~~the only field here that
         can fall~~ — struck (SPEC-034 AC-2c): ``queued`` falls on every drain. Those two are the
-        gauges and the other five integers are monotonic, which is the distinction an operator
-        alerting on "any non-zero" needs and which no name here encodes. A close is
+        only gauges and every other integer here is monotonic, which is the distinction an
+        operator alerting on "any non-zero" needs and which no name encodes. Stated as the rule
+        rather than as a count: it said "the other five" until SPEC-051, having gone stale when
+        SPEC-036 appended ``orphan_lost`` and ``in_span_lost`` and made it six. A close is
         bounded only in how long ``configure()`` waits for it, so this is how a destination
         stuck in ``close()`` becomes visible at all. Reading it non-zero once means a swap just
         happened; reading it non-zero repeatedly means a close is not coming back, and that sink

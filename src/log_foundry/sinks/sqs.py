@@ -16,7 +16,7 @@ from log_foundry import _diag
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
-__all__ = ["SQSSink"]
+__all__ = ["DedupIdSource", "GroupIdSource", "SQSSink"]
 
 _BACKOFF_BASE = 0.1
 
@@ -27,7 +27,10 @@ MAX_ID_LEN = 128
 """SQS maximum length for ``MessageGroupId`` and ``MessageDeduplicationId``."""
 
 GroupIdSource = str | Callable[[dict[str, object]], str] | None
+"""What ``message_group_id=`` accepts: an event key to read, a callable, or ``None``."""
+
 DedupIdSource = Callable[[dict[str, object]], str] | None
+"""What ``message_deduplication_id=`` accepts: a callable, or ``None`` for a minted UUID."""
 
 
 class _Prepared(NamedTuple):

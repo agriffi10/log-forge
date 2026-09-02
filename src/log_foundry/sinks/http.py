@@ -8,17 +8,23 @@ import threading
 import urllib.error
 import urllib.request
 from base64 import b64encode
+from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import Any, NoReturn, TypedDict
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-__all__ = ["HTTPSink", "merge_headers"]
+__all__ = [
+    "HTTPAuthKwargs",
+    "HTTPForwardKwargs",
+    "HTTPKwargs",
+    "HTTPPlatformKwargs",
+    "HTTPRetryKwargs",
+    "HTTPSink",
+    "merge_headers",
+]
 
 _BACKOFF_BASE = 0.1
 
@@ -196,7 +202,50 @@ def _no_redirect_opener() -> Callable[..., Any]:
     return urllib.request.build_opener(_NoRedirect()).open
 
 
-def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[str, str]:
+class HTTPForwardKwargs(TypedDict, total=False):
+    """The :class:`HTTPSink` keywords every platform sink in this family can forward.
+
+    Five shapes, composed by inheritance so each key is declared exactly once, replace the
+    ``**http_kwargs: object`` that let ``timeout="not-a-float"`` past ``mypy`` and past
+    construction (SPEC-051 FR-005). A platform sink cannot forward a keyword it sets itself or
+    shadows with a parameter of its own — ``mypy`` refuses a ``**kwargs`` TypedDict key that
+    collides with a named parameter — so this is the intersection and the four below widen it.
+    Every annotation matches ``HTTPSink.__init__``'s, and a roster test holds them there.
+    """
+
+    method: str
+    headers: dict[str, str] | None
+    gzip: bool
+    max_retry_after: float
+    max_batch_count: int | None
+    max_batch_bytes: int | None
+    opener: Callable[..., Any] | None
+
+
+class HTTPRetryKwargs(HTTPForwardKwargs, total=False):
+    """:class:`HTTPForwardKwargs` plus the two a sink with a single transport does not own."""
+
+    timeout: float
+    max_retries: int
+
+
+class HTTPAuthKwargs(HTTPForwardKwargs, total=False):
+    """:class:`HTTPForwardKwargs` plus ``auth``, for a sink taking no credentials of its own."""
+
+    auth: str | tuple[str, str] | None
+
+
+class HTTPPlatformKwargs(HTTPRetryKwargs, HTTPAuthKwargs, total=False):
+    """Both of those: for a sink that owns only the body format."""
+
+
+class HTTPKwargs(HTTPPlatformKwargs, total=False):
+    """Every keyword :class:`HTTPSink` accepts besides its positional ``url``."""
+
+    body_format: str
+
+
+def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
     """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
 
     This is shared by the SaaS sinks that set a fixed auth header — Datadog, Splunk, New Relic,
@@ -205,7 +254,11 @@ def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[
     Args:
       base: The sink's own headers, updated in place.
       http_kwargs: The caller's keyword arguments, mutated by popping ``headers`` out so the
-        rest can be forwarded to :class:`HTTPSink` without a duplicate argument.
+        rest can be forwarded to :class:`HTTPSink` without a duplicate argument. Typed as the
+        narrowest shape (SPEC-051 FR-005); every wider one is assignable to it, and ``pop`` is
+        allowed because each key is ``total=False``. The pop is why a caller may still pass
+        ``headers``, and — since it happens *here*, in another function — why ``mypy`` reports
+        the caller's own forwarding call as a possible duplicate anyway.
 
     Returns:
       The merged headers.

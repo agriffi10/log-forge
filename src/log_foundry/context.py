@@ -13,17 +13,20 @@ if TYPE_CHECKING:
 
 __all__ = [
     "current_baggage_header",
-    "current_span",
     "current_trace_context",
     "current_traceparent",
     "get_baggage",
-    "pop_baggage_scope",
-    "pop_span",
-    "push_baggage_scope",
-    "push_span",
     "reset_context",
     "set_baggage",
 ]
+"""Exactly the six names ``log_foundry`` re-exports (SPEC-051 FR-003).
+
+The five that left -- ``current_span``, ``push_span``, ``pop_span``, ``push_baggage_scope``
+and ``pop_baggage_scope`` -- are internal and stay importable; what was withdrawn is the
+claim, not the symbol. ``current_span`` is why this matters: it hands back a **mutable**
+:class:`~.model.Span`, which is what :func:`current_trace_context` exists to keep callers
+away from, and a name still in ``__all__`` at ``1.0`` could not be withdrawn afterwards.
+"""
 
 _span_stack: contextvars.ContextVar[tuple[Span, ...]] = contextvars.ContextVar(
     "log_foundry_span_stack", default=()

@@ -57,6 +57,7 @@ Rules that keep this file useful:
 - [A client exception costs its chunk, and is provable non-delivery for it](#a-client-exception-costs-its-chunk-and-is-provable-non-delivery-for-it)
 - [A sink that released its transport refuses; one that released nothing keeps accepting](#a-sink-that-released-its-transport-refuses-one-that-released-nothing-keeps-accepting)
 - [A destination's limit is found by halving the *budget*, not the chunk](#a-destinations-limit-is-found-by-halving-the-budget-not-the-chunk)
+- [A sink's constructor keeps the vendor's own spelling, and types what it forwards](#a-sinks-constructor-keeps-the-vendors-own-spelling-and-types-what-it-forwards)
 
 **The sink contract: waiting, concurrency and shutdown**
 
@@ -81,6 +82,7 @@ Rules that keep this file useful:
 - [A public accessor hands out a copy; the library reads the live object](#a-public-accessor-hands-out-a-copy-the-library-reads-the-live-object)
 - [A result that can grow a reason must stop being a `bool` before 1.0, not after](#a-result-that-can-grow-a-reason-must-stop-being-a-bool-before-10-not-after)
 - [A protocol that is exported is a protocol that will be inherited](#a-protocol-that-is-exported-is-a-protocol-that-will-be-inherited)
+- [A frozen surface is keyword-first, and says what it will not grow](#a-frozen-surface-is-keyword-first-and-says-what-it-will-not-grow)
 
 **Release, supply chain and naming**
 
@@ -234,6 +236,11 @@ Rules that keep this file useful:
 **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests (11,954 measured for one exit backlog), because each accepted size is rediscovered in every branch; halving the budget re-chunks the remainder once per reduction and converges in `log2(ratio)` (8 for a 5 MB default against a 20 kB endpoint). Capping the recursion *depth* instead is the trap: a 250× ratio needs ~8 halvings, so a cap of 4 delivered 2 events of 2,000. Each reduction halves **what was refused**, not the nominal budget. A `413` is never retried — it is a verdict on the bytes — and a size already refused is not asked about again, **except under `gzip`**, where the refusal is uncompressed and the destination judges the wire. (SPEC-038 FR-001)
 
 
+### A sink's constructor keeps the vendor's own spelling, and types what it forwards
+
+**A sink's constructor keeps the vendor's own spelling, and types what it forwards** — the family's parameter names are **frozen as they are** (2026-09-02). Most of the apparent drift is not the library's: a connection parameter carries the vendor's own vocabulary, literally where the client takes that keyword — `servers` is what `nats.connect` takes, `dsn` what `clickhouse_connect.get_client` takes — and as the Python spelling of it where the wire or config key cannot be one: `queue_url` for boto3's `QueueUrl=`, `bootstrap_servers` for confluent-kafka's `bootstrap.servers`. A house vocabulary would put those at odds with the vendor doc the user has open beside them, which is worse than the inconsistency, and renaming across the family is breaking for every consumer. **Checked rather than assumed, because the first draft of this entry claimed more than was true:** `connection_str` and `uri` are *ours*, not Azure's and pymongo's — both are passed positionally to clients whose own parameters are `conn_str` and `host` — and `dsn` for Postgres is the domain's word, since psycopg's is `conninfo`. Those join the residues recorded rather than fixed: the injected pre-built client is `client`/`producer`/`connection`/`opener`, and the destination is keyword-only in a few sinks and positional in most. All of them are addressable additively by an alias if they ever cost anything. `create_table` is **not** in that set: `True` for SQLite and `False` for Postgres and ClickHouse is principled, an embedded file you own against a shared server where DDL needs privileges. What did change is the **types**: the seven platform sinks forward `Unpack[TypedDict]` rather than `**kwargs: object`, so `timeout="not-a-float"` is refused instead of failing at the first request, and each shape excludes exactly what its sink sets or shadows. (SPEC-051 FR-005)
+
+
 ## The sink contract: waiting, concurrency and shutdown
 
 
@@ -316,6 +323,11 @@ Dependabot's first `pip` PR raised `boto3`/`sentry-sdk`/`pika` past floors that 
 ### A protocol that is exported is a protocol that will be inherited
 
 **A protocol that is exported is a protocol that will be inherited** — `Sink`'s members were empty-bodied and not `@abstractmethod`, so a subclass with one typo instantiated happily and its inherited `emit` returned `None`: three events gone, `flush()` truthy, every counter zero. `mypy` refused it and only the runtime did not. Structural satisfaction is untouched, which matters because no shipped sink inherits it. (SPEC-034 FR-005)
+
+
+### A frozen surface is keyword-first, and says what it will not grow
+
+**A frozen surface is keyword-first, and says what it will not grow** — every public dataclass is `kw_only=True`, so field **order** is not part of the frozen contract: `Health` reached twelve fields by appending nine, each append safe only because nothing outside the library had bound to a position, and after the tag that stops being true on its own. **Two consequences reach outside the library and are the price, not an oversight:** `SinkLosses` is the one public type a third-party sink must construct, so a `0.x` sink building it positionally now raises inside `losses()` — and since `read_losses` swallows a raising accessor by design, that sink's loss reporting degrades to `None`, which the composites read as "reports nothing" rather than "no loss". And `kw_only` empties `__match_args__`, so a positional `case Health(a, b):` stops matching while a keyword pattern still does. Both are asserted in the suite rather than only documented. `configure(defaults=)` and `trace(defaults=)` take `Mapping[str, object]`, since `dict` is invariant and a caller's `dict[str, str]` was refused — the SPEC-034 FR-004 fix applied to the two parameters it missed; `trace` copies at **decoration**, because it used to bind the caller's object to every span and read it live, and an arbitrary `Mapping`'s `keys()` is user code on the per-event path. `context.__all__` names only the six the package re-exports: `current_span` hands back a mutable `Span` and could not have been withdrawn after `1.0`. A name a public signature uses is exported — `GroupIdSource`, `DedupIdSource`, `Backend`, and `flush_sink`/`DEFAULT_SWAP_TIMEOUT` beside the siblings they belong with. **Do NOT build** `configure(batch_size=…, flush_interval=…, max_queue=…, max_retries=…)`: the worker's tunables stay unreachable, deferred deliberately on 2026-09-02 because keyword-only parameters are fully additive after `1.0` and the semantics are unsettled — the worker is built lazily at the first span, so a call before that would apply and a call after would silently not, contradicting `configure()`'s own "repeated calls compose rather than reset". None of it is checkable from inside `src`, where `mypy`'s `files` stops, which is why a consumer probe runs under `mypy --strict` in the suite. (SPEC-051)
 
 
 ## Release, supply chain and naming

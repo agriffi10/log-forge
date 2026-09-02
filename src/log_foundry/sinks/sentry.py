@@ -12,10 +12,14 @@ from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import HTTPSink
 
-__all__ = ["SentrySink"]
+__all__ = ["Backend", "SentrySink"]
 
 Backend = Literal["auto", "sdk", "http"]
-"""Which transport a :class:`SentrySink` uses. Not exported: callers pass the literals."""
+"""Which transport a :class:`SentrySink` uses.
+
+Exported (SPEC-051 FR-004) because it is in a public signature: passing the literal is still
+the ordinary way to call, but a caller annotating a variable that holds one needs the name.
+"""
 
 _BACKENDS: Final = get_args(Backend)
 

@@ -15,8 +15,14 @@ from log_foundry.context import (
 )
 from log_foundry.decorator import continue_trace, trace
 from log_foundry.results import ContinueResult, FlushResult
-from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
-from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, Health
+from log_foundry.sinks.base import (
+    Sink,
+    SinkDeliveryError,
+    SinkLosses,
+    flush_sink,
+    read_losses,
+)
+from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health
 
 try:
     __version__ = _dist_version("log-foundry")
@@ -95,7 +101,9 @@ def health() -> Health:
 
     Returns:
       The snapshot: ``queued``, ``dropped``, ``failed_batches``, ``stopped_reason``, ``sink``,
-      ``retired``, ``submitted_after_shutdown`` and ``incomplete_swaps``. ``retired`` says
+      ``retired``, ``submitted_after_shutdown``, ``incomplete_swaps``, ``closing_sinks``,
+      ``inherited_sink``, ``orphan_lost`` and ``in_span_lost`` — every field, since a counter
+      documented nowhere is a loss nobody looks for. ``retired`` says
       :func:`shutdown` was called, and ``submitted_after_shutdown`` counts events accepted
       afterwards, which are queued where nothing will drain them — non-zero together, that is
       the ``shutdown()``-per-invocation mistake, and the remedy is :func:`flush`.
@@ -112,7 +120,11 @@ def health() -> Health:
       Its ``dropped`` is not the worker's: the worker's is backpressure at the queue, the
       sink's is an event that never reached the wire, and the stderr line names which. Its
       ``failed`` is an upper bound on loss rather than a count of it, since a sink that raises
-      on total failure counts the attempt and hands the batch back for the worker to retry. A
+      on total failure counts the attempt and hands the batch back for the worker to retry.
+      ``inherited_sink`` is a state and not a fault: it says **whether** the sink this process
+      last installed for delivery is one it inherited across a ``fork`` and may not release,
+      which is what explains a handle still open after :func:`shutdown` (SPEC-042). ``orphan_lost`` and ``in_span_lost``
+      are the two terms above that describe no worker at all, and the alert idiom ends on them. A
       process that has never logged has no worker, and asking does not create one — the
       snapshot is simply zeroed, except for ``retired``, which stays truthful even for a
       process that only ever logged outside a span and so built no worker at all (SPEC-031
@@ -176,6 +188,7 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
 
 __all__ = [
     "DEFAULT_SHUTDOWN_TIMEOUT",
+    "DEFAULT_SWAP_TIMEOUT",
     "Config",
     "ContinueResult",
     "FlushResult",
@@ -193,6 +206,7 @@ __all__ = [
     "debug",
     "error",
     "flush",
+    "flush_sink",
     "get_baggage",
     "get_config",
     "health",

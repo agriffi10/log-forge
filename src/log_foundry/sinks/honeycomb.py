@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import Unpack
 
-from log_foundry.sinks.http import HTTPSink, merge_headers
+from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, merge_headers
 
 __all__ = ["HoneycombSink"]
 
@@ -39,7 +40,7 @@ class HoneycombSink(HTTPSink):
         dataset: str,
         *,
         url: str = "https://api.honeycomb.io",
-        **http_kwargs: object,
+        **http_kwargs: Unpack[HTTPPlatformKwargs],
     ) -> None:
         """Points the sink at a dataset's batch endpoint.
 
@@ -47,7 +48,9 @@ class HoneycombSink(HTTPSink):
           api_key: The key sent as ``X-Honeycomb-Team``.
           dataset: The target dataset, which forms part of the path.
           url: The API base URL.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
+            ``HTTPPlatformKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+            ``body_format``, which this sink pins to Honeycomb's JSON array.
 
         Returns:
           None.
@@ -58,7 +61,9 @@ class HoneycombSink(HTTPSink):
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",
-            headers=headers, body_format="json_array", **http_kwargs,  # type: ignore[arg-type]
+            headers=headers,
+            body_format="json_array",
+            **http_kwargs,  # type: ignore[misc]
         )
 
     def _render(self, event: dict[str, object]) -> str:

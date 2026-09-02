@@ -186,9 +186,9 @@ class FilteringSink:
 
         Returns:
           The inner sink's losses. ``None`` passes through unchanged rather than becoming
-          ``SinkLosses(0, 0)``: FR-003 distinguishes "the sink reports nothing" from "the sink
-          reports no loss", and flattening the two would claim a clean bill of health on a sink
-          that never gave one.
+          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports
+          nothing" from "the sink reports no loss", and flattening the two would claim a
+          clean bill of health on a sink that never gave one.
 
         Raises:
           None.

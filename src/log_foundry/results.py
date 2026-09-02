@@ -7,7 +7,7 @@ from dataclasses import dataclass
 __all__ = ["ContinueResult", "FlushResult"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class _Result:
     """A verdict that reads as a boolean and can say why (SPEC-034 FR-007).
 

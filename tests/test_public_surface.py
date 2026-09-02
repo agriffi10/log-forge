@@ -8,6 +8,7 @@ SPEC-032 and SPEC-035 both paid for.
 """
 
 import ast
+import collections.abc
 import dataclasses
 import inspect
 import io
@@ -16,6 +17,7 @@ import pkgutil
 import re
 import threading
 import time
+import types
 
 import pytest
 
@@ -23,6 +25,7 @@ log_foundry = pytest.importorskip("log_foundry")
 api = pytest.importorskip("log_foundry.api")
 config = pytest.importorskip("log_foundry.config")
 model = pytest.importorskip("log_foundry.model")
+context = pytest.importorskip("log_foundry.context")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
@@ -1240,3 +1243,385 @@ def test_a_new_reason_is_additive() -> None:
     assert not invented
     assert invented.reason == "a-reason-invented-later"
     assert bool(log_foundry.FlushResult(ok=True)) is True
+
+
+# ── SPEC-051 FR-001: the public dataclasses are constructed by keyword ──────────────────
+#
+# Field order stopped being part of the frozen contract at SPEC-051. `Health` reached twelve
+# fields by appending nine of them, each append safe only because nothing outside the library
+# had bound to the order; `kw_only=True` is what makes that true after 1.0 as well.
+
+_PUBLIC_DATACLASSES = (
+    ("Health", log_foundry.Health, (0, 0, 0)),
+    ("SinkLosses", log_foundry.SinkLosses, (0, 0)),
+    ("FlushResult", log_foundry.FlushResult, (True,)),
+    ("ContinueResult", log_foundry.ContinueResult, (True,)),
+    ("Config", log_foundry.Config, ("svc",)),
+)
+
+
+@pytest.mark.parametrize(("name", "cls", "args"), _PUBLIC_DATACLASSES, ids=[
+    row[0] for row in _PUBLIC_DATACLASSES
+])
+def test_a_public_dataclass_refuses_positional_construction(name, cls, args) -> None:
+    """FR-001 AC-1. Asserted on the message, not on `TypeError` alone.
+
+    A misspelled keyword raises `TypeError` from the same constructor, so `pytest.raises(
+    TypeError)` on its own is green against a class that never became keyword-only -- the
+    test that discriminates is the one below.
+    """
+    with pytest.raises(TypeError, match="positional argument"):
+        cls(*args)
+
+
+def test_a_keyword_typo_raises_a_different_typeerror() -> None:
+    """FR-001 AC-1, the discriminator. Both are `TypeError` and only one says "positional"."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        log_foundry.Health(quued=0, dropped=0, failed_batches=0)
+
+
+def test_every_keyword_construction_the_library_performs_still_works(lf, fake_sink) -> None:
+    """FR-001 AC-2. Both `health()` paths, and `replace`, which `_lifecycle` uses on a Health."""
+    no_worker = log_foundry.health()
+    assert no_worker.queued == 0
+
+    @lf.trace
+    def work():
+        pass
+
+    work()
+    with_worker = log_foundry.health()
+    assert dataclasses.replace(with_worker, retired=True).retired is True
+    assert dataclasses.replace(no_worker, orphan_lost=3).orphan_lost == 3
+
+
+def test_no_source_file_constructs_a_public_dataclass_positionally() -> None:
+    """FR-001 AC-4. The sweep, over `src/` -- code by AST and prose by pattern.
+
+    Both halves are needed and neither sees the other's population: a docstring showing
+    `SinkLosses(0, 0)` is not a `Call` node, and a real positional call is not matched by a
+    text pattern that would also hit every keyword call.
+    """
+    names = {row[0] for row in _PUBLIC_DATACLASSES}
+    # Prose is matched only inside a double-backtick span, which is how this repo writes inline
+    # code in a docstring. A looser pattern over the raw line matched `class FlushResult(_Result):`
+    # -- it reported two offenders on its first run and would have reported them forever.
+    spans = re.compile(rf"``({'|'.join(sorted(names))})\(([^`)]*)\)``")
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted((_ROOT / "src").rglob("*.py")):
+        scanned += 1
+        text = path.read_text(encoding="utf-8")
+        offenders.extend(
+            f"{path.relative_to(_ROOT)}:{node.lineno}: positional call {node.func.id}(...)"
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in names
+            and node.args
+        )
+        offenders.extend(
+            f"{path.relative_to(_ROOT)}: docstring shows ``{m.group(1)}({m.group(2)})``"
+            for m in spans.finditer(text)
+            if m.group(2).strip() and "=" not in m.group(2)
+        )
+    assert scanned > 30, f"the sweep collapsed to {scanned} files -- it cannot see an absence"
+    assert not offenders, "positional construction survives:\n" + "\n".join(offenders)
+
+
+# ── SPEC-051 FR-002: `defaults=` accepts any mapping ────────────────────────────────────
+
+
+class _CountingMapping(collections.abc.Mapping):
+    """A `Mapping` that records how often it is read, to tell one copy from one per call.
+
+    `keys` is the counter and `__iter__` deliberately is not: `dict(m)` on a `Mapping` calls
+    `keys()` and then `__getitem__`, and never `__iter__` at all, so an `__iter__` counter
+    reads zero both before and after the change and passes against the defect.
+    """
+
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+        self.key_reads = 0
+
+    def keys(self):
+        self.key_reads += 1
+        return self._data.keys()
+
+    def __getitem__(self, key: str) -> object:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+def test_configure_defaults_copies_the_callers_mapping() -> None:
+    """FR-002 AC-2. `configure` already did this; the widened annotation must not lose it."""
+    labels = {"tenant": "acme"}
+    log_foundry.configure(service="svc", defaults=labels)
+    labels["tenant"] = "other"
+    assert log_foundry.get_config().defaults == {"tenant": "acme"}
+
+
+def test_trace_defaults_copies_at_decoration(lf, fake_sink) -> None:
+    """FR-002 AC-3, the one behavioural change SPEC-051 makes.
+
+    Before it, `_open_span` bound the caller's own object to every span and `build_event` read
+    it live, so a mutation after decoration reached later spans.
+    """
+    labels = {"tenant": "acme"}
+
+    @lf.trace(defaults=labels)
+    def work():
+        pass
+
+    labels["region"] = "eu"
+    work()
+
+    assert fake_sink.events[0]["fields"] == {"tenant": "acme"}
+
+
+def test_trace_reads_the_defaults_mapping_once_at_decoration(lf, fake_sink) -> None:
+    """FR-002 AC-4. Three calls, one read -- what separates "copied" from "copied per call"."""
+    labels = _CountingMapping({"tenant": "acme"})
+
+    @lf.trace(defaults=labels)
+    def work():
+        pass
+
+    for _ in range(3):
+        work()
+
+    assert labels.key_reads == 1, f"read {labels.key_reads} times -- not copied at decoration"
+    assert fake_sink.events[0]["fields"] == {"tenant": "acme"}
+
+
+def test_a_non_dict_mapping_produces_the_same_fields(lf, fake_sink) -> None:
+    """FR-002 AC-5. Both parameters, and `Span.defaults` is a plain `dict` afterwards."""
+    log_foundry.configure(defaults=types.MappingProxyType({"env_tag": "x"}))
+    assert log_foundry.get_config().defaults == {"env_tag": "x"}
+    assert isinstance(log_foundry.get_config().defaults, dict)
+
+    seen: list[object] = []
+
+    @lf.trace(defaults=types.MappingProxyType({"tenant": "acme"}))
+    def work():
+        seen.append(type(context.current_span().defaults))
+
+    work()
+
+    assert seen == [dict]
+    assert fake_sink.events[0]["fields"] == {"env_tag": "x", "tenant": "acme"}
+
+
+# ── SPEC-051 FR-003: `context.__all__` names only what the package re-exports ────────────
+
+_WITHDRAWN_CONTEXT_NAMES = (
+    "current_span",
+    "pop_baggage_scope",
+    "pop_span",
+    "push_baggage_scope",
+    "push_span",
+)
+
+
+def test_context_exports_exactly_what_the_package_re_exports() -> None:
+    """FR-003 AC-1 and AC-2, derived from the package rather than from a written list.
+
+    The set is not spelled out here: it is whatever `log_foundry` re-exports, so neither side
+    can move without the other. Object identity rather than `hasattr`, because a same-named
+    attribute arriving from somewhere else would satisfy a presence check.
+    """
+    for name in context.__all__:
+        assert getattr(log_foundry, name, None) is getattr(context, name), name
+    assert len(context.__all__) == 6, context.__all__
+
+
+def test_the_withdrawn_context_names_are_not_public_anywhere() -> None:
+    """FR-003 AC-1, the other direction: `__all__` shrank because these are not re-exported."""
+    still_public = [n for n in _WITHDRAWN_CONTEXT_NAMES if n in context.__all__]
+    assert not still_public, f"still exported: {still_public}"
+    leaked = [n for n in _WITHDRAWN_CONTEXT_NAMES if hasattr(log_foundry, n)]
+    assert not leaked, f"reachable from the package root: {leaked}"
+
+
+def test_withdrawing_the_claim_did_not_withdraw_the_symbol(lf, fake_sink) -> None:
+    """FR-003 AC-3. `__all__` governs `import *`; the decorator still uses all five."""
+    from log_foundry.context import (
+        current_span,
+        pop_baggage_scope,
+        pop_span,
+        push_baggage_scope,
+        push_span,
+    )
+
+    assert all(callable(fn) for fn in
+               (current_span, push_span, pop_span, push_baggage_scope, pop_baggage_scope))
+
+    @lf.trace
+    def work():
+        assert current_span() is not None
+
+    work()
+    assert current_span() is None
+    assert [e["message"] for e in fake_sink.events] == ["span.start", "span.end"]
+
+
+# ── SPEC-051 FR-004: a name a public signature uses is a name a module exports ───────────
+
+
+def test_the_aliases_a_public_signature_names_are_exported() -> None:
+    """FR-004 AC-1, derived: the export is checked against the signature that needs it.
+
+    Keying on the annotation text rather than on a written list means renaming the alias
+    without moving the export fails here, which is the drift this criterion exists for.
+    """
+    sqs = pytest.importorskip("log_foundry.sinks.sqs")
+    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    for module, sink, aliases in (
+        (sqs, sqs.SQSSink, ("GroupIdSource", "DedupIdSource")),
+        (sentry, sentry.SentrySink, ("Backend",)),
+    ):
+        annotations = " ".join(
+            str(p.annotation) for p in inspect.signature(sink.__init__).parameters.values()
+        )
+        for alias in aliases:
+            assert alias in annotations, f"{alias} is no longer in {sink.__name__}'s signature"
+            assert alias in module.__all__, f"{alias} is used in a public signature, not exported"
+
+
+def test_the_sentry_backend_docstring_no_longer_denies_its_own_export() -> None:
+    """FR-004 AC-1. A docstring that contradicts `__all__` is the SPEC-042 failure again.
+
+    Read from the source, not from `__doc__`: a string literal after a module-level assignment
+    is a docstring only to a documentation tool, and is unreachable at runtime -- so a runtime
+    assertion here would pass against the contradiction it claims to catch.
+    """
+    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    assert "Backend" in sentry.__all__
+    source = (_SINK_PKG / "sentry.py").read_text(encoding="utf-8")
+    assert "Not exported" not in source
+
+
+def test_the_two_new_top_level_names_are_exports_not_copies() -> None:
+    """FR-004 AC-2 and AC-3. Identity, so a same-valued rebinding does not satisfy it."""
+    worker = pytest.importorskip("log_foundry.worker")
+    base = pytest.importorskip("log_foundry.sinks.base")
+    assert "DEFAULT_SWAP_TIMEOUT" in log_foundry.__all__
+    assert "flush_sink" in log_foundry.__all__
+    assert log_foundry.DEFAULT_SWAP_TIMEOUT is worker.DEFAULT_SWAP_TIMEOUT
+    assert log_foundry.flush_sink is base.flush_sink
+
+
+# ── SPEC-051 FR-006: the public record states what the code does ─────────────────────────
+
+
+def test_health_returns_block_documents_every_field() -> None:
+    """FR-006 AC-2, derived from `dataclasses.fields` so the next appended field fails it.
+
+    Sliced between `Returns:` and `Raises:`: `orphan_lost` and `in_span_lost` were described in
+    the prose above `Args:` while absent from `Returns:`, so a whole-docstring search was
+    already green over the defect this catches.
+    """
+    doc = log_foundry.health.__doc__ or ""
+    block = doc.split("Returns:", 1)[1].split("Raises:", 1)[0]
+    missing = [
+        f.name for f in dataclasses.fields(log_foundry.Health)
+        if not re.search(rf"``{re.escape(f.name)}``", block)
+    ]
+    assert not missing, f"health() documents 12 fields minus {missing}"
+
+
+def test_the_health_docstring_makes_no_index_claim() -> None:
+    """FR-006 AC-1, with the fact that made the claim false asserted beside it.
+
+    The claim was inherited from the `NamedTuple` SPEC-034 replaced. Asserting only its absence
+    would pass against a docstring that had never made it; asserting `len()` too says why it
+    had to go.
+    """
+    assert "index access" not in (log_foundry.Health.__doc__ or "")
+    with pytest.raises(TypeError):
+        len(log_foundry.health())
+
+
+def test_the_typed_consumer_probe_covers_every_exported_name() -> None:
+    """SPEC-051 FR-004 AC-4, derived, because the probe's import list is hand-written.
+
+    `tests/typed_consumer/accepts.py` is only ever read by `mypy`, so a name added to an `__all__`
+    and not to it leaves the probe silently incomplete with every gate green. Reading the probe's
+    own `from ... import` statements against the live `__all__` is what stops that -- the same
+    rot the context and HTTP rosters are written against, one layer out.
+    """
+    probe = _ROOT / "tests" / "typed_consumer" / "accepts.py"
+    tree = ast.parse(probe.read_text(encoding="utf-8"))
+    imported: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    assert imported, "the probe's import scan collapsed -- it cannot see an absence"
+
+    for module_name, exported in (
+        ("log_foundry", log_foundry.__all__),
+        ("log_foundry.sinks.sqs", pytest.importorskip("log_foundry.sinks.sqs").__all__),
+        ("log_foundry.sinks.sentry", pytest.importorskip("log_foundry.sinks.sentry").__all__),
+        ("log_foundry.sinks.http", pytest.importorskip("log_foundry.sinks.http").__all__),
+    ):
+        missing = sorted(set(exported) - imported.get(module_name, set()))
+        assert not missing, f"{module_name} exports these and the probe never imports them: {missing}"
+
+    # Importing is not exercising, and `mypy` does not flag an unused import: reduced to its
+    # import statements alone the probe still satisfies every check above, while five of the
+    # source mutations it is the only killer of would survive. So each imported name must also
+    # appear somewhere that is not an import.
+    used = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+    } | {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+    }
+    unexercised = sorted(
+        name for names in imported.values() for name in names if name not in used
+    )
+    assert not unexercised, f"imported by the probe and never used in it: {unexercised}"
+
+
+def test_a_zero_x_sink_building_sinklosses_positionally_degrades_to_none() -> None:
+    """SPEC-051 FR-001, the consequence that reaches OUTSIDE the library, asserted not asserted-of.
+
+    `SinkLosses` is the one public type a third-party sink is required to construct, and
+    `read_losses` swallows a raising accessor by design (SPEC-026) -- so a sink written against
+    `0.x` does not get a loud `TypeError`, it gets `None`, which the composites read as "reports
+    nothing" rather than "no loss". `sinks/base.py` documents that; this is what makes the
+    documentation a claim rather than a hope.
+    """
+    base = pytest.importorskip("log_foundry.sinks.base")
+
+    class _ZeroXSink:
+        def emit(self, batch: list[dict[str, object]]) -> None: ...
+        def close(self) -> None: ...
+        def losses(self) -> object:
+            return log_foundry.SinkLosses(3, 7)  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError, match="positional argument"):
+        _ZeroXSink().losses()
+    assert base.read_losses(_ZeroXSink()) is None
+
+
+@pytest.mark.parametrize(("name", "cls", "args"), _PUBLIC_DATACLASSES, ids=[
+    row[0] for row in _PUBLIC_DATACLASSES
+])
+def test_keyword_only_construction_empties_match_args(name, cls, args) -> None:
+    """SPEC-051 FR-001, the second outward consequence: positional pattern matching stops.
+
+    `kw_only=True` sets `__match_args__` to `()`, so `case Health(a, b):` no longer matches
+    while `case Health(queued=q):` still does. Recorded here because field order not being a
+    contract is exactly what that means, and a consumer would otherwise meet it after the tag.
+    """
+    assert cls.__match_args__ == ()
+    assert dataclasses.fields(cls), name

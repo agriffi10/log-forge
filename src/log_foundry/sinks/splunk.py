@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from typing import Unpack
 
 from log_foundry.sinks._time import epoch_seconds
-from log_foundry.sinks.http import HTTPSink, _Item, merge_headers
+from log_foundry.sinks.http import HTTPKwargs, HTTPSink, _Item, merge_headers
 
 __all__ = ["SplunkHECSink"]
 
@@ -44,7 +45,7 @@ class SplunkHECSink(HTTPSink):
         *,
         host: str | None = None,
         source: str = "log-foundry",
-        **http_kwargs: object,
+        **http_kwargs: Unpack[HTTPKwargs],
     ) -> None:
         """Points the sink at a collector endpoint.
 
@@ -53,7 +54,9 @@ class SplunkHECSink(HTTPSink):
           token: The HEC token sent in the ``Authorization`` header.
           host: The ``host`` stamped on each envelope, or ``None`` to omit it.
           source: The ``source`` stamped on each envelope.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
+            ``HTTPKwargs`` (SPEC-051 FR-005) — every keyword it takes, since this sink pins
+            none of them.
 
         Returns:
           None.
@@ -64,7 +67,7 @@ class SplunkHECSink(HTTPSink):
         self._host = host
         self._source = source
         headers = merge_headers({"Authorization": f"Splunk {token}"}, http_kwargs)
-        super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[arg-type]
+        super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[misc]
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event's HEC envelope (FR-008).

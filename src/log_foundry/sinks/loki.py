@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from typing import Unpack
 
 from log_foundry.sinks._time import epoch_nanos
-from log_foundry.sinks.http import HTTPSink, _Item
+from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _Item
 
 __all__ = ["LokiSink"]
 
@@ -48,13 +49,15 @@ class LokiSink(HTTPSink):
     MAX_BATCH_BYTES = 4_000_000
 
     def __init__(self, url: str, *, labels: tuple[str, ...] = ("service", "env", "level"),
-                 **http_kwargs: object) -> None:
+                 **http_kwargs: Unpack[HTTPPlatformKwargs]) -> None:
         """Points the sink at a Loki push endpoint.
 
         Args:
           url: The Loki base URL, to which the push path is appended.
           labels: The event keys promoted to stream labels.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
+            ``HTTPPlatformKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+            ``body_format``, which this sink pins to Loki's JSON array.
 
         Returns:
           None.
@@ -64,7 +67,7 @@ class LokiSink(HTTPSink):
         """
         self._labels = labels
         super().__init__(
-            url.rstrip("/") + _PUSH_PATH, body_format="json_array", **http_kwargs  # type: ignore[arg-type]
+            url.rstrip("/") + _PUSH_PATH, body_format="json_array", **http_kwargs
         )
 
     def _render(self, event: dict[str, object]) -> str:
