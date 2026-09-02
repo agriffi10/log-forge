@@ -1,0 +1,19 @@
+@@@ expect exit=1
+@@@ match over 100
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Does the thing and again and again and again and again and again and again and again and again and again and again finally.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

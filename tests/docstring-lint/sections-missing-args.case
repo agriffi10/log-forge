@@ -1,0 +1,16 @@
+@@@ expect exit=1
+@@@ match missing 'Args:' section
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Does the thing.
+
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

@@ -1,0 +1,20 @@
+@@@ expect exit=1
+@@@ match comment in src/ that is not a directive
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+# this explains the next line
+def f() -> None:
+    """Does the thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

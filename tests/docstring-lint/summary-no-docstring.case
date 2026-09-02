@@ -1,0 +1,8 @@
+@@@ expect exit=1
+@@@ match def has no docstring
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    return None

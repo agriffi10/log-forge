@@ -1,0 +1,13 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+class C:
+    """Represents the thing.
+
+    Attributes:
+      a: The thing.
+    """
+
+    a: int = 1

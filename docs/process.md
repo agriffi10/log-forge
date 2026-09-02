@@ -110,10 +110,10 @@ gate has run (*A replaced artifact restarts its gate*, below).
   passes against the bug it claims to catch, a lock taken in the wrong order, or an acceptance
   criterion ticked with no evidence. SPEC-028 merged green and a review then found a sink that could
   hang an application thread forever; that review is the one that now happens before the push.
-- Before pushing, run **this repo's five gates** locally and get them green: `poetry run ruff check .`,
-  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`, and
-  `sh scripts/docs-lint-test.sh` if you touched the linter.
-  **`docs-lint.sh` is in that set and nothing in CI runs it.** They are a pre-push step — don't
+- Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
+  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
+  `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that linter.
+  **The last two are in that set and nothing in CI runs either.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (§6). Format only the files you edited.
@@ -325,10 +325,10 @@ So the loop rotates the frame instead of adding rounds:
   check that fails for the wrong reason gets "fixed" by changing the wrong thing. Include cases that
   assert **silence** — a corpus of only-failures cannot see a false positive, and false positives are
   a large share of what a gate gets wrong. Prove the corpus bites by defeating each check in turn and watching it redden.
-  Measured here, not carried: `scripts/docs-lint.sh` has a 44-case corpus and `scripts/spec-lint.sh`
-  has none. Two of its five branches can fail a build and three only warn, and nothing proves any of
+  Measured here, not carried: `scripts/docs-lint.sh` and `scripts/docstring-lint.py` each have a
+  corpus of their own, and `scripts/spec-lint.sh` has none. Two of its five branches can fail a build and three only warn, and nothing proves any of
   the five still fires. It is paths-filtered in CI (`docs/specs/**` and its own script), so it did not
-  even run on the pull request that added this rule. One gate here is proved and its sibling is not.
+  even run on the pull request that added this rule. Two gates here are proved and the third is not.
 - **One fixture per guard is not enough when the guard has more than one exit.** A check with two
   terminating conditions is satisfied by a fixture exercising either, so the mutant that breaks the
   other survives with the suite green. Count the ways a check can stop, and write that many cases.
@@ -400,8 +400,10 @@ yields a different class of finding than any reading-based frame.*
   cannot both hold; a return type nobody named; a phase boundary that leaves `main` exposed. An
   adversarial reader finds defects and does not find these; the implementer finds these and is worse
   at defects. Run both, not one twice.
-- **Every reviewer runs the repo's gates against the branch** — `ruff check`, `mypy`, `pytest`, and
-  `scripts/spec-lint.sh` on any spec it touched. Four rounds reviewed SPEC-205 and none ran the
+- **Every reviewer runs the repo's gates against the branch** — `ruff check`, `mypy`, `pytest`,
+  `docs-lint.sh`, `docstring-lint.py`, and `spec-lint.sh` on any spec it touched. The two local-only
+  gates are the ones a reviewer is likeliest to skip, and skipping one is how a branch stays red on
+  a gate nobody in CI will ever run. Four rounds reviewed SPEC-205 and none ran the
   sibling repo's doc-layout gate; the branch was red on it throughout, for a reason unrelated to the
   spec, and it took an agent that *built* the change to notice. A review of a change touching gated
   files runs the gates.

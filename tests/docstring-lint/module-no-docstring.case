@@ -1,0 +1,16 @@
+@@@ expect exit=1
+@@@ match module has no docstring
+@@@ file src/log_foundry/example.py
+def f() -> None:
+    """Does the thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

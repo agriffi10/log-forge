@@ -1,0 +1,22 @@
+@@@ expect exit=1
+@@@ match module docstring is more than one line
+@@@ file src/log_foundry/example.py
+"""A fixture module.
+
+With a second line, at a path that is not exempt.
+"""
+
+
+def f() -> None:
+    """Does the thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

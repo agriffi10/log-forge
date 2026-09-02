@@ -1,0 +1,18 @@
+@@@ expect exit=1
+@@@ match summary line is more than one sentence
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Chunks the batch. 500 events per request.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

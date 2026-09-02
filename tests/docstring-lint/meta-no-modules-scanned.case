@@ -1,0 +1,18 @@
+@@@ expect exit=1
+@@@ match examined no modules
+@@@ file src/other/x.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Does the thing.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

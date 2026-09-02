@@ -1,0 +1,18 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f(a: int) -> int:
+    """Returns the argument unchanged.
+
+    Args:
+      a: The value.
+
+    Returns:
+      The same value.
+
+    Raises:
+      ValueError: Never, but the section is present.
+    """
+    return a

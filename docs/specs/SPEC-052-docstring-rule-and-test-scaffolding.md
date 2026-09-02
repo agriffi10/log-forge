@@ -245,10 +245,11 @@ and dotted-name summary lines from FR-002 must each produce no output.
 
 #### Description:
 
-Every `pytest.importorskip("log_foundry…")` **call** in `tests/` becomes a plain import. At
-`451edf9` there are **147** of them across 26 files, against 22 distinct module paths; all 54
-modules of the package import with zero extras installed, so none can fire for the reason it
-was written. What each can still do is turn a real `ImportError` into a **silently skipped file**, and the
+Every `pytest.importorskip("log_foundry…")` **call** in `tests/` becomes a plain import. The
+population is **derived by the rewriter at build time, never carried**: it was 147 across 26
+files at `451edf9`, and `spec/051-api-freeze-tidy` alone adds 11 more, so a swept count fixed
+in advance would leave guards standing with the gate green. All 54 modules of the package
+import with zero extras installed, so none can fire for the reason it was written. What each can still do is turn a real `ImportError` into a **silently skipped file**, and the
 population that matters is narrower than it looks: `src/log_foundry/__init__.py:19` imports
 `worker`, so 16 of the 54 modules — `worker`, `_lifecycle` and `config` among them — are
 already loaded by a bare `import log_foundry` and a break in one is a collection error today.
@@ -311,6 +312,11 @@ AST-driven, not a regex over source.
 - [ ] Every site where `ruff` reports the **substituted** import as unused is listed and
       decided explicitly, not auto-fixed. Expected: exactly two.
 - [ ] Every file under `tests/` parses: `python3 -m compileall -q tests/` exits 0.
+- [ ] `tests/typed_consumer/accepts.py` and `tests/typed_consumer/rejects.py` are **byte-identical**
+      before and after. They are never imported or collected — they are inputs to a
+      `mypy --strict` subprocess, and `rejects.py` is deliberately full of type errors, so any
+      tool that "fixes" it destroys the fixture. The rewriter excludes them by path rather than
+      relying on them happening to contain no guard.
 - [ ] The set of collected test **names** — `pytest --collect-only -q`, sorted — is
       byte-identical before and after. The baseline is captured on **this branch's own start
       commit**, not quoted as an absolute: two concurrent sessions are editing files in the

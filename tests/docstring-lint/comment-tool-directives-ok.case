@@ -1,0 +1,22 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+# ruff: noqa: SIM115
+# mypy: disable-error-code="import-not-found"
+# fmt: off
+# coding: utf-8
+# nosec
+def f() -> None:
+    """Does the thing.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
