@@ -596,3 +596,22 @@ def test_the_reordered_flush_preserves_event_order_and_counts_nothing(fake_sink,
     names = [e.get("message") or e.get("event") for e in fake_sink.events]
     assert names == ["span.start", "one", "two", "span.end"], f"order changed: {names}"
     assert log_foundry.health().in_span_lost == 0, "the ordinary path loses nothing"
+
+
+def test_a_swept_span_cannot_be_double_counted_by_the_reordered_flush() -> None:
+    """FR-003 AC-5, which the reorder makes reachable and the code answers by construction.
+
+    `_sweep_open_spans` performs the same detach on the same attribute, so a span swept while
+    `_get_worker()` is blocked hands its buffer over once and `_flush`'s later detach finds an
+    empty list. The double-count half is structural rather than timed: `_sweep_open_spans` never
+    calls `_note_in_span_loss`, so there is no second site to count from — asserted here as a
+    property of the module rather than raced for, because a race test for an invariant that holds
+    by construction can only ever pass.
+    """
+    decorator = pytest.importorskip("log_foundry.decorator")
+    import inspect
+
+    source = inspect.getsource(decorator._sweep_open_spans)
+    assert "_note_in_span_loss" not in source, (
+        "the sweep gained a loss count, so a span it and _flush both touch can now be counted twice"
+    )

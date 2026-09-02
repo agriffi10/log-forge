@@ -53,5 +53,8 @@ requirement). Twenty-six new tests. Every guard whose failure would be silent wa
 one at a time, restored by copying from the scratchpad rather than `git checkout --`, with
 `log_foundry.__file__` confirmed to resolve to this worktree: sixteen mutants planted, fifteen
 killed, one documented as equivalent (reading `_orphan_closing` under the lock versus the value
-captured under the same lock). Three of the fifteen were killed only after the test that named
-them was rewritten to reach the guard.
+captured under the same lock). Five were killed only after the test that named them was rewritten
+to reach the guard — including two the first diff review found by mutating what the author had
+not: the orphan path's arming condition, which only a *third* successive `shutdown()` can see,
+and its wait, which took a flat cap and made the two paths disagree by two seconds on
+`shutdown(timeout=0)`.

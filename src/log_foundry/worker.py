@@ -133,8 +133,12 @@ class Health:
         did not complete (SPEC-030 FR-003). The swap still took effect, so the caller has the
         sink it asked for, but two things could not be guaranteed: events submitted before the
         call may have been carried to the new sink instead of the old one, and the old sink was
-        left **open** rather than closed, because the drain thread may still be inside its
+        left open **for now** rather than closed, because the drain thread may still be inside its
         ``emit`` — the reasoning SPEC-027 FR-004 applies to an expired ``shutdown()``.
+        ~~left **open** rather than closed~~ — struck (SPEC-050 FR-004): that objection is about
+        the *instant* of the swap and expires when the drain thread does, so the sink is recorded
+        and closed by the first ``shutdown()`` that finds the thread ended. A non-zero count here
+        still means events may have been misrouted; it no longer means a sink leaks.
         It describes the **worker's drain** and nothing else. A swap on the orphan path has no
         queue and no drain, so there is nothing to confirm and this stays zero there (SPEC-033
         FR-006); an expired *close* join reports nothing on either path, by the decision that
@@ -786,9 +790,12 @@ class Worker:
 
         On a drain that cannot be confirmed the swap still stands, because the caller asked for
         the new sink and silently keeping the old one is the defect this method exists to fix.
-        What changes is that the old sink is left **open** and ``incomplete_swaps`` records it:
-        the drain thread may still be using it, and SPEC-027 FR-004 already settled that a
-        leaked resource beats a close raced against a write.
+        What changes is that the old sink is left open **for now** and ``incomplete_swaps``
+        records it: the drain thread may still be using it, and SPEC-027 FR-004 already settled
+        that a leaked resource beats a close raced against a write. ~~left **open**~~ — struck
+        (SPEC-050 FR-004): it is recorded in :attr:`_unclosed_swaps` and closed by
+        :meth:`_close_if_owed` once the drain thread has ended, which is when that objection
+        stops applying.
 
         Both guards are re-taken after the first drain, which blocks and therefore cannot be
         trusted to return into the state it left. Retirement is the one that bites: ``shutdown``
@@ -860,8 +867,10 @@ class Worker:
         that cannot be performed now — the drain thread may still be inside its ``emit``, which is
         SPEC-027 FR-004's reasoning — but that objection expires when the thread does, so
         :meth:`_close_if_owed` performs it once ``is_alive()`` reads ``False``. Recorded by
-        identity, at most once: a sink already in the record is not appended again, so a second
-        unconfirmed swap handing over the same object owes one close rather than two.
+        identity, at most once. That dedup is defensive rather than reached: the same object can
+        only be ``old`` twice if it was re-adopted as ``self.sink`` in between, and every
+        re-adoption prunes it — so under the documented single-threaded ``configure()`` contract
+        it owes one close for one other reason as well.
 
         Args:
           timeout: The budget the drain was given, rendered for the line.
@@ -1213,25 +1222,24 @@ class Worker:
                 for stale in owed:
                     _lifecycle.discharge_owed(stale)
             if self._sink_closed or alive:
-                claimed, waiting = False, self._closing
+                claimed, closing = False, self._closing
             else:
                 self._sink_closed = True
                 self._closing = threading.Event()
-                claimed, waiting = True, None
+                claimed, closing = True, self._closing
         for stale in owed:
             _lifecycle.release(stale, detached=True)
         if not claimed:
-            if waiting is not None:
-                waiting.wait(_closer_grace(deadline))
+            if closing is not None:
+                closing.wait(_closer_grace(deadline))
             return
-        finished = self._closing
         try:
             self._close_sink()
         finally:
             with self._lock:
                 self._closing = None
-            if finished is not None:
-                finished.set()
+            if closing is not None:
+                closing.set()
 
     def _close_sink(self) -> None:
         """Closes the sink, absorbing a failure.

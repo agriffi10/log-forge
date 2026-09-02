@@ -360,6 +360,13 @@ child set its own ``_orphan_stop`` that sink was handed the **set** event and ba
 all, permanently.
 """
 _closing_now_lock = threading.Lock()
+"""Guards :data:`_closing_now`, and sits **last** in the lock order.
+
+``_state._lock`` -> ``_config_lock`` -> ``_owned_lock`` is the order :data:`_owned_lock` states;
+this one is taken under ``_state._lock`` (through :func:`_offer_orphan_signal`) and is never
+nested with either of the other two, so there is no cycle. It is held only across a set
+membership test or a single mutation, never across a ``close()``.
+"""
 
 _orphan_closing: threading.Event | None = None
 """The in-flight orphan close's completion event, or ``None`` when none is running (SPEC-050 FR-002).
@@ -378,13 +385,6 @@ unwaitable behind an event still set from the first. A fresh event per close has
 Not in :data:`_FORK_SKIP` — an ``Event`` is exactly what ``_fork``'s repair walk exists to
 replace. What the walk cannot know is that the slot should be *empty* in a child, since the thread
 that would clear it did not survive the fork; :func:`_clear_closing_after_fork` empties it.
-"""
-"""Guards :data:`_closing_now`, and sits **last** in the lock order.
-
-``_state._lock`` -> ``_config_lock`` -> ``_owned_lock`` is the order :data:`_owned_lock` states;
-this one is taken under ``_state._lock`` (through :func:`_offer_orphan_signal`) and is never
-nested with either of the other two, so there is no cycle. It is held only across a set
-membership test or a single mutation, never across a ``close()``.
 """
 
 
@@ -1479,6 +1479,31 @@ def _inline_close_choice(owed: list[Sink]) -> Sink:
     return owed[-1]
 
 
+def _bystander_grace(deadline: float | None) -> float:
+    """Returns how long a caller may wait on a close another caller is performing (SPEC-050 FR-002).
+
+    ``join_closers``'s arithmetic, and :func:`~log_foundry.worker._closer_grace` is its twin on the
+    worker path: capped at :data:`DEFAULT_CLOSER_GRACE` because this is an exit waiting on a close
+    it does not own, and carved from the caller's own budget so a ``shutdown(timeout=0)`` does not
+    inherit somebody else's. The flat cap this replaced made the two paths disagree — the worker
+    half returned in under half a second on a ``timeout=0`` call while this one took the whole two
+    seconds.
+
+    Args:
+      deadline: The calling ``shutdown``'s monotonic deadline, or ``None`` for an unbounded caller,
+        which takes the cap rather than waiting indefinitely.
+
+    Returns:
+      Seconds to wait, never negative and never above the cap.
+
+    Raises:
+      None.
+    """
+    if deadline is None:
+        return DEFAULT_CLOSER_GRACE
+    return max(0.0, min(DEFAULT_CLOSER_GRACE, deadline - monotonic()))
+
+
 def discharge_owed(sink: Sink) -> None:
     """Records that a sink's owed close is being performed elsewhere (SPEC-050 FR-004).
 
@@ -1509,7 +1534,7 @@ def discharge_owed(sink: Sink) -> None:
     _state._orphan_closed_sink = sink
 
 
-def _close_orphan_sink() -> None:
+def _close_orphan_sink(deadline: float | None = None) -> None:
     """Closes a sink only the orphan path ever wrote to, once (SPEC-031 FR-006).
 
     A process that never opens a span builds no worker, so nothing owned the sink's close and
@@ -1524,19 +1549,22 @@ def _close_orphan_sink() -> None:
     through a running close and kills it. For a sink whose ``close()`` *is* the delivery that is
     total loss of its buffer.
 
-    **A caller cannot wait on itself**, and that is a property of *where* the slot is written
-    rather than of the order the two lines happen to sit in. :data:`_orphan_closing` is written
-    only where ``owed`` is non-empty and read only where it is empty, so the closer and the
-    bystander are disjoint by construction; both happen under ``_state._lock``, so reading the
-    global there and reading the captured value are the same read, and mutating one into the other
-    is an equivalent mutant rather than a defect. What would *not* be equivalent is a flag set
-    unconditionally — that caller would see its own write, wait out the grace on an event it is
-    itself responsible for setting, and since :func:`_shutdown_worker` calls this on the *worker*
-    path too, stall every ordinary shutdown. The local exists so a reader can see which of the two
-    a caller is without re-deriving it.
+    **A caller cannot wait on itself, and the guard for that is the `if owed:` on the write.**
+    :data:`_orphan_closing` is installed only where ``owed`` is non-empty, so a caller that takes
+    the work never reaches the read below and a bystander never installs anything. Capturing
+    ``waiting`` before the write is *not* what makes this safe — both happen under
+    ``_state._lock``, so reading the global there and reading the captured value are the same
+    read, and mutating one into the other is an equivalent mutant. The conditional is the live
+    guard: made unconditional, a caller with nothing owed leaves a permanently unset event behind
+    it, and every call after the next one pays the whole grace on an event nothing will set —
+    measured at the *third* successive orphan ``shutdown()``, which is why a test doing two of
+    them cannot see it. The local exists so a reader can tell which of the two a caller is
+    without re-deriving it.
 
-    The wait is :data:`DEFAULT_CLOSER_GRACE` and nothing longer: this function takes no budget
-    from its caller, so there is none to carve.
+    The wait is :func:`_bystander_grace` — capped at :data:`DEFAULT_CLOSER_GRACE` and carved from
+    the caller's own deadline, the same arithmetic the worker path uses, so a
+    ``shutdown(timeout=0)`` does not inherit another caller's budget on one path and not the other.
+    It took a flat cap first, which made the two paths disagree by two seconds on that call.
 
     A worker that owns *this* sink closes it instead, and this returns — that is what makes a
     mixed process exactly one ``close()`` in either order. It also inherits that worker's reasons
@@ -1595,7 +1623,8 @@ def _close_orphan_sink() -> None:
     choice is between closing inline and never closing at all.
 
     Args:
-      None.
+      deadline: The calling ``shutdown``'s monotonic deadline, or ``None``. It bounds only
+        the wait for another caller's close, never a close performed here.
 
     Returns:
       None.
@@ -1619,7 +1648,7 @@ def _close_orphan_sink() -> None:
         finished = _orphan_closing
     if not owed:
         if waiting is not None:
-            waiting.wait(DEFAULT_CLOSER_GRACE)
+            waiting.wait(_bystander_grace(deadline))
         return
     inline = _inline_close_choice(owed)
     started: list[threading.Thread] = []
@@ -1715,10 +1744,10 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             _state._shutdown_running += 1
     if worker is not None:
         worker.shutdown(timeout)
-        _close_orphan_sink()
+        _close_orphan_sink(deadline)
         return
     try:
-        _close_orphan_sink()
+        _close_orphan_sink(deadline)
     finally:
         with _state._lock:
             late_worker = _state._late_worker

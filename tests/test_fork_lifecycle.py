@@ -2932,7 +2932,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         def close(self) -> None:
             """Releases nothing."""
 
-    setattr(_Hooked, _REACQUIRE_HOOK, lambda self: None)
+    setattr(_Hooked, _REACQUIRE_HOOK, lambda self: _lifecycle.reclaim(self))
 
     worker = Worker(_Hooked())
     stranded = _Hooked()
@@ -2951,6 +2951,27 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         assert any(obj is stranded for obj in reached_control), (
             "the control did not reach it either, so the assertion above proves nothing"
         )
+
+        # The consequence the opt-out exists for, asserted rather than left to follow. The
+        # walk only *collects* hooks; `_fork` then calls them, and `_lifecycle.reclaim` is what
+        # a called hook reaches — the one write that overrides an inherited `_FOREIGN` stamp.
+        # So "the hook did not run in the child" is the step between the walk and `releasable`.
+        worker._not_skipped = []  # type: ignore[attr-defined]
+        worker._unclosed_swaps = [stranded]
+        reclaimed: list[object] = []
+        real_reclaim = _lifecycle.reclaim
+        _lifecycle.reclaim = reclaimed.append  # type: ignore[assignment]
+        try:
+            assert run_in_child(lambda: str(stranded in reclaimed)).output == "False", (
+                "a child re-stamped a sink the record only pins, so it could then release it"
+            )
+            worker._unclosed_swaps = []
+            worker._not_skipped = [stranded]  # type: ignore[attr-defined]
+            assert run_in_child(lambda: str(stranded in reclaimed)).output == "True", (
+                "the control did not re-stamp it either, so the assertion above proves nothing"
+            )
+        finally:
+            _lifecycle.reclaim = real_reclaim  # type: ignore[assignment]
     finally:
         _lifecycle._state._worker = None
         worker.shutdown(timeout=2.0)

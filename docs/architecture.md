@@ -335,8 +335,9 @@ that a leaked resource in a running process beats a close raced against a write.
 > gets. An expired `shutdown()` still leaves it open, because the thread is still live, and the
 > next call performs the close instead. What changed the decision was measuring the cost: for a
 > sink whose `close()` *is* the delivery, "left open" is nine events lost, not a leaked handle.
-> Full entry in `decisions.md` under *The sink contract: waiting, concurrency and shutdown*. Passing the sink already
-live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
+> Full entry in `decisions.md` under *The sink contract: waiting, concurrency and shutdown*.
+
+Passing the sink already live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
 updated and the retirement signals (§9) continue to apply — but the sink adopted by that call is
 still delivered to and is closed by the orphan path below, since a retired worker owns nothing
 further.
