@@ -787,8 +787,9 @@ Redis, RabbitMQ and Event Hubs sinks retry through `sinks/_retry`, so their back
 *and* cut short by a shutdown.
 
 `KafkaSink` and `GooglePubSubSink` add no retry loop and need none — each hands off locally and
-returns without waiting, so nothing of theirs holds the single drain thread, and their clients
-retry on their own threads within their own bounds. For Kafka that is `message.timeout.ms`, five
+returns without waiting, and their clients retry on their own threads within their own bounds.
+(`KafkaSink` holds nothing at all; `GooglePubSubSink` does take one wait on the drain thread, its
+`overflow_timeout`, when a batch exceeds `max_pending` — bounded and interruptible per SPEC-027.) For Kafka that is `message.timeout.ms`, five
 minutes by default (measured: the delivery callback fires at 300.18 s), reachable through
 `producer_config=`; for Pub/Sub, a 600 s deadline.
 

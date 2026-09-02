@@ -362,7 +362,7 @@ MODULE_FLOORS: dict[str, int] = {
     "test_redis": 2,
     "test_kafka": 2,
     "test_logstash": 2,
-    "test_nats": 6,
+    "test_nats": 7,
     "test_pubsub": 2,
     "test_mongo": 1,
     "test_rabbitmq": 1,

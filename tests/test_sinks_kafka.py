@@ -361,3 +361,11 @@ def test_producer_config_alongside_an_injected_producer_is_refused() -> None:
     # consume is an error, not an ignore).
     with pytest.raises(ValueError, match="producer_config"):
         KafkaSink("logs", producer=FakeProducer(), producer_config={"message.timeout.ms": 1500})
+
+
+def test_an_empty_producer_config_alongside_an_injected_producer_is_still_refused() -> None:
+    # The companion of the NATS boundary: the check is `is not None`, not truthiness. An empty
+    # mapping is a no-op, but accepting it would mean the guard reads the value rather than the
+    # caller's intent, and the next falsy shape it admits would not be a no-op.
+    with pytest.raises(ValueError, match="producer_config"):
+        KafkaSink("logs", producer=FakeProducer(), producer_config={})

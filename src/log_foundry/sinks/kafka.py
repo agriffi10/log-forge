@@ -54,13 +54,21 @@ class KafkaSink:
     serviced by ``poll()`` and ``flush()``.
 
     **Retry (SPEC-041 FR-004).** This sink adds none and needs none: ``produce()`` is a local
-    hand-off that returns without waiting — measured at 0.0000 s for three messages against a
+    hand-off that returns without waiting — measured at 0.0001 s for three messages against a
     dead broker — so it never holds the worker's single drain thread, and librdkafka's own retry
     is bounded by ``message.timeout.ms`` (five minutes by default). Measured: with that set to
     1500 ms the delivery callback fired at 2.01 s, and at 4000 ms it fired at 4.01 s. SPEC-027's
     "cut short by a shutdown" governs a wait *between attempts*, and this sink has none to cut —
     which is also why it deliberately exposes no ``log_foundry_stop_signal`` attribute, since
     ``_lifecycle.offer_stop_signal`` probes by ``hasattr`` and that absence is the opt-out.
+
+    **The bound is ``librdkafka``'s, and since SPEC-047 FR-003 it is reachable.** ``message.
+    timeout.ms`` is what decides how long an accepted message is retried, five minutes by
+    default — measured, the delivery callback fires at 300.18 s — and before ``producer_config``
+    nothing could change it without abandoning ``bootstrap_servers=`` and injecting a whole
+    producer. No log-foundry retry was added instead: ``produce()`` having returned means the
+    producer owns delivery, so re-sending duplicates whatever it eventually lands (SPEC-018), and
+    a second bound over a five-minute one multiplies the worst case rather than shortening it.
 
     The worst case (SPEC-027 FR-005) is not a retry loop — this sink has none — but its
     ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent **beside**

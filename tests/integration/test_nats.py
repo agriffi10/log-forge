@@ -189,3 +189,24 @@ def test_a_large_batch_reaches_a_healthy_stream_with_a_publish_timeout_set(strea
 
     assert count() == 200
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_a_bounded_constructor_fails_fast_against_an_unreachable_server(
+    services_are_up: dict[str, Endpoint],
+) -> None:
+    # SPEC-047 FR-002 AC-2, and the only place the forwarding is proved to BIND rather than merely
+    # be passed: the unit tests assert kwargs against a fake module that would accept any name.
+    # At the driver's defaults this blocks ~120 s (60 reconnect attempts x 2 s), measured at
+    # 120.17 s -- on the application's own startup thread, since `configure(sink=NATSSink(...))`
+    # is called by the caller.
+    began = time.monotonic()
+    with pytest.raises(Exception, match=r"(?i)no servers|connect"):
+        NATSSink(
+            "lf.unreachable",
+            servers="nats://127.0.0.1:1",
+            max_reconnect_attempts=1,
+            reconnect_time_wait=0.1,
+        )
+    elapsed = time.monotonic() - began
+
+    assert elapsed < 5.0, f"the connect budget was not reached: {elapsed:.2f}s"

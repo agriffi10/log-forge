@@ -550,6 +550,16 @@ def test_omitting_them_reproduces_todays_call_exactly(monkeypatch) -> None:
     assert kwargs == {}
 
 
+def test_a_falsy_connect_bound_is_still_forwarded(monkeypatch) -> None:
+    # The omission test is `value is not None`, not truthiness, and zero is the case that tells
+    # them apart. Both zeros are meaningful to the driver -- nats-py guards
+    # `max_reconnect_attempts` with `> 0` / `< 0`, and `reconnect_time_wait=0` means retry
+    # immediately -- so a truthiness test would silently drop a caller's "never reconnect".
+    module = _build(monkeypatch, max_reconnect_attempts=0, reconnect_time_wait=0)
+    _, kwargs = module.calls[0]
+    assert kwargs == {"max_reconnect_attempts": 0, "reconnect_time_wait": 0}
+
+
 @pytest.mark.parametrize(
     "kwarg",
     ["connect_timeout", "max_reconnect_attempts", "reconnect_time_wait", "drain_timeout"],
@@ -559,6 +569,14 @@ def test_a_connect_bound_alongside_an_injected_client_is_refused(kwarg: str) -> 
     # ignoring it would silently discard the caller's bound (SPEC-043's rule).
     with pytest.raises(ValueError, match=kwarg):
         NATSSink("logs", client=FakeNATS(), **{kwarg: 1})
+
+
+def test_a_falsy_connect_bound_alongside_an_injected_client_is_also_refused() -> None:
+    # The same `is not None` boundary on the refusal side: a truthiness test would accept
+    # `reconnect_time_wait=0` against a client that cannot consume it, which is the silent ignore
+    # SPEC-043 forbids.
+    with pytest.raises(ValueError, match="reconnect_time_wait"):
+        NATSSink("logs", client=FakeNATS(), reconnect_time_wait=0)
 
 
 def test_publish_timeout_is_not_refused_alongside_an_injected_client() -> None:
@@ -592,3 +610,25 @@ def test_a_refused_construction_creates_no_event_loop(monkeypatch) -> None:
         NATSSink("logs", client=FakeNATS(), connect_timeout=1.0)
 
     assert created == 0, "the refusal must come before the loop is built, or it leaks one"
+
+
+def test_every_connect_kwarg_we_forward_is_one_the_driver_accepts() -> None:
+    # FR-002's forwarding is asserted elsewhere against a FAKE module whose
+    # `connect(*args, **kwargs)` swallows anything, so a wrong keyword name passes the whole
+    # suite and raises TypeError in production the first time a real sink is built. That is the
+    # SPEC-043 shape -- four SentrySink tests were green only because CI never installed the
+    # extra -- so the names are checked against the real driver here, under the same gate.
+    if not _EXTRAS_EXPECTED:
+        pytest.importorskip("nats", reason="the `nats` extra is not installed")
+    import inspect
+
+    from nats.aio.client import Client
+
+    accepted = inspect.signature(Client.connect).parameters
+    for name in (
+        "connect_timeout",
+        "max_reconnect_attempts",
+        "reconnect_time_wait",
+        "drain_timeout",
+    ):
+        assert name in accepted, f"NATSSink forwards {name!r}, which the driver does not accept"
