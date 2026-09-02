@@ -69,7 +69,16 @@ spec stands alone; the identifiers are there so a reader can find the original e
 
 `Worker.shutdown`'s expiry branch records `stopped_reason`, sets `_drain_settled`, writes its
 line and returns — before `_release_waiters()`, whose own docstring says it exists for this
-caller. A `flush(timeout=None)` parked behind a stuck sink therefore waits forever on a drain
+caller.
+
+**The audit's prescribed remedy did not cover the audit's own probe, and the first attempt
+shipped it anyway.** Calling `_release_waiters()` there answers markers still *in* the queue.
+Which markers those are is a race the caller does not control: a `flush()` whose marker arrives
+while the drain is already inside `emit` stays queued and is swept, but one the drain dequeues
+*before* blocking is held in that thread's local and reachable by nothing. Reproduced on merged
+`main` by a peer session and confirmed here — `items in queue: 0, markers visible: 0`, flusher
+still alive after `shutdown` returned. The drain thread now registers each marker it takes, and
+the sweep answers those as well as the queued ones. A `flush(timeout=None)` parked behind a stuck sink therefore waits forever on a drain
 that has been given up on. Reproduced: `flusher still waiting after shutdown gave up: True`.
 
 **The trade this makes, stated rather than assumed.** On the two existing call sites the drain
@@ -98,6 +107,10 @@ deleted; its sentinel half is unchanged and still asserted.
       `lost` line, with the same text as before.
 - [ ] A marker re-answered by a later `_final_drain` corrupts nothing: the sink still receives its
       batch exactly once, and no second `FlushResult` is produced.
+- [ ] The same holds for the ordering the first fix missed: with the drain thread holding the
+      marker rather than the queue, the flush is still answered — asserted separately, because the
+      test written from the audit's probe passes with that half reverted.
+- [ ] A marker taken by `_final_drain` rather than by the loop is answered too.
 - [ ] Deleting the new call makes the first criterion fail (mutation-tested, not asserted).
 
 ### FR-002: A second shutdown waits for an in-flight inline close, on both delivery paths

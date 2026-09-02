@@ -2360,6 +2360,79 @@ def test_a_parked_unbounded_flush_is_released_when_shutdown_expires(capsys) -> N
     )
 
 
+def test_a_marker_the_drain_already_took_is_released_too(capsys) -> None:
+    """FR-001. The half the audit's own prescribed remedy did not cover.
+
+    `_release_waiters` answers markers by reading `self._queue.queue`, so it reaches a marker only
+    while the marker is still *in* the queue. Whether it is depends on a race the caller does not
+    control: if the drain thread is already inside `emit` when `flush()` puts the marker, it stays
+    queued and is swept; if the drain dequeues it and *then* blocks in `emit`, it is held in that
+    thread's local and nothing answers it.
+
+    The sibling test above pins the first ordering, and it passes with this fix reverted — it was
+    written from a probe that waited for the sink to be entered before flushing, which forces the
+    easy ordering. This one forces the other: no wait, so the marker is taken and the drain blocks
+    with it in hand. Measured on the shipped fix before this one: `items in queue: 0, markers
+    visible: 0`, and the flushing thread still alive after `shutdown` returned.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert sink.in_emit.wait(5.0), "the premise: the drain is inside emit"
+    with worker._queue.mutex:
+        queued = [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)]
+    assert queued == [], (
+        "the premise: the drain took the marker before blocking, so a queue sweep cannot see it"
+    )
+
+    worker.shutdown(timeout=0.3)
+    flusher.join(timeout=2.0)
+    still_waiting = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    flusher.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_waiting, "a marker in flight in a wedged drain is answered by nobody"
+    assert verdict and verdict[0].reason == "abandoned"
+
+
+def test_a_marker_taken_by_the_final_drain_is_released_too(capsys) -> None:
+    """FR-001. `_final_drain` takes markers too, and its emit can wedge just as the loop's can.
+
+    `shutdown` queues the sentinel and joins; the drain leaves its loop, `_final_drain` pulls the
+    remaining markers out of the queue and blocks inside the tail emit holding them. The join then
+    expires, and the sweep on the expiry branch is the only thing left that can answer them — so
+    the registration in `_final_drain` is load-bearing on exactly this path and on no other.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(marker)
+
+    worker.shutdown(timeout=0.5)
+
+    assert worker._thread.is_alive(), "the premise: the final drain is wedged in emit"
+    assert sink.in_emit.is_set(), "the premise: it got as far as the sink"
+    with worker._queue.mutex:
+        assert not [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)], (
+            "the premise: the final drain took the marker, so a queue sweep cannot see it"
+        )
+    assert marker.event.is_set(), "the expiry sweep must reach a marker the final drain holds"
+    assert marker.delivered is False
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+
 def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:
     """FR-001 AC-4. The sweep costs a verdict, never a delivery.
 

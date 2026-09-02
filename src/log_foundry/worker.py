@@ -345,6 +345,7 @@ class Worker:
         self._shutdown_done = False
         self._sink_closed = sink_released
         self._closing: threading.Event | None = None
+        self._taken_markers: list[_FlushMarker] = []
         self._unclosed_swaps: list[Sink] = []
         self._lock = threading.Lock()
         self._offer_stop_signal()
@@ -1342,6 +1343,50 @@ class Worker:
         finally:
             self._release_waiters()
 
+    def _take_marker(self, marker: _FlushMarker) -> None:
+        """Records a marker the drain thread has taken out of the queue (SPEC-050 FR-001).
+
+        :meth:`_release_waiters` answers markers by reading ``self._queue.queue``, so it can only
+        reach one that is still *in* the queue. A marker the drain has already dequeued is held in
+        that thread's local while it emits — and if the sink's ``emit`` never returns, nothing
+        answers it and a ``flush(timeout=None)`` waits forever, which is the defect FR-001 exists
+        to remove. Registering it here is what puts it back within reach.
+
+        Args:
+          marker: The marker this thread is about to work on.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._taken_markers.append(marker)
+
+    def _release_marker(self, marker: _FlushMarker) -> None:
+        """Drops a marker the drain thread has finished with, before it is answered.
+
+        The order against ``event.set()`` is **not** load-bearing, and an earlier draft of this
+        docstring said it was. Either way no waiter is stranded: deregister-then-set leaves a
+        window where a sweep finds nothing, but the owner is about to answer the marker itself;
+        set-then-deregister leaves a window where a sweep answers it twice, which ``Event.set``
+        makes a no-op. Mutation-tested both ways, both green — so this is an ordering chosen for
+        readability, and the claim that it defends something has been removed rather than left
+        standing.
+
+        Args:
+          marker: The marker this thread has finished with.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._taken_markers = [m for m in self._taken_markers if m is not marker]
+
     def _release_waiters(self) -> None:
         """Answers every ``flush()`` marker still queued, so no caller waits out its timeout.
 
@@ -1385,6 +1430,8 @@ class Worker:
         try:
             with self._queue.mutex:
                 markers = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
+            with self._lock:
+                markers.extend(self._taken_markers)
             for marker in markers:
                 marker.event.set()
         except Exception:
@@ -1463,11 +1510,13 @@ class Worker:
             except queue.Empty:
                 item = None
             if isinstance(item, _FlushMarker):
+                self._take_marker(item)
                 try:
                     self._emit_pending(pending)
                     item.delivered = self._nothing_lost_since(item)
                 finally:
                     last_flush = time.monotonic()
+                    self._release_marker(item)
                     item.event.set()
                 continue
             if item is _SHUTDOWN:
@@ -1546,6 +1595,7 @@ class Worker:
                 break
             if isinstance(item, _FlushMarker):
                 markers.append(item)
+                self._take_marker(item)
                 continue
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
@@ -1555,6 +1605,7 @@ class Worker:
                 marker.delivered = self._nothing_lost_since(marker)
         finally:
             for marker in markers:
+                self._release_marker(marker)
                 marker.event.set()
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
