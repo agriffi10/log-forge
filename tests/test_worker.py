@@ -2433,6 +2433,67 @@ def test_a_marker_taken_by_the_final_drain_is_released_too(capsys) -> None:
     capsys.readouterr()
 
 
+def test_the_taken_marker_record_does_not_grow(capsys) -> None:
+    """FR-001. The deregistration is the guard whose failure is silent.
+
+    A `_release_marker` that did nothing would leak one `_FlushMarker` and its `Event` per
+    `flush()`, forever, and the entire suite stays green against it — measured, 1000 flushes
+    leaving 1000 residual entries. Nothing else here would ever notice, which is precisely the
+    shape this repo mutation-tests for.
+
+    Both terminating paths are driven: an emit that returns normally, and one that raises, since
+    the deregistration sits in a `finally` and only the second proves it.
+    """
+    sink = FlakySink(fail_times=0)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_retries=0)
+    for i in range(200):
+        if i % 3 == 0:
+            sink.fail_times = sink.attempts + 1  # make the next emit raise
+        worker.submit(_span(i))
+        worker.flush(timeout=5.0)
+    capsys.readouterr()
+
+    assert worker._taken_markers == [], (
+        f"{len(worker._taken_markers)} markers retained after 200 flushes — one per flush is a "
+        f"leak of an Event apiece for the life of the process"
+    )
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+    assert worker._taken_markers == [], "and the final drain releases the ones it took"
+
+
+def test_a_marker_taken_after_the_drain_settled_answers_itself(capsys) -> None:
+    """FR-001. The last gap: between `Queue.get` returning a marker and it being recorded.
+
+    In that window the marker is in neither the queue nor the record, so a sweep landing there
+    misses it — and because the premise is a sink whose `emit` never returns, the drain never
+    reaches its own closing sweep either, so the strand is permanent. Measured at 1 in 300 with
+    `shutdown(timeout=0)`, a public argument.
+
+    `_drain_settled` is set immediately before the sweep on both the expiry and terminal paths, so
+    a marker taken after that point answers itself. Driven directly rather than raced for: the
+    race is 1-in-300 and a test that reproduces it that rarely passes against the bug.
+    """
+    worker = Worker(RecordingSink(), batch_size=10, flush_interval=60.0)
+    marker = worker_mod._FlushMarker(seen_failures=0)
+
+    worker._drain_settled.set()  # as the expiry branch leaves it, sweep already gone by
+    worker._take_marker(marker)
+
+    assert marker.event.is_set(), (
+        "a marker taken after the drain settled is answered by nothing else, so it must self-answer"
+    )
+    assert marker.delivered is False, "and pessimistically, as the sweep would have"
+
+    other = worker_mod._FlushMarker(seen_failures=0)
+    worker._drain_settled.clear()
+    worker._take_marker(other)
+    assert not other.event.is_set(), "the ordinary path must not answer a marker on arrival"
+
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
 def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:
     """FR-001 AC-4. The sweep costs a verdict, never a delivery.
 
@@ -2640,12 +2701,17 @@ def test_the_closing_slot_is_emptied_for_a_forked_child() -> None:
         worker._closing = threading.Event()
         worker._closing.set()  # as an inherited, already-answered close would arrive
         worker._unclosed_swaps = [RecordingSink()]  # and a sink the child never stranded
+        worker._taken_markers = [worker_mod._FlushMarker(seen_failures=0)]  # and a caller it
+        # cannot answer: the flush() waiting on it is on a thread that did not survive the fork
 
         worker._reinit_after_fork(resume=resume)
 
         assert worker._closing is None, f"the slot survived the fork with resume={resume}"
         assert worker._unclosed_swaps == [], (
             f"the child inherited the parent's stranded sinks with resume={resume}"
+        )
+        assert worker._taken_markers == [], (
+            f"the child inherited the parent's in-flight flush markers with resume={resume}"
         )
         worker.shutdown(timeout=2.0)
 

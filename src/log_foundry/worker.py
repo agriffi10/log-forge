@@ -270,8 +270,14 @@ class Worker:
     mechanics only, and knows nothing about spans or context.
     """
 
-    _FORK_SKIP = ("_unclosed_swaps",)
+    _FORK_SKIP = ("_unclosed_swaps", "_taken_markers")
     """Attribute names ``_fork``'s repair walk must not read or descend into (SPEC-050 FR-004).
+
+    ``_taken_markers`` names ``flush()`` callers **in the parent**, whose ``Event`` the walk would
+    otherwise replace on an object nothing in the child will ever wait on. The skip stops that
+    work and :meth:`_reinit_after_fork` drops the references, because a skip alone leaves them
+    held — measured, a child inherited the parent's in-flight marker permanently and kept it
+    through fifty further flushes of its own.
 
     ``_unclosed_swaps`` holds sinks this process has **stopped** delivering to, which is exactly
     the shape ``_fork._SKIP_ATTRIBUTE`` describes: bookkeeping that pins objects is not live state
@@ -386,6 +392,9 @@ class Worker:
         release at every child exit. Emptying is what "a child inherits no promise" means for the
         record as well as for the close.
 
+        ``_taken_markers`` and ``_unclosed_swaps`` are emptied with it: a child inherits no
+        ``flush()`` caller to answer and stranded no sink, so both are references it can only hold.
+
         ``_closing`` is emptied unconditionally, on both branches (SPEC-050 FR-002). It names a
         close running on a thread that did not survive the fork, so the child inherits a promise
         nothing can keep: ``_fork._fresh_primitive`` carries an ``Event``'s set state across, so
@@ -448,6 +457,7 @@ class Worker:
         self.incomplete_swaps = 0
         self.stopped_reason = None
         self._closing = None
+        self._taken_markers = []
         self._unclosed_swaps = []
         if not resume:
             self._drain_finished.set()
@@ -1363,6 +1373,9 @@ class Worker:
         """
         with self._lock:
             self._taken_markers.append(marker)
+            settled = self._drain_settled.is_set()
+        if settled:
+            marker.event.set()
 
     def _release_marker(self, marker: _FlushMarker) -> None:
         """Drops a marker the drain thread has finished with, before it is answered.

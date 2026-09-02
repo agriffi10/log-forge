@@ -78,8 +78,10 @@ while the drain is already inside `emit` stays queued and is swept, but one the 
 *before* blocking is held in that thread's local and reachable by nothing. Reproduced on merged
 `main` by a peer session and confirmed here — `items in queue: 0, markers visible: 0`, flusher
 still alive after `shutdown` returned. The drain thread now registers each marker it takes, and
-the sweep answers those as well as the queued ones. A `flush(timeout=None)` parked behind a stuck sink therefore waits forever on a drain
-that has been given up on. Reproduced: `flusher still waiting after shutdown gave up: True`.
+the sweep answers those as well as the queued ones.
+
+Reproduced before either half: `flusher still waiting after shutdown gave up: True`, a
+`flush(timeout=None)` waiting forever on a drain this very call had given up on.
 
 **The trade this makes, stated rather than assumed.** On the two existing call sites the drain
 thread is finished or terminally dead, so `delivered=False` is simply true. Here it is not: the
