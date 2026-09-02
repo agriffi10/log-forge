@@ -74,6 +74,18 @@ jobs:
         # Every supported version runs the full gate. `requires-python = ">=3.12"` is only worth
         # what the test run behind it proves — a 3.13-only call on a rarely-exercised path would
         # otherwise surface as an AttributeError in a consumer's production Lambda (SPEC-013 FR-001).
+        #
+        # THIS LIST IS COPIED IN FIVE OTHER PLACES, and nothing checks any of them. Changing
+        # it means changing all of: `pyproject.toml`'s `Programming Language :: Python :: X.Y`
+        # classifiers (hand-written to equal this list, because the set poetry-core derives
+        # follows `requires-python` and so claimed 3.14, which nothing here has ever run);
+        # README's feature bullet, its CI table row, and its note naming the required checks
+        # `test / test (py3.12)` / `(py3.13)` — those are branch-protection check NAMES, so a
+        # matrix change moves a repository setting too; and CLAUDE.md's Tech Stack row.
+        # Both directions are wrong and both are silent: adding a version here without the
+        # classifier understates what is supported, and removing one (or raising
+        # `requires-python`) leaves a classifier claiming a runtime nothing tests, which is
+        # the defect that produced the hand-written list in the first place.
         python-version: ["3.12", "3.13"]
     name: test (py${{ matrix.python-version }})
     steps:

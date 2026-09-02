@@ -19,6 +19,70 @@ requires-python = ">=3.12"
 dependencies = [
 ]
 
+# Declared explicitly rather than left to poetry-core's derivation from `requires-python`.
+# The derived set follows the RANGE, so `>=3.12` produced a `Programming Language :: Python ::
+# 3.14` classifier — an assertion of support for a runtime no CI job has ever run. `requires-python`
+# is the install-time contract and correctly stays open; a classifier is a claim about what is
+# tested, and the two are not the same statement. These list the versions `ci.yml` actually
+# gates — its `python-version` matrix is the other half of the pair and carries the same note.
+# The coupling is by comment, not by check: a test asserting it would live in `tests/`, which
+# this change does not own.
+classifiers = [
+    # Asserts what the NEXT STABLE TAG will be, not what the current version is. Safe only
+    # because PyPI's default project page renders the latest stable release, which is still
+    # `v0.10.1` and carries none of this; the artifacts carrying it in the meantime are the
+    # `.devN` pre-releases that SECURITY.md declares unsupported and that `pip install` does
+    # not select. Their own per-version pages DO show it, so this is narrow, not free.
+    # Revisit if the next stable tag is not `v1.0.0`: README still says three public shapes
+    # change once, before the API is frozen, and Production/Stable on the default page would
+    # then contradict it.
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    # Not by the "only what CI runs" rule above — every workflow is `ubuntu-latest`. By
+    # source evidence instead: `src/` imports no `fcntl`, `pwd`, `grp` or `posix`, opens no
+    # `AF_UNIX` socket and reads no `/dev/null` path, and `_fork.py` guards
+    # `os.register_at_fork` with `hasattr` precisely so Windows imports cleanly. A POSIX-only
+    # sink would invalidate this line, which is why the evidence is written down.
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# No `License :: OSI Approved :: MIT License` classifier: `license = "MIT"` above is a PEP 639
+# expression, and PyPI refuses a distribution that carries both.
+
+keywords = [
+    "logging",
+    "structured-logging",
+    "json-logging",
+    "observability",
+    "trace-context",
+    "correlation-id",
+    "sqs",
+    "elasticsearch",
+    "serverless",
+]
+
+# Without these the PyPI project page links nowhere: the sidebar is built from this table alone,
+# and a reader who arrives from `pip show` has no route to the source, the release notes or the
+# vulnerability-reporting channel. The repository is still named `log-forge` — the ORIGINAL name,
+# which PyPI rejected for the distribution — so these URLs deliberately do not match the package
+# name. See the note on `name` above before "correcting" them.
+
+[project.urls]
+Homepage = "https://github.com/agriffi10/log-forge"
+Repository = "https://github.com/agriffi10/log-forge"
+Documentation = "https://github.com/agriffi10/log-forge#readme"
+"Release notes" = "https://github.com/agriffi10/log-forge/releases"
+Issues = "https://github.com/agriffi10/log-forge/issues"
+Security = "https://github.com/agriffi10/log-forge/security/policy"
+
 # Optional features. Install with: pip install log-foundry[aws]
 
 [project.optional-dependencies]
