@@ -87,10 +87,13 @@ def _bounded_seconds(timeout: float | None) -> str:
 class Health:
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
-    ``stopped_reason``, ``sink``, and SPEC-030's three are defaulted and appended in that
-    order, so the zeroed snapshot in ``_lifecycle._worker_health`` — and any third-party
-    construction — keeps working, and attribute and index access to every earlier field stays
-    as it was.
+    Construction is **keyword-only** (SPEC-051 FR-001), which is what makes appending a field
+    safe: order is not part of the contract, so a new counter can go anywhere and no third-party
+    construction can bind to a position. It was previously ordered — every field after
+    ``failed_batches`` is defaulted and was appended in the order the specs landed. The claim
+    that a caller could also subscript this, carried here from the ``NamedTuple`` SPEC-034
+    replaced, was false from the moment it became a dataclass: ``len(health())`` raises
+    ``TypeError``, and ``README.md`` said the opposite correctly throughout.
 
     Attributes:
       queued: Submissions currently buffered. Approximate by nature: it is read without

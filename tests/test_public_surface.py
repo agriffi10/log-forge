@@ -1415,3 +1415,133 @@ def test_a_non_dict_mapping_produces_the_same_fields(lf, fake_sink) -> None:
 
     assert seen == [dict]
     assert fake_sink.events[0]["fields"] == {"env_tag": "x", "tenant": "acme"}
+
+
+# ── SPEC-051 FR-003: `context.__all__` names only what the package re-exports ────────────
+
+_WITHDRAWN_CONTEXT_NAMES = (
+    "current_span",
+    "pop_baggage_scope",
+    "pop_span",
+    "push_baggage_scope",
+    "push_span",
+)
+
+
+def test_context_exports_exactly_what_the_package_re_exports() -> None:
+    """FR-003 AC-1 and AC-2, derived from the package rather than from a written list.
+
+    The set is not spelled out here: it is whatever `log_foundry` re-exports, so neither side
+    can move without the other. Object identity rather than `hasattr`, because a same-named
+    attribute arriving from somewhere else would satisfy a presence check.
+    """
+    for name in context.__all__:
+        assert getattr(log_foundry, name, None) is getattr(context, name), name
+    assert len(context.__all__) == 6, context.__all__
+
+
+def test_the_withdrawn_context_names_are_not_public_anywhere() -> None:
+    """FR-003 AC-1, the other direction: `__all__` shrank because these are not re-exported."""
+    still_public = [n for n in _WITHDRAWN_CONTEXT_NAMES if n in context.__all__]
+    assert not still_public, f"still exported: {still_public}"
+    leaked = [n for n in _WITHDRAWN_CONTEXT_NAMES if hasattr(log_foundry, n)]
+    assert not leaked, f"reachable from the package root: {leaked}"
+
+
+def test_withdrawing_the_claim_did_not_withdraw_the_symbol(lf, fake_sink) -> None:
+    """FR-003 AC-3. `__all__` governs `import *`; the decorator still uses all five."""
+    from log_foundry.context import (
+        current_span,
+        pop_baggage_scope,
+        pop_span,
+        push_baggage_scope,
+        push_span,
+    )
+
+    assert all(callable(fn) for fn in
+               (current_span, push_span, pop_span, push_baggage_scope, pop_baggage_scope))
+
+    @lf.trace
+    def work():
+        assert current_span() is not None
+
+    work()
+    assert current_span() is None
+    assert [e["message"] for e in fake_sink.events] == ["span.start", "span.end"]
+
+
+# ── SPEC-051 FR-004: a name a public signature uses is a name a module exports ───────────
+
+
+def test_the_aliases_a_public_signature_names_are_exported() -> None:
+    """FR-004 AC-1, derived: the export is checked against the signature that needs it.
+
+    Keying on the annotation text rather than on a written list means renaming the alias
+    without moving the export fails here, which is the drift this criterion exists for.
+    """
+    sqs = pytest.importorskip("log_foundry.sinks.sqs")
+    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    for module, sink, aliases in (
+        (sqs, sqs.SQSSink, ("GroupIdSource", "DedupIdSource")),
+        (sentry, sentry.SentrySink, ("Backend",)),
+    ):
+        annotations = " ".join(
+            str(p.annotation) for p in inspect.signature(sink.__init__).parameters.values()
+        )
+        for alias in aliases:
+            assert alias in annotations, f"{alias} is no longer in {sink.__name__}'s signature"
+            assert alias in module.__all__, f"{alias} is used in a public signature, not exported"
+
+
+def test_the_sentry_backend_docstring_no_longer_denies_its_own_export() -> None:
+    """FR-004 AC-1. A docstring that contradicts `__all__` is the SPEC-042 failure again.
+
+    Read from the source, not from `__doc__`: a string literal after a module-level assignment
+    is a docstring only to a documentation tool, and is unreachable at runtime -- so a runtime
+    assertion here would pass against the contradiction it claims to catch.
+    """
+    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    assert "Backend" in sentry.__all__
+    source = (_SINK_PKG / "sentry.py").read_text(encoding="utf-8")
+    assert "Not exported" not in source
+
+
+def test_the_two_new_top_level_names_are_exports_not_copies() -> None:
+    """FR-004 AC-2 and AC-3. Identity, so a same-valued rebinding does not satisfy it."""
+    worker = pytest.importorskip("log_foundry.worker")
+    base = pytest.importorskip("log_foundry.sinks.base")
+    assert "DEFAULT_SWAP_TIMEOUT" in log_foundry.__all__
+    assert "flush_sink" in log_foundry.__all__
+    assert log_foundry.DEFAULT_SWAP_TIMEOUT is worker.DEFAULT_SWAP_TIMEOUT
+    assert log_foundry.flush_sink is base.flush_sink
+
+
+# ── SPEC-051 FR-006: the public record states what the code does ─────────────────────────
+
+
+def test_health_returns_block_documents_every_field() -> None:
+    """FR-006 AC-2, derived from `dataclasses.fields` so the next appended field fails it.
+
+    Sliced between `Returns:` and `Raises:`: `orphan_lost` and `in_span_lost` were described in
+    the prose above `Args:` while absent from `Returns:`, so a whole-docstring search was
+    already green over the defect this catches.
+    """
+    doc = log_foundry.health.__doc__ or ""
+    block = doc.split("Returns:", 1)[1].split("Raises:", 1)[0]
+    missing = [
+        f.name for f in dataclasses.fields(log_foundry.Health)
+        if not re.search(rf"``{re.escape(f.name)}``", block)
+    ]
+    assert not missing, f"health() documents 12 fields minus {missing}"
+
+
+def test_the_health_docstring_makes_no_index_claim() -> None:
+    """FR-006 AC-1, with the fact that made the claim false asserted beside it.
+
+    The claim was inherited from the `NamedTuple` SPEC-034 replaced. Asserting only its absence
+    would pass against a docstring that had never made it; asserting `len()` too says why it
+    had to go.
+    """
+    assert "index access" not in (log_foundry.Health.__doc__ or "")
+    with pytest.raises(TypeError):
+        len(log_foundry.health())
