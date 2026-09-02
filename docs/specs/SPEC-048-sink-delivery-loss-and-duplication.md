@@ -1,7 +1,7 @@
 # Spec: Sink Delivery — Loss and Duplication
 
 **ID:** SPEC-048
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-09-02
 **Depends On:** SPEC-016, SPEC-018, SPEC-026, SPEC-027, SPEC-032, SPEC-036, SPEC-038
 
