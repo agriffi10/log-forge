@@ -9,7 +9,13 @@
 # whose service never becomes healthy.
 #
 #   docker compose -f tests/integration/docker-compose.yml up -d
-#   LOG_FOUNDRY_INTEGRATION=1 poetry run pytest tests/integration
+#   LOG_FOUNDRY_INTEGRATION=1 poetry run pytest tests/integration -n 0
+#
+# The `-n 0` is REQUIRED, not stylistic: `addopts` in pyproject.toml defaults every pytest
+# run to `-n 8 --dist load`, and these nine modules share the nine services above, so a
+# distributed run has them draining each other's destinations. Measured with these services
+# up: `-n 0` gave `19 passed`, without it `1 failed, 18 passed`. `conftest.py` refuses a
+# distributed session rather than leaving this to the reader.
 #   docker compose -f tests/integration/docker-compose.yml down -v
 #
 # READINESS IS THE HARNESS'S JOB, NOT THE CONTAINER'S. There are deliberately no `healthcheck:`

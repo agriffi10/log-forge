@@ -87,7 +87,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # Deliberately uncached, and the measurement is why. Installing Poetry and the dev group
-      # takes ~18 s of a ~166 s job; the tests take ~141 s. Caching the smaller half would also
+      # takes ~18 s; before the suite was parallelised the tests took ~141 s of a ~166 s job,
+      # and they now take ~49 s. Caching the install would also
       # put a restorable cache into the workflow `release.yml` calls immediately before it
       # publishes to PyPI with `id-token: write` — the cache-poisoning shape zizmor audits for.
       # Not worth ~5 s on the one path where a poisoned input reaches consumers.
