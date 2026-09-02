@@ -240,7 +240,7 @@ and a fixture that reached this point has a service listening.
 def _not_distributed(request: pytest.FixtureRequest) -> None:
     """Refuses a session that would run this directory's tests across processes.
 
-    **A correctness guard.** `addopts` carries `-n 8 --dist load`, so parallel is the DEFAULT for
+    **A correctness guard.** `addopts` carries `-n 12 --dist worksteal`, so parallel is the DEFAULT for
     every invocation and this suite must opt out with `-n 0`: the nine modules share nine real
     services, so distributing them has them draining each other's destinations. Measured with the
     services up, on this repo's own documented recipe: `-n 0` gave `19 passed`, and the same
@@ -278,7 +278,7 @@ def _not_distributed(request: pytest.FixtureRequest) -> None:
         raise RuntimeError(
             "the integration suite must not be distributed -- these tests share nine real "
             "services and will drain each other's destinations. `addopts` defaults to "
-            "`-n 8 --dist load`, so add `-n 0`: "
+            "`-n 12 --dist worksteal`, so add `-n 0`: "
             "`LOG_FOUNDRY_INTEGRATION=1 poetry run pytest tests/integration -n 0`"
         )
 
@@ -380,7 +380,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fails a run that collected work but verified nothing (FR-001).
 
     **Recorded limit: this does not report from an xdist CONTROLLER.** Measured, gate exported:
-    a whole-suite `pytest` (parallel by default since `addopts` carries `-n 8`) printed ZERO
+    a whole-suite `pytest` (parallel by default since `addopts` carries `-n 12`) printed ZERO
     `INTEGRATION FLOOR` lines, while `pytest tests/integration -n 0` printed 10. The controller
     loads conftests only for the invocation's initial paths, and a worker setting
     `session.exitstatus` cannot change the controller's. No false green follows today: CI runs

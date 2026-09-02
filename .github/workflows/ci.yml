@@ -106,11 +106,12 @@ jobs:
       - name: Type check (mypy)
         run: poetry run mypy
 
-      # Deliberately a BARE `pytest`. The parallel flags (`-n 8 --dist load`) live in
+      # Deliberately a BARE `pytest`. The parallel flags (`-n 12 --dist worksteal`) live in
       # `[tool.pytest.ini_options] addopts` in pyproject.toml, so this is the identical command a
       # developer runs as the pre-push gate — no drift between what CI proves and what a human can
       # reproduce, and the reasoning and measurements for the worker count live beside the setting
-      # rather than here. Measured on this runner: the step fell from 141 s to ~49 s.
+      # rather than here. Measured on this runner: the step fell from 141 s to ~49 s at the
+      # first setting; the scheduler has since changed, so expect that or better.
       #
       # To debug serially, `-n 0` overrides it.
       - name: Test (pytest)

@@ -17,7 +17,7 @@ you build.
 
 ```bash
 poetry install --with dev       # first time: gets pytest, pytest-asyncio, etc.
-poetry run pytest               # run everything (parallel by default: -n 8, ~41 s)
+poetry run pytest               # run everything (parallel by default: -n 12, ~35 s)
 poetry run pytest -n 0          # ...serially; required for -s and --pdb
 poetry run pytest -v            # see which tests run vs. skip
 poetry run pytest --cov=log_foundry

@@ -13,7 +13,7 @@
 #   docker compose -f tests/integration/docker-compose.yml down -v
 #
 # The `-n 0` is REQUIRED, not stylistic: `addopts` in pyproject.toml defaults every pytest run to
-# `-n 8 --dist load`, and these nine modules share the nine services above, so a distributed run
+# `-n 12 --dist worksteal`, and these nine modules share the nine services above, so a distributed
 # has them draining each other's destinations. Measured with these services up, the distributed
 # run fails INTERMITTENTLY -- `1 failed, 18 passed` in two of three runs, and a clean `19 passed`
 # in the third, with `test_logstash.py` the loser each time. That intermittency is the reason
