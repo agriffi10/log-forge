@@ -37,6 +37,10 @@ the treatment their siblings already have.
   `http`/`https`.
 - Extending SPEC-043's rule — an argument no backend can use is an error, not a silent ignore —
   to `LogstashSink` and `SentrySink`, the two places it is still violated.
+- Refusing whitespace in `SyslogSink(app_name=)` and `ElasticsearchSink(index=)`. These arrive
+  here because **every** construction-time refusal is this spec's, whatever its consequence:
+  SPEC-048's first draft kept them for their wire effect and its own Out of Scope forbade them,
+  which is what a seam drawn on consequence rather than on timing produces.
 - Bounding `pymongo`'s socket timeout and `pika`'s blocked-connection timeout, whose driver
   defaults are infinite; exposing `clickhouse-connect`'s `send_receive_timeout`, whose default is
   finite; and recording all three in `architecture.md` §13.
@@ -56,6 +60,11 @@ the treatment their siblings already have.
 - Bounding `pymongo`'s `serverSelectionTimeoutMS` or `pika`'s `socket_timeout`/`stack_timeout`.
   Those defaults are finite (30 s, 10 s, 15 s); they are exposed and recorded, not overridden.
 - The `tests/` tree's own scaffolding and its wall-clock budgets outside `test_sinks_*.py`.
+- Validating an Elasticsearch index name beyond whitespace. The audit recorded whitespace there as
+  frame corruption; it is not — `json.dumps` escapes the `_bulk` action line correctly and a name
+  the cluster rejects already arrives as a counted per-item error. The refusal is kept because it
+  turns a sink that fails every batch forever into a startup error, not because anything is silent,
+  and the full index-name grammar is the cluster's to enforce.
 
 ---
 
@@ -149,6 +158,14 @@ already-connected `client=` raises rather than being dropped. Two sinks still vi
 and `transport` in silence, so a caller who meant the socket backend gets HTTP and no word about
 it. It must raise when a socket-only argument accompanies `url=`.
 
+Two more arguments are accepted that no backend can use. `SyslogSink(app_name=)` is interpolated
+raw into a space-delimited RFC 5424 header (`syslog.py:229`), so whitespace shifts PROCID, MSGID and
+STRUCTURED-DATA for every message — corruption no counter sees. `ElasticsearchSink(index=)` is
+different and the difference is stated because the audit got it wrong: the action line is built with
+`json.dumps` (`elasticsearch.py:88`), so the NDJSON frame stays intact and a name the cluster rejects
+is counted per item. It is refused anyway, because an index name the cluster can never accept makes
+every batch fail for the life of the process, and a startup error is the honest place to say so.
+
 `SentrySink._parse_dsn` documents `Raises: ValueError: If the DSN cannot be parsed as a URL`, but
 `urlparse` almost never raises: a DSN with no scheme, no host or no key yields an ingest URL of
 `None://None/api//envelope/` and an auth header reading `sentry_key=None`, and the sink then posts
@@ -165,6 +182,11 @@ all present — with a `ValueError` at construction, making the existing docstri
 - [ ] A well-formed DSN produces exactly the ingest URL and auth header it produces today — an
       existing-behaviour test pins both strings.
 - [ ] The refusal is at construction, not at first emit, for both sinks.
+- [ ] `SyslogSink(app_name="my app")` raises `ValueError`; a tab and a newline are refused on the
+      same path. Measured before the fix: the RFC 5424 header became
+      `<14>1 <ts> <host> my app 22113 - - {json}`, so a receiver reads `app` as PROCID and `22113`
+      as MSGID — every field after APP-NAME shifts, for every message the sink ever sends, silently.
+- [ ] `ElasticsearchSink(index="my index")` raises `ValueError` on the same whitespace test.
 
 ### FR-005: The three remaining drivers' waits are bounded or recorded
 
@@ -299,6 +321,8 @@ src/log_foundry/sinks/
 ├── sentry.py          # FR-004
 ├── mongodb.py         # FR-005
 ├── rabbitmq.py        # FR-005
+├── syslog.py          # FR-004
+├── elasticsearch.py   # FR-004
 ├── logging_sink.py    # FR-006
 ├── nats.py, loki.py   # FR-006
 docs/architecture.md   # FR-005 §13 rows
@@ -315,7 +339,8 @@ docs/architecture.md   # FR-005 §13 rows
 ### Phase 2: The remaining refusals (FR-002, FR-003, FR-004)
 
 - `SocketTransport`, `ClickHouseSink`, `PostgresSink`, `GooglePubSubSink`, `RotatingFileSink`.
-- `LogstashSink`'s ignored-argument error and `SentrySink`'s DSN validation.
+- `LogstashSink`'s ignored-argument error, `SentrySink`'s DSN validation, and the two
+  whitespace refusals SPEC-048's seam handed over.
 
 ### Phase 3: The driver bounds (FR-005)
 
@@ -333,3 +358,11 @@ docs/architecture.md   # FR-005 §13 rows
 - Each new `ValueError` is a guard whose failure is silent — the sink simply constructs again.
   Remove each check in turn, confirm its test reddens, and assert the **message**, not the
   exception type: `ValueError` is what several neighbouring checks already raise.
+
+## Revision history
+
+Widened at authoring time, before its own spec review, by SPEC-048's review: that spec's Out of
+Scope deferred construction-time validation here while one of its FRs required two such refusals,
+and this spec did not name them. The seam is now stated as *when* the library refuses rather than
+*what the consequence is*, and FR-004 carries `SyslogSink(app_name=)` and
+`ElasticsearchSink(index=)` alongside the two SPEC-043 violations it already had.
