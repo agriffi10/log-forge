@@ -56,6 +56,7 @@ to status only — no prose.
 | [SPEC-049](SPEC-049-sink-construction-validation-and-driver-bounds.md) | Sink Construction Validation and Driver Bounds | Draft | SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048 |
 | [SPEC-050](SPEC-050-lifecycle-residue.md) | Lifecycle Residue — Stranded Waiters, Unfinished Closes and Uncounted Loss | Completed | SPEC-013, SPEC-021, SPEC-027, SPEC-030, SPEC-031, SPEC-036, SPEC-039, SPEC-042, SPEC-045, SPEC-046 |
 | [SPEC-052](SPEC-052-docstring-rule-and-test-scaffolding.md) | The Ungated Docstring Rule, and the Scaffolding It Left Behind | In Progress | None |
+| [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | Draft | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
 
 ## Arcs (build order)
 
