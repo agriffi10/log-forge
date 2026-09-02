@@ -47,10 +47,10 @@ build.
 
 ## Verification
 
-Five gates green by exit code: `ruff` 0, `mypy` 0, `pytest` 0 (1954 passed, 8 skipped — 39 new),
+Five gates green by exit code: `ruff` 0, `mypy` 0, `pytest` 0 (1955 passed, 8 skipped — 40 new),
 `spec-lint` 0, `docs-lint` 0. Collected test names diffed against the parent commit: **0 removed**.
-Sixteen mutants planted and all sixteen killed, one per guard whose failure would be silent, each
-asserting a reason rather than an exit code. FR-001 is exercised against two real `http.server`
+Twenty-one mutants planted and all twenty-one killed, one per guard whose failure would be
+silent, each asserting a reason rather than an exit code. FR-001 is exercised against two real `http.server`
 origins because every existing HTTP test injects a fake opener and would not touch the fix; the
 FR-002 roster was demonstrated by adding a hypothetical unguarded fifth AWS sink and watching it
 be named. Nothing was deferred to CI.

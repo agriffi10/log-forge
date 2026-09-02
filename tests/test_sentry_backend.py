@@ -614,12 +614,41 @@ def test_a_raising_sdk_flush_does_not_stop_the_fallback_release(capsys) -> None:
     assert "RuntimeError" in capsys.readouterr().err, "and the failure is announced by type"
 
 
-def test_a_client_less_sink_attempts_no_sdk_flush() -> None:
-    """`backend="http"` holds no SDK queue, so close() must not push one on the app's behalf."""
+def test_a_client_less_sink_attempts_no_sdk_flush(capsys) -> None:
+    """`backend="http"` holds no SDK queue, so close() must not push one on the app's behalf.
+
+    Asserted on the *release*, not on `client is None` — that last is state the test arranged.
+
+    **What this can and cannot show**, because the difference was got wrong once here. It cannot
+    show that `flush()`'s `None` guard is what protects this path: mutating that guard away leaves
+    the test green, since `getattr(None, "flush", None)` returns `None` and `callable(None)` is
+    `False`, so the call is inert either way. With no client there is nothing a flush *could*
+    reach, which makes "no SDK flush attempted" close to tautological. What is not tautological,
+    and what this pins, is that adding the flush to `close()` did not short-circuit the release
+    below it — a `close()` that returned early, or raised into its own absorbing guard, would fail
+    both assertions.
+    """
+    from log_foundry.sinks import sentry as sentry_mod
+
+    released: list[object] = []
+    real_release = sentry_mod._lifecycle.release
+
+    def spy(sink_obj, *, owner):
+        released.append(sink_obj)
+        return real_release(sink_obj, owner=owner)
+
     opener = FakeOpener()
     sink = SentrySink(dsn=DSN, backend="http", opener=opener)
-    assert sink.client is None
-    sink.close()
+    assert sink.client is None, "the http backend holds no SDK client"
+    patch = pytest.MonkeyPatch()
+    patch.setattr(sentry_mod._lifecycle, "release", spy)
+    try:
+        sink.close()
+    finally:
+        patch.undo()
+
+    assert capsys.readouterr().err == "", "close() absorbed and announced nothing"
+    assert released == [sink._http], "and close() still ran through to the fallback release"
 
 
 def test_the_close_flush_is_not_suppressed_on_a_repeat_close() -> None:

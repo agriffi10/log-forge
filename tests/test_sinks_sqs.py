@@ -261,3 +261,49 @@ def test_a_keyboard_interrupt_is_not_absorbed_by_the_chunk_guard() -> None:
     sink = SQSSink("https://q", client=_Interrupting(fail_on=set()), max_retries=0)
     with pytest.raises(KeyboardInterrupt):
         sink.emit([{"i": 1, "trace_id": "t"}])
+
+
+def test_partial_acceptance_before_a_raise_charges_only_the_outstanding(capsys) -> None:
+    """SPEC-048 FR-002 AC-4. This is what makes the guard's *placement* load-bearing.
+
+    The guard sits inside `_send`, not around `self._send(chunk)` in `emit`, because by the time
+    `_send` raises it may already hold a non-zero `accepted` and have narrowed `entries` to the
+    retryable subset. An `emit`-level guard charges the whole chunk and reports nothing delivered
+    — turning a partial success into "nothing landed" and provoking the very retry FR-002 removes.
+
+    Nothing else in this file reaches that state: every other double fails a *whole* call, so
+    `accepted` is 0 when the guard fires and the two placements are indistinguishable.
+    """
+
+    class PartialThenRaises:
+        """Accepts 7 of 10 on the first call, then raises on the retry of the other 3."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.accepted: list[str] = []
+
+        def send_message_batch(self, *, QueueUrl, Entries):
+            self.calls += 1
+            if self.calls == 1:
+                failed_ids = {"7", "8", "9"}
+                self.accepted += [
+                    e["MessageBody"] for e in Entries if e["Id"] not in failed_ids
+                ]
+                return {
+                    "Failed": [
+                        {"Id": i, "SenderFault": False, "Code": "InternalError"}
+                        for i in sorted(failed_ids)
+                    ]
+                }
+            raise _Boom("the endpoint went away before the retry")
+
+    client = PartialThenRaises()
+    sink = SQSSink("https://q", client=client, max_retries=1)
+    sink.emit([{"i": i} for i in range(10)])
+
+    assert len(client.accepted) == 7, "the first call's acceptances stand"
+    assert sink.losses().failed == 3, (
+        f"only the 3 entries still outstanding are charged, not the whole chunk; "
+        f"got {sink.losses().failed}"
+    )
+    assert "_Boom" in capsys.readouterr().err

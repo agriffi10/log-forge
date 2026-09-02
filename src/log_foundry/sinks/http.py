@@ -171,13 +171,29 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return
 
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect()).open
-"""The opener every sink in this family uses unless the caller injected one.
+def _no_redirect_opener() -> Callable[..., Any]:
+    """Builds an opener that refuses redirects, for a sink the caller gave no ``opener=``.
 
-Built once at import: ``build_opener`` snapshots ``ProxyHandler``'s environment, which is the one
-behavioural difference from ``urlopen``'s lazily-built global opener, and proxy settings changed
-after import are not picked up. A caller needing that injects their own ``opener=``.
-"""
+    Built per sink at construction rather than once at import, for two reasons. ``python.md`` §15
+    forbids a module doing real work at import time, which is why the ``StdoutSink`` default and
+    the worker are lazy too. And ``build_opener`` snapshots ``ProxyHandler``'s environment, so an
+    import-time opener would pin whatever ``http_proxy`` said when ``log_foundry`` was first
+    imported — a sink built after the application sets its proxy would silently ignore it, where
+    ``urlopen``'s lazily-built global opener would not. Construction time is when the caller is
+    standing there, so it is the honest moment to read the environment.
+
+    A sink is constructed once, so the cost is one object per sink and never per request.
+
+    Args:
+      None.
+
+    Returns:
+      A ``urlopen``-shaped callable that raises ``HTTPError`` on any ``3xx``.
+
+    Raises:
+      None.
+    """
+    return urllib.request.build_opener(_NoRedirect()).open
 
 
 def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[str, str]:
@@ -305,7 +321,7 @@ class HTTPSink:
           max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
             :attr:`MAX_BATCH_BYTES`. Floored at one for the same reason.
           opener: A ``urlopen``-shaped callable, which a test can inject to assert on the
-            request without any network access. Defaults to :data:`_NO_REDIRECT_OPENER` rather
+            request without any network access. Defaults to :func:`_no_redirect_opener` rather
             than ``urlopen`` (SPEC-048 FR-001); an injected one is used exactly as given, since
             it is the caller's object and the library does not reshape it.
 
@@ -331,7 +347,7 @@ class HTTPSink:
             max_batch_bytes if max_batch_bytes is not None else self.MAX_BATCH_BYTES, 1
         )
         self.log_foundry_stop_signal: threading.Event | None = None
-        self._opener = opener if opener is not None else _NO_REDIRECT_OPENER
+        self._opener = opener if opener is not None else _no_redirect_opener()
         self.failed = 0
         self.dropped_oversized = 0
         self._counter_lock = threading.Lock()

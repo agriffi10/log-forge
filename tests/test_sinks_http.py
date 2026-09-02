@@ -757,9 +757,12 @@ def test_gzip_does_not_overwrite_a_content_encoding_the_caller_set() -> None:
 def test_a_per_request_content_encoding_does_not_suppress_gzip() -> None:
     """`extra_headers` sits *beneath* the caller's own, so it must not switch compression off.
 
-    The test is against `self._headers` rather than the merged map, and this is what pins that:
-    keying on the merged map would make `SentrySink`'s per-request `X-Sentry-Auth` path -- the
-    only caller that passes `extra_headers` at all -- able to disable gzip by accident.
+    The test is against `self._headers` rather than the merged map, and this pins that choice.
+    Keying on the merged map would let *any* per-request `Content-Encoding` switch the sink's own
+    compression off — a subclass or a future caller passing one through `extra_headers` would
+    silently stop gzipping, with the header and the intent disagreeing. No shipped caller does
+    that today (`SentrySink` is the only one passing `extra_headers` at all, and it passes
+    `X-Sentry-Auth`), which is exactly why a test is what keeps it true.
     """
     opener = FakeOpener([FakeResponse(200)])
     sink = HTTPSink("http://x", gzip=True, opener=opener)

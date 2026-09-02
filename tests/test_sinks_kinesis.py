@@ -283,7 +283,7 @@ def test_a_client_failure_costs_its_chunk_not_the_batch(capsys) -> None:
 
     A `ClientError` on chunk N propagated out of `emit` after chunks 1..N-1 had landed, and the
     worker retries whole batches -- so the exit drain, which is one large batch by construction,
-    re-sent everything already delivered. Measured before the fix: 600 records, `duplicates=500 losses=(0, 0)`.
+    re-sent everything already delivered. Measured before the fix: 1,000 records in 2 chunks, `duplicates=500 losses=(0, 0)`.
 
     The criterion that binds is that `emit` **returns**: that is what stops the worker's retry at
     its source, so the duplication cannot happen rather than being cleaned up afterwards.

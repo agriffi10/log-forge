@@ -320,7 +320,13 @@ def test_an_overflow_wait_that_expires_puts_the_publish_back_rather_than_losing_
 
 
 class _NeverSettles(PollableFuture):
-    """A publish the destination never confirms, recording every timeout it was waited on with."""
+    """A publish the destination never confirms, recording every timeout it was waited on with.
+
+    An **unbounded** wait blocks for `CLIENT_DEADLINE`, standing in for the real client's 600 s
+    publish deadline. That is what makes a bounded-close test able to fail: with `result(None)`
+    returning instantly, an unbounded close finishes in ~0 s and every wall-clock assertion holds
+    either way -- the vacuous shape this repo keeps finding.
+    """
 
     def __init__(self) -> None:
         super().__init__(settled=False)
@@ -330,7 +336,16 @@ class _NeverSettles(PollableFuture):
         self.waits.append(timeout)
         if timeout is not None:
             raise TimeoutError("still in flight")
+        time.sleep(CLIENT_DEADLINE)
         return "message-id"
+
+
+CLIENT_DEADLINE = 5.0
+"""Seconds an unbounded wait blocks in these tests, standing in for the client's own 600 s.
+
+Long enough that an unbounded `close()` blows every bound asserted below, short enough that a
+failure costs seconds rather than minutes. A passing run never reaches it.
+"""
 
 
 def _closed_with_stop(stopping: bool) -> tuple[float, SinkLosses, list[_NeverSettles]]:
@@ -389,9 +404,11 @@ def test_a_shutdown_defers_the_overflow_wait_to_close_rather_than_blocking_the_d
     assert all(
         None not in f.waits for f in stopping_futures
     ), "close() is bounded now: no future is waited on with timeout=None"
-    assert not stopping_futures[-1].waits, (
-        "one deadline covers the whole list, not one per future — the later futures are "
-        "abandoned unwaited once it expires (SPEC-038: a bound applied per item is n x timeout)"
+    assert stopping_futures[-1].waits == [0], (
+        "one deadline covers the whole list, not one per future: once it expires the remaining "
+        "futures get a single zero-second classification probe and no real wait, which is what "
+        "keeps the bound a bound (SPEC-038: a bound applied per item is n x timeout) while still "
+        "telling an expired future from an unboundable one"
     )
 
 
@@ -569,8 +586,9 @@ def test_close_is_bounded_rather_than_running_to_the_clients_deadline() -> None:
     deadline, and would have been 600 s against a real one.
 
     The budget is deliberately **generous**. What carries the assertion is the *gap* — 3 s against
-    a 30 s stand-in deadline — not a tight bound, which is what keeps it from failing on its own
-    setup under load.
+    a `CLIENT_DEADLINE` of 5 s — not a tight bound, which is what keeps it from failing on its own
+    setup under load. Verified by reverting `close()` to the unbounded form: this test then fails
+    on the wall clock rather than passing, which it did while the stand-in returned instantly.
     """
     client = PollablePublisher(lambda _i: _NeverSettles())
     sink = GooglePubSubSink(
@@ -583,8 +601,10 @@ def test_close_is_bounded_rather_than_running_to_the_clients_deadline() -> None:
     elapsed = time.monotonic() - wall
     burned = time.process_time() - cpu
 
-    assert elapsed < 3.0, f"close() is bounded; ran {elapsed:.2f}s against a 30 s stand-in"
-    assert burned < 0.5, f"and waits rather than spinning; burned {burned:.2f}s of CPU"
+    assert elapsed < 3.0, (
+        f"close() is bounded; ran {elapsed:.2f}s against a {CLIENT_DEADLINE}s stand-in deadline"
+    )
+    assert burned < 0.1, f"and waits rather than spinning; burned {burned:.2f}s of CPU"
 
 
 def test_close_counts_the_publishes_it_abandoned(capsys) -> None:

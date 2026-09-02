@@ -459,6 +459,16 @@ class RotatingFileSink:
         subsequent event would retry the rotation and write another diagnostic, with no damping
         anywhere.
 
+        **The reopen can itself raise, and that is not absorbed.** It is the same
+        ``open(self._path, "a")`` call ``_rotate`` ends with, so whatever defeats it there —
+        a read-only mount, ``EMFILE``, a directory that lost write permission — defeats it here.
+        At that point this sink has no stream and cannot continue, so there is nothing to absorb
+        *into*; the ``OSError`` reaches ``emit`` and the worker retries the batch, duplicating the
+        prefix the pre-rotation flush had already written. That residue is recorded rather than
+        fixed: it is unchanged from before SPEC-048, the surviving events are on disk rather than
+        lost, and inventing a half-open state to avoid a duplicate would trade a visible
+        duplication for a silent loss.
+
         Args:
           None.
 
@@ -466,8 +476,9 @@ class RotatingFileSink:
           None.
 
         Raises:
-          None. The failure is announced through ``_diag`` and the batch continues; nothing is
-            dropped, so no counter moves and this class still has no ``losses()``.
+          OSError: If the *reopen* fails, per the paragraph above. A failed **rotation** is
+            absorbed and announced through ``_diag``; the batch continues, nothing is dropped, no
+            counter moves, and this class still has no ``losses()``.
         """
         try:
             self._rotate()

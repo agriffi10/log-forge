@@ -374,14 +374,45 @@ class GooglePubSubSink:
                     break
                 wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
             else:
-                expired.append(future)
-                expired.extend(pending[index + 1 :])
+                self._classify_remainder(pending[index:], expired, unboundable)
                 break
             if unpollable:
                 unboundable.append(future)
-            elif not settled:
-                expired.append(future)
         return expired, unboundable
+
+    def _classify_remainder(
+        self, remaining: list[Any], expired: list[Any], unboundable: list[Any]
+    ) -> None:
+        """Sorts the futures a deadline never reached into expired and unboundable.
+
+        The pass gives up on the whole remainder when its one deadline expires, and the two
+        outcomes must still be told apart: an expired future is unconfirmed and is counted, while
+        an **unboundable** one is a healthy publish that simply cannot be polled within a timeout,
+        and counting it invents loss. A blanket ``expired.extend(...)`` here charged three healthy
+        publishes as lost behind one stalled future, which is SPEC-036's measured defect
+        reintroduced by the fix that cites it.
+
+        The probe is a zero-second wait, so it costs nothing against a deadline that has already
+        gone: a future whose ``result()`` takes no ``timeout`` raises ``_Unboundable`` on the way
+        in, and everything else either settles immediately or reports itself still in flight.
+
+        Args:
+          remaining: The futures the pass did not reach, the current one first.
+          expired: The unconfirmed list, appended to in place.
+          unboundable: The cannot-be-polled list, appended to in place.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for future in remaining:
+            try:
+                if not self._resolve(future, 0):
+                    expired.append(future)
+            except _Unboundable:
+                unboundable.append(future)
 
     def _past(self, deadline: float, *, heed_stop: bool) -> bool:
         """Reports whether a resolution pass must stop.
