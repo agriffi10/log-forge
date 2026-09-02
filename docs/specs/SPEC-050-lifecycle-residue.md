@@ -1,7 +1,7 @@
 # Spec: Lifecycle Residue — Stranded Waiters, Unfinished Closes and Uncounted Loss
 
 **ID:** SPEC-050  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-09-02  
 **Depends On:** SPEC-013, SPEC-021, SPEC-027, SPEC-030, SPEC-031, SPEC-036, SPEC-039, SPEC-042, SPEC-045, SPEC-046
 
