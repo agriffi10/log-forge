@@ -911,7 +911,8 @@ close it.
 alternative was built and measured worse, or because fixing it would change a published contract.
 It is **not** a backlog: something genuinely unfinished belongs in §12, which names what would
 close it. A closed item is struck in place with the spec that closed it (SPEC-021's rule) and its
-reasoning is *not* repeated here — that lives in CLAUDE.md's Key Decisions and the delivery doc,
+reasoning is *not* repeated here — that lives in `decisions.md` (digested in CLAUDE.md's Key
+Decisions) and the delivery doc,
 and a third copy is a fork with no merge.
 
 - **`flush()` reports success over events `NATSSink`'s publish deadline absorbed.** Measured with
@@ -979,7 +980,7 @@ and a third copy is a fork with no merge.
 
 - ~~**A process that only ever used the orphan path never closes its sink**, and a sink
   adopted after `shutdown()` is closed by nothing.~~ — **fixed by SPEC-031 FR-006 and
-  SPEC-033.** The reasoning is in CLAUDE.md's Key Decisions ("The close is once-only across
+  SPEC-033.** The reasoning is in `decisions.md` ("The close is once-only across
   both delivery paths" and "A sink handoff is owned by whoever is delivering") and in
   [SPEC-031](spec-delivery/SPEC-031-audit-small-corrections.md) and
   [SPEC-033](spec-delivery/SPEC-033-orphan-path-sink-handoff.md); it is not repeated here.
@@ -1380,7 +1381,9 @@ and a third copy is a fork with no merge.
   reproduced byte-identically on the pre-SPEC-040 tree, so the refactor caused none of them.
   The sixth is the `shutdown(timeout=…)` limit stated above and is not repeated here. What each
   race was, and the depth counter, close registry and latch that closed them, is in
-  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and CLAUDE.md's Key Decisions.
+  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and `decisions.md` →
+  "A worker guard asks one of four questions". It is not in CLAUDE.md: the digest line for that
+  entry names none of the three.
 
 ---
 

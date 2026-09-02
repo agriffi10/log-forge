@@ -3,13 +3,12 @@
 #
 # Why this exists as a script rather than a rule. Every check below already existed in
 # prose — in `docs/process.md` §5 (*Anti-regrowth & doc hygiene*), in `CLAUDE.md`'s own
-# doc-size guardrail, and in `docs/decisions.md`'s rules header — and in the sibling
-# project this template was extracted from (`log-forge`, published as `log-foundry`),
-# every one of them was violated anyway. That repo's `CLAUDE.md` went from 7,583 bytes
-# on 2026-07-09 to 89,340 on 2026-09-02 — monotonically, not one commit reducing it —
-# while its own `process.md` named the violation in the present tense throughout and its
-# `CLAUDE.md` repeated the confession. It was cut back to 29,515 on 2026-09-02, in the
-# same change that first ran this script against it.
+# doc-size guardrail, and in `docs/decisions.md`'s rules header — and every one of them
+# was violated in THIS repo anyway. `CLAUDE.md` went from 7,583
+# bytes on 2026-07-09 to 89,340 on 2026-09-02 — monotonically, not one commit reducing
+# it — while `docs/process.md` named the violation in the present tense throughout and
+# `CLAUDE.md` repeated the confession. It was cut back to a digest over
+# `docs/decisions.md` in the change that first ran this script here.
 #
 # A rule a reader has to remember is a rule that rots. This is the same rules where CI
 # can see them.
@@ -44,14 +43,11 @@ cd "$ROOT"
 # RATCHETS AT THE MEASURED LEVEL, not targets. When a doc grows past one, the fix is
 # to move detail down a tier — into `docs/`, behind a pointer — which is the entire
 # reason the budget is here. Lowering the bar to fit the edit is the failure mode, and
-# it is how the sibling project reached 89 KB one justified exception at a time.
+# it is how this file reached 89 KB one justified exception at a time.
 #
-# ON ADOPTION, re-ratchet ALL THREE to what this repo measures once its real docs
-# exist, rounded up a little. A budget far above the measurement never fires. The
-# Set on 2026-09-02, the day this file was cut from 89,340 bytes to a digest over
-# docs/decisions.md, and DELIBERATELY NOT A RATCHET AT THE MEASURED LEVEL — the one
-# budget here that is not. The file measured 29,570 after the cut; a ratchet there left
-# 430 bytes, about two digest lines.
+# CLAUDE_MAX_BYTES is set deliberately and is the one budget here NOT pinned at the
+# measurement. The file was cut to a digest over docs/decisions.md on 2026-09-02, and a
+# ratchet at what it then measured left about two digest lines of room.
 #
 # The sibling repo already paid for that mistake and recorded it: its budget sat at
 # 34,000 with 161 bytes free, so the next spec to settle a decision could not close

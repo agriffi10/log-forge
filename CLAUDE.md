@@ -3,6 +3,7 @@
 Loaded every session — keep it lean. Deep docs live in `docs/` and are pulled **on demand**, except
 `process.md`, which is the contract this file summarises:
 - `@docs/process.md` — how we work: spec lifecycle, session rhythm, completion ritual (**read every session**)
+- `@docs/decisions.md` — the settled decisions in full; Key Decisions below is its one-line digest (read the entry for your area before working in it)
 - `@docs/architecture.md` — system design + Known Constraints / Non-goals (read the section you need)
 - `@docs/implementation-guide.md` — phase-by-phase build guide that mirrors architecture.md (reference)
 - `@docs/specs/INDEX.md` — the spec index + status (one row per spec)
@@ -37,7 +38,7 @@ implementation against the design in `architecture.md`.
   `ContinueResult`). The full module map is now built; the setup-phase
   `core.py` + `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
-- `docs/` — architecture, implementation guide, specs, spec-delivery, templates.
+- `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
 ## Tech Stack
 
@@ -119,137 +120,80 @@ in `@docs/decisions.md`, where every line below has an entry under the same bold
 for an area before working in it. A line here is **never the only home of a fact**, and a completion
 **replaces or extends the clause for its area** rather than appending a new one.
 
-
 ### The trace model and its context
 
-
 - **Unit of work = a decorated call** — `@log_foundry.trace`; the outermost call starts a trace, every call is a span within it. (arch §4)
-
 - **IDs are W3C Trace Context compatible** — `trace_id` 16B/32hex, `span_id` 8B/16hex, `log_id` UUID, so adopting tracing later stays cheap. (arch §3.1)
-
 - **Context via `contextvars`** — not thread-locals — correct under threads and asyncio; holds a span stack plus baggage. (arch §5)
-
 - **Cross-process traces are adopted explicitly, never auto-instrumented** — no client patching or middleware, which would need the deps the core refuses. Inbound context is untrusted and confers no authority. (SPEC-014)
-
 - **Boundary events take the span's *final* baggage; mid-span events keep the moment's** — backfill only at close. Backfilling everything inverts `build_event`'s precedence and lets baggage beat a per-call field. (SPEC-015)
-
 - **Per-request context is released at the root span — baggage restored, an adopted trace context cleared** — the asymmetry is deliberate: restoring an inbound context puts back an adoption made *before* the span, leaving a warm container joining the first caller's trace forever. (SPEC-024)
-
-- **A reserved word needs exactly one route through, including its own name** — `fields` is the third reserved word and `fields={"fields": …}` must work. The keyword form wins a collision, and the merge **absorbs** a non-mapping rather than raising. (SPEC-025, SPEC-034)
-
 
 ### The pipeline: buffer, worker, drain
 
-
 - **Buffer-then-flush, background, non-blocking** — the app never blocks on sink I/O; graceful drain on `atexit`/`shutdown()`. (arch §9)
-
 - **Two drains, deliberately distinct** — `shutdown()` is terminal; `flush()` drains on demand and leaves everything running. A frozen-not-exited process needs the second, and `atexit` never runs there. (SPEC-013)
-
 - **`flush()` reports delivery, and answers from the drain that carried the events** — a marker that finds nothing pending inherits the outcome of the emit ahead of it in the FIFO — otherwise a second concurrent flush reports success for events the first one just abandoned. (SPEC-021, SPEC-036)
-
 - **The close is once-only across both delivery paths; the `atexit` *registration* is not the thing being guarded** — the arming fires **after** the emit returns, because what must be recorded is that an event *reached* the sink; keying on a configured sink is the phrasing that misses it. (SPEC-004, SPEC-030, SPEC-031)
-
-- **A worker guard asks one of four questions, and the set is enforced rather than remembered** — existence, liveness, ownership, and ownership ∧ moment. Bare ownership skips the stop-signal offer for a worker whose shutdown has *finished*, leaving a live sink on a set event that never clears. (arch §9.2)
-
+- **A worker guard asks one of four questions, and the set is enforced rather than remembered** — existence, liveness, ownership, and ownership ∧ moment. Bare ownership skips the stop-signal offer for a worker whose shutdown has *finished*, leaving a live sink on a set event that never clears. **None of the four takes the lock.** The entry also carries the owed-close record (a set, not a slot), the per-module roster floor, and when joining beats detaching. (SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046; arch §9.2)
 - **Only the forked *child* is repaired, and its order of work is the contract** — locks and events, then inherited buffers, then the registered handlers — a lock re-initialised after a handler that takes it is a handler that hangs. `before` does not run for a C-level fork at all. (SPEC-039)
-
-- **A value the child inherits is stranded, never merely detached** — `dup2` to `/dev/null` *and* reopen in **append** mode: rebinding alone leaves the old object flushing to the real file, and `"w"` truncates a log shared with the parent. (SPEC-039)
-
+- **A value the child inherits is stranded, never merely detached** — `dup2` to `/dev/null` *and* reopen in **append** mode: rebinding alone leaves the old object flushing to the real file, and `"w"` truncates a log shared with the parent. The hook is **per-sink** on purpose: `StdoutSink` has the same window and must *not* be fixed. (SPEC-039)
 
 ### Event assembly: safety and bounds
 
-
+- **A reserved word needs exactly one route through, including its own name** — `fields` is the third reserved word and `fields={"fields": …}` must work. The keyword form wins a collision, and the merge **absorbs** a non-mapping rather than raising. (SPEC-025, SPEC-034)
 - **An event is safe by construction — coerced and bounded once at assembly, not per sink** — `build_event` runs every value through `sanitize.py`, so the bare `json.dumps` calls in `sinks/` are correct by consequence. The unserializable fallback is a type name, never `repr()`. Ceilings bound per *value*. (SPEC-017)
-
 - **A value too large to *render* is replaced, never clipped** — an over-long int becomes `<int: ~N digits>`; a truncated number is silently wrong. Detection is `bit_length()`, never `len(str(v))` — the obvious check raises the very error it prevents. (SPEC-020)
-
-- **A value on the wire is measured on the clock that cannot move** — rotation deadlines are `time.monotonic()`, since a wall-clock deadline is defeated by any step larger than the interval. The *label* stays wall-clock wherever one exists. (SPEC-031)
-
 
 ### The sink contract: delivery and its verdict
 
-
 - **The sink is a durable buffer, not the final store** — ship to SQS, which absorbs spikes and outages, and let a separate consumer index into ELK. `StdoutSink` is the zero-dep default. (arch §8, §9.1)
-
 - **A FIFO message group is a trace, not the process** — `MessageGroupId` defaults to the event's `trace_id`, which keeps traces parallel instead of serialising everything behind one group. Ordering is best-effort across a retry boundary, and sender faults are abandoned rather than re-sent. (SPEC-016)
-
 - **A positional response adjudicates all of a chunk or none of it** — a mismatch is evidence of misalignment, so even the overlapping prefix is refused. What cannot be adjudicated is abandoned and counted (`dropped_unadjudicated`), never retried. (SPEC-018)
-
 - **A sink that delivered nothing raises; one that delivered something reports** — a sink that absorbs a total failure is a sink the worker *believes*: retry never engages, counters stay at zero, and `flush()` returns `True` while everything is lost. (SPEC-026, SPEC-043)
-
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — both halves bind — three shipped sinks lost every post-`close()` event, while making the stateless sinks refuse would invent loss where a batch would have landed. (SPEC-032)
-
+- **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests because each accepted size is rediscovered in every branch; capping the recursion *depth* instead is the trap — a cap of 4 against a 250x ratio delivered 2 events of 2,000. (SPEC-038)
 
 ### The sink contract: waiting, concurrency and shutdown
 
-
+- **A value on the wire is measured on the clock that cannot move** — rotation deadlines are `time.monotonic()`, since a wall-clock deadline is defeated by any step larger than the interval. The *label* stays wall-clock wherever one exists. (SPEC-031)
 - **A sink's wait is bounded, interruptible, and never taken on a destination's word** — one drain thread means a sink's backoff pauses *all* delivery and spans `shutdown()`, so every sink waits on the worker's stop event and `time.sleep` is the wrong primitive. (SPEC-027, SPEC-038, SPEC-047)
-
 - **A sink tolerates concurrent callers; the library cannot serialize them for it** — a level call with no active span emits on the *caller's* thread, so `emit`/`close` are called concurrently against one sink object. It is a requirement on implementations, not a promise the library can keep. (SPEC-028)
-
 - **A terminal `shutdown()` and a captured sink are both reported, not prevented** — logging after `shutdown()` is still *accepted* — refusing would hide the mistake and restarting the worker would fight a process trying to exit. `Health` reports the **pair** `retired` + `submitted_after_shutdown`. (SPEC-030)
-
 - **A sink handoff is owned by whoever is delivering, and "a worker exists" is not "a worker owns this sink"** — the orphan path records the sink **object** an emit reached, because `configure()` assigns `_config.sink` *before* the swap runs and a boolean cannot tell the two apart. (SPEC-033)
-
 - **A shutdown shortens a *wait*; it must never skip *work*** — the stop event is set for the whole of `_final_drain`, so any sink consulting it to do *less* degrades itself on the exit drain — the one path a serverless process has. (SPEC-038)
-
-- **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests because each accepted size is rediscovered in every branch; capping the recursion *depth* instead hides the loss. (SPEC-038)
-
-- **A subclass that inherits a method is still in the roster** — scope a roster on defines-or-inherits: keying on *defining* a method made membership a function of where code sits, and dropped five classes out of two lints in one commit with the suite green. (SPEC-038)
-
-- **A bound is only a bound if it is measured where it binds** — assert **CPU** time, not wall clock, or a busy-spin passes; a timeout applied per *item* is `n × timeout`, not a bound. (SPEC-038)
-
 - **A process releases only a transport it acquired *here*, and unrecorded must be unclaimable rather than merely unreleasable** — the record is stamped when the library is *handed* a sink, over the whole reachable graph, and every close consults it. Write-once alone defends only a record that already exists. (SPEC-042)
-
 
 ### Failure paths and diagnostics
 
-
 - **A dead worker is reported, not restarted — and as a *reason*, not a liveness flag** — `Health.stopped_reason` is `None` for a live worker, a never-created one, **and** a cleanly shut-down one, so it extends the alert idiom by a term. No auto-restart: a thread that resurrects itself fights a process trying to exit. (SPEC-019)
-
 - **Every path the caller stands on is total, and a swallowed fault is announced by *type*** — never `BaseException` — a `KeyboardInterrupt` or `SystemExit` is the operator's or the runtime's intent and must reach the caller. (SPEC-025)
-
 - **One module writes every diagnostic, so the rules are applied once rather than remembered twenty-eight times** — `_diag` owns `absorbed`/`lost`/`rejected`, and an exception is named by `type(exc).__name__`, never `repr(exception)`. Twelve sites printed the repr and two were unguarded before the rules had one home. (SPEC-029)
-
 
 ### The public API surface
 
-
 - **Logs-only, send everything for now** — no metrics or OTel-native traces. Sampling is deferred and **unbuilt** — no `should_send` exists in code — and the per-span flush makes the pipeline span-outcome-ready, *not* tail-sampling-ready. (arch §10, §13)
-
 - **An extra's floor is a published contract — moved deliberately, never by a bot** — `versioning-strategy: increase-if-necessary` stays, so floors move only when a human decides they should. A floor raise is a contract change. (No spec — it shipped alongside SPEC-022 in `v0.9.0`.)
-
 - **A public accessor hands out a copy; the library reads the live object** — a public getter documented "do not mutate" is a promise the caller's slip breaks silently; `_live_config()`/`_live_baggage()` are the per-event reads. (SPEC-034)
-
 - **A result that can grow a reason must stop being a `bool` before 1.0, not after** — a `NamedTuple` cannot be retrofitted — a non-empty tuple is always truthy, so every `if flush():` would silently keep passing. `FlushResult`/`ContinueResult` grow by new reason values only. (SPEC-034)
-
 - **A protocol that is exported is a protocol that will be inherited** — `Sink`'s members are `@abstractmethod`: empty bodies let a subclass with one typo instantiate happily and return `None` from `emit`, losing events with every counter at zero. (SPEC-034)
-
 
 ### Release, supply chain and naming
 
-
 - **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases; merges to `main` publish `.devN` pre-releases. (SPEC-012)
-
-- **Every action is pinned to a commit SHA, and the pins are maintained, not frozen** — a mutable tag on a workflow holding `id-token: write` against PyPI is a silent path from a third-party repository into every consumer's install. A lagging pin fails loudly; a compromised action fails forever. (SPEC-022)
-
+- **Every action is pinned to a commit SHA, and the pins are maintained, not frozen** — a mutable tag on a workflow holding `id-token: write` against PyPI is a silent path from a third-party repository into every consumer's install. A lagging pin fails loudly; a compromised action fails forever. The version comment must read exactly `# vX.Y.Z` or Dependabot silently stops rewriting the pin — that comment is what "maintained" rests on. (SPEC-022)
 - **A scanner that exits zero has not said "clean"** — the alert count is the verdict, never the check mark — zizmor and CodeQL pass the job regardless of findings by design, and only `dependency-review` fails a build. (SPEC-022)
-
 - **An SBOM describes the published artifact, and is generated from it** — `make-sbom.py` describes the built wheel installed with every extra, and runs from a *second* venv or it lists its own ~30 dependencies as the library's. (SPEC-023)
-
 - **Release assets are attached to a draft, never to a published release** — immutable releases freeze assets at publish, so it is create-as-draft → upload → publish. Deleting an immutable release does **not** free its tag name; a botched release is repaired only by a new version tag. (SPEC-023)
-
 - **`pip-audit` gates, and audits the extras or it audits nothing** — `dependency-review` only sees a PR's dependency *diff*, so the weekly re-examination is the point. `--no-root` is load-bearing and `--strict` is on, because a silently skipped package is a silently unaudited one. (SPEC-023)
-
 - **One name everywhere: `log-foundry` / `log_foundry`** — the import package was renamed from `log_forge` in `v0.2.0` to match the distribution name — breaking for `0.1.x`, no shim. Historical `log-forge` mentions survive only where they name the PyPI-rejected original.
 
+### Working rules: findings, rosters and testing bounds
 
-### Working rules for findings and open items
-
-
+- **A subclass that inherits a method is still in the roster** — scope a roster on defines-or-inherits: keying on *defining* a method made membership a function of where code sits, and dropped five classes out of two lints in one commit with the suite green. (SPEC-038)
+- **A bound is only a bound if it is measured where it binds** — assert **CPU** time, not wall clock, or a busy-spin passes; a timeout applied per *item* is `n × timeout`, not a bound. (SPEC-038)
 - **An open item is closed by being fixed, settled, or recorded as a constraint — never deleted** — a note merely removed takes its reasoning with it, and a reader cannot tell a live defect from a decision that reads like one. Supersede in place, struck through and marked with the spec that closed it. (SPEC-021)
-
-- **A read-only finding is not closed until it has been run, and the job that runs it needs a floor rather than an exit code** — fourteen sink modules reach a third party through eleven optional extras and none was ever executed, so the sinks most likely to be in production were the least verified. (SPEC-041)
+- **A read-only finding is not closed until it has been run, and the job that runs it needs a floor rather than an exit code** — fourteen sink modules reach a third party through eleven optional extras and none was ever executed, so the sinks most likely to be in production were the least verified. **A floor, not an exit code:** a fixture that skips on an absent service exits **0**, so a dropped module reads as a smaller pass count and nothing fails — an absent service must fail, and a per-module floor makes a silent shrink loud. (SPEC-041)
 
 ## Out of Scope (don't build)
 
@@ -277,7 +221,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 2. Update the one-line row in `@docs/specs/INDEX.md` (status only — don't add prose).
 3. Write a short delivery doc at `docs/spec-delivery/SPEC-XXX-<name>.md` from the template.
 4. If it added reusable modules, add a one-line row to `@docs/component-inventory.md`.
-5. A *new architectural decision* gets its **full entry in `@docs/decisions.md` first**, then one line in Key Decisions above — never a paragraph there, and never the only home of the fact. Add it to the AREA it belongs to, replacing or extending that area's clause rather than appending a new one. If it **supersedes** an earlier decision, add an in-place superseded marker (short blockquote) at every doc site still stating the old claim. Reasoning belongs in the spec/delivery doc.
+5. A *new architectural decision* gets its **full entry in `@docs/decisions.md` first, plus a row in that file's `## Contents`** — docs-lint fails an entry the Contents does not reach — then one line in Key Decisions above, under the same AREA, replacing or extending that area's clause rather than appending a new one. Never a paragraph there, and never the only home of the fact. If it **supersedes** an earlier decision, add an in-place superseded marker (short blockquote) at every doc site still stating the old claim. Reasoning belongs in the spec/delivery doc.
 
 **Doc-size guardrail:** this is the always-loaded file — if an edit pushes a section past a few
 lines, the detail belongs in a `docs/` file behind a pointer. Same for `INDEX.md` (status rows only)
@@ -286,6 +230,9 @@ it is not a per-spec changelog, and `## Specs` is not one either. Both were exac
 2026-09-02, when this file was cut from 89,340 bytes to a digest over `@docs/decisions.md`; the rule
 had been stated here and in `@docs/process.md` §5 the whole time and lost anyway, roughly forty
 times running. **`scripts/docs-lint.sh` now enforces it on every PR** — the byte budget, the digest
-line cap, and an entry in the register behind every digest line. The budget is a **ratchet**: when it
-fires, cut and re-ratchet at the new measurement, never raise it to fit the edit in hand. Full rule
+line cap, and an entry in the register behind every digest line. The digest cap and the delivery cap are **ratchets**: when one fires, cut
+and re-ratchet at the new measurement, never raise it to fit the edit in hand. The byte budget is
+deliberately **not** one — it carries headroom on purpose, because a budget pinned at the measurement
+makes the next spec to settle a decision pay for it by pruning another area's fences. The script says
+why. Full rule
 set: `@docs/process.md` §5 → *Anti-regrowth & doc hygiene*.

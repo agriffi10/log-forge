@@ -22,3 +22,4 @@ carried. Add a row when a release is cut.
 | `v0.3.0` | SPEC-013 + SPEC-014 |
 | `v0.2.0` | the `log_forge` → `log_foundry` rename (no spec — a mechanical change) |
 | `v0.1.0` | the first stable release |
+| `v0.0.1` | the first tag cut, before the package was published under this name |

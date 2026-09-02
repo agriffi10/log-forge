@@ -18,7 +18,8 @@ is deliberately small and **must not regrow**.
 
 | Tier | File(s) | Loaded | Authoritative for |
 |---|---|---|---|
-| Always | `CLAUDE.md` | every session | conventions, key decisions, session workflow |
+| Always | `CLAUDE.md` | every session | conventions, the key-decisions **digest**, session workflow |
+| Decisions | `docs/decisions.md` | the entry for the area you are working in | the settled decisions **in full** — reasoning, rejected alternatives, every "do NOT build" fence |
 | Status | `docs/specs/INDEX.md` + each spec header | on demand | spec **status** (one row per spec) |
 | The work | `docs/specs/SPEC-XXX-*.md` | the one you're building | requirements + phases |
 | Why | `docs/architecture.md` | the *section* you need | design rationale + Known Constraints |
@@ -498,9 +499,13 @@ When a spec is done, in the same pass:
    code/config pasted** (the code + component-inventory are the source of truth for reuse).
 4. If reusable modules/services/components were added, add a **one-line** row to
    `docs/component-inventory.md`.
-5. A *new architectural decision* gets **one line** in CLAUDE.md's Key Decisions (+ a pointer) — never a
-   paragraph, and the digest line is **never the only home of a fact**. Reasoning lives in the
-   spec/delivery doc. If the decision **supersedes an earlier one**, add a superseded marker (short
+5. A *new architectural decision* gets its **full entry in `docs/decisions.md` first**, under the AREA
+   it belongs to, **and a row in that file's `## Contents`** — an entry missing from the Contents is
+   findable only by reading the whole file, and `scripts/docs-lint.sh` fails the PR for it. Then, and
+   only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
+   that area's clause rather than appending a new one. Entry first, line second: the digest line is
+   **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
+   a reminder and become the reasoning, which belongs in the register. If the decision **supersedes an earlier one**, add a superseded marker (short
    blockquote: what changed, which spec, where the full entry lives) at every doc site that still
    states the old claim — `architecture.md` sections, `INDEX.md` build-order notes. The new entry
    alone is not enough; an agent reading only the old site must see the reversal.
@@ -523,15 +528,17 @@ this way).
   reads as disposable gets treated as disposable. **Paid 2026-09-02:** `docs/decisions.md` now holds
   the 48 entries in nine areas, and `CLAUDE.md`'s Key Decisions is a one-line digest grouped by the
   same areas. A completion **replaces or extends the clause for its area** rather than appending
-  another entry — appending is what took this file's own digest from 7,583 bytes to 89,340 in eight
-  weeks, with this rule stated here throughout.
+  another entry — appending is what took `CLAUDE.md` from 7,583 bytes to 89,340 in eight weeks,
+  with this rule stated here throughout.
 - **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
   (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
   bullet to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
   digest line for every entry, and to list every entry in its Contents; requires every Completed spec
-  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The budgets are
+  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The digest and delivery caps are
   ratchets at the measured level** — when one fires, move detail down a tier and re-ratchet, rather
-  than raising the cap. Every rule it checks was already written here, and every one was violated
+  than raising the cap. The `CLAUDE.md` byte budget is deliberately NOT pinned at the measurement: it
+  carries headroom, because a budget with none forces the next closing spec to prune another area's
+  fences to buy room for its own, which is the gate causing the damage it exists to prevent. Every rule it checks was already written here, and every one was violated
   anyway; that is the argument for a script over a paragraph.
 - **When a doc moves, the pointers that rot unseen are in SOURCE files** — `.py` docstrings, `.toml`
   comments, `.yml` steps. A markdown-only sweep reports the tree clean. Grep the path, not the
@@ -561,7 +568,8 @@ this way).
   other docs must match a greppable heading — "read the entry for your area" must be a jump, not a
   full-file read.
 - **Live findings and obligations never live in historical or cancelled narrative** — rehome them to
-  CLAUDE.md's Key Decisions or the relevant `architecture.md` section, and leave a pointer behind.
+  `docs/decisions.md` (with its one-line digest in CLAUDE.md's Key
+  Decisions) or the relevant `architecture.md` section, and leave a pointer behind.
   `docs/audits/` is history: a live obligation parked in a handoff doc is one nobody will read.
 
 ---
