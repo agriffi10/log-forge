@@ -70,24 +70,35 @@ CLAUDE_MAX_BYTES=34000
 # bullet with its continuation lines joined, or a prose paragraph — because measuring
 # the physical line looks equivalent and is not: the moment the section is rewritten as
 # wrapped prose the longest physical line collapses to the wrap width, and the guard can
-# never fire again while still being advertised in process.md.
-#
-# A PROSE PARAGRAPH COUNTS AS A UNIT, and that is the point. Keying only on "- " left
-# the section rewritable as prose to escape both this cap and the register cross-check
-# below — 6.8 KB of settled decisions with no register behind them passed green.
+# never fire again while still being advertised in process.md. A PROSE PARAGRAPH COUNTS
+# AS A UNIT, and that is the point: keying only on bullets left the section rewritable
+# as prose to escape both this cap and the register cross-check below.
 #
 # BYTES, not characters: awk length() is byte-based in the one-true-awk that ships on
-# BSD and macOS, so em dashes and smart quotes count for more than one. Named for what
-# it actually measures rather than for what would be tidier.
-DIGEST_MAX_BYTES=1400
+# macOS, so em dashes and smart quotes count for more than one.
+#
+# 800 rather than the template default of 1400, which was calibrated on a repo whose
+# digest lines are far denser than this one. After the 2026-09-02 cut this corpus runs
+# min 136 / median 273 / p90 321 / max 334 bytes, so 1400 sat 4.2x above the worst unit
+# it governed and could not fire — a fence advertised in process.md that was not one,
+# which is the same failure as a budget set far above its measurement. 800 clears the
+# current worst by 2.4x, so no ordinary new line trips it, and sits below the seventeen
+# pre-cut units that were the actual problem. Measured against the pre-cut section
+# rather than asserted: it fires on those seventeen and on nothing that exists today.
+DIGEST_MAX_BYTES=800
 
 # A delivery doc answers "what shipped and what changed"; the completion template aims
-# for well under a page. Applies to every *.md in docs/spec-delivery/, not only those
-# tied to a Completed spec. A RATCHET AT THE MEASURED LEVEL rather than the template
-# default of 150: three docs already sit above that (SPEC-028 at 267, SPEC-030 at 230,
-# SPEC-032 at 165), written before anything checked, and failing main on three historical
-# docs on day one is how a new gate gets switched off. Trimming any of them LOWERS this
-# number in the same PR; nothing may raise it.
+# for under ~40 lines. Applies to every *.md in docs/spec-delivery/, not only those tied
+# to a Completed spec.
+#
+# 270 rather than the template default of 150 because three docs already sit above that
+# (SPEC-028 at 267, SPEC-030 at 230, SPEC-032 at 165), written before anything checked,
+# and failing main on three historical docs on day one is how a new gate gets switched
+# off. Read it accurately, though: the binding doc is SPEC-028 at 267 and it is frozen
+# history, so this constant does not mean "a delivery doc may run to 270 lines" — it
+# means nobody may add four lines to SPEC-028. New docs aim well under a page and will
+# not approach it. Trimming any of the three LOWERS this number in the same PR; nothing
+# may raise it.
 DELIVERY_MAX_LINES=270
 
 CLAUDE="CLAUDE.md"
