@@ -77,14 +77,20 @@ CLAUDE_MAX_BYTES=34000
 # BYTES, not characters: awk length() is byte-based in the one-true-awk that ships on
 # macOS, so em dashes and smart quotes count for more than one.
 #
-# 800 rather than the template default of 1400, which was calibrated on a repo whose
-# digest lines are far denser than this one. After the 2026-09-02 cut this corpus runs
-# min 136 / median 273 / p90 321 / max 334 bytes, so 1400 sat 4.2x above the worst unit
-# it governed and could not fire — a fence advertised in process.md that was not one,
-# which is the same failure as a budget set far above its measurement. 800 clears the
-# current worst by 2.4x, so no ordinary new line trips it, and sits below the seventeen
-# pre-cut units that were the actual problem. Measured against the pre-cut section
-# rather than asserted: it fires on those seventeen and on nothing that exists today.
+# 800 rather than the template default of 1400, which was calibrated on the sibling
+# repo, whose digest lines are much denser than this one. At 1400 this cap sat several
+# times above the worst unit it governed and could not fire — process.md advertised as
+# a fence the one check that was not one, which is the same failure as a budget set far
+# above its measurement. 800 leaves a dense claim-plus-fence line ample room while
+# sitting below the units that made the pre-cut file unreadable.
+#
+# Deliberately carries NO count of what it catches. The evidence is the Key Decisions
+# section as it stood at e60b60d, which is frozen and can be re-measured by anyone who
+# wants to check the claim. A cap comment is read exactly when someone is about to
+# change what it counts, and process.md §5 forbids a standing rule citing a volatile
+# number for that reason: architecture.md §12 carries "Measured 2026-09-01: 1,398 and
+# 1,887 lines" and one of those files was 2,030 within a commit of it being written.
+# Dating the measurement did not save it — a dated number still reads as current.
 DIGEST_MAX_BYTES=800
 
 # A delivery doc answers "what shipped and what changed"; the completion template aims
