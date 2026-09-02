@@ -95,6 +95,7 @@ class KafkaSink:
         bootstrap_servers: str | None = None,
         key_field: str = "trace_id",
         flush_timeout: float = DEFAULT_FLUSH_TIMEOUT,
+        producer_config: dict[str, object] | None = None,
     ) -> None:
         """Binds the sink to a topic and a producer.
 
@@ -110,22 +111,43 @@ class KafkaSink:
             default, as ``Worker._emit`` floors its own retries (SPEC-021): ``0`` reinstates
             exactly the ``flush(0)`` that switched this sink's exit delivery off, and ``inf``
             reinstates the unbounded wait.
+          producer_config: ``librdkafka`` configuration merged **beneath** this sink's own keys
+            when it builds the producer (SPEC-047 FR-003). It is the route to the bound that
+            actually governs delivery here: this sink adds no retry — ``produce()`` is a local
+            hand-off, measured at 0.0001 s for three messages against a dead broker — and
+            ``librdkafka`` retries on its own thread within ``message.timeout.ms``, whose
+            five-minute default was measured at a 300.18 s delivery callback. Before this
+            argument nothing reached it, so a caller working to a shorter deadline could not fit
+            the sink inside one. The default is deliberately left alone: lowering it would drop
+            messages that a process surviving a two-minute broker outage delivers today, which
+            is the durable-buffer role ``architecture.md`` section 8 gives this sink.
 
         Returns:
           None.
 
         Raises:
-          ValueError: If no producer is injected and no broker list was given.
+          ValueError: If no producer is injected and no broker list was given, or if
+            ``producer_config`` is passed alongside ``producer=`` — it can only be applied to a
+            producer this sink builds, and ignoring it would silently discard the caller's bound
+            (SPEC-043's rule).
           ImportError: If the ``kafka`` extra is not installed.
         """
-        if producer is None:
+        if producer is not None:
+            if producer_config is not None:
+                raise ValueError(
+                    "KafkaSink cannot apply producer_config to an injected producer, which is "
+                    "already built; pass the settings where the producer is constructed"
+                )
+        else:
             if bootstrap_servers is None:
                 raise ValueError(
                     "KafkaSink requires bootstrap_servers when no producer is injected"
                 )
             from confluent_kafka import Producer  # type: ignore[import-not-found]
 
-            producer = Producer({"bootstrap.servers": bootstrap_servers})
+            producer = Producer(
+                {**(producer_config or {}), "bootstrap.servers": bootstrap_servers}
+            )
         self.topic = topic
         self.producer = producer
         self.key_field = key_field

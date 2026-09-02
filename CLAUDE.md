@@ -619,6 +619,25 @@ against the real `sentry-sdk` in **SPEC-041's** extras leg of the unit suite, ne
   `emit`, and a leaked resource in an exiting process beats a corrupt write. It reports through
   `stopped_reason` (`"ShutdownTimeout"`) rather than a new field, extending SPEC-019's vocabulary
   as that spec intended. (SPEC-027, arch §9)
+  **A bound belongs to the BATCH, and whose bound it is decides whether to add one or expose it**
+  (SPEC-047). `NATSSink` awaited a JetStream ack per *event* over an unbounded batch — measured
+  25.01 s for five against a stalled server, with `_final_drain` handing the exit backlog over as
+  one batch — which is SPEC-038's "a bound applied per item is `n × timeout`, not a bound" in a
+  sink that spec did not reach. One `publish_timeout` now covers the call, each publish taking
+  `min(DEFAULT_ACK_TIMEOUT, remaining)`; the bare remainder would give the *first* event a longer
+  ack wait than the driver's own default. It reads no stop signal and declares no
+  `log_foundry_stop_signal`: that await is **work**, not an inter-attempt wait. `KafkaSink` gets
+  **no** retry and no new bound — `produce()` is a 0.0001 s local hand-off and librdkafka's own
+  retry is real (measured: the delivery callback at 300.18 s), so a second loop could only re-send
+  messages the producer already owns, duplicating downstream against SPEC-018 and multiplying the
+  worst case rather than bounding it. What was missing there was **reachability**, so
+  `producer_config=` exposes librdkafka's bound and the five-minute default stands, since lowering
+  it would drop what a process surviving a short outage delivers today. An argument the receiving
+  backend cannot consume is a `ValueError`, never an ignore (SPEC-043) — but `publish_timeout` is
+  outside that set, being the sink's own bound rather than a connect-time request. The exit drain
+  is still `(max_retries + 1) × publish_timeout` and can exceed `shutdown()`'s join; recorded in
+  §12 rather than closed, because bounding the worker's retry of an already-bounded batch is every
+  sink's question. (SPEC-047, arch §12, §13)
 - **A sink tolerates concurrent callers; the library cannot serialize them for it** — the worker
   drains on one thread, but a level call with no active span emits on the *caller's* thread, so
   `emit`/`close` are called concurrently against one sink object and `sinks/base.py` states that as

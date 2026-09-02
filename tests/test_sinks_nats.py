@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 
@@ -492,3 +493,102 @@ def test_the_core_publish_still_takes_no_timeout() -> None:
     from nats.aio.client import Client
 
     assert "timeout" not in inspect.signature(Client.publish).parameters
+
+
+# --- SPEC-047 FR-002: the driver's connect bounds are reachable from the constructor ----------
+
+
+class FakeNatsModule:
+    """A stand-in for the `nats` module, capturing what `connect` was asked for.
+
+    Nothing in this suite drove the constructor's *build* path before SPEC-047 -- every test
+    injects `client=` -- so the kwargs it forwards were unobservable.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple, dict]] = []
+
+    async def _connect(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return FakeNATS()
+
+    def connect(self, *args, **kwargs):
+        return self._connect(*args, **kwargs)
+
+
+def _build(monkeypatch, **kwargs) -> FakeNatsModule:
+    module = FakeNatsModule()
+    monkeypatch.setitem(sys.modules, "nats", module)
+    NATSSink("logs", servers="nats://example:4222", **kwargs).close()
+    return module
+
+
+def test_each_connect_bound_is_forwarded_to_the_driver(monkeypatch) -> None:
+    # FR-002 AC-1.
+    module = _build(
+        monkeypatch,
+        connect_timeout=1.5,
+        max_reconnect_attempts=3,
+        reconnect_time_wait=0.25,
+        drain_timeout=4.0,
+    )
+    _, kwargs = module.calls[0]
+    assert kwargs == {
+        "connect_timeout": 1.5,
+        "max_reconnect_attempts": 3,
+        "reconnect_time_wait": 0.25,
+        "drain_timeout": 4.0,
+    }
+
+
+def test_omitting_them_reproduces_todays_call_exactly(monkeypatch) -> None:
+    # FR-002 AC-3. Asserted on the ABSENCE of the keys, not on their values: passing the driver's
+    # own defaults explicitly would look identical in a value assertion while changing the call.
+    module = _build(monkeypatch)
+    args, kwargs = module.calls[0]
+    assert args == ("nats://example:4222",)
+    assert kwargs == {}
+
+
+@pytest.mark.parametrize(
+    "kwarg",
+    ["connect_timeout", "max_reconnect_attempts", "reconnect_time_wait", "drain_timeout"],
+)
+def test_a_connect_bound_alongside_an_injected_client_is_refused(kwarg: str) -> None:
+    # FR-002 AC-4. An injected client is already connected, so the argument can have no effect;
+    # ignoring it would silently discard the caller's bound (SPEC-043's rule).
+    with pytest.raises(ValueError, match=kwarg):
+        NATSSink("logs", client=FakeNATS(), **{kwarg: 1})
+
+
+def test_publish_timeout_is_not_refused_alongside_an_injected_client() -> None:
+    # FR-001 AC-10, as the counterpart to the rule above: publish_timeout is this sink's own
+    # bound over its own loop, so it applies to any client. Every other test in this module
+    # injects one, so folding it into the refusal set would break the whole file.
+    sink = NATSSink("logs", client=FakeNATS(), publish_timeout=2.0)
+    assert sink.publish_timeout == 2.0
+    sink.close()
+
+
+def test_a_refused_construction_creates_no_event_loop(monkeypatch) -> None:
+    # The refusal is raised BEFORE `asyncio.new_event_loop()`, not after. Raising after it leaves
+    # a loop nobody closes, which surfaces only as a PytestUnraisableExceptionWarning whenever the
+    # GC happens to reach it -- a green run with a leak in it.
+    #
+    # Asserted by counting the CONSTRUCTOR CALL, not by counting live loop objects: a survey of
+    # `gc.get_objects()` sees every other test's loops too, so its baseline moves depending on
+    # what ran first -- measured, it passed alone and failed beside `test_sinks_kafka.py`. The
+    # invariant is an ordering one, so the ordering is what the test observes.
+    created = 0
+    real = asyncio.new_event_loop
+
+    def counting_new_event_loop():
+        nonlocal created
+        created += 1
+        return real()
+
+    monkeypatch.setattr(asyncio, "new_event_loop", counting_new_event_loop)
+    with pytest.raises(ValueError):
+        NATSSink("logs", client=FakeNATS(), connect_timeout=1.0)
+
+    assert created == 0, "the refusal must come before the loop is built, or it leaks one"

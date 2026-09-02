@@ -160,8 +160,16 @@ delay rather than bound it. But it has to be a decision, not a documentation edi
 decision about how each *client* behaves, which is a question only a real service can answer.
 
 **The widening, and why it is here rather than in a later spec.** Answering AC-1 for `NATSSink`
-required running it against a real server, and the answer — "bounded, because it never waits" —
-is true for a reason that is itself a defect. Core `publish()` writes into the client's outbound
+required running it against a real server, and the answer — ~~"bounded, because it never waits"~~ —
+is true for a reason that is itself a defect.
+
+> **Superseded by SPEC-047 FR-001.** "It never waits" is true of a *core* publish, which is what
+> this FR measured, and false of a **JetStream** one, which awaits an ack. The awaits are
+> sequential and nothing bounded how many there were, so the cost was `n × 5 s` on the single
+> drain thread — measured at 25.01 s for five events against a stalled server, with
+> `Worker._final_drain` handing the exit backlog over as one batch. `NATSSink` now bounds a whole
+> `emit` with one `publish_timeout`. Struck in place rather than corrected silently, per
+> SPEC-021's rule. Core `publish()` writes into the client's outbound
 buffer and returns, so with the server stopped five successive `emit`s each returned in 0.00 s
 with `losses()` reading `dropped=0, failed=0`, 96 bytes sat in the client's pending buffer, and
 when the reconnect budget (60 attempts × 2 s) expired first, **one of six events reached the

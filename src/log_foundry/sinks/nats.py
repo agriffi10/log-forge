@@ -87,8 +87,11 @@ class NATSSink:
     disconnected.
 
     The limit is stated rather than overclaimed: ``is_connected`` does not flip the instant the
-    server dies, so the first batch in the window before the client notices is still accepted and
-    still buffered — measured, one of five emits landed in that window. It is the same
+    server dies, so a batch in the window before the client notices is still accepted and still
+    buffered. ~~Measured, one of five emits landed in that window.~~ **Corrected by SPEC-047
+    FR-004:** the window is wider than that reading suggests — the flag was still ``True``
+    **40 s after the server was stopped**, which is a lower bound on the window rather than the
+    window, because ``nats-py`` notices through a 120 s ping interval or a failed write. It is the same
     check-then-act window ``MongoDBSink`` and ``KafkaSink`` already document for their own flags;
     what the guard ends is the far larger case of an outage that has been going on for any
     appreciable time. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
@@ -104,6 +107,10 @@ class NATSSink:
         jetstream: bool = False,
         servers: str | None = None,
         publish_timeout: float = DEFAULT_PUBLISH_TIMEOUT,
+        connect_timeout: float | None = None,
+        max_reconnect_attempts: int | None = None,
+        reconnect_time_wait: float | None = None,
+        drain_timeout: float | None = None,
     ) -> None:
         """Binds the sink to a subject and connects if no client was injected.
 
@@ -116,14 +123,45 @@ class NATSSink:
             :func:`~log_foundry.sinks._retry.usable_timeout` as ``KafkaSink`` floors its flush
             (SPEC-047 FR-001). It applies to an injected ``client=`` too: it is this sink's own
             bound over its own loop, not a request made of the driver at connect time.
+          connect_timeout: Seconds the driver may spend on one connection attempt, or ``None``
+            to pass nothing and leave the driver's own default (SPEC-047 FR-002).
+          max_reconnect_attempts: Attempts the driver makes before giving up, or ``None`` to
+            pass nothing. This is what governs the *initial* connect too, which is why the
+            constructor blocked for a measured 120.17 s against a dead server at the driver's
+            defaults (60 attempts x 2 s) before this argument existed.
+          reconnect_time_wait: Seconds between reconnect attempts, or ``None`` to pass nothing.
+          drain_timeout: Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
+            forwarded because it does bound the driver's subscription drain, but it is **not**
+            what bounds :meth:`close`: ``drain()`` ends with a ``flush()`` carrying the driver's
+            own 10 s default, and that is what fired in both measured cases (10.00 s against a
+            stalled server, 0.00 s against a stopped one). Recorded in ``architecture.md``
+            section 12.
 
         Returns:
           None.
 
         Raises:
+          ValueError: If a connect-time argument is passed alongside ``client=``, which cannot
+            consume it — SPEC-043's rule that an argument no backend can use is an error rather
+            than a silent ignore. ``publish_timeout`` is deliberately outside that set: it is
+            this sink's own bound and applies to any client.
           ImportError: If the ``nats`` extra is not installed.
           Exception: Whatever the driver raises when connecting.
         """
+        options: dict[str, object] = {
+            "connect_timeout": connect_timeout,
+            "max_reconnect_attempts": max_reconnect_attempts,
+            "reconnect_time_wait": reconnect_time_wait,
+            "drain_timeout": drain_timeout,
+        }
+        supplied = {name: value for name, value in options.items() if value is not None}
+        if client is not None and supplied:
+            raise ValueError(
+                "NATSSink cannot apply "
+                + ", ".join(sorted(supplied))
+                + " to an injected client, which is already connected; "
+                "pass them where the client is built, or drop client="
+            )
         self._subject = subject
         self._jetstream = jetstream
         self.publish_timeout = usable_timeout(publish_timeout, DEFAULT_PUBLISH_TIMEOUT)
@@ -135,7 +173,7 @@ class NATSSink:
             import nats  # type: ignore[import-not-found]
 
             client = self._loop.run_until_complete(
-                nats.connect(servers or "nats://localhost:4222")
+                nats.connect(servers or "nats://localhost:4222", **supplied)
             )
         self._client = client
 

@@ -820,6 +820,27 @@ close it.
   means bounding the worker's retry of an *already-bounded* batch, which is every sink's question
   and not this sink's. **Closed by** a spec that gives `Worker._emit` a total budget, or by the
   caller lowering `publish_timeout` to 7.0 or below.
+- **`NATSSink.close()`'s real bound is the driver's, and it is not reachable** (SPEC-047 FR-002).
+  `Client.drain` is `wait_for(drain_is_done, drain_timeout)` followed by `self.flush()`, whose 10 s
+  default is not a `connect()` option. `drain_timeout` is therefore forwarded but is **not** what
+  bounded `close()` in either measured case — 10.00 s against a stalled server (`FlushTimeoutError`)
+  and 0.00 s against a stopped one (`ConnectionReconnectingError`). **Closed by** the driver
+  exposing that flush timeout as a connect option, or by this sink driving `drain()` and `flush()`
+  itself instead of calling the driver's combined one.
+- **`NATSSink`'s `is_connected` guard has a wide, unmeasured window** (SPEC-047 FR-004). The flag
+  was still `True` **40 s after the server was stopped** — a lower bound, not the window — because
+  `nats-py` notices a dead server through a 120 s ping interval or a failed write. Batches accepted
+  in that window are buffered by the client and reported as delivered, which is the SPEC-026 shape
+  the guard was added to end and only narrows. **Closed by** a liveness check that does not depend
+  on the driver's own flag — a JetStream round trip, or the client's last-activity timestamp.
+- **A timed-out JetStream publish is not retried, and cannot safely be** (SPEC-047, Out of Scope).
+  A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
+  (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
+  deduplicates, which makes a retry safe and is its own spec.
+- **`NATSSink(client=X, servers=…)` ignores `servers` silently** (SPEC-047, Out of Scope). The same
+  shape FR-002 makes a `ValueError` for the four connect timeouts, in the same constructor, left
+  alone because changing it would break a caller passing both today. **Closed by** a major version
+  that can refuse it, or by a deprecation warning first.
 
 ### Resolved
 
