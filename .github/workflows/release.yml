@@ -33,9 +33,36 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Pinned rather than `--upgrade`, because this is the job that produces the artifact
+      # every consumer installs, and an unpinned install here means the build FRONTEND is
+      # whatever PyPI served that minute. Scorecard's `PinnedDependenciesID` has been open on
+      # this line ("pipCommand not pinned by hash") for exactly that reason.
+      #
+      # Read the scope narrowly, because the obvious reading is wrong. `build` is only the
+      # frontend: it creates an isolated environment and resolves the actual BACKEND —
+      # `poetry-core` and `poetry-dynamic-versioning` — live from PyPI, bounded only by the
+      # ranges in `[build-system] requires`. Those are what write the wheel, and they are still
+      # unpinned after this change. Closing that needs a `PIP_CONSTRAINT` file, which nothing
+      # here would maintain either.
+      #
+      # Version pins, not hashes, so Scorecard's finding is NARROWED as a risk and unchanged as
+      # a report: its check clears a `pip install` only for `--require-hashes` or a bare local
+      # wheel, so this alert keeps its text and its score. Hash-pinning would need a
+      # requirements file covering both tools and their whole transitive closure.
+      #
+      # THESE TWO MOVE BY HAND, and nothing here will tell you when they are stale. Unlike
+      # `.github/actions/install-poetry`, which derives its pin from `poetry.lock`, these have
+      # nothing in the repository to derive themselves from: Dependabot cannot see a `run:`
+      # step, no schedule checks them, and a lagging build frontend just keeps working. The
+      # fix that would close it is known and deliberately not taken here — put `build` and
+      # `twine` in a Poetry group so the `pip` ecosystem maintains them, then read the pin out
+      # of the lock the way `scripts/make-sbom.py`'s `locked_version()` already pins
+      # `cyclonedx-bom`. That edits `pyproject.toml` and regenerates `poetry.lock`, which is a
+      # dependency change rather than a CI one, so it is recorded here to be done rather than
+      # left as an unwritten intention.
       - name: Build sdist and wheel
         run: |
-          python -m pip install --upgrade build twine
+          python -m pip install build==1.6.0 twine==7.0.0
           python -m build
 
       # Every merge publishes, so a bad artifact turns main red at upload time.

@@ -30,6 +30,10 @@ on:
       - "pyproject.toml"
       - ".github/pip-audit-ignores.txt"
       - ".github/workflows/pip-audit.yml"
+      # The shared Poetry install, an input this job now depends on from outside itself.
+      # It matters more here than elsewhere: this workflow has no `pull_request` trigger, so
+      # without this line a change to that action would first surface as a red `main`.
+      - ".github/actions/install-poetry/**"
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Poetry
-        run: pipx install poetry
+        uses: ./.github/actions/install-poetry
 
       # `--all-extras` is the whole point: runtime dependencies are empty by design, so an audit
       # without the extras audits nothing. `dev` comes along too — this is a supply-chain scan of

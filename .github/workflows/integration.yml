@@ -28,6 +28,10 @@ on:
       - "src/log_foundry/sinks/**"
       - "tests/integration/**"
       - ".github/workflows/integration.yml"
+      # The shared Poetry install. Listed because this job now depends on a file outside
+      # itself, and a path filter that stops covering an input is the failure mode
+      # `zizmor.yml` has been an instance of twice.
+      - ".github/actions/install-poetry/**"
       - "pyproject.toml"
       - "poetry.lock"
 
@@ -75,7 +79,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Poetry
-        run: pipx install poetry
+        uses: ./.github/actions/install-poetry
 
       # `--all-extras` rather than only the extras the nine services need. The point of the job
       # is the environment as a consumer has it, and the narrower install would silently drop
