@@ -209,7 +209,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 - **Every path the caller stands on is total, and a swallowed fault is announced by *type*** — never `BaseException` — a `KeyboardInterrupt` or `SystemExit` is the operator's or the runtime's intent and must reach the caller. (SPEC-025)
 
-- **One module writes every diagnostic, so the rules are applied once rather than remembered twenty-eight times** — `_diag` owns `absorbed`/`lost`/`rejected`, and an exception is named by `type(exc).__name__`, never `repr()`. Twelve sites printed the repr and two were unguarded before the rules had one home. (SPEC-029)
+- **One module writes every diagnostic, so the rules are applied once rather than remembered twenty-eight times** — `_diag` owns `absorbed`/`lost`/`rejected`, and an exception is named by `type(exc).__name__`, never `repr(exception)`. Twelve sites printed the repr and two were unguarded before the rules had one home. (SPEC-029)
 
 
 ### The public API surface
@@ -217,7 +217,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 - **Logs-only, send everything for now** — no metrics or OTel-native traces. Sampling is deferred and **unbuilt** — no `should_send` exists in code — and the per-span flush makes the pipeline span-outcome-ready, *not* tail-sampling-ready. (arch §10, §13)
 
-- **An extra's floor is a published contract — moved deliberately, never by a bot** — `versioning-strategy: increase-if-necessary` stays, so floors move only when a human decides they should. A floor raise is a contract change. (SPEC-022)
+- **An extra's floor is a published contract — moved deliberately, never by a bot** — `versioning-strategy: increase-if-necessary` stays, so floors move only when a human decides they should. A floor raise is a contract change. (No spec — it shipped alongside SPEC-022 in `v0.9.0`.)
 
 - **A public accessor hands out a copy; the library reads the live object** — a public getter documented "do not mutate" is a promise the caller's slip breaks silently; `_live_config()`/`_live_baggage()` are the per-event reads. (SPEC-034)
 

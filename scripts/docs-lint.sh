@@ -48,13 +48,23 @@ cd "$ROOT"
 #
 # ON ADOPTION, re-ratchet ALL THREE to what this repo measures once its real docs
 # exist, rounded up a little. A budget far above the measurement never fires. The
-# Ratcheted at the measured level on 2026-09-02, the day this file was cut from 89,340
-# bytes to a digest over docs/decisions.md. The 48 decisions live there in full; what
-# remains here is the claim and the fence for each. If this number needs to rise, the
-# answer is another cut: the last one was structural and took the file to a third of its
-# size without losing a fact — verified by sweeping every bold span, every superseded
-# marker and every word token from the old section into the new two tiers.
-CLAUDE_MAX_BYTES=30000
+# Set on 2026-09-02, the day this file was cut from 89,340 bytes to a digest over
+# docs/decisions.md, and DELIBERATELY NOT A RATCHET AT THE MEASURED LEVEL — the one
+# budget here that is not. The file measured 29,570 after the cut; a ratchet there left
+# 430 bytes, about two digest lines.
+#
+# The sibling repo already paid for that mistake and recorded it: its budget sat at
+# 34,000 with 161 bytes free, so the next spec to settle a decision could not close
+# without pruning another area's fences to pay for its own — the gate causing the exact
+# damage it exists to prevent. A ratchet at the measurement assumes the file only grows
+# by accretion, and after a structural cut that is no longer true: what remains is
+# fences, and a genuinely new architectural decision folds a clause in beside them.
+#
+# 34,000 leaves roughly fifteen digest lines of room. That is NOT a per-spec allowance
+# — most closing specs add nothing here, because the ritual gates the fold on a new
+# *architectural* decision and a per-feature choice is a register entry and nothing
+# more. If this file approaches 34,000 the answer is another cut, not another raise.
+CLAUDE_MAX_BYTES=34000
 
 # The longest a single Key Decisions unit may be. Measured on the LOGICAL unit — a
 # bullet with its continuation lines joined, or a prose paragraph — because measuring
