@@ -42,6 +42,11 @@ after this spec.
 - The `Health` docstring's index-access claim, inherited from the `NamedTuple` SPEC-034 replaced,
   is gone; `health()`'s `Returns:` now names all twelve fields.
 
+The two consequences that reach outside the library, recorded in the register and asserted in
+the suite rather than left to be met after the tag: a `0.x` sink constructing `SinkLosses`
+positionally now raises inside `losses()`, which `read_losses` swallows into `None`; and
+`kw_only` empties `__match_args__`, so positional pattern matching on these five stops.
+
 ## Verification
 
 `ruff`, `mypy`, `pytest`, `spec-lint`, `docs-lint`, `docs-lint-test` all exit 0 locally. Every new

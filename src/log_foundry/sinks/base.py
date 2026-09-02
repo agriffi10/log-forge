@@ -30,6 +30,14 @@ class SinkLosses:
     lost. ``health().failed_batches`` is the worker-level record of a batch given up on for
     good; this is the sink-level record of everything that did not go through first time.
 
+    Construction is **keyword-only** (SPEC-051 FR-001), which is a break for a sink written
+    against ``0.x``: passing the two counters positionally now raises, and because
+    :func:`read_losses`
+    swallows a raising accessor by design, that sink's loss reporting degrades to ``None`` —
+    "reports nothing" — rather than to an error anyone sees. One keyword each is the fix. The
+    same decision empties ``__match_args__``, so a positional ``case SinkLosses(d, f):`` no
+    longer matches while ``case SinkLosses(dropped=d, failed=f):`` still does.
+
     Attributes:
       dropped: An event the sink discarded before attempting delivery, usually one the
         destination could never have accepted as built, so the fix is upstream in what the

@@ -26,10 +26,11 @@ http = pytest.importorskip("log_foundry.sinks.http")
 
 _SINK_PKG = pathlib.Path(http.__file__).resolve().parent
 
-# `sinks/http.py` carries `from __future__ import annotations` and imports `Callable` only under
-# `TYPE_CHECKING`, so every annotation is a string and `get_type_hints` cannot resolve that name
-# from the module's runtime globals. Supplying it here beats moving the import: `ruff`'s TC003
-# refuses a runtime `collections.abc` import that is only used in annotations.
+# `sinks/http.py` carries `from __future__ import annotations`, so every annotation is a string.
+# The names still resolve because that module imports `Callable` at runtime, behind a ruff TC003
+# suppression -- these five shapes are public and frozen at 1.0, and a public type a consumer
+# cannot pass to `get_type_hints` is a poor one. This mapping is the belt to that braces: move
+# the import back under `TYPE_CHECKING` and the roster keeps working while a consumer breaks.
 _LOCALNS = {"Callable": collections.abc.Callable, "Any": typing.Any}
 
 _FORWARDING_SINKS = (

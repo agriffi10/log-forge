@@ -8,15 +8,13 @@ import threading
 import urllib.error
 import urllib.request
 from base64 import b64encode
+from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NoReturn, TypedDict
+from typing import Any, NoReturn, TypedDict
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import clamp_server_delay, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 __all__ = [
     "HTTPAuthKwargs",

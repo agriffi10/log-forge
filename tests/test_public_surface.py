@@ -1571,3 +1571,57 @@ def test_the_typed_consumer_probe_covers_every_exported_name() -> None:
     ):
         missing = sorted(set(exported) - imported.get(module_name, set()))
         assert not missing, f"{module_name} exports these and the probe never imports them: {missing}"
+
+    # Importing is not exercising, and `mypy` does not flag an unused import: reduced to its
+    # import statements alone the probe still satisfies every check above, while five of the
+    # source mutations it is the only killer of would survive. So each imported name must also
+    # appear somewhere that is not an import.
+    used = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+    } | {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+    }
+    unexercised = sorted(
+        name for names in imported.values() for name in names if name not in used
+    )
+    assert not unexercised, f"imported by the probe and never used in it: {unexercised}"
+
+
+def test_a_zero_x_sink_building_sinklosses_positionally_degrades_to_none() -> None:
+    """SPEC-051 FR-001, the consequence that reaches OUTSIDE the library, asserted not asserted-of.
+
+    `SinkLosses` is the one public type a third-party sink is required to construct, and
+    `read_losses` swallows a raising accessor by design (SPEC-026) -- so a sink written against
+    `0.x` does not get a loud `TypeError`, it gets `None`, which the composites read as "reports
+    nothing" rather than "no loss". `sinks/base.py` documents that; this is what makes the
+    documentation a claim rather than a hope.
+    """
+    base = pytest.importorskip("log_foundry.sinks.base")
+
+    class _ZeroXSink:
+        def emit(self, batch: list[dict[str, object]]) -> None: ...
+        def close(self) -> None: ...
+        def losses(self) -> object:
+            return log_foundry.SinkLosses(3, 7)  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError, match="positional argument"):
+        _ZeroXSink().losses()
+    assert base.read_losses(_ZeroXSink()) is None
+
+
+@pytest.mark.parametrize(("name", "cls", "args"), _PUBLIC_DATACLASSES, ids=[
+    row[0] for row in _PUBLIC_DATACLASSES
+])
+def test_keyword_only_construction_empties_match_args(name, cls, args) -> None:
+    """SPEC-051 FR-001, the second outward consequence: positional pattern matching stops.
+
+    `kw_only=True` sets `__match_args__` to `()`, so `case Health(a, b):` no longer matches
+    while `case Health(queued=q):` still does. Recorded here because field order not being a
+    contract is exactly what that means, and a consumer would otherwise meet it after the tag.
+    """
+    assert cls.__match_args__ == ()
+    assert dataclasses.fields(cls), name
