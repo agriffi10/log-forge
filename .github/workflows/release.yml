@@ -195,6 +195,16 @@ jobs:
     permissions:
       contents: write          # create the release and upload its asset; nothing else
     steps:
+      # Sparse and shallow: this job needs only the notes directory, and it is the one job here
+      # holding `contents: write`, so it checks out as little as possible and keeps no credential
+      # on disk. Cone mode off, because the pattern is a single directory rather than a cone.
+      - name: Check out the release notes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: docs/release-notes
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Download SBOM
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -226,13 +236,38 @@ jobs:
                  "amended — delete it and re-run this workflow to attach the SBOM."
             exit 1
           fi
-          # --generate-notes builds the changelog server-side from the commits since the previous
-          # tag, so this job needs no checkout and no history.
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --repo "$GITHUB_REPOSITORY"
+          # Notes come from `docs/release-notes/<tag>.md` when that file exists, so a release
+          # worth explaining can explain itself; otherwise `--generate-notes` builds the changelog
+          # server-side from the commits since the previous tag, which is right for a routine patch
+          # and wrong for a release carrying two audit arcs — for v1.0.0 it would have rendered
+          # nearly a hundred spec-level commit subjects with no user-facing framing.
+          #
+          # Written into the DRAFT, never attached afterwards. Same reasoning as the asset upload
+          # below: the immutability that freezes assets at publish is not something to bet against
+          # on the body, and a follow-up `gh release edit` would be exactly that bet.
+          #
+          # Two ways this silently falls back, both worth knowing before cutting a tag. The
+          # checkout above takes `github.ref`, so the notes must exist in the TAGGED COMMIT's
+          # tree — tagging a commit that predates the notes file gets generated notes and a
+          # green job. And the lookup is by exact tag name, so notes written for `v1.0.0` do
+          # nothing for any other tag. Neither is an error: a missing file is the fallback
+          # working as designed.
+          notes="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then
+            echo "using curated notes from $notes"
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$notes" \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            echo "::warning::no $notes; generating notes from the commit range. If this tag was meant to carry curated notes, the file must exist in the TAGGED commit and be named for the tag."
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY"
+          fi
           gh release upload "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY"
           gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
           echo "published $GITHUB_REF_NAME with $asset attached"
