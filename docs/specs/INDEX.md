@@ -52,6 +52,8 @@ to status only — no prose.
 | [SPEC-045](SPEC-045-every-owed-close-is-performed.md) | Every Owed Close Is Performed | Completed | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
 | [SPEC-046](SPEC-046-concurrent-owed-closes.md) | Concurrent Owed Closes | Completed | SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045 |
 | [SPEC-047](SPEC-047-bounded-delivery-kafka-and-nats.md) | Bounded Delivery for `KafkaSink` and `NATSSink` | Completed | SPEC-026, SPEC-027, SPEC-032, SPEC-038, SPEC-041 |
+| [SPEC-048](SPEC-048-sink-delivery-loss-and-duplication.md) | Sink Delivery — Loss and Duplication | Draft | SPEC-016, SPEC-018, SPEC-026, SPEC-027, SPEC-032, SPEC-036, SPEC-038 |
+| [SPEC-049](SPEC-049-sink-construction-validation-and-driver-bounds.md) | Sink Construction Validation and Driver Bounds | Draft | SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048 |
 
 ## Arcs (build order)
 
@@ -259,3 +261,14 @@ Group related specs and record the order to build them in. Keep this section: a 
   owed closes concurrently and joins every one, which is strictly better than today on both axes
   — cost falls from `sum` to `max`, loss stays zero. It deliberately does **not** narrow the §13
   constraint that a single `Sink.close` cannot be bounded at all.
+
+- **Sink delivery correctness:** SPEC-048 then SPEC-049 — the nine sink findings of the 2026-09-02
+  pre-1.0 audit, cut on the seam between what reaches the wire wrongly and what should never have
+  been constructed. SPEC-048 is the loss and duplication: a followed redirect that loses every
+  batch and forwards the bearer token, four AWS sinks that raise on partial failure so the worker's
+  retry duplicates what landed, an unbounded Pub/Sub close, a Sentry close that strands the SDK's
+  queue. SPEC-049 is what the constructor should have refused, plus the three driver defaults
+  SPEC-041 and SPEC-047 did not reach. Build SPEC-048 first: it is the pair's blocking half, and
+  SPEC-049's Kinesis and ClickHouse work reads the counters SPEC-048 makes move. The split is on
+  consequence rather than on file, so both touch `http.py`, `clickhouse.py` and `file.py` — the
+  second rebases onto the first rather than running beside it.
