@@ -534,7 +534,7 @@ this way).
   with this rule stated here throughout.
 - **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
   (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
-  **unit** — a bullet with its continuations, or a prose paragraph — to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
+  **unit** — a bullet with its continuations — to a length, and refuses any construct in that section but an area heading, a bullet, a continuation, a blank line and plain intro prose; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
   digest line for every entry, and to list every entry in its Contents; requires every Completed spec
   to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve.
   **`scripts/docs-lint-test.sh` is the corpus that proves those checks still fire** — running the

@@ -1,11 +1,18 @@
-@@@ expect exit=1
-@@@ match with no matching bold label
+@@@ expect exit=0
 @@@ file CLAUDE.md
 # Project
 
+## Pointers
+
+Example of a pointer:
+
+```md
+[x](docs/nope.md)
+```
+
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro.
 
 ### Area one
 
@@ -14,14 +21,12 @@ One line each; the full entry lives in the register.
 ## Out of Scope
 
 nothing
-
 @@@ file docs/decisions.md
 # Key Decisions — full register
 
 ## Contents
 
 - [Alpha rule](#alpha-rule)
-- [Beta rule](#beta-rule)
 
 ---
 
@@ -29,9 +34,4 @@ nothing
 
 ### Alpha rule
 
-R.
-
-### Beta rule
-
-R.
-
+Reasoning.

@@ -1,5 +1,5 @@
 @@@ expect exit=1
-@@@ match with no matching bold label
+@@@ match has no `### ` area heading
 @@@ file CLAUDE.md
 # Project
 
@@ -7,9 +7,7 @@
 
 One line each; the full entry lives in the register.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
+- **Alpha rule** — short claim.
 
 ## Out of Scope
 
@@ -21,7 +19,6 @@ nothing
 ## Contents
 
 - [Alpha rule](#alpha-rule)
-- [Beta rule](#beta-rule)
 
 ---
 
@@ -29,9 +26,5 @@ nothing
 
 ### Alpha rule
 
-R.
-
-### Beta rule
-
-R.
+Reasoning.
 

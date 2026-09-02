@@ -1,7 +1,5 @@
 @@@ expect exit=1
-@@@ match is empty
-@@@ file CLAUDE.md
-
+@@@ match does not exist, but docs/ is scaffolded
 @@@ file docs/decisions.md
 # Key Decisions — full register
 

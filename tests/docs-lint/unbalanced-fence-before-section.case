@@ -1,19 +1,23 @@
 @@@ expect exit=1
-@@@ match with no matching bold label
+@@@ match No `## Key Decisions` section found
 @@@ file CLAUDE.md
 # Project
 
-## Key Decisions
+An example someone forgot to close:
 
-One line each; the full entry lives in the register.
+```
+
+## Key Decisions
 
 ### Area one
 
 - **Alpha rule** — short claim and its fence.
 
+| a | b |
+
 ## Out of Scope
 
-nothing
+x
 
 @@@ file docs/decisions.md
 # Key Decisions — full register
@@ -21,7 +25,6 @@ nothing
 ## Contents
 
 - [Alpha rule](#alpha-rule)
-- [Beta rule](#beta-rule)
 
 ---
 
@@ -29,9 +32,5 @@ nothing
 
 ### Alpha rule
 
-R.
-
-### Beta rule
-
-R.
+Reasoning.
 

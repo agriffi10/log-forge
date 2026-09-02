@@ -6,26 +6,26 @@
 
 One line each; the full entry lives in the register.
 
-### Area one
+### (example) Area
 
-- **Alpha rule** — short claim and its fence.
+- **(example) Decision label** — replace me.
 
 ## Out of Scope
 
 nothing
 
 @@@ file docs/decisions.md
-# Key Decisions — full register
+# Register
 
 ## Contents
 
-- [Alpha rule](#alpha-rule)
+- [(example) Decision label](#example-decision-label)
 
 ---
 
-## Area one
+## Area
 
-### Alpha rule
+### (example) Decision label
 
-Reasoning.
+R.
 
