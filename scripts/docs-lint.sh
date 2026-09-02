@@ -3,12 +3,15 @@
 #
 # Why this exists as a script rather than a rule. Every check below already existed in
 # prose — in `docs/process.md` §5 (*Anti-regrowth & doc hygiene*), in `CLAUDE.md`'s own
-# doc-size guardrail, and in `docs/decisions.md`'s rules header — and every one of them
-# was violated in THIS repo anyway. `CLAUDE.md` went from 7,583
-# bytes on 2026-07-09 to 89,340 on 2026-09-02 — monotonically, not one commit reducing
-# it — while `docs/process.md` named the violation in the present tense throughout and
-# `CLAUDE.md` repeated the confession. It was cut back to a digest over
-# `docs/decisions.md` in the change that first ran this script here.
+# doc-size guardrail, and in `docs/decisions.md`'s rules header — and several were
+# violated here anyway. The history says something sharper than "a rule was ignored".
+# This file grew from 7,350 bytes at `ad898fc8` to 89,340 at `e60b60d`, more
+# than tenfold, and for most of that `docs/process.md` carried only a TWO-SENTENCE version
+# of the rule, naming no shape, no register and no budget. The full set arrived at
+# `690d2a55`, two days before the cut, named the violation in the present tense and
+# correctly — and the file grew a further fifth anyway. Both ends are anchored to commits
+# rather than restated: an earlier version of this comment carried three numbers and two
+# were wrong by the time it shipped.
 #
 # A rule a reader has to remember is a rule that rots. This is the same rules where CI
 # can see them.
