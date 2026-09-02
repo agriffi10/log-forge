@@ -390,6 +390,21 @@ The predicate a bystander needs is "no orphan close is in flight", so that is wh
 :data:`_orphan_idle` is cleared while the count is non-zero and set when it returns to zero. One
 ``Event``, built once at module scope, which is also what keeps it where ``_fork``'s repair walk
 can replace it.
+
+**A leaked count is permanent, so the increment is inside the ``try`` and the decrement is
+clamped.** Two ways it leaked, both reproduced: a ``KeyboardInterrupt`` delivered at a bytecode
+boundary between the increment and the ``try`` — measured leaking once in a few hundred iterations
+under a real ``SIGINT`` storm — and a ``fork()`` from *inside* the inline close, where the child's
+handler zeroes the count and the forking thread's own ``finally`` then takes it to ``-1``, which
+``if not _orphan_closing`` never satisfies again. Either leaves the gate clear forever and every
+later caller paying the whole grace, in a process that survives rather than exits. The count is
+therefore taken and released under one ``try``, guarded by a flag set in the same critical section
+as the increment, and floored at zero.
+
+**The gate is process-wide, not per-sink**, so a worker-path ``shutdown()`` can pay the grace for
+an orphan close it has nothing to do with — measured at 2.007 s wall, 0.000 s CPU, with the live
+sink still drained and closed. That is the price of not exiting through a running close, and it is
+bounded by the grace either way.
 """
 
 _orphan_idle = threading.Event()
@@ -1566,7 +1581,10 @@ def _close_orphan_sink(deadline: float | None = None) -> None:
     through a running close and kills it. For a sink whose ``close()`` *is* the delivery that is
     total loss of its buffer.
 
-    **A caller cannot wait on itself, and the guard for that is the `if owed:` on the write.**
+    **A separate caller cannot wait on itself, and the guard for that is the `if owed:` on the
+    write.** (A sink whose own ``close()`` calls ``shutdown()`` re-enters on the closing thread and
+    does wait out its grace — bounded, no deadlock, and pathological usage rather than a case this
+    guards.)
     :data:`_orphan_closing` is installed only where ``owed`` is non-empty, so a caller that takes
     the work never reaches the read below and a bystander never installs anything. Capturing
     ``waiting`` before the write is *not* what makes this safe — both happen under
@@ -1652,22 +1670,24 @@ def _close_orphan_sink(deadline: float | None = None) -> None:
         itself. ``Exception``, never ``BaseException`` (SPEC-025 FR-004).
     """
     global _orphan_closing
-    with _state._lock:
-        owed: list[Sink] = [
-            sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
-        ]
-        for sink in owed:
-            del _state._orphan_owed[id(sink)]
-            _state._orphan_closed_sink = sink
-        if owed:
-            _orphan_closing += 1
-            _orphan_idle.clear()
-    if not owed:
-        _orphan_idle.wait(_bystander_grace(deadline))
-        return
-    inline = _inline_close_choice(owed)
+    took = False
     started: list[threading.Thread] = []
     try:
+        with _state._lock:
+            owed: list[Sink] = [
+                sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
+            ]
+            for sink in owed:
+                del _state._orphan_owed[id(sink)]
+                _state._orphan_closed_sink = sink
+            if owed:
+                _orphan_closing += 1
+                _orphan_idle.clear()
+                took = True
+        if not owed:
+            _orphan_idle.wait(_bystander_grace(deadline))
+            return
+        inline = _inline_close_choice(owed)
         for sink in owed:
             if sink is inline:
                 continue
@@ -1689,10 +1709,11 @@ def _close_orphan_sink(deadline: float | None = None) -> None:
     finally:
         for closer in started:
             closer.join()
-        with _state._lock:
-            _orphan_closing -= 1
-            if not _orphan_closing:
-                _orphan_idle.set()
+        if took:
+            with _state._lock:
+                _orphan_closing = max(0, _orphan_closing - 1)
+                if not _orphan_closing:
+                    _orphan_idle.set()
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 

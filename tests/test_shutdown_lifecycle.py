@@ -679,6 +679,148 @@ def test_a_completed_orphan_close_does_not_defeat_a_later_bystanders_wait() -> N
     closer.join(5)
 
 
+def test_a_bystander_does_not_release_the_gate_for_the_next_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-002. Only a caller that took work releases the count, so bystanders do not stack.
+
+    A bystander that decremented on its way out would drive the count to zero and set the gate
+    while the real close is still running, so the *second* bystander returns immediately. One
+    bystander cannot see that, because its own release happens after its own wait; it takes two.
+
+    The close has to outlast **both** waits or the test measures the grace rather than the guard:
+    with a close shorter than one grace, the first bystander waits it out legitimately and the
+    second one finds it finished, which is correct behaviour and indistinguishable from the bug.
+    The grace is shortened rather than the close lengthened so this costs a second, not ten.
+    """
+    monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.3)
+    class _Slow:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.in_close = threading.Event()
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Runs longer than two shortened bystander waits put together."""
+            self.in_close.set()
+            time.sleep(1.5)
+            self.closed += 1
+
+    sink = _Slow()
+    log_foundry.configure(service="test", sink=sink)
+    log_foundry.info("orphan")
+
+    closer = threading.Thread(target=_lifecycle._close_orphan_sink, daemon=True)
+    closer.start()
+    assert sink.in_close.wait(5.0), "the premise: the close is running"
+
+    _lifecycle._close_orphan_sink()  # first bystander
+    start = time.monotonic()
+    _lifecycle._close_orphan_sink()  # second: must still find the close in flight
+    waited = time.monotonic() - start
+
+    assert waited > 0.1, (
+        f"the second bystander returned in {waited:.3f}s, so the first released a count it "
+        f"never took"
+    )
+    closer.join(5)
+
+
+def test_an_interrupt_between_taking_the_count_and_the_close_does_not_leak_it() -> None:
+    """FR-002. A leaked in-flight count is permanent, so the take is inside the `try`.
+
+    `KeyboardInterrupt` is delivered asynchronously at a bytecode boundary, so one landing between
+    the increment and the `try` left the count raised and the gate clear for the life of the
+    process — every later caller then paying the whole grace. Measured on the unguarded shape: a
+    real `SIGINT` storm leaked once every few hundred iterations. Simulated here at the point
+    rather than raced for, because a storm test passes against the bug most of the time.
+
+    `BaseException`, not `Exception`: SPEC-025 requires the interrupt to reach the caller, so the
+    claim is that it reaches the caller *and* leaves the count clean.
+
+    **What this cannot reach, stated rather than implied.** It injects at a call site, so it
+    covers an interrupt anywhere in the body. The window that produced the finding is narrower —
+    the few bytecodes between the increment and the `try:`, which contain no call at all — so
+    moving the `try:` back below the lock survives this test. That mutant is only killable by a
+    real `SIGINT` storm, which leaked once every few hundred iterations before the fix and not
+    once in 21,000 after it. A storm is not in the suite because it cannot report through its own
+    interrupts; the placement is held by review and by this test's weaker cousin.
+    """
+    class _Quiet:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing."""
+            self.closed += 1
+
+    log_foundry.configure(service="test", sink=_Quiet())
+    log_foundry.info("orphan")
+
+    real_choice = _lifecycle._inline_close_choice
+
+    def interrupted(owed: list[object]) -> object:
+        """Stands in for an async interrupt landing after the count was taken."""
+        raise KeyboardInterrupt
+
+    _lifecycle._inline_close_choice = interrupted  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _lifecycle._close_orphan_sink()
+    finally:
+        _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
+
+    assert _lifecycle._orphan_closing == 0, (
+        f"the in-flight count leaked to {_lifecycle._orphan_closing} and never returns"
+    )
+    assert _lifecycle._orphan_idle.is_set(), "the gate stayed clear, so every later caller waits"
+
+    start = time.monotonic()
+    log_foundry.shutdown(timeout=30.0)
+    assert time.monotonic() - start < _lifecycle.DEFAULT_CLOSER_GRACE, (
+        "a later shutdown paid the grace for a close that never happened"
+    )
+
+
+def test_a_double_release_of_the_count_cannot_drive_it_negative() -> None:
+    """FR-002. A negative count never satisfies `not _orphan_closing`, so the gate never sets.
+
+    Reproduced by forking from *inside* the inline close: the child's fork handler zeroes the
+    count, and the forking thread's own `finally` then takes it to -1. The floor is what makes
+    that recoverable, and it is asserted directly because the fork shape needs a subprocess to
+    observe and this is the invariant that shape depends on.
+    """
+    _lifecycle._orphan_closing = 0
+    _lifecycle._orphan_idle.set()
+
+    class _Quiet:
+        def __init__(self) -> None:
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing, but zeroes the count as a forked child's handler would."""
+            _lifecycle._clear_closing_after_fork()
+
+    log_foundry.configure(service="test", sink=_Quiet())
+    log_foundry.info("orphan")
+    _lifecycle._close_orphan_sink()
+
+    assert _lifecycle._orphan_closing == 0, (
+        f"the count went to {_lifecycle._orphan_closing}, which the gate's test never satisfies"
+    )
+    assert _lifecycle._orphan_idle.is_set(), "and the gate never sets again"
+
+
 def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() -> None:
     """FR-002 AC-5, on the orphan path — the half a flat cap got wrong.
 

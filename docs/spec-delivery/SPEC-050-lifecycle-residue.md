@@ -36,6 +36,17 @@ now a count plus an idle gate, which is the correction SPEC-045 made to the owed
 the same reason. Measured: the bystander waited 0.000 s and lost five events, and now waits
 0.955 s and loses none.
 
+**A fifth reviewer was spent, out of budget and said so.** The orphan record was *replaced*
+rather than revised after both diff reviews, so those reviews examined a mechanism that no longer
+existed — which `process.md` prices at one more pass in the frame that catches a replacement's own
+class of defect. It found three: an async `KeyboardInterrupt` landing between taking the in-flight
+count and the `try` leaked it permanently (measured, once every few hundred iterations under a real
+`SIGINT` storm); a `fork()` from *inside* the inline close left the child at `-1`, which
+`if not _orphan_closing` never satisfies again; and the suite was green only because three tests
+that leave a close running happen to sit *after* the one that measures the no-wait path — reversing
+that pair fails it at 4.01 s. The first two share one edit (take inside the `try`, guarded by a flag
+and floored at zero); the third is a `conftest` reset.
+
 **Rejected, with the reasoning in `decisions.md`:** `health().retired` reading `True` for a worker
 built after an orphan-only `shutdown()`. The field documents an action the caller took, the
 alert idiom is the *pair*, and the fresh worker's events are not lost silently.
