@@ -20,7 +20,7 @@ import nats
 import pytest
 
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.nats import NATSSink
+from log_foundry.sinks.nats import DEFAULT_ACK_TIMEOUT, NATSSink
 
 if TYPE_CHECKING:
     from integration.conftest import Endpoint
@@ -149,3 +149,43 @@ def test_a_disconnected_client_reports_non_delivery(stream) -> None:
         # failure, so it would have gone unnoticed.
         with contextlib.suppress(Exception):
             sink.close()
+
+
+def test_a_whole_batch_is_bounded_against_a_stalled_server(stream) -> None:
+    # SPEC-047 FR-001 AC-1, against a real server rather than a double. `pause` (SIGSTOP) keeps
+    # the TCP connection open, so the client stays `is_connected` and simply never acks -- which
+    # is what a wedged broker looks like, and what stops FR-004's disconnect guard pre-empting
+    # the measurement the way `stop` would.
+    url, subject, _ = stream
+    sink = NATSSink(subject, servers=url, jetstream=True, publish_timeout=3.0)
+    sink.emit([{"n": -1}])                      # prove the path works before stalling it
+
+    subprocess.run(["docker", "compose", "-f", str(COMPOSE), "pause", "nats"], check=True,
+                   capture_output=True)
+    try:
+        began = time.monotonic()
+        with contextlib.suppress(SinkDeliveryError):
+            sink.emit([{"n": i} for i in range(20)])
+        elapsed = time.monotonic() - began
+        # Unbounded this is 20 x the 5 s ack timeout = 100 s; bounded it is one budget plus at
+        # most one in-flight ack. The generous ceiling is deliberate -- the gap carries the test.
+        assert elapsed < 3.0 + DEFAULT_ACK_TIMEOUT + 5.0, f"batch not bounded: {elapsed:.2f}s"
+    finally:
+        subprocess.run(["docker", "compose", "-f", str(COMPOSE), "unpause", "nats"], check=True,
+                       capture_output=True)
+        with contextlib.suppress(Exception):
+            sink.close()
+
+
+def test_a_large_batch_reaches_a_healthy_stream_with_a_publish_timeout_set(stream) -> None:
+    # SPEC-047 FR-001 AC-4, and the half no unit test can prove: that `timeout=` is the keyword
+    # the REAL JetStreamContext.publish takes. `_publish_all` catches every per-event exception,
+    # so a wrong kwarg would surface as a counted failure rather than a crash -- the shape
+    # SPEC-041 and SPEC-043 paid for with SentrySink. Asserting delivery is what refuses it.
+    url, subject, count = stream
+    sink = NATSSink(subject, servers=url, jetstream=True, publish_timeout=30.0)
+    sink.emit([{"n": i} for i in range(200)])
+    sink.close()
+
+    assert count() == 200
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
