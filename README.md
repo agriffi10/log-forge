@@ -782,23 +782,37 @@ Two things worth knowing:
 #### Queue & stream
 
 Each needs its own extra (lazy-imported). All publish within a bound and close cleanly. **Where the
-retry lives differs, and it was measured rather than assumed** (SPEC-041 FR-004): the Redis,
-RabbitMQ and Event Hubs sinks retry through `sinks/_retry`, so their backoff is bounded *and* cut
-short by a shutdown. `KafkaSink`, `NATSSink` and `GooglePubSubSink` add no retry loop and need
-none — each hands off locally and returns without waiting, so nothing of theirs holds the single
-drain thread. Their clients retry on their own threads within their own bounds:
-`message.timeout.ms` (5 min default) for Kafka, a 600 s deadline for Pub/Sub, and for NATS a
-JetStream publish bounded by its 5 s ack timeout with no retry at all. `NATSSink` refuses a batch
-outright while its client reports itself disconnected, so a sustained outage moves
-`health().failed_batches` instead of being absorbed.
+bound lives differs, and it was measured rather than assumed** (SPEC-041 FR-004, SPEC-047): the
+Redis, RabbitMQ and Event Hubs sinks retry through `sinks/_retry`, so their backoff is bounded
+*and* cut short by a shutdown.
+
+`KafkaSink` and `GooglePubSubSink` add no retry loop and need none — each hands off locally and
+returns without waiting, and their clients retry on their own threads within their own bounds.
+(`KafkaSink` holds nothing at all; `GooglePubSubSink` does take one wait on the drain thread, its
+`overflow_timeout`, when a batch exceeds `max_pending` — bounded and interruptible per SPEC-027.) For Kafka that is `message.timeout.ms`, five
+minutes by default (measured: the delivery callback fires at 300.18 s), reachable through
+`producer_config=`; for Pub/Sub, a 600 s deadline.
+
+> ~~and for NATS a JetStream publish bounded by its 5 s ack timeout with no retry at all~~ —
+> **superseded by SPEC-047 FR-001.** That was true per *event* and false per *batch*: the awaits
+> were sequential and nothing bounded how many there were, so a stalled server cost `n × 5 s` on
+> the single drain thread (measured: 25.01 s for five events), and `_final_drain` hands the exit
+> backlog over as one batch.
+
+`NATSSink` now bounds a whole `emit` with one `publish_timeout` (10 s by default), giving each
+JetStream publish the lesser of the driver's ack timeout and the budget remaining; a core publish
+takes no timeout and is bounded between events. Its connect, reconnect and drain timeouts are
+reachable from the constructor — at the driver's defaults, construction against an unreachable
+server blocks for a measured 120.17 s. It refuses a batch outright while its client reports itself
+disconnected, so a sustained outage moves `health().failed_batches` instead of being absorbed.
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id")` |
+| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id", producer_config=None)` — `producer_config` is merged **beneath** the sink's own keys, so it reaches `message.timeout.ms` and friends without displacing `bootstrap.servers`; passing it with `producer=` is a `ValueError` |
 | `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
 | `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
 | `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
-| `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None)` |
+| `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None, publish_timeout=10.0, connect_timeout=None, max_reconnect_attempts=None, reconnect_time_wait=None, drain_timeout=None)` — `publish_timeout` bounds one whole `emit` and applies to an injected `client=` too; the four `None` timeouts are forwarded to `nats.connect` only when set, and passing one with `client=` is a `ValueError` |
 | `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
 | `AzureEventHubsSink` | `log_foundry.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
 

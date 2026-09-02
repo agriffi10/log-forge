@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
+import sys
 import threading
 import time
 
 import pytest
 
+import log_foundry.sinks.nats as nats_sink_module
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
     DEFAULT_ACK_TIMEOUT,
@@ -492,3 +495,170 @@ def test_the_core_publish_still_takes_no_timeout() -> None:
     from nats.aio.client import Client
 
     assert "timeout" not in inspect.signature(Client.publish).parameters
+
+
+# --- SPEC-047 FR-002: the driver's connect bounds are reachable from the constructor ----------
+
+
+class FakeNatsModule:
+    """A stand-in for the `nats` module, capturing what `connect` was asked for.
+
+    Nothing in this suite drove the constructor's *build* path before SPEC-047 -- every test
+    injects `client=` -- so the kwargs it forwards were unobservable.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple, dict]] = []
+
+    async def _connect(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return FakeNATS()
+
+    def connect(self, *args, **kwargs):
+        return self._connect(*args, **kwargs)
+
+
+def _build(monkeypatch, **kwargs) -> FakeNatsModule:
+    module = FakeNatsModule()
+    monkeypatch.setitem(sys.modules, "nats", module)
+    NATSSink("logs", servers="nats://example:4222", **kwargs).close()
+    return module
+
+
+def test_each_connect_bound_is_forwarded_to_the_driver(monkeypatch) -> None:
+    # FR-002 AC-1.
+    module = _build(
+        monkeypatch,
+        connect_timeout=1.5,
+        max_reconnect_attempts=3,
+        reconnect_time_wait=0.25,
+        drain_timeout=4.0,
+    )
+    _, kwargs = module.calls[0]
+    assert kwargs == {
+        "connect_timeout": 1.5,
+        "max_reconnect_attempts": 3,
+        "reconnect_time_wait": 0.25,
+        "drain_timeout": 4.0,
+    }
+
+
+def test_omitting_them_reproduces_todays_call_exactly(monkeypatch) -> None:
+    # FR-002 AC-3. Asserted on the ABSENCE of the keys, not on their values: passing the driver's
+    # own defaults explicitly would look identical in a value assertion while changing the call.
+    module = _build(monkeypatch)
+    args, kwargs = module.calls[0]
+    assert args == ("nats://example:4222",)
+    assert kwargs == {}
+
+
+def test_a_falsy_connect_bound_is_still_forwarded(monkeypatch) -> None:
+    # The omission test is `value is not None`, not truthiness, and zero is the case that tells
+    # them apart. Both zeros reach the driver and change its behaviour, so dropping them is a
+    # silent loss of what the caller asked for: `reconnect_time_wait=0` means retry immediately
+    # (measured, dropping it made a failure 100x slower -- 2.03 s against 0.02 s), and
+    # `max_reconnect_attempts=0` makes the connect loop unbounded, which the constructor's
+    # docstring warns about. Forwarding zero faithfully is the point either way -- this test is
+    # about the boundary, not an endorsement of the value.
+    module = _build(monkeypatch, max_reconnect_attempts=0, reconnect_time_wait=0)
+    _, kwargs = module.calls[0]
+    assert kwargs == {"max_reconnect_attempts": 0, "reconnect_time_wait": 0}
+
+
+@pytest.mark.parametrize(
+    "kwarg",
+    ["connect_timeout", "max_reconnect_attempts", "reconnect_time_wait", "drain_timeout"],
+)
+def test_a_connect_bound_alongside_an_injected_client_is_refused(kwarg: str) -> None:
+    # FR-002 AC-4. An injected client is already connected, so the argument can have no effect;
+    # ignoring it would silently discard the caller's bound (SPEC-043's rule).
+    with pytest.raises(ValueError, match=kwarg):
+        NATSSink("logs", client=FakeNATS(), **{kwarg: 1})
+
+
+def test_a_falsy_connect_bound_alongside_an_injected_client_is_also_refused() -> None:
+    # The same `is not None` boundary on the refusal side: a truthiness test would accept
+    # `reconnect_time_wait=0` against a client that cannot consume it, which is the silent ignore
+    # SPEC-043 forbids.
+    with pytest.raises(ValueError, match="reconnect_time_wait"):
+        NATSSink("logs", client=FakeNATS(), reconnect_time_wait=0)
+
+
+def test_publish_timeout_is_not_refused_alongside_an_injected_client() -> None:
+    # FR-001 AC-10, as the counterpart to the rule above: publish_timeout is this sink's own
+    # bound over its own loop, so it applies to any client. Every other test in this module
+    # injects one, so folding it into the refusal set would break the whole file.
+    sink = NATSSink("logs", client=FakeNATS(), publish_timeout=2.0)
+    assert sink.publish_timeout == 2.0
+    sink.close()
+
+
+def test_a_refused_construction_creates_no_event_loop(monkeypatch) -> None:
+    # The refusal is raised BEFORE `asyncio.new_event_loop()`, not after. Raising after it leaves
+    # a loop nobody closes, which surfaces only as a PytestUnraisableExceptionWarning whenever the
+    # GC happens to reach it -- a green run with a leak in it.
+    #
+    # Asserted by counting the CONSTRUCTOR CALL, not by counting live loop objects: a survey of
+    # `gc.get_objects()` sees every other test's loops too, so its baseline moves depending on
+    # what ran first -- measured, it passed alone and failed beside `test_sinks_kafka.py`. The
+    # invariant is an ordering one, so the ordering is what the test observes.
+    created = 0
+    real = asyncio.new_event_loop
+
+    def counting_new_event_loop():
+        nonlocal created
+        created += 1
+        return real()
+
+    monkeypatch.setattr(asyncio, "new_event_loop", counting_new_event_loop)
+    with pytest.raises(ValueError):
+        NATSSink("logs", client=FakeNATS(), connect_timeout=1.0)
+
+    assert created == 0, "the refusal must come before the loop is built, or it leaks one"
+
+
+def _forwarded_connect_kwargs() -> set[str]:
+    """The kwarg names `NATSSink.__init__` actually forwards, read from its own source.
+
+    Derived, never hand-listed. A literal list here is a second roster that rots: renaming the key
+    in `nats.py` and the expectation in the forwarding test leaves a hand-written list still
+    naming the old, valid name, so the check passes while every real construction raises
+    `TypeError` -- measured, exactly that mutant was green across the whole file.
+    """
+    import ast
+
+    source = pathlib.Path(nats_sink_module.__file__).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict) and any(
+                    isinstance(k, ast.Constant) and k.value == "connect_timeout"
+                    for k in sub.keys
+                ):
+                    return {
+                        k.value for k in sub.keys if isinstance(k, ast.Constant)
+                    }
+    raise AssertionError("could not locate the forwarded-options dict in nats.py")
+
+
+def test_the_forwarded_kwarg_roster_is_derived_and_not_empty() -> None:
+    # The guard on the guard, kept to one assertion: a resolver that silently returned an empty
+    # set would make the driver check below vacuous in the quietest possible way.
+    assert len(_forwarded_connect_kwargs()) == 4
+
+
+def test_every_connect_kwarg_we_forward_is_one_the_driver_accepts() -> None:
+    # FR-002's forwarding is asserted elsewhere against a FAKE module whose
+    # `connect(*args, **kwargs)` swallows anything, so a wrong keyword name passes the whole
+    # suite and raises TypeError at the first real construction. That is the SPEC-043 shape --
+    # four SentrySink tests were green only because CI never installed the extra.
+    if not _EXTRAS_EXPECTED:
+        pytest.importorskip("nats", reason="the `nats` extra is not installed")
+    import inspect
+
+    from nats.aio.client import Client
+
+    accepted = set(inspect.signature(Client.connect).parameters)
+    unknown = _forwarded_connect_kwargs() - accepted
+    assert not unknown, f"NATSSink forwards {unknown}, which nats.connect does not accept"

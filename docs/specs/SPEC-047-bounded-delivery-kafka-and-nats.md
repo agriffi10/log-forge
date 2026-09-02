@@ -1,7 +1,7 @@
 # Spec: Bounded Delivery for `KafkaSink` and `NATSSink`
 
 **ID:** SPEC-047
-**Status:** In Progress
+**Status:** Completed
 **Last Updated:** 2026-09-01
 **Depends On:** SPEC-026, SPEC-027, SPEC-032, SPEC-038, SPEC-041
 

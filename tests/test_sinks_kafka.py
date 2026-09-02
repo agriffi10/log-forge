@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -300,3 +301,71 @@ def test_a_flush_timeout_that_bounds_nothing_falls_back_to_the_default() -> None
         sink = KafkaSink("t", producer=producer, flush_timeout=bad)
         assert sink.flush_timeout == DEFAULT_FLUSH_TIMEOUT, f"{bad!r} bounds nothing"
     assert KafkaSink("t", producer=producer, flush_timeout=2.5).flush_timeout == 2.5
+
+
+# --- SPEC-047 FR-003: librdkafka's own delivery bound is reachable from the constructor --------
+
+
+class FakeConfluentModule:
+    """A stand-in for `confluent_kafka`, capturing the config the Producer was built with.
+
+    Nothing in this suite drove the constructor's *build* path before SPEC-047 -- every test
+    injects `producer=` -- so the config it assembles was unobservable.
+    """
+
+    def __init__(self) -> None:
+        self.configs: list[dict] = []
+
+    # Capitalised to mirror `confluent_kafka.Producer`, which is what the sink imports.
+    def Producer(self, config: dict) -> FakeProducer:
+        self.configs.append(dict(config))
+        return FakeProducer()
+
+
+def _build(monkeypatch, **kwargs) -> FakeConfluentModule:
+    module = FakeConfluentModule()
+    monkeypatch.setitem(sys.modules, "confluent_kafka", module)
+    KafkaSink("logs", bootstrap_servers="broker:9092", **kwargs)
+    return module
+
+
+def test_producer_config_reaches_the_producer_this_sink_builds(monkeypatch) -> None:
+    # FR-003 AC-1. This is the route to the bound that actually governs delivery here:
+    # `produce()` is a local hand-off (0.0001 s measured against a dead broker), so librdkafka's
+    # `message.timeout.ms` -- measured at a 300.18 s delivery callback by default -- is what
+    # decides how long a message is retried, and nothing reached it before.
+    module = _build(monkeypatch, producer_config={"message.timeout.ms": 1500, "retries": 2})
+    assert module.configs[0]["message.timeout.ms"] == 1500
+    assert module.configs[0]["retries"] == 2
+
+
+def test_the_sinks_own_key_wins_over_producer_config(monkeypatch) -> None:
+    # FR-003 AC-2, asserted on the resulting VALUE rather than on the key being present: a merge
+    # in the other order leaves the key there too, holding the wrong broker.
+    module = _build(
+        monkeypatch, producer_config={"bootstrap.servers": "wrong:9092", "retries": 1}
+    )
+    assert module.configs[0]["bootstrap.servers"] == "broker:9092"
+    assert module.configs[0]["retries"] == 1, "the caller's other keys still apply"
+
+
+def test_omitting_producer_config_builds_exactly_todays_config(monkeypatch) -> None:
+    # FR-003 AC-4, by equality: no existing caller's producer changes.
+    module = _build(monkeypatch)
+    assert module.configs[0] == {"bootstrap.servers": "broker:9092"}
+
+
+def test_producer_config_alongside_an_injected_producer_is_refused() -> None:
+    # FR-003 AC-3. It can only be applied to a producer this sink builds, and ignoring it would
+    # silently discard the caller's bound (SPEC-043's rule that an argument no backend can
+    # consume is an error, not an ignore).
+    with pytest.raises(ValueError, match="producer_config"):
+        KafkaSink("logs", producer=FakeProducer(), producer_config={"message.timeout.ms": 1500})
+
+
+def test_an_empty_producer_config_alongside_an_injected_producer_is_still_refused() -> None:
+    # The companion of the NATS boundary: the check is `is not None`, not truthiness. An empty
+    # mapping is a no-op, but accepting it would mean the guard reads the value rather than the
+    # caller's intent, and the next falsy shape it admits would not be a no-op.
+    with pytest.raises(ValueError, match="producer_config"):
+        KafkaSink("logs", producer=FakeProducer(), producer_config={})
