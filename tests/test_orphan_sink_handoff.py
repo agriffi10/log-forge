@@ -534,8 +534,15 @@ def test_the_live_orphan_sinks_close_stays_inline_and_unbounded() -> None:
     log_foundry.info("to it")
 
     caller = threading.current_thread().name
-    threading.Timer(0.4, slow.release.set).start()
+    # `start` is taken BEFORE the timer, and the order is the assertion. Started first, the
+    # timer's 0.4 s runs on a clock that begins earlier than the measured one, so anything
+    # between the two lines -- a GIL handoff, an OS preemption, `Thread.start()` itself -- is
+    # subtracted from `elapsed` and never enters the window `elapsed >= 0.4` claims to clear.
+    # Both matrix legs failed that way on a loaded runner at 0.390 s and 0.397 s while passing
+    # everywhere else. This order makes the bound hold by construction: the release cannot fire
+    # before `start + 0.4`, whatever the machine does in between.
     start = time.monotonic()
+    threading.Timer(0.4, slow.release.set).start()
     log_foundry.shutdown(timeout=5.0)
     elapsed = time.monotonic() - start
 
