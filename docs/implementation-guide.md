@@ -39,11 +39,6 @@ Dependency direction:  ids, config  ◄─ model ◄─ context ◄─ api/decor
                                          sinks ◄─ worker ◄─ decorator
 ```
 
-Your current `core.py` (`LogForge`) and `modules/v1/log.py` (`Log`) are scaffolding from
-the setup phase. `LogForge` can become the internal singleton that the façade functions
-delegate to (or you can drop it for a pure module-level API — your call). `Log` is
-superseded by `model.py`.
-
 ---
 
 ## Phase 0 — Decide the public shape first

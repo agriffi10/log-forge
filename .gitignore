@@ -222,3 +222,11 @@ __marimo__/
 # Scratch git worktrees created for fresh-context reviews; `git add -A` otherwise stages them
 # as embedded repositories.
 .claude/worktrees/
+
+# CycloneDX SBOMs. Generated, never committed: `scripts/make-sbom.py` and the documented
+# `cyclonedx-py` command in CLAUDE.md both write `sbom.cdx.json` at the repo root, and
+# release.yml renames it to `log-foundry-<version>.cdx.json` before attaching it to the release.
+# The published artifact's SBOM is a release asset, not a tracked file. Anchored to the
+# root: both real filenames are written there, and an unanchored glob would silently
+# untrack a `tests/fixtures/*.cdx.json` if make-sbom.py ever grows a golden file.
+/*.cdx.json

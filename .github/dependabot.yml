@@ -22,6 +22,11 @@ updates:
     # `aws` extra onto a near-current boto3 for no functional reason. `>=1.34` already permitted
     # it. Eleven extras have the same shape.
     #
+    # Read that as history rather than as a live defect: those raised floors were reviewed and
+    # KEPT — they shipped in `v0.9.0` (`docs/spec-delivery/RELEASES.md`) and `boto3>=1.43.61` is
+    # what `pyproject.toml` still publishes. The setting is not a rollback of that decision. It
+    # decides who makes the NEXT one: a floor is a contract, so it moves when a human says so.
+    #
     # `increase-if-necessary` leaves a requirement alone whenever it already admits the new
     # version, and only widens when it genuinely does not — so poetry.lock still moves and CI
     # still exercises current releases, while the floors consumers must satisfy stay put.

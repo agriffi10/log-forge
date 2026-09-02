@@ -93,6 +93,15 @@ jobs:
       # versions (v0.5.7, v0.6.0, v0.6.1). A `@v0` reference does not exist and must not be
       # invented. Dependabot's github-actions ecosystem moves this pin like any other.
       #
+      # DECLINED, recorded rather than silently skipped: the 2026-09-02 pre-1.0 audit (D10)
+      # reports zizmor flagging `self-repository` on `release.yml:14`, the
+      # `uses: ./.github/workflows/ci.yml` reference. This gate reports it nowhere — the SARIF
+      # from the run on `main` at 451edf9 carries `"results": []` and code scanning holds zero
+      # zizmor alerts — because the rule shipped in zizmor 1.30.0 and the action's `latest`
+      # resolves to 1.29.0. Rewriting the PUBLISH workflow's own gate reference to the `$/`
+      # form, on a path no pull request can exercise, to close a finding nothing here reports,
+      # is the wrong trade. When `latest` moves and the alert appears, it is a one-line fix.
+      #
       # `advanced-security` defaults to true, which emits SARIF to code scanning and exits
       # zero rather than failing the job. That is deliberate, and it matches how CodeQL
       # reports here: Advanced Security owns triage. To make a finding blocking, use a
