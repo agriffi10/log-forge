@@ -163,7 +163,7 @@ for an area before working in it. A line here is **never the only home of a fact
 - **A client exception costs its chunk, and is provable non-delivery for it** — guarded *inside* `_send`, since an outer guard reports a partial success as "nothing delivered"; it feeds SQS's recoverable term, or a total failure returns silently. (SPEC-048)
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — both halves bind — three shipped sinks lost every post-`close()` event, while making the stateless sinks refuse would invent loss where a batch would have landed. (SPEC-032)
 - **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests because each accepted size is rediscovered in every branch; capping the recursion *depth* instead is the trap — a cap of 4 against a 250x ratio delivered 2 events of 2,000. (SPEC-038)
-- **A sink's constructor keeps the vendor's own spelling, and types what it forwards** — the names are frozen: `servers`, `queue_url` and `bootstrap_servers` are the vendors' own words, and a house vocabulary would fight the doc beside them. The forwarded HTTP keywords are typed instead. (SPEC-051)
+- **A sink's constructor keeps the vendor's own spelling, and types what it forwards** — `servers`, `queue_url` and `bootstrap_servers` are the vendors' own words, so the names are frozen rather than normalised; the forwarded HTTP keywords are typed instead. (SPEC-051)
 
 ### The sink contract: waiting, concurrency and shutdown
 
@@ -188,7 +188,7 @@ for an area before working in it. A line here is **never the only home of a fact
 - **A public accessor hands out a copy; the library reads the live object** — a public getter documented "do not mutate" is a promise the caller's slip breaks silently; `_live_config()`/`_live_baggage()` are the per-event reads. (SPEC-034)
 - **A result that can grow a reason must stop being a `bool` before 1.0, not after** — a `NamedTuple` cannot be retrofitted — a non-empty tuple is always truthy, so every `if flush():` would silently keep passing. `FlushResult`/`ContinueResult` grow by new reason values only. (SPEC-034)
 - **A protocol that is exported is a protocol that will be inherited** — `Sink`'s members are `@abstractmethod`: empty bodies let a subclass with one typo instantiate happily and return `None` from `emit`, losing events with every counter at zero. (SPEC-034)
-- **A frozen surface is keyword-first, and says what it will not grow** — every public dataclass is `kw_only`, `defaults=` takes a `Mapping` (`dict` is invariant), `context.__all__` names only the six re-exported, and the worker tunables stay **unreachable** from `configure()`. Only a consumer probe under `mypy --strict` sees any of it: the gate stops at `src`. (SPEC-051)
+- **A frozen surface is keyword-first, and says what it will not grow** — every public dataclass is `kw_only`, `defaults=` takes a `Mapping` (`dict` is invariant), `context.__all__` names only the six re-exported, and the worker tunables stay **unreachable** from `configure()`. Only a typed consumer probe sees any of it — the gate stops at `src`. (SPEC-051)
 
 ### Release, supply chain and naming
 
