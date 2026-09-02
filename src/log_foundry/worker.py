@@ -151,8 +151,10 @@ class Health:
       closing_sinks: Swapped-out sinks whose ``close()`` is running *at this instant* — a live
         gauge rather than a counter, so it falls as well as rises. ~~the only field here that
         can fall~~ — struck (SPEC-034 AC-2c): ``queued`` falls on every drain. Those two are the
-        gauges and the other five integers are monotonic, which is the distinction an operator
-        alerting on "any non-zero" needs and which no name here encodes. A close is
+        only gauges and every other integer here is monotonic, which is the distinction an
+        operator alerting on "any non-zero" needs and which no name encodes. Stated as the rule
+        rather than as a count: it said "the other five" until SPEC-051, having gone stale when
+        SPEC-036 appended ``orphan_lost`` and ``in_span_lost`` and made it six. A close is
         bounded only in how long ``configure()`` waits for it, so this is how a destination
         stuck in ``close()`` becomes visible at all. Reading it non-zero once means a swap just
         happened; reading it non-zero repeatedly means a close is not coming back, and that sink
