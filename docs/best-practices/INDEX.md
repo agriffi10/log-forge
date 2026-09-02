@@ -7,7 +7,7 @@ repeated here, which rots silently. This index is a **router, not content** — 
 
 | Domain | Doc | Load when you are… |
 |---|---|---|
-| Python (3.13; PEP 8 + PEP 257/484/526 + Google Python Style Guide) | `python/python.md` | writing or refactoring any Python — style, naming, types, exceptions, docstrings, threading/`contextvars` |
+| Python (3.12+; PEP 8 + PEP 257/484/526 + Google Python Style Guide) | `python/python.md` | writing or refactoring any Python — style, naming, types, exceptions, docstrings, threading/`contextvars` |
 
 ## How to use
 
