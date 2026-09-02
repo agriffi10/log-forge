@@ -835,25 +835,39 @@ class Worker:
                 return True
             self.sink = new_sink
             self._sink_closed = False
+            self._discard_owed_swap(new_sink)
         self._offer_stop_signal()
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not (drained and self.flush(remaining)):
-            self._record_incomplete_swap(timeout)
+            self._record_incomplete_swap(timeout, old)
             return True
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        with self._lock:
+            self._discard_owed_swap(old)
         self._close_swapped_out(old, left)
         return True
 
-    def _record_incomplete_swap(self, timeout: float | None) -> None:
-        """Counts a swap whose drain could not be confirmed, then announces it (FR-003).
+    def _record_incomplete_swap(self, timeout: float | None, sink: Sink) -> None:
+        """Records a swap whose drain could not be confirmed, then announces it (FR-003).
 
         Two things are reported at once because they have one cause: queued items may have been
-        carried to the new sink rather than the old one, and the old sink was left open. The
+        carried to the new sink rather than the old one, and the old sink is not closed here. The
         count is queued *items* — one per submitted span plus any marker — which makes it a
         floor on the events involved, the useful direction for a reader deciding whether to care.
+        It counts the queue and not the previous sink's buffer deliberately: the queued items are
+        the ones that may be misrouted. A probe read it as zero while nine events sat in that
+        sink's client buffer, and both numbers were right about different things.
+
+        **The sink is also recorded, not merely announced** (SPEC-050 FR-004). It is owed a close
+        that cannot be performed now — the drain thread may still be inside its ``emit``, which is
+        SPEC-027 FR-004's reasoning — but that objection expires when the thread does, so
+        :meth:`_close_if_owed` performs it once ``is_alive()`` reads ``False``. Recorded by
+        identity, at most once: a sink already in the record is not appended again, so a second
+        unconfirmed swap handing over the same object owes one close rather than two.
 
         Args:
           timeout: The budget the drain was given, rendered for the line.
+          sink: The previous sink, left open now and owed a close at shutdown.
 
         Returns:
           None.
@@ -863,13 +877,46 @@ class Worker:
         """
         with self._lock:
             self.incomplete_swaps += 1
+            if not any(owed is sink for owed in self._unclosed_swaps):
+                self._unclosed_swaps.append(sink)
         _diag.lost(
             "item",
             self._queued_or_unknown(),
             f"the previous sink could not be confirmed drained within "
-            f"{_bounded_seconds(timeout)} of a configure(sink=...); it is left open, and "
-            f"queued items may reach the new sink instead",
+            f"{_bounded_seconds(timeout)} of a configure(sink=...); it is left open until a "
+            f"shutdown() that finds the drain thread ended closes it, and queued items may "
+            f"reach the new sink instead",
         )
+
+    def _discard_owed_swap(self, sink: Sink) -> None:
+        """Drops a stranded sink from the owed record, because something else will close it.
+
+        The record is what makes :meth:`_close_if_owed`'s close once-only (SPEC-050 FR-004), so
+        every route by which a recorded sink acquires a *different* closer has to prune it, or
+        that sink is closed twice — and ``_lifecycle.release`` guards process ownership only and
+        latches nothing about "already closed", so nothing downstream would catch it.
+
+        Three routes, which is the whole rule. A stranded sink **re-adopted** as this worker's
+        live sink is closed by :meth:`_close_if_owed`'s live-sink branch; one swapped out again on
+        a **confirmed** drain is closed by :meth:`_close_swapped_out`; and one the orphan record
+        hands over in ``_lifecycle._swap_sink`` is closed there, which matters because that
+        function's re-arm guard is a single slot a later swap overwrites. The third is defensive:
+        no reachable sequence that re-arms a swapped-out sink was found, and the spec says so
+        rather than asserting a test for a scenario nobody can construct.
+
+        Callers hold :attr:`_lock`, ``_lifecycle._swap_sink`` included — it holds the process-wide
+        lock and takes this one under it, the same nesting :meth:`swap_sink` already performs.
+
+        Args:
+          sink: The sink to drop, matched by identity. Absent is the ordinary case and a no-op.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._unclosed_swaps = [owed for owed in self._unclosed_swaps if owed is not sink]
 
     def _close_swapped_out(self, sink: Sink, timeout: float | None) -> None:
         """Closes a sink the worker no longer delivers to, waiting only for the budget.
