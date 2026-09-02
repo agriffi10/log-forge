@@ -6,8 +6,8 @@ is given here on purpose — `_CHECKS`, `_PROSE_SITES` and `_FLOOR_SITES` below 
 and a number in this sentence would be a claim nothing re-measures.
 
 `.github/workflows/ci.yml`'s `python-version` matrix is the **authority**, because it is the only
-one that is evidence rather than a claim: it is the set of runtimes a gate actually ran on. Every
-other site restates it, and until this file nothing checked that they agreed. That
+one that is evidence rather than a claim: it is the set of runtimes a gate actually ran on. The
+sites below restate it, and until this file nothing checked that they agreed. That
 was measured, not assumed — the matrix was mutated to `["3.12", "3.13", "3.14"]` and all five repo
 gates (ruff, mypy, pytest, spec-lint, docs-lint) exited 0. Nothing in `tests/` or `scripts/` read
 `ci.yml`, and `scripts/make-sbom.py` parses `pyproject.toml` for `[project.optional-dependencies]`
@@ -49,9 +49,25 @@ site carrying both — the README bullet and CLAUDE.md's Tech Stack row each do 
 ways, because set equality alone passes a bullet reading "Python >= 3.13 ... gates on 3.12 and
 3.13": every number present is right and the floor is wrong.
 
-**Not** checked: that the versions are real CPython releases, that the interpreter running this
-test is one of them, or anything about the prose around the numbers. This binds the restatements to
-each other; it does not adjudicate the fact.
+**Not** checked, and the first item is the one to read. **Restatements outside the files in
+`Sources` are unbound**, and they exist: `src/log_foundry/decorator.py`'s flush-lock docstring says
+"the floor is ``>=3.12``", and `docs/architecture.md` says 3.13 "added `Queue.shutdown()` — which
+CI gates on". So are the *comments* inside files whose data lines are bound — `pyproject.toml` and
+the workflows both explain the floor in prose this reads straight past. Raising the floor means
+editing those by hand, with nothing to remind you. They are recorded here rather than swept in
+because reaching into `src/` for a sentence is a wider change than this file has made, and a
+half-bound `src` would read as covered.
+
+Distinguish those from a third kind that is deliberately **not** a restatement and must not be
+"fixed" to agree: a claim about when a *language feature* appeared. `sanitize.py` says CPython 3.11+
+raises past `sys.get_int_max_str_digits()`; the rulebook says `X | None` is 3.10+ syntax. Both are
+history, true regardless of what this package supports, and both would be made wrong by aligning
+them with the matrix. It is also why `_python_versions_in` filters on the gated major rather than
+scanning every dotted number.
+
+Also not checked: that the versions are real CPython releases, that the interpreter running this
+test is one of them, or anything about the prose around the numbers. This binds the restatements it
+names to each other; it does not adjudicate the fact.
 
 **Two of the sites are documentation the repo routes agents through**, and they are here because
 they are the two that have already drifted. `ae7447d` — this branch's own parent — exists to
@@ -410,6 +426,14 @@ _FLOOR_SITES = (
         "docs/best-practices/python/python.md, the rulebook's scope blockquote",
         "python_rulebook",
         re.compile(r"^> .*\*\*Python [≥>]=? ?(?P<v>\d+\.\d+)\*\*", re.MULTILINE),
+    ),
+    (
+        "docs/best-practices/python/python.md, the Repo defaults bullet",
+        "python_rulebook",
+        # The rulebook states the floor TWICE, and binding only the scope blockquote left this
+        # one free to drift alone. Found by sweeping the repo for version tokens rather than by
+        # reading the file, which is the only way a second copy in a bound file turns up.
+        re.compile(r"^- Repo defaults:.*Runtime floor = \*\*(?P<v>\d+\.\d+)\*\*", re.MULTILINE),
     ),
     (
         "docs/best-practices/INDEX.md, the Python row of the router table",
@@ -918,6 +942,8 @@ _FIXTURE = Sources(
         "here). Distilled from **PEP 8** (+ PEP 257, PEP 484/526).\n"
         "\n"
         "## How to use this doc\n"
+        "- Repo defaults: format/lint with **`ruff`**, type-check with **`mypy --strict`**. "
+        "Runtime floor = **3.12**.\n"
     ),
     bp_index=(
         "| Domain | Doc | Load when you are… |\n"
@@ -1289,6 +1315,18 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "prose_versions",
         _mutate(python_rulebook=("> Rulebook for agents", "Rulebook for agents")),
         "expected exactly one line matching",
+    ),
+    (
+        "the rulebook's SECOND floor statement drifts while its first stays right",
+        "prose_floor",
+        _mutate(python_rulebook=("Runtime floor = **3.12**", "Runtime floor = **3.13**")),
+        "Repo defaults bullet claims a floor of Python ['3.13']",
+    ),
+    (
+        "the rulebook's Repo defaults bullet loses its floor",
+        "prose_floor",
+        _mutate(python_rulebook=("Runtime floor = **3.12**", "Runtime floor = the pyproject one")),
+        "Repo defaults bullet: no `>= MAJOR.MINOR` floor found",
     ),
     (
         "the best-practices router claims a floor above the matrix",
