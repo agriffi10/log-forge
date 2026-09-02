@@ -34,7 +34,9 @@ exit drain. This deadline deliberately does not consult that event (a shutdown s
 never skips work), so the exit drain's worst case is ``(max_retries + 1) x publish_timeout``. Ten is
 chosen on the size of the improvement rather than on fitting the sequence inside the join: the same
 path is *unbounded* today, 8.3 hours for a 5,980-event backlog at 5 s an event. A caller who needs
-the whole sequence to fit lowers this to 7.0 or below. Recorded in ``architecture.md`` section 12.
+the whole sequence to fit lowers this to 7.0 or below. Recorded as an open item in
+``architecture.md`` section 12, since closing it means bounding the worker's retry of an
+already-bounded batch -- every sink's question rather than this sink's.
 """
 
 DEFAULT_ACK_TIMEOUT = 5.0
@@ -57,12 +59,23 @@ class NATSSink:
     handed off. With JetStream enabled it publishes through JetStream for durable
     acknowledgement.
 
-    **Retry and the worst-case delay** (SPEC-041 FR-004). This sink adds no retry loop and needs
-    none: a core ``publish()`` writes into the client's outbound buffer and returns without
-    waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's single
-    drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee is met
-    because there is no wait, not because a wait is bounded. Under JetStream ``publish()`` awaits
-    an ack bounded by the driver's own timeout (5 s by default) and does not retry.
+    **Retry and the worst-case delay** (SPEC-041 FR-004, SPEC-047 FR-001). This sink adds no retry
+    loop and needs none: a core ``publish()`` writes into the client's outbound buffer and returns
+    without waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's
+    single drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee
+    is met because there is no wait, not because a wait is bounded.
+
+    > ~~Under JetStream ``publish()`` awaits an ack bounded by the driver's own timeout (5 s by
+    > default) and does not retry.~~ **Superseded by SPEC-047 FR-001.** True per *event* and false
+    > per *batch*: the awaits are sequential and nothing bounded how many there were, so the cost
+    > was ``n x 5 s`` on the drain thread — measured at 25.01 s for five events against a stalled
+    > server, and ``Worker._final_drain`` hands the exit backlog over as one batch. One
+    > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
+
+    The worst case is therefore ``publish_timeout`` per emit, plus one in-flight ack — and across
+    the exit drain ``(max_retries + 1) x publish_timeout``, since ``Worker._emit`` retries a failing
+    batch and its inter-attempt wait returns immediately during a shutdown. That exceeds
+    ``shutdown()``'s join at the defaults and is recorded in ``architecture.md`` section 12.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with
@@ -238,8 +251,9 @@ class NATSSink:
         driver failure and is counted here exactly as before this spec. An event **never
         attempted** because the budget expired is counted only when this returns: a raise sends
         the whole batch back to ``Worker._emit``, which retries it, so booking the remainder there
-        would report a loss that has not happened — the rule :meth:`flush` already applies to
-        ``KafkaSink``'s queued remainder.
+        would report a loss that has not happened — the rule
+        :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` already applies to its own queued
+        remainder.
 
         Args:
           batch: The events to publish.
@@ -259,8 +273,8 @@ class NATSSink:
             if remaining <= 0:
                 break
             attempted += 1
-            payload = json.dumps(event).encode("utf-8")
             try:
+                payload = json.dumps(event).encode("utf-8")
                 if self._jetstream:
                     await target.publish(
                         self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)

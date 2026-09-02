@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 
@@ -200,6 +201,30 @@ class SlowNATS:
         pass
 
 
+class AlternatingNATS(SlowNATS):
+    """Fails every other publish, so a batch is genuinely mixed rather than all-or-nothing."""
+
+    def __init__(self) -> None:
+        super().__init__(per_event=0.0)
+        self._n = 0
+
+    def jetstream(self) -> AlternatingJetStream:
+        return AlternatingJetStream(self)
+
+
+class AlternatingJetStream:
+    def __init__(self, owner: AlternatingNATS) -> None:
+        self._owner = owner
+
+    async def publish(self, subject, payload, *, timeout=None) -> None:  # noqa: ASYNC109
+        self._owner.timeouts.append(timeout)
+        self._owner.calls += 1
+        self._owner._n += 1
+        if self._owner._n % 2:
+            raise RuntimeError("no responders")
+        self._owner.published.append((subject, payload))
+
+
 def test_a_whole_batch_is_bounded_not_each_event_in_it() -> None:
     # FR-001 AC-1. 100 events at 0.05 s each is 5 s of per-event cost; the batch budget is 0.3 s.
     # The generous 2.0 s assertion is deliberate -- this proves something IS bounded, so the gap
@@ -263,12 +288,23 @@ def test_the_per_publish_timeout_shrinks_as_the_budget_is_spent() -> None:
 
 def test_a_large_batch_against_a_healthy_server_is_not_truncated() -> None:
     # FR-001 AC-4. A hard cap that truncates a slow-but-succeeding exit backlog would satisfy
-    # every other criterion here; this is the one that refuses it.
-    client = SlowNATS(per_event=0.0)
+    # every other criterion here; this is the one that refuses it -- and the ONLY thing in the
+    # suite that pins DEFAULT_PUBLISH_TIMEOUT's value, since every other test passes an explicit
+    # `publish_timeout=`. It takes the default deliberately.
+    #
+    # The per-event cost is load-bearing. With a free double the batch costs microseconds, so no
+    # *time* budget could ever truncate it and the test refuses only a *count* cap -- measured,
+    # the whole suite stayed green with the default mutated to 0.02 s. The precondition below is
+    # the test asserting its own sensitivity (the SPEC-038 FR-004/FR-005 idiom): a batch that
+    # cost no time proves nothing about a bound measured in time.
+    client = SlowNATS(per_event=0.005)
     sink = NATSSink("logs", client=client, jetstream=True)
+    began = time.monotonic()
     sink.emit([{"n": i} for i in range(200)])
+    elapsed = time.monotonic() - began
     sink.close()
 
+    assert elapsed > 0.5, f"the batch cost no time, so no budget could truncate it: {elapsed:.3f}s"
     assert len(client.published) == 200
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
@@ -350,3 +386,109 @@ def test_publish_timeout_applies_to_an_injected_client() -> None:
 
     assert elapsed < 2.0
     assert sink.publish_timeout == 0.2
+
+
+def test_the_core_path_is_bounded_too_not_only_the_jetstream_one() -> None:
+    # FR-001 AC-8, second clause. The first clause (a whole batch still delivers) cannot fail a
+    # guard that skips the core path, so this is what pins it: measured, restricting the deadline
+    # to `self._jetstream and remaining <= 0` left the whole suite green. `Client.publish` takes
+    # no timeout and does not block, so what this defends is an injected `client=` that does.
+    client = SlowNATS(per_event=0.05)
+    sink = NATSSink("logs", client=client, jetstream=False, publish_timeout=0.3)
+    sink.emit([{"n": i} for i in range(100)])
+    sink.close()
+
+    assert 0 < len(client.published) < 100, "the core path must honour the deadline too"
+
+
+def test_a_mixed_batch_counts_each_failure_once_and_no_successes() -> None:
+    # A batch where some publishes raise and some succeed, with the deadline NOT expired -- the
+    # case no other test covers, and the reason a mutant moving `attempted += 1` into the success
+    # branch survived the whole suite. That mutant makes `unattempted` count the failures a
+    # second time, so five failures are reported as ten.
+    client = AlternatingNATS()
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=30.0)
+    sink.emit([{"n": i} for i in range(10)])
+    sink.close()
+
+    assert len(client.published) == 5
+    assert sink.failed == 5, "a failure is booked once, never again as an unattempted event"
+
+
+def test_the_deadline_drop_is_announced_not_only_counted(capsys) -> None:
+    # An absorbed loss that moves a counter silently is what `_diag` exists to prevent, and
+    # deleting the announcement survived the whole suite: `capsys` was asserted only for the
+    # per-event publish error, never for the deadline drop.
+    client = SlowNATS(per_event=0.08)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
+    sink.emit([{"n": i} for i in range(30)])
+    sink.close()
+
+    err = capsys.readouterr().err
+    assert "publish_timeout" in err, "the events the deadline skipped must be announced"
+    assert str(sink.failed) in err, "the announcement carries the count, not one line per event"
+
+
+def test_an_unserializable_event_is_isolated_not_allowed_to_destroy_the_batch() -> None:
+    # Per-event isolation covers SERIALIZATION, not only the publish. A revision of this file
+    # hoisted `json.dumps` out of the `try` to build one payload for both branches, and measured
+    # against main that turned 4-of-5 delivered into 2-of-5: the TypeError escaped `emit`, and
+    # because it is not a SinkDeliveryError the worker retried the whole batch, delivering the
+    # first two events four times each with every counter at zero -- duplicate delivery
+    # (SPEC-018) and silent loss (SPEC-026) in one path.
+    #
+    # `build_event` makes this unreachable through `@trace`/`info` (SPEC-017), but `emit` is
+    # public API and the docstring promises the isolation.
+    client = SlowNATS(per_event=0.0)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=30.0)
+    batch: list[dict[str, object]] = [{"n": 0}, {"n": 1}, {"bad": object()}, {"n": 3}, {"n": 4}]
+    sink.emit(batch)          # must NOT raise: four of the five published
+    sink.close()
+
+    assert len(client.published) == 4
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+# --- SPEC-047: the driver-facing claims, gated on the extras being installed (SPEC-043's idiom) ---
+
+_EXTRAS_EXPECTED = os.environ.get("LOG_FOUNDRY_EXTRAS") == "1"
+"""Whether the optional extras are expected to be importable.
+
+`LOG_FOUNDRY_EXTRAS=1` makes the checks below **fail** rather than skip, which is the point:
+CI's gating leg deliberately has no extras, and a check that silently skips there is a check that
+never runs anywhere. SPEC-043 added this gate after four `SentrySink` tests were found green only
+because the extra was never installed.
+"""
+
+
+def test_our_ack_ceiling_still_mirrors_the_drivers_own_default() -> None:
+    # DEFAULT_ACK_TIMEOUT's docstring claims a divergence "can only ever make the per-publish
+    # timeout smaller than the driver would have used, never larger". That claim depends on a
+    # third-party constant, and nothing noticed if either side moved -- measured, mutating our
+    # constant 5.0 -> 50.0 left the whole suite green, because every assertion about it is
+    # expressed IN TERMS of it. This turns the prose into a gate.
+    if not _EXTRAS_EXPECTED:
+        pytest.importorskip("nats", reason="the `nats` extra is not installed")
+    import inspect
+
+    from nats.js.client import JetStreamContext
+
+    driver_default = inspect.signature(JetStreamContext.__init__).parameters["timeout"].default
+    assert driver_default >= DEFAULT_ACK_TIMEOUT, (
+        f"our ceiling {DEFAULT_ACK_TIMEOUT} exceeds the driver's own {driver_default}, so a "
+        "publish would get a LONGER ack wait than the driver would have chosen"
+    )
+
+
+def test_the_core_publish_still_takes_no_timeout() -> None:
+    # The other half of the same premise: `_publish_all`'s core branch passes no `timeout=`
+    # because `Client.publish` has no such parameter. If the driver gained one, passing it would
+    # be the better behaviour and this test is where that is noticed -- `_publish_all` catches
+    # every per-event exception, so a wrong keyword would otherwise look like a counted failure.
+    if not _EXTRAS_EXPECTED:
+        pytest.importorskip("nats", reason="the `nats` extra is not installed")
+    import inspect
+
+    from nats.aio.client import Client
+
+    assert "timeout" not in inspect.signature(Client.publish).parameters
