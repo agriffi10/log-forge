@@ -77,12 +77,18 @@ CLAUDE_MAX_BYTES=34000
 # BYTES, not characters: awk length() is byte-based in the one-true-awk that ships on
 # macOS, so em dashes and smart quotes count for more than one.
 #
-# 800 rather than the template default of 1400, which was calibrated on the sibling
-# repo, whose digest lines are much denser than this one. At 1400 this cap sat several
-# times above the worst unit it governed and could not fire — process.md advertised as
-# a fence the one check that was not one, which is the same failure as a budget set far
-# above its measurement. 800 leaves a dense claim-plus-fence line ample room while
-# sitting below the units that made the pre-cut file unreadable.
+# 800 rather than the inherited 1400. The important part is WHY 1400 stopped working,
+# because the obvious reading is wrong. It was not miscalibrated: against the pre-cut
+# section it caught a substantial share of the units and was a working fence. What
+# floated it was the cut SUCCEEDING — shrinking every unit well below the cap left it
+# sitting several times above anything it governed, so process.md went on advertising
+# as a fence the one check that could no longer fire.
+#
+# **A fence can be invalidated by its own success, not only by being wrong**, and this
+# one has the same exposure: 800 clears today's worst unit by roughly double, so ANY
+# FUTURE STRUCTURAL CUT of Key Decisions must re-derive this constant rather than
+# merely check it. A cut that leaves this number alone hands the next reader a fence
+# that passes everything.
 #
 # Deliberately carries NO count of what it catches. The evidence is the Key Decisions
 # section as it stood at e60b60d, which is frozen and can be re-measured by anyone who
