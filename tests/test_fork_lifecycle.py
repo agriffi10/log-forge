@@ -3003,7 +3003,7 @@ def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
         worker._taken_markers = [marker]
         before = id(marker.event)
         _fork._reinit_primitives()
-        assert id(marker.event) is not None and id(marker.event) == before, (
+        assert id(marker.event) == before, (
             "the repair walk replaced the Event of a flush() caller that is in the parent"
         )
 

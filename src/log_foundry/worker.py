@@ -1380,13 +1380,15 @@ class Worker:
     def _release_marker(self, marker: _FlushMarker) -> None:
         """Drops a marker the drain thread has finished with, before it is answered.
 
-        The order against ``event.set()`` is **not** load-bearing, and an earlier draft of this
-        docstring said it was. Either way no waiter is stranded: deregister-then-set leaves a
-        window where a sweep finds nothing, but the owner is about to answer the marker itself;
-        set-then-deregister leaves a window where a sweep answers it twice, which ``Event.set``
-        makes a no-op. Mutation-tested both ways, both green — so this is an ordering chosen for
-        readability, and the claim that it defends something has been removed rather than left
-        standing.
+        **It runs after ``event.set()``, and that order is load-bearing** — the reverse survives
+        the suite, which is this repo's evidence that nothing covers it rather than that it is
+        safe. An earlier draft of this docstring read the green as proof of equivalence and said
+        so; it is not. Deregistering first leaves a window in which the marker is in neither the
+        queue nor the record, so an async ``BaseException`` landing there — the one ``_run``
+        catches, on this thread — strands a ``flush(timeout=None)`` that ``_run``'s own closing
+        sweep can no longer reach. Answering first inverts the failure into a leaked list entry on
+        a worker that is already dead. This is the reasoning :meth:`_final_drain` already applies
+        to its own ``finally``.
 
         Args:
           marker: The marker this thread has finished with.
@@ -1401,7 +1403,17 @@ class Worker:
             self._taken_markers = [m for m in self._taken_markers if m is not marker]
 
     def _release_waiters(self) -> None:
-        """Answers every ``flush()`` marker still queued, so no caller waits out its timeout.
+        """Answers every outstanding ``flush()`` marker, so no caller waits out its timeout.
+
+        **Two populations, and the second is not optional** (SPEC-050 FR-001). A marker still in
+        the queue is read from it; a marker the drain thread has already **taken** is read from
+        :attr:`_taken_markers`, because between dequeuing one and returning from ``sink.emit`` the
+        drain holds it in a local where a queue read cannot see it. Answering only the first is
+        what the audit prescribed and it does not cover the audit's own probe. The taken markers
+        are answered **before** the queue read and outside its ``try``: that read reaches into
+        ``Queue``'s privates, a risk ``architecture.md`` §13 accepts on the understanding that a
+        CPython change costs *timed-out* waiters, and letting the new mechanism inherit it would
+        upgrade that cost to waiters that never return at all.
 
         A ``BaseException`` from the main loop skips :meth:`_final_drain` entirely, which is
         where queued markers are normally answered, leaving a waiter to sit for its full
@@ -1410,7 +1422,7 @@ class Worker:
         ``health().queued`` and the terminal line report; each keeps its pessimistic
         ``delivered``, which is the truth here.
 
-        It is called from two places. The terminal-failure path is the original one. The clean
+        It is called from three places. The terminal-failure path is the original one. The clean
         :meth:`shutdown` path was added because that same enqueue-after-the-drain race happens
         there too, and hurts more: measured stranding a marker in 13 of 400 shutdowns raced
         against a ``flush()`` under load, where the caller sat out its whole timeout — and
@@ -1440,12 +1452,14 @@ class Worker:
         Raises:
           None. This runs after the record and the stderr line, neither of which may be lost.
         """
+        with self._lock:
+            taken = list(self._taken_markers)
+        for marker in taken:
+            marker.event.set()
         try:
             with self._queue.mutex:
-                markers = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
-            with self._lock:
-                markers.extend(self._taken_markers)
-            for marker in markers:
+                queued = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
+            for marker in queued:
                 marker.event.set()
         except Exception:
             pass
@@ -1529,8 +1543,8 @@ class Worker:
                     item.delivered = self._nothing_lost_since(item)
                 finally:
                     last_flush = time.monotonic()
-                    self._release_marker(item)
                     item.event.set()
+                    self._release_marker(item)
                 continue
             if item is _SHUTDOWN:
                 break
@@ -1618,8 +1632,8 @@ class Worker:
                 marker.delivered = self._nothing_lost_since(marker)
         finally:
             for marker in markers:
-                self._release_marker(marker)
                 marker.event.set()
+                self._release_marker(marker)
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
         """Flattens queued per-span event-lists into one batch and emits it, retrying.

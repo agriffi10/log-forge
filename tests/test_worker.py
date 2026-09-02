@@ -2471,27 +2471,62 @@ def test_a_marker_taken_after_the_drain_settled_answers_itself(capsys) -> None:
     `shutdown(timeout=0)`, a public argument.
 
     `_drain_settled` is set immediately before the sweep on both the expiry and terminal paths, so
-    a marker taken after that point answers itself. Driven directly rather than raced for: the
-    race is 1-in-300 and a test that reproduces it that rarely passes against the bug.
+    a marker taken after that point answers itself.
+
+    Asserted through `flush()` rather than by calling the private method, so what it pins is the
+    caller's outcome and not the two lines that produce it. The window is widened rather than
+    simulated: the queue's `get` is interposed so the drain parks *after* it has the marker and
+    before it returns, which is precisely the gap, and it makes a 1-in-300 race deterministic
+    without changing the code under test.
     """
-    worker = Worker(RecordingSink(), batch_size=10, flush_interval=60.0)
-    marker = worker_mod._FlushMarker(seen_failures=0)
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: worker._queue.qsize() == 0), "the span must reach `pending` first"
+    live, took, may_return = threading.Event(), threading.Event(), threading.Event()
+    real_get = worker._queue.get
 
-    worker._drain_settled.set()  # as the expiry branch leaves it, sweep already gone by
-    worker._take_marker(marker)
+    def parked_get(block: bool = True, timeout: float | None = None) -> object:
+        """Parks the drain with the marker in hand, in the window before it is recorded."""
+        live.set()
+        item = real_get(block, timeout)
+        if isinstance(item, worker_mod._FlushMarker):
+            took.set()
+            may_return.wait(10)
+        return item
 
-    assert marker.event.is_set(), (
-        "a marker taken after the drain settled is answered by nothing else, so it must self-answer"
+    worker._queue.get = parked_get  # type: ignore[method-assign]
+    # The drain is parked inside the *unwrapped* `get`, which would hand it the marker without
+    # ever entering the wrapper. One more submission wakes it so it re-enters through the wrapper;
+    # neither trigger fires at two items, so both just accumulate in `pending`.
+    worker.submit(_span("b"))
+    assert live.wait(5.0), "the interposed get was never reached"
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
     )
-    assert marker.delivered is False, "and pessimistically, as the sweep would have"
+    flusher.start()
+    assert took.wait(5.0), "the premise: the drain holds the marker and has not recorded it"
+    with worker._queue.mutex:
+        assert not [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)]
+    assert not sink.in_emit.is_set(), "the premise: it has not started emitting yet"
+    assert worker._taken_markers == [], "the premise: it is in neither the queue nor the record"
 
-    other = worker_mod._FlushMarker(seen_failures=0)
-    worker._drain_settled.clear()
-    worker._take_marker(other)
-    assert not other.event.is_set(), "the ordinary path must not answer a marker on arrival"
-
-    worker.shutdown(timeout=5.0)
+    worker.shutdown(timeout=0)  # its sweep finds both populations empty
+    may_return.set()  # the drain records the marker, then wedges in the sink for good
+    flusher.join(timeout=5.0)
+    still_waiting = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
     capsys.readouterr()
+
+    assert not still_waiting, (
+        "a marker taken after the sweep had already run is answered by nothing else"
+    )
+    assert verdict and verdict[0].reason == "abandoned", (
+        "the self-answer is the pessimistic verdict the sweep would have given"
+    )
 
 
 def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:

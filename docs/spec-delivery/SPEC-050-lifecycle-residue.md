@@ -5,10 +5,14 @@
 R3, R4, R6, R11 and R13 of `docs/audits/2026-09-02-pre-1.0-audit.md`, each reproduced by running
 it against `eb80099` before the spec was written and re-run against the fix.
 
-- **FR-001** — `Worker.shutdown`'s expiry branch now calls `_release_waiters()`, and the drain
-  thread registers markers it has taken out of the queue so that sweep can reach them. The first
-  attempt shipped only the first half — the audit's prescribed remedy, which does not cover the
-  audit's own probe — and a peer session reproduced R3 verbatim against it. A
+- **FR-001** — `Worker.shutdown`'s expiry branch now calls `_release_waiters()`; the drain thread
+  registers markers it has taken out of the queue so that sweep can reach them, releases them
+  after answering, drops them for a forked child, and self-answers one taken after the sweep has
+  already run. The first attempt shipped only the first of those — the audit's prescribed remedy,
+  which does not cover the audit's own probe — and a peer session reproduced R3 verbatim against
+  it. The pessimistic-verdict population is correspondingly wider, recorded in `docs/decisions.md`
+  as a narrowing of "`flush()` answers from the drain that carried the events"; the converse is
+  untouched, since `delivered` is only ever written by the owning drain. A
   `flush(timeout=None)` parked behind a stuck sink used to wait forever on a drain that call had
   just given up on; it now returns `FlushResult(ok=False, reason="abandoned")`.
 - **FR-002** — an in-flight inline `close()` is recorded in a slot holding an `Event`, on the

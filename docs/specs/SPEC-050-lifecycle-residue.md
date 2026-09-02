@@ -93,6 +93,14 @@ alternative is an unbounded wait on a drain nothing will settle, and a pessimist
 caller can act on beats a correct one it never receives. The events are unaffected either way —
 `_final_drain` still carries them to the sink — so what is traded is a *verdict*, not delivery.
 
+**The population that can receive that pessimistic verdict is wider than the sweep**, and the
+widening is part of the trade rather than a side effect of it. It now covers a marker the drain
+thread was *holding* when the sweep ran, and a marker taken *after* the sweep, which answers
+itself. In none of these does a caller see `ok=True` over lost events: `delivered` starts `False`
+and is only ever written by the owning drain, so every added path can produce `abandoned` and
+nothing else. The direction is one-way by construction, which is what makes the trade acceptable
+against `flush()` answering "from the drain that carried the events".
+
 **It supersedes a settled decision, which is recorded in a test rather than in the register.**
 `test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread` asserts the opposite and gives
 the reason. That test is superseded **in place**, struck through with this spec named, not
@@ -113,6 +121,14 @@ deleted; its sentinel half is unchanged and still asserted.
       marker rather than the queue, the flush is still answered — asserted separately, because the
       test written from the audit's probe passes with that half reverted.
 - [ ] A marker taken by `_final_drain` rather than by the loop is answered too.
+- [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`
+      and the drain holding a marker it has not yet recorded, the `flush(timeout=None)` still
+      returns `abandoned` rather than waiting on a drain that will never reach its own sweep.
+- [ ] The record of taken markers returns to empty, over an emit that returns and one that raises.
+      A deregistration that did nothing would leak one marker and one `Event` per `flush()` for
+      the life of the process, and no other assertion here would notice.
+- [ ] A forked child holds none of the parent's in-flight markers, and the repair walk does not
+      reach them — asserted against the walk with a control, since the reset would mask the skip.
 - [ ] Deleting the new call makes the first criterion fail (mutation-tested, not asserted).
 
 ### FR-002: A second shutdown waits for an in-flight inline close, on both delivery paths
