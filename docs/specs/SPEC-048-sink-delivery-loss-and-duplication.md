@@ -61,11 +61,17 @@ happened, and in four of the seven it provokes the duplication.
 
 #### Description:
 
-`HTTPSink` passes requests to `urllib.request.urlopen`, whose default opener follows `301`, `302`,
-`303`, `307` and `308`. For the first three the stdlib rewrites the method to `GET` and drops the
-body while keeping every header, including `Authorization`. The batch is never delivered, the
-credential reaches a host the caller did not configure, and the redirect target's `200` is read as
-success.
+`HTTPSink` passes requests to `urllib.request.urlopen`, whose default opener follows `301`, `302`
+and `303` **on a POST**, rewriting the method to `GET` and dropping the body while keeping every
+header, including `Authorization`. The batch is never delivered, the credential reaches a host the
+caller did not configure, and the redirect target's `200` is read as success.
+
+`307` and `308` are **already** refused for a POST: `HTTPRedirectHandler.redirect_request` raises
+`HTTPError` unless the method is `GET`/`HEAD`, or the status is one of the first three and the
+method is `POST`. The audit and this spec's first draft both said all five were followed; only three
+are. They stay in the parametrized test as a **regression pin** rather than as evidence the fix
+works — an acceptance criterion that passes against the unfixed sink proves nothing, and this one
+is labelled so it is not read as proof.
 
 The sink must use a private opener that refuses to redirect, so a `3xx` arrives at `_attempt` as an
 `HTTPError` — which `_attempt` already unifies into a status — and takes the existing `_abandon`
@@ -86,8 +92,10 @@ the caller's object and the library does not reshape it.
 - [ ] After that emit, `losses().failed` is 1 and a `_diag` line names `HTTP 302`.
 - [ ] The test asserts on the second origin's received-request list being empty, which is where the
       `Authorization` header would otherwise appear.
-- [ ] `301`, `303`, `307` and `308` are refused on the same path, so no status in `300..399` is
-      followed.
+- [ ] `301` and `303` are refused on the same path, asserted identically to `302`.
+- [ ] `307` and `308` are refused too — a **regression pin**, not a demonstration: the stdlib
+      already refuses both on a POST, so these two parameters pass against the unfixed sink and the
+      test says so in a comment.
 - [ ] A `200` from the configured URL is unaffected, and a caller-injected `opener=` is called
       exactly as before — the existing `HTTPSink` suite, which injects an opener in almost every
       test, passes untouched.
@@ -145,9 +153,11 @@ not be adjudicated, and an exception is not a response.
       still outstanding: `losses().failed` is less than the chunk size, and the accepted entries
       count toward `delivered`.
 - [ ] `KeyboardInterrupt` and `SystemExit` reach the caller unabsorbed from all four (SPEC-025).
-- [ ] The first three criteria hold for `SNSSink`, `KinesisSink` and `FirehoseSink`, and a roster
-      test over the four asserts each `_send` guards its client call, so a fifth AWS-shaped sink
-      cannot be added unguarded.
+- [ ] The first three criteria hold for `SNSSink`, `KinesisSink` and `FirehoseSink`.
+- [ ] A roster test asserts each `_send` guards its client call, and is **derived on shape** — every
+      `_send` in `sinks/` whose body calls `self.client.<method>(...)` — with a floor of four, as
+      this repo's other rosters carry one. A hard-coded four-module list would leave a fifth
+      AWS-shaped sink green, which is the criterion's whole point.
 
 ### FR-003: The Kinesis per-record ceiling charges the partition key, in bytes
 
@@ -164,6 +174,13 @@ count, so a multi-byte key under-charges the request budget too. The `[:256]` tr
 `kinesis.py:193` is likewise characters and must become a byte bound, or a 256-character key of
 multi-byte characters exceeds the service's own 256-byte key limit.
 
+**Every encode here passes `errors="replace"`.** `sanitize.coerce` passes a lone surrogate through
+unchanged, so a bare `.encode("utf-8")` on a caller's `trace_id` raises `UnicodeEncodeError` — a raw
+exception out of `emit`, which is the failure this whole spec exists to remove, introduced by its
+own fix. `sanitize.truncate_str` is the inventoried byte-bounded clipper and is deliberately **not**
+reused: it appends a truncation marker, which in a partition key changes the shard a record lands
+on.
+
 #### Acceptance Criteria:
 
 - [ ] An event whose serialized data is `MAX_RECORD_BYTES` with a non-empty partition key is
@@ -174,7 +191,8 @@ multi-byte characters exceeds the service's own 256-byte key limit.
       per-record check and `_record_size`, asserted with a key whose byte length exceeds its
       character length.
 - [ ] A partition key longer than 256 **bytes** is truncated to at most 256 bytes and the result is
-      still valid UTF-8.
+      still valid UTF-8, including when the cut falls mid-character.
+- [ ] An event whose partition-key field holds a lone surrogate does not raise out of `emit`.
 
 ### FR-004: `GooglePubSubSink.close()` is bounded, and counts what it abandons
 
@@ -186,15 +204,36 @@ closes the live sink **inline**, and the client's publish deadline is 600 s, so 
 destination holds process exit for that long. Measured with a stalled client: `flush()` raised at
 0.51 s and `close()` ran to the client's deadline with the worker's stop signal already set.
 
-`flush()`'s deadline loop is factored out and called by both. `close()` then counts whatever is
-still in flight into `failed` and announces it once with a count — `KafkaSink._flush_bounded`'s
-rule, for its reason.
+`flush()`'s deadline loop is factored out and shared, but **`close()` cannot run it unmodified**,
+and the two reasons are the design rather than details of it. Both were found by building the naive
+version and running the suite, where each broke an existing test.
 
-Two residues are in scope with it. `flush()` has its own unbounded call on the
-flush-races-close path (`pubsub.py:480-482`): when a `close()` lands while `flush()` is resolving,
-the leftover futures are resolved with `timeout=None`, which is the same unbounded wait one branch
-deeper. And `_resolve`'s docstring becomes false the moment `close` is bounded; it is corrected
-here rather than left for SPEC-049, because the sentence describes the behaviour this FR changes.
+**The stop signal must not shorten a close.** The loop's guard is `_out_of_time`, which returns
+`True` the moment `log_foundry_stop_signal` is set — and `Worker.shutdown` sets that event *before*
+closing the sink inline, so a shared loop would abandon every pending future on every ordinary
+shutdown. That is SPEC-038's settled rule reversed: *a shutdown shortens a wait; it must never skip
+work*, and the exit drain is the one path a serverless process has. `close()`'s bound is therefore
+`time.monotonic()` against `overflow_timeout` alone.
+
+**An unboundable future is resolved unbounded, never counted.** A future whose `result()` takes no
+`timeout` raises `_Unboundable`; SPEC-036 measured that counting it invents loss on publishes that
+were going to succeed, and `test_a_future_whose_result_takes_no_timeout_is_not_counted_as_lost`
+forbids it. `close()` resolves those with `timeout=None` as today — which is what "unbounded" is
+still correct for — and bounds only the futures that *can* be waited on within a timeout.
+
+So the shared loop returns two lists, expired and unboundable, and the close-shaped tail resolves
+the second unbounded and counts the first into `failed` with one announcement —
+`KafkaSink._flush_bounded`'s rule, for its reason.
+
+**All three close-race tails take that tail**, not just `close()`: `flush()`'s
+(`pubsub.py:480-482`) and `_await_overflow`'s (`pubsub.py:343-345`) each resolve leftover futures
+with `timeout=None` when a close lands mid-pass. The third runs on whichever thread called `emit`,
+which on the orphan path is an application thread — SPEC-028's exact hazard. Widening to the third
+site is the "fix the rule, not the cited line" discipline: it is the same three lines, and
+documenting why one instance was left would cost more than fixing it.
+
+`_resolve`'s docstring becomes false the moment `close` is bounded; it is corrected here rather
+than left for SPEC-049, because the sentence describes the behaviour this FR changes.
 
 `close()` must stay total (`Raises: None`), which is the isolation boundary this sink documents.
 
@@ -208,11 +247,20 @@ here rather than left for SPEC-049, because the sentence describes the behaviour
       one `_diag` line reports the count.
 - [ ] CPU time burned across that `close()` is under 0.1 s, so a busy-spin cannot pass it.
 - [ ] `close()` raises nothing, including when a future's `result()` itself raises.
-- [ ] The flush-races-close branch is bounded on the same loop: a `close()` landing mid-`flush()`
-      leaves no `timeout=None` call reachable, asserted by a test that never-settling futures cannot
-      hold either call past its bound.
-- [ ] Futures that settle normally are still resolved and counted exactly as today; the existing
-      `close()` and `flush()` tests pass unchanged.
+- [ ] With the worker's **stop signal set** — a shutdown in progress — `close()` waits exactly as
+      long as it does without it, and counts the same. This replaces
+      `test_the_stop_signal_is_not_consulted_by_close`'s current assertion that close waits
+      `[None]`: that pinned the *mechanism* (unboundedness), and this FR changes the mechanism while
+      keeping the rule it was there for. Asserting the rule directly is the stronger test.
+- [ ] `test_a_future_whose_result_takes_no_timeout_is_not_counted_as_lost` passes **unchanged**:
+      `failed` stays 0 and each future is resolved exactly once.
+- [ ] Both other close-race tails — `flush()`'s and `_await_overflow`'s — are bounded on the same
+      tail, so no `timeout=None` call is reachable for a future that *can* be bounded, and each
+      counts what it abandoned.
+- [ ] Futures that settle normally are still resolved and counted exactly as today. Every existing
+      `close()`/`flush()` test passes unchanged **except** the one named above, whose assertion this
+      FR deliberately replaces — the first draft's blanket "all existing tests pass unchanged" was
+      false, and would have forced the design that reverses SPEC-038.
 
 ### FR-005: `SentrySink.close()` pushes the SDK transport
 
@@ -254,8 +302,18 @@ lines reached disk, 3 of them duplicates. With a persistent failure the raw `Per
 escapes `emit` on every subsequent batch — a non-`SinkDeliveryError` the worker books as
 `failed_batches` with no `losses()` behind it, since the sink has none.
 
-A failed rotation must be absorbed: reopen the active file, re-seed `_size` from it, announce the
-failure once through `_diag`, and **continue the batch on the un-rotated file**. Nothing is lost
+**The batch is flushed before the rotation is attempted.** `_rotate`'s first statement is
+`self._stream.close()`, which flushes, while `emit` flushes once at the end of the batch — so under
+the canonical trigger for a rotation failure, a full or read-only filesystem, it is that flush that
+raises and the batch's buffered lines are gone before any rename is tried. Absorbing the error is
+then not enough: the events are already lost and `os.path.getsize` reports a file that never
+received them. Flushing first makes the "every event on disk exactly once" criterion hold at every
+one of `_rotate`'s raise sites rather than only at the renames.
+
+A failed rotation must then be absorbed: reopen the active file, re-seed `_size` from it, **re-arm
+`_next_rollover`** — `_rotate` sets it on its last line, so an absorbed failure otherwise leaves a
+deadline permanently in the past and every later event retries the rotation — announce the failure
+once through `_diag`, and **continue the batch on the un-rotated file**. Nothing is lost
 and nothing is duplicated; the only cost is the active file exceeding `max_bytes` until a rotation
 succeeds, which is what happens anyway when rotation is impossible. That is the same trade
 SPEC-027 FR-004 already took — a leaked resource beats a corrupt write.
@@ -275,6 +333,11 @@ added. The rotation failure is announced, not counted.
 - [ ] After a failed rotation the sink's stream is **open**: a subsequent `emit` with the failure
       still in place writes its events rather than raising, and the file has grown past
       `max_bytes`.
+- [ ] A rotation failing at the **flush** rather than at a rename — the full-disk shape — also
+      leaves every event of the batch on disk exactly once, which is the criterion the first draft
+      could not meet because its only injection point was `os.replace`, downstream of the flush.
+- [ ] After an absorbed failure the time trigger is re-armed, so a persistent failure writes one
+      `_diag` line per rotation *attempt* at the configured interval rather than one per event.
 - [ ] Once the underlying failure clears, the next triggering event rotates normally.
 - [ ] `RotatingFileSink` gains no `losses()` and no counter, and the existing rotation suite passes
       unchanged.
