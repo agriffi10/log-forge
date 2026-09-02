@@ -82,6 +82,8 @@ poetry run pytest -n 0             # ...serially — REQUIRED for --pdb and -s (
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
 sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
+sh scripts/docs-lint.sh            # the always-loaded tier: shape + budgets (run before every push)
+sh scripts/docs-lint-test.sh       # prove docs-lint's own checks still fire (if you changed it)
 
 # Supply-chain tooling (SPEC-023). The `security` group is optional — `--with dev` never installs it.
 poetry install --with security --all-extras    # audit tooling + every optional extra

@@ -5,16 +5,17 @@
 # prose — in `docs/process.md` §5 (*Anti-regrowth & doc hygiene*), in `CLAUDE.md`'s own
 # doc-size guardrail, and in `docs/decisions.md`'s rules header — and several were
 # violated here anyway. The history says something sharper than "a rule was ignored".
-# This file grew from 7,350 bytes at `ad898fc8` to 89,340 at `e60b60d`, more
+# `CLAUDE.md` grew from 7,350 bytes at `ad898fc8` to 89,340 at `e60b60d`, more
 # than tenfold, and for most of that `docs/process.md` carried only a TWO-SENTENCE version
 # of the rule, naming no shape, no register and no budget. The full set arrived at
-# `690d2a55`, two days before the cut, named the violation in the present tense and
-# correctly — and the file grew a further fifth anyway. Both ends are anchored to commits
+# `690d2a55`, days before the cut, named the violation in the present tense and
+# correctly — and the file grew by nearly a third again anyway. Both ends are anchored
 # rather than restated: an earlier version of this comment carried three numbers and two
 # were wrong by the time it shipped.
 #
-# A rule a reader has to remember is a rule that rots. This is the same rules where CI
-# can see them.
+# A rule a reader has to remember is a rule that rots. This is the same rules where a
+# script can see them — run before every push, deliberately not in CI, so the failure
+# lands on whoever caused it rather than on a shared branch.
 #
 # FAIL (exit 1): the always-loaded file is over budget or has been removed outright, a
 #   Key Decisions unit has become the reasoning, the register is missing or has inverted
@@ -34,7 +35,7 @@
 # NOTE for maintainers: the awk programs below are single-quoted. An apostrophe anywhere
 # inside one — including in a comment — closes the quote, and the shell then parses awk
 # source as shell. That failed *silently with status 0* once during authoring, which is
-# why `.github/workflows/docs-lint.yml` runs `sh -n` on this file as its own step.
+# why `scripts/docs-lint-test.sh` runs `sh -n` on this file before anything else.
 
 set -eu
 
