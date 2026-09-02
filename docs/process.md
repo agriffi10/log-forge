@@ -109,8 +109,9 @@ gate has run (*A replaced artifact restarts its gate*, below).
   passes against the bug it claims to catch, a lock taken in the wrong order, or an acceptance
   criterion ticked with no evidence. SPEC-028 merged green and a review then found a sink that could
   hang an application thread forever; that review is the one that now happens before the push.
-- Before pushing, run **this repo's four gates** locally and get them green: `poetry run ruff check .`,
-  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`. They are a pre-push step — don't
+- Before pushing, run **this repo's five gates** locally and get them green: `poetry run ruff check .`,
+  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`. They are
+  a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (§6). Format only the files you edited.
@@ -203,8 +204,9 @@ path documented `Raises: None` — and both diff reviews then found more, with n
   argued with. A finding silently dropped is a finding that was not reviewed; a finding rejected in
   one sentence is a finding that was. **Write a rejection down only when it carries a lesson worth
   keeping** — then it belongs in the spec, its delivery doc, or CLAUDE.md's Key Decisions, as
-  reasoning, not as a paper trail. (This repo has no separate `decisions.md`; Key Decisions is the
-  register, and `architecture.md` holds the reasoning behind it.)
+  reasoning, not as a paper trail. (The register is `docs/decisions.md`, added
+  2026-09-02; `CLAUDE.md`'s Key Decisions is its one-line digest, and `architecture.md` holds the
+  system-shape reasoning behind both.)
 - **The reviewer gets the artifact and its sources, never the author's reasoning.** For a spec: the
   spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
   and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. For a
@@ -518,11 +520,19 @@ this way).
 - **A register is grouped by AREA; ordering it by spec number turns it into a changelog.** The
   question a reader arrives with is "what has been settled about X", never "what did SPEC-033
   decide". A register is the only home of the rejected alternatives and the fences, so a shape that
-  reads as disposable gets treated as disposable. **This is an obligation this repo has not yet
-  paid:** CLAUDE.md's Key Decisions is a flat spec-ordered list and `## Specs` is a paragraph per
-  completed spec, which is the changelog shape this rule names. Until they are regrouped, a
-  completion **replaces or extends the clause for its area** rather than appending another entry —
-  appending is what took the sibling repo's digest to its own byte ceiling and forced the regroup.
+  reads as disposable gets treated as disposable. **Paid 2026-09-02:** `docs/decisions.md` now holds
+  the 48 entries in nine areas, and `CLAUDE.md`'s Key Decisions is a one-line digest grouped by the
+  same areas. A completion **replaces or extends the clause for its area** rather than appending
+  another entry — appending is what took this file's own digest from 7,583 bytes to 89,340 in eight
+  weeks, with this rule stated here throughout.
+- **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
+  (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
+  bullet to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
+  digest line for every entry, and to list every entry in its Contents; requires every Completed spec
+  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The budgets are
+  ratchets at the measured level** — when one fires, move detail down a tier and re-ratchet, rather
+  than raising the cap. Every rule it checks was already written here, and every one was violated
+  anyway; that is the argument for a script over a paragraph.
 - **When a doc moves, the pointers that rot unseen are in SOURCE files** — `.py` docstrings, `.toml`
   comments, `.yml` steps. A markdown-only sweep reports the tree clean. Grep the path, not the
   filename, and fix the Draft specs too: a Draft is an unbuilt instruction, and pointing one at a
