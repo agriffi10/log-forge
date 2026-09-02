@@ -1,0 +1,23 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/sinks/sqs.py
+"""A fixture module.
+
+With a second line, which is allowed only at an exempt path.
+"""
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Does the thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

@@ -1,0 +1,19 @@
+@@@ expect exit=1
+@@@ match summary line is more than one sentence
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+def f() -> None:
+    """Does the thing. Then does another thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

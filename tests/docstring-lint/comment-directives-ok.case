@@ -1,0 +1,21 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+
+x: int = 1  # noqa: F841
+y: int = 2  # type: ignore[assignment]
+z: int = 3  # pragma: no cover
+def f() -> None:
+    """Does the thing.
+
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """

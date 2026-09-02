@@ -1,0 +1,30 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/example.py
+"""A compliant fixture module."""
+
+from typing import overload
+
+
+@overload
+def f(a: int) -> int:
+    """Handles the int case."""
+
+
+@overload
+def f(a: str) -> str:
+    """Handles the str case."""
+
+
+def f(a: object) -> object:
+    """Does the thing.
+
+    Args:
+      a: The thing.
+
+    Returns:
+      The thing.
+
+    Raises:
+      None.
+    """
+    return a
