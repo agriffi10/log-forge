@@ -173,7 +173,7 @@ def _work() -> int:
     return 1
 
 
-def _sinks() -> list[object] :
+def _sinks() -> list[object]:
     """Constructs the HTTP family with the keywords FR-005 AC-2 says must still check.
 
     Args:

@@ -203,8 +203,10 @@ declared once each in `sinks/http.py` and composed by inheritance rather than re
       `TypeError` (`DatadogSink("k", body_format=…)`) and a keyword silently discarded
       (`LogstashSink(host=…, port=…, unknown=…)`, whose socket mode forwards nothing).
 - [ ] No `# type: ignore[arg-type]` remains on any of the seven forwarding calls. Four remain as
-      `[misc]` — Datadog, Honeycomb, New Relic and Splunk HEC, the `merge_headers` callers — and
-      each covers only the `headers` key that call pops.
+      `[misc]` — Datadog, Honeycomb, New Relic and Splunk HEC, the `merge_headers` callers —
+      and the only error each suppresses is the duplicate `headers` that call pops. A `misc`
+      directive silences its whole line, so what stops it hiding a wrong *shape* is the
+      roster below and the probe, not the narrower code.
 - [ ] A derived test asserts the TypedDicts cannot drift from `HTTPSink`: the widest one's keys
       **and their annotations** equal `HTTPSink.__init__`'s keyword-only parameters and theirs,
       and every narrower one is a subset of it on both. A keyword added to `HTTPSink` and to no
@@ -398,7 +400,7 @@ docs/
 
 ### Phase 3: The forwarded HTTP keywords
 
-- The five `TypedDict`s in `sinks/http.py`; `merge_headers` accepts one.
+- The five `TypedDict`s in `sinks/http.py`; `merge_headers` takes the narrowest of them.
 - `Unpack[…]` on all seven sinks; drop each `# type: ignore[arg-type]`, leaving `[misc]` on the
   four `merge_headers` callers.
 - The derived anti-drift test against `HTTPSink.__init__`'s signature and annotations.

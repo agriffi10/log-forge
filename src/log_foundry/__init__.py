@@ -121,9 +121,9 @@ def health() -> Health:
       sink's is an event that never reached the wire, and the stderr line names which. Its
       ``failed`` is an upper bound on loss rather than a count of it, since a sink that raises
       on total failure counts the attempt and hands the batch back for the worker to retry.
-      ``inherited_sink`` is a state and not a fault: the sink this process last installed for
-      delivery is one it inherited across a ``fork`` and may not release, which is what explains
-      a handle still open after :func:`shutdown` (SPEC-042). ``orphan_lost`` and ``in_span_lost``
+      ``inherited_sink`` is a state and not a fault: it says **whether** the sink this process
+      last installed for delivery is one it inherited across a ``fork`` and may not release,
+      which is what explains a handle still open after :func:`shutdown` (SPEC-042). ``orphan_lost`` and ``in_span_lost``
       are the two terms above that describe no worker at all, and the alert idiom ends on them. A
       process that has never logged has no worker, and asking does not create one — the
       snapshot is simply zeroed, except for ``retired``, which stays truthful even for a

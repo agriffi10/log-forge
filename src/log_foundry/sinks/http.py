@@ -225,20 +225,20 @@ class HTTPForwardKwargs(TypedDict, total=False):
 
 
 class HTTPRetryKwargs(HTTPForwardKwargs, total=False):
-    """...and the two a sink with a single transport does not own."""
+    """:class:`HTTPForwardKwargs` plus the two a sink with a single transport does not own."""
 
     timeout: float
     max_retries: int
 
 
 class HTTPAuthKwargs(HTTPForwardKwargs, total=False):
-    """...and ``auth``, for a sink that takes no credentials of its own."""
+    """:class:`HTTPForwardKwargs` plus ``auth``, for a sink taking no credentials of its own."""
 
     auth: str | tuple[str, str] | None
 
 
 class HTTPPlatformKwargs(HTTPRetryKwargs, HTTPAuthKwargs, total=False):
-    """Both of the above: for a sink that owns only the body format."""
+    """Both of those: for a sink that owns only the body format."""
 
 
 class HTTPKwargs(HTTPPlatformKwargs, total=False):
@@ -247,7 +247,7 @@ class HTTPKwargs(HTTPPlatformKwargs, total=False):
     body_format: str
 
 
-def merge_headers(base: dict[str, str], http_kwargs: Any) -> dict[str, str]:
+def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
     """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
 
     This is shared by the SaaS sinks that set a fixed auth header — Datadog, Splunk, New Relic,
@@ -256,11 +256,11 @@ def merge_headers(base: dict[str, str], http_kwargs: Any) -> dict[str, str]:
     Args:
       base: The sink's own headers, updated in place.
       http_kwargs: The caller's keyword arguments, mutated by popping ``headers`` out so the
-        rest can be forwarded to :class:`HTTPSink` without a duplicate argument. Typed ``Any``
-        rather than a mapping because it *mutates*: callers now pass a ``TypedDict``, which is
-        assignable to ``Mapping[str, object]`` but not to ``MutableMapping``, and ``mypy``
-        cannot see the ``pop`` narrow it either — which is why the four callers keep one
-        ``type: ignore[misc]`` on their forwarding call.
+        rest can be forwarded to :class:`HTTPSink` without a duplicate argument. Typed as the
+        narrowest shape (SPEC-051 FR-005); every wider one is assignable to it, and ``pop`` is
+        allowed because each key is ``total=False``. The pop is why a caller may still pass
+        ``headers``, and — since it happens *here*, in another function — why ``mypy`` reports
+        the caller's own forwarding call as a possible duplicate anyway.
 
     Returns:
       The merged headers.

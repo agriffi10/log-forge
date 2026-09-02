@@ -163,7 +163,7 @@ for an area before working in it. A line here is **never the only home of a fact
 - **A client exception costs its chunk, and is provable non-delivery for it** — guarded *inside* `_send`, since an outer guard reports a partial success as "nothing delivered"; it feeds SQS's recoverable term, or a total failure returns silently. (SPEC-048)
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — both halves bind — three shipped sinks lost every post-`close()` event, while making the stateless sinks refuse would invent loss where a batch would have landed. (SPEC-032)
 - **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests because each accepted size is rediscovered in every branch; capping the recursion *depth* instead is the trap — a cap of 4 against a 250x ratio delivered 2 events of 2,000. (SPEC-038)
-- **A sink's constructor keeps the vendor's own spelling, and types what it forwards** — the names are frozen: `bootstrap_servers`, `queue_url`, `dsn` are the vendors' own, and a house vocabulary would fight the doc beside it. The forwarded HTTP keywords are typed instead. (SPEC-051)
+- **A sink's constructor keeps the vendor's own spelling, and types what it forwards** — the names are frozen: `servers`, `queue_url` and `bootstrap_servers` are the vendors' own words, and a house vocabulary would fight the doc beside them. The forwarded HTTP keywords are typed instead. (SPEC-051)
 
 ### The sink contract: waiting, concurrency and shutdown
 

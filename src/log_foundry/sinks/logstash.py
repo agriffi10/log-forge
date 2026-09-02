@@ -113,7 +113,8 @@ class LogstashSink:
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode,
             typed as ``HTTPAuthKwargs`` (SPEC-051 FR-005) — every keyword it takes except
             ``body_format``, ``timeout`` and ``max_retries``, each a parameter of this sink's
-            own because socket mode needs it too.
+            own: the last two because socket mode uses them, and ``body_format`` because it is
+            validated in both modes and defaults differently here.
 
         Returns:
           None.

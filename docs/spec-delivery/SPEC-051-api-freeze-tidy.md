@@ -36,18 +36,22 @@ after this spec.
   positional arguments. Nothing in `src/` or `tests/` constructed them that way.
 - SPEC-034 FR-004 widened `fields=` to `Mapping`; the same fix reaches `defaults=` here.
 - SPEC-009's seven platform sinks lose `# type: ignore[arg-type]` on their forwarding call; four
-  keep a `[misc]` covering only the `headers` key `merge_headers` pops. `merge_headers` takes
-  `Any`, because it mutates by popping and a `TypedDict` is not a `MutableMapping`.
+  keep a `[misc]`, whose only suppressed error is the duplicate `headers` that call pops.
+  `merge_headers` takes `HTTPForwardKwargs`, the narrowest shape — the first draft widened it
+  to `Any` on a premise the first diff review disproved by building it.
 - The `Health` docstring's index-access claim, inherited from the `NamedTuple` SPEC-034 replaced,
   is gone; `health()`'s `Returns:` now names all twelve fields.
 
 ## Verification
 
 `ruff`, `mypy`, `pytest`, `spec-lint`, `docs-lint`, `docs-lint-test` all exit 0 locally. Every new
-guard was mutation-tested: three in Phase 1, four in Phase 2, six against the HTTP roster, four
-against the probe. Two findings came out of that rather than out of review — a subset assertion
-over the TypedDict family that inheritance made unkillable (removed, with the reason in the file),
-and a `# want:` regex that collected two sentences of its own docstring (now `tokenize`).
+guard was mutation-tested. Two findings came out of that rather than out of review — a subset
+assertion over the TypedDict family that inheritance made unkillable (removed, with the reason
+in the file), and a `# want:` regex that collected two sentences of its own docstring (now
+`tokenize`). The first diff review found three false claims in prose that no test could reach:
+two in `merge_headers`'s docstring, which had `Any` standing on them, and three vendor-spelling
+claims in the new register entry — `connection_str` and `uri` are the library's own names, not
+Azure's and pymongo's.
 
 `MYPYPATH` in the probe runner is proved the only way it can be: pointed at a library without this
 spec's additions, the consumer must fail and name one. Dropping it is undetectable from a worktree

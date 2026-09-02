@@ -1545,3 +1545,29 @@ def test_the_health_docstring_makes_no_index_claim() -> None:
     assert "index access" not in (log_foundry.Health.__doc__ or "")
     with pytest.raises(TypeError):
         len(log_foundry.health())
+
+
+def test_the_typed_consumer_probe_covers_every_exported_name() -> None:
+    """SPEC-051 FR-004 AC-4, derived, because the probe's import list is hand-written.
+
+    `tests/typed_consumer/accepts.py` is only ever read by `mypy`, so a name added to an `__all__`
+    and not to it leaves the probe silently incomplete with every gate green. Reading the probe's
+    own `from ... import` statements against the live `__all__` is what stops that -- the same
+    rot the context and HTTP rosters are written against, one layer out.
+    """
+    probe = _ROOT / "tests" / "typed_consumer" / "accepts.py"
+    tree = ast.parse(probe.read_text(encoding="utf-8"))
+    imported: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    assert imported, "the probe's import scan collapsed -- it cannot see an absence"
+
+    for module_name, exported in (
+        ("log_foundry", log_foundry.__all__),
+        ("log_foundry.sinks.sqs", pytest.importorskip("log_foundry.sinks.sqs").__all__),
+        ("log_foundry.sinks.sentry", pytest.importorskip("log_foundry.sinks.sentry").__all__),
+        ("log_foundry.sinks.http", pytest.importorskip("log_foundry.sinks.http").__all__),
+    ):
+        missing = sorted(set(exported) - imported.get(module_name, set()))
+        assert not missing, f"{module_name} exports these and the probe never imports them: {missing}"

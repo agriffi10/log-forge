@@ -208,7 +208,8 @@ Group related specs and record the order to build them in. Keep this section: a 
   every remaining counter, hook and reason is *additive* and free in `1.x`. What genuinely freezes
   at 1.0 is **SPEC-034 entire**, plus **SPEC-038 FR-012** (`RotatingFileSink`'s default),
   **FR-013** (the utility sinks' module) and **SPEC-051**, which is the same test applied to
-  what 034 left: a shape that is free to change today and breaking to change after the tag. Everything else is urgent because it is data loss, not
+  what 034 left: a shape that is free to change today and breaking to change after the tag.
+  Everything else is urgent because it is data loss, not
   because of the tag — a distinction worth keeping, because treating the whole arc as
   release-blocking is how a tag stays held indefinitely.
 
