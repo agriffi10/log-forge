@@ -1157,7 +1157,7 @@ Falsy carries a `reason` saying which of these happened, because they need diffe
 | `"retired"` | `shutdown()` was already called. Your lifecycle is wrong, not the sink. |
 | `"thread-died"` | The drain thread is gone; see `health().stopped_reason`. |
 | `"queue-full"` | Backpressure — the queue could not even accept the marker. |
-| `"abandoned"` | A batch was given up on after its retry budget. The destination is broken. |
+| `"abandoned"` | The drain that would have carried those events did not confirm delivery of them. A broken destination is one cause, but not the only one — an expiring bounded `shutdown()` answers waiting calls pessimistically, and the drain may still deliver afterwards. So this is not by itself evidence that anything was lost: `health()` is what says whether it was. |
 | `"sink-flush"` | Everything queued reached the sink, but the sink's own `flush()` raised — a client-side buffer that did not go out. Distinct from `"abandoned"`: the library delivered, the sink did not. |
 
 ```python
