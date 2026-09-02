@@ -164,7 +164,14 @@ later narrows the SPEC-036 FR-004 window it exists to close rather than widening
 fail.
 
 `in_span_lost` is the field: these events were lost while the span was being closed, which is the
-population SPEC-036 FR-003 defined it over.
+population SPEC-036 FR-003 defined it over. Surfacing a `stopped_reason` instead was the audit's
+other suggestion and is rejected: there is no worker to carry it, so it would need module state
+synthesized the way `retired` is, for a signal that names a cause where the caller needs a count.
+
+**It falsifies two docstrings, and they are part of this FR.** `Health.in_span_lost` (public) and
+`decorator._note_in_span_loss` both say the path "cannot fail at `emit`", so a non-zero count
+"always means **the data**, never the destination". After this it can also mean the process could
+not give the library a thread to deliver through. Both are corrected here.
 
 #### Acceptance Criteria:
 
@@ -178,6 +185,8 @@ population SPEC-036 FR-003 defined it over.
 - [ ] A span swept by `_sweep_open_spans` while `_get_worker()` is blocked is not double-counted
       and its events are not delivered twice.
 - [ ] `orphan_lost` is untouched by this path.
+- [ ] `Health.in_span_lost` and `_note_in_span_loss` no longer claim the count always means the
+      data, and the new cause is named in both.
 
 ### FR-004: A sink stranded by an unconfirmed swap is closed once the drain thread has ended
 
@@ -229,8 +238,11 @@ true.
 - [ ] A `shutdown()` that expires with the drain thread still alive leaves A open; a *later*
       `shutdown()` that finds the thread finished closes it then.
 - [ ] A is never closed twice by any route: swapped out unconfirmed then re-adopted as the live
-      sink; swapped out unconfirmed, re-adopted, then swapped out again on a confirmed drain; or
-      re-armed on the orphan path after a second unconfirmed swap.
+      sink, and swapped out unconfirmed, re-adopted, then swapped out again on a *confirmed*
+      drain. A third route — an orphan re-arm after a second unconfirmed swap overwrites the
+      single `_orphan_closed_sink` slot — is guarded by the same prune and is **not** asserted:
+      no reachable call sequence for it was found, and a test for an unconstructable scenario
+      passes vacuously.
 - [ ] Two successive unconfirmed swaps A→B→C leave both A and B closed exactly once after
       `shutdown()`.
 - [ ] A *stranded* sink whose `close()` never returns cannot extend the budget: `shutdown(timeout=T)`
@@ -326,10 +338,12 @@ docs/
 ├── decisions.md     # the sink-contract area (FR-004's reversal) + the rejection above
 └── specs/SPEC-050-lifecycle-residue.md
 tests/
-├── test_worker.py          # FR-001, FR-002, FR-004, FR-005 + the budget housekeeping
-├── test_lifecycle.py       # FR-002's orphan path and exit-path coverage
-├── test_fork.py            # FR-002's and FR-004's forked-child criteria
-└── test_decorator_sync.py  # FR-003
+├── test_worker.py             # FR-001, FR-002, FR-004, FR-005 + the budget housekeeping
+├── test_shutdown_lifecycle.py # FR-002's orphan path and exit-path coverage
+├── test_fork_lifecycle.py     # FR-002's and FR-004's forked-child criteria
+├── test_worker_predicate_roster.py  # FR-003's new worker-question site, classified
+├── test_config.py             # a monkeypatch that mirrors _close_if_owed's signature
+└── test_decorator_sync.py     # FR-003
 ```
 
 ## Implementation Phases
