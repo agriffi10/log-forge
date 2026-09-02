@@ -9,28 +9,6 @@ import asyncio
 import pytest
 
 
-def _async_trace_supported() -> bool:
-    """True once ``@trace`` returns a coroutine function for async defs (SPEC-003 FR-001).
-
-    Until the async wrapper lands, ``trace`` yields the SPEC-001 sync wrapper, which is not a
-    coroutine function — so this probe (and the module skip below) lifts automatically when
-    SPEC-003 is implemented, matching the "guard on the feature you need" suite convention.
-    """
-    lf = pytest.importorskip("log_foundry")
-    if not hasattr(lf, "trace"):
-        return False
-
-    async def _probe() -> None: ...
-
-    return asyncio.iscoroutinefunction(lf.trace(_probe))
-
-
-pytestmark = pytest.mark.skipif(
-    not _async_trace_supported(),
-    reason="async @trace not implemented yet (SPEC-003)",
-)
-
-
 async def test_async_trace_emits_span_and_status(lf, fake_sink) -> None:
     @lf.trace(name="afetch")
     async def afetch() -> str:
@@ -225,7 +203,7 @@ async def test_cancellation_records_error_end_event(lf, fake_sink) -> None:
 
 
 async def test_async_success_survives_a_broken_close(lf, monkeypatch, capsys) -> None:
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     calls: list[str] = []
 
     def _raise(span, status, exc):
@@ -245,7 +223,7 @@ async def test_async_success_survives_a_broken_close(lf, monkeypatch, capsys) ->
 
 
 async def test_async_failure_propagates_its_own_exception(lf, monkeypatch) -> None:
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(
         decorator, "_close_span", lambda *a: (_ for _ in ()).throw(RuntimeError("closing"))
     )
@@ -262,7 +240,7 @@ async def test_async_failure_propagates_its_own_exception(lf, monkeypatch) -> No
 
 async def test_cancellation_still_propagates_through_a_broken_close(lf, monkeypatch) -> None:
     """FR-001: CancelledError is a BaseException and must not be absorbed by the guard."""
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(
         decorator, "_close_span", lambda *a: (_ for _ in ()).throw(RuntimeError("closing"))
     )
@@ -281,7 +259,7 @@ async def test_cancellation_still_propagates_through_a_broken_close(lf, monkeypa
 
 
 async def test_async_keyboardinterrupt_from_the_close_reaches_the_caller(lf, monkeypatch) -> None:
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(
         decorator, "_close_span", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt)
     )
@@ -295,7 +273,7 @@ async def test_async_keyboardinterrupt_from_the_close_reaches_the_caller(lf, mon
 
 
 async def test_async_call_still_runs_when_the_span_cannot_be_opened(lf, monkeypatch) -> None:
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(
         decorator, "_open_span", lambda name, defaults: (_ for _ in ()).throw(OSError("nope"))
     )

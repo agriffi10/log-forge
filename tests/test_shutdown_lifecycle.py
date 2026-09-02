@@ -8,11 +8,8 @@ import time
 
 import pytest
 
+import log_foundry
 from log_foundry import _lifecycle
-
-log_foundry = pytest.importorskip("log_foundry")
-decorator = pytest.importorskip("log_foundry.decorator")
-worker_mod = pytest.importorskip("log_foundry.worker")
 
 
 class CountingSink:
@@ -299,7 +296,7 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait() -> None:
 def test_the_closer_grace_is_granted_exactly_once_per_call(monkeypatch) -> None:
     """AC-4. Asserted by counting the joins, not by timing them — a gauge that has already
     unwound, or an elapsed time, is the observable that fails to hold here."""
-    lifecycle = pytest.importorskip("log_foundry._lifecycle")
+    from log_foundry import _lifecycle as lifecycle
     joins: list[float | None] = []
     real = lifecycle.join_closers
     monkeypatch.setattr(

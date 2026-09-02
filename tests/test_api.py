@@ -11,9 +11,7 @@ import sys
 
 import pytest
 
-from log_foundry import _lifecycle
-
-api = pytest.importorskip("log_foundry.api")
+from log_foundry import _lifecycle, api
 
 LEVELS = ["debug", "info", "warning", "error", "critical"]
 
@@ -312,7 +310,7 @@ class _BrokenStream:
 
 @pytest.mark.parametrize("level", LEVELS)
 def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=_BrokenSink())
 
     def body() -> None:
@@ -328,9 +326,9 @@ def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
 
 def test_an_in_span_log_is_unaffected_by_a_broken_sink() -> None:
     """FR-003 requires no behaviour change in-span: it buffers and never touches the sink."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=_BrokenSink())
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     seen: list[int] = []
 
     def body() -> None:
@@ -356,7 +354,7 @@ def _break_console(monkeypatch, exc: BaseException | None = None) -> None:
     process-global writer permanently broken — and this spec's own echo guard would then
     absorb the breakage silently for the rest of the session.
     """
-    console_mod = pytest.importorskip("log_foundry.console")
+    from log_foundry import console as console_mod
     monkeypatch.setattr(
         api, "_console", console_mod.ConsoleWriter(stream=_BrokenStream(exc))
     )
@@ -365,7 +363,7 @@ def _break_console(monkeypatch, exc: BaseException | None = None) -> None:
 def test_echo_survives_a_broken_console_and_the_event_still_reaches_the_sink(
     fake_sink, monkeypatch, capsys
 ) -> None:
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=fake_sink)
     _break_console(monkeypatch)
 
@@ -384,9 +382,9 @@ def test_a_broken_sink_still_lets_the_echo_through(monkeypatch, capsys) -> None:
     The event was built before `emit` was reached, so the operator still sees the line on the
     console even though the sink lost it — which is the more useful of the two outcomes.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=_BrokenSink())
-    console_mod = pytest.importorskip("log_foundry.console")
+    from log_foundry import console as console_mod
     stream = io.StringIO()
     monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=stream))
 
@@ -403,7 +401,7 @@ def test_a_broken_sink_still_lets_the_echo_through(monkeypatch, capsys) -> None:
 
 def test_a_keyboardinterrupt_from_the_console_still_propagates(fake_sink, monkeypatch) -> None:
     """The echo guard draws the same line as the sink guard: Exception, never BaseException."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=fake_sink)
     _break_console(monkeypatch, KeyboardInterrupt())
 
@@ -421,7 +419,7 @@ def test_the_guard_covers_building_the_orphan_event_not_only_the_emit(monkeypatc
     nothing to echo, and echoing ``None`` would raise a second, unrelated failure inside the
     guard that exists to keep this call quiet.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t")
     monkeypatch.setattr(
         api, "build_event", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cannot build"))
@@ -438,7 +436,7 @@ def test_the_guard_covers_building_the_orphan_event_not_only_the_emit(monkeypatc
 
 def test_an_orphan_log_returns_even_when_stderr_is_broken_too(monkeypatch) -> None:
     """The channel of last resort has no fallback: losing the line beats raising."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=_BrokenSink())
     monkeypatch.setattr(sys, "stderr", _BrokenStream())
 
@@ -450,7 +448,7 @@ def test_an_orphan_log_returns_even_when_stderr_is_broken_too(monkeypatch) -> No
 
 def test_a_keyboardinterrupt_from_the_sink_still_propagates() -> None:
     """FR-003, as FR-001: the guard catches Exception, never BaseException."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t", sink=_BrokenSink(KeyboardInterrupt()))
 
     def body() -> None:
@@ -462,7 +460,7 @@ def test_a_keyboardinterrupt_from_the_sink_still_propagates() -> None:
 
 def test_a_sink_that_fails_to_construct_does_not_fail_an_orphan_log(monkeypatch, capsys) -> None:
     """`_ensure_sink` builds the sink on first use, so the whole branch is guarded, not `emit`."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     lf.configure(service="t")
     monkeypatch.setattr(
         api, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("cannot build a sink"))
@@ -495,7 +493,7 @@ class _CountingSink:
 
 def test_an_orphan_only_process_closes_its_sink_exactly_once_on_shutdown() -> None:
     """The defect: shutdown() returned early on a null worker, so close() never happened."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
 
@@ -509,7 +507,7 @@ def test_an_orphan_only_process_closes_its_sink_exactly_once_on_shutdown() -> No
 
 
 def test_shutdown_stays_idempotent_on_the_orphan_path() -> None:
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
     lf.info("x")
@@ -523,7 +521,7 @@ def test_shutdown_stays_idempotent_on_the_orphan_path() -> None:
 
 def test_a_close_that_raises_does_not_reach_the_caller(capsys) -> None:
     """SPEC-025: this runs from atexit, where an escape makes CPython print the message."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     class _Exploding(_CountingSink):
         def close(self) -> None:
@@ -547,7 +545,7 @@ def test_a_close_that_raises_does_not_reach_the_caller(capsys) -> None:
 
 def test_configure_without_ever_logging_closes_nothing_and_creates_nothing() -> None:
     """AC-8. Not because the sink was never built — configure() always builds one."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
@@ -562,7 +560,7 @@ def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
     """AC-7. Out of Scope bans standing up a thread at exit to prove there is nothing to drain."""
     import threading
 
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     before = threading.active_count()
     sink = _CountingSink()
@@ -578,7 +576,7 @@ def test_no_worker_thread_is_created_by_the_orphan_lifecycle() -> None:
 
 def test_health_reports_retired_after_an_orphan_only_shutdown() -> None:
     """AC-4/AC-5: `retired` stops being vacuous; `submitted_after_shutdown` keeps its meaning."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
@@ -598,8 +596,8 @@ def test_health_reports_retired_after_an_orphan_only_shutdown() -> None:
 
 def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys) -> None:
     """AC-6, against a sink that actually carries a post-close guard (SPEC-032)."""
-    lf = pytest.importorskip("log_foundry")
-    sqlite_mod = pytest.importorskip("log_foundry.sinks.sqlite")
+    import log_foundry as lf
+    from log_foundry.sinks import sqlite as sqlite_mod
 
     sink = sqlite_mod.SQLiteSink(str(tmp_path / "events.db"))
     lf.configure(service="t", sink=sink)
@@ -621,7 +619,7 @@ def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys)
 
 def test_the_default_stdout_sink_is_not_expected_to_refuse(capsys) -> None:
     """The counterpart to AC-6: 19 of 34 sink classes add no post-close guard, by design."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     stream = io.StringIO()
     from log_foundry.sinks.stdout import StdoutSink
 
@@ -648,7 +646,7 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -
     handler would double-close, since ``atexit`` runs LIFO. Neither shows up in a span-only or
     an orphan-only test.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -673,7 +671,7 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_orphan_first() -
 
 def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_span_first() -> None:
     """AC-3, the other order — the worker exists before anything arms the orphan close."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -701,7 +699,7 @@ def test_a_mixed_process_closes_once_and_keeps_the_worker_drain_span_first() -> 
 
 def test_a_span_only_process_still_closes_exactly_once() -> None:
     """The regression guard: nothing about FR-006 may add a close to the path that worked."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -755,7 +753,7 @@ def test_interpreter_exit_closes_an_orphan_only_sink_exactly_once(
     import subprocess
     import sys as sys_mod
 
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     src = pathlib.Path(lf.__file__).resolve().parent.parent
     script = tmp_path / f"orphan_exit_{len(shutdown)}.py"
     script.write_text(_ORPHAN_EXIT_PROGRAM.format(shutdown=shutdown))
@@ -830,7 +828,7 @@ def test_a_mixed_process_at_interpreter_exit_closes_once_and_still_drains(
     import subprocess
     import sys as sys_mod
 
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     src = pathlib.Path(lf.__file__).resolve().parent.parent
     script = tmp_path / f"mixed_exit_{order}.py"
     script.write_text(_MIXED_EXIT_PROGRAM.format(first=first, second=second))
@@ -867,7 +865,7 @@ def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() ->
     still the guard that keeps a `shutdown()` racing a first `@trace` from closing the sink the
     new worker just captured, so it is asserted directly rather than only through that caller.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
@@ -892,7 +890,7 @@ def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> 
     wrapper creates the worker inside `__enter__`, i.e. exactly while a thread is blocked
     acquiring `_worker_lock`, which is the interleaving a bare unlocked read admits.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     from log_foundry import worker as worker_mod
 
     sink = _CountingSink()
@@ -935,7 +933,7 @@ def test_a_sink_that_raises_on_emit_is_still_closed() -> None:
     emit would leave the socket that failure came from open forever — the exact leak FR-006
     exists to stop. A sink that raised is still a sink that was written to.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     from log_foundry.sinks.base import SinkDeliveryError
 
     class _DeadDestination(_CountingSink):
@@ -956,7 +954,7 @@ def test_a_sink_that_raises_on_emit_is_still_closed() -> None:
 
 def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     """The other side of it: there is no sink, so there is nothing to close."""
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     lf.configure(service="t")
     original = api._ensure_sink
@@ -984,7 +982,7 @@ def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None
     worker whose own `retired` is False. Reading that alone says the process was never shut
     down — false, and it contradicts what `health()` reported one call earlier.
     """
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
 
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)

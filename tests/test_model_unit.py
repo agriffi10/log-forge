@@ -8,10 +8,7 @@ fields are verified now.
 
 import re
 
-import pytest
-
-config = pytest.importorskip("log_foundry.config")
-model = pytest.importorskip("log_foundry.model")
+from log_foundry import config, model
 
 BASE_FIELDS = (
     "timestamp", "level", "message", "trace_id", "span_id", "parent_span_id",

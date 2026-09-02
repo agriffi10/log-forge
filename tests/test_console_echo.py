@@ -8,9 +8,7 @@ conftest to prove the event rode both paths.
 import contextvars
 import io
 
-import pytest
-
-console_mod = pytest.importorskip("log_foundry.console")
+from log_foundry import console as console_mod
 
 
 def test_console_writer_renders_level_and_message() -> None:

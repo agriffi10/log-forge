@@ -20,10 +20,7 @@ import time
 import pytest
 
 import log_foundry
-from log_foundry import _fork, _lifecycle
-
-api = pytest.importorskip("log_foundry.api")
-stdout_sink = pytest.importorskip("log_foundry.sinks.stdout")
+from log_foundry import _fork, _lifecycle, api
 
 
 class CountingSink:
@@ -388,7 +385,7 @@ def test_a_sink_shared_with_the_graph_that_replaces_it_is_not_stranded() -> None
     it keeps taking events through the wrapper, so it is owed a further close. Measured at
     `A.LOST == 2` on a draft that vetoed the repeat close.
     """
-    multi = pytest.importorskip("log_foundry.sinks.multi")
+    from log_foundry.sinks import multi
     first, second = BufferingSink("A"), BufferingSink("B")
     log_foundry.configure(service="t", sink=first)
     log_foundry.info("one")
@@ -589,7 +586,7 @@ def test_a_stranded_sink_re_armed_on_the_orphan_path_is_closed_once(
     because this cannot be raced for reliably and a race test that passes against the bug is
     worse than none.
     """
-    worker_mod = pytest.importorskip("log_foundry.worker")
+    from log_foundry import worker as worker_mod
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.3)
 
     class _Slow(BufferingSink):

@@ -22,7 +22,7 @@ import typing
 
 import pytest
 
-http = pytest.importorskip("log_foundry.sinks.http")
+from log_foundry.sinks import http
 
 _SINK_PKG = pathlib.Path(http.__file__).resolve().parent
 

@@ -11,8 +11,7 @@ import pytest
 
 
 def test_span_stack_push_and_pop() -> None:
-    context = pytest.importorskip("log_foundry.context")
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import context, model
 
     def body() -> None:
         assert context.current_span() is None
@@ -27,7 +26,7 @@ def test_span_stack_push_and_pop() -> None:
 
 
 def test_baggage_merges_within_context() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> dict:
         context.set_baggage(tenant="acme")
@@ -38,7 +37,7 @@ def test_baggage_merges_within_context() -> None:
 
 
 def test_baggage_does_not_leak_across_contexts() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     contextvars.copy_context().run(lambda: context.set_baggage(secret="leak"))
     # a fresh context sees nothing the previous one set
@@ -49,7 +48,7 @@ def test_baggage_does_not_leak_across_contexts() -> None:
 
 
 def test_baggage_scope_restores_the_prior_value() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_baggage(process="default")
@@ -64,7 +63,7 @@ def test_baggage_scope_restores_the_prior_value() -> None:
 
 
 def test_baggage_scope_restores_to_empty_when_nothing_was_set() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         scope = context.push_baggage_scope()
@@ -76,7 +75,7 @@ def test_baggage_scope_restores_to_empty_when_nothing_was_set() -> None:
 
 
 def test_baggage_scope_clears_the_adopted_context() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         scope = context.push_baggage_scope()
@@ -89,7 +88,7 @@ def test_baggage_scope_clears_the_adopted_context() -> None:
 
 
 def test_baggage_scope_clears_an_adopted_context_that_predates_it() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_adopted_context("a" * 32, "b" * 16)
@@ -103,7 +102,7 @@ def test_baggage_scope_clears_an_adopted_context_that_predates_it() -> None:
 
 def test_pop_baggage_scope_tolerates_a_token_from_another_context() -> None:
     """A span body that hands work to another thread can make `reset` raise ValueError."""
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     minted: dict[str, object] = {}
 
     def mint() -> None:
@@ -125,7 +124,7 @@ def test_pop_baggage_scope_tolerates_a_token_from_another_context() -> None:
 
 def test_pop_baggage_scope_from_another_context_falls_back_to_empty() -> None:
     """The same fallback when the foreign token captured an unset variable."""
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     minted: dict[str, object] = {}
 
     # An empty Context has never had the baggage var set, so the token's old value is MISSING.
@@ -143,7 +142,7 @@ def test_pop_baggage_scope_from_another_context_falls_back_to_empty() -> None:
 
 
 def test_reset_context_clears_baggage() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_baggage(tenant="acme", request="r1")
@@ -154,7 +153,7 @@ def test_reset_context_clears_baggage() -> None:
 
 
 def test_reset_context_clears_the_adopted_context() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_adopted_context("a" * 32, "b" * 16)
@@ -166,7 +165,7 @@ def test_reset_context_clears_the_adopted_context() -> None:
 
 def test_reset_context_clears_a_process_level_baggage_default() -> None:
     """Unlike the scope release, an explicit reset erases rather than restores."""
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_baggage(process="p1")  # set before any span — a deliberate default
@@ -177,7 +176,7 @@ def test_reset_context_clears_a_process_level_baggage_default() -> None:
 
 
 def test_reset_context_is_safe_when_nothing_was_ever_set() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.reset_context()
@@ -189,7 +188,7 @@ def test_reset_context_is_safe_when_nothing_was_ever_set() -> None:
 
 
 def test_reset_context_inside_a_span_clears_for_the_remainder_then_the_scope_restores() -> None:
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_baggage(process="p1")
@@ -211,7 +210,7 @@ def test_reset_context_replaces_the_baggage_dict_rather_than_emptying_it() -> No
     holds, so emptying it in place reaches back and wipes the parent's baggage. Only `.set()` of
     a new dict is confined to the context that calls it.
     """
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     def body() -> None:
         context.set_baggage(tenant="acme")
@@ -230,7 +229,7 @@ def test_reset_context_does_not_hand_back_the_shared_contextvar_default() -> Non
     ``reset_context`` bug reinstated (``_baggage.get().clear()``) it passed. Found by review, by
     running that exact mutant against both branches.
     """
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     shared_default = contextvars.Context().run(context._live_baggage)
 
     def body() -> None:
@@ -242,7 +241,7 @@ def test_reset_context_does_not_hand_back_the_shared_contextvar_default() -> Non
 
 
 def test_reset_context_is_exported_from_the_package() -> None:
-    lf = pytest.importorskip("log_foundry")
+    import log_foundry as lf
     assert "reset_context" in lf.__all__
     assert callable(lf.reset_context)
 
@@ -251,8 +250,7 @@ def test_reset_context_is_exported_from_the_package() -> None:
 
 
 def test_pop_span_tolerates_a_token_from_another_context() -> None:
-    context = pytest.importorskip("log_foundry.context")
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import context, model
     minted: dict[str, object] = {}
 
     def span(name: str):
@@ -277,8 +275,7 @@ def test_pop_span_tolerates_a_token_from_another_context() -> None:
 
 
 def test_pop_span_from_another_context_falls_back_to_empty() -> None:
-    context = pytest.importorskip("log_foundry.context")
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import context, model
     minted: dict[str, object] = {}
 
     def mint() -> None:

@@ -323,7 +323,7 @@ def test_multi_empty_does_not_raise_on_emit() -> None:
 
 def test_worker_records_a_failed_batch_when_every_child_is_down() -> None:
     """End-to-end: the whole point of FR-004 — this used to leave failed_batches at 0."""
-    worker_mod = pytest.importorskip("log_foundry.worker")
+    from log_foundry import worker as worker_mod
 
     worker = worker_mod.Worker(MultiSink(BoomSink()), batch_size=1, max_retries=1)
     try:

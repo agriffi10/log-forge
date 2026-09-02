@@ -3,9 +3,7 @@
 import io
 import json
 
-import pytest
-
-stdout_sink = pytest.importorskip("log_foundry.sinks.stdout")
+from log_foundry.sinks import stdout as stdout_sink
 
 
 class _RecordingStream(io.StringIO):

@@ -16,8 +16,8 @@ import sys
 
 import pytest
 
-ids = pytest.importorskip("log_foundry.ids")
-context_mod = pytest.importorskip("log_foundry.context")
+from log_foundry import context as context_mod
+from log_foundry import ids
 
 # The example header from the W3C Trace Context spec.
 INBOUND_TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"

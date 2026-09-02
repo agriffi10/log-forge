@@ -1,7 +1,7 @@
 # Spec: The Ungated Docstring Rule, and the Scaffolding It Left Behind
 
 **ID:** SPEC-052
-**Status:** In Progress
+**Status:** Completed
 **Last Updated:** 2026-09-02
 **Depends On:** None
 
@@ -279,12 +279,12 @@ three follow-on edits, each of which is a mechanical fix ruff itself can apply a
   must then be sorted. Import blocks are reordered.
 - **`F401`, from two different causes, and the second is the dangerous one.** In files where
   the guards were the only use of `pytest`, `import pytest` becomes unused and is removed —
-  routine. But at two sites the **substituted import itself** is unused, because the guard
-  existed only for its skip side-effect and nothing referenced the name:
-  `test_owed_closes.py` (`sinks.stdout`) and `test_shutdown_lifecycle.py` (`worker`). A blind
-  `ruff check --fix` deletes those two conversions outright, replacing a dead guard with
-  nothing — and **the collected-name diff cannot see it**, because no test name changes.
-  Each such site is reported and decided by hand, never removed as a fix side-effect.
+  routine. But at some sites the **substituted import itself** is unused, because the guard
+  existed only for its skip side-effect and nothing referenced the name. A blind
+  `ruff check --fix` deletes those conversions outright, replacing a dead guard with nothing —
+  and **the collected-name diff cannot see it**, because no test name changes. Each such site is
+  reported and decided by hand, never removed as a fix side-effect. How many there are is a
+  property of the tree on the day, not of this spec.
 - **`E402`** — a module-level substitution landing after non-import code is a mid-file import.
   `# noqa` in ruff is **per line**; there is no block inheritance, so a substitution near an
   existing exempted block (`test_config.py:119-120` carry the noqa, not the `importorskip`
@@ -309,8 +309,13 @@ AST-driven, not a regex over source.
       `grep importorskip` is **not** the check — it also matches the prose at
       `test_sentry_backend.py:463` and `test_worker_predicate_roster.py:51`, the second of which
       this FR's own Description cites approvingly.
-- [ ] Every site where `ruff` reports the **substituted** import as unused is listed and
-      decided explicitly, not auto-fixed. Expected: exactly two.
+- [ ] Every site where `ruff` reports the **substituted** import as unused is listed and decided
+      explicitly, never auto-fixed. **The count is derived at build time, not written here** — an
+      earlier draft of this criterion said "expected: exactly two" and there were seven, which is
+      the same defect as a fixed population count and would have been satisfied by adjudicating
+      two of them. What is checked is that the list `ruff` reports is exhausted, each entry
+      carrying a reason: is the bound name referenced anywhere else, and does dropping the import
+      change what is in `sys.modules` when that file's tests run?
 - [ ] Every file under `tests/` parses: `python3 -m compileall -q tests/` exits 0.
 - [ ] `tests/typed_consumer/accepts.py` and `tests/typed_consumer/rejects.py` are **byte-identical**
       before and after. They are never imported or collected — they are inputs to a
@@ -329,8 +334,10 @@ AST-driven, not a regex over source.
       three species FR-006 names: `test_sinks_nats.py:474,492,657`, `test_sentry_backend.py:472`
       ×3, and `test_fork_lifecycle.py:1569,1954`.
 - [ ] Renaming `src/log_foundry/sinks/sqs.py` makes **`poetry run pytest tests/test_sinks_sqs.py`**
-      exit **2** (a collection error), where the same break before this FR gives exit **5**,
-      "1 skipped". Reverted after. Two things make this criterion precise rather than
+      fail with an **`ImportError` collection error**, where the same break before this FR gives
+      exit **5** — "no tests ran", the file silently skipped. Measured: exit 5 → exit 1. The
+      criterion is the *reason*, not the code: exit 1 is what this pytest returns for a
+      collection error, and a neighbouring failure returns it too. Reverted after. Two things make this criterion precise rather than
       approximate: the module must be one **not** reachable from `import log_foundry` — a core
       module such as `worker.py` already fails today via `__init__.py`, so using one would tick
       without the FR — and the run must be **scoped to that one file**, because at whole-suite

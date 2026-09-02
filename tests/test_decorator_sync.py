@@ -1,9 +1,8 @@
 """SPEC-001 FR-006/FR-007 — sync @trace lifecycle without the logging API.
 
-The pre-written `test_decorator.py` uses `lf.info`/`lf.set_baggage` (SPEC-002), so it stays
-skipped through SPEC-001. These tests drive the decorator against a `FakeSink` directly and
-assert on the span-boundary events, exercising FR-006 (lifecycle, hierarchy, non-swallowing)
-and FR-007 (the `trace` façade export) now.
+These tests drive the decorator against a `FakeSink` directly and assert on the span-boundary
+events, exercising FR-006 (lifecycle, hierarchy, non-swallowing) and FR-007 (the `trace`
+façade export).
 """
 
 import contextvars
@@ -13,12 +12,8 @@ import time
 
 import pytest
 
-log_foundry = pytest.importorskip("log_foundry")
-
-pytestmark = pytest.mark.skipif(
-    not (hasattr(log_foundry, "trace") and hasattr(log_foundry, "configure")),
-    reason="log_foundry.trace / configure not implemented yet",
-)
+import log_foundry
+from log_foundry.sinks import stdout as stdout_sink
 
 
 def test_single_span_records_start_end_ok(fake_sink) -> None:
@@ -120,7 +115,7 @@ def test_end_event_appended_before_flush(fake_sink) -> None:
 @pytest.fixture
 def broken_close(monkeypatch):
     """Make `_close_span` raise, and hand back the list of what it was called with."""
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     calls: list[tuple[str, object]] = []
 
     def _raise(span, status, exc):
@@ -165,7 +160,7 @@ def test_the_close_runs_exactly_once_per_span(fake_sink, monkeypatch) -> None:
     """FR-002: the old shape closed in the `try` *and* the `except`, so a close that failed on
     the success path emitted a second, contradicting `span.end` for a call that had returned."""
     log_foundry.configure(service="t", sink=fake_sink)
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     flushed: list[list[str]] = []
 
     def flush_then_fail(span):
@@ -211,7 +206,7 @@ def test_one_end_event_on_each_path(fake_sink) -> None:
 def test_a_keyboardinterrupt_from_the_close_still_reaches_the_caller(monkeypatch) -> None:
     """FR-001: the guard catches Exception, never BaseException."""
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
 
     def _interrupt(span, status, exc):
         raise KeyboardInterrupt
@@ -229,7 +224,7 @@ def test_a_keyboardinterrupt_from_the_close_still_reaches_the_caller(monkeypatch
 def test_a_call_still_runs_when_the_span_cannot_be_opened(monkeypatch, capsys) -> None:
     """Hardening the pre-body setup: a fault there would stop the app doing its work at all."""
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
 
     def _no_entropy(name, defaults):
         raise OSError("no entropy available")
@@ -248,7 +243,7 @@ def test_a_call_still_runs_when_the_span_cannot_be_opened(monkeypatch, capsys) -
 
 def test_an_untraced_call_still_propagates_its_own_exception(monkeypatch) -> None:
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(
         decorator, "_open_span", lambda name, defaults: (_ for _ in ()).throw(OSError("nope"))
     )
@@ -264,7 +259,7 @@ def test_an_untraced_call_still_propagates_its_own_exception(monkeypatch) -> Non
 def test_the_span_stack_is_left_clean_after_a_broken_close(broken_close) -> None:
     """`pop_span` runs after the guarded close, so the stack unwinds even when the close fails."""
     log_foundry.configure(service="t")
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
 
     @log_foundry.trace(name="work")
     def work() -> int:
@@ -280,7 +275,7 @@ def test_the_span_stack_is_left_clean_after_a_broken_close(broken_close) -> None
 def test_duration_is_measured_before_the_flush(fake_sink, monkeypatch) -> None:
     """FR-002: `duration_ms` covers the function body, not the flush that follows it."""
     log_foundry.configure(service="t", sink=fake_sink)
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     real_flush = decorator._flush
 
     def slow_flush(span):
@@ -303,7 +298,7 @@ def test_duration_is_measured_before_the_flush(fake_sink, monkeypatch) -> None:
 def test_the_setup_guard_lets_a_keyboardinterrupt_through(monkeypatch) -> None:
     """FR-001: `_begin` catches Exception, never BaseException — as `_end` does."""
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
 
     def _interrupt(name, defaults):
         raise KeyboardInterrupt
@@ -323,7 +318,7 @@ def test_a_span_that_could_not_be_pushed_is_still_closed_and_flushed(
 ) -> None:
     """Partial setup is kept, not unwound — the span exists, so its events are worth having."""
     log_foundry.configure(service="t", sink=fake_sink)
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     monkeypatch.setattr(
         context, "push_span", lambda span: (_ for _ in ()).throw(RuntimeError("no push"))
     )
@@ -346,8 +341,7 @@ def test_an_untraced_root_call_still_releases_its_baggage_scope(fake_sink, monke
     path. Taken first, the scope is still there to release even though nothing was traced.
     """
     log_foundry.configure(service="t", sink=fake_sink)
-    context = pytest.importorskip("log_foundry.context")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import context, decorator
     monkeypatch.setattr(
         decorator, "_open_span", lambda name, defaults: (_ for _ in ()).throw(OSError("nope"))
     )
@@ -371,7 +365,7 @@ def test_a_root_whose_scope_fails_is_not_traced_at_all(fake_sink, monkeypatch, c
     not also claim, in the log stream, to be a well-formed span.
     """
     log_foundry.configure(service="t", sink=fake_sink)
-    context = pytest.importorskip("log_foundry.context")
+    from log_foundry import context
     monkeypatch.setattr(
         context, "push_baggage_scope", lambda: (_ for _ in ()).throw(RuntimeError("no scope"))
     )
@@ -389,8 +383,7 @@ def test_a_root_whose_scope_fails_is_not_traced_at_all(fake_sink, monkeypatch, c
 def test_an_untraced_nested_call_does_not_detach_its_parent(fake_sink, monkeypatch) -> None:
     """`_end`'s `token is not None` guard: `pop_span(None)` would wipe the whole stack."""
     log_foundry.configure(service="t", sink=fake_sink)
-    context = pytest.importorskip("log_foundry.context")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import context, decorator
     real_open = decorator._open_span
     seen: list[object] = []
 
@@ -446,7 +439,7 @@ def test_events_are_flushed_before_the_wrapper_returns(fake_sink) -> None:
 def test_a_sink_that_fails_to_construct_does_not_fail_the_caller(monkeypatch, capsys) -> None:
     """FR-001 as worded: the motivating case is a sink whose *construction* raises."""
     log_foundry.configure(service="t")
-    config = pytest.importorskip("log_foundry.config")
+    from log_foundry import config
     monkeypatch.setattr(
         config, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("no sink"))
     )
@@ -473,7 +466,7 @@ def test_a_raising_traced_call_leaves_no_reference_cycle(monkeypatch) -> None:
     a cycle only the collector can break, which also pins the *caller's* frames and locals.
     """
     log_foundry.configure(service="t")
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     monkeypatch.setattr(decorator, "_flush", lambda span: None)
 
     @log_foundry.trace(name="boom")
@@ -523,7 +516,7 @@ def test_a_span_that_cannot_reach_a_worker_counts_every_event_it_held(capsys) ->
     whole buffer, so three events per span rather than one — a per-span increment would read 2
     for six lost events and understate the loss by a factor of the span's size.
     """
-    sink = pytest.importorskip("log_foundry.sinks.stdout").StdoutSink()
+    sink = stdout_sink.StdoutSink()
     log_foundry.configure(service="test", sink=sink)
 
     with pytest.MonkeyPatch.context() as patch:
@@ -553,8 +546,8 @@ def test_a_span_failing_before_its_end_event_counts_only_what_it_held(capsys) ->
     fault in `_flush` leaves it holding the end event too. Counting `len(span.events)` is what
     makes one site cover both; a constant would be wrong for at least one of them.
     """
-    decorator = pytest.importorskip("log_foundry.decorator")
-    sink = pytest.importorskip("log_foundry.sinks.stdout").StdoutSink()
+    from log_foundry import decorator
+    sink = stdout_sink.StdoutSink()
     log_foundry.configure(service="test", sink=sink)
 
     with pytest.MonkeyPatch.context() as patch:
@@ -608,8 +601,9 @@ def test_a_swept_span_cannot_be_double_counted_by_the_reordered_flush() -> None:
     property of the module rather than raced for, because a race test for an invariant that holds
     by construction can only ever pass.
     """
-    decorator = pytest.importorskip("log_foundry.decorator")
     import inspect
+
+    from log_foundry import decorator
 
     source = inspect.getsource(decorator._sweep_open_spans)
     assert "_note_in_span_loss" not in source, (
