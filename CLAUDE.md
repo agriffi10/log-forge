@@ -82,6 +82,8 @@ poetry run pytest -n 0             # ...serially — REQUIRED for --pdb and -s (
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
 sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
+sh scripts/docs-lint.sh            # the always-loaded tier: shape + budgets (run before every push)
+sh scripts/docs-lint-test.sh       # prove docs-lint's own checks still fire (if you changed it)
 
 # Supply-chain tooling (SPEC-023). The `security` group is optional — `--with dev` never installs it.
 poetry install --with security --all-extras    # audit tooling + every optional extra
@@ -214,7 +216,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 
 **Spec size — one slice, not a whole feature:** aim for **3–6 FRs**; past **8**, write a second spec beside the first and record the pair's build order as an arc in `@docs/specs/INDEX.md` rather than growing one. The second spec restarts at FR-001 (IDs are spec-local). `spec-lint.sh` **warns** above 8 rather than failing, because a genuinely indivisible spec may sit above the line — say so in one line under *Scope → In Scope* and let the reviewer accept or reject it. Cut on a seam the system already has, never at the FR where the count ran out. Full rule: `@docs/process.md` §4.
 
-**PRs & main:** before pushing, get the diff through the review gate above, and get this repo's five gates green locally — `poetry run ruff check .`, `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`, and `sh scripts/docs-lint-test.sh` if you touched the linter. **`ruff format` is NOT among them**: it is not a CI gate and this repo is not clean under it, so format only the files you edited (process.md §6). Watch every PR to completion and merge it as soon as CI is green — never open-and-abandon. **Key the watch on the current head sha** — a bare `gh pr checks --watch` can exit clean against the *previous* commit's checks. `main` is always watched: after any merge confirm it went green, and if `main` fails, diagnose immediately and fix it with a new PR before anything else.
+**PRs & main:** before pushing, get the diff through the review gate above, and get this repo's five gates green locally — `poetry run ruff check .`, `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, and **`sh scripts/docs-lint.sh` always, before every PR — nothing in CI runs it** (plus `sh scripts/docs-lint-test.sh` whenever you touch the linter). **`ruff format` is NOT among them**: it is not a CI gate and this repo is not clean under it, so format only the files you edited (process.md §6). Watch every PR to completion and merge it as soon as CI is green — never open-and-abandon. **Key the watch on the current head sha** — a bare `gh pr checks --watch` can exit clean against the *previous* commit's checks. `main` is always watched: after any merge confirm it went green, and if `main` fails, diagnose immediately and fix it with a new PR before anything else.
 
 **On spec completion — keep the always-loaded files lean:**
 1. Set the spec file's `Status: Completed`.
@@ -229,7 +231,7 @@ and the component inventory. **Key Decisions is grouped by AREA and carries fenc
 it is not a per-spec changelog, and `## Specs` is not one either. Both were exactly that until
 2026-09-02, when this file was cut from 89,340 bytes to a digest over `@docs/decisions.md`; the rule
 had been stated here and in `@docs/process.md` §5 the whole time and lost anyway, roughly forty
-times running. **`scripts/docs-lint.sh` now enforces it on every PR** — the byte budget, the digest
+times running. **`scripts/docs-lint.sh` now enforces it — run it locally before every push; it is deliberately not a CI job** — the byte budget, the digest
 line cap, and an entry in the register behind every digest line. The delivery cap is a **ratchet**: when it fires, cut
 and re-ratchet at the new measurement, never raise it to fit the edit in hand. The byte budget is
 deliberately **not** one — it carries headroom on purpose, because a budget pinned at the measurement

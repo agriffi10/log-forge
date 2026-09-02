@@ -112,7 +112,8 @@ gate has run (*A replaced artifact restarts its gate*, below).
   hang an application thread forever; that review is the one that now happens before the push.
 - Before pushing, run **this repo's five gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`, and
-  `sh scripts/docs-lint-test.sh` if you touched the linter. They are a pre-push step — don't
+  `sh scripts/docs-lint-test.sh` if you touched the linter.
+  **`docs-lint.sh` is in that set and nothing in CI runs it.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (§6). Format only the files you edited.
@@ -501,7 +502,7 @@ When a spec is done, in the same pass:
    `docs/component-inventory.md`.
 5. A *new architectural decision* gets its **full entry in `docs/decisions.md` first**, under the AREA
    it belongs to, **and a row in that file's `## Contents`** — an entry missing from the Contents is
-   findable only by reading the whole file, and `scripts/docs-lint.sh` fails the PR for it. Then, and
+   findable only by reading the whole file, and `scripts/docs-lint.sh` fails for it locally, before the push. Then, and
    only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
    that area's clause rather than appending a new one. Entry first, line second: the digest line is
    **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
@@ -532,8 +533,10 @@ this way).
   same areas. A completion **replaces or extends the clause for its area** rather than appending
   another entry — appending is what took `CLAUDE.md` from 7,583 bytes to 89,340 in eight weeks,
   with this rule stated here throughout.
-- **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
-  (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
+- **`scripts/docs-lint.sh` enforces the structural half of these rules, and is a LOCAL PRE-PUSH
+  gate — deliberately not a CI job.** Keeping it local puts the failure in front of the person who
+  caused it, while they can still fix it silently, rather than on a shared branch where it reds
+  someone else's unrelated work and becomes a thing to be waived. It holds `CLAUDE.md` to a byte budget and each Key Decisions
   **unit** — a bullet with its continuations — to a length, and refuses any construct in that section but an area heading, a bullet, a continuation, a blank line and plain intro prose; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
   digest line for every entry, and to list every entry in its Contents; requires every Completed spec
   to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve.

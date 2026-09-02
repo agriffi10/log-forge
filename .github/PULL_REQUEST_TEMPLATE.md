@@ -34,7 +34,8 @@ Closes #<!-- issue number -->
 
 ## Checklist
 - [ ] Code follows the project's style and conventions
-- [ ] `ruff`, `mypy`, `pytest`, and `sh scripts/spec-lint.sh` pass
+- [ ] `ruff`, `mypy`, `pytest`, `sh scripts/spec-lint.sh` and `sh scripts/docs-lint.sh` pass
+- [ ] `sh scripts/docs-lint-test.sh` passes (only if you changed the linter)
 - [ ] Documentation updated if applicable
 - [ ] No unrelated changes included
 
