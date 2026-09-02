@@ -572,7 +572,7 @@ def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> Non
 
         order: list[str] = []
         real_close_if_owed, real_join = worker._close_if_owed, worker._join_closers
-        worker._close_if_owed = lambda: (order.append("live sink"), real_close_if_owed())[1]
+        worker._close_if_owed = lambda *a: (order.append("live sink"), real_close_if_owed(*a))[1]
         worker._join_closers = lambda t: (order.append("swapped-out"), real_join(t))[1]
 
         worker.shutdown(timeout=0.5)

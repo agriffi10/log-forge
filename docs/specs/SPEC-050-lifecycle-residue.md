@@ -77,7 +77,13 @@ branch is entered *because* the thread is still alive, and if its `emit` later r
 and reported `"abandoned"` for a batch that may yet land. That is a false negative against
 "`flush()` answers from the drain that carried the events", and it is accepted deliberately: the
 alternative is an unbounded wait on a drain nothing will settle, and a pessimistic answer a
-caller can act on beats a correct one it never receives.
+caller can act on beats a correct one it never receives. The events are unaffected either way —
+`_final_drain` still carries them to the sink — so what is traded is a *verdict*, not delivery.
+
+**It supersedes a settled decision, which is recorded in a test rather than in the register.**
+`test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread` asserts the opposite and gives
+the reason. That test is superseded **in place**, struck through with this spec named, not
+deleted; its sentinel half is unchanged and still asserted.
 
 #### Acceptance Criteria:
 

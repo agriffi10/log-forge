@@ -393,15 +393,19 @@ def _note_orphan_loss() -> None:
         _orphan_lost += 1
 
 
-def _note_in_span_loss() -> None:
-    """Counts one event lost while being built inside a span (SPEC-036 FR-003).
+def _note_in_span_loss(count: int = 1) -> None:
+    """Counts events lost while being built or handed over inside a span (SPEC-036 FR-003).
 
     Separate from :func:`_note_orphan_loss` because the two aggregate different failure
-    populations: this path cannot fail at ``emit``, so a non-zero count here always means the
-    data, never the destination.
+    populations: this path cannot fail at a sink's ``emit``, which is ``failed_batches``. It has
+    **two** causes, not one (SPEC-050 FR-003): a value that could not be built into an event, and
+    a process that could not give the library a thread to deliver through at all — where
+    ``Worker.__init__`` cannot start the drain thread, so the span's whole buffer is lost with no
+    worker in existence to record anything. The count is what the span was holding, so the second
+    cause moves it by more than one.
 
     Args:
-      None.
+      count: How many events were lost, defaulting to the single event the build path loses.
 
     Returns:
       None.
@@ -411,7 +415,7 @@ def _note_in_span_loss() -> None:
     """
     global _in_span_lost
     with _loss_lock:
-        _in_span_lost += 1
+        _in_span_lost += count
 
 
 def _read_losses() -> tuple[int, int]:
@@ -459,6 +463,15 @@ def _flush(span: Span) -> None:
     eight threads, 20,000 spans each). The **append** window this does not close is a different
     one, needs a per-span lock, and is declined in ``architecture.md`` §13.
 
+    **The worker is resolved before the buffer is detached** (SPEC-050 FR-003), which is what
+    lets :func:`_end` count what was lost. Resolving second, the events were already in a local
+    when :func:`~log_foundry._lifecycle._get_worker` raised, so they died with the exception and
+    ``len(span.events)`` read zero on exactly the path the count is for. Nothing between the
+    detach and the hand-off can fail: :meth:`~log_foundry.worker.Worker.submit` is total on every
+    path, so the events cannot be stranded in the local by this order. It also **narrows** the
+    SPEC-036 FR-004 window rather than widening it — the gap between detaching and submitting
+    falls from the whole of ``_get_worker()`` to a lock release.
+
     Args:
       span: The finished span whose buffered events are submitted.
 
@@ -468,9 +481,10 @@ def _flush(span: Span) -> None:
     Raises:
       Exception: Whatever creating the worker or submitting raises; :func:`_end` is the guard.
     """
+    worker = _lifecycle._get_worker()
     with _sweep_lock:
         events, span.events = span.events, []
-    _lifecycle._get_worker().submit(events)
+    worker.submit(events)
 
 
 type _SpanScope = tuple[
@@ -546,6 +560,14 @@ def _end(
     would fall through that function's own guard to ``set(())`` and wipe the whole stack,
     detaching the parent of an untraced nested call and splitting its trace.
 
+    **The absorbed close is counted, not merely announced** (SPEC-050 FR-003). It used to write
+    one stderr line and move no field, so a process that could not start a drain thread lost every
+    span's events under ``Health(stopped_reason=None, in_span_lost=0)`` — all zeros over total
+    loss, which is the reading SPEC-036 FR-003 added the counter to remove. The count is
+    ``len(span.events)``, which :func:`_flush` leaves intact until there is a worker to take them,
+    and it is recorded **before** the announcement for the reason every other site here is:
+    stderr may be wedged, and the counter must not be lost to it.
+
     Args:
       span: The span to close, or ``None`` if none was opened.
       token: The span-stack token to release, or ``None``.
@@ -565,6 +587,7 @@ def _end(
         try:
             _close_span(span, status, error)
         except Exception as exc:
+            _note_in_span_loss(len(span.events))
             _diag.absorbed("closing a span", exc, "the span's events were lost")
     if token is not None:
         context.pop_span(token)

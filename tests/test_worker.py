@@ -2016,13 +2016,23 @@ def test_a_flush_marker_queued_after_the_final_drain_is_still_answered() -> None
     assert marker.delivered is False, "the drain that would have carried it is gone"
 
 
-def test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread() -> None:
-    """A thread still running may yet consume it, so the sweep must not run on that path.
+def test_an_expired_shutdown_leaves_the_sentinel_but_answers_the_waiters() -> None:
+    """The sentinel stays the live thread's; the markers do not (SPEC-050 FR-001).
 
-    Both halves matter. The sentinel is the live thread's wake-up, and a marker is the live
-    thread's to *answer*: sweeping here would resolve it pessimistically as undelivered while
-    the drain that is about to carry it is still running, turning a ``flush()`` that was going
-    to succeed into one that reports failure.
+    ~~A thread still running may yet consume it, so the sweep must not run on that path …
+    sweeping here would resolve a marker pessimistically as undelivered while the drain that is
+    about to carry it is still running, turning a ``flush()`` that was going to succeed into one
+    that reports failure.~~ — **superseded by SPEC-050 FR-001.** The claim was right about what
+    the sweep costs and wrong about what it saves. What it costs is a pessimistic *verdict* on a
+    batch the live drain still delivers, since the events are answered again by ``_final_drain``
+    and reach the sink either way. What not sweeping costs is a ``flush(timeout=None)`` — which
+    the API documents as supported — parked forever on a drain this call has just given up on,
+    measured as an application thread still alive after ``shutdown`` returned. An unbounded hang
+    is strictly worse than an actionable false negative, so the trade is taken and stated in the
+    spec rather than left implicit.
+
+    The sentinel half is unchanged and still asserted: it is the live thread's wake-up, nothing
+    else consumes it, and the sweep reads markers without touching it.
     """
     sink = BlockingSink()
     worker = Worker(sink, batch_size=1, flush_interval=60.0)
@@ -2038,11 +2048,14 @@ def test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread() -> None:
     assert _SHUTDOWN_SENTINEL in list(worker._queue.queue), (
         "the sentinel is still the live thread's to consume"
     )
-    assert not marker.event.is_set(), "answering it here would pre-empt a drain still running"
+    assert marker.event.is_set(), "a caller with timeout=None would otherwise wait forever"
+    assert marker.delivered is False, "pessimistic: this call has given up on that drain"
 
     sink.release.set()
     worker._thread.join(timeout=5)
-    assert marker.event.is_set(), "and the live thread did answer it, as it was going to"
+    assert sink.events == [{"message": "a"}], (
+        "and the events still reach the sink — the verdict was pessimistic, not the delivery"
+    )
 
 
 def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
