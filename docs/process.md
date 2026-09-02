@@ -502,7 +502,7 @@ When a spec is done, in the same pass:
    `docs/component-inventory.md`.
 5. A *new architectural decision* gets its **full entry in `docs/decisions.md` first**, under the AREA
    it belongs to, **and a row in that file's `## Contents`** — an entry missing from the Contents is
-   findable only by reading the whole file, and `scripts/docs-lint.sh` fails the PR for it. Then, and
+   findable only by reading the whole file, and `scripts/docs-lint.sh` fails for it locally, before the push. Then, and
    only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
    that area's clause rather than appending a new one. Entry first, line second: the digest line is
    **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
