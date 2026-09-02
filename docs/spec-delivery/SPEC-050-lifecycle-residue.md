@@ -2,8 +2,8 @@
 
 ## What was completed?
 
-Five findings from a pre-1.0 audit dated 2026-09-02, each reproduced by running it against
-`eb80099` before the spec was written and re-run against the fix.
+R3, R4, R6, R11 and R13 of `docs/audits/2026-09-02-pre-1.0-audit.md`, each reproduced by running
+it against `eb80099` before the spec was written and re-run against the fix.
 
 - **FR-001** — `Worker.shutdown`'s expiry branch now calls `_release_waiters()`. A
   `flush(timeout=None)` parked behind a stuck sink used to wait forever on a drain that call had

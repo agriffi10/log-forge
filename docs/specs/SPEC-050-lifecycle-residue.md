@@ -17,9 +17,11 @@ the final drain is queued where nothing will read it, with the counter built for
 case reading zero. Each is small, each loses or hides something an operator would want, and each
 is fixed with machinery this library already has.
 
-The findings come from a pre-1.0 audit dated 2026-09-02 that is **not a document in this repo**,
-so its `R<n>` identifiers resolve to nothing here and are not used below. Each finding is
-restated in full in the FR that owns it, so this spec stands alone.
+The findings are R3, R4, R6, R11 and R13 of `docs/audits/2026-09-02-pre-1.0-audit.md`, which
+landed on `main` while this spec was being built — an earlier draft said the audit was not a
+document in this repo and that its identifiers resolved to nothing, which was true when it was
+written and is not now. Each finding is still restated in full in the FR that owns it, so this
+spec stands alone; the identifiers are there so a reader can find the original evidence.
 
 ## Scope
 
