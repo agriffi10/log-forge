@@ -18,7 +18,8 @@ is deliberately small and **must not regrow**.
 
 | Tier | File(s) | Loaded | Authoritative for |
 |---|---|---|---|
-| Always | `CLAUDE.md` | every session | conventions, key decisions, session workflow |
+| Always | `CLAUDE.md` | every session | conventions, the key-decisions **digest**, session workflow |
+| Decisions | `docs/decisions.md` | the entry for the area you are working in | the settled decisions **in full** — reasoning, rejected alternatives, every "do NOT build" fence |
 | Status | `docs/specs/INDEX.md` + each spec header | on demand | spec **status** (one row per spec) |
 | The work | `docs/specs/SPEC-XXX-*.md` | the one you're building | requirements + phases |
 | Why | `docs/architecture.md` | the *section* you need | design rationale + Known Constraints |
@@ -109,8 +110,9 @@ gate has run (*A replaced artifact restarts its gate*, below).
   passes against the bug it claims to catch, a lock taken in the wrong order, or an acceptance
   criterion ticked with no evidence. SPEC-028 merged green and a review then found a sink that could
   hang an application thread forever; that review is the one that now happens before the push.
-- Before pushing, run **this repo's four gates** locally and get them green: `poetry run ruff check .`,
-  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`. They are a pre-push step — don't
+- Before pushing, run **this repo's five gates** locally and get them green: `poetry run ruff check .`,
+  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`, and
+  `sh scripts/docs-lint-test.sh` if you touched the linter. They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (§6). Format only the files you edited.
@@ -203,8 +205,9 @@ path documented `Raises: None` — and both diff reviews then found more, with n
   argued with. A finding silently dropped is a finding that was not reviewed; a finding rejected in
   one sentence is a finding that was. **Write a rejection down only when it carries a lesson worth
   keeping** — then it belongs in the spec, its delivery doc, or CLAUDE.md's Key Decisions, as
-  reasoning, not as a paper trail. (This repo has no separate `decisions.md`; Key Decisions is the
-  register, and `architecture.md` holds the reasoning behind it.)
+  reasoning, not as a paper trail. (The register is `docs/decisions.md`, added
+  2026-09-02; `CLAUDE.md`'s Key Decisions is its one-line digest, and `architecture.md` holds the
+  system-shape reasoning behind both.)
 - **The reviewer gets the artifact and its sources, never the author's reasoning.** For a spec: the
   spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
   and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. For a
@@ -496,9 +499,15 @@ When a spec is done, in the same pass:
    code/config pasted** (the code + component-inventory are the source of truth for reuse).
 4. If reusable modules/services/components were added, add a **one-line** row to
    `docs/component-inventory.md`.
-5. A *new architectural decision* gets **one line** in CLAUDE.md's Key Decisions (+ a pointer) — never a
-   paragraph, and the digest line is **never the only home of a fact**. Reasoning lives in the
-   spec/delivery doc. If the decision **supersedes an earlier one**, add a superseded marker (short
+5. A *new architectural decision* gets its **full entry in `docs/decisions.md` first**, under the AREA
+   it belongs to, **and a row in that file's `## Contents`** — an entry missing from the Contents is
+   findable only by reading the whole file, and `scripts/docs-lint.sh` fails the PR for it. Then, and
+   only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
+   that area's clause rather than appending a new one. Entry first, line second: the digest line is
+   **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
+   a reminder and become the reasoning, which belongs in the register. A reversal that changes the entry's **heading** must move its Contents row and its
+   digest label with it, or the row points at a dead anchor and docs-lint fails.
+   If the decision **supersedes an earlier one**, add a superseded marker (short
    blockquote: what changed, which spec, where the full entry lives) at every doc site that still
    states the old claim — `architecture.md` sections, `INDEX.md` build-order notes. The new entry
    alone is not enough; an agent reading only the old site must see the reversal.
@@ -518,11 +527,26 @@ this way).
 - **A register is grouped by AREA; ordering it by spec number turns it into a changelog.** The
   question a reader arrives with is "what has been settled about X", never "what did SPEC-033
   decide". A register is the only home of the rejected alternatives and the fences, so a shape that
-  reads as disposable gets treated as disposable. **This is an obligation this repo has not yet
-  paid:** CLAUDE.md's Key Decisions is a flat spec-ordered list and `## Specs` is a paragraph per
-  completed spec, which is the changelog shape this rule names. Until they are regrouped, a
-  completion **replaces or extends the clause for its area** rather than appending another entry —
-  appending is what took the sibling repo's digest to its own byte ceiling and forced the regroup.
+  reads as disposable gets treated as disposable. **Paid 2026-09-02:** `docs/decisions.md` now holds
+  the 48 entries in nine areas, and `CLAUDE.md`'s Key Decisions is a one-line digest grouped by the
+  same areas. A completion **replaces or extends the clause for its area** rather than appending
+  another entry — appending is what took `CLAUDE.md` from 7,583 bytes to 89,340 in eight weeks,
+  with this rule stated here throughout.
+- **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
+  (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
+  **unit** — a bullet with its continuations — to a length, and refuses any construct in that section but an area heading, a bullet, a continuation, a blank line and plain intro prose; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
+  digest line for every entry, and to list every entry in its Contents; requires every Completed spec
+  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve.
+  **`scripts/docs-lint-test.sh` is the corpus that proves those checks still fire** — running the
+  linter against the repo's own documents proves the documents pass and nothing about whether any
+  check works, which is how four rounds of regressions reached main. A change to the linter runs
+  the corpus.
+  **The delivery cap is a ratchet at the
+  measured level** — when one fires, move detail down a tier and re-ratchet, rather
+  than raising the cap. The `CLAUDE.md` byte budget is deliberately NOT pinned at the measurement: it
+  carries headroom, because a budget with none forces the next closing spec to prune another area's
+  fences to buy room for its own, which is the gate causing the damage it exists to prevent. Every rule it checks was already written here, and every one was violated
+  anyway; that is the argument for a script over a paragraph.
 - **When a doc moves, the pointers that rot unseen are in SOURCE files** — `.py` docstrings, `.toml`
   comments, `.yml` steps. A markdown-only sweep reports the tree clean. Grep the path, not the
   filename, and fix the Draft specs too: a Draft is an unbuilt instruction, and pointing one at a
@@ -551,7 +575,8 @@ this way).
   other docs must match a greppable heading — "read the entry for your area" must be a jump, not a
   full-file read.
 - **Live findings and obligations never live in historical or cancelled narrative** — rehome them to
-  CLAUDE.md's Key Decisions or the relevant `architecture.md` section, and leave a pointer behind.
+  `docs/decisions.md` (with its one-line digest in CLAUDE.md's Key
+  Decisions) or the relevant `architecture.md` section, and leave a pointer behind.
   `docs/audits/` is history: a live obligation parked in a handoff doc is one nobody will read.
 
 ---
