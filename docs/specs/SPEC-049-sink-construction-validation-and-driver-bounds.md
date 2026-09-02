@@ -43,8 +43,8 @@ recorded and deferred to "a major version that can refuse it" — which 1.0 is.
   defaults are infinite; exposing `clickhouse-connect`'s `send_receive_timeout`, whose default is
   finite; and recording all three in `architecture.md` §12.
 - The `SocketTransport` abandonment line's attempt count, which overstates by up to four.
-- Three literal prose defects in `sinks/`: a missing module docstring, a `@staticmethod`, and a
-  docstring paragraph dedented to column 0.
+- Two literal prose defects in `sinks/`: a `@staticmethod`, and a docstring paragraph dedented to
+  column 0.
 
 **Above the 3–6 aim at seven FRs, deliberately.** Six are one rule — *the library refuses at
 construction what it cannot make work* — applied to six populations that share a test corpus and a
@@ -73,11 +73,13 @@ reject this.
   the cluster rejects already arrives as a counted per-item error. The refusal is kept because it
   turns a sink that fails every batch forever into a startup error, not because anything is
   silent, and the full index-name grammar is the cluster's to enforce.
-- The measured counts in `sinks/` docstrings. The audit's C6 called them "anchored to a spec rather
-  than a commit" and named four files; the population is **nineteen sites across nine modules**,
-  and they are design rationale rather than standing rules — the global rule against volatile
-  numbers governs rules, and stripping the evidence from a docstring would remove the reasoning
-  the rule wants kept. Recorded here rather than deleted, per SPEC-021.
+- The measured counts in `src/` docstrings. The audit's C6 called them "anchored to a spec rather
+  than a commit" and named four files in `sinks/`; the population is **nineteen sites across nine
+  modules** there, and SPEC-052's sweep names three more outside it (`config.py:57`,
+  `worker.py:136`, `_lifecycle.py:1496`) that the audit's split gave to neither session. They are
+  design rationale rather than standing rules — the global rule against volatile numbers governs
+  rules, and stripping the evidence from a docstring would remove the reasoning that rule wants
+  kept. Recorded here rather than deleted, per SPEC-021.
 
 ---
 
@@ -328,10 +330,14 @@ SPEC-029 put the rules in one module.
 
 #### Description:
 
-`sinks/__init__.py` is zero bytes and has no module docstring, which CLAUDE.md requires of every
-module. `file.py:358 _rollover_seconds` is a `@staticmethod`, which `python.md` §9 forbids; it is
-the only one in the package. And `postgres.py::_reconnect_if_broken`'s docstring has a paragraph
-dedented to column 0 mid-docstring, which renders wrongly in every tool that reads it.
+`file.py:358 _rollover_seconds` is a `@staticmethod`, which `python.md` §9 forbids; it is the only
+one in the package. And `postgres.py::_reconnect_if_broken`'s docstring has a paragraph dedented to
+column 0 mid-docstring, which renders wrongly in every tool that reads it.
+
+`sinks/__init__.py`'s missing module docstring — the audit's C6 assigned it here — is **handed to
+SPEC-052** rather than fixed here. It is the only module in the tree without one, so it is the sole
+finding of that spec's new docstring gate, and a gate shipped with an exemption for its own only
+finding is not a gate. SPEC-048 and SPEC-049 touch the file nowhere else.
 
 `LoggingSink.emit` documents `Raises: Exception: Whatever the logger's handlers raise`. That is
 overstated rather than false: `logging.Handler`'s own `emit` implementations route their failures
@@ -342,7 +348,6 @@ extreme.
 
 #### Acceptance Criteria:
 
-- [ ] `sinks/__init__.py` carries a one-line module docstring.
 - [ ] `_rollover_seconds` is a module-level function, and no `@staticmethod` remains in
       `src/log_foundry/`, asserted by an AST test rather than by grep.
 - [ ] `_reconnect_if_broken`'s docstring has no line at column 0 after the opening quotes;
@@ -404,7 +409,6 @@ None. The two new defaults are module constants, not environment reads.
 src/log_foundry/sinks/
 ├── _retry.py          # FR-001 validators
 ├── _chunk.py          # FR-002 chunk_list raise
-├── __init__.py        # FR-007
 ├── http.py            # FR-001
 ├── _socket.py         # FR-002, FR-006
 ├── clickhouse.py      # FR-002, FR-005
@@ -484,3 +488,8 @@ the two floor-side callers. The spec also claimed every construction-time refusa
 struck in place. And FR-002's third criterion restated its own premise rather than testing
 anything, while its conclusion was false — refusing `chunk_size <= 0` closes the route into
 `ClickHouseSink`'s unguarded `chunks == 0` branch but not the branch, which is now guarded.
+
+`sinks/__init__.py`'s module docstring was handed to SPEC-052 after this revision, at that
+session's request: it is the only module in the tree lacking one and therefore the only finding of
+that spec's new docstring gate, which cannot go green around it. That session independently
+re-measured the false `_reconnect_if_broken` claim above and reached the same result.
