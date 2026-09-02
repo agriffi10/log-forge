@@ -2360,6 +2360,175 @@ def test_a_parked_unbounded_flush_is_released_when_shutdown_expires(capsys) -> N
     )
 
 
+def test_a_marker_the_drain_already_took_is_released_too(capsys) -> None:
+    """FR-001. The half the audit's own prescribed remedy did not cover.
+
+    `_release_waiters` answers markers by reading `self._queue.queue`, so it reaches a marker only
+    while the marker is still *in* the queue. Whether it is depends on a race the caller does not
+    control: if the drain thread is already inside `emit` when `flush()` puts the marker, it stays
+    queued and is swept; if the drain dequeues it and *then* blocks in `emit`, it is held in that
+    thread's local and nothing answers it.
+
+    The sibling test above pins the first ordering, and it passes with this fix reverted — it was
+    written from a probe that waited for the sink to be entered before flushing, which forces the
+    easy ordering. This one forces the other: no wait, so the marker is taken and the drain blocks
+    with it in hand. Measured on the shipped fix before this one: `items in queue: 0, markers
+    visible: 0`, and the flushing thread still alive after `shutdown` returned.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert sink.in_emit.wait(5.0), "the premise: the drain is inside emit"
+    with worker._queue.mutex:
+        queued = [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)]
+    assert queued == [], (
+        "the premise: the drain took the marker before blocking, so a queue sweep cannot see it"
+    )
+
+    worker.shutdown(timeout=0.3)
+    flusher.join(timeout=2.0)
+    still_waiting = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    flusher.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_waiting, "a marker in flight in a wedged drain is answered by nobody"
+    assert verdict and verdict[0].reason == "abandoned"
+
+
+def test_a_marker_taken_by_the_final_drain_is_released_too(capsys) -> None:
+    """FR-001. `_final_drain` takes markers too, and its emit can wedge just as the loop's can.
+
+    `shutdown` queues the sentinel and joins; the drain leaves its loop, `_final_drain` pulls the
+    remaining markers out of the queue and blocks inside the tail emit holding them. The join then
+    expires, and the sweep on the expiry branch is the only thing left that can answer them — so
+    the registration in `_final_drain` is load-bearing on exactly this path and on no other.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(marker)
+
+    worker.shutdown(timeout=0.5)
+
+    assert worker._thread.is_alive(), "the premise: the final drain is wedged in emit"
+    assert sink.in_emit.is_set(), "the premise: it got as far as the sink"
+    with worker._queue.mutex:
+        assert not [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)], (
+            "the premise: the final drain took the marker, so a queue sweep cannot see it"
+        )
+    assert marker.event.is_set(), "the expiry sweep must reach a marker the final drain holds"
+    assert marker.delivered is False
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+
+def test_the_taken_marker_record_does_not_grow(capsys) -> None:
+    """FR-001. The deregistration is the guard whose failure is silent.
+
+    A `_release_marker` that did nothing would leak one `_FlushMarker` and its `Event` per
+    `flush()`, forever, and the entire suite stays green against it — measured, 1000 flushes
+    leaving 1000 residual entries. Nothing else here would ever notice, which is precisely the
+    shape this repo mutation-tests for.
+
+    Both terminating paths are driven: an emit that returns normally, and one that raises, since
+    the deregistration sits in a `finally` and only the second proves it.
+    """
+    sink = FlakySink(fail_times=0)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_retries=0)
+    for i in range(200):
+        if i % 3 == 0:
+            sink.fail_times = sink.attempts + 1  # make the next emit raise
+        worker.submit(_span(i))
+        worker.flush(timeout=5.0)
+    capsys.readouterr()
+
+    assert worker._taken_markers == [], (
+        f"{len(worker._taken_markers)} markers retained after 200 flushes — one per flush is a "
+        f"leak of an Event apiece for the life of the process"
+    )
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+    assert worker._taken_markers == [], "and the final drain releases the ones it took"
+
+
+def test_a_marker_taken_after_the_drain_settled_answers_itself(capsys) -> None:
+    """FR-001. The last gap: between `Queue.get` returning a marker and it being recorded.
+
+    In that window the marker is in neither the queue nor the record, so a sweep landing there
+    misses it — and because the premise is a sink whose `emit` never returns, the drain never
+    reaches its own closing sweep either, so the strand is permanent. Measured at 1 in 300 with
+    `shutdown(timeout=0)`, a public argument.
+
+    `_drain_settled` is set immediately before the sweep on both the expiry and terminal paths, so
+    a marker taken after that point answers itself.
+
+    Asserted through `flush()` rather than by calling the private method, so what it pins is the
+    caller's outcome and not the two lines that produce it. The window is widened rather than
+    simulated: the queue's `get` is interposed so the drain parks *after* it has the marker and
+    before it returns, which is precisely the gap, and it makes a 1-in-300 race deterministic
+    without changing the code under test.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: worker._queue.qsize() == 0), "the span must reach `pending` first"
+    live, took, may_return = threading.Event(), threading.Event(), threading.Event()
+    real_get = worker._queue.get
+
+    def parked_get(block: bool = True, timeout: float | None = None) -> object:
+        """Parks the drain with the marker in hand, in the window before it is recorded."""
+        live.set()
+        item = real_get(block, timeout)
+        if isinstance(item, worker_mod._FlushMarker):
+            took.set()
+            may_return.wait(10)
+        return item
+
+    worker._queue.get = parked_get  # type: ignore[method-assign]
+    # The drain is parked inside the *unwrapped* `get`, which would hand it the marker without
+    # ever entering the wrapper. One more submission wakes it so it re-enters through the wrapper;
+    # neither trigger fires at two items, so both just accumulate in `pending`.
+    worker.submit(_span("b"))
+    assert live.wait(5.0), "the interposed get was never reached"
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert took.wait(5.0), "the premise: the drain holds the marker and has not recorded it"
+    with worker._queue.mutex:
+        assert not [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)]
+    assert not sink.in_emit.is_set(), "the premise: it has not started emitting yet"
+    assert worker._taken_markers == [], "the premise: it is in neither the queue nor the record"
+
+    worker.shutdown(timeout=0)  # its sweep finds both populations empty
+    may_return.set()  # the drain records the marker, then wedges in the sink for good
+    flusher.join(timeout=5.0)
+    still_waiting = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_waiting, (
+        "a marker taken after the sweep had already run is answered by nothing else"
+    )
+    assert verdict and verdict[0].reason == "abandoned", (
+        "the self-answer is the pessimistic verdict the sweep would have given"
+    )
+
+
 def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:
     """FR-001 AC-4. The sweep costs a verdict, never a delivery.
 
@@ -2567,12 +2736,17 @@ def test_the_closing_slot_is_emptied_for_a_forked_child() -> None:
         worker._closing = threading.Event()
         worker._closing.set()  # as an inherited, already-answered close would arrive
         worker._unclosed_swaps = [RecordingSink()]  # and a sink the child never stranded
+        worker._taken_markers = [worker_mod._FlushMarker(seen_failures=0)]  # and a caller it
+        # cannot answer: the flush() waiting on it is on a thread that did not survive the fork
 
         worker._reinit_after_fork(resume=resume)
 
         assert worker._closing is None, f"the slot survived the fork with resume={resume}"
         assert worker._unclosed_swaps == [], (
             f"the child inherited the parent's stranded sinks with resume={resume}"
+        )
+        assert worker._taken_markers == [], (
+            f"the child inherited the parent's in-flight flush markers with resume={resume}"
         )
         worker.shutdown(timeout=2.0)
 

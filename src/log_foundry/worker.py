@@ -270,8 +270,14 @@ class Worker:
     mechanics only, and knows nothing about spans or context.
     """
 
-    _FORK_SKIP = ("_unclosed_swaps",)
+    _FORK_SKIP = ("_unclosed_swaps", "_taken_markers")
     """Attribute names ``_fork``'s repair walk must not read or descend into (SPEC-050 FR-004).
+
+    ``_taken_markers`` names ``flush()`` callers **in the parent**, whose ``Event`` the walk would
+    otherwise replace on an object nothing in the child will ever wait on. The skip stops that
+    work and :meth:`_reinit_after_fork` drops the references, because a skip alone leaves them
+    held — measured, a child inherited the parent's in-flight marker permanently and kept it
+    through fifty further flushes of its own.
 
     ``_unclosed_swaps`` holds sinks this process has **stopped** delivering to, which is exactly
     the shape ``_fork._SKIP_ATTRIBUTE`` describes: bookkeeping that pins objects is not live state
@@ -345,6 +351,7 @@ class Worker:
         self._shutdown_done = False
         self._sink_closed = sink_released
         self._closing: threading.Event | None = None
+        self._taken_markers: list[_FlushMarker] = []
         self._unclosed_swaps: list[Sink] = []
         self._lock = threading.Lock()
         self._offer_stop_signal()
@@ -384,6 +391,9 @@ class Worker:
         no close and costs a strong reference to every superseded sink, plus a pointless refused
         release at every child exit. Emptying is what "a child inherits no promise" means for the
         record as well as for the close.
+
+        ``_taken_markers`` and ``_unclosed_swaps`` are emptied with it: a child inherits no
+        ``flush()`` caller to answer and stranded no sink, so both are references it can only hold.
 
         ``_closing`` is emptied unconditionally, on both branches (SPEC-050 FR-002). It names a
         close running on a thread that did not survive the fork, so the child inherits a promise
@@ -447,6 +457,7 @@ class Worker:
         self.incomplete_swaps = 0
         self.stopped_reason = None
         self._closing = None
+        self._taken_markers = []
         self._unclosed_swaps = []
         if not resume:
             self._drain_finished.set()
@@ -1342,8 +1353,67 @@ class Worker:
         finally:
             self._release_waiters()
 
+    def _take_marker(self, marker: _FlushMarker) -> None:
+        """Records a marker the drain thread has taken out of the queue (SPEC-050 FR-001).
+
+        :meth:`_release_waiters` answers markers by reading ``self._queue.queue``, so it can only
+        reach one that is still *in* the queue. A marker the drain has already dequeued is held in
+        that thread's local while it emits — and if the sink's ``emit`` never returns, nothing
+        answers it and a ``flush(timeout=None)`` waits forever, which is the defect FR-001 exists
+        to remove. Registering it here is what puts it back within reach.
+
+        Args:
+          marker: The marker this thread is about to work on.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._taken_markers.append(marker)
+            settled = self._drain_settled.is_set()
+        if settled:
+            marker.event.set()
+
+    def _release_marker(self, marker: _FlushMarker) -> None:
+        """Drops a marker the drain thread has finished with, before it is answered.
+
+        **It runs after ``event.set()``, and that order is load-bearing** — the reverse survives
+        the suite, which is this repo's evidence that nothing covers it rather than that it is
+        safe. An earlier draft of this docstring read the green as proof of equivalence and said
+        so; it is not. Deregistering first leaves a window in which the marker is in neither the
+        queue nor the record, so an async ``BaseException`` landing there — the one ``_run``
+        catches, on this thread — strands a ``flush(timeout=None)`` that ``_run``'s own closing
+        sweep can no longer reach. Answering first inverts the failure into a leaked list entry on
+        a worker that is already dead. This is the reasoning :meth:`_final_drain` already applies
+        to its own ``finally``.
+
+        Args:
+          marker: The marker this thread has finished with.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._taken_markers = [m for m in self._taken_markers if m is not marker]
+
     def _release_waiters(self) -> None:
-        """Answers every ``flush()`` marker still queued, so no caller waits out its timeout.
+        """Answers every outstanding ``flush()`` marker, so no caller waits out its timeout.
+
+        **Two populations, and the second is not optional** (SPEC-050 FR-001). A marker still in
+        the queue is read from it; a marker the drain thread has already **taken** is read from
+        :attr:`_taken_markers`, because between dequeuing one and returning from ``sink.emit`` the
+        drain holds it in a local where a queue read cannot see it. Answering only the first is
+        what the audit prescribed and it does not cover the audit's own probe. The taken markers
+        are answered **before** the queue read and outside its ``try``: that read reaches into
+        ``Queue``'s privates, a risk ``architecture.md`` §13 accepts on the understanding that a
+        CPython change costs *timed-out* waiters, and letting the new mechanism inherit it would
+        upgrade that cost to waiters that never return at all.
 
         A ``BaseException`` from the main loop skips :meth:`_final_drain` entirely, which is
         where queued markers are normally answered, leaving a waiter to sit for its full
@@ -1352,7 +1422,7 @@ class Worker:
         ``health().queued`` and the terminal line report; each keeps its pessimistic
         ``delivered``, which is the truth here.
 
-        It is called from two places. The terminal-failure path is the original one. The clean
+        It is called from three places. The terminal-failure path is the original one. The clean
         :meth:`shutdown` path was added because that same enqueue-after-the-drain race happens
         there too, and hurts more: measured stranding a marker in 13 of 400 shutdowns raced
         against a ``flush()`` under load, where the caller sat out its whole timeout — and
@@ -1382,10 +1452,14 @@ class Worker:
         Raises:
           None. This runs after the record and the stderr line, neither of which may be lost.
         """
+        with self._lock:
+            taken = list(self._taken_markers)
+        for marker in taken:
+            marker.event.set()
         try:
             with self._queue.mutex:
-                markers = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
-            for marker in markers:
+                queued = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
+            for marker in queued:
                 marker.event.set()
         except Exception:
             pass
@@ -1463,12 +1537,14 @@ class Worker:
             except queue.Empty:
                 item = None
             if isinstance(item, _FlushMarker):
+                self._take_marker(item)
                 try:
                     self._emit_pending(pending)
                     item.delivered = self._nothing_lost_since(item)
                 finally:
                     last_flush = time.monotonic()
                     item.event.set()
+                    self._release_marker(item)
                 continue
             if item is _SHUTDOWN:
                 break
@@ -1546,6 +1622,7 @@ class Worker:
                 break
             if isinstance(item, _FlushMarker):
                 markers.append(item)
+                self._take_marker(item)
                 continue
             if item is not None and item is not _SHUTDOWN:
                 pending.append(cast("list[dict[str, object]]", item))
@@ -1556,6 +1633,7 @@ class Worker:
         finally:
             for marker in markers:
                 marker.event.set()
+                self._release_marker(marker)
 
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
         """Flattens queued per-span event-lists into one batch and emits it, retrying.

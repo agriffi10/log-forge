@@ -2977,6 +2977,48 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         worker.shutdown(timeout=2.0)
 
 
+def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
+    """FR-001. The walk must not spend itself repairing a `flush()` caller in the parent.
+
+    `_taken_markers` names markers whose waiting thread did not survive the fork, so replacing
+    their `Event` is work with no consumer. Unlike `_unclosed_swaps` this skip is hygiene rather
+    than correctness — `_reinit_after_fork` empties the list either way, which is why removing the
+    skip breaks no behavioural test. It is asserted here so the guard is not merely declared:
+    without it the walk reaches the marker's `Event` and replaces it, and the control run proves
+    the walk would otherwise get there.
+    """
+    from log_foundry.worker import Worker, _FlushMarker
+
+    class _Quiet(Sink):
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    worker = Worker(_Quiet())
+    marker = _FlushMarker(seen_failures=0)
+    try:
+        _lifecycle._state._worker = worker
+        worker._taken_markers = [marker]
+        before = id(marker.event)
+        _fork._reinit_primitives()
+        assert id(marker.event) == before, (
+            "the repair walk replaced the Event of a flush() caller that is in the parent"
+        )
+
+        # Control: the same walk, with the record renamed out from under the opt-out.
+        worker._taken_markers = []
+        worker._not_skipped = [marker]  # type: ignore[attr-defined]
+        _fork._reinit_primitives()
+        assert id(marker.event) != before, (
+            "the control did not reach it either, so the assertion above proves nothing"
+        )
+    finally:
+        _lifecycle._state._worker = None
+        worker.shutdown(timeout=2.0)
+
+
 def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
     """FR-002. Both slots naming an in-flight close are emptied for the child.
 

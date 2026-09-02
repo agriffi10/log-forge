@@ -1036,8 +1036,15 @@ and a third copy is a fork with no merge.
   caller sits out its full timeout, and no caller who passed `timeout=None` waits forever. The
   audit that produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than
   changing it**, per SPEC-021's rule that an open item is closed by being fixed, settled, or
-  recorded. It is called on the terminal-failure path and, since the shutdown-sentinel fix, on
-  the clean shutdown path too — the same enqueue-after-the-drain race reaches both.
+  recorded. It is called on the terminal-failure path, on the clean shutdown path since the
+  shutdown-sentinel fix, and on the expiry path since SPEC-050 FR-001 — the same
+  enqueue-after-the-drain race reaches all three.
+
+  **The private read now covers only half of what the method answers** (SPEC-050 FR-001). A
+  marker the drain thread has already dequeued is held in that thread's local, where no queue
+  read can reach it, so those are tracked separately and answered **before** this read and
+  outside its `try`. The blast radius below is therefore unchanged rather than widened: a CPython
+  change still costs waiters whose markers were queued, and never one whose marker was in flight.
 
   It stays a **read**. A write was built and reverted: the first fix for a stranded `_SHUTDOWN`
   sentinel rebuilt the deque without it, and rested on the claim that "nothing in this module

@@ -69,8 +69,19 @@ spec stands alone; the identifiers are there so a reader can find the original e
 
 `Worker.shutdown`'s expiry branch records `stopped_reason`, sets `_drain_settled`, writes its
 line and returns — before `_release_waiters()`, whose own docstring says it exists for this
-caller. A `flush(timeout=None)` parked behind a stuck sink therefore waits forever on a drain
-that has been given up on. Reproduced: `flusher still waiting after shutdown gave up: True`.
+caller.
+
+**The audit's prescribed remedy did not cover the audit's own probe, and the first attempt
+shipped it anyway.** Calling `_release_waiters()` there answers markers still *in* the queue.
+Which markers those are is a race the caller does not control: a `flush()` whose marker arrives
+while the drain is already inside `emit` stays queued and is swept, but one the drain dequeues
+*before* blocking is held in that thread's local and reachable by nothing. Reproduced on merged
+`main` by a peer session and confirmed here — `items in queue: 0, markers visible: 0`, flusher
+still alive after `shutdown` returned. The drain thread now registers each marker it takes, and
+the sweep answers those as well as the queued ones.
+
+Reproduced before either half: `flusher still waiting after shutdown gave up: True`, a
+`flush(timeout=None)` waiting forever on a drain this very call had given up on.
 
 **The trade this makes, stated rather than assumed.** On the two existing call sites the drain
 thread is finished or terminally dead, so `delivered=False` is simply true. Here it is not: the
@@ -81,6 +92,14 @@ and reported `"abandoned"` for a batch that may yet land. That is a false negati
 alternative is an unbounded wait on a drain nothing will settle, and a pessimistic answer a
 caller can act on beats a correct one it never receives. The events are unaffected either way —
 `_final_drain` still carries them to the sink — so what is traded is a *verdict*, not delivery.
+
+**The population that can receive that pessimistic verdict is wider than the sweep**, and the
+widening is part of the trade rather than a side effect of it. It now covers a marker the drain
+thread was *holding* when the sweep ran, and a marker taken *after* the sweep, which answers
+itself. In none of these does a caller see `ok=True` over lost events: `delivered` starts `False`
+and is only ever written by the owning drain, so every added path can produce `abandoned` and
+nothing else. The direction is one-way by construction, which is what makes the trade acceptable
+against `flush()` answering "from the drain that carried the events".
 
 **It supersedes a settled decision, which is recorded in a test rather than in the register.**
 `test_an_expired_shutdown_leaves_the_sentinel_for_the_live_thread` asserts the opposite and gives
@@ -98,6 +117,18 @@ deleted; its sentinel half is unchanged and still asserted.
       `lost` line, with the same text as before.
 - [ ] A marker re-answered by a later `_final_drain` corrupts nothing: the sink still receives its
       batch exactly once, and no second `FlushResult` is produced.
+- [ ] The same holds for the ordering the first fix missed: with the drain thread holding the
+      marker rather than the queue, the flush is still answered — asserted separately, because the
+      test written from the audit's probe passes with that half reverted.
+- [ ] A marker taken by `_final_drain` rather than by the loop is answered too.
+- [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`
+      and the drain holding a marker it has not yet recorded, the `flush(timeout=None)` still
+      returns `abandoned` rather than waiting on a drain that will never reach its own sweep.
+- [ ] The record of taken markers returns to empty, over an emit that returns and one that raises.
+      A deregistration that did nothing would leak one marker and one `Event` per `flush()` for
+      the life of the process, and no other assertion here would notice.
+- [ ] A forked child holds none of the parent's in-flight markers, and the repair walk does not
+      reach them — asserted against the walk with a control, since the reset would mask the skip.
 - [ ] Deleting the new call makes the first criterion fail (mutation-tested, not asserted).
 
 ### FR-002: A second shutdown waits for an in-flight inline close, on both delivery paths
