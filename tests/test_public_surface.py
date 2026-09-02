@@ -8,6 +8,7 @@ SPEC-032 and SPEC-035 both paid for.
 """
 
 import ast
+import collections.abc
 import dataclasses
 import inspect
 import io
@@ -16,6 +17,7 @@ import pkgutil
 import re
 import threading
 import time
+import types
 
 import pytest
 
@@ -23,6 +25,7 @@ log_foundry = pytest.importorskip("log_foundry")
 api = pytest.importorskip("log_foundry.api")
 config = pytest.importorskip("log_foundry.config")
 model = pytest.importorskip("log_foundry.model")
+context = pytest.importorskip("log_foundry.context")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
@@ -1240,3 +1243,175 @@ def test_a_new_reason_is_additive() -> None:
     assert not invented
     assert invented.reason == "a-reason-invented-later"
     assert bool(log_foundry.FlushResult(ok=True)) is True
+
+
+# ── SPEC-051 FR-001: the public dataclasses are constructed by keyword ──────────────────
+#
+# Field order stopped being part of the frozen contract at SPEC-051. `Health` reached twelve
+# fields by appending nine of them, each append safe only because nothing outside the library
+# had bound to the order; `kw_only=True` is what makes that true after 1.0 as well.
+
+_PUBLIC_DATACLASSES = (
+    ("Health", log_foundry.Health, (0, 0, 0)),
+    ("SinkLosses", log_foundry.SinkLosses, (0, 0)),
+    ("FlushResult", log_foundry.FlushResult, (True,)),
+    ("ContinueResult", log_foundry.ContinueResult, (True,)),
+    ("Config", log_foundry.Config, ("svc",)),
+)
+
+
+@pytest.mark.parametrize(("name", "cls", "args"), _PUBLIC_DATACLASSES, ids=[
+    row[0] for row in _PUBLIC_DATACLASSES
+])
+def test_a_public_dataclass_refuses_positional_construction(name, cls, args) -> None:
+    """FR-001 AC-1. Asserted on the message, not on `TypeError` alone.
+
+    A misspelled keyword raises `TypeError` from the same constructor, so `pytest.raises(
+    TypeError)` on its own is green against a class that never became keyword-only -- the
+    test that discriminates is the one below.
+    """
+    with pytest.raises(TypeError, match="positional argument"):
+        cls(*args)
+
+
+def test_a_keyword_typo_raises_a_different_typeerror() -> None:
+    """FR-001 AC-1, the discriminator. Both are `TypeError` and only one says "positional"."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        log_foundry.Health(quued=0, dropped=0, failed_batches=0)
+
+
+def test_every_keyword_construction_the_library_performs_still_works(lf, fake_sink) -> None:
+    """FR-001 AC-2. Both `health()` paths, and `replace`, which `_lifecycle` uses on a Health."""
+    no_worker = log_foundry.health()
+    assert no_worker.queued == 0
+
+    @lf.trace
+    def work():
+        pass
+
+    work()
+    with_worker = log_foundry.health()
+    assert dataclasses.replace(with_worker, retired=True).retired is True
+    assert dataclasses.replace(no_worker, orphan_lost=3).orphan_lost == 3
+
+
+def test_no_source_file_constructs_a_public_dataclass_positionally() -> None:
+    """FR-001 AC-4. The sweep, over `src/` -- code by AST and prose by pattern.
+
+    Both halves are needed and neither sees the other's population: a docstring showing
+    `SinkLosses(0, 0)` is not a `Call` node, and a real positional call is not matched by a
+    text pattern that would also hit every keyword call.
+    """
+    names = {row[0] for row in _PUBLIC_DATACLASSES}
+    # Prose is matched only inside a double-backtick span, which is how this repo writes inline
+    # code in a docstring. A looser pattern over the raw line matched `class FlushResult(_Result):`
+    # -- it reported two offenders on its first run and would have reported them forever.
+    spans = re.compile(rf"``({'|'.join(sorted(names))})\(([^`)]*)\)``")
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted((_ROOT / "src").rglob("*.py")):
+        scanned += 1
+        text = path.read_text(encoding="utf-8")
+        offenders.extend(
+            f"{path.relative_to(_ROOT)}:{node.lineno}: positional call {node.func.id}(...)"
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in names
+            and node.args
+        )
+        offenders.extend(
+            f"{path.relative_to(_ROOT)}: docstring shows ``{m.group(1)}({m.group(2)})``"
+            for m in spans.finditer(text)
+            if m.group(2).strip() and "=" not in m.group(2)
+        )
+    assert scanned > 30, f"the sweep collapsed to {scanned} files -- it cannot see an absence"
+    assert not offenders, "positional construction survives:\n" + "\n".join(offenders)
+
+
+# ── SPEC-051 FR-002: `defaults=` accepts any mapping ────────────────────────────────────
+
+
+class _CountingMapping(collections.abc.Mapping):
+    """A `Mapping` that records how often it is read, to tell one copy from one per call.
+
+    `keys` is the counter and `__iter__` deliberately is not: `dict(m)` on a `Mapping` calls
+    `keys()` and then `__getitem__`, and never `__iter__` at all, so an `__iter__` counter
+    reads zero both before and after the change and passes against the defect.
+    """
+
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+        self.key_reads = 0
+
+    def keys(self):
+        self.key_reads += 1
+        return self._data.keys()
+
+    def __getitem__(self, key: str) -> object:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+def test_configure_defaults_copies_the_callers_mapping() -> None:
+    """FR-002 AC-2. `configure` already did this; the widened annotation must not lose it."""
+    labels = {"tenant": "acme"}
+    log_foundry.configure(service="svc", defaults=labels)
+    labels["tenant"] = "other"
+    assert log_foundry.get_config().defaults == {"tenant": "acme"}
+
+
+def test_trace_defaults_copies_at_decoration(lf, fake_sink) -> None:
+    """FR-002 AC-3, the one behavioural change SPEC-051 makes.
+
+    Before it, `_open_span` bound the caller's own object to every span and `build_event` read
+    it live, so a mutation after decoration reached later spans.
+    """
+    labels = {"tenant": "acme"}
+
+    @lf.trace(defaults=labels)
+    def work():
+        pass
+
+    labels["region"] = "eu"
+    work()
+
+    assert fake_sink.events[0]["fields"] == {"tenant": "acme"}
+
+
+def test_trace_reads_the_defaults_mapping_once_at_decoration(lf, fake_sink) -> None:
+    """FR-002 AC-4. Three calls, one read -- what separates "copied" from "copied per call"."""
+    labels = _CountingMapping({"tenant": "acme"})
+
+    @lf.trace(defaults=labels)
+    def work():
+        pass
+
+    for _ in range(3):
+        work()
+
+    assert labels.key_reads == 1, f"read {labels.key_reads} times -- not copied at decoration"
+    assert fake_sink.events[0]["fields"] == {"tenant": "acme"}
+
+
+def test_a_non_dict_mapping_produces_the_same_fields(lf, fake_sink) -> None:
+    """FR-002 AC-5. Both parameters, and `Span.defaults` is a plain `dict` afterwards."""
+    log_foundry.configure(defaults=types.MappingProxyType({"env_tag": "x"}))
+    assert log_foundry.get_config().defaults == {"env_tag": "x"}
+    assert isinstance(log_foundry.get_config().defaults, dict)
+
+    seen: list[object] = []
+
+    @lf.trace(defaults=types.MappingProxyType({"tenant": "acme"}))
+    def work():
+        seen.append(type(context.current_span().defaults))
+
+    work()
+
+    assert seen == [dict]
+    assert fake_sink.events[0]["fields"] == {"env_tag": "x", "tenant": "acme"}

@@ -20,7 +20,7 @@ class SinkDeliveryError(Exception):
     """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SinkLosses:
     """What a sink discarded or could not confirm, cumulative for its lifetime (FR-002).
 

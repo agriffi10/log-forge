@@ -125,8 +125,10 @@ copy at decoration time — once per decorated function, not once per call.
       does not change what `get_config().defaults` reports.
 - [ ] A mapping mutated after `@trace(defaults=…)` has decorated a function does not change the
       fields stamped on later spans — the one behavioural change this spec makes.
-- [ ] The copy is taken **once at decoration**: a `Mapping` that counts its own `__iter__` reports
-      exactly one read after the decorated function has been called three times.
+- [ ] The copy is taken **once at decoration**: a `Mapping` counting its own `keys()` reports one
+      read after the decorated function has been called three times, against six before. The
+      counter must be `keys()`, not `__iter__` — `dict(m)` calls `keys()` and `__getitem__` and
+      never `__iter__`, so an `__iter__` counter reads zero in both trees and passes vacuously.
 - [ ] A non-`dict` `Mapping` passed to either produces the same event fields a `dict` produces,
       and `Span.defaults` is a `dict` regardless of what was passed.
 
@@ -217,7 +219,7 @@ declared once each in `sinks/http.py` and composed by inheritance rather than re
 Two public docstrings describe a `Health` that no longer exists, and two decisions this spec
 settles have no home. `Health`'s class docstring still says "attribute and index access to every
 earlier field stays as it was" — a `NamedTuple` claim that has been false since it became a
-dataclass, and one `README.md` contradicts correctly. `health()`'s `Returns:` enumerates eight of
+dataclass, and one `README.md` contradicts correctly. `health()`'s `Returns:` enumerates nine of
 the twelve fields: `inherited_sink` is not mentioned in the file at all, and `orphan_lost` and
 `in_span_lost` are described in the prose above but absent from `Returns:`. The two decisions are
 the sink family's frozen parameter naming and the deliberately-deferred worker tunables, both

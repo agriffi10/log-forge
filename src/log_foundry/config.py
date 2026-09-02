@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING
 from log_foundry import _lifecycle
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from log_foundry.sinks.base import Sink
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Config:
     """Process-wide settings stamped onto every event and consulted by the pipeline.
 
@@ -92,7 +94,7 @@ def configure(
     version: str | None = None,
     env: str | None = None,
     sink: Sink | None = None,
-    defaults: dict[str, object] | None = None,
+    defaults: Mapping[str, object] | None = None,
     max_value_bytes: int | None = None,
     max_stack_bytes: int | None = None,
     max_keys: int | None = None,
@@ -147,7 +149,9 @@ def configure(
       sink: The destination every event is delivered to. Passed after the first log, it swaps
         the live target as described above rather than only updating what ``get_config()``
         reports.
-      defaults: Fields merged into every event at the lowest precedence.
+      defaults: Fields merged into every event at the lowest precedence. Any ``Mapping`` is
+        accepted and a copy is stored, so a later edit to the caller's own object does not
+        reach the config (SPEC-051 FR-002).
       max_value_bytes: Per-value ceiling, in UTF-8 bytes or rendered digits.
       max_stack_bytes: Ceiling for ``error.stack`` alone.
       max_keys: Ceiling on the entries of one mapping or sequence.

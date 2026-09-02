@@ -83,7 +83,7 @@ def _bounded_seconds(timeout: float | None) -> str:
         return "?"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Health:
     """A point-in-time snapshot of the worker's delivery counters (SPEC-017 FR-005).
 
