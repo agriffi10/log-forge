@@ -8,7 +8,7 @@ path is forward.
 
 | Version | Supported |
 |---------|-----------|
-| Latest `0.x` release | ✅ |
+| Latest release | ✅ |
 | Anything older | ❌ — upgrade to the latest release |
 
 Development pre-releases (`X.Y.Z.devN`) are published to PyPI on every merge to `main` so the
