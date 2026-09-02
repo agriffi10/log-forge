@@ -130,6 +130,13 @@ def _reset_worker() -> None:
     an event would otherwise leave every later test reading a non-zero ``orphan_lost`` — the exact
     failure this fixture's first paragraph describes, on a field whose whole purpose is to be
     believed.
+
+    SPEC-050 FR-002 adds the orphan close's in-flight count and its idle gate, and this pair leaks
+    the most quietly of any here: three tests leave a daemon thread mid-``close()``, so the count
+    stays raised and the gate stays clear, and every later caller that finds nothing owed pays the
+    whole closer grace. Nothing errors — the suite was green only because those three happen to sit
+    *after* the test that measures the no-wait path. Reversing that pair fails it deterministically
+    at 4.01 s for three shutdowns that should cost nothing.
     """
     try:
         from log_foundry import _lifecycle, decorator
@@ -151,6 +158,9 @@ def _reset_worker() -> None:
         _lifecycle._closers.clear()
     with _lifecycle._closing_now_lock:
         _lifecycle._closing_now.clear()
+    with _lifecycle._state._lock:
+        _lifecycle._orphan_closing = 0
+        _lifecycle._orphan_idle.set()
 
 
 class FakeSink:

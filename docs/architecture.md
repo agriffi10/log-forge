@@ -325,9 +325,19 @@ guards are re-taken after the first drain, since it blocks: a `shutdown()` landi
 abandon the swap, or it installs a sink nothing will ever close. A drain that cannot be confirmed
 does **not** cancel the swap — the caller asked for the
 new sink, and silently keeping the old one is the defect being fixed — but the previous sink is
-left **open** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning that a
-leaked resource in a running process beats a close raced against a write. Passing the sink already
-live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
+left **open for now** and `health().incomplete_swaps` records it, on SPEC-027 FR-004's reasoning
+that a leaked resource in a running process beats a close raced against a write.
+
+> **Superseded in part, SPEC-050 FR-004.** "Open" used to mean *forever*. The objection is about
+> that instant — the drain thread may still be inside the old sink's `emit` — and it expires when
+> that thread does, so the sink is recorded and closed by the first `shutdown()` that finds
+> `is_alive()` false, detached and bounded by the same closer grace a swapped-out close already
+> gets. An expired `shutdown()` still leaves it open, because the thread is still live, and the
+> next call performs the close instead. What changed the decision was measuring the cost: for a
+> sink whose `close()` *is* the delivery, "left open" is nine events lost, not a leaked handle.
+> Full entry in `decisions.md` under *The sink contract: waiting, concurrency and shutdown*.
+
+Passing the sink already live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
 updated and the retirement signals (§9) continue to apply — but the sink adopted by that call is
 still delivered to and is closed by the orphan path below, since a retired worker owns nothing
 further.

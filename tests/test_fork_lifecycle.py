@@ -2903,3 +2903,114 @@ def test_the_buffer_lint_reads_the_shapes_it_claims_to() -> None:
     assert _sinks_missing_the_discard_hook([fixed, inheriting]) == []
     assert _sinks_missing_the_discard_hook([inheriting]) == ["brandnew.InheritingSink"]
     assert _sinks_missing_the_discard_hook([given]) == []
+
+
+# -- SPEC-050: the two pieces of new state a fork must not carry across ------------------
+
+
+def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
+    """FR-004. `Worker._unclosed_swaps` pins superseded sinks, so the walk must not enter it.
+
+    The hazard `_fork._SKIP_ATTRIBUTE` documents, at a new container: reaching a sink the process
+    abandoned replaces its locks — merely wasteful — and runs its fork hooks, which is not, since
+    `_lifecycle.reclaim` then overwrites the `_FOREIGN` stamp `_mark_inherited` set and leaves a
+    child able to release a transport it never acquired.
+
+    Asserted against the walk itself rather than against a symptom, because the symptom is a
+    child closing a parent's connection and there is no in-process way to observe it. A control
+    run pins the other half: without the opt-out the same walk *does* reach the sink, so this
+    cannot pass by the walk having stopped reaching anything.
+    """
+    from log_foundry.worker import Worker
+
+    class _Hooked(Sink):
+        """Carries the reacquire hook, which is what the walk collects and would then run."""
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Accepts a batch; this test asserts on the walk, not on delivery."""
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    setattr(_Hooked, _REACQUIRE_HOOK, lambda self: _lifecycle.reclaim(self))
+
+    worker = Worker(_Hooked())
+    stranded = _Hooked()
+    try:
+        worker._unclosed_swaps = [stranded]
+        _lifecycle._state._worker = worker
+        reached = _fork._reinit_primitives()
+        assert not any(obj is stranded for obj in reached), (
+            "the repair walk reached a sink the record only pins"
+        )
+
+        # Control: the same walk, with the attribute renamed out from under the opt-out.
+        worker._unclosed_swaps = []
+        worker._not_skipped = [stranded]  # type: ignore[attr-defined]
+        reached_control = _fork._reinit_primitives()
+        assert any(obj is stranded for obj in reached_control), (
+            "the control did not reach it either, so the assertion above proves nothing"
+        )
+
+        # The consequence the opt-out exists for, asserted rather than left to follow. The
+        # walk only *collects* hooks; `_fork` then calls them, and `_lifecycle.reclaim` is what
+        # a called hook reaches — the one write that overrides an inherited `_FOREIGN` stamp.
+        # So "the hook did not run in the child" is the step between the walk and `releasable`.
+        worker._not_skipped = []  # type: ignore[attr-defined]
+        worker._unclosed_swaps = [stranded]
+        reclaimed: list[object] = []
+        real_reclaim = _lifecycle.reclaim
+        _lifecycle.reclaim = reclaimed.append  # type: ignore[assignment]
+        try:
+            assert run_in_child(lambda: str(stranded in reclaimed)).output == "False", (
+                "a child re-stamped a sink the record only pins, so it could then release it"
+            )
+            worker._unclosed_swaps = []
+            worker._not_skipped = [stranded]  # type: ignore[attr-defined]
+            assert run_in_child(lambda: str(stranded in reclaimed)).output == "True", (
+                "the control did not re-stamp it either, so the assertion above proves nothing"
+            )
+        finally:
+            _lifecycle.reclaim = real_reclaim  # type: ignore[assignment]
+    finally:
+        _lifecycle._state._worker = None
+        worker.shutdown(timeout=2.0)
+
+
+def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
+    """FR-002. Both slots naming an in-flight close are emptied for the child.
+
+    `_fork._fresh_primitive` carries an `Event`'s set state across, and the thread that would
+    have cleared these did not survive the fork — so a child inheriting either would answer its
+    *own* later close instantly and exit through a close still running, which is the defect
+    FR-002 closes, made permanent.
+    """
+    from log_foundry.worker import Worker
+
+    class _Quiet(Sink):
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    worker = Worker(_Quiet())
+    try:
+        _lifecycle._state._worker = worker  # only the *registered* worker is rebuilt
+        worker._closing = threading.Event()
+        worker._closing.set()
+        _lifecycle._orphan_closing = 1
+        _lifecycle._orphan_idle.clear()
+
+        def in_child() -> str:
+            """Reports both records as the child sees them, after the handlers have run."""
+            return f"{worker._closing is None},{not _lifecycle._orphan_closing}"
+
+        child = run_in_child(in_child)
+    finally:
+        _lifecycle._orphan_closing = 0
+        _lifecycle._orphan_idle.set()
+        _lifecycle._state._worker = None
+        worker.shutdown(timeout=2.0)
+
+    assert child.output == "True,True", child.output

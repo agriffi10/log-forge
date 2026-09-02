@@ -368,6 +368,56 @@ nested with either of the other two, so there is no cycle. It is held only acros
 membership test or a single mutation, never across a ``close()``.
 """
 
+_orphan_closing = 0
+"""How many orphan closes are running right now, written under ``_state._lock`` (SPEC-050 FR-002).
+
+The orphan path's half of the C3 residue :meth:`~log_foundry.worker.Worker._close_if_owed` fixes
+for the worker: :func:`_close_orphan_sink` empties ``_orphan_owed`` under that lock and *then*
+closes, so a second caller found nothing owed and returned instantly — and an ``atexit`` call that
+returns while a background thread is still inside a close-is-delivery sink's ``close()`` exits
+through it and kills it.
+
+**A count and a gate, not one close's event.** A single slot was tried and is wrong, because the
+orphan close is not once-only: ``_orphan_owed`` is repopulated by :func:`_note_orphan_emit` and
+:func:`_adopt_declined_swap`, so a second close overwrote the first's event and its own completion
+then cleared the slot — a bystander arriving after that read nothing, waited for nothing, and the
+interpreter exited through the *first* close, still running. Measured against a one-second close:
+the bystander waited 1.005 s alone and 0.000 s with a second close completing in between, losing
+the first sink's whole buffer. It is the correction SPEC-045 made to the owed-close *record*,
+arriving here for the same reason.
+
+The predicate a bystander needs is "no orphan close is in flight", so that is what is published:
+:data:`_orphan_idle` is cleared while the count is non-zero and set when it returns to zero. One
+``Event``, built once at module scope, which is also what keeps it where ``_fork``'s repair walk
+can replace it.
+
+**A leaked count is permanent, so the increment is inside the ``try`` and the decrement is
+clamped.** Two ways it leaked, both reproduced: a ``KeyboardInterrupt`` delivered at a bytecode
+boundary between the increment and the ``try`` — measured leaking once in a few hundred iterations
+under a real ``SIGINT`` storm — and a ``fork()`` from *inside* the inline close, where the child's
+handler zeroes the count and the forking thread's own ``finally`` then takes it to ``-1``, which
+``if not _orphan_closing`` never satisfies again. Either leaves the gate clear forever and every
+later caller paying the whole grace, in a process that survives rather than exits. The count is
+therefore taken and released under one ``try``, guarded by a flag set in the same critical section
+as the increment, and floored at zero.
+
+**The gate is process-wide, not per-sink**, so a worker-path ``shutdown()`` can pay the grace for
+an orphan close it has nothing to do with — measured at 2.007 s wall, 0.000 s CPU, with the live
+sink still drained and closed. That is the price of not exiting through a running close, and it is
+bounded by the grace either way.
+"""
+
+_orphan_idle = threading.Event()
+"""Set exactly when :data:`_orphan_closing` is zero — what a bystander waits on (SPEC-050 FR-002).
+
+Starts set: a process with no orphan close in flight must not make the first bystander wait.
+Not in :data:`_FORK_SKIP` — an ``Event`` is what ``_fork``'s repair walk exists to replace. What
+the walk cannot know is that a child is idle whatever the parent was doing, since the threads that
+would have finished those closes did not survive the fork; :func:`_clear_closing_after_fork` says
+so.
+"""
+_orphan_idle.set()
+
 
 def _closing(sink: Sink) -> bool:
     """Whether a release of this sink is in flight on some thread right now (FR-003).
@@ -402,6 +452,12 @@ def _clear_closing_after_fork() -> None:
     the placement is free rather than load-bearing: the registry holds ``int`` ids and no handler
     reads it.
 
+    :data:`_orphan_closing` is zeroed here for the same reason and by the same argument
+    (SPEC-050 FR-002). It counts closes running on threads that did not survive the fork, so a
+    child inheriting a non-zero count would make its next bystander wait out the whole closer
+    grace for closes that can never finish. The fork walk replaces the ``Event`` but not the count
+    that keeps it clear, which is the distinction this handler exists for.
+
     Args:
       None.
 
@@ -411,8 +467,12 @@ def _clear_closing_after_fork() -> None:
     Raises:
       None.
     """
+    global _orphan_closing
     with _closing_now_lock:
         _closing_now.clear()
+    with _state._lock:
+        _orphan_closing = 0
+        _orphan_idle.set()
 
 
 _FORK_SKIP = ("_owned",)
@@ -1451,13 +1511,95 @@ def _inline_close_choice(owed: list[Sink]) -> Sink:
     return owed[-1]
 
 
-def _close_orphan_sink() -> None:
+def _bystander_grace(deadline: float | None) -> float:
+    """Returns how long a caller may wait on a close another caller is performing (SPEC-050 FR-002).
+
+    ``join_closers``'s arithmetic, and :func:`~log_foundry.worker._closer_grace` is its twin on the
+    worker path: capped at :data:`DEFAULT_CLOSER_GRACE` because this is an exit waiting on a close
+    it does not own, and carved from the caller's own budget so a ``shutdown(timeout=0)`` does not
+    inherit somebody else's. The flat cap this replaced made the two paths disagree — the worker
+    half returned in under half a second on a ``timeout=0`` call while this one took the whole two
+    seconds.
+
+    Args:
+      deadline: The calling ``shutdown``'s monotonic deadline, or ``None`` for an unbounded caller,
+        which takes the cap rather than waiting indefinitely.
+
+    Returns:
+      Seconds to wait, never negative and never above the cap.
+
+    Raises:
+      None.
+    """
+    if deadline is None:
+        return DEFAULT_CLOSER_GRACE
+    return max(0.0, min(DEFAULT_CLOSER_GRACE, deadline - monotonic()))
+
+
+def discharge_owed(sink: Sink) -> None:
+    """Records that a sink's owed close is being performed elsewhere (SPEC-050 FR-004).
+
+    The orphan record and :attr:`~log_foundry.worker.Worker._unclosed_swaps` can name the **same**
+    sink: an unconfirmed swap strands it in the worker's record, and an orphan emit that resolved
+    it before the swap and resumed after the re-arm slot had moved on puts it back in
+    ``_orphan_owed``. Both then close it — measured ``A.closes == 2`` with a preemption point at
+    ``_ensure_sink``, which is SPEC-044 FR-004's shape at a record that did not exist then.
+
+    Called with ``_state._lock`` held, by the worker taking its own record under it, so the take
+    and the discharge are one critical section: split, a concurrent ``_close_orphan_sink`` can read
+    the sink out of ``_orphan_owed`` in the gap and close it alongside.
+
+    ``_orphan_closed_sink`` is latched as well as the entry removed, for the reason
+    :func:`_get_worker` latches it: removal stops *this* close being performed twice, and the latch
+    stops a later orphan emit re-arming a sink whose close is already under way.
+
+    Args:
+      sink: The sink whose close the caller is about to perform.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _state._orphan_owed.pop(id(sink), None)
+    _state._orphan_closed_sink = sink
+
+
+def _close_orphan_sink(deadline: float | None = None) -> None:
     """Closes a sink only the orphan path ever wrote to, once (SPEC-031 FR-006).
 
     A process that never opens a span builds no worker, so nothing owned the sink's close and
     nothing performed it: on a locally-buffering sink every event died in the client's batch,
     on a synchronous one the flush and the resource were lost, and ``health()`` read all-clear
     because every field it carries describes a worker that does not exist.
+
+    **A caller that finds nothing owed waits for the one that is closing** (SPEC-050 FR-002).
+    The record is emptied under ``_state._lock`` before any close begins, so a second caller took
+    the early return below while the first was still inside an unbounded ``close()`` — and where
+    that first caller is a background thread and the second is ``atexit``, the interpreter exits
+    through a running close and kills it. For a sink whose ``close()`` *is* the delivery that is
+    total loss of its buffer.
+
+    **A separate caller cannot wait on itself, and the guard for that is the `if owed:` on the
+    write.** (A sink whose own ``close()`` calls ``shutdown()`` re-enters on the closing thread and
+    does wait out its grace — bounded, no deadlock, and pathological usage rather than a case this
+    guards.)
+    :data:`_orphan_closing` is installed only where ``owed`` is non-empty, so a caller that takes
+    the work never reaches the read below and a bystander never installs anything. Capturing
+    ``waiting`` before the write is *not* what makes this safe — both happen under
+    ``_state._lock``, so reading the global there and reading the captured value are the same
+    read, and mutating one into the other is an equivalent mutant. The conditional is the live
+    guard: made unconditional, a caller with nothing owed leaves a permanently unset event behind
+    it, and every call after the next one pays the whole grace on an event nothing will set —
+    measured at the *third* successive orphan ``shutdown()``, which is why a test doing two of
+    them cannot see it. The local exists so a reader can tell which of the two a caller is
+    without re-deriving it.
+
+    The wait is :func:`_bystander_grace` — capped at :data:`DEFAULT_CLOSER_GRACE` and carved from
+    the caller's own deadline, the same arithmetic the worker path uses, so a
+    ``shutdown(timeout=0)`` does not inherit another caller's budget on one path and not the other.
+    It took a flat cap first, which made the two paths disagree by two seconds on that call.
 
     A worker that owns *this* sink closes it instead, and this returns — that is what makes a
     mixed process exactly one ``close()`` in either order. It also inherits that worker's reasons
@@ -1516,7 +1658,8 @@ def _close_orphan_sink() -> None:
     choice is between closing inline and never closing at all.
 
     Args:
-      None.
+      deadline: The calling ``shutdown``'s monotonic deadline, or ``None``. It bounds only
+        the wait for another caller's close, never a close performed here.
 
     Returns:
       None.
@@ -1526,18 +1669,25 @@ def _close_orphan_sink() -> None:
         traceback carrying the message arch §6 keeps out of anything the library says about
         itself. ``Exception``, never ``BaseException`` (SPEC-025 FR-004).
     """
-    with _state._lock:
-        owed: list[Sink] = [
-            sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
-        ]
-        for sink in owed:
-            del _state._orphan_owed[id(sink)]
-            _state._orphan_closed_sink = sink
-    if not owed:
-        return
-    inline = _inline_close_choice(owed)
+    global _orphan_closing
+    took = False
     started: list[threading.Thread] = []
     try:
+        with _state._lock:
+            owed: list[Sink] = [
+                sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
+            ]
+            for sink in owed:
+                del _state._orphan_owed[id(sink)]
+                _state._orphan_closed_sink = sink
+            if owed:
+                _orphan_closing += 1
+                _orphan_idle.clear()
+                took = True
+        if not owed:
+            _orphan_idle.wait(_bystander_grace(deadline))
+            return
+        inline = _inline_close_choice(owed)
         for sink in owed:
             if sink is inline:
                 continue
@@ -1559,6 +1709,11 @@ def _close_orphan_sink() -> None:
     finally:
         for closer in started:
             closer.join()
+        if took:
+            with _state._lock:
+                _orphan_closing = max(0, _orphan_closing - 1)
+                if not _orphan_closing:
+                    _orphan_idle.set()
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 
@@ -1625,10 +1780,10 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             _state._shutdown_running += 1
     if worker is not None:
         worker.shutdown(timeout)
-        _close_orphan_sink()
+        _close_orphan_sink(deadline)
         return
     try:
-        _close_orphan_sink()
+        _close_orphan_sink(deadline)
     finally:
         with _state._lock:
             late_worker = _state._late_worker
@@ -1699,6 +1854,15 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     but the library does not *rely* on that — it cannot enforce what a third-party sink does — so
     it performs one close (SPEC-032).
 
+    **A sink this branch closes is dropped from the worker's owed-swap record** (SPEC-050
+    FR-004). That record is what makes :meth:`~log_foundry.worker.Worker._close_if_owed`'s close
+    of a stranded sink once-only, and this is the one route by which a sink in it can acquire a
+    different closer: the re-arm guard next to this line is a single slot, so a second
+    unconfirmed swap overwrites the first sink's protection and an orphan emit could put it back
+    in the owed record. Defensive rather than reproduced — no reachable sequence for it was found
+    — and one call, taken under the worker's own lock beneath this one, the same nesting
+    :meth:`~log_foundry.worker.Worker.swap_sink` already performs.
+
     The latch is keyed on ``worker.sink``, **not** on the orphan record. The sink
     ``Worker.swap_sink`` is about to close is the one the worker holds, and in the reproduced case
     the record is ``None`` — the worker cleared it when it was built — so keying on the record
@@ -1738,6 +1902,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             for stale in _state.take_orphan_owed():
                 if stale is not new_sink and stale is not worker.sink:
                     _state._orphan_closed_sink = stale
+                    with worker._lock:
+                        worker._discard_owed_swap(stale)
                     closer = release(stale, detached=True)
                     if closer is not None:
                         closers.append(closer)

@@ -647,8 +647,8 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
     a decision somebody takes rather than a default.
 
     SPEC-045 made the record a `dict` rather than a single slot, which collapsed three separate
-    clears into `take_orphan_owed`. The three that remain are the two armings and the per-sink
-    removal that pairs with a close.
+    clears into `take_orphan_owed`. What remains is the armings and the per-sink removals that
+    pair with a close — one for each thing that can perform one.
 
     The set equality **is** the floor: an exact comparison against a hand-written table cannot
     shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
@@ -661,6 +661,12 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
         ),
         ("_close_orphan_sink", "_state._orphan_owed[id(sink)]"): (
             "removed per sink — this function performs that sink's close itself"
+        ),
+        ("discharge_owed", "_state._orphan_owed.pop"): (
+            "removed per sink — a worker taking its own owed-swap record performs that close, "
+            "and the two records can name the same sink (SPEC-050 FR-004). Removed under "
+            "_state._lock in the caller's critical section, so this and _close_orphan_sink "
+            "cannot both decide the sink is theirs — measured A.closes == 2 without it"
         ),
         ("_swap_sink", "new_sink"): "armed — the sink configure() just installed is owed a close",
         ("_note_orphan_emit", "sink"): "armed — the emit that landed owns the close",

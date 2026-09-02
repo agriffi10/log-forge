@@ -568,3 +568,80 @@ def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
     assert log_foundry.health().inherited_sink is False, (
         "and the answer follows the record rather than being constant"
     )
+
+
+# -- SPEC-050 FR-004: the worker's owed-swap record can name the orphan record's sink ----
+
+
+def test_a_stranded_sink_re_armed_on_the_orphan_path_is_closed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-004 AC-3, the route a reviewer could not construct and a probe then did.
+
+    Two records can name the same sink. An unconfirmed `configure(sink=B)` strands A in the
+    worker's owed-swap record; a *second* swap moves the single `_orphan_closed_sink` slot off A;
+    and an orphan emit that resolved A before all of it and resumes after is then allowed to
+    re-arm A into `_orphan_owed`. At shutdown the worker closes A from its record and
+    `_close_orphan_sink` closes it again — measured `A.closes == 2`, which is SPEC-044 FR-004's
+    shape at a record that did not exist when that spec was written.
+
+    The preemption point is injected at `_ensure_sink`, exactly as the sibling test above does,
+    because this cannot be raced for reliably and a race test that passes against the bug is
+    worse than none.
+    """
+    worker_mod = pytest.importorskip("log_foundry.worker")
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.3)
+
+    class _Slow(BufferingSink):
+        """Emits slowly enough that a swap's drain cannot be confirmed inside its budget."""
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Buffers, after a delay that outlasts the swap budget."""
+            time.sleep(0.5)
+            super().emit(batch)
+
+    first, second, third = _Slow("A"), BufferingSink("B"), BufferingSink("C")
+    log_foundry.configure(service="t", sink=first)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("in span")
+
+    work()
+
+    resolved, may_resume = threading.Event(), threading.Event()
+    real_ensure_sink = api._ensure_sink
+
+    def preempting_ensure_sink() -> object:
+        """Parks the emit thread with A already resolved, before any swap has run."""
+        sink = real_ensure_sink()
+        if threading.current_thread().name == "preempted-emit":
+            resolved.set()
+            may_resume.wait(10.0)
+        return sink
+
+    monkeypatch.setattr(api, "_ensure_sink", preempting_ensure_sink)
+    emitter = threading.Thread(
+        target=lambda: log_foundry.info("preempted"), name="preempted-emit", daemon=True
+    )
+    emitter.start()
+    assert resolved.wait(10.0), "the emit resolved A and parked"
+
+    log_foundry.configure(sink=second)
+    worker = _lifecycle._state._worker
+    assert worker is not None and any(s is first for s in worker._unclosed_swaps), (
+        "the premise: the swap could not confirm A's drain, so A is stranded in the record"
+    )
+    log_foundry.configure(sink=third)  # moves the single re-arm slot off A
+
+    may_resume.set()
+    emitter.join(10.0)
+    monkeypatch.setattr(api, "_ensure_sink", real_ensure_sink)
+    assert any(s is first for s in _lifecycle._state._orphan_owed.values()), (
+        "the premise: the resumed emit re-armed A, so both records now name it"
+    )
+
+    log_foundry.shutdown()
+
+    assert first.closes == 1, f"A was closed {first.closes} times — got {first!r}"
+    assert first.buffered == 0, f"and it still delivered its buffer — got {first!r}"

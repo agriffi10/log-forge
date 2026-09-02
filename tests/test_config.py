@@ -371,7 +371,10 @@ def test_an_unconfirmable_drain_is_bounded_counted_and_leaves_the_old_sink_open(
 
         assert elapsed < 2.0, f"configure() must stay bounded, took {elapsed:.2f}s"
         assert worker.sink is new, "the swap still stands — the caller asked for this sink"
-        assert wedged.closed == 0, "left open: the drain thread may still be inside its emit"
+        assert wedged.closed == 0, (
+            "left open here: the drain thread may still be inside its emit. SPEC-050 FR-004 "
+            "closes it at a later shutdown() that finds the thread ended, not at this swap"
+        )
         assert log_foundry.health().incomplete_swaps == 1
         err = capsys.readouterr().err
         assert "could not be confirmed drained" in err
@@ -572,7 +575,7 @@ def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> Non
 
         order: list[str] = []
         real_close_if_owed, real_join = worker._close_if_owed, worker._join_closers
-        worker._close_if_owed = lambda: (order.append("live sink"), real_close_if_owed())[1]
+        worker._close_if_owed = lambda *a: (order.append("live sink"), real_close_if_owed(*a))[1]
         worker._join_closers = lambda t: (order.append("swapped-out"), real_join(t))[1]
 
         worker.shutdown(timeout=0.5)

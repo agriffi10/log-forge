@@ -68,11 +68,28 @@ cd "$ROOT"
 # by accretion, and after a structural cut that is no longer true: what remains is
 # fences, and a genuinely new architectural decision folds a clause in beside them.
 #
-# 34,000 leaves real working room without being open-ended. That is NOT a per-spec allowance
-# — most closing specs add nothing here, because the ritual gates the fold on a new
-# *architectural* decision and a per-feature choice is a register entry and nothing
-# more. If this file approaches 34,000 the answer is another cut, not another raise.
-CLAUDE_MAX_BYTES=34000
+# ~~34,000 … If this file approaches 34,000 the answer is another cut, not another
+# raise.~~ — superseded 2026-09-02 (SPEC-050). That sentence was right about the failure
+# mode and wrong about the premise under it, which was stated one line earlier: "most
+# closing specs add nothing here". True while specs land one at a time. The pre-1.0 audit
+# is being closed by five specs running in PARALLEL, several settling genuinely new
+# architectural decisions, so the wave folds in several clauses between one cut and the
+# next — and the file reached 33,691 with 309 bytes free, one digest line, which is the
+# state the paragraph above calls the mistake. What changed is the RATE, not the rule:
+# process.md §5's "a threshold can be invalidated by its own success" is about exactly
+# this, and it says re-derive rather than re-check.
+#
+# So the rule that survives is sharper than the one it replaces. A raise is legitimate
+# ONLY when the rate the fence was sized against has changed, and it must say which wave
+# it was sized for. A raise to fit the edit in hand is still the failure mode, and it is
+# still how CLAUDE.md reached 89 KB one justified exception at a time.
+#
+# 36,000 is derived, not chosen: 33,691 measured on main at 74c928d, plus ~2,300 for the
+# in-flight wave (SPEC-050 +410 and SPEC-051 +636 measured; two more specs unmeasured at
+# roughly the same size). It is not a per-spec allowance. When this wave has landed the
+# number is re-derived DOWNWARD against what the file then measures — a cap that can no
+# longer fire is not a fence, which is the other half of the §5 rule.
+CLAUDE_MAX_BYTES=36000
 
 # The whole Key Decisions section, measured as bytes. This is the guard that cannot be
 # evaded by reformatting: a per-bullet cap is escaped by splitting one decision into

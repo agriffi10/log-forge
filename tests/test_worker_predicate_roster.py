@@ -555,6 +555,20 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "sink would drain a client nothing is filling while the live target went unflushed."
         ),
     ),
+    ("_flush", "_lifecycle._get_worker()", 0): (
+        LIVENESS,
+        (
+            "who *performs* the submit of a finished span's buffer — `_sweep_open_spans`'s "
+            "sibling, and filed the same way, by the question it feeds: `worker.submit(events)`. "
+            "Not existence, for that row's reason: `_get_worker` answers existence by "
+            "construction. It became a roster site in SPEC-050 FR-003 without becoming a new "
+            "question: the call was already here, inline as `_get_worker().submit(events)`, "
+            "which files nothing. Binding it is what the sweep site already does and for the "
+            "identical reason — `_get_worker` can raise out of `Thread.start()`, and a detach "
+            "that already happened leaves the events in a discarded local, so `_end` counts "
+            "zero into `in_span_lost` on precisely the path the counter exists for."
+        ),
+    ),
     ("_sweep_open_spans", "_lifecycle._get_worker()", 0): (
         LIVENESS,
         (
@@ -968,7 +982,7 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 46, "log_foundry.decorator": 1}
+_SITE_FLOOR = {"log_foundry._lifecycle": 46, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
 
 A refactor that relocates guards can shrink a derived roster silently, which is the one failure
@@ -978,8 +992,11 @@ of 36 and passed — the exact scenario the test below is named for, measured. A
 mapping fails instead, because the dropped module's entry has nothing to satisfy it.
 
 The counts are measured and may rise; either may fall only in a change that deliberately removes
-guards and says so here. `decorator`'s 1 is `_sweep_open_spans`'s `worker = _lifecycle._get_worker()`
-— small, and that is the point: it is the site that makes walking both modules necessary.
+guards and says so here. `decorator`'s 2 are `_sweep_open_spans`'s and `_flush`'s
+`worker = _lifecycle._get_worker()` — small, and that is the point: they are the sites that make
+walking both modules necessary. It rose from 1 in SPEC-050 FR-003, which bound `_flush`'s call to
+a name so the span's buffer survives a worker that cannot be built; a floor left at 1 would have
+accepted losing either site.
 """
 
 

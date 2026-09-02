@@ -95,8 +95,9 @@ silently (FR-002 AC-8).
 
 _EXPECTED_UNJOINED_REQUESTERS = {
     ("_lifecycle", "_get_worker"),
+    ("worker", "Worker._close_if_owed"),
 }
-"""The one site that asks for a detached close and deliberately does **not** join it.
+"""The two sites that ask for a detached close and deliberately do **not** join it.
 
 A written decision rather than a table edit (SPEC-044 FR-002). `_get_worker` closes a sink the
 worker it just built did not adopt, and it is the only requester with no deadline of its own to
@@ -104,6 +105,12 @@ spend: `_swap_sink` and `Worker._close_swapped_out` are both given one by their 
 this runs inside the double-checked build on the first traced call in the process. Joining there
 would put a whole sink `close()` -- with SPEC-028's emit lock and SPEC-027's backoff behind it --
 on that one call, for a close nobody is waiting on.
+
+`Worker._close_if_owed` closes the sinks an unconfirmed `configure(sink=...)` stranded (SPEC-050
+FR-004), once the drain thread that might have been inside their `emit` has ended. It declines
+the join for a different reason: it runs *inside* `shutdown`, immediately before the live sink's
+own inline close, and joining here would serialise the two and spend the budget `_join_closers`
+is about to spend anyway. The grace that follows is the join, one method later.
 
 What replaces the join is what SPEC-030 FR-003 built for exactly this: the thread is registered
 in `_closers`, `join_closers` grants it the capped grace at shutdown and at exit, and
@@ -618,6 +625,12 @@ _LATCH_DISPOSITIONS = {
     ("worker", "Worker._close_sink"): (
         "records nothing, and does not need to: _orphan_sink still names this sink where "
         "anything named it and worker_owns() answers True, so _close_orphan_sink declines"
+    ),
+    ("worker", "Worker._close_if_owed"): (
+        "records nothing, and does not need to: it takes each stranded sink out of "
+        "Worker._unclosed_swaps under Worker._lock before releasing it, so the list itself is "
+        "the once-only record, and _swap_sink already latched the same sink when it handed it "
+        "over (SPEC-050 FR-004)"
     ),
     ("worker", "Worker._close_swapped_out"): (
         "records nothing — its caller is reached through _lifecycle._swap_sink, which latches "
