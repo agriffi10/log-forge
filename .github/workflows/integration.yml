@@ -91,7 +91,13 @@ jobs:
       - name: Run the integration suite
         env:
           LOG_FOUNDRY_INTEGRATION: "1"
-        run: poetry run pytest tests/integration
+        # `-n 0` DISABLES the parallelism that `addopts` now applies by default, and this is a
+        # correctness requirement rather than a preference: these nine tests share nine real
+        # services — one Kafka topic, one Postgres table, one syslog socket — so distributing them
+        # would have them reading each other's writes, and a test asserting a delivered count is
+        # exactly the kind that would then fail intermittently. The unit re-run below is parallel;
+        # this one must not be.
+        run: poetry run pytest tests/integration -n 0
 
       # The existing suite, with the extras PRESENT. Its 20-odd `test_sinks_*.py` modules run
       # only in the no-extras leg today, where every lazy import raises ImportError and the real
@@ -105,16 +111,11 @@ jobs:
         # `LOG_FOUNDRY_INTEGRATION` — that one gates `tests/integration` and its name would lie.
         env:
           LOG_FOUNDRY_EXTRAS: "1"
-        # Parallel for the same measured reason as `ci.yml` (125.9 s -> 40.8 s): this is the whole
-        # unit suite a second time, and it is the same sleep-bound suite.
-        #
-        # Deliberately NOT applied to `tests/integration` above. Those tests share nine real
-        # services — one Kafka topic, one Postgres table, one syslog socket — so distributing them
-        # across processes would have them reading each other's writes, and a test that asserts a
-        # delivered count is exactly the kind that would then fail intermittently. The service
-        # suite is seconds; the win here is entirely in the unit re-run, so the parallelism goes
-        # only where it is both safe and worth something.
-        run: poetry run pytest tests -n 8 --dist load
+        # Bare, so it inherits the parallelism from `addopts` — this is the whole unit suite a
+        # second time, and it is the same sleep-bound suite `ci.yml` runs. The service step above
+        # opts OUT with `-n 0`; this one is where the parallel default is both safe and worth
+        # something.
+        run: poetry run pytest tests
 
       - name: Service logs on failure
         if: failure()

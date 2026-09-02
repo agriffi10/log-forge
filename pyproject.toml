@@ -114,7 +114,30 @@ build-backend = "poetry_dynamic_versioning.backend"
 testpaths = ["tests"]
 pythonpath = ["src"]             # src layout: make `import log_foundry` work without an install
 asyncio_mode = "auto"            # async test functions run without an explicit marker
-addopts = "--strict-markers"
+# `-n 8 --dist load` lives HERE rather than in the CI workflow, so the gate a developer runs
+# before pushing is the same command CI runs, at the same speed: ~126 s -> ~41 s locally, and the
+# pre-push gate is where that 85 s is actually paid for by a human waiting. It also removes a
+# divergence — with the flags only in CI, an order-dependent failure could appear there and be
+# unreproducible with a bare `poetry run pytest`.
+#
+# The suite is sleep-bound, not CPU-bound (~116 s of wall clock at 7% CPU), because this library's
+# promises ARE bounds and a bound is proved by waiting for it; two tests in
+# test_orphan_sink_handoff.py block 30 s each. That is why the count is a fixed 8 rather than
+# `auto`: workers here are overwhelmingly blocked rather than computing, so `auto` — the CPU
+# count, which is 4 on a GitHub runner — leaves most of the win on the table. Measured, same
+# 1,871 passed / 5 skipped every time:
+#
+#     serial               125.9 s        -n 8  --dist load     40.8 s   <- chosen
+#     -n 4  --dist load     75.7 s        -n 12 --dist load     38.6 s   (knee)
+#
+# `--dist load`, not `--dist loadfile`: loadfile keeps a module on one worker, which pins those
+# two 30 s tests to the same process and floors the run at ~72 s at ANY worker count.
+#
+# TO OVERRIDE, PASS `-n 0` — it disables distribution entirely (verified: no workers are created)
+# and is the right flag for debugging a failure, for `--pdb`, or for reading interleaved output.
+# `tests/integration` is run that way in CI for a stronger reason than convenience: those tests
+# share nine real services, so distributing them would have them reading each other's writes.
+addopts = "--strict-markers -n 8 --dist load"
 
 [tool.ruff]
 src = ["src", "tests"]

@@ -76,7 +76,8 @@ deliberate constraint — new runtime deps belong behind an optional extra (as `
 ```bash
 poetry self add "poetry-dynamic-versioning[plugin]"   # one-time: resolve the tag-derived version locally
 poetry install --with dev          # set up
-poetry run pytest                  # test
+poetry run pytest                  # test (parallel by default: -n 8, ~41 s not ~126 s)
+poetry run pytest -n 0             # ...serially, for debugging, --pdb, or readable output
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
 sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
