@@ -79,15 +79,16 @@ jobs:
         # binds every site it names to THIS line — so change it here, run the suite, and let
         # the failures enumerate what else moves. Do not hunt the copies by hand; that is what
         # this comment used to ask for, and it was wrong about how many there are.
-        # Both directions of drift are silent, which is why the test exists: adding a version
+        # Both directions of drift were silent before it, which is why it exists: adding a version
         # here without its classifier understates what the package supports, and removing one
         # (or raising `requires-python`) leaves a classifier claiming a runtime nothing tests
         # — the defect that produced the hand-written classifier list in the first place.
         # The test also guards the two seams that make this list an authority at all: the
         # `python-version:` on the setup-python step below must CONSUME the matrix, and the
         # job `name:` must template on it, since a check run is named `<caller job> / <job
-        # name>`. It does NOT check that this workflow is triggered, or that an `if:` or an
-        # `exclude:` has not thinned it; those are named in the test's own docstring.
+        # name>`. It does NOT check that this workflow is triggered, that a path filter or an
+        # `if:` has not skipped the job, or that an `exclude:` has not thinned the matrix — all
+        # four are named in the test's own docstring as preconditions it cannot verify.
         python-version: ["3.12", "3.13"]
     name: test (py${{ matrix.python-version }})
     steps:

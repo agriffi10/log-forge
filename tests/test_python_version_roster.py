@@ -49,21 +49,26 @@ site carrying both — the README bullet and CLAUDE.md's Tech Stack row each do 
 ways, because set equality alone passes a bullet reading "Python >= 3.13 ... gates on 3.12 and
 3.13": every number present is right and the floor is wrong.
 
-**Not** checked, and the first item is the one to read. **Restatements outside the files in
-`Sources` are unbound**, and they exist: `src/log_foundry/decorator.py`'s flush-lock docstring says
-"the floor is ``>=3.12``", and `docs/architecture.md` says 3.13 "added `Queue.shutdown()` — which
-CI gates on". So are the *comments* inside files whose data lines are bound — `pyproject.toml` and
-the workflows both explain the floor in prose this reads straight past. Raising the floor means
-editing those by hand, with nothing to remind you. They are recorded here rather than swept in
-because reaching into `src/` for a sentence is a wider change than this file has made, and a
-half-bound `src` would read as covered.
+**Not** checked, and the first item is the one to read. **A restatement on a line no anchor reaches
+is unbound** — the boundary is the line, not the file, which is the shape of every gap found here so
+far. In files outside `Sources` that is all of them: `src/log_foundry/decorator.py`'s flush-lock
+docstring says "the floor is ``>=3.12``", `docs/architecture.md` says 3.13 "added
+`Queue.shutdown()` — which CI gates on", and the *comments* in `pyproject.toml` and the workflows
+explain the floor in prose this reads straight past. Raising the floor means editing those by hand
+with nothing to remind you; reaching into `src/` for a sentence is a wider change than this file has
+made, and a half-bound `src` would read as covered. Inside the four prose files the gap is closed
+from the other side by `check_version_lines_are_classified`, so a *new* unanchored line naming a
+gated version cannot arrive unnoticed.
 
-Distinguish those from a third kind that is deliberately **not** a restatement and must not be
+Distinguish all of that from a third kind that is deliberately **not** a restatement and must not be
 "fixed" to agree: a claim about when a *language feature* appeared. `sanitize.py` says CPython 3.11+
 raises past `sys.get_int_max_str_digits()`; the rulebook says `X | None` is 3.10+ syntax. Both are
-history, true regardless of what this package supports, and both would be made wrong by aligning
-them with the matrix. It is also why `_python_versions_in` filters on the gated major rather than
-scanning every dotted number.
+history, true regardless of what this package supports, and aligning them with the matrix would make
+them wrong. **Nothing filters them out by shape** — an earlier draft of this paragraph credited
+`_python_versions_in`'s gated-major cutoff, which is false: it keeps 3.10 and 3.11 happily, and its
+own docstring says what it is really for. What keeps them out is **anchoring** (`sanitize.py` is not
+in `Sources`; the `X | None` bullet is on no anchored line) and, inside the swept files, the
+explicit `_NOT_A_SUPPORT_CLAIM` classification.
 
 Also not checked: that the versions are real CPython releases, that the interpreter running this
 test is one of them, or anything about the prose around the numbers. This binds the restatements it
@@ -395,6 +400,11 @@ _PROSE_SITES = (
         re.compile(r"^\|\s*Language\s*\|.*$", re.MULTILINE),
     ),
     (
+        "docs/best-practices/python/python.md, the Repo defaults bullet",
+        "python_rulebook",
+        re.compile(r"^- Repo defaults:.*$", re.MULTILINE),
+    ),
+    (
         "docs/best-practices/python/python.md, the rulebook's scope blockquote",
         "python_rulebook",
         # Anchored on the SHAPE OF THE CLAIM rather than on the sentence around it, so the line
@@ -651,6 +661,81 @@ def check_workflow_pins(sources: Sources, matrix: list[str]) -> list[str]:
     return complaints
 
 
+# Lines in a prose file that name a **gated** Python version for a reason OTHER than saying what
+# this package supports. A classified list rather than a syntactic rule, for the reason
+# `test_public_surface.py` keeps one: "we run on 3.13" and "`Queue.shutdown()` arrived in 3.13"
+# are not distinguishable by the shape of the sentence, so a rule would have to guess. Anything
+# neither anchored nor listed here FAILS, which makes this a roster rather than a backlog.
+#
+# The one entry is **precautionary and currently inert**: `X | None` names 3.10, which the sweep
+# below never sees because it only looks for versions the matrix gates. It is here because the
+# rulebook is where a gated-version language claim would land — `architecture.md` already carries
+# one ("3.13 added `Queue.shutdown()`") and is not a swept file. The corpus proves the mechanism
+# fires by classifying a gated-version line.
+_NOT_A_SUPPORT_CLAIM = (
+    (
+        "python_rulebook",
+        re.compile(r"^- ✅ \*\*Explicit `X \| None`\*\*"),
+        "names when PEP 604 union syntax arrived, not what this package runs on",
+    ),
+    (
+        "python_rulebook",
+        re.compile(r"^- ✅ Prefer `Queue\.shutdown\(\)`"),
+        "names when the method arrived; the corpus uses it to prove this list fires",
+    ),
+)
+
+
+def check_version_lines_are_classified(sources: Sources, matrix: list[str]) -> list[str]:
+    """Every line of a prose file naming a gated version is anchored, or classified as not a claim.
+
+    The structural answer to a class that recurred three times: a version claim inside a *bound
+    file*, on a line no anchor names. The rulebook's scope blockquote was bound while its Repo
+    defaults bullet was not; that bullet's floor was then bound while its "CI gates 3.12 **and**
+    3.13" was not. Each was closed by hand and the next review found the next, which is where
+    CLAUDE.md says to change the mechanism rather than add another instance.
+
+    **A floor anchor does not discharge a set claim** — that is the third instance exactly. A line
+    naming anything beyond the floor must be reached by a `_PROSE_SITES` anchor, because only a set
+    check reads the whole line.
+
+    The population is lines naming a version the matrix **gates**, not every dotted number: outside
+    an anchored line there is no context to tell `3.12` from `§3.1`, `timeout=5.0` or `300.18 s`,
+    and a first draft using `_python_versions_in` file-wide reported all three. The cost is that a
+    line left stale *after* a version stops being gated is not re-flagged; the value is at
+    authoring time, where a new line naming 3.12 or 3.13 must be classified before it can pass.
+    """
+    floor = _floor(matrix)
+    if floor is None:
+        return []
+    gated = set(matrix)
+    fields = {attribute for _, attribute, _ in _PROSE_SITES} | {
+        attribute for _, attribute, _ in _FLOOR_SITES
+    }
+    complaints = []
+    for attribute in sorted(fields):
+        exempt = [p for f, p, _ in _NOT_A_SUPPORT_CLAIM if f == attribute]
+        set_anchors = [a for _, f, a in _PROSE_SITES if f == attribute]
+        floor_anchors = [a for _, f, a in _FLOOR_SITES if f == attribute]
+        for line in getattr(sources, attribute).splitlines():
+            stated = {v for v in _VERSION.findall(line) if v in gated}
+            if not stated or any(p.search(line) for p in exempt):
+                continue
+            anchors = set_anchors if stated != {floor} else set_anchors + floor_anchors
+            if any(a.search(line) for a in anchors):
+                continue
+            complaints.append(
+                f"{attribute}: this line names Python {_show(stated)} and no "
+                f"{'set ' if stated != {floor} else ''}anchor reaches it, so it can drift alone:\n"
+                f"  {line.strip()}\n"
+                "  Bind it — `_PROSE_SITES` for a set claim, `_FLOOR_SITES` for a floor — or, if "
+                "it names the version for some other reason (when a language feature arrived, "
+                "say), classify it in `_NOT_A_SUPPORT_CLAIM` with that reason. A floor anchor "
+                "does not discharge a set claim: only a set check reads the whole line."
+            )
+    return complaints
+
+
 def check_prose_versions(sources: Sources, matrix: list[str]) -> list[str]:
     """Each prose statement of the supported versions names the matrix's set, and only it."""
     complaints = []
@@ -772,6 +857,7 @@ _CHECKS: dict[str, Callable[[Sources, list[str]], list[str]]] = {
     "ruff_target_version": check_ruff_target_version,
     "workflow_pins": check_workflow_pins,
     "prose_versions": check_prose_versions,
+    "version_lines_are_classified": check_version_lines_are_classified,
     "prose_floor": check_prose_floor,
     "readme_check_names": check_readme_check_names,
     "name_suffix": check_name_suffix,
@@ -943,7 +1029,8 @@ _FIXTURE = Sources(
         "\n"
         "## How to use this doc\n"
         "- Repo defaults: format/lint with **`ruff`**, type-check with **`mypy --strict`**. "
-        "Runtime floor = **3.12**.\n"
+        "Runtime floor = **3.12** (`requires-python`); CI gates 3.12 **and** 3.13.\n"
+        "- ✅ **Explicit `X | None`** for nullable args (3.10+ union syntax).\n"
     ),
     bp_index=(
         "| Domain | Doc | Load when you are… |\n"
@@ -1329,6 +1416,23 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "Repo defaults bullet: no `>= MAJOR.MINOR` floor found",
     ),
     (
+        "a prose file gains an unanchored line naming a gated version",
+        "version_lines_are_classified",
+        _mutate(claude=("| Packaging | Poetry |", "| Runtime | smoke-tested on 3.13 too |")),
+        "this line names Python ['3.13'] and no set anchor reaches it",
+    ),
+    (
+        "a SET claim lands on a line only a FLOOR anchor reaches",
+        "version_lines_are_classified",
+        _mutate(
+            bp_index=(
+                "| Python (3.12+; PEP 8 + Google Python Style Guide)",
+                "| Python (3.12+; PEP 8) | CI gates 3.12 **and** 3.13",
+            )
+        ),
+        "no set anchor reaches it",
+    ),
+    (
         "the best-practices router claims a floor above the matrix",
         "prose_floor",
         _mutate(bp_index=("| Python (3.12+;", "| Python (3.13+;")),
@@ -1404,6 +1508,17 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
             readme=(
                 "- **Python ≥ 3.12**",
                 ("- **Python free-threading builds** are not supported yet.\n- **Python ≥ 3.12**"),
+            )
+        ),
+        "",
+    ),
+    (
+        "SILENCE: a GATED version named as language history, and classified",
+        None,
+        _mutate(
+            python_rulebook=(
+                "## How to use this doc\n",
+                "## How to use this doc\n- ✅ Prefer `Queue.shutdown()` where available (3.13+).\n",
             )
         ),
         "",
