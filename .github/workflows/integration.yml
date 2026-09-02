@@ -35,7 +35,8 @@ permissions:
   contents: read
 
 # The most valuable place in this repository to supersede a stale run: nine service containers,
-# an image-pull path and a JVM start make this the longest job here (~296 s against CI's ~155 s),
+# an image-pull path and a JVM start make this the longest job here (~179 s against CI's ~70 s;
+# both fell when the suite was parallelised, and this is still the longest),
 # so a pull request pushed to twice would otherwise hold two full sets of containers at once.
 # `cancel-in-progress` is an expression, but NOT for the reason it would be easy to write here: a
 # scheduled run on `main` and a pull request are already in different groups (`...-refs/heads/main`

@@ -139,6 +139,9 @@ asyncio_mode = "auto"            # async test functions run without an explicit 
 # and is the right flag for debugging a failure, for `--pdb`, or for reading interleaved output.
 # `tests/integration` is run that way in CI for a stronger reason than convenience: those tests
 # share nine real services, so distributing them would have them reading each other's writes.
+# That one is ENFORCED, not merely configured -- `tests/integration/conftest.py` refuses a
+# distributed session, so deleting `-n 0` from the workflow fails loudly instead of producing the
+# intermittent cross-talk it used to.
 addopts = "--strict-markers -n 8 --dist load"
 
 [tool.ruff]
