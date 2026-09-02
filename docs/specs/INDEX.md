@@ -263,12 +263,15 @@ Group related specs and record the order to build them in. Keep this section: a 
   constraint that a single `Sink.close` cannot be bounded at all.
 
 - **Sink delivery correctness:** SPEC-048 then SPEC-049 — the nine sink findings of the 2026-09-02
-  pre-1.0 audit, cut on the seam between what reaches the wire wrongly and what should never have
-  been constructed. SPEC-048 is the loss and duplication: a followed redirect that loses every
-  batch and forwards the bearer token, four AWS sinks that raise on partial failure so the worker's
-  retry duplicates what landed, an unbounded Pub/Sub close, a Sentry close that strands the SDK's
-  queue. SPEC-049 is what the constructor should have refused, plus the three driver defaults
-  SPEC-041 and SPEC-047 did not reach. Build SPEC-048 first: it is the pair's blocking half, and
-  SPEC-049's Kinesis and ClickHouse work reads the counters SPEC-048 makes move. The split is on
-  consequence rather than on file, so both touch `http.py`, `clickhouse.py` and `file.py` — the
-  second rebases onto the first rather than running beside it.
+  pre-1.0 audit. The seam is **when the library refuses**, not what the refusal prevents: SPEC-048
+  is everything that reaches the wire wrongly or twice at run time, SPEC-049 is everything the
+  constructor should have refused, plus the three driver defaults SPEC-041 and SPEC-047 did not
+  reach. That is a correction — the pair was first cut on *consequence*, which put two
+  construction-time refusals in SPEC-048 while its own Out of Scope forbade them and SPEC-049 did
+  not name them. Build SPEC-048 first: it is the pair's blocking half (a followed redirect that
+  loses every batch and forwards the bearer token; four AWS sinks whose partial failure makes the
+  worker's retry duplicate what landed), and SPEC-049 rebases onto it rather than running beside
+  it, since both touch `http.py`, `clickhouse.py` and `file.py`. SPEC-049 also closes the two
+  construction-time open items `architecture.md` §12 records from SPEC-047 and defers to "a major
+  version that can refuse it" — 1.0 is that version, and a spec claiming every construction-time
+  refusal cannot leave the identical case open two sections away.
