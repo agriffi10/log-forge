@@ -10,7 +10,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | id generators | `src/log_foundry/ids.py` | `new_trace_id` / `new_span_id` / `new_log_id` (W3C-compatible). |
 | `Span` + event builders | `src/log_foundry/model.py` | `Span` dataclass; `build_event` / `start_event` / `end_event` — the arch §6 JSON schema + precedence merge. |
 | value sanitizer | `src/log_foundry/sanitize.py` | `coerce` / `sanitize_fields` / `truncate_str` / `truncate_tail` — makes any value JSON-safe and size-bounded, integers included (SPEC-020); total (never raises). |
-| `health()` + `Health` | `src/log_foundry/__init__.py`, `worker.py` | Public snapshot of the worker's `queued` / `dropped` / `failed_batches`; never creates a worker. |
+| `health()` + `Health` | `src/log_foundry/__init__.py`, `worker.py` | Public frozen snapshot: `queued` (a gauge) plus every loss and lifecycle term. Read it by attribute, never by position; never creates a worker. What each of those terms means and the response it implies: README → *Flushing and shutdown*, which covers all of them and deliberately not `queued`. |
 | context stack + baggage | `src/log_foundry/context.py` | `contextvars` current-span stack and baggage (`push/pop/current`, `get/set_baggage`). |
 | root-span context scope | `src/log_foundry/context.py` | `push_baggage_scope` / `pop_baggage_scope` — bracket a root span so baggage is restored and the adopted context cleared on exit; total, tolerates a foreign-context token (SPEC-024). |
 | `reset_context` | `src/log_foundry/context.py` | Public clear of baggage + adopted context, for callers who open no span (the orphan path) or adopt before dispatching into a child context. Never raises. |
