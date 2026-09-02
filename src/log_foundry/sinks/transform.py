@@ -154,8 +154,9 @@ class TransformSink:
 
         Returns:
           The inner sink's losses. ``None`` passes through unchanged rather than becoming
-          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports nothing" from "the sink
-          reports no loss", and flattening the two would claim a clean bill of health on a sink
+          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports
+          nothing" from "the sink reports no loss", and flattening the two would claim a
+          clean bill of health on a sink
           that never gave one.
 
         Raises:

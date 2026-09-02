@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from typing import Unpack
 
 from log_foundry import _diag
 from log_foundry.sinks._batch import usable_results
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPSink, _Item
+from log_foundry.sinks.http import HTTPRetryKwargs, HTTPSink, _Item
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
 
@@ -48,14 +49,17 @@ class ElasticsearchSink(HTTPSink):
     MAX_BATCH_BYTES = 10_000_000
 
     def __init__(self, url: str, *, index: str, auth: str | tuple[str, str] | None = None,
-                 **http_kwargs: object) -> None:
+                 **http_kwargs: Unpack[HTTPRetryKwargs]) -> None:
         """Points the sink at a cluster's ``_bulk`` endpoint.
 
         Args:
           url: The cluster base URL, to which ``/_bulk`` is appended.
           index: The target index named in every action line.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
+            ``HTTPRetryKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+            ``body_format``, pinned to the bulk API's NDJSON, and ``auth``, which is a
+            parameter of this sink's own.
 
         Returns:
           None.
@@ -65,7 +69,7 @@ class ElasticsearchSink(HTTPSink):
         """
         self._index = index
         super().__init__(
-            url.rstrip("/") + "/_bulk", auth=auth, body_format="ndjson", **http_kwargs  # type: ignore[arg-type]
+            url.rstrip("/") + "/_bulk", auth=auth, body_format="ndjson", **http_kwargs
         )
         self.item_errors = 0
         self.dropped_unadjudicated = 0

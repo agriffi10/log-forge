@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from log_foundry.sinks.http import HTTPSink, merge_headers
+from typing import Unpack
+
+from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, merge_headers
 
 __all__ = ["NewRelicSink"]
 
@@ -29,13 +31,18 @@ class NewRelicSink(HTTPSink):
     MAX_BATCH_COUNT = 1000
     MAX_BATCH_BYTES = 1_000_000
 
-    def __init__(self, api_key: str, *, region: str = "US", **http_kwargs: object) -> None:
+    def __init__(
+        self, api_key: str, *, region: str = "US",
+        **http_kwargs: Unpack[HTTPPlatformKwargs],
+    ) -> None:
         """Points the sink at a region's Log API endpoint.
 
         Args:
           api_key: The key sent as ``Api-Key``.
           region: The account region, matched case-insensitively, which selects the host.
-          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`.
+          **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
+            ``HTTPPlatformKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+            ``body_format``, which this sink pins to New Relic's JSON array.
 
         Returns:
           None.
@@ -49,5 +56,7 @@ class NewRelicSink(HTTPSink):
         headers = merge_headers({"Api-Key": api_key}, http_kwargs)
         super().__init__(
             f"https://{_HOSTS[region]}/log/v1",
-            headers=headers, body_format="json_array", **http_kwargs,  # type: ignore[arg-type]
+            headers=headers,
+            body_format="json_array",
+            **http_kwargs,  # type: ignore[misc]
         )
