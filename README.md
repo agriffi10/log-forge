@@ -14,8 +14,11 @@ calls form a tree you can query later.
 - **Structured, never free-form** — every event is the same named-field JSON shape.
 - **Safe by default** — never captures your arguments or return values (no accidental PII/secret leakage), and the decorator **never swallows exceptions**.
 - **Correct under threads and asyncio** — context propagates via `contextvars`.
-- **Non-blocking delivery** — finished spans are handed to a background worker; your code never
-  blocks on sink I/O, and a graceful drain at exit means buffered events aren't lost.
+- **Non-blocking delivery from a traced call** — a finished span's events are handed to a
+  background worker, so code inside `@trace` never blocks on sink I/O, and a graceful drain at
+  exit means buffered events aren't lost. Two things you can do *deliberately* are synchronous:
+  a level call with **no open span**, which emits on your own thread, and `flush()`, which by
+  definition waits for the drain it asked for.
 
 ---
 
@@ -37,13 +40,14 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 >
 > - **`health()` and `sink.losses()` return frozen dataclasses**, not `NamedTuple`s. Attribute
 >   access (`h.dropped`, `losses.failed`) is unchanged and is the whole contract; `len(h)`,
->   `h[0]` and `queued, dropped, failed = health()` now raise `TypeError`. `Health` has gained a
->   field in six consecutive specs and gains more — with no positions, that stops being breaking.
+>   `h[0]` and the four-way `queued, dropped, failed_batches, stopped_reason = health()` now
+>   raise `TypeError`. `Health` gains fields, and will gain more — with no positions to
+>   preserve, that stops being a breaking change.
 > - **`flush()` returns a `FlushResult` and `continue_trace()` a `ContinueResult`**, each truthy
 >   or falsy with a `reason` naming *why*. `if lf.flush():` is unchanged; **`lf.flush() is True`
 >   is not** — the result is an object. A one-bit return could not grow a reason later without
 >   silently changing what `if flush():` means, which is why it moved now.
-> - **`SQSSink`'s injected client is keyword-only** (`SQSSink(url, client=…)`), **`SentrySink`
+> - **`SQSSink`'s injected client is keyword-only** (`SQSSink(queue_url, client=…)`), **`SentrySink`
 >   injects through `client=`** rather than the old `sdk` keyword, with no alias, and the sink attribute the
 >   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
 >   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
@@ -126,9 +130,9 @@ with the child span pointing at its parent via `parent_span_id`:
 
 ```json
 {"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.start", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "6aeb63c0eba85bf4", "parent_span_id": "b02197e75f40eb81", "log_id": "754adb40e10c445f9ec9e23a2f3dcbf2", "function": "tax.compute", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {"component": "tax"}}
-{"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.end", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "6aeb63c0eba85bf4", "parent_span_id": "b02197e75f40eb81", "log_id": "3af73c51540848afbeaba9fdf7a9dce8", "function": "tax.compute", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {"component": "tax"}, "duration_ms": 0.018, "status": "ok"}
+{"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.end", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "6aeb63c0eba85bf4", "parent_span_id": "b02197e75f40eb81", "log_id": "3af73c51540848afbeaba9fdf7a9dce8", "function": "tax.compute", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {"component": "tax"}, "duration_ms": 0.0233328901231289, "status": "ok"}
 {"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.start", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "b02197e75f40eb81", "parent_span_id": null, "log_id": "e789f7e5268b46d8b779c9cbcdde8656", "function": "charge", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {}}
-{"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.end", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "b02197e75f40eb81", "parent_span_id": null, "log_id": "8f3dbfcfcf4a45f688c738eefef882b0", "function": "charge", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {}, "duration_ms": 0.326, "status": "ok"}
+{"timestamp": "2026-07-10T00:57:10.411Z", "level": "INFO", "message": "span.end", "trace_id": "8ab2add1480f8f6a52fe97cd23ae6f36", "span_id": "b02197e75f40eb81", "parent_span_id": null, "log_id": "8f3dbfcfcf4a45f688c738eefef882b0", "function": "charge", "service": "billing-api", "version": "1.4.2", "env": "prod", "fields": {}, "duration_ms": 0.342666869983077, "status": "ok"}
 ```
 
 > **Note on ordering:** the child span (`tax.compute`) finishes first, so its events flush
@@ -140,7 +144,11 @@ with the child span pointing at its parent via `parent_span_id`:
 
 A traced call travels through a small pipeline. The first four steps run on your own thread
 and are deliberately fast; the last two run on a background thread so your code never waits on
-the destination.
+the destination. That is the traced path. A level call with no **open** span takes the
+synchronous route instead, described under
+[Flushing and shutdown](#flushing-and-shutdown) — and "open" is the operative word: a task
+that outlives its span still sees that span, but it has closed, so the call takes the
+synchronous route too.
 
 1. **You call the code** — a `@trace` function, or one of the `debug`/`info`/… emitters.
 2. **A span opens** — a record of this one call. It inherits the current trace and parent (see
@@ -302,9 +310,9 @@ def process(): ...
 - `defaults` — per-decorator fields merged into every event this span emits.
 
 The **outermost** decorated call starts a new trace; every nested decorated call becomes a
-child span within it. On an exception, the decorator records `status="error"` plus the
-exception type and formatted stack, then **re-raises the original exception unchanged** — it
-never swallows errors.
+child span within it. On an exception, the decorator records `status="error"` plus an `error`
+sub-document carrying the exception's type, module, message and formatted stack, then
+**re-raises the original exception unchanged** — it never swallows errors.
 
 **Async is supported.** Apply `@trace` to an `async def` and it traces the coroutine's actual
 run — the span opens when the coroutine starts and closes when the awaits complete, not when the
@@ -369,7 +377,7 @@ def process_payment(user_id: int) -> str:
   It reaches its own name too (`fields={"fields": ...}`), so every reserved word has exactly one
   route through. A key given both ways takes the keyword's value, since `**kwargs` is what you
   wrote at the call site and `fields=` is usually a mapping built elsewhere.
-- **Orphan logs** — a level call made with no active span is not dropped: it emits a standalone
+- **Orphan logs** — a level call made with no **open** span is not dropped: it emits a standalone
   one-event span with a fresh `trace_id`, flushed straight to the sink.
 
 ### Continuing a trace across processes
@@ -411,9 +419,13 @@ def handler(event, context):       # the entry point, deliberately not decorated
         lf.flush()                 # the span has closed, so its events are drained
 ```
 
-`flush()` goes **outside** the traced function, not in its `finally`. An in-span event lives on the
-span until the span *closes*, and `flush()` drains the queue — so a `flush()` inside the span has
-nothing to drain yet.
+`flush()` works either side of the traced function. Putting it outside, as above, is still the
+clearer shape — the span has closed, so there is nothing to reason about. But a `flush()`
+*inside* an open span is no longer a mistake: it sweeps every open span in the calling context,
+hands their buffered events to the worker and drains them, leaving the spans open. It does not
+deliver a `span.end` that has not happened yet. Before `1.0.0` a flush inside a span swept
+nothing, and this recipe with the `flush()` moved into the traced function delivered **nothing**
+with every counter clean.
 
 | Call | Does |
 |---|---|
@@ -504,8 +516,16 @@ nothing.
 
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
 call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
-`SinkDeliveryError`, `SinkLosses` and `read_losses`; the **concrete sinks** are not, so import each
-from its own module, e.g. `from log_foundry.sinks.sqs import SQSSink`.
+`SinkDeliveryError`, `SinkLosses`, `read_losses` and `flush_sink` — the last two being the probes
+a wrapper sink needs to ask a child for its losses and to push its client-side buffer. The
+**concrete sinks** are not exported, so import each from its own module, e.g.
+`from log_foundry.sinks.sqs import SQSSink`.
+
+**Construct `SinkLosses` with keywords**, as the example below does. The public dataclasses are
+keyword-only from `1.0.0`, so a positional `SinkLosses(0, 3)` raises `TypeError` — and it raises
+*inside* your `losses()`, where `read_losses` deliberately swallows it so a broken reporter cannot
+take `health()` down. The symptom is not an error: your sink's loss reporting silently becomes
+`None`.
 
 A few conventions hold across every sink below:
 
@@ -555,8 +575,8 @@ A few conventions hold across every sink below:
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `StdoutSink` | `log_foundry.sinks.stdout` | `StdoutSink(stream=sys.stdout)` — one JSON line per event; the zero-config default |
-| `StderrSink` | `log_foundry.sinks.stdout` | `StderrSink(stream=sys.stderr)` — same, on stderr (twelve-factor) |
+| `StdoutSink` | `log_foundry.sinks.stdout` | `StdoutSink(stream=None)` — one JSON line per event; `None` resolves to `sys.stdout` **at construction** and is not re-read per write. The zero-config default |
+| `StderrSink` | `log_foundry.sinks.stdout` | `StderrSink(stream=None)` — same, resolving to `sys.stderr` (twelve-factor) |
 | `NullSink` | `log_foundry.sinks.null` | `NullSink()` — discard everything; `.dropped` counts events |
 | `MemorySink` | `log_foundry.sinks.memory` | `MemorySink(maxlen=None)` — collect into `.events` (a bounded ring when `maxlen` is set) |
 
@@ -912,7 +932,7 @@ class MySink:
 
     def losses(self) -> SinkLosses:
         with self._counter_lock:               # both fields from one instant
-            return SinkLosses(dropped=self._dropped, failed=self._failed)
+            return SinkLosses(dropped=self._dropped, failed=self._failed)   # keywords required
 
     def close(self) -> None:
         with self._lock:                       # never release under an active writer
@@ -972,7 +992,12 @@ Every wrapper shipped here — `MultiSink`, `FilteringSink`, `TransformSink`, `S
 
 Delivery is off the hot path. When a span ends, its events are handed to a per-process
 background worker via a fast, non-blocking submit — your function returns without waiting on
-the sink. The worker batches events (by count and time), emits them on its own thread, retries
+the sink. A level call with no **open** span has no span to end, so it emits synchronously on
+the calling thread — including a call from a task that outlived the span it inherited, whose
+span is present but closed. That path needs no worker, and in a process that only ever logs
+that way none is ever built; it is a span closing, or a `flush()` sweeping one, that builds it.
+The rest of this paragraph is about the buffered path.
+The worker batches events (by count and time), emits them on its own thread, retries
 a failing sink with backoff, and applies backpressure so a slow or down sink can never block or
 back-pressure the app: when its bounded queue is full it drops the newest submissions and counts
 them rather than stalling.
@@ -1000,7 +1025,7 @@ They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
-| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Tune `batch_size`/`flush_interval`, or scale the sink. |
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
@@ -1008,7 +1033,7 @@ They tell you different things, and they want different responses:
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
 | `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
-| `orphan_lost` | An event logged **with no active span** never reached the sink. That call emits on your own thread with no worker behind it, so no other field here can carry it — it is not a batch, there was no retry, and there may be no worker at all. Covers a sink that failed to *construct* as well as one that raised. | Fix the destination, or the data. The stderr line names the exception type. If a process logs this way at all, this is the field to alert on: nothing else describes that path. |
+| `orphan_lost` | An event logged **with no open span** never reached the sink. That call emits on your own thread with no worker behind it, so no other field here can carry it — it is not a batch, there was no retry, and there may be no worker at all. Covers a sink that failed to *construct* as well as one that raised. | Fix the destination, or the data. The stderr line names the exception type. If a process logs this way at all, this is the field to alert on: nothing else describes that path. |
 | `in_span_lost` | An event logged **inside a span** could not be built — a value that could not be turned into an event. Always the data, never the destination: the in-span path cannot fail at delivery, which is `failed_batches`. | Fix the call site. Passing a non-string message (an exception object, say) is the common cause. |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter. It and `queued` are the two fields here that fall as well as rise; the other integer counters only climb. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
 
@@ -1016,8 +1041,9 @@ They tell you different things, and they want different responses:
 reported. They aggregate different failure populations — one can mean the destination *or* the
 data, the other can only mean the data — so a single number would hide which fix applies.
 
-`h.sink` is a `SinkLosses(dropped, failed)` or `None` — `None` when no worker exists yet, or when
-the configured sink reports nothing (`losses()` is optional). Note the two `dropped` fields count
+`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no worker
+exists yet, or when the configured sink reports nothing (`losses()` is optional, and a sink whose
+`losses()` raises reports `None` too). Note the two `dropped` fields count
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
 itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
@@ -1058,11 +1084,12 @@ guards its own post-close state — rather than queued where nothing will drain 
 the same claim. A stateless sink such as the default `StdoutSink` still accepts it.
 
 Read a snapshot **by attribute** (`h.dropped`), as above — that is the whole contract. `Health`
-and `SinkLosses` are frozen dataclasses, so `len(h)`, `h[0]` and `queued, dropped, failed =
-health()` all raise `TypeError`. They were `NamedTuple`s before `1.0.0` and the tuple shape is
-deliberately gone: `Health` has gained a field in six consecutive specs and gains more, and every
-one of those had to argue that the positions before it were undisturbed. There are no positions to
-disturb now, and adding a field is not a breaking change.
+and `SinkLosses` are frozen dataclasses, so `len(h)`, `h[0]` and the four-way
+`queued, dropped, failed_batches, stopped_reason = health()` all raise `TypeError`. They were
+`NamedTuple`s before `1.0.0`, and the tuple shape is deliberately gone: `Health` gains fields
+as the library learns to report more, and while it was a tuple every one of those additions
+had to argue that the positions before it were undisturbed. There are no positions to disturb
+now, and adding a field is not a breaking change.
 
 `dropped` counts submissions discarded because the queue filled; `failed_batches` counts batches
 abandoned after the retry budget was spent. Overflow also warns on stderr — on the first drop and
@@ -1122,7 +1149,7 @@ was outstanding** — the drain it forces reached the sink, and so did anything 
 emitted while it waited its turn. A truthy result is evidence of delivery, not merely that a drain
 took place.
 
-Falsy carries a `reason` saying which of five things happened, because they need different fixes:
+Falsy carries a `reason` saying which of these happened, because they need different fixes:
 
 | `reason` | Means |
 |---|---|
@@ -1131,6 +1158,7 @@ Falsy carries a `reason` saying which of five things happened, because they need
 | `"thread-died"` | The drain thread is gone; see `health().stopped_reason`. |
 | `"queue-full"` | Backpressure — the queue could not even accept the marker. |
 | `"abandoned"` | A batch was given up on after its retry budget. The destination is broken. |
+| `"sink-flush"` | Everything queued reached the sink, but the sink's own `flush()` raised — a client-side buffer that did not go out. Distinct from `"abandoned"`: the library delivered, the sink did not. |
 
 ```python
 result = lf.flush(5.0)
@@ -1189,7 +1217,8 @@ def _handler(event, context):
 
 def handler(event, context):
     # NOT decorated, so the span closes when `_handler` returns and its events reach the queue
-    # before `flush()` runs. A `flush()` *inside* the traced function has nothing to drain yet.
+    # before `flush()` runs. Since 1.0.0 a `flush()` *inside* the traced function also works —
+    # it sweeps the open span — but keeping it out here means there is nothing to reason about.
     try:
         return _handler(event, context)
     finally:
@@ -1231,9 +1260,9 @@ Every event is the same shape (arch §6). Boundary events add a few fields:
 | `function` | ✓ | span name |
 | `service` / `version` / `env` | ✓ | from `configure(...)` |
 | `fields` | ✓ | merged user fields (config `defaults` → span `defaults` → …) |
-| `duration_ms` | span.end | wall time from a monotonic delta |
+| `duration_ms` | span.end | wall time from a monotonic delta, unrounded — full float precision |
 | `status` | span.end | `"ok"` or `"error"` |
-| `error` | on failure | `{"type": ..., "stack": ...}` |
+| `error` | on failure | `{"type": ..., "module": ..., "message": ..., "stack": ...}` |
 | `truncated` | when a ceiling fired | `true`; absent otherwise, never `false` |
 
 IDs are [W3C Trace Context](https://www.w3.org/TR/trace-context/)-compatible by design, so the
@@ -1278,18 +1307,30 @@ poetry run pytest              # test (runs in parallel by default; see addopts)
 poetry run pytest -n 0         # ...serially, when debugging a failure
 poetry run ruff check .        # lint (line-length 100)
 poetry run mypy                # typecheck (strict, over src/)
+sh scripts/spec-lint.sh        # lint the design specs
+sh scripts/docs-lint.sh        # the always-loaded docs tier — NOTHING IN CI RUNS THIS
+poetry run python scripts/docstring-lint.py   # the docstring rule over src/ — ALSO NOT IN CI
 ```
 
+All six run before a push. The last two are the ones to remember, because they are deliberately
+not CI jobs: they hold the documentation and the docstrings to rules a reviewer would otherwise
+have to carry, and keeping them local means the failure lands on whoever caused it rather than on
+a shared branch. Each has a `-test.sh` beside it that proves its own checks still fire; run that
+one too if you change the linter.
+
 The library uses a src layout (`src/log_foundry/`) with a single concept per module: `config`,
-`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, and the `sinks/` package (the
-`base` protocol, `stdout`, and one module per sink family — see [Sinks](#sinks)).
+`ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, `sanitize` and `results`,
+the internal `_lifecycle`, `_fork` and `_diag`, and the `sinks/` package (the `base` protocol,
+`stdout`, and one module per sink family — see [Sinks](#sinks)). Anything underscore-prefixed
+is internal and moves without notice.
 Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
 
 ### Continuous integration
 
-Every pull request runs the checks below. A check whose verdict cannot change on the tree in
-front of it is path-filtered rather than run to the same answer twice, so the *When* column is
-part of the contract:
+The checks below guard this repository. Most run on every pull request; a check whose verdict
+cannot change on the tree in front of it is path-filtered rather than run to the same answer
+twice, and two run only after the merge — so the *When* column is part of the contract and is
+worth reading before assuming a PR was audited:
 
 | Check | Does | When | Fails the build |
 |---|---|---|---|
@@ -1298,6 +1339,14 @@ part of the contract:
 | [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | every PR | yes |
 | [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflow, action, dependabot or zizmor config touched; also weekly | no — reports to code scanning |
 | CodeQL | `python` + `actions`, `extended` query suite; also weekly | every PR | no — reports to code scanning |
+| [`integration.yml`](.github/workflows/integration.yml) | the extras-backed sinks against nine real services in containers | sinks, `tests/integration/`, `pyproject.toml`, `poetry.lock` or that workflow touched; also weekly | it goes red, and like every check here it is advisory — `main` requires no status check at all, and this one is furthest from earning that: nine service containers are a flakiness budget |
+| [`pip-audit.yml`](.github/workflows/pip-audit.yml) | advisories across every extra, `--strict` | **not on PRs at all** — on the merge to `main` when the lockfile, extras, the ignore list or that workflow moved, and weekly | yes, on `main` |
+| [`scorecard.yml`](.github/workflows/scorecard.yml) | OpenSSF Scorecard over the repository's own supply chain | **not on PRs** — on the merge to `main` when `.github/`, `scripts/`, `SECURITY.md`, `LICENSE` or the lockfile moved, and weekly | no — reports to code scanning |
+
+**`scripts/docs-lint.sh` is deliberately not in that table**, because nothing in CI runs it. It
+holds the always-loaded documentation tier to its budgets and is a local pre-push gate, so its
+failure lands on whoever caused it rather than on a shared branch. Contributors run it, along
+with `scripts/spec-lint.sh`, before pushing.
 
 On a push to `main` the full `ci.yml` matrix still runs, but as the first job of
 [`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it is
@@ -1340,9 +1389,12 @@ everything it instruments:
   [`SECURITY.md`](SECURITY.md#software-bill-of-materials) has the detail.
 
 Scanning runs continuously rather than at release time: CodeQL over the source and the workflows,
-zizmor over the workflows, `dependency-review` on every pull request, a weekly `pip-audit` across
-all eleven extras, and OpenSSF Scorecard. Findings go to code scanning; `dependency-review` and
-`pip-audit` are the two that fail a build.
+zizmor over the workflows, `dependency-review` on every pull request, `pip-audit` across all
+eleven extras, and OpenSSF Scorecard. Findings go to code scanning; `dependency-review` and
+`pip-audit` are the two that fail a build — but note **where**: only `dependency-review` runs
+on a pull request. `pip-audit` runs weekly and on the merge to `main`, so a floor change is
+audited after it lands, not before. The weekly re-examination is the point of it: an advisory
+is published on the advisory database's clock, not on this repository's.
 
 ## Releasing
 
@@ -1365,9 +1417,19 @@ pip ignores pre-releases unless you pass `--pre`.
 Cutting a release is one tag:
 
 ```bash
-git tag -a v0.9.0 -m "log-foundry 0.9.0"
-git push origin v0.9.0
+git tag -a v1.2.3 -m "log-foundry 1.2.3"
+git push origin v1.2.3
 ```
+
+**One precondition, because it fails quietly.** If `docs/release-notes/<tag>.md` exists in the
+**tagged commit's tree**, the release job uses it as the release body; otherwise it generates
+one from the commit range. Both are valid, but the lookup is by exact tag name and the checkout
+takes the tag, so notes written for one version do nothing for another and notes added after
+the tagged commit are not seen. A release body cannot be amended once published — this
+repository has immutable releases — so check the file is there and named for the tag before
+pushing it. [`docs/release-notes/`](docs/release-notes/) holds the ones written so far, and
+[`docs/spec-delivery/RELEASES.md`](docs/spec-delivery/RELEASES.md) records which specs each
+released version carried.
 
 Uploads authenticate with PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
 (OIDC) through the `pypi` GitHub Environment — there is no API token stored in the repository.
