@@ -505,7 +505,9 @@ When a spec is done, in the same pass:
    only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
    that area's clause rather than appending a new one. Entry first, line second: the digest line is
    **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
-   a reminder and become the reasoning, which belongs in the register. If the decision **supersedes an earlier one**, add a superseded marker (short
+   a reminder and become the reasoning, which belongs in the register. A reversal that changes the entry's **heading** must move its Contents row and its
+   digest label with it, or the row points at a dead anchor and docs-lint fails.
+   If the decision **supersedes an earlier one**, add a superseded marker (short
    blockquote: what changed, which spec, where the full entry lives) at every doc site that still
    states the old claim — `architecture.md` sections, `INDEX.md` build-order notes. The new entry
    alone is not enough; an agent reading only the old site must see the reversal.
@@ -532,10 +534,10 @@ this way).
   with this rule stated here throughout.
 - **`scripts/docs-lint.sh` enforces the structural half of these rules, and runs on every PR**
   (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
-  bullet to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
+  **unit** — a bullet with its continuations, or a prose paragraph — to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
   digest line for every entry, and to list every entry in its Contents; requires every Completed spec
-  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The digest and delivery caps are
-  ratchets at the measured level** — when one fires, move detail down a tier and re-ratchet, rather
+  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The delivery cap is a ratchet at the
+  measured level** — when one fires, move detail down a tier and re-ratchet, rather
   than raising the cap. The `CLAUDE.md` byte budget is deliberately NOT pinned at the measurement: it
   carries headroom, because a budget with none forces the next closing spec to prune another area's
   fences to buy room for its own, which is the gate causing the damage it exists to prevent. Every rule it checks was already written here, and every one was violated

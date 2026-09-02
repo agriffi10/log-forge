@@ -43,7 +43,7 @@ cd "$ROOT"
 # RATCHETS AT THE MEASURED LEVEL, not targets. When a doc grows past one, the fix is
 # to move detail down a tier — into `docs/`, behind a pointer — which is the entire
 # reason the budget is here. Lowering the bar to fit the edit is the failure mode, and
-# it is how this file reached 89 KB one justified exception at a time.
+# it is how `CLAUDE.md` reached 89 KB one justified exception at a time.
 #
 # CLAUDE_MAX_BYTES is set deliberately and is the one budget here NOT pinned at the
 # measurement. The file was cut to a digest over docs/decisions.md on 2026-09-02, and a
@@ -56,7 +56,7 @@ cd "$ROOT"
 # by accretion, and after a structural cut that is no longer true: what remains is
 # fences, and a genuinely new architectural decision folds a clause in beside them.
 #
-# 34,000 leaves roughly fifteen digest lines of room. That is NOT a per-spec allowance
+# 34,000 leaves real working room without being open-ended. That is NOT a per-spec allowance
 # — most closing specs add nothing here, because the ritual gates the fold on a new
 # *architectural* decision and a per-feature choice is a register entry and nothing
 # more. If this file approaches 34,000 the answer is another cut, not another raise.
@@ -81,7 +81,7 @@ CLAUDE_MAX_BYTES=34000
 # as a fence the one check that could no longer fire.
 #
 # **A fence can be invalidated by its own success, not only by being wrong**, and this
-# one has the same exposure: 800 clears today's worst unit by roughly double, so ANY
+# one has the same exposure: 800 clears today's worst unit with room to spare, so ANY
 # FUTURE STRUCTURAL CUT of Key Decisions must re-derive this constant rather than
 # merely check it. A cut that leaves this number alone hands the next reader a fence
 # that passes everything.
@@ -176,15 +176,25 @@ awk -v cap="$DIGEST_MAX_BYTES" -v reg="$REGISTER" '
              length(cur), cap, substr(cur, 1, 70), reg
     cur = ""
   }
-  /^## Key Decisions/  { in_sec = 1; next }
-  in_sec && /^## /     { flush(); in_sec = 0 }
-  !in_sec              { next }
-  /^[ \t]*#/           { flush(); next }
-  /^[ \t]*$/           { flush(); next }
-  /^[ \t]*[-*+][ \t]/  { flush(); cur = $0; next }
-                       { s = $0; sub(/^[ \t]+/, "", s)
-                         cur = (cur == "") ? s : cur " " s }
-  END                  { flush() }
+  /^## Key Decisions/       { in_sec = 1; next }
+  in_sec && /^## /          { flush(); in_sec = 0 }
+  !in_sec                   { next }
+  /^[ \t]*(```|~~~)/        { flush(); fence = !fence; next }
+  fence                     { next }
+  /^[ \t]*#/               { flush(); next }
+  /^[ \t]*$/               { flush(); next }
+  # A table row or a blockquote is not a digest unit. The supersede marker the ritual
+  # asks for is a blockquote, and joining it to the bullet above pushed the longest
+  # line over the cap with a message telling the author to move "the reasoning" out.
+  /^[ \t]*[|>]/            { flush(); next }
+  # A NEW unit starts only at column 0. Matching an indented bullet here flushed its
+  # parent and started a fresh unit, so a decision written as a parent plus nested
+  # children escaped the cap entirely — the same reformat-to-escape hole this check
+  # was widened to close for prose.
+  /^[-*+][ \t]/            { flush(); cur = $0; next }
+  /^[ \t]+[^ \t]/         { if (cur != "") { s = $0; sub(/^[ \t]+/, "", s); cur = cur " " s } next }
+                            { cur = (cur == "") ? $0 : cur " " $0 }
+  END                       { flush() }
 ' "$CLAUDE" >> "$FAILS"
 
 # ── 3, 4 & 5. The register: present, not inverted with its digest, all reachable ─
@@ -206,6 +216,22 @@ else
   # two sets with comm would want process substitution, which is a bashism.
   awk -v claude="$CLAUDE" -v reg="$REGISTER" '
     function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function emit(   s, i, j, k, p, label) {
+      if (unit == "" || unit !~ /^[-*+][ \t]+\*\*/) { unit = ""; return }
+      s = unit; sub(/^[-*+][ \t]+\*\*/, "", s)
+      # The closing ** is the first NOT followed by another *. A label ending in an
+      # italic (...skip *work*) is stored as *work***, and taking the first pair
+      # truncates it by one character — reported as both halves of the cross-check
+      # missing, for a label that is correct.
+      i = 0; p = 1
+      while ((j = index(substr(s, p), "**")) > 0) {
+        k = p + j - 1
+        if (substr(s, k + 2, 1) != "*") { i = k; break }
+        p = k + 1
+      }
+      if (i > 1) { label = trim(substr(s, 1, i - 1)); if (label !~ /^\(example\)/) digest[label] = 1 }
+      unit = ""
+    }
     function anchor(s,   t) {
       t = tolower(trim(s))
       gsub(/`/, "", t); gsub(/\*/, "", t)
@@ -214,29 +240,23 @@ else
       return t
     }
     # ---- first file: the always-loaded digest ----
+    # ---- first file: the always-loaded digest ----
+    # Labels are read off the SAME logical units check 2 measures, for two reasons a
+    # line-based reader got wrong. A label whose `**…**` wraps across two physical lines
+    # yielded no label at all, so the cross-check demanded nothing and a digest line with
+    # no entry behind it passed — and six of the pre-cut bullets wrapped that way. And an
+    # INDENTED bold span is emphasis inside a decision, not a label, so reading one as a
+    # label demanded a register entry for the word "Never".
     NR == FNR {
-      if ($0 ~ /^## Key Decisions/) { in_sec = 1; next }
-      if (in_sec && $0 ~ /^## /)    { in_sec = 0 }
-      if (in_sec && $0 ~ /^[ \t]*[-*+][ \t]+\*\*/) {
-        s = $0
-        sub(/^[ \t]*[-*+][ \t]+\*\*/, "", s)
-        # The closing ** is the first one NOT followed by another *. A label ending in
-        # an italic (...skip *work*) is stored as *work***, where a plain index(s,"**")
-        # finds the pair straddling the italic own asterisk and truncates the label by
-        # one character — which reads as a digest line whose entry is missing AND an
-        # entry whose digest line is missing, two failures naming almost the same
-        # string, for a label that is in fact correct.
-        i = 0; p = 1
-        while ((j = index(substr(s, p), "**")) > 0) {
-          k = p + j - 1
-          if (substr(s, k + 2, 1) != "*") { i = k; break }
-          p = k + 1
-        }
-        if (i > 1) {
-          label = trim(substr(s, 1, i - 1))
-          if (label !~ /^\(example\)/) digest[label] = 1
-        }
-      }
+      if ($0 ~ /^## Key Decisions/) { kd = 1; next }
+      if (kd && $0 ~ /^## /)        { emit(); kd = 0 }
+      if (!kd) next
+      if ($0 ~ /^[ \t]*(```|~~~)/)  { emit(); kfence = !kfence; next }
+      if (kfence) next
+      if ($0 ~ /^[ \t]*#/ || $0 ~ /^[ \t]*$/ || $0 ~ /^[ \t]*[|>]/) { emit(); next }
+      if ($0 ~ /^[-*+][ \t]/)      { emit(); unit = $0; next }
+      if ($0 ~ /^[ \t]+[^ \t]/)   { if (unit != "") { s = $0; sub(/^[ \t]+/, "", s); unit = unit " " s } next }
+      unit = (unit == "") ? $0 : unit " " $0
       next
     }
     # ---- second file: the register ----
@@ -259,6 +279,7 @@ else
       }
     }
     END {
+      emit()
       for (l in digest)
         if (!(l in entry))
           printf "FAIL  Key Decisions carries \"%s\" with no \"### %s\" in %s.\n      Entry first, line second: a digest line is never the only home of a fact.\n", l, l, reg
@@ -280,7 +301,14 @@ fi
 if [ -d "$SPEC_DIR" ]; then
   for f in "$SPEC_DIR"/SPEC-*.md; do
     [ -f "$f" ] || continue
-    grep -qiE '^[^A-Za-z]*Status[^A-Za-z]+Completed' "$f" || continue
+    # Fence-aware: a Draft spec that quotes the completion ritual in a fenced block
+    # would otherwise be read as Completed and told it owes a delivery doc.
+    awk '
+      /^[ \t]*(```|~~~)/ { fence = !fence; next }
+      fence { next }
+      tolower($0) ~ /^[^a-z]*status[^a-z]+completed/ { found = 1 }
+      END { exit !found }
+    ' "$f" || continue
     num=$(basename "$f" | sed -n 's/^\(SPEC-[0-9][0-9]*\).*/\1/p')
     [ -n "$num" ] || continue
     found=0

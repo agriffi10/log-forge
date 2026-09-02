@@ -221,7 +221,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 2. Update the one-line row in `@docs/specs/INDEX.md` (status only — don't add prose).
 3. Write a short delivery doc at `docs/spec-delivery/SPEC-XXX-<name>.md` from the template.
 4. If it added reusable modules, add a one-line row to `@docs/component-inventory.md`.
-5. A *new architectural decision* gets its **full entry in `@docs/decisions.md` first, plus a row in that file's `## Contents`** — docs-lint fails an entry the Contents does not reach — then one line in Key Decisions above, under the same AREA, replacing or extending that area's clause rather than appending a new one. Never a paragraph there, and never the only home of the fact. If it **supersedes** an earlier decision, add an in-place superseded marker (short blockquote) at every doc site still stating the old claim. Reasoning belongs in the spec/delivery doc.
+5. A *new architectural decision* gets its **full entry in `@docs/decisions.md` first, plus a row in that file's `## Contents`** — docs-lint fails an entry the Contents does not reach — then one line in Key Decisions above, under the same AREA, replacing or extending that area's clause rather than appending a new one. Never a paragraph there, and never the only home of the fact. If it **supersedes** an earlier decision, add an in-place superseded marker (short blockquote) at every doc site still stating the old claim — and if the reversal changes the entry's **heading**, move its Contents row and its digest label with it, or the row points at a dead anchor and docs-lint fails. Reasoning belongs in the spec/delivery doc.
 
 **Doc-size guardrail:** this is the always-loaded file — if an edit pushes a section past a few
 lines, the detail belongs in a `docs/` file behind a pointer. Same for `INDEX.md` (status rows only)
@@ -230,7 +230,7 @@ it is not a per-spec changelog, and `## Specs` is not one either. Both were exac
 2026-09-02, when this file was cut from 89,340 bytes to a digest over `@docs/decisions.md`; the rule
 had been stated here and in `@docs/process.md` §5 the whole time and lost anyway, roughly forty
 times running. **`scripts/docs-lint.sh` now enforces it on every PR** — the byte budget, the digest
-line cap, and an entry in the register behind every digest line. The digest cap and the delivery cap are **ratchets**: when one fires, cut
+line cap, and an entry in the register behind every digest line. The delivery cap is a **ratchet**: when it fires, cut
 and re-ratchet at the new measurement, never raise it to fit the edit in hand. The byte budget is
 deliberately **not** one — it carries headroom on purpose, because a budget pinned at the measurement
 makes the next spec to settle a decision pay for it by pruning another area's fences. The script says
