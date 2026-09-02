@@ -33,10 +33,11 @@ implementation against the design in `architecture.md`.
   `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
   SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
   optional `aws` extra — renamed from `sqs` in SPEC-010). Plus three leaf helpers no module map
-  anticipated, none of which imports anything from the package: `sanitize` (SPEC-017),
+  anticipated, none of which imports anything from the package at runtime: `sanitize` (SPEC-017),
   `_diag` (SPEC-025, owned by SPEC-029) and `results` (SPEC-034 FR-007 — `FlushResult` /
-  `ContinueResult`). The full module map is now built; the setup-phase
-  `core.py` + `modules/v1/` have been removed.
+  `ContinueResult`). Plus two the map did not anticipate that are **not** leaves by that same
+  test, importing from the package at runtime: `_lifecycle` (SPEC-033) and `_fork` (SPEC-039). The full module map
+  is now built; the setup-phase `core.py` + `modules/v1/` have been removed.
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -77,7 +78,7 @@ deliberate constraint — new runtime deps belong behind an optional extra (as `
 ```bash
 poetry self add "poetry-dynamic-versioning[plugin]"   # one-time: resolve the tag-derived version locally
 poetry install --with dev          # set up
-poetry run pytest                  # test (parallel by default: -n 12, ~35 s not ~133 s)
+poetry run pytest                  # test (parallel by default: -n 12 — serial is several times slower)
 poetry run pytest -n 0             # ...serially — REQUIRED for --pdb and -s (xdist discards -s output silently)
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
@@ -110,7 +111,7 @@ Index + status: `@docs/specs/INDEX.md`; what each spec shipped: `@docs/spec-deli
 carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@docs/implementation-guide.md`.
 **This section carries only what is live and recorded nowhere else** — when a spec closes, prune here
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
-loads every session; 308 lines of it lived here until 2026-09-02.
+loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
 **Current work:** none in flight — every spec in the index is Completed.
 
@@ -229,9 +230,9 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 lines, the detail belongs in a `docs/` file behind a pointer. Same for `INDEX.md` (status rows only)
 and the component inventory. **Key Decisions is grouped by AREA and carries fences, not history** —
 it is not a per-spec changelog, and `## Specs` is not one either. Both were exactly that until
-2026-09-02, when this file was cut from 89,340 bytes to a digest over `@docs/decisions.md`; the rule
-had been stated here and in `@docs/process.md` §5 the whole time and lost anyway, roughly forty
-times running. **`scripts/docs-lint.sh` now enforces it — run it locally before every push; it is deliberately not a CI job** — the byte budget, the digest
+`561a9f6` cut this file to a digest over `@docs/decisions.md` (measure it across that commit
+rather than trusting a number here). The rule had been stated here and in `@docs/process.md` §5
+the whole time and was lost anyway, roughly forty times running. **`scripts/docs-lint.sh` now enforces it — run it locally before every push; it is deliberately not a CI job** — the byte budget, the digest
 line cap, and an entry in the register behind every digest line. A threshold can be invalidated by its own **success** — after a structural cut, re-derive it rather than re-checking it, since a cap that can no longer fire is still advertised as a fence, and one pinned at the measurement leaves the next decision nothing to spend. The delivery cap is a **ratchet**: when it fires, cut
 and re-ratchet at the new measurement, never raise it to fit the edit in hand. The byte budget is
 deliberately **not** one — it carries headroom on purpose, because a budget pinned at the measurement
