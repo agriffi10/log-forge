@@ -298,11 +298,40 @@ So the loop rotates the frame instead of adding rounds:
   for unused module-level helpers classified pytest's `Test*` classes as dead and would have deleted
   every test inside them — caught only because it printed first. A regex over source is the same
   hazard one level down; parse instead where a parser exists.
+- **A verification method has a frame, exactly as a review does.** Three sweeps that all ask "is the
+  old content still present" are one check run three times, however exhaustive each is — they cover the
+  mechanical half of a change and say nothing about the half that was authored. Before trusting a
+  verification, ask what question it asks, and whether anything asks a different one. Proving that moved content survived says
+  nothing about content that was newly written, and the newly-written half is where the errors are.
+  Its stopping rule is the sweep's: stop when a fresh question would not change what you conclude.
+- **Never carry an evidence sentence from another repo's commit message or script header — re-measure
+  it where you are putting it.** This is the mechanism behind every false claim a review has caught in
+  these docs, and it does not feel like guessing: the sentence was written by someone who had the repo
+  open, it reads as measured, and it is repeated verbatim. A claim about another codebase is unverifiable in this one, and a
+  reader who checks it finds nothing. The sentences that survive checking come from the same
+  place as the ones that do not, which is exactly why the habit persists.
+  **Anchor both ends of any measurement to a commit** a reader can re-derive it from: anchoring only
+  the end is what let "eight weeks" through, because "from" was then whichever commit the writer had
+  in mind. If you cannot cite both ends, state the principle and drop the number.
 - **A finding should carry a reproducing mutation, and the fix is verified by re-planting it.**
   Then fix-verification is mechanical and needs no second reviewer — which is what stops a review
   round spawning a review of its fixes. A frame only finds what its mutations probe, so a fix that
   satisfies a weak mutation can still be wrong: the same reduction had a CI-watch guard restored
   against one frame's probe and broken under the next frame's.
+- **A gate is not tested by running it on the thing it guards.** Running a linter over the repo's own
+  files proves the files pass; it proves nothing about whether any check still fires, and a gate whose
+  checks have gone quiet is indistinguishable from a healthy repo. Every gate owes a **fixture corpus**:
+  one case per construct, asserting the specific **failure text** rather than the exit code, because a
+  check that fails for the wrong reason gets "fixed" by changing the wrong thing. Include cases that
+  assert **silence** — a corpus of only-failures cannot see a false positive, and false positives are
+  a large share of what a gate gets wrong. Prove the corpus bites by defeating each check in turn and watching it redden.
+  Measured here, not carried: `scripts/docs-lint.sh` has a 44-case corpus and `scripts/spec-lint.sh`
+  has none. Two of its five branches can fail a build and three only warn, and nothing proves any of
+  the five still fires. It is paths-filtered in CI (`docs/specs/**` and its own script), so it did not
+  even run on the pull request that added this rule. One gate here is proved and its sibling is not.
+- **One fixture per guard is not enough when the guard has more than one exit.** A check with two
+  terminating conditions is satisfied by a fixture exercising either, so the mutant that breaks the
+  other survives with the suite green. Count the ways a check can stop, and write that many cases.
 - **Reasoning finds wording; execution finds defects.** Every finding that mattered in the
   2026-08-07 audit was *run*: 5,980 events in one emit, 19 of 60 forked children hung, 0 of 9
   events delivered. Require a reproduction, not an argument.
@@ -544,7 +573,15 @@ this way).
   linter against the repo's own documents proves the documents pass and nothing about whether any
   check works, which is how four rounds of regressions reached main. A change to the linter runs
   the corpus.
-  **The delivery cap is a ratchet at the
+  **A threshold can be invalidated by its own success, not only by being wrong.** A cap
+  catches things until a cut shrinks everything below it, after which it sits far above anything it
+  governs and can never fire — still advertised as a fence, and now not one. After any structural
+  change to what a threshold measures, **re-derive it rather than re-checking it**. Measured here: `DIGEST_MAX_BYTES` was 1400 and caught nine of the
+  48 pre-cut units; the cut took the longest unit to 550 bytes, leaving the cap at 2.5x the worst
+  thing it governed until it was re-derived to 800. The opposite error is as tempting —
+  `CLAUDE_MAX_BYTES` set at the post-cut measurement left 2,467 bytes, three digest lines, so the
+  next decision to settle would have paid for itself out of another area's fences. It carries headroom deliberately, and `scripts/docs-lint.sh` says why beside the
+  number. **The delivery cap is a ratchet at the
   measured level** — when one fires, move detail down a tier and re-ratchet, rather
   than raising the cap. The `CLAUDE.md` byte budget is deliberately NOT pinned at the measurement: it
   carries headroom, because a budget with none forces the next closing spec to prune another area's
@@ -570,6 +607,12 @@ this way).
   delivery doc or a superseded marker, so those headings keep theirs.
 - **Standing rules never cite volatile numbers** (line counts, row counts, section ranges) — state the
   principle. The numbers rot, and a rule resting on false evidence teaches readers to distrust it.
+  **Dating the measurement does not save it**, which is the tempting half-fix: a dated number still
+  reads as current to anyone not checking the date against the calendar. Measured here: the `architecture.md` §12 entry added by
+  `dcb07c3` justifies leaving two modules unsplit by citing their line counts, and carries the date
+  it measured them. One of the two files no longer matches, and the date is what made that invisible
+  — a reader meets "Measured 2026-09-01" and reads it as current rather than as history to check. Either delete the number and state the principle,
+  or anchor both ends of the evidence to a commit a reader can re-measure from.
 - **A rule practice consistently violates gets reconciled or deleted.** A dead rule trains agents to
   ignore the live ones.
 - **Routers and indexes carry only what self-describes.** Hand-maintained metadata (symbol counts,
