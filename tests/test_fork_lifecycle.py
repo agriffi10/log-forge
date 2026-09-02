@@ -2999,15 +2999,17 @@ def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
         _lifecycle._state._worker = worker  # only the *registered* worker is rebuilt
         worker._closing = threading.Event()
         worker._closing.set()
-        _lifecycle._orphan_closing = threading.Event()
+        _lifecycle._orphan_closing = 1
+        _lifecycle._orphan_idle.clear()
 
         def in_child() -> str:
-            """Reports both slots as the child sees them, after the handlers have run."""
-            return f"{worker._closing is None},{_lifecycle._orphan_closing is None}"
+            """Reports both records as the child sees them, after the handlers have run."""
+            return f"{worker._closing is None},{not _lifecycle._orphan_closing}"
 
         child = run_in_child(in_child)
     finally:
-        _lifecycle._orphan_closing = None
+        _lifecycle._orphan_closing = 0
+        _lifecycle._orphan_idle.set()
         _lifecycle._state._worker = None
         worker.shutdown(timeout=2.0)
 

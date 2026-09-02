@@ -28,6 +28,14 @@ invariant stated where it stood. The spec said the orphan re-arm route was guard
 asserted because no reachable sequence was found; building it showed it *is* reachable
 (`A.closes == 2`), so the discharge is atomic with taking the record and the route is tested.
 
+**Corrected by the second diff review, which built rather than read.** The orphan path's
+in-flight-close record was a single slot holding one `Event`; a second orphan close overwrote it
+and its own completion then cleared it, so a later bystander waited for nothing and the process
+exited through the first close — the very defect FR-002 exists to remove, one level down. It is
+now a count plus an idle gate, which is the correction SPEC-045 made to the owed-close record for
+the same reason. Measured: the bystander waited 0.000 s and lost five events, and now waits
+0.955 s and loses none.
+
 **Rejected, with the reasoning in `decisions.md`:** `health().retired` reading `True` for a worker
 built after an orphan-only `shutdown()`. The field documents an action the caller took, the
 alert idiom is the *pair*, and the fresh worker's events are not lost silently.
@@ -57,4 +65,8 @@ captured under the same lock). Five were killed only after the test that named t
 to reach the guard — including two the first diff review found by mutating what the author had
 not: the orphan path's arming condition, which only a *third* successive `shutdown()` can see,
 and its wait, which took a flat cap and made the two paths disagree by two seconds on
-`shutdown(timeout=0)`.
+`shutdown(timeout=0)`. The second diff review ran a 200-run concurrency fuzz per side: under the
+documented single-threaded `configure()` contract, sinks that took events and were never closed
+fall from 124/200 to 0/200, with the double-close rate unchanged; at a real interpreter exit, a
+daemon-thread `shutdown()` goes from losing twelve events silently in 0.203 s to delivering all
+twelve in 1.506 s. Every bound held at 0.000 s CPU.

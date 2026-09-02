@@ -2556,15 +2556,22 @@ def test_the_closing_slot_is_emptied_for_a_forked_child() -> None:
     would answer the child's *own* later close instantly — its background `shutdown()` claims a
     close, `atexit` reads "already finished" and returns, and the child exits through it. Both
     branches are asserted because a resumed child and a retired one inherit the same slot.
+
+    The owed-swap record goes with it: a child stranded nothing, and keeping the parent's sinks
+    costs a strong reference each and a refused release at every child exit.
     """
     for resume in (True, False):
         worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
         worker._closing = threading.Event()
         worker._closing.set()  # as an inherited, already-answered close would arrive
+        worker._unclosed_swaps = [RecordingSink()]  # and a sink the child never stranded
 
         worker._reinit_after_fork(resume=resume)
 
         assert worker._closing is None, f"the slot survived the fork with resume={resume}"
+        assert worker._unclosed_swaps == [], (
+            f"the child inherited the parent's stranded sinks with resume={resume}"
+        )
         worker.shutdown(timeout=2.0)
 
 

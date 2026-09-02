@@ -374,6 +374,12 @@ class Worker:
         that field as "the drain thread died", and this child's drain thread is about to be
         running — the alternative reads as the more honest one and is not.
 
+        ``_unclosed_swaps`` is emptied alongside it. A child stranded nothing, and
+        ``releasable()`` refuses the parent's sinks on the pid stamp anyway — so keeping them buys
+        no close and costs a strong reference to every superseded sink, plus a pointless refused
+        release at every child exit. Emptying is what "a child inherits no promise" means for the
+        record as well as for the close.
+
         ``_closing`` is emptied unconditionally, on both branches (SPEC-050 FR-002). It names a
         close running on a thread that did not survive the fork, so the child inherits a promise
         nothing can keep: ``_fork._fresh_primitive`` carries an ``Event``'s set state across, so
@@ -436,6 +442,7 @@ class Worker:
         self.incomplete_swaps = 0
         self.stopped_reason = None
         self._closing = None
+        self._unclosed_swaps = []
         if not resume:
             self._drain_finished.set()
             self._drain_settled.set()
@@ -497,8 +504,14 @@ class Worker:
         liveness check in ``submit`` does not reach it: that was about probing the thread, this
         is a boolean already in the object's dict.
 
-        **The flag is read again after the put, and that second read is what makes the count
-        true** (SPEC-050 FR-005). A caller preempted between the first read and the ``put_nowait``
+        **The flag is read again after the put** (SPEC-050 FR-005), which stops the count missing
+        a submission — not, despite the temptation to say so, which makes it *exact*.
+        ``Health.submitted_after_shutdown`` documents the count as deliberately generous, starting
+        when ``shutdown()`` begins rather than when the drain ends, so a submission the final drain
+        in fact carried is counted anyway; this read widens that population in the direction that
+        field calls correct, and the stderr line's "nothing will drain these" is over-strong for
+        exactly the same reason and for exactly as long as it has been. A caller preempted between
+        the first read and the ``put_nowait``
         queues its item after the final drain has already run, where nothing will read it — and
         the counter built for exactly that case stayed at zero, so the documented
         ``retired`` + ``submitted_after_shutdown`` pair could not fire. It **closes** the window
@@ -506,7 +519,8 @@ class Worker:
         :meth:`shutdown`, strictly before the sentinel and before ``_stop`` is set, therefore
         strictly before :meth:`_final_drain`. Any submission that can be stranded has the flag
         already latched by the time this read runs, and a read that still sees ``False`` proves
-        the item was queued before the shutdown began. This is :meth:`flush`'s post-put
+        the shutdown had not begun when the item was queued — which is not the same as proving the
+        drain missed it, and is the whole of the over-report above. This is :meth:`flush`'s post-put
         ``_drain_finished`` check, in the same place for the same race. A submission the queue
         **dropped** returns before it: an item that never joined the queue cannot be stranded in
         it, and counting it in both fields would double-report one loss.

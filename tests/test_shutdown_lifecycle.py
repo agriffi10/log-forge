@@ -624,6 +624,61 @@ def test_an_orphan_only_shutdown_with_no_close_in_flight_does_not_wait() -> None
     )
 
 
+def test_a_completed_orphan_close_does_not_defeat_a_later_bystanders_wait() -> None:
+    """FR-002. The orphan record is a count and a gate, because it is not once-only.
+
+    A single slot held one close's event, so a second orphan close overwrote it and its own
+    completion then cleared it — a bystander arriving afterwards read nothing, waited for nothing,
+    and the process exited through the *first* close, still running. Measured on that shape: the
+    bystander waited 1.005 s with one close and 0.000 s with a second completing in between,
+    losing the first sink's whole buffer.
+
+    The second close is driven to **completion** here rather than left running, which is the whole
+    point: a test where both closes overlap passes against the slot as well.
+    """
+    class _Slow:
+        def __init__(self, seconds: float) -> None:
+            self.seconds = seconds
+            self.held = 0
+            self.wire = 0
+            self.closed = 0
+            self.in_close = threading.Event()
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Buffers; the close is the delivery."""
+            self.held += len(batch)
+
+        def close(self) -> None:
+            """Delivers after a measurable delay."""
+            self.in_close.set()
+            time.sleep(self.seconds)
+            self.wire, self.held = self.wire + self.held, 0
+            self.closed += 1
+
+    first, second = _Slow(1.0), _Slow(0.05)
+    log_foundry.configure(service="test", sink=first)
+    for _ in range(5):
+        log_foundry.info("x")
+
+    closer = threading.Thread(target=_lifecycle._close_orphan_sink, daemon=True)
+    closer.start()
+    assert first.in_close.wait(5.0), "the premise: the first close is running"
+
+    log_foundry.configure(service="test", sink=second)
+    log_foundry.info("y")
+    _lifecycle._close_orphan_sink()
+    assert second.closed == 1, "the premise: a second orphan close ran to completion in between"
+
+    start = time.monotonic()
+    _lifecycle._close_orphan_sink()  # a bystander: nothing owed
+    waited = time.monotonic() - start
+
+    assert waited > 0.3, f"the bystander returned in {waited:.3f}s with a close still running"
+    assert first.wire == 5 and first.closed == 1, f"the first sink lost its buffer: {first.wire}"
+    closer.join(5)
+
+
 def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() -> None:
     """FR-002 AC-5, on the orphan path — the half a flat cap got wrong.
 

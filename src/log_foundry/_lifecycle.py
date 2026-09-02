@@ -368,24 +368,40 @@ nested with either of the other two, so there is no cycle. It is held only acros
 membership test or a single mutation, never across a ``close()``.
 """
 
-_orphan_closing: threading.Event | None = None
-"""The in-flight orphan close's completion event, or ``None`` when none is running (SPEC-050 FR-002).
+_orphan_closing = 0
+"""How many orphan closes are running right now, written under ``_state._lock`` (SPEC-050 FR-002).
 
-Read and written under ``_state._lock``. It is the orphan path's half of the C3 residue
-:meth:`~log_foundry.worker.Worker._close_if_owed` fixes for the worker: :func:`_close_orphan_sink`
-empties ``_orphan_owed`` under that lock and *then* closes, so a second caller found nothing owed
-and returned instantly — and an ``atexit`` call that returns while a background thread is still
-inside a close-is-delivery sink's ``close()`` exits through it and kills it.
+The orphan path's half of the C3 residue :meth:`~log_foundry.worker.Worker._close_if_owed` fixes
+for the worker: :func:`_close_orphan_sink` empties ``_orphan_owed`` under that lock and *then*
+closes, so a second caller found nothing owed and returned instantly — and an ``atexit`` call that
+returns while a background thread is still inside a close-is-delivery sink's ``close()`` exits
+through it and kills it.
 
-A **slot** holding an event rather than a flag beside a permanent one, and here that is load-bearing
-rather than symmetry: the orphan close is not once-only. ``_orphan_owed`` is repopulated by
-:func:`_note_orphan_emit` and :func:`_adopt_declined_swap`, so a second close's window would be
-unwaitable behind an event still set from the first. A fresh event per close has no such state.
+**A count and a gate, not one close's event.** A single slot was tried and is wrong, because the
+orphan close is not once-only: ``_orphan_owed`` is repopulated by :func:`_note_orphan_emit` and
+:func:`_adopt_declined_swap`, so a second close overwrote the first's event and its own completion
+then cleared the slot — a bystander arriving after that read nothing, waited for nothing, and the
+interpreter exited through the *first* close, still running. Measured against a one-second close:
+the bystander waited 1.005 s alone and 0.000 s with a second close completing in between, losing
+the first sink's whole buffer. It is the correction SPEC-045 made to the owed-close *record*,
+arriving here for the same reason.
 
-Not in :data:`_FORK_SKIP` — an ``Event`` is exactly what ``_fork``'s repair walk exists to
-replace. What the walk cannot know is that the slot should be *empty* in a child, since the thread
-that would clear it did not survive the fork; :func:`_clear_closing_after_fork` empties it.
+The predicate a bystander needs is "no orphan close is in flight", so that is what is published:
+:data:`_orphan_idle` is cleared while the count is non-zero and set when it returns to zero. One
+``Event``, built once at module scope, which is also what keeps it where ``_fork``'s repair walk
+can replace it.
 """
+
+_orphan_idle = threading.Event()
+"""Set exactly when :data:`_orphan_closing` is zero — what a bystander waits on (SPEC-050 FR-002).
+
+Starts set: a process with no orphan close in flight must not make the first bystander wait.
+Not in :data:`_FORK_SKIP` — an ``Event`` is what ``_fork``'s repair walk exists to replace. What
+the walk cannot know is that a child is idle whatever the parent was doing, since the threads that
+would have finished those closes did not survive the fork; :func:`_clear_closing_after_fork` says
+so.
+"""
+_orphan_idle.set()
 
 
 def _closing(sink: Sink) -> bool:
@@ -421,11 +437,11 @@ def _clear_closing_after_fork() -> None:
     the placement is free rather than load-bearing: the registry holds ``int`` ids and no handler
     reads it.
 
-    :data:`_orphan_closing` is emptied here for the same reason and by the same argument
-    (SPEC-050 FR-002). It names a close running on a thread that did not survive the fork, so a
-    child inheriting a non-empty slot would make its next bystander wait out the whole closer
-    grace on an event nothing can set. The fork walk replaces the ``Event`` object but not the
-    fact that the slot is occupied, which is the distinction this handler exists for.
+    :data:`_orphan_closing` is zeroed here for the same reason and by the same argument
+    (SPEC-050 FR-002). It counts closes running on threads that did not survive the fork, so a
+    child inheriting a non-zero count would make its next bystander wait out the whole closer
+    grace for closes that can never finish. The fork walk replaces the ``Event`` but not the count
+    that keeps it clear, which is the distinction this handler exists for.
 
     Args:
       None.
@@ -440,7 +456,8 @@ def _clear_closing_after_fork() -> None:
     with _closing_now_lock:
         _closing_now.clear()
     with _state._lock:
-        _orphan_closing = None
+        _orphan_closing = 0
+        _orphan_idle.set()
 
 
 _FORK_SKIP = ("_owned",)
@@ -1639,16 +1656,14 @@ def _close_orphan_sink(deadline: float | None = None) -> None:
         owed: list[Sink] = [
             sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)
         ]
-        waiting = None if owed else _orphan_closing
         for sink in owed:
             del _state._orphan_owed[id(sink)]
             _state._orphan_closed_sink = sink
         if owed:
-            _orphan_closing = threading.Event()
-        finished = _orphan_closing
+            _orphan_closing += 1
+            _orphan_idle.clear()
     if not owed:
-        if waiting is not None:
-            waiting.wait(_bystander_grace(deadline))
+        _orphan_idle.wait(_bystander_grace(deadline))
         return
     inline = _inline_close_choice(owed)
     started: list[threading.Thread] = []
@@ -1675,9 +1690,9 @@ def _close_orphan_sink(deadline: float | None = None) -> None:
         for closer in started:
             closer.join()
         with _state._lock:
-            _orphan_closing = None
-        if finished is not None:
-            finished.set()
+            _orphan_closing -= 1
+            if not _orphan_closing:
+                _orphan_idle.set()
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes the process worker, or closes an orphan-only sink, backing ``shutdown()``.
 
