@@ -49,7 +49,9 @@ extra is absent.
 Every number claimed here was measured: 25.01 s for five stalled JetStream events, 300.18 s for
 librdkafka's default delivery callback, 120.17 s for the NATS constructor against a dead server,
 0.0001 s for `produce()`, 10.00 s for a stalled `close()`, 8.01 s against an 8.00 s prediction for
-the exit-drain arithmetic. Seventeen mutants were planted; all seventeen reddened.
+the exit-drain arithmetic. Nineteen mutants were planted; all nineteen reddened — the last being the execution
+frame's own, which renamed a forwarded kwarg in `nats.py` *and* its expectation in the
+test, and which a hand-listed version of that check survived.
 
 **Six reviewers rather than four** — one on the spec, one on the plan, then two on *each* PR's
 diff, because that gate is per branch and this shipped in two PRs. Said out loud since the grouping

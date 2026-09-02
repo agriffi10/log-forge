@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import sys
 import threading
 import time
 
 import pytest
 
+import log_foundry.sinks.nats as nats_sink_module
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
     DEFAULT_ACK_TIMEOUT,
@@ -552,9 +554,12 @@ def test_omitting_them_reproduces_todays_call_exactly(monkeypatch) -> None:
 
 def test_a_falsy_connect_bound_is_still_forwarded(monkeypatch) -> None:
     # The omission test is `value is not None`, not truthiness, and zero is the case that tells
-    # them apart. Both zeros are meaningful to the driver -- nats-py guards
-    # `max_reconnect_attempts` with `> 0` / `< 0`, and `reconnect_time_wait=0` means retry
-    # immediately -- so a truthiness test would silently drop a caller's "never reconnect".
+    # them apart. Both zeros reach the driver and change its behaviour, so dropping them is a
+    # silent loss of what the caller asked for: `reconnect_time_wait=0` means retry immediately
+    # (measured, dropping it made a failure 100x slower -- 2.03 s against 0.02 s), and
+    # `max_reconnect_attempts=0` makes the connect loop unbounded, which the constructor's
+    # docstring warns about. Forwarding zero faithfully is the point either way -- this test is
+    # about the boundary, not an endorsement of the value.
     module = _build(monkeypatch, max_reconnect_attempts=0, reconnect_time_wait=0)
     _, kwargs = module.calls[0]
     assert kwargs == {"max_reconnect_attempts": 0, "reconnect_time_wait": 0}
@@ -612,23 +617,48 @@ def test_a_refused_construction_creates_no_event_loop(monkeypatch) -> None:
     assert created == 0, "the refusal must come before the loop is built, or it leaks one"
 
 
+def _forwarded_connect_kwargs() -> set[str]:
+    """The kwarg names `NATSSink.__init__` actually forwards, read from its own source.
+
+    Derived, never hand-listed. A literal list here is a second roster that rots: renaming the key
+    in `nats.py` and the expectation in the forwarding test leaves a hand-written list still
+    naming the old, valid name, so the check passes while every real construction raises
+    `TypeError` -- measured, exactly that mutant was green across the whole file.
+    """
+    import ast
+
+    source = pathlib.Path(nats_sink_module.__file__).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict) and any(
+                    isinstance(k, ast.Constant) and k.value == "connect_timeout"
+                    for k in sub.keys
+                ):
+                    return {
+                        k.value for k in sub.keys if isinstance(k, ast.Constant)
+                    }
+    raise AssertionError("could not locate the forwarded-options dict in nats.py")
+
+
+def test_the_forwarded_kwarg_roster_is_derived_and_not_empty() -> None:
+    # The guard on the guard, kept to one assertion: a resolver that silently returned an empty
+    # set would make the driver check below vacuous in the quietest possible way.
+    assert len(_forwarded_connect_kwargs()) == 4
+
+
 def test_every_connect_kwarg_we_forward_is_one_the_driver_accepts() -> None:
     # FR-002's forwarding is asserted elsewhere against a FAKE module whose
     # `connect(*args, **kwargs)` swallows anything, so a wrong keyword name passes the whole
-    # suite and raises TypeError in production the first time a real sink is built. That is the
-    # SPEC-043 shape -- four SentrySink tests were green only because CI never installed the
-    # extra -- so the names are checked against the real driver here, under the same gate.
+    # suite and raises TypeError at the first real construction. That is the SPEC-043 shape --
+    # four SentrySink tests were green only because CI never installed the extra.
     if not _EXTRAS_EXPECTED:
         pytest.importorskip("nats", reason="the `nats` extra is not installed")
     import inspect
 
     from nats.aio.client import Client
 
-    accepted = inspect.signature(Client.connect).parameters
-    for name in (
-        "connect_timeout",
-        "max_reconnect_attempts",
-        "reconnect_time_wait",
-        "drain_timeout",
-    ):
-        assert name in accepted, f"NATSSink forwards {name!r}, which the driver does not accept"
+    accepted = set(inspect.signature(Client.connect).parameters)
+    unknown = _forwarded_connect_kwargs() - accepted
+    assert not unknown, f"NATSSink forwards {unknown}, which nats.connect does not accept"

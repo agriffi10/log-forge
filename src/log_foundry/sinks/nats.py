@@ -128,7 +128,14 @@ class NATSSink:
           max_reconnect_attempts: Attempts the driver makes before giving up, or ``None`` to
             pass nothing. This is what governs the *initial* connect too, which is why the
             constructor blocked for a measured 120.17 s against a dead server at the driver's
-            defaults (60 attempts x 2 s) before this argument existed.
+            defaults (60 attempts x 2 s) before this argument existed. **``0`` and negative
+            values do not mean "give up immediately" — they block forever.** ``nats-py`` retires
+            a server from its pool only under ``if max_reconnect_attempts > 0``, so a
+            non-positive value never retires one and the connect loop does not terminate;
+            measured, both ``0`` and ``-1`` were still blocking at 30 s and one probe of ``0``
+            ran past 400 s. The smallest value that bounds anything is ``1`` (measured 2.02 s
+            against a dead server). Passed through rather than corrected here, because
+            overriding a driver's documented behaviour would surprise a caller who knows it.
           reconnect_time_wait: Seconds between reconnect attempts, or ``None`` to pass nothing.
           drain_timeout: Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
             forwarded because it does bound the driver's subscription drain, but it is **not**

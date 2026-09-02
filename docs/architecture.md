@@ -837,6 +837,15 @@ close it.
   A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
   (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
   deduplicates, which makes a retry safe and is its own spec.
+- **`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded** (SPEC-047 FR-002).
+  `nats-py` retires a server from its pool only under `if max_reconnect_attempts > 0`, so a
+  non-positive value never retires one and the constructor never returns — measured, both `0` and
+  `-1` still blocking at 30 s, one probe past 400 s, where `1` raises in 2.02 s. It is the value a
+  reader is most likely to reach for from "attempts before giving up", and it makes the block this
+  FR exists to bound *permanent*. Documented rather than corrected, because overriding a driver's
+  documented behaviour surprises a caller who knows it. **Closed by** refusing a non-positive
+  `max_reconnect_attempts` with a `ValueError`, which is a small breaking change for anyone
+  currently passing one.
 - **`NATSSink(client=X, servers=…)` ignores `servers` silently** (SPEC-047, Out of Scope). The same
   shape FR-002 makes a `ValueError` for the four connect timeouts, in the same constructor, left
   alone because changing it would break a caller passing both today. **Closed by** a major version
