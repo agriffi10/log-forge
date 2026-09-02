@@ -79,7 +79,10 @@ reject this.
   `worker.py:136`, `_lifecycle.py:1496`) that the audit's split gave to neither session. They are
   design rationale rather than standing rules — the global rule against volatile numbers governs
   rules, and stripping the evidence from a docstring would remove the reasoning that rule wants
-  kept. Recorded here rather than deleted, per SPEC-021.
+  kept. **The spec ID is the anchor, one hop short of a commit:** that rule's alternative to
+  deleting a number is to anchor both ends to a commit a reader can re-measure from, and a spec ID
+  reaches one through its delivery doc, which names the release that carried it. So these are
+  anchored, not unanchored. Recorded here rather than deleted, per SPEC-021.
 
 ---
 
