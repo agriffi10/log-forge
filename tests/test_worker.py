@@ -56,14 +56,28 @@ class RecordingSink:
             return [e for b in self.batches for e in b]
 
 
-class SleepySink(RecordingSink):
-    def __init__(self, delay: float) -> None:
-        super().__init__()
-        self.delay = delay
+class _BoundedEvent(threading.Event):
+    """An `Event` whose `wait()` is bounded even when the caller passes no timeout.
 
-    def emit(self, batch: list[dict]) -> None:
-        time.sleep(self.delay)
-        super().emit(batch)
+    `BlockingSink.emit` waits without one, which is right for tests that always release it. A
+    test asserting `submit` did **not** wait needs the failure to be a failed assertion rather
+    than a hung suite, so it substitutes this: unreleased, the emit ends after 30 s and the
+    assertion reports how long `submit` took.
+    """
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Waits, substituting a 30 s bound for an unbounded caller.
+
+        Args:
+          timeout: Seconds to wait, or `None` for the substituted bound.
+
+        Returns:
+          Whether the event was set.
+
+        Raises:
+          None.
+        """
+        return super().wait(30.0 if timeout is None else timeout)
 
 
 class BlockingSink(RecordingSink):
@@ -107,13 +121,26 @@ class AlwaysFailSink(RecordingSink):
 
 
 def test_submit_returns_before_emit_completes() -> None:
-    sink = SleepySink(delay=0.3)
+    """FR-001. `submit` hands off; it does not wait on the sink.
+
+    The budget is deliberately generous and the **gap** is what carries the claim. This asserted
+    `< 0.1` against a 0.3 s sleep, a gap of 3x — tight enough that the scheduler, not the
+    library, decides the outcome under load, and a test proving an operation is *not* bounded
+    fails on its own setup long before it fails on its subject. Against a sink that blocks until
+    released the gap is the whole 30 s wait, so a synchronous `submit` misses by two orders of
+    magnitude, and the test still finishes in milliseconds because the release comes right after
+    the assertion. Bounded rather than unbounded so a regression **fails** rather than hanging.
+    """
+    sink = BlockingSink()
+    sink.release = _BoundedEvent()
     w = Worker(sink, batch_size=1, flush_interval=0.01)
 
     start = time.monotonic()
     w.submit(_span("x"))
     elapsed = time.monotonic() - start
-    assert elapsed < 0.1, "submit must not block on the sink's emit"
+
+    sink.release.set()
+    assert elapsed < 1.0, f"submit blocked for {elapsed:.2f}s on a sink that waits 30s"
 
     w.shutdown()
     assert any(e["message"] == "x" for e in sink.events)
@@ -2284,3 +2311,592 @@ def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
     assert [bool(r) for r in result] == [False], (
         "answered is not delivered — the batch it carried was abandoned"
     )
+
+
+# -- SPEC-050 FR-001: an expired shutdown releases the waiters it stranded ---------------
+
+
+def test_a_parked_unbounded_flush_is_released_when_shutdown_expires(capsys) -> None:
+    """FR-001 AC-1, AC-2. `flush(timeout=None)` behind a stuck sink is answered, not stranded.
+
+    The reproduction the spec was written from: the expiry branch returned before
+    `_release_waiters`, so a caller the API documents as supported waited forever on a drain this
+    very call had just given up on. Measured before the fix, `flusher still waiting after
+    shutdown gave up: True`.
+
+    The verdict is asserted, not merely the wakeup: `abandoned` and not `timed-out` is what says
+    the marker was *answered* pessimistically rather than left to run out a clock, and the two
+    are indistinguishable from the fact that the thread finished.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set()), "the premise: the drain is inside emit"
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert _wait_until(lambda: any(isinstance(i, worker_mod._FlushMarker)
+                                   for i in list(worker._queue.queue))), "marker never queued"
+
+    worker.shutdown(timeout=0.3)
+    flusher.join(timeout=2.0)
+    still_waiting = flusher.is_alive()
+    # Released unconditionally: a regression strands this thread on an unbounded wait, and a
+    # failing assertion that also hangs the runner reports nothing useful.
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    flusher.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_waiting, "an unbounded flush must not outlive the shutdown that gave up"
+    assert verdict and verdict[0].ok is False
+    assert verdict[0].reason == "abandoned", (
+        "answered pessimistically by the sweep, not left to time out"
+    )
+
+
+def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:
+    """FR-001 AC-4. The sweep costs a verdict, never a delivery.
+
+    `_release_waiters` reads markers without consuming them, so one it answers is still in the
+    queue for `_final_drain` to answer again when the emit returns. That second answer reaches
+    nobody — the waiter woke on the first — and the events must reach the sink exactly once,
+    which is the half of the trade FR-001 claims is unaffected.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set())
+    marker = worker_mod._FlushMarker(seen_failures=0)
+    worker._queue.put_nowait(marker)
+
+    worker.shutdown(timeout=0.3)
+    assert marker.event.is_set(), "the premise: the sweep answered it"
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+    assert sink.events == [{"message": "a"}], "one delivery, whatever the verdict said"
+
+
+def test_a_clean_shutdown_still_answers_each_marker_with_the_real_outcome(capsys) -> None:
+    """FR-001 AC-3, and the guard that the new call did not displace the old one.
+
+    A `shutdown()` whose join succeeds is the untouched path: the marker is answered by the
+    drain that carried it, so it reports delivered rather than the sweep's pessimism.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    result = worker.flush(timeout=2.0)
+    worker.shutdown(timeout=2.0)
+    capsys.readouterr()
+
+    assert bool(result) is True, "a confirmed drain still reports delivery"
+    assert worker.health().stopped_reason is None, "and no ShutdownTimeout on a clean join"
+
+
+def test_the_expiry_branch_still_reports_shutdown_timeout(capsys) -> None:
+    """FR-001 AC-3. The record and the line are unchanged by the sweep that now follows them."""
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set())
+
+    worker.shutdown(timeout=0.2)
+    err = capsys.readouterr().err
+
+    assert worker.health().stopped_reason == "ShutdownTimeout"
+    assert err.count("shutdown timed out after") == 1, "exactly one line, as before"
+    assert "the sink is left open" in err
+
+    sink.release.set()
+    worker._thread.join(timeout=5)
+
+
+# -- SPEC-050 FR-002: a second shutdown waits for an in-flight inline close --------------
+
+
+class _CloseIsDeliverySink(RecordingSink):
+    """Buffers on emit and delivers on close, so a killed close is measurable as lost events."""
+
+    def __init__(self, close_seconds: float = 0.0) -> None:
+        super().__init__()
+        self.wire: list[dict] = []
+        self.in_close = threading.Event()
+        self.may_finish = threading.Event()
+        self._close_seconds = close_seconds
+
+    def close(self) -> None:
+        """Puts the buffer on the wire, slowly enough that a caller returning through it shows."""
+        self.in_close.set()
+        if self._close_seconds:
+            time.sleep(self._close_seconds)
+        else:
+            self.may_finish.wait(30)
+        self.wire.extend(self.events)
+        self.closed += 1
+
+
+def test_a_second_shutdown_waits_for_an_inline_close_it_did_not_claim(capsys) -> None:
+    """FR-002 AC-1. The reproduction: `atexit` returned through a close that was still running.
+
+    Measured before the fix with this sink shape — `closes started=1 finished=0 wire=0
+    buffered=12` at 0.31 s — because `_close_if_owed` found the close already claimed and
+    returned. The claim is about the *second* caller, so it is the second call that is timed.
+    """
+    sink = _CloseIsDeliverySink(close_seconds=0.6)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: bool(sink.events)), "the premise: the batch reached the sink"
+
+    first = threading.Thread(target=lambda: worker.shutdown(timeout=5.0))
+    first.start()
+    assert sink.in_close.wait(5.0), "the premise: the first caller is inside close()"
+
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+    assert sink.closed == 1, "the second caller waited; it did not close a second time"
+    assert sink.wire == [{"message": "a"}], "and the close it waited for delivered"
+    first.join(timeout=5)
+
+
+def test_the_waiting_caller_does_not_close_a_second_time(capsys) -> None:
+    """FR-002 AC-7. Waiting is not closing.
+
+    Distinct from the assertion above because that one is satisfied by a close count of 1 for a
+    caller that skipped the wait entirely; this pins the pair — it waited *and* closed nothing.
+    """
+    sink = _CloseIsDeliverySink(close_seconds=0.4)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    first = threading.Thread(target=lambda: worker.shutdown(timeout=5.0))
+    first.start()
+    assert sink.in_close.wait(5.0)
+
+    start = time.monotonic()
+    worker.shutdown(timeout=5.0)
+    elapsed = time.monotonic() - start
+    capsys.readouterr()
+
+    assert sink.closed == 1
+    assert elapsed >= 0.1, f"the second caller returned in {elapsed:.3f}s without waiting"
+    first.join(timeout=5)
+
+
+def test_a_stuck_close_costs_the_second_caller_only_the_closer_grace(capsys) -> None:
+    """FR-002 AC-4. The wait is capped, so a stuck close cannot hold the exit for the budget.
+
+    The gap is what makes this a bound rather than a coincidence: the close never returns at all,
+    and the budget offered is 30 s, so a caller that returns inside a few seconds can only have
+    been capped. `DEFAULT_CLOSER_GRACE` is read rather than written, so re-deriving that constant
+    does not silently make this assertion vacuous.
+    """
+    sink = _CloseIsDeliverySink()  # never finishes: may_finish is never set
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    first = threading.Thread(target=lambda: worker.shutdown(timeout=None), daemon=True)
+    first.start()
+    assert sink.in_close.wait(5.0)
+
+    start = time.monotonic()
+    worker.shutdown(timeout=30.0)
+    elapsed = time.monotonic() - start
+    capsys.readouterr()
+
+    grace = _lifecycle.DEFAULT_CLOSER_GRACE
+    assert elapsed < grace + 2.0, f"waited {elapsed:.2f}s against a {grace}s cap on a 30s budget"
+    sink.may_finish.set()
+
+
+def test_a_zero_timeout_second_shutdown_does_not_inherit_the_other_deadline(capsys) -> None:
+    """FR-002 AC-5. The new arithmetic is exactly what could get this wrong.
+
+    `_closer_grace` carves from the caller's own deadline, so a zero budget must yield a zero
+    wait rather than the cap — the failure mode being a `min()` that dropped the caller's term.
+    """
+    sink = _CloseIsDeliverySink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    first = threading.Thread(target=lambda: worker.shutdown(timeout=None), daemon=True)
+    first.start()
+    assert sink.in_close.wait(5.0)
+
+    start = time.monotonic()
+    worker.shutdown(timeout=0)
+    elapsed = time.monotonic() - start
+    capsys.readouterr()
+
+    assert elapsed < 0.5, f"shutdown(timeout=0) waited {elapsed:.2f}s on another caller's close"
+    sink.may_finish.set()
+
+
+def test_a_second_shutdown_with_no_close_in_flight_returns_at_once(capsys) -> None:
+    """FR-002 AC-6. The ordinary case pays nothing for the new wait."""
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    worker.shutdown(timeout=5.0)
+
+    start = time.monotonic()
+    worker.shutdown(timeout=5.0)
+    elapsed = time.monotonic() - start
+    capsys.readouterr()
+
+    assert sink.closed == 1
+    assert elapsed < 0.5, f"an idempotent shutdown with nothing running waited {elapsed:.2f}s"
+
+
+def test_the_closing_slot_is_emptied_for_a_forked_child() -> None:
+    """FR-002 AC-8. A child inherits no closer thread, so it must inherit no promise of one.
+
+    `_fork._fresh_primitive` carries an `Event`'s set state across a fork, so an inherited slot
+    would answer the child's *own* later close instantly — its background `shutdown()` claims a
+    close, `atexit` reads "already finished" and returns, and the child exits through it. Both
+    branches are asserted because a resumed child and a retired one inherit the same slot.
+    """
+    for resume in (True, False):
+        worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
+        worker._closing = threading.Event()
+        worker._closing.set()  # as an inherited, already-answered close would arrive
+
+        worker._reinit_after_fork(resume=resume)
+
+        assert worker._closing is None, f"the slot survived the fork with resume={resume}"
+        worker.shutdown(timeout=2.0)
+
+
+# -- SPEC-050 FR-004: a sink stranded by an unconfirmed swap is closed at shutdown -------
+
+
+class _ClientBufferingSink(RecordingSink):
+    """Holds events in a client buffer that only `close()` puts on the wire."""
+
+    def __init__(self, emit_seconds: float = 0.0) -> None:
+        super().__init__()
+        self.wire: list[dict] = []
+        self._emit_seconds = emit_seconds
+
+    def emit(self, batch: list[dict]) -> None:
+        """Buffers, slowly enough that a swap's drain cannot be confirmed within its budget."""
+        if self._emit_seconds:
+            time.sleep(self._emit_seconds)
+        super().emit(batch)
+
+    def close(self) -> None:
+        """Delivers the buffer; a sink never closed therefore reads as lost events."""
+        self.wire.extend(self.events)
+        self.closed += 1
+
+
+def _strand(worker: Worker, old: _ClientBufferingSink, new: object) -> None:
+    """Performs a swap whose drain cannot be confirmed, leaving `old` recorded and open."""
+    assert worker.swap_sink(new, timeout=0.05) is True  # type: ignore[arg-type]
+    assert worker.incomplete_swaps >= 1, "the premise: the drain was not confirmed"
+    assert any(s is old for s in worker._unclosed_swaps), "the premise: it was recorded"
+
+
+def test_a_sink_stranded_by_an_unconfirmed_swap_is_closed_at_shutdown(capsys) -> None:
+    """FR-004 AC-1. The reproduction: nine events died in a client buffer that was never closed.
+
+    Measured before the fix, `A.closes=0 A.buf(unflushed)=9 A.wire=0` after a clean `shutdown()`.
+    The wire is asserted rather than the close count alone, because for this sink shape the close
+    *is* the delivery and a close that happened but delivered nothing would pass a count check.
+    """
+    old = _ClientBufferingSink(emit_seconds=0.4)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    for i in range(3):
+        worker.submit(_span(i))
+    assert _wait_until(lambda: bool(old.events)), "the premise: events reached the old sink"
+    new = RecordingSink()
+    _strand(worker, old, new)
+
+    worker.shutdown(timeout=10.0)
+    capsys.readouterr()
+
+    assert old.closed == 1, "the stranded sink is closed exactly once"
+    assert old.wire == old.events, "and its buffer reached the wire"
+    assert worker._unclosed_swaps == [], "the record is discharged"
+
+
+def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) -> None:
+    """FR-004 AC-2. The drain thread may still be inside its emit, so an expired call declines.
+
+    And the deferral is the point: `_close_if_owed` is where the close lives precisely so the
+    `atexit` call that follows an expired one performs it, rather than the record dying with the
+    first attempt.
+    """
+    old = _ClientBufferingSink(emit_seconds=0.3)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    blocking = BlockingSink()
+    _strand(worker, old, blocking)
+    worker.submit(_span("b"))
+    assert _wait_until(lambda: blocking.in_emit.is_set()), "the premise: the drain is wedged"
+
+    worker.shutdown(timeout=0.3)
+    assert worker._thread.is_alive(), "the premise: the join expired"
+    assert old.closed == 0, "a live drain thread means no close is decided yet"
+    assert any(s is old for s in worker._unclosed_swaps), "and the record survives the attempt"
+
+    # The idempotent path is where `_close_if_owed` is actually reached with the thread still
+    # alive — the expiry branch returns before it — so this is what pins the liveness guard.
+    worker.shutdown(timeout=0.3)
+    assert worker._thread.is_alive(), "the premise: still wedged"
+    assert old.closed == 0, (
+        "the drain thread may still be inside the stranded sink's emit; it must not be closed"
+    )
+    assert any(s is old for s in worker._unclosed_swaps), "and the record still survives"
+
+    blocking.release.set()
+    worker._thread.join(timeout=5)
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+    assert old.closed == 1, "the next call finds the thread finished and closes it then"
+
+
+def test_a_stranded_sink_readopted_as_the_live_sink_is_closed_once(capsys) -> None:
+    """FR-004 AC-3, route one. The live-sink branch closes it, so the record must let go.
+
+    Without the prune both branches of `_close_if_owed` reach the same object, and
+    `_lifecycle.release` latches nothing about "already closed" — so the second close is silent.
+    """
+    old = _ClientBufferingSink(emit_seconds=0.3)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    _strand(worker, old, RecordingSink())
+
+    assert worker.swap_sink(old, timeout=5.0) is True, "re-adopt it as the live sink"
+    assert worker._unclosed_swaps == [], "re-adoption must drop it from the owed record"
+
+    worker.shutdown(timeout=10.0)
+    capsys.readouterr()
+
+    assert old.closed == 1, f"closed {old.closed} times"
+
+
+def test_a_stranded_sink_swapped_out_again_confirmed_is_closed_once(capsys) -> None:
+    """FR-004 AC-3, route two. `_close_swapped_out` takes it, so the record must let go.
+
+    The second swap's drain *is* confirmed, so the confirmed branch closes it — while the record
+    from the first, unconfirmed swap still named it.
+    """
+    old = _ClientBufferingSink(emit_seconds=0.3)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    _strand(worker, old, RecordingSink())
+    assert worker.swap_sink(old, timeout=5.0) is True
+    old._emit_seconds = 0.0
+
+    assert worker.swap_sink(RecordingSink(), timeout=5.0) is True, "confirmed this time"
+    worker.shutdown(timeout=10.0)
+    capsys.readouterr()
+
+    assert old.closed == 1, f"closed {old.closed} times"
+
+
+def test_two_unconfirmed_swaps_close_both_stranded_sinks_once(capsys) -> None:
+    """FR-004 AC-4. The record is a list, so a second stranding does not displace the first."""
+    first = _ClientBufferingSink(emit_seconds=0.3)
+    worker = Worker(first, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    second = _ClientBufferingSink(emit_seconds=0.3)
+    _strand(worker, first, second)
+    worker.submit(_span("b"))
+    third = RecordingSink()
+    _strand(worker, second, third)
+
+    worker.shutdown(timeout=10.0)
+    capsys.readouterr()
+
+    assert (first.closed, second.closed) == (1, 1), "both stranded sinks closed exactly once"
+    assert third.closed == 1, "and the live sink by its own branch"
+
+
+def test_a_confirmed_swap_records_nothing(capsys) -> None:
+    """FR-004 AC-6. The negative case: the record stays empty where the drain was confirmed.
+
+    Without this a change that recorded on *every* swap would pass every other test here — the
+    prune would hide it — while doubling the closes on the one path that already had a closer.
+    """
+    old = _ClientBufferingSink()
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    new = RecordingSink()
+
+    assert worker.swap_sink(new, timeout=5.0) is True
+    assert worker.incomplete_swaps == 0, "the premise: this drain was confirmed"
+    assert worker._unclosed_swaps == [], "a confirmed swap owes nothing"
+
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+    assert old.closed == 1, f"closed {old.closed} times"
+
+
+def test_a_stuck_stranded_close_does_not_extend_the_shutdown_budget(capsys) -> None:
+    """FR-004 AC-5. The stranded close is detached, so only `_join_closers` waits on it.
+
+    The stranded sink's `close()` never returns and the live sink's is instant, so a shutdown
+    that ran the stranded close inline would not return at all.
+    """
+    class _NeverCloses(_ClientBufferingSink):
+        def close(self) -> None:
+            """Never returns, so an inline close here would hang the shutdown outright."""
+            self.closed += 1
+            time.sleep(30)
+
+    old = _NeverCloses(emit_seconds=0.3)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    _strand(worker, old, RecordingSink())
+
+    start = time.monotonic()
+    worker.shutdown(timeout=5.0)
+    elapsed = time.monotonic() - start
+    capsys.readouterr()
+
+    grace = _lifecycle.DEFAULT_CLOSER_GRACE
+    assert elapsed < 5.0 + grace + 2.0, f"shutdown took {elapsed:.2f}s on a close that never ends"
+    assert old.closed == 1, "the close was started, just not waited on"
+
+
+def test_the_incomplete_swap_line_no_longer_says_the_sink_stays_open(capsys) -> None:
+    """FR-004 AC-8, AC-9. The announcement had to change with the behaviour it describes.
+
+    The old text said the sink "is left open" full stop, which FR-004 makes false: it is left
+    open only until a `shutdown()` that finds the drain thread ended. A line that outlives the
+    claim it was written for is the class this repo's docstring rule exists for.
+    """
+    old = _ClientBufferingSink(emit_seconds=0.3)
+    worker = Worker(old, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    _strand(worker, old, RecordingSink())
+    err = capsys.readouterr().err
+
+    assert err.count("could not be confirmed drained") == 1, "exactly one line per swap"
+    assert "shutdown() that finds the drain thread ended closes it" in err
+    assert worker.incomplete_swaps == 1
+
+    worker.shutdown(timeout=10.0)
+    capsys.readouterr()
+
+
+# -- SPEC-050 FR-005: a submission that lands after the final drain is counted -----------
+
+
+def test_a_submission_racing_the_final_drain_is_counted(capsys) -> None:
+    """FR-005 AC-1, AC-5. The unlocked read is fine; returning on it alone was not.
+
+    A caller preempted between reading `_shutdown_done` and its `put_nowait` queues its item
+    after the final drain, where nothing will read it — measured `queued=1
+    submitted_after_shutdown=0` with no line, so the documented `retired` + counter pair could
+    not fire. The preemption point is injected at the put rather than raced for, because a race
+    test that passes against the bug it exists to catch is worse than none.
+    """
+    sink = RecordingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    at_put, release = threading.Event(), threading.Event()
+    real_put = worker._queue.put_nowait
+
+    def parked_put(item: object) -> None:
+        """Parks exactly where `submit` sits after its unlocked flag read.
+
+        It un-patches itself first, so only the submitter is parked: `shutdown` puts its own
+        sentinel through this same object, and leaving the patch in place deadlocked the two.
+        """
+        worker._queue.put_nowait = real_put  # type: ignore[method-assign]
+        at_put.set()
+        release.wait(10)
+        real_put(item)
+
+    submitter = threading.Thread(target=lambda: worker.submit(_span("late")))
+    worker._queue.put_nowait = parked_put  # type: ignore[method-assign]
+    submitter.start()
+    assert at_put.wait(5.0), "the premise: the submitter is parked at its put"
+
+    worker.shutdown(timeout=5.0)
+    release.set()
+    submitter.join(timeout=5)
+    err = capsys.readouterr().err
+
+    health = worker.health()
+    assert health.submitted_after_shutdown == 1, "the item was queued where nothing will read it"
+    assert "logged after shutdown()" in err, "and announced, not only counted"
+    assert health.queued == 1, "still visible as queued, unchanged"
+
+
+def test_a_submission_after_a_latched_shutdown_is_counted_exactly_once(capsys) -> None:
+    """FR-005 AC-2. The post-put read must not double-count what the pre-put read caught.
+
+    The `not retired` conjunct is the whole guard, and dropping it leaves every post-shutdown
+    submission counted twice — a doubling no other assertion here would notice.
+    """
+    worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
+    worker.shutdown(timeout=5.0)
+
+    worker.submit(_span("a"))
+    worker.submit(_span("b"))
+    capsys.readouterr()
+
+    assert worker.health().submitted_after_shutdown == 2, "two submissions, two counts"
+
+
+def test_a_submission_before_shutdown_is_not_counted(capsys) -> None:
+    """FR-005 AC-3. The ordinary path is untouched by the second read."""
+    worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+    assert worker.health().submitted_after_shutdown == 0
+
+
+def test_a_submission_dropped_while_racing_shutdown_is_not_counted_as_stranded(capsys) -> None:
+    """FR-005 AC-6. An item the queue refused cannot be stranded in it.
+
+    The window is the same one AC-1 is about, with the put *failing*: a caller reads the flag as
+    clear, `shutdown()` latches it, and the put then raises `queue.Full`. Without the `return` in
+    that branch the post-put read runs on a submission that never joined the queue, reporting one
+    loss in two fields — `dropped` and `submitted_after_shutdown` — where a reader has no way to
+    tell it was one event.
+
+    The queue has to stay full across the shutdown for the put to fail at all, which is why the
+    drain thread is wedged and the shutdown is left to expire.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=60.0, max_queue=1)
+    worker.submit(_span("a"))
+    assert _wait_until(lambda: sink.in_emit.is_set()), "the premise: the drain is wedged"
+    worker.submit(_span("b"))  # fills the queue, and nothing will drain it
+
+    at_put, release = threading.Event(), threading.Event()
+    real_put = worker._queue.put_nowait
+
+    def parked_put(item: object) -> None:
+        """Parks where `submit` sits after its unlocked read, then un-patches itself."""
+        worker._queue.put_nowait = real_put  # type: ignore[method-assign]
+        at_put.set()
+        release.wait(10)
+        real_put(item)
+
+    submitter = threading.Thread(target=lambda: worker.submit(_span("c")))
+    worker._queue.put_nowait = parked_put  # type: ignore[method-assign]
+    submitter.start()
+    assert at_put.wait(5.0), "the premise: the submitter is parked with the flag still clear"
+
+    worker.shutdown(timeout=0.3)
+    assert worker._thread.is_alive(), "the premise: the join expired, so the queue is still full"
+    release.set()
+    submitter.join(timeout=5)
+    capsys.readouterr()
+
+    health = worker.health()
+    assert health.dropped == 1, f"the premise: the put was refused, dropped={health.dropped}"
+    assert health.submitted_after_shutdown == 0, (
+        "an item that never joined the queue cannot be stranded in it"
+    )
+    sink.release.set()
+    worker._thread.join(timeout=5)

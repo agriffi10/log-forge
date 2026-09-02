@@ -842,8 +842,6 @@ class Worker:
             self._record_incomplete_swap(timeout, old)
             return True
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
-        with self._lock:
-            self._discard_owed_swap(old)
         self._close_swapped_out(old, left)
         return True
 
@@ -896,13 +894,18 @@ class Worker:
         that sink is closed twice — and ``_lifecycle.release`` guards process ownership only and
         latches nothing about "already closed", so nothing downstream would catch it.
 
-        Three routes, which is the whole rule. A stranded sink **re-adopted** as this worker's
-        live sink is closed by :meth:`_close_if_owed`'s live-sink branch; one swapped out again on
-        a **confirmed** drain is closed by :meth:`_close_swapped_out`; and one the orphan record
-        hands over in ``_lifecycle._swap_sink`` is closed there, which matters because that
-        function's re-arm guard is a single slot a later swap overwrites. The third is defensive:
-        no reachable sequence that re-arms a swapped-out sink was found, and the spec says so
-        rather than asserting a test for a scenario nobody can construct.
+        Two routes, and the count is two rather than three because of an invariant worth stating:
+        **a sink in the record is never this worker's live sink.** It is recorded as ``old``,
+        after ``self.sink`` has already been reassigned, and it is pruned again the moment it is
+        re-adopted — so the confirmed-swap branch of :meth:`swap_sink` can never see a recorded
+        sink and a prune there would be unreachable. It was written, mutation-tested, found to
+        survive every mutant for exactly that reason, and removed.
+
+        So: a stranded sink **re-adopted** as this worker's live sink is closed by
+        :meth:`_close_if_owed`'s live-sink branch, which is the prune in :meth:`swap_sink`; and
+        one the orphan record hands over in ``_lifecycle._swap_sink`` is closed there, which
+        matters because that function's re-arm guard is a single slot a later swap overwrites,
+        the shape SPEC-044 FR-004 measured as ``A.closed == 2``.
 
         Callers hold :attr:`_lock`, ``_lifecycle._swap_sink`` included — it holds the process-wide
         lock and takes this one under it, the same nesting :meth:`swap_sink` already performs.
@@ -1201,12 +1204,14 @@ class Worker:
             ``_close_sink`` absorbs ``Exception`` but lets a ``KeyboardInterrupt`` or
             ``SystemExit`` through to the caller (SPEC-025 FR-004).
         """
-        with self._lock:
+        with _lifecycle._state._lock, self._lock:
             alive = self._thread.is_alive()
             if alive:
                 owed: list[Sink] = []
             else:
                 owed, self._unclosed_swaps = self._unclosed_swaps, []
+                for stale in owed:
+                    _lifecycle.discharge_owed(stale)
             if self._sink_closed or alive:
                 claimed, waiting = False, self._closing
             else:

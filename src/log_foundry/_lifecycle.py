@@ -1479,6 +1479,36 @@ def _inline_close_choice(owed: list[Sink]) -> Sink:
     return owed[-1]
 
 
+def discharge_owed(sink: Sink) -> None:
+    """Records that a sink's owed close is being performed elsewhere (SPEC-050 FR-004).
+
+    The orphan record and :attr:`~log_foundry.worker.Worker._unclosed_swaps` can name the **same**
+    sink: an unconfirmed swap strands it in the worker's record, and an orphan emit that resolved
+    it before the swap and resumed after the re-arm slot had moved on puts it back in
+    ``_orphan_owed``. Both then close it — measured ``A.closes == 2`` with a preemption point at
+    ``_ensure_sink``, which is SPEC-044 FR-004's shape at a record that did not exist then.
+
+    Called with ``_state._lock`` held, by the worker taking its own record under it, so the take
+    and the discharge are one critical section: split, a concurrent ``_close_orphan_sink`` can read
+    the sink out of ``_orphan_owed`` in the gap and close it alongside.
+
+    ``_orphan_closed_sink`` is latched as well as the entry removed, for the reason
+    :func:`_get_worker` latches it: removal stops *this* close being performed twice, and the latch
+    stops a later orphan emit re-arming a sink whose close is already under way.
+
+    Args:
+      sink: The sink whose close the caller is about to perform.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _state._orphan_owed.pop(id(sink), None)
+    _state._orphan_closed_sink = sink
+
+
 def _close_orphan_sink() -> None:
     """Closes a sink only the orphan path ever wrote to, once (SPEC-031 FR-006).
 
@@ -1492,13 +1522,21 @@ def _close_orphan_sink() -> None:
     the early return below while the first was still inside an unbounded ``close()`` — and where
     that first caller is a background thread and the second is ``atexit``, the interpreter exits
     through a running close and kills it. For a sink whose ``close()`` *is* the delivery that is
-    total loss of its buffer. ``waiting`` is captured in the **same critical section and strictly
-    before** :data:`_orphan_closing` is written, which is what makes "am I the closer or a
-    bystander" answerable at all: read afterwards, the caller that took the work would see its own
-    write and wait the grace on an event it is itself responsible for setting — and since
-    :func:`_shutdown_worker` calls this on the *worker* path too, that would stall every ordinary
-    shutdown. The wait is :data:`DEFAULT_CLOSER_GRACE` and nothing longer: this function takes no
-    budget from its caller, so there is none to carve.
+    total loss of its buffer.
+
+    **A caller cannot wait on itself**, and that is a property of *where* the slot is written
+    rather than of the order the two lines happen to sit in. :data:`_orphan_closing` is written
+    only where ``owed`` is non-empty and read only where it is empty, so the closer and the
+    bystander are disjoint by construction; both happen under ``_state._lock``, so reading the
+    global there and reading the captured value are the same read, and mutating one into the other
+    is an equivalent mutant rather than a defect. What would *not* be equivalent is a flag set
+    unconditionally — that caller would see its own write, wait out the grace on an event it is
+    itself responsible for setting, and since :func:`_shutdown_worker` calls this on the *worker*
+    path too, stall every ordinary shutdown. The local exists so a reader can see which of the two
+    a caller is without re-deriving it.
+
+    The wait is :data:`DEFAULT_CLOSER_GRACE` and nothing longer: this function takes no budget
+    from its caller, so there is none to carve.
 
     A worker that owns *this* sink closes it instead, and this returns — that is what makes a
     mixed process exactly one ``close()`` in either order. It also inherits that worker's reasons

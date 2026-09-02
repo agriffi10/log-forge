@@ -394,9 +394,10 @@ def test_the_old_sink_is_not_closed_by_both_paths() -> None:
 def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> None:
     """The verdict is about **ownership**, not the quality of the drain (AC-4's boundary).
 
-    An unconfirmed drain leaves the old sink open and counts ``incomplete_swaps``, but the swap
-    itself happened — so returning False there would re-home a sink the worker is delivering to,
-    which is the opposite of this FR.
+    An unconfirmed drain leaves the old sink open *for now* — until a ``shutdown()`` that finds
+    the drain thread ended closes it (SPEC-050 FR-004) — and counts ``incomplete_swaps``, but the
+    swap itself happened, so returning False there would re-home a sink the worker is delivering
+    to, which is the opposite of this FR.
     """
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
@@ -533,3 +534,144 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
         f"{result.stdout}\n{result.stderr[-800:]}"
     )
     assert result.stdout.count("CLOSED A") == 1, f"and A exactly once:\n{result.stdout}"
+
+
+# -- SPEC-050 FR-002: the orphan path's half of the in-flight-close wait -----------------
+
+
+def test_an_orphan_only_second_shutdown_waits_for_the_close_in_flight() -> None:
+    """FR-002 AC-3. `_close_orphan_sink` had `_close_if_owed`'s shape, and the same residue.
+
+    It empties `_orphan_owed` under `_state._lock` and *then* closes, so a second caller took the
+    early return while the first was still inside an unbounded `close()`. In a process that only
+    ever logged outside a span there is no worker, so this function is the *only* thing that
+    closes the sink — which makes an `atexit` call returning through a running close total loss
+    of a close-is-delivery sink's buffer.
+    """
+    class _CloseIsDelivery:
+        """Buffers on emit; the close is the delivery, and it is slow enough to be raced."""
+
+        def __init__(self) -> None:
+            self.held: list[dict] = []
+            self.wire: list[dict] = []
+            self.closed = 0
+            self.in_close = threading.Event()
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Buffers the batch without delivering it."""
+            self.held.extend(batch)
+
+        def close(self) -> None:
+            """Delivers, slowly, so a caller returning through it is measurable."""
+            self.in_close.set()
+            time.sleep(0.6)
+            self.wire.extend(self.held)
+            self.closed += 1
+
+    sink = _CloseIsDelivery()
+    log_foundry.configure(service="test", sink=sink)
+    log_foundry.info("orphan")  # no span: no worker is ever built
+    assert sink.held, "the premise: the orphan emit reached the sink"
+
+    first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
+    first.start()
+    assert sink.in_close.wait(5.0), "the premise: the first caller is inside close()"
+
+    log_foundry.shutdown(timeout=30.0)
+
+    assert sink.closed == 1, "the second caller waited rather than closing again"
+    assert sink.wire == sink.held, "and the close it waited for delivered the buffer"
+    first.join(timeout=5)
+
+
+def test_an_orphan_only_shutdown_with_no_close_in_flight_does_not_wait() -> None:
+    """FR-002 AC-6, on the orphan path. `waiting` is captured before the slot is written.
+
+    Read after the write instead, the caller that took the work would see its own event and wait
+    out the whole closer grace on something it is itself responsible for setting — and since
+    `_shutdown_worker` calls this on the *worker* path too, that is a stall on every ordinary
+    shutdown, not just an orphan one.
+    """
+    class _Quiet:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.log_foundry_stop_signal: threading.Event | None = None
+
+        def emit(self, batch: list[dict]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing, instantly."""
+            self.closed += 1
+
+    sink = _Quiet()
+    log_foundry.configure(service="test", sink=sink)
+    log_foundry.info("orphan")
+
+    start = time.monotonic()
+    log_foundry.shutdown(timeout=30.0)
+    first = time.monotonic() - start
+    log_foundry.shutdown(timeout=30.0)
+    both = time.monotonic() - start
+
+    assert sink.closed == 1
+    assert both < _lifecycle.DEFAULT_CLOSER_GRACE, (
+        f"two orphan shutdowns took {both:.2f}s (first {first:.2f}s) with nothing to wait for"
+    )
+
+
+def test_a_daemon_thread_shutdown_finishes_its_close_before_the_process_exits() -> None:
+    """FR-002 AC-2. The reproduction, and only a real interpreter exit can show it.
+
+    Measured before the fix: `main exiting at 0.31s; closes started=1 finished=0 wire=0
+    buffered=12`, because `atexit` found the close already claimed and returned, and the daemon
+    performing it was killed where it stood. The observer registers **first**, so LIFO runs it
+    last — after the library's own handler — since a probe registered last reports the state
+    before the thing it is measuring has run.
+    """
+    import subprocess
+    import sys
+
+    program = textwrap.dedent(
+        """
+        import atexit, sys, threading, time
+        sys.path.insert(0, "src")
+        state = {"started": 0, "finished": 0, "wire": 0, "buffered": 0}
+        atexit.register(lambda: print(
+            "RESULT started=%(started)d finished=%(finished)d wire=%(wire)d "
+            "buffered=%(buffered)d" % state, flush=True))
+
+        import log_foundry
+
+        class S:
+            log_foundry_stop_signal = None
+            def emit(self, b): state["buffered"] += len(b)
+            def close(self):
+                state["started"] += 1
+                time.sleep(1.5)
+                state["wire"] += state["buffered"]; state["buffered"] = 0
+                state["finished"] += 1
+
+        log_foundry.configure(service="t", sink=S())
+
+        @log_foundry.trace
+        def w(): log_foundry.info("x")
+        for _ in range(3): w()
+
+        started = threading.Event()
+        threading.Thread(
+            target=lambda: (started.set(), log_foundry.shutdown()), daemon=True
+        ).start()
+        started.wait(5); time.sleep(0.3)
+        print("EXITING", flush=True)
+        """
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=120
+    )
+    assert "EXITING" in result.stdout, f"the child never got there: {result.stderr[-800:]}"
+    assert "RESULT started=1 finished=1 wire=9 buffered=0" in result.stdout, (
+        "the atexit call returned through a running close and the buffer died with it:\n"
+        f"{result.stdout}\n{result.stderr[-800:]}"
+    )

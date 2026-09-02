@@ -8,6 +8,7 @@ and FR-007 (the `trace` façade export) now.
 
 import contextvars
 import gc
+import threading
 import time
 
 import pytest
@@ -494,3 +495,104 @@ def test_a_raising_traced_call_leaves_no_reference_cycle(monkeypatch) -> None:
 
     # ~13 objects per call are retained when the cycle is present (650 for 50 calls).
     assert growth < 100, f"retained {growth} objects across 50 raising calls"
+
+
+# -- SPEC-050 FR-003: a span whose events cannot reach a worker counts them --------------
+
+
+class _RefusingThread:
+    """Makes `Thread.start` refuse for the drain thread only, as an out-of-threads process does."""
+
+    def __init__(self, monkeypatch) -> None:
+        self._real = threading.Thread.start
+
+        def refuse(thread: threading.Thread) -> None:
+            """Refuses the library's drain thread and lets pytest's own threads through."""
+            if thread.name == "log-foundry-worker":
+                raise RuntimeError("can't start new thread")
+            self._real(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+
+
+def test_a_span_that_cannot_reach_a_worker_counts_every_event_it_held(capsys) -> None:
+    """FR-003 AC-1, AC-2. The reproduction: total loss under an all-clear `health()`.
+
+    Measured before the fix: two traced calls, two stderr lines, and
+    `Health(stopped_reason=None, in_span_lost=0)` with nothing delivered. The count is the span's
+    whole buffer, so three events per span rather than one — a per-span increment would read 2
+    for six lost events and understate the loss by a factor of the span's size.
+    """
+    sink = pytest.importorskip("log_foundry.sinks.stdout").StdoutSink()
+    log_foundry.configure(service="test", sink=sink)
+
+    with pytest.MonkeyPatch.context() as patch:
+        _RefusingThread(patch)
+
+        @log_foundry.trace
+        def work() -> None:
+            log_foundry.info("inside")
+
+        work()
+        work()
+
+    err = capsys.readouterr().err
+    health = log_foundry.health()
+
+    assert health.in_span_lost == 6, "three events per span, both spans"
+    assert err.count("absorbed a failure while closing a span (RuntimeError)") == 2, (
+        "the existing line is unchanged and still one per span"
+    )
+    assert health.orphan_lost == 0, "this is not the synchronous path"
+
+
+def test_a_span_failing_before_its_end_event_counts_only_what_it_held(capsys) -> None:
+    """FR-003 AC-4. Both failure populations reach the count, with different totals.
+
+    A fault in `end_event` leaves the span holding what it had *before* the close began, and a
+    fault in `_flush` leaves it holding the end event too. Counting `len(span.events)` is what
+    makes one site cover both; a constant would be wrong for at least one of them.
+    """
+    decorator = pytest.importorskip("log_foundry.decorator")
+    sink = pytest.importorskip("log_foundry.sinks.stdout").StdoutSink()
+    log_foundry.configure(service="test", sink=sink)
+
+    with pytest.MonkeyPatch.context() as patch:
+        def boom(*args: object, **kwargs: object) -> None:
+            """Fails where the end event is built, before it can be appended."""
+            raise RuntimeError("no end event")
+
+        patch.setattr(decorator, "end_event", boom)
+
+        @log_foundry.trace
+        def work() -> None:
+            log_foundry.info("inside")
+
+        work()
+
+    capsys.readouterr()
+    assert log_foundry.health().in_span_lost == 2, (
+        "span.start and the info() call — the end event was never appended"
+    )
+
+
+def test_the_reordered_flush_preserves_event_order_and_counts_nothing(fake_sink, capsys) -> None:
+    """FR-003 AC-3. The regression guard for reordering the hottest path in the library.
+
+    `_flush` now resolves the worker before it detaches the buffer. The ordinary path must be
+    untouched: every event delivered, in order, with the loss counter still at zero.
+    """
+    log_foundry.configure(service="test", sink=fake_sink)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("one")
+        log_foundry.info("two")
+
+    work()
+    assert bool(log_foundry.flush(timeout=5.0)), "the premise: the batch was delivered"
+    capsys.readouterr()
+
+    names = [e.get("message") or e.get("event") for e in fake_sink.events]
+    assert names == ["span.start", "one", "two", "span.end"], f"order changed: {names}"
+    assert log_foundry.health().in_span_lost == 0, "the ordinary path loses nothing"
