@@ -67,7 +67,7 @@ pytest-cov = "^7.1.0"
 # CPU, because the bounds this library promises (a 30 s shutdown budget, a backoff, a
 # wedged drain) are proved by waiting for them. Two tests block 30 s each. Distributing
 # across processes therefore buys almost the whole wall clock back — measured 125.9 s ->
-# 40.8 s at `-n 8 --dist load` — where caching the dependency install could only ever
+# 34.8 s at `-n 12 --dist worksteal` — where caching the dependency install could only ever
 # save the 18 s that install takes.
 pytest-xdist = "^3.8"
 # Bounded to a minor, not left open. Ruff's DEFAULT rule set is not stable across minors —
@@ -114,7 +114,42 @@ build-backend = "poetry_dynamic_versioning.backend"
 testpaths = ["tests"]
 pythonpath = ["src"]             # src layout: make `import log_foundry` work without an install
 asyncio_mode = "auto"            # async test functions run without an explicit marker
-addopts = "--strict-markers"
+# `-n 12 --dist worksteal` lives HERE rather than in the CI workflow, so the gate a developer runs
+# before pushing is the same command CI runs, at the same speed: ~133 s -> ~35 s locally, and the
+# pre-push gate is where those 98 s are actually paid for by a human waiting. It also removes a
+# divergence — with the flags only in CI, an order-dependent failure could appear there and be
+# unreproducible with a bare `poetry run pytest`.
+#
+# The suite is sleep-bound, not CPU-bound (~133 s of wall clock at well under 10% CPU), because
+# this library's promises ARE bounds and a bound is proved by waiting for it; two tests in
+# test_orphan_sink_handoff.py block 30 s each. That is why the count is a fixed 12 rather than
+# `auto`: workers here are overwhelmingly blocked rather than computing, so `auto` — the CPU
+# count, which is 4 on a GitHub runner — leaves most of the win on the table.
+#
+# `--dist worksteal`, NOT `--dist load`, and this was learned the expensive way. `load` hands each
+# worker a fixed slice up front, so the allocation is a deterministic function of the test list —
+# and when SPEC-047 added a handful of NATS tests, both 30 s tests landed in the SAME slice and
+# the parallel run went from 40.8 s to 71.4 s (three runs, spread 0.1 s: not luck, and it would
+# have stayed green in CI while quietly costing 30 s a run). `worksteal` lets an idle worker take
+# work from a busy one, which is exactly the long-tail shape here. Measured on the same tree,
+# 1,899 passed / 7 skipped every time:
+#
+#     serial                    133.4 s      -n 8  --dist worksteal   40.0 s
+#     -n 8  --dist load          71.4 s      -n 12 --dist worksteal   34.8 s   <- chosen
+#     -n 12 --dist load          38.4 s      -n 16 --dist worksteal   34.1 s   (knee)
+#
+# `loadfile` is worse than either: it keeps a module on one worker, pinning those two 30 s tests
+# to one process and flooring the run at ~72 s — measured at both -n 8 and -n 12, though not at
+# every worker count, since `-n 1 --dist loadfile` is 125.4 s.
+#
+# TO OVERRIDE, PASS `-n 0` — it disables distribution entirely (verified: no workers are created)
+# and is the right flag for debugging a failure, for `--pdb`, or for reading interleaved output.
+# `tests/integration` is run that way in CI for a stronger reason than convenience: those tests
+# share nine real services, so distributing them would have them reading each other's writes.
+# That one is ENFORCED, not merely configured -- `tests/integration/conftest.py` refuses a
+# distributed session, so deleting `-n 0` from the workflow fails loudly instead of producing the
+# intermittent cross-talk it used to.
+addopts = "--strict-markers -n 12 --dist worksteal"
 
 [tool.ruff]
 src = ["src", "tests"]

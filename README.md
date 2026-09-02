@@ -1260,7 +1260,8 @@ bound each *value* — an event of many bounded values can still be large; see
 
 ```bash
 poetry install --with dev      # set up (Python 3.12+)
-poetry run pytest              # test
+poetry run pytest              # test (runs in parallel by default; see addopts)
+poetry run pytest -n 0         # ...serially, when debugging a failure
 poetry run ruff check .        # lint (line-length 100)
 poetry run mypy                # typecheck (strict, over src/)
 ```

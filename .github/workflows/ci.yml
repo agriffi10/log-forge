@@ -87,7 +87,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # Deliberately uncached, and the measurement is why. Installing Poetry and the dev group
-      # takes ~18 s of a ~166 s job; the tests take ~141 s. Caching the smaller half would also
+      # takes ~18 s against ~49 s of tests, so caching is now the smaller half of a ~70 s job
+      # rather than the small corner of a ~166 s one -- a better case than before parallelism,
+      # and still not a good one, because the ceiling is a few seconds of a restore that is not
+      # free either. Caching would also
       # put a restorable cache into the workflow `release.yml` calls immediately before it
       # publishes to PyPI with `id-token: write` — the cache-poisoning shape zizmor audits for.
       # Not worth ~5 s on the one path where a poisoned input reaches consumers.
@@ -103,29 +106,13 @@ jobs:
       - name: Type check (mypy)
         run: poetry run mypy
 
-      # `-n 8 --dist load`, not the default serial run and not `-n auto`.
+      # Deliberately a BARE `pytest`. The parallel flags (`-n 12 --dist worksteal`) live in
+      # `[tool.pytest.ini_options] addopts` in pyproject.toml, so this is the identical command a
+      # developer runs as the pre-push gate — no drift between what CI proves and what a human can
+      # reproduce, and the reasoning and measurements for the worker count live beside the setting
+      # rather than here. Measured on this runner: the step fell from 141 s to ~49 s at the
+      # first setting; the scheduler has since changed, so expect that or better.
       #
-      # The suite is sleep-bound rather than CPU-bound — 1,871 tests, ~116 s of wall clock at 7%
-      # CPU — because this library's promises ARE bounds, and a bound is proved by waiting for it.
-      # Two tests in test_orphan_sink_handoff.py block 30 s each on a deliberately wedged sink, so
-      # they alone are half the serial run. That shape is why the worker count is 8 on a 4-vCPU
-      # runner: the workers are overwhelmingly blocked, not computing, so `-n auto` (which reads
-      # the CPU count, giving 4) leaves most of the win on the table. Measured locally, same
-      # 1,871 passed / 5 skipped every time:
-      #
-      #     serial               125.9 s
-      #     -n 4  --dist load     75.7 s
-      #     -n 8  --dist load     40.8 s   <- chosen
-      #     -n 12 --dist load     38.6 s   (knee; the floor is the two 30 s tests)
-      #
-      # `--dist load` rather than `--dist loadfile`: loadfile keeps a module on one worker, which
-      # pins those two 30 s tests to the same process and floors the run at ~72 s regardless of
-      # worker count (measured at -n 8 and -n 12). Per-test distribution is what breaks them apart.
-      #
-      # Verified before adopting: the collected test-name sets are identical serial vs parallel
-      # (1,876 each, empty diff — a pass count alone would not have shown a test going missing),
-      # and five consecutive parallel runs were green at 40.78-41.06 s.
-      #
-      # To debug a failure serially, drop the flags: `poetry run pytest` is unchanged.
+      # To debug serially, `-n 0` overrides it.
       - name: Test (pytest)
-        run: poetry run pytest -n 8 --dist load
+        run: poetry run pytest

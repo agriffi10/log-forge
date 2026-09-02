@@ -237,7 +237,54 @@ and a fixture that reached this point has a service listening.
 
 
 @pytest.fixture(scope="session", autouse=True)
-def services_are_up() -> dict[str, Endpoint]:
+def _not_distributed(request: pytest.FixtureRequest) -> None:
+    """Refuses a session that would run this directory's tests across processes.
+
+    **A correctness guard.** `addopts` carries `-n 12 --dist worksteal`, so parallel is the DEFAULT for
+    every invocation and this suite must opt out with `-n 0`: the nine modules share nine real
+    services, so distributing them has them draining each other's destinations. Measured with the
+    services up, on this repo's own documented recipe: `-n 0` gave `19 passed`, and the same
+    command without it gave `1 failed, 18 passed` -- a Logstash test reading a destination its
+    sibling had already consumed. A requirement stated only in a comment is enforced by nobody.
+
+    Three mechanism choices, each measured rather than assumed. It runs BEFORE
+    :func:`services_are_up`, which requests it, because that fixture spends up to 90 s probing
+    nine services and a run that is already invalid should say so first -- ordering by
+    *dependency* rather than by definition order, which is not guaranteed. It raises from a
+    fixture rather than from `pytest_collection_modifyitems`, because a `UsageError` raised during
+    a worker's collection surfaces not as a message but as `INTERNALERROR ... assert not
+    crashitem`. And the predicate reads `workerinput` and not only `getoption("dist")`, because in
+    an xdist **worker** `dist` reads `"no"` -- the controller holds `"load"` -- so a `dist`-only
+    test would never fire in the very place this runs.
+
+    It defers to :func:`_gate_is_set` when the gate is unset, returning rather than refusing.
+    Naming a file directly with no gate is the invocation form that fixture exists to diagnose,
+    and refusing here first told that caller to add `-n 0` -- which then produced the gate error
+    they should have seen in the first place, a two-step diagnosis for one mistake.
+
+    Args:
+      request: The fixture request, for the session config carrying the xdist state.
+
+    Returns:
+      None.
+
+    Raises:
+      RuntimeError: If the session is distributing tests across worker processes.
+    """
+    if not os.environ.get(GATE):
+        return
+    config = request.config
+    if hasattr(config, "workerinput") or config.getoption("dist", "no") != "no":
+        raise RuntimeError(
+            "the integration suite must not be distributed -- these tests share nine real "
+            "services and will drain each other's destinations. `addopts` defaults to "
+            "`-n 12 --dist worksteal`, so add `-n 0`: "
+            "`LOG_FOUNDRY_INTEGRATION=1 poetry run pytest tests/integration -n 0`"
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def services_are_up(_not_distributed: None) -> dict[str, Endpoint]:
     """Waits for every service, concurrently, against one shared deadline.
 
     **It fails rather than skips**, which is the whole point. A skipped integration test leaves a
@@ -331,6 +378,16 @@ tests. The numbers are what each module ships today, not a target.
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fails a run that collected work but verified nothing (FR-001).
+
+    **Recorded limit: this does not report from an xdist CONTROLLER.** Measured, gate exported:
+    a whole-suite `pytest` (parallel by default since `addopts` carries `-n 12`) printed ZERO
+    `INTEGRATION FLOOR` lines, while `pytest tests/integration -n 0` printed 10. The controller
+    loads conftests only for the invocation's initial paths, and a worker setting
+    `session.exitstatus` cannot change the controller's. No false green follows today: CI runs
+    this suite with `-n 0`, where the floor works, and the one invocation that would otherwise
+    reach here distributed is refused outright by :func:`_not_distributed` -- the run above still
+    exited 1, on the guard's 10 errors rather than on this. Left as a limit rather than fixed
+    because the scenario it covers no longer exists.
 
     **The vacuity guard, and it is not an exit code.** `pytest tests/integration` exits 5 when
     nothing is collected, which catches only a forgotten gate variable -- a typo that surfaces on
