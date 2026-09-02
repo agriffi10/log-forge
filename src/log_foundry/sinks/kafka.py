@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KafkaSink"]
@@ -16,10 +17,9 @@ def _usable_timeout(value: float) -> float:
     """Returns a flush timeout that is actually a bound, or the default.
 
     ``0`` is the value that switched this sink's exit delivery off, and ``inf`` is the unbounded
-    wait FR-006 exists to remove, so neither is accepted from a caller. The test is
-    ``not (0 < value < inf)`` rather than a pair of comparisons, because ``NaN`` compares
-    ``False`` to everything and would otherwise slip through (SPEC-027 FR-001's reasoning for
-    ``Retry-After``).
+    wait FR-006 exists to remove, so neither is accepted from a caller. The rule itself lives in
+    :func:`~log_foundry.sinks._retry.usable_timeout`, shared with ``NATSSink``'s publish budget
+    since SPEC-047; this wrapper binds it to :data:`DEFAULT_FLUSH_TIMEOUT`.
 
     Args:
       value: The caller's timeout.
@@ -30,7 +30,7 @@ def _usable_timeout(value: float) -> float:
     Raises:
       None.
     """
-    return value if 0 < value < float("inf") else DEFAULT_FLUSH_TIMEOUT
+    return usable_timeout(value, DEFAULT_FLUSH_TIMEOUT)
 
 DEFAULT_FLUSH_TIMEOUT = 10.0
 """Seconds :meth:`KafkaSink.close` waits for the producer to drain (SPEC-038 FR-006).

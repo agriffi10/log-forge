@@ -1,4 +1,4 @@
-"""Shared retry waiting for the sinks (SPEC-027)."""
+"""Shared bounding of the sinks' waits and timeouts (SPEC-027, SPEC-047)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import threading
 
-__all__ = ["MAX_WAIT", "clamp_server_delay", "wait"]
+__all__ = ["MAX_WAIT", "clamp_server_delay", "usable_timeout", "wait"]
 
 MAX_WAIT = 86_400.0
 """Hard ceiling on any single wait, in seconds — a day.
@@ -87,3 +87,27 @@ def clamp_server_delay(value: float | None, ceiling: float) -> float | None:
     if not (ceiling > 0):
         return None
     return min(value, ceiling)
+
+
+def usable_timeout(value: float, default: float) -> float:
+    """Returns a timeout that actually bounds something, or the caller's default (SPEC-047).
+
+    ``0`` switches a bounded wait off entirely and ``inf`` restores the unbounded one the bound
+    exists to remove, so neither is accepted. The test is ``not (0 < value < inf)`` rather than a
+    pair of comparisons, because ``NaN`` compares ``False`` to everything and would otherwise slip
+    through — :func:`clamp_server_delay`'s reasoning for ``Retry-After``, applied to a value the
+    caller supplies rather than one a destination does.
+
+    Args:
+      value: The caller's timeout.
+      default: The fallback, passed in rather than named here because each sink's default is its
+        own — ``KafkaSink``'s flush and ``NATSSink``'s publish budget are unrelated numbers, and a
+        constant baked in here would silently give one sink the other's.
+
+    Returns:
+      The value if it bounds anything, else the default.
+
+    Raises:
+      None.
+    """
+    return value if 0 < value < float("inf") else default

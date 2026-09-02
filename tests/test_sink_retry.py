@@ -15,7 +15,7 @@ import pytest
 
 import log_foundry.sinks._socket as socket_mod
 from log_foundry import _lifecycle
-from log_foundry.sinks._retry import clamp_server_delay, wait
+from log_foundry.sinks._retry import clamp_server_delay, usable_timeout, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
 from log_foundry.worker import Worker
 from test_sinks_http import FakeOpener, FakeResponse
@@ -953,3 +953,25 @@ def test_concurrent_shutdowns_close_the_sink_exactly_once() -> None:
         thread.join(10.0)
 
     assert sink.closed == 1
+
+
+# --- SPEC-047: usable_timeout, the rule KafkaSink's flush and NATSSink's publish budget share ---
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("inf"), float("nan")])
+def test_a_timeout_that_bounds_nothing_falls_back_to_the_caller_s_default(bad: float) -> None:
+    # `nan` is the reason the test is `not (0 < value < inf)` rather than a pair of comparisons:
+    # it compares False to everything, so `value <= 0` would let it through to become the bound.
+    assert usable_timeout(bad, 7.5) == 7.5
+
+
+def test_a_timeout_that_bounds_something_is_honoured_exactly() -> None:
+    assert usable_timeout(2.5, 7.5) == 2.5
+
+
+def test_the_default_is_the_callers_not_a_constant_of_this_module() -> None:
+    # The whole reason for extracting this with a parameter: KafkaSink's flush timeout and
+    # NATSSink's publish budget are unrelated numbers, and a baked-in constant would silently
+    # hand one sink the other's fallback.
+    assert usable_timeout(0, 10.0) == 10.0
+    assert usable_timeout(0, 30.0) == 30.0

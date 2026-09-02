@@ -810,6 +810,16 @@ close it.
   SPEC-035 FR-002 drew the roster's module boundary where it did. Neither is a defect; both are
   recorded so the next reader knows the split was considered. **Closed by** a spec that does it,
   or by a decision that the shape is right.
+- **`NATSSink`'s exit drain can still exceed `shutdown()`'s join** (SPEC-047 FR-001).
+  `publish_timeout` bounds one `emit`, but `Worker._emit` retries a failing batch
+  `max_retries + 1` times — four at the default — and its inter-attempt wait returns immediately
+  once the stop event is set, which it is for the whole of `_final_drain`. So the exit drain's
+  worst case is `(max_retries + 1) x publish_timeout`: 40 s at the defaults against a 30 s join,
+  measured at **8.01 s against an 8.00 s prediction** with `publish_timeout=2.0`. An expired join
+  leaves the sink open (SPEC-027 FR-004). It is recorded rather than fixed because closing it
+  means bounding the worker's retry of an *already-bounded* batch, which is every sink's question
+  and not this sink's. **Closed by** a spec that gives `Worker._emit` a total budget, or by the
+  caller lowering `publish_timeout` to 7.0 or below.
 
 ### Resolved
 
@@ -873,6 +883,16 @@ It is **not** a backlog: something genuinely unfinished belongs in §12, which n
 close it. A closed item is struck in place with the spec that closed it (SPEC-021's rule) and its
 reasoning is *not* repeated here — that lives in CLAUDE.md's Key Decisions and the delivery doc,
 and a third copy is a fork with no merge.
+
+- **`flush()` reports success over events `NATSSink`'s publish deadline absorbed.** Measured with
+  a slow-but-healthy JetStream and `publish_timeout=0.2`: `flush()` returned `True` with 4 of 42
+  events delivered and `health().sink` reading `failed=38`. This is SPEC-026's routing working as
+  designed — absorbed partial loss is reported through `Health.sink`, and `flush()`'s verdict is
+  built on `failed_batches`, which a returning `emit` does not move (SPEC-021). What SPEC-047 FR-001
+  adds is that `NATSSink` can now absorb loss for a **timing** reason against a destination that is
+  not failing, which it could not before. The alternative — raising when the deadline drops
+  anything — would send a partially delivered batch back to `Worker._emit`'s retry and duplicate
+  whatever landed, which is SPEC-018's rule and the reason partial failure must not raise.
 
 - **An event logged from a task that outlives its span leaves its trace.** `contextvars` copies the
   same `Span` object into every task created inside a span, so a fire-and-forget `create_task` can

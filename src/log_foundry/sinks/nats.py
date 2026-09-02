@@ -5,12 +5,49 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["NATSSink"]
+
+DEFAULT_PUBLISH_TIMEOUT = 10.0
+"""Seconds one whole :meth:`NATSSink.emit` may spend publishing (SPEC-047 FR-001).
+
+A budget for the **batch**, not for an event. Under JetStream each publish awaits an ack bounded by
+the driver's own timeout, and applying that per item is ``n x timeout``, which is not a bound --
+measured, five events against a stalled server cost 25.01 s, and ``Worker._final_drain`` hands the
+process's exit backlog over as a single batch (SPEC-038 measured 5,980 events).
+
+It is spent inside ``_lifecycle.DEFAULT_SHUTDOWN_TIMEOUT`` (30.0): ``Worker.shutdown`` joins the
+drain thread against that deadline and ``_final_drain``'s single emit runs on that thread, and an
+expired join leaves the sink **open** by SPEC-027 FR-004, so ``close()`` never drains the client's
+outbound buffer.
+
+**It does not fit inside that join, and the arithmetic is stated rather than assumed.**
+``Worker._emit`` retries a failing batch ``max_retries + 1`` times -- four at the default -- and its
+inter-attempt wait returns immediately once the stop event is set, which it is for the whole of the
+exit drain. This deadline deliberately does not consult that event (a shutdown shortens a wait and
+never skips work), so the exit drain's worst case is ``(max_retries + 1) x publish_timeout``. Ten is
+chosen on the size of the improvement rather than on fitting the sequence inside the join: the same
+path is *unbounded* today, 8.3 hours for a 5,980-event backlog at 5 s an event. A caller who needs
+the whole sequence to fit lowers this to 7.0 or below. Recorded as an open item in
+``architecture.md`` section 12, since closing it means bounding the worker's retry of an
+already-bounded batch -- every sink's question rather than this sink's.
+"""
+
+DEFAULT_ACK_TIMEOUT = 5.0
+"""Ceiling on any one JetStream publish's ack wait, in seconds (SPEC-047 FR-001).
+
+A constant of this module's own rather than a value read from the driver: the sink builds its
+context with a bare ``self._client.jetstream()``, so ``JetStreamContext``'s ``timeout`` is its
+constructor default and is not readable back off the object. It mirrors that default, and every
+publish is given ``min(DEFAULT_ACK_TIMEOUT, remaining budget)`` -- so a divergence can only ever
+make the per-publish timeout smaller than the driver would have used, never larger.
+"""
 
 
 class NATSSink:
@@ -22,12 +59,23 @@ class NATSSink:
     handed off. With JetStream enabled it publishes through JetStream for durable
     acknowledgement.
 
-    **Retry and the worst-case delay** (SPEC-041 FR-004). This sink adds no retry loop and needs
-    none: a core ``publish()`` writes into the client's outbound buffer and returns without
-    waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's single
-    drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee is met
-    because there is no wait, not because a wait is bounded. Under JetStream ``publish()`` awaits
-    an ack bounded by the driver's own timeout (5 s by default) and does not retry.
+    **Retry and the worst-case delay** (SPEC-041 FR-004, SPEC-047 FR-001). This sink adds no retry
+    loop and needs none: a core ``publish()`` writes into the client's outbound buffer and returns
+    without waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's
+    single drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee
+    is met because there is no wait, not because a wait is bounded.
+
+    > ~~Under JetStream ``publish()`` awaits an ack bounded by the driver's own timeout (5 s by
+    > default) and does not retry.~~ **Superseded by SPEC-047 FR-001.** True per *event* and false
+    > per *batch*: the awaits are sequential and nothing bounded how many there were, so the cost
+    > was ``n x 5 s`` on the drain thread — measured at 25.01 s for five events against a stalled
+    > server, and ``Worker._final_drain`` hands the exit backlog over as one batch. One
+    > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
+
+    The worst case is therefore ``publish_timeout`` per emit, plus one in-flight ack — and across
+    the exit drain ``(max_retries + 1) x publish_timeout``, since ``Worker._emit`` retries a failing
+    batch and its inter-attempt wait returns immediately during a shutdown. That exceeds
+    ``shutdown()``'s join at the defaults and is recorded in ``architecture.md`` section 12.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with
@@ -55,6 +103,7 @@ class NATSSink:
         client: Any = None,
         jetstream: bool = False,
         servers: str | None = None,
+        publish_timeout: float = DEFAULT_PUBLISH_TIMEOUT,
     ) -> None:
         """Binds the sink to a subject and connects if no client was injected.
 
@@ -63,6 +112,10 @@ class NATSSink:
           client: A ``nats-py``-shaped client to borrow, or ``None`` to connect one.
           jetstream: Whether to publish through JetStream.
           servers: The server URL used when connecting.
+          publish_timeout: Seconds one whole :meth:`emit` may spend, floored by
+            :func:`~log_foundry.sinks._retry.usable_timeout` as ``KafkaSink`` floors its flush
+            (SPEC-047 FR-001). It applies to an injected ``client=`` too: it is this sink's own
+            bound over its own loop, not a request made of the driver at connect time.
 
         Returns:
           None.
@@ -73,6 +126,7 @@ class NATSSink:
         """
         self._subject = subject
         self._jetstream = jetstream
+        self.publish_timeout = usable_timeout(publish_timeout, DEFAULT_PUBLISH_TIMEOUT)
         self._loop = asyncio.new_event_loop()
         self.failed = 0
         self._counter_lock = threading.Lock()
@@ -179,10 +233,27 @@ class NATSSink:
                 self._loop.close()
 
     async def _publish_all(self, batch: list[dict[str, object]]) -> None:
-        """Publishes each event, isolating a per-event failure.
+        """Publishes each event under one deadline for the whole batch (SPEC-047 FR-001).
 
         Per-event isolation stays because a partial batch must not be retried wholesale: the
-        events that published would be delivered twice.
+        events that published would be delivered twice. What changes is that the *batch* is
+        bounded rather than each event in it — applying the driver's ack timeout per item is
+        ``n x timeout``, and ``Worker._final_drain`` hands the exit backlog over as one batch.
+
+        The two paths take the bound differently because the driver offers different handles. A
+        JetStream publish accepts a ``timeout`` and is given ``min(DEFAULT_ACK_TIMEOUT,
+        remaining)`` — never the bare remainder, which would hand the first event of a fresh
+        budget a longer ack wait than the driver's own default. A core publish accepts none and
+        writes into the client's outbound buffer without waiting, so the deadline is checked
+        between events, which is all there is to check.
+
+        Two populations are counted by different rules. An event whose publish **raised** is a
+        driver failure and is counted here exactly as before this spec. An event **never
+        attempted** because the budget expired is counted only when this returns: a raise sends
+        the whole batch back to ``Worker._emit``, which retries it, so booking the remainder there
+        would report a loss that has not happened — the rule
+        :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` already applies to its own queued
+        remainder.
 
         Args:
           batch: The events to publish.
@@ -194,18 +265,39 @@ class NATSSink:
           SinkDeliveryError: When none of them landed (SPEC-026 FR-001).
         """
         target = self._client.jetstream() if self._jetstream else self._client
+        deadline = time.monotonic() + self.publish_timeout
         published = 0
+        attempted = 0
         for event in batch:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempted += 1
             try:
-                await target.publish(self._subject, json.dumps(event).encode("utf-8"))
+                payload = json.dumps(event).encode("utf-8")
+                if self._jetstream:
+                    await target.publish(
+                        self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)
+                    )
+                else:
+                    await target.publish(self._subject, payload)
             except Exception as err:
                 with self._counter_lock:
                     self.failed += 1
                 _diag.lost("event", 1, f"NATSSink publish, {type(err).__name__}")
             else:
                 published += 1
+        unattempted = len(batch) - attempted
         if batch and not published:
-            raise SinkDeliveryError(f"NATSSink published none of {len(batch)} event(s)")
+            raise SinkDeliveryError(
+                f"NATSSink published none of {len(batch)} event(s)"
+                + (f", {unattempted} not attempted within {self.publish_timeout}s" if unattempted
+                   else "")
+            )
+        if unattempted:
+            with self._counter_lock:
+                self.failed += unattempted
+            _diag.lost("event", unattempted, f"NATSSink publish_timeout {self.publish_timeout}s")
 
     def flush(self) -> None:
         """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
