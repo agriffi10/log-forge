@@ -253,3 +253,146 @@ def test_firehose_has_no_partition_key_to_charge() -> None:
     client = FakeFirehose()
     FirehoseSink("stream", client=client).emit([{"a": 1}])
     assert set(client.calls[0][0]) == {"Data"}, "a Firehose record carries no PartitionKey"
+
+
+class _Boom(Exception):
+    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError."""
+
+
+class _Raising:
+    """A Kinesis client that raises on the chosen call numbers, and records what it accepted."""
+
+    def __init__(self, fail_on: set[int]) -> None:
+        self.calls = 0
+        self.accepted: list[str] = []
+        self.fail_on = fail_on
+
+    def _go(self, items: list[str]) -> None:
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise _Boom("the endpoint could not be reached")
+        self.accepted.extend(items)
+
+    def put_records(self, *, StreamName, Records):
+        self._go([bytes(r["Data"]).decode() for r in Records])
+        return {"FailedRecordCount": 0, "Records": [{} for _ in Records]}
+
+
+def test_a_client_failure_costs_its_chunk_not_the_batch(capsys) -> None:
+    """SPEC-048 FR-002. The client call was unguarded, so a fault mid-batch duplicated the rest.
+
+    A `ClientError` on chunk N propagated out of `emit` after chunks 1..N-1 had landed, and the
+    worker retries whole batches -- so the exit drain, which is one large batch by construction,
+    re-sent everything already delivered. Measured before the fix: 600 records, `duplicates=500 losses=(0, 0)`.
+
+    The criterion that binds is that `emit` **returns**: that is what stops the worker's retry at
+    its source, so the duplication cannot happen rather than being cleaned up afterwards.
+    """
+    client = _Raising(fail_on={2})
+    sink = KinesisSink("stream", client=client, max_retries=0)
+    sink.emit([{"i": i, "trace_id": f"t{i}"} for i in range(1000)])
+    assert len(client.accepted) == len(set(client.accepted)) == 500, (
+        "the chunks that landed are delivered exactly once"
+    )
+    assert sink.losses().failed == 500, "and the failed chunk is counted, not silent"
+    assert "_Boom" in capsys.readouterr().err, "and announced by exception type"
+
+
+def test_a_total_client_failure_still_raises() -> None:
+    """A wholly-failed batch must still reach the worker's retry -- nothing landed to duplicate.
+
+    **This is the mutation-sensitive one.** With the guard added and the failure not fed back
+    into the total-failure test, `emit` returns normally having lost the entire batch with
+    `losses()` reading zero -- which is precisely the "a sink that absorbs a total failure is a
+    sink the worker believes" shape SPEC-026 exists to end.
+    """
+    client = _Raising(fail_on=set(range(1, 500)))
+    sink = KinesisSink("stream", client=client, max_retries=0)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": i, "trace_id": f"t{i}"} for i in range(1000)])
+    assert client.accepted == [], "nothing landed"
+    assert sink.losses().failed > 0, "and every abandoned item is counted"
+
+
+def test_a_keyboard_interrupt_is_not_absorbed_by_the_chunk_guard() -> None:
+    """The guard catches `Exception`, never `BaseException` (SPEC-025 FR-004).
+
+    An operator's Ctrl-C and the runtime's `SystemExit` are intent, and must reach the caller.
+    """
+
+    class _Interrupting(_Raising):
+        def _go(self, items: list[str]) -> None:
+            raise KeyboardInterrupt
+
+    sink = KinesisSink("stream", client=_Interrupting(fail_on=set()), max_retries=0)
+    with pytest.raises(KeyboardInterrupt):
+        sink.emit([{"i": 1, "trace_id": "t"}])
+
+
+def test_the_per_record_ceiling_charges_the_partition_key(capsys) -> None:
+    """SPEC-048 FR-003. `PutRecords` bills the key against the per-record limit; the check did not.
+
+    Measured before the fix: `data=1048576 + key=200` passed the sink's check and went to the
+    wire, where the service rejects the whole `PutRecords` call -- which, via the unguarded
+    client call FR-002 closes, then duplicated every earlier chunk.
+    """
+    client = FakeKinesis()
+    sink = KinesisSink("stream", client=client, partition_key_field="trace_id")
+    key = "k" * 200
+    probe = {"trace_id": key, "pad": ""}
+    overhead = len(json.dumps(probe).encode())
+    event = {"trace_id": key, "pad": "x" * (sink.MAX_RECORD_BYTES - overhead)}
+
+    sink.emit([event])
+    assert client.calls == [], "the record is dropped before any client call"
+    assert sink.losses().dropped == 1
+    err = capsys.readouterr().err
+    assert "1048776 bytes with its partition key" in err, (
+        "the diagnostic reports the total charged, not the data length alone"
+    )
+
+
+def test_a_record_exactly_at_the_ceiling_including_its_key_is_sent() -> None:
+    """The boundary is inclusive: data + key == the limit still goes."""
+    client = FakeKinesis()
+    sink = KinesisSink("stream", client=client, partition_key_field="trace_id")
+    key = "k" * 200
+    probe = {"trace_id": key, "pad": ""}
+    overhead = len(json.dumps(probe).encode())
+    event = {"trace_id": key, "pad": "x" * (sink.MAX_RECORD_BYTES - overhead - len(key))}
+
+    sink.emit([event])
+    assert len(client.calls) == 1, "a record exactly at the ceiling is sent"
+    assert sink.losses().dropped == 0
+
+
+def test_a_partition_key_is_charged_and_bounded_in_utf8_bytes() -> None:
+    """Bytes, not characters. The two differ for any non-ASCII key and the service bills bytes."""
+    from log_foundry.sinks.kinesis import MAX_PARTITION_KEY_BYTES, _partition_key, _record_size
+
+    multibyte = "é" * 200  # 200 characters, 400 UTF-8 bytes
+    assert len(multibyte) == 200 and len(multibyte.encode()) == 400
+
+    bounded = _partition_key(multibyte)
+    encoded = bounded.encode("utf-8")
+    assert len(encoded) <= MAX_PARTITION_KEY_BYTES, "bounded on bytes, not on characters"
+    assert bounded == encoded.decode("utf-8"), "and the cut leaves valid UTF-8"
+
+    record = {"Data": b"x" * 10, "PartitionKey": bounded}
+    assert _record_size(record) == 10 + len(encoded), (
+        "the request budget charges the key's byte length too"
+    )
+    assert _record_size(record) != 10 + len(bounded), "which differs from its character length"
+
+
+def test_a_lone_surrogate_in_the_partition_key_does_not_raise_out_of_emit() -> None:
+    """`sanitize.coerce` passes a lone surrogate through, and a bare encode on one raises.
+
+    A `UnicodeEncodeError` escaping `emit` is precisely the raw, uncounted failure SPEC-048
+    exists to remove -- so introducing one through its own fix would be the worst kind of
+    regression. Both encodes carry `errors=` for this.
+    """
+    client = FakeKinesis()
+    sink = KinesisSink("stream", client=client, partition_key_field="trace_id")
+    sink.emit([{"trace_id": "\udcff-bad", "i": 1}])
+    assert len(client.calls) == 1, "the record still goes"

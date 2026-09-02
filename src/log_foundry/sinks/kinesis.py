@@ -180,17 +180,18 @@ class KinesisSink:
         records: list[dict[str, Any]] = []
         for event in batch:
             data = json.dumps(event).encode("utf-8")
-            if len(data) > self.MAX_RECORD_BYTES:
+            key = _partition_key(str(event.get(self.partition_key_field) or "log-foundry"))
+            charged = len(data) + len(key.encode("utf-8"))
+            if charged > self.MAX_RECORD_BYTES:
                 with self._counter_lock:
                     self.dropped_oversized += 1
                 _diag.lost(
                     "event",
                     1,
-                    f"KinesisSink, {len(data)} bytes exceeds the "
+                    f"KinesisSink, {charged} bytes with its partition key exceeds the "
                     f"{self.MAX_RECORD_BYTES}-byte per-record limit",
                 )
                 continue
-            key = str(event.get(self.partition_key_field) or "log-foundry")[:256]
             records.append({"Data": data, "PartitionKey": key})
         return records
 
@@ -200,6 +201,22 @@ class KinesisSink:
         The wait comes before the next attempt and never before abandoning (SPEC-027 FR-003):
         this loop re-sends the records the destination flagged, and the canonical reason it flags
         them is throttling, which an immediate re-send makes worse.
+
+        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
+        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
+        the worker re-send the whole batch and duplicate everything already delivered — the exit
+        drain, one large batch by construction, is exactly that shape. The guard sits around the
+        client call *inside* this loop rather than around ``_send`` in ``emit``, so only the
+        records still outstanding at the failing attempt are charged and the ones already accepted
+        still count toward the return.
+
+        A client exception is treated as **provable non-delivery** for the chunk, so a wholly
+        failed batch still raises and ``unknown`` is untouched: SPEC-018's "unadjudicable" is a
+        property of a *response*, and an exception is not a response. The cost is written down —
+        a read timeout means the request went out and the reply was lost, so a re-send may
+        duplicate — and taken because an unreachable endpoint is the common case and is exactly
+        what the worker's retry exists for, while suppressing the raise would lose every event of
+        every batch for a whole outage, silently.
 
         Args:
           records: One chunk's request entries.
@@ -212,11 +229,27 @@ class KinesisSink:
           SPEC-018 settled must never be re-sent.
 
         Raises:
-          Exception: Whatever the client raises.
+          None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
+            or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
         sent = len(records)
         for attempt in range(self.max_retries + 1):
-            response = self.client.put_records(StreamName=self.stream_name, Records=records)
+            try:
+                response = self.client.put_records(
+                    StreamName=self.stream_name, Records=records
+                )
+            except Exception as err:
+                if attempt < self.max_retries:
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
+                    continue
+                with self._counter_lock:
+                    self.failed += len(records)
+                _diag.lost(
+                    "record",
+                    len(records),
+                    f"KinesisSink, {self.max_retries + 1} attempt(s), {type(err).__name__}",
+                )
+                return sent - len(records)
             if not response.get("FailedRecordCount"):
                 return sent
             results = usable_results(response.get("Records"))
@@ -248,6 +281,38 @@ class KinesisSink:
         return 0
 
 
+MAX_PARTITION_KEY_BYTES = 256
+"""The service's ceiling on a ``PutRecords`` partition key, in UTF-8 bytes."""
+
+
+def _partition_key(raw: str) -> str:
+    """Bounds a partition key to the service's 256 **bytes**, never 256 characters.
+
+    Both encodes carry an ``errors=`` and both are load-bearing. ``sanitize.coerce`` passes a lone
+    surrogate through unchanged, so a bare ``encode("utf-8")`` on a caller's ``trace_id`` raises
+    ``UnicodeEncodeError`` — a raw exception out of ``emit``, which is the failure SPEC-048 exists
+    to remove rather than introduce. ``errors="ignore"`` on the decode drops a character the byte
+    cut landed inside, so the result always decodes cleanly.
+
+    ``sanitize.truncate_str`` is the inventoried byte-bounded clipper and is deliberately **not**
+    reused: it appends a truncation marker, and a marker inside a partition key changes the shard
+    the record lands on.
+
+    Args:
+      raw: The derived key.
+
+    Returns:
+      The key, at most :data:`MAX_PARTITION_KEY_BYTES` UTF-8 bytes and always valid UTF-8.
+
+    Raises:
+      None.
+    """
+    encoded = raw.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_PARTITION_KEY_BYTES:
+        return encoded.decode("utf-8")
+    return encoded[:MAX_PARTITION_KEY_BYTES].decode("utf-8", errors="ignore")
+
+
 def _record_size(record: dict[str, Any]) -> int:
     """Measures one request entry, partition key included (SPEC-038 FR-009).
 
@@ -255,6 +320,10 @@ def _record_size(record: dict[str, Any]) -> int:
     to 256 bytes, so a 500-record request could understate itself by ~128 KB — enough to have the
     service reject a chunk this sink believed was inside the budget. ``SQSSink`` charges its FIFO
     ids for the same reason and records the same rationale.
+
+    The charge is the key's **UTF-8 byte length**, not its character count (SPEC-048 FR-003): the
+    two differ for any non-ASCII key, and the service bills bytes. No ``errors=`` is needed here,
+    because :func:`_partition_key` already built this value and its output always encodes cleanly.
 
     This applies to Kinesis alone: a Firehose record is ``{"Data": data}`` and that API has no
     partition key, so there is nothing there to charge.
@@ -268,4 +337,4 @@ def _record_size(record: dict[str, Any]) -> int:
     Raises:
       None.
     """
-    return len(record["Data"]) + len(record["PartitionKey"])
+    return len(record["Data"]) + len(record["PartitionKey"].encode("utf-8"))

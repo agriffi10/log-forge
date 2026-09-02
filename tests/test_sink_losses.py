@@ -7,6 +7,7 @@ fake sockets/openers — so no test touches the network.
 
 from __future__ import annotations
 
+import ast
 import json
 
 import pytest
@@ -1382,3 +1383,79 @@ def test_pubsub_names_which_counter_moved(capsys) -> None:
     unconfirmed = capsys.readouterr().err
     assert "publish unconfirmed" in unconfirmed
     assert "refused" not in unconfirmed, "the two paths must not read alike"
+
+
+def _sends_with_a_client_call() -> dict[str, ast.FunctionDef]:
+    """Every `_send` in `sinks/` whose body calls `self.client.<method>(...)`.
+
+    Derived on **shape**, not from a module list: a hard-coded `{sqs, sns, kinesis, firehose}`
+    would leave a fifth AWS-shaped sink green, which is the whole point of the criterion this
+    roster serves (SPEC-048 FR-002 AC-6). The same lesson SPEC-033's four-site defect and
+    SPEC-028's three missing sinks both taught — a roster in prose is not a roster the tests check.
+    """
+    import pathlib
+
+    import log_foundry
+
+    found: dict[str, ast.FunctionDef] = {}
+    for path in sorted((pathlib.Path(log_foundry.__file__).parent / "sinks").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "_send":
+                continue
+            calls_client = any(
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Attribute)
+                and call.func.value.attr == "client"
+                and isinstance(call.func.value.value, ast.Name)
+                and call.func.value.value.id == "self"
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+            )
+            if calls_client:
+                found[path.stem] = node
+    return found
+
+
+def test_every_send_that_calls_a_client_guards_it() -> None:
+    """SPEC-048 FR-002 AC-6. An unguarded client call makes the worker duplicate what landed.
+
+    A `ClientError` on chunk N propagated out of `emit` after chunks 1..N-1 had landed, and the
+    worker retries whole batches — measured at `duplicates=500` for a 1,000-record Kinesis batch,
+    with `losses()` reading (0, 0) throughout.
+
+    The floor matters as much as the check: a derived roster with no floor goes quiet the moment
+    the derivation breaks, and this repo already floors its fork and concurrency rosters for that
+    reason. Four is the shipped population; a fifth is a decision somebody takes, not a silence.
+    """
+    roster = _sends_with_a_client_call()
+    assert len(roster) >= 4, (
+        f"the derivation found {len(roster)} `_send`s calling a client, expected at least the "
+        f"four AWS batch sinks; found {sorted(roster)}"
+    )
+    assert {"sqs", "sns", "kinesis", "firehose"} <= set(roster), sorted(roster)
+
+    unguarded = []
+    for module, node in sorted(roster.items()):
+        guarded = any(
+            any(
+                isinstance(handler.type, ast.Name) and handler.type.id == "Exception"
+                for handler in try_node.handlers
+            )
+            and any(
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Attribute)
+                and call.func.value.attr == "client"
+                for call in ast.walk(try_node)
+                if isinstance(call, ast.Call)
+            )
+            for try_node in ast.walk(node)
+            if isinstance(try_node, ast.Try)
+        )
+        if not guarded:
+            unguarded.append(module)
+    assert unguarded == [], (
+        f"these sinks call a client from `_send` without catching Exception around it, so a "
+        f"client fault mid-batch escapes `emit` and the worker's retry duplicates every chunk "
+        f"that already landed: {unguarded}"
+    )
