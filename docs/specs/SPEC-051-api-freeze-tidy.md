@@ -1,7 +1,7 @@
 # Spec: API Freeze Tidy
 
 **ID:** SPEC-051  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-09-02  
 **Depends On:** SPEC-034, SPEC-036, SPEC-040, SPEC-042
 
