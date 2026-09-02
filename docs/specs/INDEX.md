@@ -56,7 +56,7 @@ to status only — no prose.
 | [SPEC-049](SPEC-049-sink-construction-validation-and-driver-bounds.md) | Sink Construction Validation and Driver Bounds | Draft | SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048 |
 | [SPEC-050](SPEC-050-lifecycle-residue.md) | Lifecycle Residue — Stranded Waiters, Unfinished Closes and Uncounted Loss | Completed | SPEC-013, SPEC-021, SPEC-027, SPEC-030, SPEC-031, SPEC-036, SPEC-039, SPEC-042, SPEC-045, SPEC-046 |
 | [SPEC-052](SPEC-052-docstring-rule-and-test-scaffolding.md) | The Ungated Docstring Rule, and the Scaffolding It Left Behind | In Progress | None |
-| [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | Draft | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
+| [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | In Progress | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
 
 ## Arcs (build order)
 
@@ -206,8 +206,9 @@ Group related specs and record the order to build them in. Keep this section: a 
   **The 1.0 cut line.** Most of this arc does **not** have to precede the tag, and that follows
   from taking 034 first: with `Health` a frozen dataclass and the `Sink` members probed by name,
   every remaining counter, hook and reason is *additive* and free in `1.x`. What genuinely freezes
-  at 1.0 is **SPEC-034 entire**, plus **SPEC-038 FR-012** (`RotatingFileSink`'s default) and
-  **FR-013** (the utility sinks' module). Everything else is urgent because it is data loss, not
+  at 1.0 is **SPEC-034 entire**, plus **SPEC-038 FR-012** (`RotatingFileSink`'s default),
+  **FR-013** (the utility sinks' module) and **SPEC-051**, which is the same test applied to
+  what 034 left: a shape that is free to change today and breaking to change after the tag. Everything else is urgent because it is data loss, not
   because of the tag — a distinction worth keeping, because treating the whole arc as
   release-blocking is how a tag stays held indefinitely.
 
