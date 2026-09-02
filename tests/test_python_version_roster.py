@@ -1,8 +1,13 @@
-"""The supported-Python versions are stated in twelve places; this makes them agree.
+"""One fact, restated across eight files; this makes the restatements agree.
+
+The supported-Python versions are stated in `ci.yml`, `release.yml`, `integration.yml`,
+`pip-audit.yml`, `pyproject.toml`, `README.md`, `CLAUDE.md`, and both best-practices docs. No count
+is given here on purpose — `_CHECKS`, `_PROSE_SITES` and `_FLOOR_SITES` below are the enumeration,
+and a number in this sentence would be a claim nothing re-measures.
 
 `.github/workflows/ci.yml`'s `python-version` matrix is the **authority**, because it is the only
-one of the twelve that is evidence rather than a claim: it is the set of runtimes a gate actually
-ran on. Every other site restates it, and until this file nothing checked that they agreed. That
+one that is evidence rather than a claim: it is the set of runtimes a gate actually ran on. Every
+other site restates it, and until this file nothing checked that they agreed. That
 was measured, not assumed — the matrix was mutated to `["3.12", "3.13", "3.14"]` and all five repo
 gates (ruff, mypy, pytest, spec-lint, docs-lint) exited 0. Nothing in `tests/` or `scripts/` read
 `ci.yml`, and `scripts/make-sbom.py` parses `pyproject.toml` for `[project.optional-dependencies]`
@@ -18,12 +23,16 @@ Both directions of drift are silent, and they fail differently:
   `Programming Language :: Python :: 3.14` in the built wheel's METADATA — verified by building
   one — for a runtime no CI job has ever run.
 
-**The matrix is only an authority while something consumes it**, which is why two of the checks
-here are about `ci.yml` itself rather than about a site downstream of it. Pin the `setup-python`
-step to a literal and both legs install the same interpreter while every claim in the repo stays
-true on paper; hardcode the matrix job's `name:` and the branch-protection check names stop being
-derived from the matrix at all. A roster over the restatements alone would have been green through
-either.
+**The matrix is an authority only under conditions this file cannot fully verify**, and saying so
+is the honest form of the claim. `check_setup_python_consumes_matrix` covers one of them — pin the
+`setup-python` step to a literal and both legs install the same interpreter while every claim in
+the repo stays true on paper — and `check_name_suffix` covers a second. The rest are named and not
+checked: the workflow has to be **triggered** (delete `on: pull_request` and this roster is green
+over a gate nothing runs), the job must not be skipped by an `if:` or a path filter, and no
+`exclude:` may thin the matrix. Each is a fresh instance of one class — the authority can be
+neutralised upstream — and CLAUDE.md's rule is that a recurring class wants a structural answer
+rather than another check. The structural answer is this paragraph: the roster establishes that
+every *restatement* matches the matrix, not that the matrix ran.
 
 The sites are **derived where they can be** rather than hand-kept, for the reason
 `docs/decisions.md` gives for the SPEC-035 and SPEC-040 rosters: "a roster that hand-lists
@@ -41,14 +50,23 @@ ways, because set equality alone passes a bullet reading "Python >= 3.13 ... gat
 3.13": every number present is right and the floor is wrong.
 
 **Not** checked: that the versions are real CPython releases, that the interpreter running this
-test is one of them, or anything about the prose around the numbers. This binds twelve statements
-of one fact to each other; it does not adjudicate the fact.
+test is one of them, or anything about the prose around the numbers. This binds the restatements to
+each other; it does not adjudicate the fact.
 
-The README's required-check names are branch-protection check NAMES, so a matrix change also moves
-a repository setting that no file here can see. Both halves of `test / test (py3.12)` are bound:
-the prefix is the id of the `release.yml` job that `uses:` this workflow, and the suffix is the
-matrix job's own `name:`. They are bound here because a stale README is how that repository setting
-gets missed.
+**Two of the sites are documentation the repo routes agents through**, and they are here because
+they are the two that have already drifted. `ae7447d` — this branch's own parent — exists to
+correct a `>= 3.13` floor stated twice in `docs/best-practices/python/python.md` and once in the
+`INDEX.md` that routes every Python task to it. A stale floor there does not merely read wrong: it
+instructs the next session to write a call the floor cannot run. The roster bound CLAUDE.md, the
+file that stayed correct, before it bound the two that did not.
+
+The README's `test / test (pyX.Y)` strings are branch-protection check-run NAMES, and both halves
+are bound: the prefix is the id of the `release.yml` job that `uses:` this workflow, the suffix is
+the matrix job's own `name:`. Bound, but stated carefully — `main`'s ruleset requires **no** status
+checks today, which `ci.yml` records having checked rather than assumed. So a matrix change breaks
+nothing on the remote the moment it lands; what it changes is the string anyone would have to
+require *if* a check is ever made required, and no file in this repository can see that setting to
+correct it later.
 
 Parsed with `re`, not a YAML or TOML reader. PyYAML is not in the dev group and the core is
 deliberately dependency-free (CLAUDE.md: "Don't add dependencies without noting them here first");
@@ -151,6 +169,8 @@ class Sources:
     pyproject: str
     readme: str
     claude: str
+    python_rulebook: str
+    bp_index: str
     workflows: dict[str, str]
 
 
@@ -233,9 +253,13 @@ def _parse_matrix(ci: str) -> tuple[list[str], str | None]:
     if unreadable:
         return [], (
             f"ci.yml: matrix entries {unreadable} are not quoted MAJOR.MINOR. YAML reads an "
-            "unquoted 3.10 as the float 3.1, so the quotes are load-bearing rather than style. A "
-            'free-threaded leg (`"3.13t"`) is refused here too: supporting one means widening '
-            "`_QUOTED_VERSION` and `_VERSION`, not editing this message."
+            "unquoted 3.10 as the float 3.1, so the quotes are load-bearing rather than style.\n"
+            '  A free-threaded leg (`"3.13t"`) is refused here too, and supporting one is more '
+            "than a wider regex: `_QUOTED_VERSION`, `_VERSION` and `_key` all have to change "
+            "together — `_key` parses each dotted part with `int()` and raises on `13t` — and "
+            "`check_classifier_versions` becomes unsatisfiable, because there is no PyPI "
+            "classifier for a free-threaded build. That is a decision to record, not a regex to "
+            "widen."
         )
     versions = sorted((entry[1:-1] for entry in entries), key=_key)
     if len(set(versions)) != len(versions):
@@ -339,7 +363,10 @@ _PROSE_SITES = (
     (
         "README.md, the Requirements bullet",
         "readme",
-        re.compile(r"^- \*\*Python .*$", re.MULTILINE),
+        # `[≥>]=? ?\d` rather than `.*`: a second bullet opening "- **Python free-threading ..."
+        # states no version and must not be mistaken for a rival copy of this claim. An anchor
+        # that reddens a legitimate edit is an anchor someone deletes.
+        re.compile(r"^- \*\*Python [≥>]=? ?\d.*$", re.MULTILINE),
     ),
     (
         "README.md, the `ci.yml` row of the Continuous integration table",
@@ -351,9 +378,23 @@ _PROSE_SITES = (
         "claude",
         re.compile(r"^\|\s*Language\s*\|.*$", re.MULTILINE),
     ),
+    (
+        "docs/best-practices/python/python.md, the rulebook's scope blockquote",
+        "python_rulebook",
+        # Anchored on the SHAPE OF THE CLAIM rather than on the sentence around it, so the line
+        # is found wherever in the file it moves to -- and a claim deleted outright is a missing
+        # anchor, which fails. CLAUDE.md routes every Python task through this file first, so a
+        # stale floor here does not merely read wrong: it instructs the next agent to write a
+        # 3.13-only call. It is also one of the two files that actually drifted -- `ae7447d`,
+        # this branch's own parent, exists to correct a `>= 3.13` floor stated here twice.
+        re.compile(r"^> .*\*\*Python [≥>]=? ?\d.*$", re.MULTILINE),
+    ),
 )
 
-# The subset whose sentence also states a FLOOR, with the pattern that extracts it.
+# The FLOOR claims. A site appears here as well as above when its sentence states both, and here
+# ALONE when it states only a minimum -- `3.12+` names one version and is not a claim about the
+# gated set. Every occurrence is checked, not just the first: two copies of a floor claim in one
+# file drift independently, and `search` would have adjudicated only the earlier one.
 _FLOOR_SITES = (
     (
         "README.md, the Requirements bullet",
@@ -364,6 +405,21 @@ _FLOOR_SITES = (
         "CLAUDE.md, the Language row of the Tech Stack table",
         "claude",
         re.compile(r"^\|\s*Language\s*\|\s*Python \*\*[≥>]=? ?(?P<v>\d+\.\d+)\*\*", re.MULTILINE),
+    ),
+    (
+        "docs/best-practices/python/python.md, the rulebook's scope blockquote",
+        "python_rulebook",
+        re.compile(r"^> .*\*\*Python [≥>]=? ?(?P<v>\d+\.\d+)\*\*", re.MULTILINE),
+    ),
+    (
+        "docs/best-practices/INDEX.md, the Python row of the router table",
+        "bp_index",
+        re.compile(r"^\|\s*Python \((?P<v>\d+\.\d+)\+", re.MULTILINE),
+    ),
+    (
+        "README.md, the `poetry install` line of the Development section",
+        "readme",
+        re.compile(r"^poetry install .*\(Python (?P<v>\d+\.\d+)\+\)", re.MULTILINE),
     ),
 )
 
@@ -593,40 +649,45 @@ def check_prose_floor(sources: Sources, matrix: list[str]) -> list[str]:
     floor = _floor(matrix)
     complaints = []
     for label, attribute, anchor in _FLOOR_SITES:
-        match = anchor.search(getattr(sources, attribute))
-        if match is None:
+        stated = [m.group("v") for m in anchor.finditer(getattr(sources, attribute))]
+        if not stated:
             complaints.append(
                 f"{label}: no `>= MAJOR.MINOR` floor found by {anchor.pattern!r}. Re-anchor it "
                 "rather than dropping the check."
             )
-        elif match.group("v") != floor:
+        wrong = sorted({v for v in stated if v != floor})
+        if wrong:
             complaints.append(
-                f"{label} claims a floor of Python {match.group('v')}; the lowest version ci.yml "
+                f"{label} claims a floor of Python {wrong}; the lowest version ci.yml "
                 f"gates is {floor}."
             )
     return complaints
 
 
 def check_readme_check_names(sources: Sources, matrix: list[str]) -> list[str]:
-    """The `<caller> / test (pyX.Y)` names the README calls required are the matrix's.
+    """The `<caller> / test (pyX.Y)` names the README records are the matrix's.
 
-    These are branch-protection check NAMES. No file here can read that setting, so a matrix change
-    moves a repository setting silently; keeping the README honest is the only in-repo trace of it.
+    These are check-run names, which is what a branch-protection rule matches on. `main`'s ruleset
+    requires no status checks today (`ci.yml` says so, having checked the ruleset rather than
+    inferred it from the review requirement), so nothing breaks on the remote when the matrix
+    moves. What the README holds is the string that would have to be required if one ever were,
+    and no file here can read that setting to correct it after the fact.
     """
     named = {m.group("v") for m in _CHECK_NAME.finditer(sources.readme)}
     if not named:
         return [
             (
-                "README.md names no `<caller> / test (pyX.Y)` check. It documented the "
-                "branch-protection required checks when this was written; re-anchor rather than drop."
+                "README.md names no `<caller> / test (pyX.Y)` check run. It recorded how the "
+                "gate is named on `main` when this was written; re-anchor rather than drop."
             )
         ]
     if named != set(matrix):
         return [
             (
-                f"README.md calls the required checks Python {_show(named)}; ci.yml gates "
-                f"{_show(matrix)}. Changing the matrix renames these check runs, which also means "
-                "editing the `main` ruleset — a repository setting, not a file."
+                f"README.md names the check runs Python {_show(named)}; ci.yml gates "
+                f"{_show(matrix)}. Changing the matrix renames these check runs. `main` requires "
+                "no status checks today, so nothing breaks on the remote — but if one is ever "
+                "made required it is this string, and no file here can see that setting."
             )
         ]
     return []
@@ -649,8 +710,9 @@ def check_name_prefix(sources: Sources, matrix: list[str]) -> list[str]:
     """The README's check-name prefix is the id of the `release.yml` job that calls `ci.yml`.
 
     On `main` the gate runs as a reusable call, so the check run is named `<caller job id> / <called
-    job name>`. Rename that job in `release.yml` and the required checks are renamed with it —
-    which breaks branch protection and falsifies the README, with nothing else in the repo noticing.
+    job name>`. Rename that job in `release.yml` and every check run on `main` is renamed with it,
+    falsifying the README and moving the string any future branch-protection rule would have to
+    match — with nothing else in the repo noticing.
     """
     callers = {
         m.group("job") for m in _CI_CALLER_JOB.finditer(sources.workflows.get("release.yml", ""))
@@ -659,7 +721,7 @@ def check_name_prefix(sources: Sources, matrix: list[str]) -> list[str]:
         return [
             (
                 "release.yml has no job that `uses: ./.github/workflows/ci.yml`. That call is what "
-                "runs the gate on `main` and what gives the required checks their `<job> / ` prefix; "
+                "runs the gate on `main` and what gives the check runs their `<job> / ` prefix; "
                 "re-anchor `_CI_CALLER_JOB` rather than dropping this."
             )
         ]
@@ -667,10 +729,10 @@ def check_name_prefix(sources: Sources, matrix: list[str]) -> list[str]:
     if named and named != callers:
         return [
             (
-                f"README.md calls the required checks {sorted(named)}`/ test (pyX.Y)`, but the "
+                f"README.md names the check runs {sorted(named)}`/ test (pyX.Y)`, but the "
                 f"release.yml job that calls ci.yml is {sorted(callers)}. The check-run name is "
-                "`<caller job id> / <called job name>`, so renaming that job renames the required "
-                "checks and silently breaks the `main` ruleset."
+                "`<caller job id> / <called job name>`, so renaming that job renames every check "
+                "run on `main` — silently, and out from under any rule that comes to require one."
             )
         ]
     return []
@@ -691,6 +753,38 @@ _CHECKS: dict[str, Callable[[Sources, list[str]], list[str]]] = {
     "name_suffix": check_name_suffix,
     "name_prefix": check_name_prefix,
 }
+
+
+_MATRIX_UNREADABLE = (
+    "Deferred: ci.yml's `python-version` matrix could not be read, so there is no authority to "
+    "check this site against — see the `matrix` check for the reason and the fix. Nothing about "
+    "this site is asserted to be wrong."
+)
+
+
+def _complaints(name: str, sources: Sources) -> list[str]:
+    """Run one check, deferring rather than adjudicating against an unreadable authority.
+
+    Without this, an unparseable matrix makes every downstream check compare its site against an
+    empty set and say so — "ci.yml gates (none)", "the lowest version ci.yml gates is None" —
+    which is loud, which is right, and which is also false: ci.yml plainly still gates the
+    versions in it. One true message and fourteen lies is worse than one true message, because
+    the true one is then just another line in the output.
+
+    Args:
+      name: The check to run.
+      sources: The text to run it over.
+
+    Returns:
+      That check's complaints.
+
+    Raises:
+      None.
+    """
+    matrix = _matrix(sources)
+    if not matrix and name != "matrix":
+        return [_MATRIX_UNREADABLE]
+    return _CHECKS[name](sources, matrix)
 
 
 def _read(path: pathlib.Path) -> str:
@@ -733,6 +827,8 @@ def _repo_sources() -> Sources:
         pyproject=_read(_ROOT / "pyproject.toml"),
         readme=_read(_ROOT / "README.md"),
         claude=_read(_ROOT / "CLAUDE.md"),
+        python_rulebook=_read(_ROOT / "docs" / "best-practices" / "python" / "python.md"),
+        bp_index=_read(_ROOT / "docs" / "best-practices" / "INDEX.md"),
         workflows={path.name: _read(path) for path in workflows},
     )
 
@@ -740,8 +836,7 @@ def _repo_sources() -> Sources:
 @pytest.mark.parametrize("name", sorted(_CHECKS), ids=sorted(_CHECKS))
 def test_the_repo_agrees_with_the_ci_matrix(name: str) -> None:
     """Every site in this repository states the versions `ci.yml` actually gates."""
-    sources = _repo_sources()
-    complaints = _CHECKS[name](sources, _matrix(sources))
+    complaints = _complaints(name, _repo_sources())
     assert not complaints, "\n".join(complaints)
 
 
@@ -801,7 +896,12 @@ _FIXTURE = Sources(
         "| [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 "
         "| every PR | yes |\n"
         "\n"
-        "The required checks are named `test / test (py3.12)` and `test / test (py3.13)`.\n"
+        "On main the checks are named `test / test (py3.12)` and `test / test (py3.13)`.\n"
+        "\n"
+        "```bash\n"
+        "poetry install --with dev      # set up (Python 3.12+)\n"
+        "poetry run pytest              # test\n"
+        "```\n"
     ),
     claude=(
         "| Layer | Tech |\n"
@@ -809,6 +909,21 @@ _FIXTURE = Sources(
         "| Language | Python **>= 3.12**, fully typed (PEP 561 `py.typed`) — CI gates on "
         "3.12 **and** 3.13 |\n"
         "| Packaging | Poetry |\n"
+    ),
+    python_rulebook=(
+        "# Python Best Practices — Agent Reference\n"
+        "\n"
+        "> Rulebook for agents writing Python in **log-foundry** (runtime **Python ≥ 3.12**, the "
+        "floor in `pyproject.toml`; CI gates 3.12 **and** 3.13, so a 3.13-only call is a bug "
+        "here). Distilled from **PEP 8** (+ PEP 257, PEP 484/526).\n"
+        "\n"
+        "## How to use this doc\n"
+    ),
+    bp_index=(
+        "| Domain | Doc | Load when you are… |\n"
+        "|---|---|---|\n"
+        "| Python (3.12+; PEP 8 + Google Python Style Guide) | `python/python.md` | writing "
+        "Python |\n"
     ),
     workflows={
         "ci.yml": (
@@ -880,10 +995,10 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "Requirements bullet names Python ['3.12', '3.13']",
     ),
     (
-        "matrix gains 3.14, seen from the required-check names",
+        "matrix gains 3.14, seen from the check-run names",
         "readme_check_names",
         _mutate(ci=('["3.12", "3.13"]', '["3.12", "3.13", "3.14"]')),
-        "calls the required checks Python ['3.12', '3.13']",
+        "names the check runs Python ['3.12', '3.13']",
     ),
     (
         "matrix drops 3.12, raising the floor",
@@ -901,7 +1016,7 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "matrix drops 3.12, seen from the prose floor",
         "prose_floor",
         _mutate(ci=('["3.12", "3.13"]', '["3.13"]')),
-        "claims a floor of Python 3.12",
+        "claims a floor of Python ['3.12']",
     ),
     (
         "matrix drops 3.12, seen from the workflow pins",
@@ -1081,7 +1196,7 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "README Requirements floor raised while its set stays right",
         "prose_floor",
         _mutate(readme=("- **Python ≥ 3.12**", "- **Python ≥ 3.13**")),
-        "claims a floor of Python 3.13",
+        "claims a floor of Python ['3.13']",
     ),
     (
         "README ci.yml table row drops a version",
@@ -1110,15 +1225,15 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "found 2",
     ),
     (
-        "README required-check names lose one leg",
+        "README check-run names lose one leg",
         "readme_check_names",
         _mutate(
             readme=("`test / test (py3.12)` and `test / test (py3.13)`", "`test / test (py3.12)`")
         ),
-        "calls the required checks Python ['3.12']",
+        "names the check runs Python ['3.12']",
     ),
     (
-        "README required-check names respelled past their anchor",
+        "README check-run names respelled past their anchor",
         "readme_check_names",
         _mutate(
             readme=(
@@ -1126,7 +1241,7 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
                 "`test (3.12)` and `test (3.13)`",
             )
         ),
-        "names no `<caller> / test (pyX.Y)` check",
+        "names no `<caller> / test (pyX.Y)` check run",
     ),
     (
         "CLAUDE.md Language row drops a version",
@@ -1138,7 +1253,7 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "CLAUDE.md Language row floor raised while its set stays right",
         "prose_floor",
         _mutate(claude=("Python **>= 3.12**", "Python **>= 3.13**")),
-        "claims a floor of Python 3.13",
+        "claims a floor of Python ['3.13']",
     ),
     (
         "CLAUDE.md Language row de-anchored",
@@ -1151,6 +1266,58 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "prose_versions",
         _mutate(claude=("CI gates on 3.12 **and** 3.13", "CI gates on 3.12, 3.13 **and** 4.0")),
         "names Python ['3.12', '3.13', '4.0']",
+    ),
+    (
+        "the Python rulebook's scope blockquote drops a version",
+        "prose_versions",
+        _mutate(
+            python_rulebook=(
+                "CI gates 3.12 **and** 3.13, so a 3.13-only call is a bug here",
+                "CI gates 3.12 only",
+            )
+        ),
+        "rulebook's scope blockquote names Python ['3.12']",
+    ),
+    (
+        "the Python rulebook's floor is raised while its set stays right",
+        "prose_floor",
+        _mutate(python_rulebook=("**Python ≥ 3.12**", "**Python ≥ 3.13**")),
+        "rulebook's scope blockquote claims a floor of Python ['3.13']",
+    ),
+    (
+        "the Python rulebook's scope blockquote is deleted",
+        "prose_versions",
+        _mutate(python_rulebook=("> Rulebook for agents", "Rulebook for agents")),
+        "expected exactly one line matching",
+    ),
+    (
+        "the best-practices router claims a floor above the matrix",
+        "prose_floor",
+        _mutate(bp_index=("| Python (3.12+;", "| Python (3.13+;")),
+        "router table claims a floor of Python ['3.13']",
+    ),
+    (
+        "the best-practices router row is de-anchored",
+        "prose_floor",
+        _mutate(bp_index=("| Python (3.12+;", "| Py (3.12+;")),
+        "router table: no `>= MAJOR.MINOR` floor found",
+    ),
+    (
+        "README's `poetry install` line claims a floor above the matrix",
+        "prose_floor",
+        _mutate(readme=("# set up (Python 3.12+)", "# set up (Python 3.13+)")),
+        "`poetry install` line of the Development section claims a floor of Python ['3.13']",
+    ),
+    (
+        "a SECOND copy of a floor claim drifts while the first stays right",
+        "prose_floor",
+        _mutate(
+            readme=(
+                "poetry run pytest              # test\n",
+                "poetry install --with security # extras (Python 3.13+)\n",
+            )
+        ),
+        "`poetry install` line of the Development section claims a floor of Python ['3.13']",
     ),
     # Silence cases. Roughly half a gate's regressions are false positives, so the corpus has to
     # prove what it does NOT complain about. The three `_VERSION` ones each sit on the ANCHORED
@@ -1193,6 +1360,17 @@ _MUTANTS: tuple[tuple[str, str | None, Sources, str], ...] = (
         "",
     ),
     (
+        "SILENCE: a second `- **Python ...` bullet that states no version",
+        None,
+        _mutate(
+            readme=(
+                "- **Python ≥ 3.12**",
+                ("- **Python free-threading builds** are not supported yet.\n- **Python ≥ 3.12**"),
+            )
+        ),
+        "",
+    ),
+    (
         "SILENCE: a classifier that is not a version claim is added",
         None,
         _mutate(pyproject=('    "Programming Language :: Python :: 3",', '    "Typing :: Typed",')),
@@ -1221,8 +1399,7 @@ def test_each_mutant_is_caught_by_the_right_check_for_the_right_reason(
     What is asserted is that the owning check is among them and that its message names the actual
     condition — a check that reddens for a different reason is not the check the corpus proves.
     """
-    matrix = _matrix(sources)
-    complaints = {name: check(sources, matrix) for name, check in _CHECKS.items()}
+    complaints = {name: _complaints(name, sources) for name in _CHECKS}
     reddened = {name for name, found in complaints.items() if found}
 
     if expected is None:
@@ -1237,6 +1414,26 @@ def test_each_mutant_is_caught_by_the_right_check_for_the_right_reason(
     assert any(reason in complaint for complaint in complaints[expected]), (
         f"{expected} complained for a different reason than the corpus claims. Wanted "
         f"{reason!r}, got: {complaints[expected]}"
+    )
+
+
+def test_an_unreadable_matrix_defers_rather_than_accusing_every_site() -> None:
+    """With no authority to check against, the other twelve checks say so rather than assert.
+
+    Before this, an unparseable matrix produced one true complaint and twelve false ones — "ci.yml
+    gates (none)", "the lowest version ci.yml gates is None" — about a file that plainly still
+    listed its versions. The true message was then just another line in the output.
+    """
+    sources = _mutate(ci=('python-version: ["3.12", "3.13"]', "python-version: []"))
+    complaints = {name: _complaints(name, sources) for name in _CHECKS}
+
+    assert complaints["matrix"] and "matrix is empty" in complaints["matrix"][0], complaints[
+        "matrix"
+    ]
+    others = {name: found for name, found in complaints.items() if name != "matrix"}
+    assert all(found == [_MATRIX_UNREADABLE] for found in others.values()), (
+        f"These checks adjudicated a site against an authority that could not be read: "
+        f"{ {n: c for n, c in others.items() if c != [_MATRIX_UNREADABLE]} }"
     )
 
 
