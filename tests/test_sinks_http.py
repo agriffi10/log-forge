@@ -10,9 +10,11 @@ double that agrees with the code cannot show that.
 from __future__ import annotations
 
 import gzip
+import http.server
 import json
 import threading
 import urllib.error
+from typing import ClassVar
 
 import pytest
 
@@ -634,3 +636,138 @@ def test_the_diagnostic_reports_the_attempts_actually_made(capsys) -> None:
         exhausted.emit([{"a": 1}])
     assert len(retried.calls) == 3
     assert "3 attempt(s)" in capsys.readouterr().err, "and an exhausted retry reports all of them"
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Records every request it receives, and answers whatever its class attributes say."""
+
+    seen: ClassVar[list[tuple[str, str, str | None, int]]] = []
+    redirect_to: str | None = None
+
+    def _record(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        type(self).seen.append(
+            (self.command, self.path, self.headers.get("Authorization"), len(body))
+        )
+
+    def do_POST(self) -> None:
+        self._record()
+        if self.redirect_to is not None:
+            self.send_response(type(self).status)
+            self.send_header("Location", self.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def _serve(handler: type) -> tuple[http.server.ThreadingHTTPServer, threading.Thread, int]:
+    """Binds `handler` on an ephemeral loopback port and serves it on a daemon thread."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, server.server_address[1]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_is_abandoned_rather_than_followed(status: int, capsys) -> None:
+    """SPEC-048 FR-001, against two real origins because the defect is in `urllib`'s own opener.
+
+    Before this, `urlopen`'s default opener followed 301/302/303 on a POST by rewriting the
+    method to GET and dropping the body, while keeping every header -- so an `http://` collector
+    behind a load balancer redirecting to `https://` lost every batch and forwarded the bearer
+    token to whatever host the redirect named, and the sink read the redirect target's 200 as
+    delivery. Measured: `[('POST', '/post', 'Bearer secret-token', 800), ('GET', '/landing',
+    'Bearer secret-token', 0)]`, emit returned, losses (0, 0).
+
+    **307 and 308 are regression pins, not evidence.** CPython's `redirect_request` already
+    raises `HTTPError` for a POST on those two, so those parameters pass against the unfixed
+    sink; only 301/302/303 exercise the fix. Labelled so a green run is not read as proof for
+    all five.
+
+    The assertion that binds is the *target's* empty request list: a test asserting only that
+    emit raised would pass against a sink that followed the redirect and then met a 4xx.
+    """
+    target = type("_Target", (_Recorder,), {"seen": [], "redirect_to": None, "status": 200})
+    tgt_server, tgt_thread, tgt_port = _serve(target)
+    collector = type(
+        "_Collector",
+        (_Recorder,),
+        {"seen": [], "redirect_to": f"http://127.0.0.1:{tgt_port}/landing", "status": status},
+    )
+    col_server, col_thread, col_port = _serve(collector)
+    try:
+        sink = HTTPSink(f"http://127.0.0.1:{col_port}/post", auth="secret-token", max_retries=0)
+        with pytest.raises(SinkDeliveryError):
+            sink.emit([{"i": i, "pad": "x" * 60} for i in range(10)])
+    finally:
+        for server, thread in ((col_server, col_thread), (tgt_server, tgt_thread)):
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    assert target.seen == [], (
+        f"the redirect target received {target.seen}; a batch and a bearer token reached a host "
+        f"the caller never configured"
+    )
+    assert sink.losses() == SinkLosses(dropped=0, failed=1), "the batch is counted, not silent"
+    assert f"HTTP {status}" in capsys.readouterr().err, "and named by status"
+
+
+def test_an_injected_opener_is_used_exactly_as_given() -> None:
+    """The no-redirect opener is the default only; an injected one is the caller's object."""
+    fake = FakeOpener([FakeResponse(200)])
+    assert HTTPSink("http://x", opener=fake)._opener is fake
+
+
+def test_gzip_does_not_overwrite_a_content_encoding_the_caller_set() -> None:
+    """SPEC-048 FR-007. `Content-Encoding` was the one caller header `gzip=True` overrode.
+
+    And when the caller's value wins the body must not be compressed, or the header and the bytes
+    disagree and the destination decodes garbage -- so the assertion is on the *body*, parsed,
+    not on its length.
+    """
+    plain = FakeOpener([FakeResponse(200)])
+    HTTPSink(
+        "http://x", gzip=True, headers={"Content-Encoding": "identity"}, opener=plain
+    ).emit([{"a": 1}])
+    call = plain.calls[0]
+    assert call["headers"]["content-encoding"] == "identity"
+    assert json.loads(call["body"].decode().strip()) == {"a": 1}, "and the body is not gzipped"
+
+    zipped = FakeOpener([FakeResponse(200)])
+    HTTPSink("http://x", gzip=True, opener=zipped).emit([{"a": 1}])
+    call = zipped.calls[0]
+    assert call["headers"]["content-encoding"] == "gzip"
+    assert json.loads(gzip.decompress(call["body"]).decode().strip()) == {"a": 1}
+
+
+def test_a_per_request_content_encoding_does_not_suppress_gzip() -> None:
+    """`extra_headers` sits *beneath* the caller's own, so it must not switch compression off.
+
+    The test is against `self._headers` rather than the merged map, and this pins that choice.
+    Keying on the merged map would let *any* per-request `Content-Encoding` switch the sink's own
+    compression off — a subclass or a future caller passing one through `extra_headers` would
+    silently stop gzipping, with the header and the intent disagreeing. No shipped caller does
+    that today (`SentrySink` is the only one passing `extra_headers` at all, and it passes
+    `X-Sentry-Auth`), which is exactly why a test is what keeps it true.
+    """
+    opener = FakeOpener([FakeResponse(200)])
+    sink = HTTPSink("http://x", gzip=True, opener=opener)
+    sink._send(b'{"a": 1}\n', content_type="application/x-ndjson",
+               extra_headers={"Content-Encoding": "identity"})
+    call = opener.calls[0]
+    assert call["headers"]["content-encoding"] == "gzip", "the sink's own gzip still wins"
+    assert gzip.decompress(call["body"])

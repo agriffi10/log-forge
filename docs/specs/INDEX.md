@@ -52,6 +52,8 @@ to status only — no prose.
 | [SPEC-045](SPEC-045-every-owed-close-is-performed.md) | Every Owed Close Is Performed | Completed | SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044 |
 | [SPEC-046](SPEC-046-concurrent-owed-closes.md) | Concurrent Owed Closes | Completed | SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045 |
 | [SPEC-047](SPEC-047-bounded-delivery-kafka-and-nats.md) | Bounded Delivery for `KafkaSink` and `NATSSink` | Completed | SPEC-026, SPEC-027, SPEC-032, SPEC-038, SPEC-041 |
+| [SPEC-048](SPEC-048-sink-delivery-loss-and-duplication.md) | Sink Delivery — Loss and Duplication | Completed | SPEC-016, SPEC-018, SPEC-026, SPEC-027, SPEC-032, SPEC-036, SPEC-038 |
+| [SPEC-049](SPEC-049-sink-construction-validation-and-driver-bounds.md) | Sink Construction Validation and Driver Bounds | Draft | SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048 |
 
 ## Arcs (build order)
 
@@ -259,3 +261,17 @@ Group related specs and record the order to build them in. Keep this section: a 
   owed closes concurrently and joins every one, which is strictly better than today on both axes
   — cost falls from `sum` to `max`, loss stays zero. It deliberately does **not** narrow the §13
   constraint that a single `Sink.close` cannot be bounded at all.
+
+- **Sink delivery correctness:** SPEC-048 then SPEC-049 — the nine sink findings of the 2026-09-02
+  pre-1.0 audit. The seam is **when the library refuses**, not what the refusal prevents: SPEC-048
+  is everything that reaches the wire wrongly or twice at run time, SPEC-049 is everything the
+  constructor should have refused, plus the three driver defaults SPEC-041 and SPEC-047 did not
+  reach. That is a correction — the pair was first cut on *consequence*, which put two
+  construction-time refusals in SPEC-048 while its own Out of Scope forbade them and SPEC-049 did
+  not name them. Build SPEC-048 first: it is the pair's blocking half (a followed redirect that
+  loses every batch and forwards the bearer token; four AWS sinks whose partial failure makes the
+  worker's retry duplicate what landed), and SPEC-049 rebases onto it rather than running beside
+  it, since both touch `http.py`, `clickhouse.py` and `file.py`. SPEC-049 also closes the two
+  construction-time open items `architecture.md` §12 records from SPEC-047 and defers to "a major
+  version that can refuse it" — 1.0 is that version, and a spec claiming every construction-time
+  refusal cannot leave the identical case open two sections away.

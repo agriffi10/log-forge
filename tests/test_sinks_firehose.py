@@ -290,3 +290,77 @@ def test_a_record_between_the_two_ceilings_is_dropped_rather_than_sent_to_be_rej
     over.emit([{"pad": "x" * (pad + 1)}])
     assert over.dropped_oversized == 1, "one byte over the real ceiling never reaches the wire"
     assert none.calls == []
+
+
+class _Boom(Exception):
+    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError."""
+
+
+class _Raising:
+    """A Firehose client that raises on the chosen call numbers, and records what it accepted."""
+
+    def __init__(self, fail_on: set[int]) -> None:
+        self.calls = 0
+        self.accepted: list[str] = []
+        self.fail_on = fail_on
+
+    def _go(self, items: list[str]) -> None:
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise _Boom("the endpoint could not be reached")
+        self.accepted.extend(items)
+
+    def put_record_batch(self, *, DeliveryStreamName, Records):
+        self._go([bytes(r["Data"]).decode() for r in Records])
+        return {"FailedPutCount": 0, "RequestResponses": [{} for _ in Records]}
+
+
+def test_a_client_failure_costs_its_chunk_not_the_batch(capsys) -> None:
+    """SPEC-048 FR-002. The client call was unguarded, so a fault mid-batch duplicated the rest.
+
+    A `ClientError` on chunk N propagated out of `emit` after chunks 1..N-1 had landed, and the
+    worker retries whole batches -- so the exit drain, which is one large batch by construction,
+    re-sent everything already delivered. Measured before the fix: 1,000 records in 2 chunks, `duplicates=500 losses=(0, 0)`.
+
+    The criterion that binds is that `emit` **returns**: that is what stops the worker's retry at
+    its source, so the duplication cannot happen rather than being cleaned up afterwards.
+    """
+    client = _Raising(fail_on={2})
+    sink = FirehoseSink("ds", client=client, max_retries=0)
+    sink.emit([{"i": i, "trace_id": f"t{i}"} for i in range(1000)])
+    assert len(client.accepted) == len(set(client.accepted)) == 500, (
+        "the chunks that landed are delivered exactly once"
+    )
+    assert sink.losses().failed == 500, "and the failed chunk is counted, not silent"
+    assert "_Boom" in capsys.readouterr().err, "and announced by exception type"
+
+
+def test_a_total_client_failure_still_raises() -> None:
+    """A wholly-failed batch must still reach the worker's retry -- nothing landed to duplicate.
+
+    **This is the mutation-sensitive one.** With the guard added and the failure not fed back
+    into the total-failure test, `emit` returns normally having lost the entire batch with
+    `losses()` reading zero -- which is precisely the "a sink that absorbs a total failure is a
+    sink the worker believes" shape SPEC-026 exists to end.
+    """
+    client = _Raising(fail_on=set(range(1, 500)))
+    sink = FirehoseSink("ds", client=client, max_retries=0)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": i, "trace_id": f"t{i}"} for i in range(1000)])
+    assert client.accepted == [], "nothing landed"
+    assert sink.losses().failed > 0, "and every abandoned item is counted"
+
+
+def test_a_keyboard_interrupt_is_not_absorbed_by_the_chunk_guard() -> None:
+    """The guard catches `Exception`, never `BaseException` (SPEC-025 FR-004).
+
+    An operator's Ctrl-C and the runtime's `SystemExit` are intent, and must reach the caller.
+    """
+
+    class _Interrupting(_Raising):
+        def _go(self, items: list[str]) -> None:
+            raise KeyboardInterrupt
+
+    sink = FirehoseSink("ds", client=_Interrupting(fail_on=set()), max_retries=0)
+    with pytest.raises(KeyboardInterrupt):
+        sink.emit([{"i": 1, "trace_id": "t"}])

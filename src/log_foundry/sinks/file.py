@@ -8,6 +8,7 @@ import threading
 import time
 from typing import TextIO
 
+from log_foundry import _diag
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["FileSink", "RotatingFileSink"]
@@ -267,6 +268,7 @@ class RotatingFileSink:
         self._stream: TextIO = open(path, "a", encoding=self._encoding)
         self._size = os.path.getsize(path) if os.path.exists(path) else 0
         self._next_rollover = self._schedule_next()
+        self._rotation_failing = False
         self._closed = False
         self._lock = threading.Lock()
 
@@ -278,6 +280,15 @@ class RotatingFileSink:
         ``_should_rotate`` check and the write that follows it must see the same stream, or a
         rotation between them sends the line to a closed handle.
 
+        **The batch is flushed before a rotation is attempted** (SPEC-048 FR-006). ``_rotate``
+        begins by closing the stream, which flushes it, while this loop otherwise flushes once at
+        the end — so under the canonical rotation failure, a full or read-only filesystem, it is
+        that flush that raises and the batch's buffered lines are gone before any rename is tried.
+        Flushing here means every event of the batch is on disk before the rotation can fail, at
+        every one of ``_rotate``'s raise sites rather than only at the renames. A flush that
+        raises *here* is deliberately not absorbed: nothing was written, so it is the
+        genuinely-total failure the worker's retry exists for.
+
         Args:
           batch: The events to write.
 
@@ -285,7 +296,9 @@ class RotatingFileSink:
           None.
 
         Raises:
-          OSError: If a write, flush or rotation fails.
+          OSError: If a write or a flush fails. A failed *rotation* no longer raises; see
+            :meth:`_rotate_or_continue`.
+          SinkDeliveryError: If the sink is closed.
         """
         if not batch:
             return
@@ -298,7 +311,8 @@ class RotatingFileSink:
                 line = json.dumps(event) + "\n"
                 data = len(line.encode(self._encoding))
                 if self._should_rotate(data):
-                    self._rotate()
+                    self._stream.flush()
+                    self._rotate_or_continue()
                 self._stream.write(line)
                 self._size += data
             self._stream.flush()
@@ -424,6 +438,68 @@ class RotatingFileSink:
         ):
             return True
         return self._next_rollover is not None and time.monotonic() >= self._next_rollover
+
+    def _rotate_or_continue(self) -> None:
+        """Rotates, or absorbs the failure and carries on writing to the un-rotated file.
+
+        A rotation that raised used to cost the batch twice. ``_rotate`` closes the active stream
+        first, so the events already written in this batch were on disk and the ``OSError``
+        propagated out of ``emit`` — the worker then re-sent the whole batch and wrote them again.
+        Measured: an 8-event batch failing after 3 were written put 11 lines on disk, 3 of them
+        duplicates. A persistent failure was worse: the sink kept a **closed** stream and every
+        later batch raised a raw ``PermissionError``, which is not a ``SinkDeliveryError`` and has
+        no ``losses()`` behind it.
+
+        Absorbing it costs nothing and duplicates nothing. The active file simply exceeds
+        ``max_bytes`` until a rotation succeeds, which is what happens anyway when rotation is
+        impossible — the trade SPEC-027 FR-004 already took, that a leaked resource beats a
+        corrupt write.
+
+        ``_next_rollover`` is re-armed as well as ``_size``: ``_rotate`` sets it on its last line,
+        so an absorbed failure would otherwise leave a **time** trigger permanently in the past.
+
+        **The re-arm does not damp the size trigger, and the diagnostic is what carries that.**
+        ``_size`` is re-seeded from a file that is now over ``max_bytes``, so ``_should_rotate``'s
+        size branch stays true and every subsequent event attempts a rotation again — measured at
+        598 attempts over 600 events. The attempts are cheap and lose nothing, but an unthrottled
+        stderr write per event is not: ``PostgresSink._reconnect_if_broken`` records the same rule
+        for the same reason, that a diagnostic which floods is one an operator stops reading. So
+        the failure is announced **once per outage** and the flag clears on the next successful
+        rotation. The remaining per-event attempt is recorded in ``architecture.md`` §12 rather
+        than fixed here, because damping it means deferring a rotation the caller asked for.
+
+        **The reopen can itself raise, and that is not absorbed.** It is the same
+        ``open(self._path, "a")`` call ``_rotate`` ends with, so whatever defeats it there —
+        a read-only mount, ``EMFILE``, a directory that lost write permission — defeats it here.
+        At that point this sink has no stream and cannot continue, so there is nothing to absorb
+        *into*; the ``OSError`` reaches ``emit`` and the worker retries the batch, duplicating the
+        prefix the pre-rotation flush had already written. That residue is recorded rather than
+        fixed: it is unchanged from before SPEC-048, the surviving events are on disk rather than
+        lost, and inventing a half-open state to avoid a duplicate would trade a visible
+        duplication for a silent loss.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the *reopen* fails, per the paragraph above. A failed **rotation** is
+            absorbed and announced through ``_diag``; the batch continues, nothing is dropped, no
+            counter moves, and this class still has no ``losses()``.
+        """
+        try:
+            self._rotate()
+        except OSError as err:
+            self._stream = open(self._path, "a", encoding=self._encoding)
+            self._size = os.path.getsize(self._path) if os.path.exists(self._path) else 0
+            self._next_rollover = self._schedule_next()
+            if not self._rotation_failing:
+                self._rotation_failing = True
+                _diag.absorbed("rotating RotatingFileSink", err)
+            return
+        self._rotation_failing = False
 
     def _rotate(self) -> None:
         """Closes the active file, shifts and prunes backups, then opens a fresh active file.

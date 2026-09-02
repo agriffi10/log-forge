@@ -548,3 +548,122 @@ def test_a_real_closed_client_is_not_a_usable_backend() -> None:
         f"client = sentry_sdk.Client(dsn={DSN!r})\n        client.close()",
         "a closed client should be active with no transport",
     )
+
+
+class FlushingClient(UsableClient):
+    """A usable client that counts the SDK-transport pushes `flush()` performs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flushes = 0
+
+    def flush(self, *args, **kwargs) -> None:
+        self.flushes += 1
+
+
+def test_close_pushes_the_sdk_transport() -> None:
+    """SPEC-048 FR-005. `shutdown()` alone stranded every captured event in the SDK's worker.
+
+    `capture_event` hands to the SDK's **background transport** and returns. `flush()` pushed that
+    queue; `close()` forwarded only to the `urllib` fallback, which holds nothing -- so the
+    frozen-Lambda path, where the SDK's own timer never fires again, lost the lot. Measured before
+    the fix: 25 events captured, `flush() calls after close() = 0`.
+    """
+    client = FlushingClient()
+    sink = SentrySink(client=client)
+    sink.emit([{"level": "error", "message": f"m{i}"} for i in range(25)])
+    assert len(client.events) == 25 and client.flushes == 0
+    sink.close()
+    assert client.flushes == 1, "close() pushes the SDK transport"
+
+
+def test_a_raising_sdk_flush_does_not_stop_the_fallback_release(capsys) -> None:
+    """close() is an isolation boundary: a failing flush must not skip the release below it.
+
+    Asserted on the release itself rather than on the absence of an exception -- "close() did not
+    raise" would pass against a close that returned early and released nothing.
+    """
+
+    class RaisingFlush(UsableClient):
+        def flush(self, *args, **kwargs):
+            raise RuntimeError("the transport is wedged")
+
+    from log_foundry.sinks import sentry as sentry_mod
+
+    released: list[object] = []
+    real_release = sentry_mod._lifecycle.release
+
+    def spy(sink_obj, *, owner):
+        released.append(sink_obj)
+        return real_release(sink_obj, owner=owner)
+
+    opener = FakeOpener()
+    sink = SentrySink(dsn=DSN, client=RaisingFlush(), opener=opener)
+    fallback = sink._http
+    assert fallback is not None
+    monkeypatched = pytest.MonkeyPatch()
+    monkeypatched.setattr(sentry_mod._lifecycle, "release", spy)
+    try:
+        sink.close()
+    finally:
+        monkeypatched.undo()
+    assert released == [fallback], (
+        "the fallback is released even though the SDK flush raised; asserting only that close() "
+        "did not raise would pass against a close that returned early and released nothing"
+    )
+    assert "RuntimeError" in capsys.readouterr().err, "and the failure is announced by type"
+
+
+def test_a_client_less_sink_attempts_no_sdk_flush(capsys) -> None:
+    """`backend="http"` holds no SDK queue, so close() must not push one on the app's behalf.
+
+    Asserted on the *release*, not on `client is None` — that last is state the test arranged.
+
+    **What this can and cannot show**, because the difference was got wrong once here. It cannot
+    show that `flush()`'s `None` guard is what protects this path: mutating that guard away leaves
+    the test green, since `getattr(None, "flush", None)` returns `None` and `callable(None)` is
+    `False`, so the call is inert either way. With no client there is nothing a flush *could*
+    reach, which makes "no SDK flush attempted" close to tautological. What is not tautological,
+    and what this pins, is that adding the flush to `close()` did not short-circuit the release
+    below it — a `close()` that returned early, or raised into its own absorbing guard, would fail
+    both assertions.
+    """
+    from log_foundry.sinks import sentry as sentry_mod
+
+    released: list[object] = []
+    real_release = sentry_mod._lifecycle.release
+
+    def spy(sink_obj, *, owner):
+        released.append(sink_obj)
+        return real_release(sink_obj, owner=owner)
+
+    opener = FakeOpener()
+    sink = SentrySink(dsn=DSN, backend="http", opener=opener)
+    assert sink.client is None, "the http backend holds no SDK client"
+    patch = pytest.MonkeyPatch()
+    patch.setattr(sentry_mod._lifecycle, "release", spy)
+    try:
+        sink.close()
+    finally:
+        patch.undo()
+
+    assert capsys.readouterr().err == "", "close() absorbed and announced nothing"
+    assert released == [sink._http], "and close() still ran through to the fallback release"
+
+
+def test_the_close_flush_is_not_suppressed_on_a_repeat_close() -> None:
+    """A second close flushes again, deliberately.
+
+    This sink adds **no post-close guard** (SPEC-032 FR-003), so a batch emitted after close()
+    still reaches Sentry -- which means events can legitimately be captured *between* two closes.
+    A flag suppressing the second flush would strand exactly what FR-005 exists to un-strand. A
+    repeat flush of a drained queue is a no-op, so the idempotence that matters is preserved.
+    """
+    client = FlushingClient()
+    sink = SentrySink(client=client)
+    sink.emit([{"level": "error", "message": "first"}])
+    sink.close()
+    sink.emit([{"level": "error", "message": "captured after the close"}])
+    sink.close()
+    assert client.flushes == 2, "the second close flushes what the second emit captured"
+    assert len(client.events) == 2

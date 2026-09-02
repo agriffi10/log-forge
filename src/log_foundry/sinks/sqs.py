@@ -337,6 +337,24 @@ class SQSSink:
         alone in re-sending immediately, while its own docstring named throttling as the
         retryable case, which is exactly what an instant retry makes worse.
 
+        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
+        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
+        the worker re-send the whole batch and duplicate everything already in the queue — the
+        exit drain, one large batch by construction, is exactly that shape. The guard sits around
+        the client call *inside* this loop rather than around ``_send`` in ``emit``, because by
+        the time an exception is raised ``accepted`` may already be non-zero and ``entries``
+        narrowed to the retryable subset: charging the whole chunk outside would report a partial
+        success as "nothing delivered" and provoke the very retry this removes.
+
+        A client exception is treated as **provable non-delivery** for the chunk, so it feeds the
+        recoverable term and a wholly-failed batch still raises. That is not free — a read timeout
+        means the request went out and the *response* was lost, so entries may have landed and a
+        re-send duplicates them, which is SPEC-018's "cannot prove nothing landed". It is taken on
+        expected cost: an unreachable or refused endpoint is the common client exception and is
+        exactly what the worker's retry exists for, and suppressing the raise for it would lose
+        every event of every batch for the whole outage, silently. ``boto3``'s own ``max_attempts``
+        retry already carries the duplication property, so this does not introduce it.
+
         Args:
           prepared: One chunk's serialized, costed entries.
 
@@ -346,7 +364,8 @@ class SQSSink:
           recover. A chunk SQS rejected wholesale as invalid reports False there.
 
         Raises:
-          Exception: Whatever the client raises.
+          None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
+            or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
         entries: list[dict[str, str]] = []
         for i, item in enumerate(prepared):
@@ -358,7 +377,22 @@ class SQSSink:
             entries.append(entry)
         accepted = 0
         for attempt in range(self.max_retries + 1):
-            response = self.client.send_message_batch(QueueUrl=self.queue_url, Entries=entries)
+            try:
+                response = self.client.send_message_batch(
+                    QueueUrl=self.queue_url, Entries=entries
+                )
+            except Exception as err:
+                if attempt < self.max_retries:
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
+                    continue
+                with self._counter_lock:
+                    self.failed += len(entries)
+                _diag.lost(
+                    "message",
+                    len(entries),
+                    f"SQSSink, {self.max_retries + 1} attempt(s), {type(err).__name__}",
+                )
+                return accepted, True
             failed = response.get("Failed", [])
             failed_ids = {item.get("Id") for item in failed}
             accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)

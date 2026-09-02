@@ -252,7 +252,21 @@ class SentrySink:
             flush()
 
     def close(self) -> None:
-        """Forwards to the HTTP fallback, whose own close releases nothing (FR-012).
+        """Pushes the SDK transport, then forwards to the HTTP fallback (FR-012, SPEC-048 FR-005).
+
+        **The flush comes first, and without it a terminal ``shutdown()`` stranded everything.**
+        ``capture_event`` hands to the SDK's background transport and returns, so a process that
+        calls ``shutdown()`` and freezes — the whole of the serverless path, where the SDK's own
+        timer never fires again — left every captured event in the SDK's worker. :meth:`flush`
+        already pushes that queue; this method reached only the ``urllib`` fallback, which holds
+        nothing. Measured before the fix: 25 events captured, zero ``flush`` calls seen by the
+        client during ``close()``.
+
+        It is absorbed, because this is an isolation boundary and a failing flush must not stop
+        the release below it. And it is **not** suppressed on a repeat close: this sink adds no
+        post-close guard (SPEC-032 FR-003), so events can legitimately be captured between two
+        closes, and a flag suppressing the second flush would strand exactly what this exists to
+        un-strand. A repeat flush of a drained queue is a no-op.
 
         Idempotent, and it releases nothing — which is why the class docstring's post-close claim
         holds despite this method calling a ``close()``. ``HTTPSink.close`` is a documented no-op,
@@ -270,6 +284,10 @@ class SentrySink:
         Raises:
           None.
         """
+        try:
+            self.flush()
+        except Exception as err:
+            _diag.absorbed("closing SentrySink", err)
         if self._http is not None:
             _lifecycle.release(self._http, owner=self)
 

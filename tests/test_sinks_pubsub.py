@@ -319,36 +319,97 @@ def test_an_overflow_wait_that_expires_puts_the_publish_back_rather_than_losing_
     assert sink.failed == 0, "an expired wait is not a failure; the publish is unfinished"
 
 
-def test_a_shutdown_defers_the_overflow_wait_to_close_rather_than_blocking_the_drain() -> None:
-    """The stop signal skips the *wait*, not the work: close() still resolves everything.
+class _NeverSettles(PollableFuture):
+    """A publish the destination never confirms, recording every timeout it was waited on with.
 
-    This is the opposite of the mistake FR-001 made — skipping delivery during the exit drain
-    loses events, while deferring a wait to close() loses nothing, because close() is where an
-    exit-time wait belongs.
+    An **unbounded** wait blocks for `CLIENT_DEADLINE`, standing in for the real client's 600 s
+    publish deadline. That is what makes a bounded-close test able to fail: with `result(None)`
+    returning instantly, an unbounded close finishes in ~0 s and every wall-clock assertion holds
+    either way -- the vacuous shape this repo keeps finding.
     """
-    import threading
 
-    class NeverSettles(PollableFuture):
-        def __init__(self) -> None:
-            super().__init__(settled=False)
-            self.waits: list[float | None] = []
+    def __init__(self) -> None:
+        super().__init__(settled=False)
+        self.waits: list[float | None] = []
 
-        def result(self, timeout=None):
-            self.waits.append(timeout)
-            if timeout is not None:
-                raise TimeoutError("still in flight")
-            return "message-id"
+    def result(self, timeout=None):
+        self.waits.append(timeout)
+        if timeout is not None:
+            raise TimeoutError("still in flight")
+        time.sleep(CLIENT_DEADLINE)
+        return "message-id"
 
-    client = PollablePublisher(lambda _i: NeverSettles())
-    sink = GooglePubSubSink("projects/p/topics/t", client=client, max_pending=1)
+
+CLIENT_DEADLINE = 5.0
+"""Seconds an unbounded wait blocks in these tests, standing in for the client's own 600 s.
+
+Long enough that an unbounded `close()` blows every bound asserted below, short enough that a
+failure costs seconds rather than minutes. A passing run never reaches it.
+"""
+
+
+def _closed_with_stop(stopping: bool) -> tuple[float, SinkLosses, list[_NeverSettles]]:
+    """Emits four never-settling publishes and closes, with or without the stop signal set.
+
+    Returns the elapsed close, the losses and the futures, so a caller can compare the two runs
+    rather than assert an absolute figure — the comparison is the rule under test.
+    """
+    client = PollablePublisher(lambda _i: _NeverSettles())
+    sink = GooglePubSubSink(
+        "projects/p/topics/t", client=client, max_pending=1, overflow_timeout=0.3
+    )
     signal = threading.Event()
-    signal.set()
+    if stopping:
+        signal.set()
     sink.log_foundry_stop_signal = signal
     sink.emit([{"i": i} for i in range(4)])
-    assert all(future.waits == [] for future in client.futures), "no waiting while stopping"
     assert len(sink._futures) == 4, "everything is retained for close()"
+    began = time.monotonic()
     sink.close()
-    assert all(future.waits == [None] for future in client.futures), "close waits unbounded"
+    return time.monotonic() - began, sink.losses(), client.futures
+
+
+def test_a_shutdown_defers_the_overflow_wait_to_close_rather_than_blocking_the_drain() -> None:
+    """The stop signal skips the *wait*, not the work: close() does the same either way.
+
+    This is the opposite of the mistake SPEC-038 FR-001 made — skipping delivery during the exit
+    drain loses events, while deferring a wait to close() loses nothing, because close() is where
+    an exit-time wait belongs.
+
+    **This assertion replaces the one this test shipped with** (SPEC-048 FR-004). That was
+    ``waits == [None]`` — close waits unbounded — which pinned the *mechanism* rather than the
+    rule. Since close() is bounded, an unbounded wait is no longer how the rule is kept, and
+    asserting it would have forced the design that reverses SPEC-038: `_out_of_time` returns True
+    the instant the stop signal is set, and ``Worker.shutdown`` sets it *before* closing the sink
+    inline, so a close sharing flush()'s guard abandons everything on every ordinary shutdown.
+    Comparing the two runs asserts the rule directly, which is strictly stronger: it fails for any
+    close that shortens itself because a shutdown is in progress, whatever the mechanism.
+    """
+    stopping, stopping_losses, stopping_futures = _closed_with_stop(True)
+    running, running_losses, running_futures = _closed_with_stop(False)
+
+    assert stopping_losses == running_losses, (
+        "a shutdown must not change what close() gives up on"
+    )
+    assert stopping >= running * 0.5, (
+        f"close() shortened itself because a shutdown was in progress: "
+        f"{stopping:.2f}s stopping vs {running:.2f}s running"
+    )
+    stopping_waits = sum(len(f.waits) for f in stopping_futures)
+    running_waits = sum(len(f.waits) for f in running_futures)
+    assert stopping_waits >= running_waits // 2, (
+        f"close() polled less because a shutdown was in progress: "
+        f"{stopping_waits} waits stopping vs {running_waits} running"
+    )
+    assert all(
+        None not in f.waits for f in stopping_futures
+    ), "close() is bounded now: no future is waited on with timeout=None"
+    assert stopping_futures[-1].waits == [0], (
+        "one deadline covers the whole list, not one per future: once it expires the remaining "
+        "futures get a single zero-second classification probe and no real wait, which is what "
+        "keeps the bound a bound (SPEC-038: a bound applied per item is n x timeout) while still "
+        "telling an expired future from an unboundable one"
+    )
 
 
 def test_a_bound_of_zero_is_floored_so_publishing_does_not_become_synchronous() -> None:
@@ -514,3 +575,192 @@ def test_an_unboundable_future_is_put_back_at_once_rather_than_waited_out() -> N
     assert elapsed < 1.0, f"an unboundable future must not be waited out; took {elapsed:.2f}s"
     assert sink.losses() == SinkLosses(dropped=0, failed=0), "and it is not counted as lost"
     assert len(sink._futures) == 3, "it is put back for close()"
+
+
+def test_close_is_bounded_rather_than_running_to_the_clients_deadline() -> None:
+    """SPEC-048 FR-004. `close()` waited `timeout=None` per future against a 600 s deadline.
+
+    `Worker.shutdown` closes the live sink **inline**, so one unreachable destination held process
+    exit for the client's publish deadline, per future. Measured before the fix: `flush()` raised
+    at 0.50 s while `close()` with the stop signal already set ran to 3.50 s against a stand-in
+    deadline, and would have been 600 s against a real one.
+
+    The budget is deliberately **generous**. What carries the assertion is the *gap* — 3 s against
+    a `CLIENT_DEADLINE` of 5 s — not a tight bound, which is what keeps it from failing on its own
+    setup under load. Verified by reverting `close()` to the unbounded form: this test then fails
+    on the wall clock rather than passing, which it did while the stand-in returned instantly.
+    """
+    client = PollablePublisher(lambda _i: _NeverSettles())
+    sink = GooglePubSubSink(
+        "projects/p/topics/t", client=client, max_pending=1, overflow_timeout=0.3
+    )
+    sink.emit([{"i": i} for i in range(5)])
+    wall = time.monotonic()
+    cpu = time.process_time()
+    sink.close()
+    elapsed = time.monotonic() - wall
+    burned = time.process_time() - cpu
+
+    assert elapsed < 3.0, (
+        f"close() is bounded; ran {elapsed:.2f}s against a {CLIENT_DEADLINE}s stand-in deadline"
+    )
+    assert burned < 0.1, f"and waits rather than spinning; burned {burned:.2f}s of CPU"
+
+
+def test_close_counts_the_publishes_it_abandoned(capsys) -> None:
+    """What the bound gives up on is counted and announced once, with a count.
+
+    `KafkaSink._flush_bounded`'s rule, for its reason: a bound that abandons silently trades one
+    invisible loss for another.
+    """
+    client = PollablePublisher(lambda _i: _NeverSettles())
+    sink = GooglePubSubSink(
+        "projects/p/topics/t", client=client, max_pending=1, overflow_timeout=0.05
+    )
+    sink.emit([{"i": i} for i in range(5)])
+    sink.close()
+
+    assert sink.losses() == SinkLosses(dropped=0, failed=5), "every abandoned publish is counted"
+    lines = [line for line in capsys.readouterr().err.splitlines() if "close bound" in line]
+    assert len(lines) == 1, f"one line with a count, not one per publish; got {len(lines)}"
+    assert "5 publish(es)" in lines[0]
+
+
+def test_close_absorbs_a_future_whose_result_raises() -> None:
+    """close() is an isolation boundary (FR-011): an unresolved future must not crash the worker."""
+
+    class Exploding(PollableFuture):
+        def __init__(self) -> None:
+            super().__init__(settled=False)
+
+        def result(self, timeout=None):
+            raise RuntimeError("the client is broken")
+
+    client = PollablePublisher(lambda _i: Exploding())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.05)
+    sink.emit([{"i": i} for i in range(3)])
+    sink.close()
+    assert sink.losses().failed == 3, "counted as unconfirmed rather than raised"
+
+
+def test_a_close_landing_mid_flush_bounds_and_counts_its_leftovers(capsys) -> None:
+    """The flush-races-close tail took `timeout=None` too, one branch deeper.
+
+    When a `close()` lands while `flush()` is resolving, the leftover futures are flush's and
+    nothing else will resolve them — so that branch owns them, and before this it owned them
+    unbounded. It shares `close()`'s tail now, which is also what keeps its counter.
+    """
+    holder: dict[str, object] = {"sink": None, "armed": False}
+
+    class ClosesMidFlush(_NeverSettles):
+        """Marks the sink closed the first time flush() waits on it, which is the race.
+
+        Armed only after `emit` has returned: with the trigger live during emit, `_await_overflow`
+        fires it instead and the test exercises the wrong tail.
+        """
+
+        def result(self, timeout=None):
+            sink_obj = holder["sink"]
+            if holder["armed"] and timeout is not None and not sink_obj._closed:
+                with sink_obj._futures_lock:
+                    sink_obj._closed = True
+            return super().result(timeout)
+
+    client = PollablePublisher(lambda _i: ClosesMidFlush())
+    sink = GooglePubSubSink("t", client=client, max_pending=50, overflow_timeout=0.05)
+    holder["sink"] = sink
+    sink.emit([{"i": i} for i in range(4)])
+    assert not sink._closed, "the race must start from an open sink, or flush refuses at its top"
+    holder["armed"] = True
+    began = time.monotonic()
+    with pytest.raises(SinkDeliveryError):
+        sink.flush()
+    elapsed = time.monotonic() - began
+    assert sink._closed, "the close landed during the pass, which is the branch under test"
+
+    assert elapsed < 3.0, f"the leftover branch is bounded too; ran {elapsed:.2f}s"
+    assert sink.losses().failed == 4, "and counts what it abandoned"
+    assert any("close bound" in line for line in capsys.readouterr().err.splitlines())
+
+
+def test_a_close_landing_mid_emit_bounds_the_overflow_tail_too(capsys) -> None:
+    """The third close-race tail, and the one that could hang an application thread.
+
+    `_await_overflow` runs on whichever thread called `emit` — which on the orphan path, a level
+    call with no active span, is an **application** thread (SPEC-028). Its leftover branch
+    resolved with `timeout=None` like the other two, so a close landing mid-emit could park the
+    caller on the client's publish deadline. It shares `close()`'s bounded tail now.
+    """
+    holder: dict[str, object] = {"sink": None}
+
+    class ClosesMidEmit(_NeverSettles):
+        def result(self, timeout=None):
+            sink_obj = holder["sink"]
+            if timeout is not None and not sink_obj._closed:
+                with sink_obj._futures_lock:
+                    sink_obj._closed = True
+            return super().result(timeout)
+
+    client = PollablePublisher(lambda _i: ClosesMidEmit())
+    sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.05)
+    holder["sink"] = sink
+
+    began = time.monotonic()
+    sink.emit([{"i": i} for i in range(4)])
+    elapsed = time.monotonic() - began
+
+    assert elapsed < 3.0, f"the overflow tail is bounded; ran {elapsed:.2f}s"
+    assert sink.losses().failed > 0, "and counts what it abandoned"
+    assert any("close bound" in line for line in capsys.readouterr().err.splitlines()), (
+        "the overflow tail's own abandonment line, not close()'s"
+    )
+    # `emit` deliberately does NOT raise here: every `publish()` call succeeded, so the events may
+    # well land and re-sending them would duplicate what did (SPEC-018's rule that only provable
+    # non-delivery may be retried). What the close cost is the *confirmation*, which is counted as
+    # unconfirmed rather than reported as a failure to the worker.
+
+
+def test_close_is_not_bounded_for_a_future_that_cannot_be_waited_on(capsys) -> None:
+    """The documented exception to close()'s bound, pinned so it is a decision and not a surprise.
+
+    A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only
+    wait it accepts and SPEC-036 measured that counting it instead invents loss on publishes that
+    were going to succeed. So a client handing out futures that are BOTH unboundable AND slow holds
+    `close()` for its own deadline, once per future — measured by a reviewer at 27.0 s for nine
+    against a 3 s stand-in. `google-cloud-pubsub`'s own future accepts a timeout, so only an
+    injected `client=` reaches this; `client=` is a frozen public parameter, which is why it is
+    tested rather than assumed away.
+
+    The existing regression test uses a future that returns *immediately*, so unboundable-and-slow
+    was untested until this. Recorded in `architecture.md` §12.
+    """
+    delay = 0.4
+
+    class UnboundableAndSlow:
+        def __init__(self) -> None:
+            self.resolved = 0
+
+        def done(self) -> bool:
+            return False
+
+        def result(self):  # no timeout parameter at all
+            self.resolved += 1
+            time.sleep(delay)
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: UnboundableAndSlow())
+    sink = GooglePubSubSink("t", client=client, max_pending=50, overflow_timeout=0.05)
+    sink.emit([{"i": i} for i in range(3)])
+    began = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - began
+
+    assert elapsed >= delay * 3 * 0.8, (
+        f"close() waits on each unboundable future in turn, unbounded: {elapsed:.2f}s. If this "
+        f"ever fails, the bound was extended to cover them and the docstring must follow."
+    )
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "and they are still not counted as lost -- SPEC-036's rule, which is why they are waited "
+        "on unbounded in the first place"
+    )
+    assert all(f.resolved == 1 for f in client.futures), "every one was actually resolved"

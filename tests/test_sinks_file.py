@@ -281,3 +281,205 @@ def test_the_rotating_sink_reports_no_losses_for_what_retention_discards(tmp_pat
     sink.emit([{"pad": "z" * 60} for _ in range(10)])
     sink.close()
     assert not hasattr(sink, "losses"), "no losses() accessor, deliberately"
+
+
+def _all_events(directory: str) -> list[dict]:
+    """Every event across the active file and its backups, in no particular order."""
+    events: list[dict] = []
+    for name in sorted(os.listdir(directory)):
+        events += read_events(os.path.join(directory, name))
+    return events
+
+
+def test_a_failed_rename_neither_loses_nor_duplicates_the_batch(tmp_path, capsys) -> None:
+    """SPEC-048 FR-006. A rotation failure mid-batch used to cost the batch twice.
+
+    `_rotate` closes the active stream first, so the events already written were on disk and the
+    `OSError` propagated out of `emit` -- and the worker retries whole batches. Measured before
+    the fix: an 8-event batch failing after 3 were written put **11 lines on disk, 3 of them
+    duplicates**.
+
+    The criterion that binds is that `emit` **returns**: that is what stops the retry at its
+    source, so the duplicate is never created rather than being reconciled afterwards.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=120, backup_count=5)
+    batch = [{"i": i, "pad": "x" * 20} for i in range(8)]
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(13, "Permission denied")
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", flaky)
+        sink.emit(batch)
+    sink.close()
+
+    seen = [event["i"] for event in _all_events(str(tmp_path))]
+    assert sorted(seen) == list(range(8)), f"every event exactly once, got {sorted(seen)}"
+    # The concrete OSError subclass is per-platform (process.md §6), so derive it rather than
+    # hardcode it: errno 13 is PermissionError here and need not be everywhere.
+    expected = type(OSError(13, "Permission denied")).__name__
+    assert f"rotating RotatingFileSink ({expected})" in capsys.readouterr().err, (
+        "the absorbed failure is announced once, by type"
+    )
+
+
+def test_a_failed_flush_still_leaves_every_event_on_disk(tmp_path, capsys) -> None:
+    """The full-disk shape, which the rename injection point cannot reach.
+
+    `_rotate`'s first statement is `self._stream.close()`, which flushes, while `emit` otherwise
+    flushes once at the end of the batch -- so on a full or read-only filesystem it is *that*
+    flush that raises, and the batch's buffered lines are gone before any rename is attempted.
+    Absorbing the error is then not enough: the events are already lost and `getsize` reports a
+    file that never received them. `emit` flushes before attempting the rotation for this reason.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=120, backup_count=5)
+    batch = [{"i": i, "pad": "x" * 20} for i in range(8)]
+
+    real_close = sink._stream.close
+    state = {"broken": True}
+
+    def failing_close():
+        if state["broken"]:
+            raise OSError(28, "No space left on device")
+        return real_close()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sink._stream, "close", failing_close)
+        sink.emit(batch)
+        state["broken"] = False
+    sink.close()
+
+    seen = [event["i"] for event in _all_events(str(tmp_path))]
+    assert sorted(seen) == list(range(8)), (
+        f"the pre-rotation flush is what makes this hold; got {sorted(seen)}"
+    )
+
+
+def test_the_sink_survives_a_persistent_rotation_failure(tmp_path, capsys) -> None:
+    """A rotation that can never succeed must not break the sink or raise out of every batch.
+
+    Before the fix `_rotate` left a **closed** stream behind, so every later batch raised a raw
+    `PermissionError` -- not a `SinkDeliveryError`, and with no `losses()` behind it, since this
+    class deliberately has none.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=120, backup_count=5)
+
+    def always_fail(src, dst):
+        raise OSError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        for round_ in range(3):
+            sink.emit([{"i": f"{round_}-{i}", "pad": "x" * 20} for i in range(4)])
+        assert not sink._stream.closed, "the sink keeps a usable stream"
+        assert os.path.getsize(path) > 120, (
+            "and grows past max_bytes rather than losing events -- the documented trade"
+        )
+    sink.close()
+    assert len(_all_events(str(tmp_path))) == 12, "all three batches are on disk"
+
+
+def test_rotation_resumes_once_the_failure_clears(tmp_path) -> None:
+    """An absorbed failure re-arms the trigger, so recovery needs no restart."""
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=120, backup_count=5)
+
+    def always_fail(src, dst):
+        raise OSError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        sink.emit([{"i": i, "pad": "x" * 20} for i in range(6)])
+    sink.emit([{"i": 100 + i, "pad": "x" * 20} for i in range(6)])
+    sink.close()
+
+    assert os.path.exists(path + ".1"), "the next triggering event rotates normally"
+    assert len(_all_events(str(tmp_path))) == 12, "and nothing was lost on the way"
+
+
+def test_a_persistent_time_trigger_failure_does_not_announce_once_per_event(
+    tmp_path, capsys
+) -> None:
+    """`_next_rollover` is re-armed on an absorbed failure, so the retry is per interval.
+
+    `_rotate` arms it on its last line, so an absorbed failure would otherwise leave a deadline
+    permanently in the past: every subsequent event would retry the rotation and write another
+    diagnostic, and `_diag` has no damping anywhere.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, when="H", interval=1, backup_count=5)
+    sink._next_rollover = time.monotonic() - 1  # a deadline already past
+
+    def always_fail(src, dst):
+        raise OSError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        sink.emit([{"i": i} for i in range(20)])
+    sink.close()
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if "rotating" in line]
+    assert len(lines) == 1, f"one line per rotation attempt, not one per event; got {len(lines)}"
+    assert len(_all_events(str(tmp_path))) == 20
+
+
+def test_a_persistent_size_trigger_failure_announces_once_not_once_per_event(
+    tmp_path, capsys
+) -> None:
+    """The size trigger is not damped by the `_next_rollover` re-arm, so the diagnostic is.
+
+    `_size` is re-seeded from a file that is now over `max_bytes`, so `_should_rotate`'s size
+    branch stays true and every later event attempts a rotation again — measured at 598 attempts
+    over 600 events by a reviewer driving a real `@trace` workload. The attempts lose nothing, but
+    an unthrottled stderr write per event on the drain thread is the flood
+    `PostgresSink._reconnect_if_broken` already refuses, and it happens while `emit` holds the lock
+    a `close()` waits on.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=200, backup_count=5)
+
+    def always_fail(src, dst):
+        raise OSError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        sink.emit([{"i": i, "pad": "x" * 30} for i in range(60)])
+    sink.close()
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if "rotating" in line]
+    assert len(lines) == 1, f"one line per outage, not one per event; got {len(lines)}"
+    assert len(_all_events(str(tmp_path))) == 60, "and nothing was lost while it was failing"
+
+
+def test_the_rotation_diagnostic_speaks_again_after_a_recovery(tmp_path, capsys) -> None:
+    """Once-per-outage, not once-per-process: a second outage must still be announced.
+
+    The flag clears on the next successful rotation, so a sink that recovers and fails again says
+    so — otherwise the damping would silence the very diagnostic it exists to keep readable.
+    """
+    path = str(tmp_path / "app.log")
+    sink = RotatingFileSink(path, max_bytes=200, backup_count=5)
+
+    def always_fail(src, dst):
+        raise OSError(13, "Permission denied")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        sink.emit([{"i": i, "pad": "x" * 30} for i in range(20)])
+    sink.emit([{"i": 100 + i, "pad": "x" * 30} for i in range(20)])  # recovers, rotates
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("log_foundry.sinks.file.os.replace", always_fail)
+        sink.emit([{"i": 200 + i, "pad": "x" * 30} for i in range(20)])
+    sink.close()
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if "rotating" in line]
+    assert len(lines) == 2, f"one line per outage, and there were two; got {len(lines)}"

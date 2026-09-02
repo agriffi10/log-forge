@@ -153,6 +153,21 @@ class SNSSink:
         this loop re-sends the entries the destination flagged, and the canonical reason it flags
         them is throttling, which an immediate re-send makes worse.
 
+        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
+        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
+        the worker re-send the whole batch and duplicate everything already delivered — the exit
+        drain, one large batch by construction, is exactly that shape. The guard sits around the
+        client call *inside* this loop rather than around ``_send`` in ``emit``, so only the
+        messages still outstanding at the failing attempt are charged and the ones already accepted
+        still count toward the return.
+
+        A client exception is treated as **provable non-delivery** for the chunk, so a wholly
+        failed batch still raises. The cost is written down —
+        a read timeout means the request went out and the reply was lost, so a re-send may
+        duplicate — and taken because an unreachable endpoint is the common case and is exactly
+        what the worker's retry exists for, while suppressing the raise would lose every event of
+        every batch for a whole outage, silently.
+
         Args:
           bodies: One chunk's serialized events.
 
@@ -161,14 +176,28 @@ class SNSSink:
           success. A chunk whose entries all failed contributes zero.
 
         Raises:
-          Exception: Whatever the client raises.
+          None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
+            or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
         sent = len(bodies)
         entries = [{"Id": str(i), "Message": body} for i, body in enumerate(bodies)]
         for attempt in range(self.max_retries + 1):
-            response = self.client.publish_batch(
-                TopicArn=self.topic_arn, PublishBatchRequestEntries=entries
-            )
+            try:
+                response = self.client.publish_batch(
+                    TopicArn=self.topic_arn, PublishBatchRequestEntries=entries
+                )
+            except Exception as err:
+                if attempt < self.max_retries:
+                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
+                    continue
+                with self._counter_lock:
+                    self.failed += len(entries)
+                _diag.lost(
+                    "message",
+                    len(entries),
+                    f"SNSSink, {self.max_retries + 1} attempt(s), {type(err).__name__}",
+                )
+                return sent - len(entries)
             failed = response.get("Failed", [])
             if not failed:
                 return sent

@@ -315,62 +315,172 @@ class GooglePubSubSink:
         """
         if not overflow:
             return
-        deadline = time.monotonic() + self.overflow_timeout
-        unresolved: list[Any] = []
-        for index, future in enumerate(overflow):
-            settled = False
-            while not self._out_of_time(deadline):
-                began = time.monotonic()
-                slice_ = min(deadline - began, _POLL_INTERVAL)
-                try:
-                    settled = self._resolve(future, slice_)
-                except _Unboundable:
-                    break
-                if settled:
-                    break
-                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
-            if settled:
-                continue
-            unresolved.append(future)
-            if self._out_of_time(deadline):
-                unresolved.extend(overflow[index + 1 :])
-                break
+        expired, unboundable = self._resolve_within(
+            overflow, time.monotonic() + self.overflow_timeout, heed_stop=True
+        )
+        unresolved = expired + unboundable
         if not unresolved:
             return
         with self._futures_lock:
             if not self._closed:
                 self._futures[:0] = unresolved
                 return
-        for future in unresolved:
-            self._resolve(future)
+        self._drain_pending(unresolved)
 
-    def _out_of_time(self, deadline: float) -> bool:
-        """Reports whether the overflow pass must stop, on the deadline or on a shutdown.
+    def _resolve_within(
+        self, pending: list[Any], deadline: float, *, heed_stop: bool
+    ) -> tuple[list[Any], list[Any]]:
+        """Waits on each future until the deadline, splitting what did not settle in two.
 
-        The stop signal is read here rather than once before the loop: read once, a shutdown
-        arriving mid-pass was not noticed until every future had been waited on.
+        One deadline covers the whole list rather than a timeout per future: at the shipped
+        ``max_pending`` a per-future wait is not a bound at all (SPEC-038's rule that a bound
+        applied per item is ``n x timeout``). ``_futures_lock`` is never held across a
+        ``result()``, because ``emit`` takes it per event and an application thread on the orphan
+        path would block behind it.
 
         Args:
-          deadline: The monotonic time the pass may not run past.
+          pending: The futures to resolve, already removed from the pending list.
+          deadline: A ``time.monotonic()`` reading the pass must not run past.
+          heed_stop: Whether a set stop signal also ends the pass. **True only on the flush
+            path.** ``Worker.shutdown`` sets that event *before* closing the sink inline, so a
+            close that heeded it would abandon everything on every ordinary shutdown -- SPEC-038's
+            rule that a shutdown shortens a *wait* and must never skip *work*, and the exit drain
+            is the one path a serverless process has.
 
         Returns:
-          True when no further waiting may happen.
+          The futures whose wait expired, and separately the ones that cannot be waited on within
+          a timeout at all. They are split because they mean opposite things: an expired future is
+          unconfirmed, while an *unboundable* one is a healthy publish this pass simply cannot
+          poll, and counting the second as loss invents it (SPEC-036 measured three of four
+          healthy publishes reported ``failed`` that way).
+
+        Raises:
+          None.
+        """
+        expired: list[Any] = []
+        unboundable: list[Any] = []
+        for index, future in enumerate(pending):
+            settled = False
+            unpollable = False
+            while not self._past(deadline, heed_stop=heed_stop):
+                began = time.monotonic()
+                slice_ = min(deadline - began, _POLL_INTERVAL)
+                try:
+                    settled = self._resolve(future, slice_)
+                except _Unboundable:
+                    unpollable = True
+                    break
+                if settled:
+                    break
+                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
+            else:
+                self._classify_remainder(pending[index:], expired, unboundable)
+                break
+            if unpollable:
+                unboundable.append(future)
+        return expired, unboundable
+
+    def _classify_remainder(
+        self, remaining: list[Any], expired: list[Any], unboundable: list[Any]
+    ) -> None:
+        """Sorts the futures a deadline never reached into expired and unboundable.
+
+        The pass gives up on the whole remainder when its one deadline expires, and the two
+        outcomes must still be told apart: an expired future is unconfirmed and is counted, while
+        an **unboundable** one is a healthy publish that simply cannot be polled within a timeout,
+        and counting it invents loss. A blanket ``expired.extend(...)`` here charged three healthy
+        publishes as lost behind one stalled future, which is SPEC-036's measured defect
+        reintroduced by the fix that cites it.
+
+        The probe is a zero-second wait, so it costs nothing against a deadline that has already
+        gone: a future whose ``result()`` takes no ``timeout`` raises ``_Unboundable`` on the way
+        in, and everything else either settles immediately or reports itself still in flight.
+
+        Args:
+          remaining: The futures the pass did not reach, the current one first.
+          expired: The unconfirmed list, appended to in place.
+          unboundable: The cannot-be-polled list, appended to in place.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for future in remaining:
+            try:
+                if not self._resolve(future, 0):
+                    expired.append(future)
+            except _Unboundable:
+                unboundable.append(future)
+
+    def _past(self, deadline: float, *, heed_stop: bool) -> bool:
+        """Reports whether a resolution pass must stop.
+
+        Args:
+          deadline: A ``time.monotonic()`` reading.
+          heed_stop: Whether a set stop signal also ends the pass.
+
+        Returns:
+          True on the deadline, or on the stop signal when this caller heeds it.
 
         Raises:
           None.
         """
         if time.monotonic() >= deadline:
             return True
+        if not heed_stop:
+            return False
         stop = self.log_foundry_stop_signal
         return stop is not None and stop.is_set()
+
+    def _drain_pending(self, pending: list[Any]) -> None:
+        """Resolves a swapped-out list within the close bound, counting what it abandons.
+
+        The tail every close-race site shares: :meth:`close`, and the two branches where a close
+        lands while another pass is mid-flight. Each used to resolve its leftovers with
+        ``timeout=None``, which is the unbounded wait ``Worker.shutdown`` performs inline against
+        a client publish deadline of 600 s. ``_await_overflow``'s copy is the one that mattered
+        most: it runs on whichever thread called ``emit``, which on the orphan path is an
+        application thread.
+
+        Unboundable futures still get ``timeout=None``, because that is the only wait they accept
+        and :meth:`_resolve` counts whatever they resolve to.
+
+        Args:
+          pending: The futures this caller owns and nothing else will resolve.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        expired, unboundable = self._resolve_within(
+            pending, time.monotonic() + self.overflow_timeout, heed_stop=False
+        )
+        for future in unboundable:
+            self._resolve(future)
+        if not expired:
+            return
+        with self._counter_lock:
+            self.failed += len(expired)
+        _diag.lost(
+            "event",
+            len(expired),
+            f"GooglePubSubSink, {len(expired)} publish(es) still in flight when the "
+            f"{self.overflow_timeout}s close bound expired",
+        )
 
     def _resolve(self, future: Any, timeout: float | None = None) -> bool:
         """Waits for one publish to settle, counting and announcing a failure.
 
         Args:
           future: The publish future to resolve.
-          timeout: Seconds to wait, or ``None`` to wait indefinitely — which is what ``close``
-            does, and what a shutdown defers this to.
+          timeout: Seconds to wait, or ``None`` to wait indefinitely. Since SPEC-048 FR-004 that
+            is what an *unboundable* future gets, not what ``close`` does: ``close`` bounds itself
+            on ``overflow_timeout`` through :meth:`_drain_pending`, because it runs inline inside
+            ``Worker.shutdown`` against a client publish deadline of 600 s.
 
         Returns:
           True when the future settled, False when a *bounded* wait expired with it still in
@@ -450,26 +560,10 @@ class GooglePubSubSink:
         if not pending:
             return
 
-        deadline = time.monotonic() + self.overflow_timeout
-        unresolved: list[Any] = []
-        for index, future in enumerate(pending):
-            settled = False
-            while not self._out_of_time(deadline):
-                began = time.monotonic()
-                slice_ = min(deadline - began, _POLL_INTERVAL)
-                try:
-                    settled = self._resolve(future, slice_)
-                except _Unboundable:
-                    break
-                if settled:
-                    break
-                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
-            if settled:
-                continue
-            unresolved.append(future)
-            if self._out_of_time(deadline):
-                unresolved.extend(pending[index + 1 :])
-                break
+        expired, unboundable = self._resolve_within(
+            pending, time.monotonic() + self.overflow_timeout, heed_stop=True
+        )
+        unresolved = expired + unboundable
 
         if not unresolved:
             return
@@ -478,14 +572,30 @@ class GooglePubSubSink:
             if not closed:
                 self._futures[:0] = unresolved
         if closed:
-            for future in unresolved:
-                self._resolve(future)
+            self._drain_pending(unresolved)
         raise SinkDeliveryError(
             f"GooglePubSubSink flushed with {len(unresolved)} publish(es) still in flight"
         )
 
     def close(self) -> None:
-        """Resolves all pending publish futures, counting and logging errors (FR-008).
+        """Resolves the pending publish futures within a bound, counting the rest (FR-008).
+
+        **Bounded since SPEC-048 FR-004.** It used to wait ``timeout=None`` per future, and
+        ``Worker.shutdown`` closes the live sink inline, so one unreachable destination held
+        process exit for the client's 600 s publish deadline per future. The bound is
+        ``overflow_timeout`` on the monotonic clock and deliberately **not** the stop signal;
+        :meth:`_resolve_within` records why.
+
+        **The bound does not cover a future that cannot be waited on within a timeout.** One whose
+        ``result()`` takes no ``timeout`` argument is resolved unbounded, because that is the only
+        wait it accepts and SPEC-036 measured that counting it instead invents loss on publishes
+        that were going to succeed. So a client handing out unboundable futures that also do not
+        settle still holds the close for its own deadline, once per future: measured at 27.0 s for
+        nine futures against a 3 s stand-in, where the bounded path took 2.0 s for sixty.
+        ``google-cloud-pubsub``'s own future accepts a timeout, so this is reachable only through
+        an injected ``client=`` that does not — but ``client=`` is a frozen public parameter, which
+        is why it is written down here rather than assumed away. Recorded in ``architecture.md``
+        §12; it is strictly better than before, where **every** future took this path.
 
         Idempotent. The pending list is swapped out under a lock rather than iterated and then
         cleared (SPEC-028 FR-002): ``emit`` appends to it from any thread, so the old
@@ -513,8 +623,7 @@ class GooglePubSubSink:
         with self._futures_lock:
             self._closed = True
             pending, self._futures = self._futures, []
-        for future in pending:
-            self._resolve(future)
+        self._drain_pending(pending)
 
 
 def _has_settled(future: Any) -> bool:

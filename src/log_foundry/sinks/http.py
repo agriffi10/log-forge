@@ -125,6 +125,77 @@ inside a typical serverless timeout while leaving room for the request itself.
 """
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Declines every redirect, so a ``3xx`` reaches the sink as an ``HTTPError`` (SPEC-048).
+
+    ``urlopen``'s default opener follows ``301``, ``302`` and ``303`` on a ``POST`` by rewriting
+    the method to ``GET`` and dropping the body, while keeping every header — so a collector
+    behind a load balancer that redirects to ``https://`` silently discarded every batch and
+    forwarded the ``Authorization`` header to whatever host the redirect named, and the sink read
+    the redirect target's ``200`` as delivery. ``307`` and ``308`` were already refused for a
+    ``POST`` by the base class.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        """Declines the redirect, leaving the default error handler to raise ``HTTPError``.
+
+        Returning ``None`` is ``urllib``'s documented "I cannot handle this, let another handler
+        try", and no other handler does, so ``HTTPDefaultErrorHandler`` raises — which
+        :meth:`HTTPSink._attempt` already unifies into a status, putting a ``3xx`` on the same
+        counted, announced path as a ``4xx``.
+
+        Args:
+          req: The request that was redirected.
+          fp: The response file object.
+          code: The ``3xx`` status.
+          msg: The status message.
+          headers: The response headers.
+          newurl: The redirect target, deliberately unused and never contacted.
+
+        Returns:
+          None, always — which is what declines the redirect. A bare ``return`` rather than
+          ``return None`` only because ``ruff``'s ``RET501`` refuses the explicit form; the value
+          urllib receives is the same.
+
+        Raises:
+          None.
+        """
+        return
+
+
+def _no_redirect_opener() -> Callable[..., Any]:
+    """Builds an opener that refuses redirects, for a sink the caller gave no ``opener=``.
+
+    Built per sink at construction rather than once at import, for two reasons. ``python.md`` §15
+    forbids a module doing real work at import time, which is why the ``StdoutSink`` default and
+    the worker are lazy too. And ``build_opener`` snapshots ``ProxyHandler``'s environment, so an
+    import-time opener would pin whatever ``http_proxy`` said when ``log_foundry`` was first
+    imported — a sink built after the application sets its proxy would silently ignore it, where
+    ``urlopen``'s lazily-built global opener would not. Construction time is when the caller is
+    standing there, so it is the honest moment to read the environment.
+
+    A sink is constructed once, so the cost is one object per sink and never per request.
+
+    Args:
+      None.
+
+    Returns:
+      A ``urlopen``-shaped callable that raises ``HTTPError`` on any ``3xx``.
+
+    Raises:
+      None.
+    """
+    return urllib.request.build_opener(_NoRedirect()).open
+
+
 def merge_headers(base: dict[str, str], http_kwargs: dict[str, object]) -> dict[str, str]:
     """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
 
@@ -250,7 +321,9 @@ class HTTPSink:
           max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
             :attr:`MAX_BATCH_BYTES`. Floored at one for the same reason.
           opener: A ``urlopen``-shaped callable, which a test can inject to assert on the
-            request without any network access.
+            request without any network access. Defaults to :func:`_no_redirect_opener` rather
+            than ``urlopen`` (SPEC-048 FR-001); an injected one is used exactly as given, since
+            it is the caller's object and the library does not reshape it.
 
         Returns:
           None.
@@ -274,7 +347,7 @@ class HTTPSink:
             max_batch_bytes if max_batch_bytes is not None else self.MAX_BATCH_BYTES, 1
         )
         self.log_foundry_stop_signal: threading.Event | None = None
-        self._opener = opener if opener is not None else urllib.request.urlopen
+        self._opener = opener if opener is not None else _no_redirect_opener()
         self.failed = 0
         self.dropped_oversized = 0
         self._counter_lock = threading.Lock()
@@ -796,7 +869,13 @@ class HTTPSink:
     ) -> tuple[dict[str, str], bytes]:
         """Builds the final header map and the optionally gzipped body.
 
-        Caller-provided headers override the sink's defaults (FR-002).
+        Caller-provided headers override the sink's defaults (FR-002), and that now includes
+        ``Content-Encoding``: ``gzip=True`` used to overwrite one the caller had set, which made
+        it the single header of theirs that did not win. A caller's own value both survives *and*
+        suppresses the compression, because a header saying ``identity`` over a gzipped body
+        makes the destination decode garbage. The test is against ``self._headers`` rather than
+        the merged map, so a per-request ``extra_headers`` value — which sits *beneath* the
+        caller's own — does not switch compression off (SPEC-048 FR-007).
 
         Args:
           body: The serialized batch.
@@ -814,7 +893,7 @@ class HTTPSink:
             headers.update(extra_headers)
         headers.update(self._headers)
         data = body
-        if self.gzip:
+        if self.gzip and "Content-Encoding" not in self._headers:
             data = _gzip.compress(body)
             headers["Content-Encoding"] = "gzip"
         self._apply_auth(headers)
