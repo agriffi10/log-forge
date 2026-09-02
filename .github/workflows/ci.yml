@@ -107,7 +107,7 @@ jobs:
       # publishes to PyPI with `id-token: write` — the cache-poisoning shape zizmor audits for.
       # Not worth ~5 s on the one path where a poisoned input reaches consumers.
       - name: Install Poetry
-        run: pipx install poetry
+        uses: ./.github/actions/install-poetry
 
       - name: Install dependencies
         run: poetry install --with dev
