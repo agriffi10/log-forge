@@ -111,8 +111,8 @@ gate has run (*A replaced artifact restarts its gate*, below).
   criterion ticked with no evidence. SPEC-028 merged green and a review then found a sink that could
   hang an application thread forever; that review is the one that now happens before the push.
 - Before pushing, run **this repo's five gates** locally and get them green: `poetry run ruff check .`,
-  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`. They are
-  a pre-push step — don't
+  `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`, and
+  `sh scripts/docs-lint-test.sh` if you touched the linter. They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (§6). Format only the files you edited.
@@ -536,7 +536,12 @@ this way).
   (`.github/workflows/docs-lint.yml`). It holds `CLAUDE.md` to a byte budget and each Key Decisions
   **unit** — a bullet with its continuations, or a prose paragraph — to a length; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
   digest line for every entry, and to list every entry in its Contents; requires every Completed spec
-  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve. **The delivery cap is a ratchet at the
+  to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve.
+  **`scripts/docs-lint-test.sh` is the corpus that proves those checks still fire** — running the
+  linter against the repo's own documents proves the documents pass and nothing about whether any
+  check works, which is how four rounds of regressions reached main. A change to the linter runs
+  the corpus.
+  **The delivery cap is a ratchet at the
   measured level** — when one fires, move detail down a tier and re-ratchet, rather
   than raising the cap. The `CLAUDE.md` byte budget is deliberately NOT pinned at the measurement: it
   carries headroom, because a budget with none forces the next closing spec to prune another area's
