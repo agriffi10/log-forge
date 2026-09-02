@@ -1,6 +1,6 @@
 # Python Best Practices — Agent Reference
 
-> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-foundry** (runtime **Python ≥ 3.13**; a `src`-layout library, distribution `log-foundry` / import `log_foundry`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
+> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-foundry** (runtime **Python ≥ 3.12**, the floor in `pyproject.toml`; CI gates 3.12 **and** 3.13, so a 3.13-only call is a bug here; a `src`-layout library, distribution `log-foundry` / import `log_foundry`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
 >
 > **Run the formatter/linter — don't hand-format.** Mechanics (§2, §3) are owned by `ruff`; this doc is for the choices a tool can't make (naming, interfaces, idioms) and for review. Style is *guidance*: the repo's configured tools win (line length **100**, quote style), and "a foolish consistency is the hobgoblin of little minds" — when a rule hurts readability in a specific case, deviate and flag it (§1).
 >
@@ -9,7 +9,7 @@
 ## How to use this doc
 - Find the relevant section ID(s) in the Index below; read only those. Sections are cross-linked by ID (e.g. "see §7").
 - Defer to the repo's configured tools (line length, formatter, import order, typing strictness) over the defaults here; when a rule conflicts with existing code, follow the rule and **flag the conflict** unless the user says otherwise.
-- Repo defaults: format/lint with **`ruff`** (line-length 100), type-check with **`mypy --strict`** over `src`, test with **`pytest`** (`asyncio_mode=auto`, `--strict-markers`) + `pytest-asyncio`. Runtime = 3.13; core has **no runtime deps** (optional `aws` extra pulls `boto3`).
+- Repo defaults: format/lint with **`ruff`** (line-length 100), type-check with **`mypy --strict`** over `src`, test with **`pytest`** (`asyncio_mode=auto`, `--strict-markers`) + `pytest-asyncio`. Runtime floor = **3.12** (`requires-python`, and `mypy`'s `python_version`); CI gates 3.12 **and** 3.13. Core has **no runtime deps** (optional `aws` extra pulls `boto3`).
 
 ## Index
 - **§1 Tooling & the "foolish consistency" rule** — formatter/linter/type-checker own the mechanics; when to deviate; don't churn diffs.
@@ -25,7 +25,7 @@
 - **§11 Strings, logging & errors** — f-strings/`%`/`.format`, never `+` in loops; lazy `%`-logging; precise, greppable error messages.
 - **§12 Truthiness & conditionals** — implicit falsiness with caveats; `is None`; `isinstance`; `startswith`/`endswith`; simple ternaries.
 - **§13 Resources, global state & threading** — `with` for files/clients/closeables; avoid mutable global state; module-level constants OK; `contextvars`/`queue`/`threading` for concurrency.
-- **§14 Docstrings & comments** — docstrings are the primary source of context; triple-quoted summary line; `Args`/`Returns`/`Raises`; no verbose comments, comment *why* not *what*; `TODO:` + tracked ref.
+- **§14 Docstrings & comments** — docstrings are the primary source of context; triple-quoted summary line; `Args`/`Returns`/`Raises` always present in `src/`; **no comments at all in `src/`**, comment *why* not *what* elsewhere; `TODO:` + tracked ref.
 - **§15 Modules, main & power features** — module docstring; `main()` behind `if __name__ == '__main__'`; avoid metaclasses/reflection/`__del__` cleanup.
 
 ---
@@ -159,14 +159,14 @@ Close what you open; avoid mutable global state; use the right concurrency primi
 - 🔴 Don't rely on atomicity of built-in types across threads; use `queue.Queue` / `threading` primitives to hand work to the background worker (the app→worker handoff is a `queue.Queue`).
 
 ## §14 Docstrings & comments
-Docstrings describe the interface and are the **primary source of context**; comments explain the non-obvious and should be rare.
+Docstrings describe the interface and are the **primary source of context**. In `src/` they are the *only* prose — `CLAUDE.md` forbids comments there outright, and the bullets below carry that scope. Elsewhere (`tests/`, `scripts/`) comments explain the non-obvious and should be rare.
 
-- ✅ Triple-double-quoted `"""` docstrings (PEP 257) for every public module, function, class, and method — plus any nontrivial or non-obvious function. First line a summary ending in a period, ≤ the docstring line limit; multi-line = summary, blank line, details, closing `"""` on its own line. 🔴 No docstring on a `lambda`. Enough info to call it without reading the body.
-- ✅ Use the section format when it adds info: **`Args:`** (each param + description; note types if not annotated), **`Returns:`** (or **`Yields:`** for generators; omit if it only returns `None` or the summary already says it), **`Raises:`** (exceptions relevant to the interface).
+- ✅ Triple-double-quoted `"""` docstrings (PEP 257) for every module, function, class, and method. 🔴 **`src/` admits no exception for a private or trivial one** — CLAUDE.md's rule is absolute there, and it is also the practice: every underscore-private function in `src/` carries one. The only defs without a docstring are the two `@overload` stubs at `decorator.py:608,610`, where the implementation below carries it. First line a summary ending in a period, ≤ the docstring line limit; multi-line = summary, blank line, details, closing `"""` on its own line. 🔴 No docstring on a `lambda`. Enough info to call it without reading the body.
+- ✅ Use the section format when it adds info: **`Args:`** (each param + description; note types if not annotated), **`Returns:`** (or **`Yields:`** for generators), **`Raises:`** (exceptions relevant to the interface). 🔴 **In `src/`, `CLAUDE.md` overrides the "omit it" half of PEP 257 here**: on a function or method all three sections are always present, filled with `None.` where they do not apply, so a missing section is a defect rather than a judgement call. A **class** docstring is governed by the bullet below instead — it takes `Attributes:`, not the callable trio.
 - ✅ Class docstring below the `class` line summarizing what an **instance represents** (an `Exception` subclass says what it *represents*, not when it's raised); document public attributes in an `Attributes:` section.
 - ✅ **When code needs explaining, prefer expanding the docstring over adding comments.** Docstrings are discoverable (`help()`, hover, generated docs); scattered comments are not.
-- ✅ **Comments explain *why*, not *what*** — tricky logic, non-obvious decisions (like the `TYPE_CHECKING` cycle-break, or catching `BaseException`); assume the reader knows Python. Complete sentences, kept in sync with the code. 🔴 No verbose or paragraph-length comments, and never a comment that just narrates *what* the next line does. 🔴 Never leave a comment that contradicts the code. Block comments at the code's indent (`# ` prefix); inline comments ≥2 spaces from code, used sparingly.
-- ✅ `TODO:` in caps + colon + a **tracked reference** (spec ID or issue link preferred) + `-` explanation: `# TODO: SPEC-004 - swap direct flush for worker.submit`. Don't attribute TODOs to a person as the context.
+- 🔴 **`src/` carries no comments at all — see `CLAUDE.md` → Code Conventions, which governs.** Docstrings are the only prose there, and reasoning that would have been a comment goes *in* the docstring (the bullet above, made absolute). `# noqa` and `# type: ignore` are directives, not comments, and stay — CLAUDE.md names those two, and `# pragma:` is a third by the same test, which `src/` also carries. Outside `src/` — `tests/`, `scripts/` — the ordinary rule applies: comments explain *why*, not *what*, in complete sentences kept in sync with the code; no paragraph-length comment, none that narrates the next line, none that contradicts it; block comments at the code's indent, inline comments ≥2 spaces from code.
+- ✅ `TODO:` in caps + colon + a **tracked reference** (spec ID or issue link preferred) + `-` explanation: `# TODO: SPEC-004 - swap direct flush for worker.submit`. Don't attribute TODOs to a person as the context. 🔴 Not in `src/` — it is a comment, and the bullet above forbids those; an unfinished obligation there belongs in the spec or `docs/decisions.md`, where something reads it.
 
 ## §15 Modules, main & power features
 Modules stay importable; avoid Python's fancy machinery.
