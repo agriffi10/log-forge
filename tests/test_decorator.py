@@ -72,9 +72,6 @@ def test_baggage_flows_to_descendant_logs(lf, fake_sink) -> None:
         lf.set_baggage(request_id="r-123")
         child()
 
-    if not hasattr(lf, "set_baggage"):
-        pytest.skip("log_foundry.set_baggage not implemented yet")
-
     contextvars.copy_context().run(parent)
 
     # Baggage rides user *log* events (SPEC-002 FR-003), not the decorator's span.start/end
@@ -147,7 +144,7 @@ def test_baggage_from_a_nested_call_reaches_the_parent_and_later_siblings(lf, fa
 
 
 def test_baggage_set_before_any_span_survives_the_span(lf, fake_sink) -> None:
-    context_mod = pytest.importorskip("log_foundry.context")
+    from log_foundry import context as context_mod
 
     @lf.trace(name="work")
     def work() -> None:

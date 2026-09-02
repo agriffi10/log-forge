@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import threading
 import time
-
-import pytest
+from typing import TYPE_CHECKING
 
 import log_foundry
 from log_foundry import _lifecycle
 
-api = pytest.importorskip("log_foundry.api")
+if TYPE_CHECKING:
+    import pytest
 
 CLOSE_SECONDS = 2.0
 """Long enough to separate `max` from `sum` at four sinks, short enough to keep the suite quick.

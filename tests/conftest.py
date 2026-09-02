@@ -1,10 +1,7 @@
 """Shared fixtures for the log-foundry test suite.
 
-These tests are written *ahead* of the implementation (see docs/implementation-guide.md).
-Every test guards on the feature it needs — `pytest.importorskip("log_foundry.<module>")`
-for whole modules, and an attribute check in the `lf` fixture for the public API — so the
-suite stays green and simply *skips* anything not built yet. As you complete each phase,
-the matching tests light up on their own.
+Imports here are plain: a `log_foundry` module that will not import is an error, not a
+skipped file. See `tests/README.md` for the two things that may still legitimately skip.
 """
 
 import sys
@@ -201,13 +198,11 @@ def lf(fake_sink: FakeSink, monkeypatch):
     the worker's own batching/retry/backpressure/shutdown behavior is covered directly in
     `test_worker.py`.
     """
-    log_foundry = pytest.importorskip("log_foundry")
-    for attr in ("configure", "trace", "info"):
-        if not hasattr(log_foundry, attr):
-            pytest.skip(f"log_foundry.{attr} not implemented yet")
+    import log_foundry
+
     log_foundry.configure(service="test", version="0.0.0", env="test", sink=fake_sink)
 
-    decorator = pytest.importorskip("log_foundry.decorator")
+    from log_foundry import decorator
     from log_foundry.config import _ensure_sink
 
     def _sync_flush(span) -> None:

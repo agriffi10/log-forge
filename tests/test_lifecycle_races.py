@@ -29,9 +29,9 @@ from log_foundry import _fork, _lifecycle
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-api = pytest.importorskip("log_foundry.api")
-retry = pytest.importorskip("log_foundry.sinks._retry")
-stdout_sink = pytest.importorskip("log_foundry.sinks.stdout")
+from log_foundry import api
+from log_foundry.sinks import _retry as retry
+from log_foundry.sinks import stdout as stdout_sink
 
 _LIFECYCLE_SRC = pathlib.Path(_lifecycle.__file__)
 _DRAIN_NAME = "log-foundry-worker"

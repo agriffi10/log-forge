@@ -2,9 +2,7 @@
 
 import pytest
 
-from log_foundry import _lifecycle
-
-config = pytest.importorskip("log_foundry.config")
+from log_foundry import _lifecycle, config
 
 
 def test_configure_sets_identity_fields() -> None:
@@ -77,7 +75,7 @@ def test_a_rejected_call_leaves_the_config_untouched() -> None:
 
 
 def test_max_keys_configured_through_configure_takes_effect() -> None:
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import model
     config.configure(max_keys=2)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
@@ -90,7 +88,7 @@ def test_max_keys_configured_through_configure_takes_effect() -> None:
 
 
 def test_max_depth_configured_through_configure_takes_effect() -> None:
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import model
     config.configure(max_depth=2)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
@@ -105,7 +103,7 @@ def test_max_depth_configured_through_configure_takes_effect() -> None:
 def test_max_depth_of_one_still_keeps_scalar_field_values() -> None:
     """`fields` is the payload container, not a nesting level the caller chose — so the
     smallest legal max_depth must still emit scalar values rather than an empty event."""
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import model
     config.configure(max_depth=1)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
@@ -119,10 +117,9 @@ def test_max_depth_of_one_still_keeps_scalar_field_values() -> None:
 import threading  # noqa: E402
 import time  # noqa: E402
 
-log_foundry = pytest.importorskip("log_foundry")
-decorator = pytest.importorskip("log_foundry.decorator")
-worker_mod = pytest.importorskip("log_foundry.worker")
-lifecycle = pytest.importorskip("log_foundry._lifecycle")
+import log_foundry  # noqa: E402
+from log_foundry import _lifecycle as lifecycle  # noqa: E402
+from log_foundry import worker as worker_mod  # noqa: E402
 
 
 def _span(msg) -> list[dict]:

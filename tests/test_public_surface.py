@@ -21,11 +21,8 @@ import types
 
 import pytest
 
-log_foundry = pytest.importorskip("log_foundry")
-api = pytest.importorskip("log_foundry.api")
-config = pytest.importorskip("log_foundry.config")
-model = pytest.importorskip("log_foundry.model")
-context = pytest.importorskip("log_foundry.context")
+import log_foundry
+from log_foundry import api, config, context, model
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SINK_PKG = _ROOT / "src" / "log_foundry" / "sinks"
@@ -319,7 +316,7 @@ def test_no_sink_takes_an_injected_transport_positionally() -> None:
 
 def test_sqs_client_is_keyword_only() -> None:
     """FR-001 AC-1, at the one site the rename was taken for."""
-    sqs = pytest.importorskip("log_foundry.sinks.sqs")
+    from log_foundry.sinks import sqs
     params = inspect.signature(sqs.SQSSink.__init__).parameters
     assert params["client"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["queue_url"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -331,7 +328,7 @@ def test_sentry_injects_through_client() -> None:
     An alias would have to live for the whole of `1.x`, which is the cost this spec exists to
     avoid.
     """
-    saas = pytest.importorskip("log_foundry.sinks.sentry")
+    from log_foundry.sinks import sentry as saas
     params = inspect.signature(saas.SentrySink.__init__).parameters
     assert "sdk" not in params
     assert params["client"].kind is inspect.Parameter.KEYWORD_ONLY
@@ -542,7 +539,7 @@ def test_the_stop_signal_attribute_is_namespaced_everywhere() -> None:
 
 def test_a_sink_offering_the_namespaced_attribute_is_handed_the_event() -> None:
     """FR-006 AC-1's contract, exercised: define the attribute and the library fills it in."""
-    lifecycle = pytest.importorskip("log_foundry._lifecycle")
+    from log_foundry import _lifecycle as lifecycle
 
     class Offering:
         def __init__(self) -> None:
@@ -1075,7 +1072,7 @@ def test_echo_still_controls_the_console(monkeypatch) -> None:
     happily had the echo been broken — while pytest's own "Captured stderr call" section printed
     the line the assertion could not see.
     """
-    console_mod = pytest.importorskip("log_foundry.console")
+    from log_foundry import console as console_mod
     stream = io.StringIO()
     monkeypatch.setattr("log_foundry.api._console", console_mod.ConsoleWriter(stream=stream))
     log_foundry.configure(service="t", sink=_Recorder())
@@ -1479,8 +1476,7 @@ def test_the_aliases_a_public_signature_names_are_exported() -> None:
     Keying on the annotation text rather than on a written list means renaming the alias
     without moving the export fails here, which is the drift this criterion exists for.
     """
-    sqs = pytest.importorskip("log_foundry.sinks.sqs")
-    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    from log_foundry.sinks import sentry, sqs
     for module, sink, aliases in (
         (sqs, sqs.SQSSink, ("GroupIdSource", "DedupIdSource")),
         (sentry, sentry.SentrySink, ("Backend",)),
@@ -1500,7 +1496,7 @@ def test_the_sentry_backend_docstring_no_longer_denies_its_own_export() -> None:
     is a docstring only to a documentation tool, and is unreachable at runtime -- so a runtime
     assertion here would pass against the contradiction it claims to catch.
     """
-    sentry = pytest.importorskip("log_foundry.sinks.sentry")
+    from log_foundry.sinks import sentry
     assert "Backend" in sentry.__all__
     source = (_SINK_PKG / "sentry.py").read_text(encoding="utf-8")
     assert "Not exported" not in source
@@ -1508,8 +1504,8 @@ def test_the_sentry_backend_docstring_no_longer_denies_its_own_export() -> None:
 
 def test_the_two_new_top_level_names_are_exports_not_copies() -> None:
     """FR-004 AC-2 and AC-3. Identity, so a same-valued rebinding does not satisfy it."""
-    worker = pytest.importorskip("log_foundry.worker")
-    base = pytest.importorskip("log_foundry.sinks.base")
+    from log_foundry import worker
+    from log_foundry.sinks import base
     assert "DEFAULT_SWAP_TIMEOUT" in log_foundry.__all__
     assert "flush_sink" in log_foundry.__all__
     assert log_foundry.DEFAULT_SWAP_TIMEOUT is worker.DEFAULT_SWAP_TIMEOUT
@@ -1563,11 +1559,15 @@ def test_the_typed_consumer_probe_covers_every_exported_name() -> None:
             imported.setdefault(node.module, set()).update(alias.name for alias in node.names)
     assert imported, "the probe's import scan collapsed -- it cannot see an absence"
 
+    from log_foundry.sinks import http as http_sink
+    from log_foundry.sinks import sentry as sentry_sink
+    from log_foundry.sinks import sqs as sqs_sink
+
     for module_name, exported in (
         ("log_foundry", log_foundry.__all__),
-        ("log_foundry.sinks.sqs", pytest.importorskip("log_foundry.sinks.sqs").__all__),
-        ("log_foundry.sinks.sentry", pytest.importorskip("log_foundry.sinks.sentry").__all__),
-        ("log_foundry.sinks.http", pytest.importorskip("log_foundry.sinks.http").__all__),
+        ("log_foundry.sinks.sqs", sqs_sink.__all__),
+        ("log_foundry.sinks.sentry", sentry_sink.__all__),
+        ("log_foundry.sinks.http", http_sink.__all__),
     ):
         missing = sorted(set(exported) - imported.get(module_name, set()))
         assert not missing, f"{module_name} exports these and the probe never imports them: {missing}"
@@ -1600,7 +1600,7 @@ def test_a_zero_x_sink_building_sinklosses_positionally_degrades_to_none() -> No
     nothing" rather than "no loss". `sinks/base.py` documents that; this is what makes the
     documentation a claim rather than a hope.
     """
-    base = pytest.importorskip("log_foundry.sinks.base")
+    from log_foundry.sinks import base
 
     class _ZeroXSink:
         def emit(self, batch: list[dict[str, object]]) -> None: ...

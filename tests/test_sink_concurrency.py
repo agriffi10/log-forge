@@ -472,7 +472,7 @@ def test_sqs_sink_counts_every_oversized_drop_under_concurrent_emitters() -> Non
     test, not the threshold. The ``losses()`` call adds one acquisition on top of the drops,
     which is the pair read taken under the same lock.
     """
-    sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
+    from log_foundry.sinks import sqs as sqs_mod
 
     class NeverCalledClient:
         def send_message_batch(self, **kwargs: object) -> dict:
@@ -1049,7 +1049,7 @@ def test_nats_sink_does_not_reenter_its_managed_event_loop() -> None:
     plainly because FR-004 asks for tests that are deterministic for CI, and this one is
     deterministic only while the lock is present.
     """
-    nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+    from log_foundry.sinks import nats as nats_mod
 
     class FakeClient:
         def __init__(self) -> None:
@@ -1086,7 +1086,7 @@ def test_rabbitmq_publishes_are_not_interleaved_on_one_channel() -> None:
     version to be caught every run. With one event per emit the critical section was short
     enough that the mutant survived roughly one run in five.
     """
-    rabbit_mod = pytest.importorskip("log_foundry.sinks.rabbitmq")
+    from log_foundry.sinks import rabbitmq as rabbit_mod
 
     class ExclusiveChannel:
         def __init__(self) -> None:
@@ -1138,7 +1138,7 @@ def test_rabbitmq_publishes_are_not_interleaved_on_one_channel() -> None:
 
 def test_clickhouse_insert_is_not_interleaved_by_a_concurrent_emit() -> None:
     """FR-002 names ClickHouse, and its lock was verified by nothing until now."""
-    clickhouse_mod = pytest.importorskip("log_foundry.sinks.clickhouse")
+    from log_foundry.sinks import clickhouse as clickhouse_mod
 
     class ExclusiveClient:
         def __init__(self) -> None:
@@ -1183,7 +1183,7 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     The retry backoff is neutralized as ``test_sinks_sqs.py`` does: this test is about the
     counter, and 200 emits each spending their full 0.7 s budget would take minutes.
     """
-    kinesis_mod = pytest.importorskip("log_foundry.sinks.kinesis")
+    from log_foundry.sinks import kinesis as kinesis_mod
     monkeypatch.setattr(kinesis_mod, "wait", lambda _delay, _stop=None: None)
 
     class ShortResponseClient:
@@ -1435,7 +1435,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     if name == "sqlite":
         return SQLiteSink(str(tmp_path / "closed.db")), lambda: 0
     if name == "rabbitmq":
-        rabbit = pytest.importorskip("log_foundry.sinks.rabbitmq")
+        from log_foundry.sinks import rabbitmq as rabbit
 
         class Channel:
             def basic_publish(self, **kwargs: object) -> None:
@@ -1463,7 +1463,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         sink._properties = object()
         return sink, lambda: len(opened)
     if name == "mongodb":
-        mongo = pytest.importorskip("log_foundry.sinks.mongodb")
+        from log_foundry.sinks import mongodb as mongo
 
         class Collection:
             def insert_many(self, documents: list, ordered: bool = False) -> None:
@@ -1488,7 +1488,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             lambda: len(opened),
         )
     if name == "clickhouse":
-        clickhouse = pytest.importorskip("log_foundry.sinks.clickhouse")
+        from log_foundry.sinks import clickhouse
 
         class Client:
             def insert(self, table: str, data: list, column_names: list) -> None:
@@ -1499,7 +1499,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
         return clickhouse.ClickHouseSink("events", client=Client()), lambda: len(opened)
     if name == "eventhubs":
-        eventhubs = pytest.importorskip("log_foundry.sinks.eventhubs")
+        from log_foundry.sinks import eventhubs
 
         class Batch(list):
             def add(self, data: object) -> None:
@@ -1543,7 +1543,7 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return PostgresSink("events", connection=connection), lambda: connection.commits
 
     if name == "nats":
-        nats_mod = pytest.importorskip("log_foundry.sinks.nats")
+        from log_foundry.sinks import nats as nats_mod
 
         class FakeClient:
             async def publish(self, subject: str, payload: bytes) -> None:
@@ -1682,7 +1682,7 @@ def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
     ``send_batch`` sequence, so narrowing the lock to cover less than the batch is caught, not
     just removing it.
     """
-    eventhubs = pytest.importorskip("log_foundry.sinks.eventhubs")
+    from log_foundry.sinks import eventhubs
     # The `azure` extra is not installed in CI, and the SDK's EventData is a plain wrapper here.
     monkeypatch.setattr(eventhubs, "_event_data_cls", lambda: bytes)
 

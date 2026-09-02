@@ -15,10 +15,12 @@ import time
 
 import pytest
 
-log_foundry_mod = pytest.importorskip("log_foundry")
+import log_foundry as log_foundry_mod
+from log_foundry import _lifecycle
+from log_foundry import worker as worker_mod
+
 FlushResult = log_foundry_mod.FlushResult
-worker_mod = pytest.importorskip("log_foundry.worker")
-_lifecycle = pytest.importorskip("log_foundry._lifecycle")
+
 Worker = worker_mod.Worker
 _SHUTDOWN_SENTINEL = worker_mod._SHUTDOWN
 
@@ -1404,7 +1406,7 @@ def test_a_keyboardinterrupt_from_close_still_propagates() -> None:
 def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
     """FR-004's criterion names `log_foundry.shutdown()`, whose delegate is deliberately
     unguarded — it relies entirely on `Worker.shutdown()` being total."""
-    log_foundry = pytest.importorskip("log_foundry")
+    import log_foundry
     sink = _CloseFailsSink()
     log_foundry.configure(service="t", sink=sink)
 

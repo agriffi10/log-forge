@@ -24,8 +24,7 @@ import pytest
 if TYPE_CHECKING:
     import threading
 
-log_foundry = pytest.importorskip("log_foundry")
-decorator = pytest.importorskip("log_foundry.decorator")
+import log_foundry
 
 PATHS = ["orphan", "traced", "async", "post_shutdown"]
 

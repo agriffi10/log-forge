@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-log_foundry = pytest.importorskip("log_foundry")
+import log_foundry
 
 # PEP 440 public versions we can actually produce: a release (0.1.0) or a dev build (0.1.1.dev3).
 _PEP440_PUBLIC = re.compile(r"^\d+\.\d+\.\d+(\.dev\d+)?$")

@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+from log_foundry.sinks import sqs as sqs_mod
 from log_foundry.sinks.base import SinkDeliveryError
 
 
@@ -19,7 +20,6 @@ def _no_sleep(monkeypatch):
     # ``time.sleep`` — patching either centrally would leave this fixture inert.
     monkeypatch.setattr("log_foundry.sinks.sqs.wait", lambda _delay, _stop=None: None)
 
-sqs_mod = pytest.importorskip("log_foundry.sinks.sqs")
 SQSSink = sqs_mod.SQSSink
 
 

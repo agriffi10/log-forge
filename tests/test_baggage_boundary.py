@@ -12,8 +12,8 @@ import asyncio
 
 import pytest
 
-context_mod = pytest.importorskip("log_foundry.context")
-model = pytest.importorskip("log_foundry.model")
+from log_foundry import context as context_mod
+from log_foundry import model
 
 
 @pytest.fixture(autouse=True)

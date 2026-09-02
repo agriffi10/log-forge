@@ -1,6 +1,5 @@
 """Phase 3 — Data model (arch §6). Schema shape and field precedence."""
 
-import pytest
 
 BASE_FIELDS = (
     "timestamp", "level", "message", "trace_id", "span_id", "parent_span_id",
@@ -19,7 +18,7 @@ def _make_span(model):
 
 
 def test_build_event_matches_schema(lf) -> None:
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import model
     event = model.build_event(
         _make_span(model), "INFO", "hello",
         fields={"user_id": 7}, baggage={"tenant": "acme"},
@@ -37,7 +36,7 @@ def test_build_event_matches_schema(lf) -> None:
 
 def test_field_precedence_explicit_fields_win(lf) -> None:
     """arch §5.1: defaults < span.defaults < baggage < per-call fields."""
-    model = pytest.importorskip("log_foundry.model")
+    from log_foundry import model
     event = model.build_event(
         _make_span(model), "INFO", "m",
         fields={"k": "from_fields"}, baggage={"k": "from_baggage"},

@@ -6,13 +6,10 @@ import time
 
 import pytest
 
-from log_foundry import _lifecycle
-
-log_foundry = pytest.importorskip("log_foundry")
-config = pytest.importorskip("log_foundry.config")
-decorator = pytest.importorskip("log_foundry.decorator")
-lifecycle = pytest.importorskip("log_foundry._lifecycle")
-worker_mod = pytest.importorskip("log_foundry.worker")
+import log_foundry
+from log_foundry import _lifecycle, config
+from log_foundry import _lifecycle as lifecycle
+from log_foundry import worker as worker_mod
 
 
 class CountingSink:
@@ -595,7 +592,7 @@ def test_an_orphan_emit_gives_the_sink_a_stop_signal() -> None:
 
 def test_shutdown_sets_the_orphan_stop_signal() -> None:
     """AC-2. A sink parked in a backoff must be released rather than serving it in full."""
-    retry = pytest.importorskip("log_foundry.sinks._retry")
+    from log_foundry.sinks import _retry as retry
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("to it")
@@ -707,7 +704,7 @@ def test_a_sink_emitted_to_after_shutdown_still_backs_off() -> None:
     loop against exactly the rate-limited destination the backoff exists for. Keying the refresh
     on *arming* misses the second case, which `FR-001 AC-5` refuses to re-arm.
     """
-    retry = pytest.importorskip("log_foundry.sinks._retry")
+    from log_foundry.sinks import _retry as retry
     same, fresh = CountingSink("same"), CountingSink("fresh")
     log_foundry.configure(service="t", sink=same)
     log_foundry.info("before")
@@ -839,7 +836,7 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
     holding a set event, so every backoff collapses to zero — the tight-retry-loop harm FR-004
     exists to prevent, in a mixed process rather than an orphan-only one.
     """
-    retry = pytest.importorskip("log_foundry.sinks._retry")
+    from log_foundry.sinks import _retry as retry
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -1081,7 +1078,7 @@ def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypa
     sink and the exit close makes that two. The window is a few instructions wide, so it is
     injected — the technique SPEC-028 uses for races that need one.
     """
-    api = pytest.importorskip("log_foundry.api")
+    from log_foundry import api
     old, new = CountingSink("old"), CountingSink("new")
     log_foundry.configure(service="t", sink=old)
     log_foundry.info("arms the record at old")
