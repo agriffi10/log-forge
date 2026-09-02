@@ -268,6 +268,7 @@ class RotatingFileSink:
         self._stream: TextIO = open(path, "a", encoding=self._encoding)
         self._size = os.path.getsize(path) if os.path.exists(path) else 0
         self._next_rollover = self._schedule_next()
+        self._rotation_failing = False
         self._closed = False
         self._lock = threading.Lock()
 
@@ -455,9 +456,17 @@ class RotatingFileSink:
         corrupt write.
 
         ``_next_rollover`` is re-armed as well as ``_size``: ``_rotate`` sets it on its last line,
-        so an absorbed failure would otherwise leave a deadline permanently in the past and every
-        subsequent event would retry the rotation and write another diagnostic, with no damping
-        anywhere.
+        so an absorbed failure would otherwise leave a **time** trigger permanently in the past.
+
+        **The re-arm does not damp the size trigger, and the diagnostic is what carries that.**
+        ``_size`` is re-seeded from a file that is now over ``max_bytes``, so ``_should_rotate``'s
+        size branch stays true and every subsequent event attempts a rotation again — measured at
+        598 attempts over 600 events. The attempts are cheap and lose nothing, but an unthrottled
+        stderr write per event is not: ``PostgresSink._reconnect_if_broken`` records the same rule
+        for the same reason, that a diagnostic which floods is one an operator stops reading. So
+        the failure is announced **once per outage** and the flag clears on the next successful
+        rotation. The remaining per-event attempt is recorded in ``architecture.md`` §12 rather
+        than fixed here, because damping it means deferring a rotation the caller asked for.
 
         **The reopen can itself raise, and that is not absorbed.** It is the same
         ``open(self._path, "a")`` call ``_rotate`` ends with, so whatever defeats it there —
@@ -486,7 +495,11 @@ class RotatingFileSink:
             self._stream = open(self._path, "a", encoding=self._encoding)
             self._size = os.path.getsize(self._path) if os.path.exists(self._path) else 0
             self._next_rollover = self._schedule_next()
-            _diag.absorbed("rotating RotatingFileSink", err)
+            if not self._rotation_failing:
+                self._rotation_failing = True
+                _diag.absorbed("rotating RotatingFileSink", err)
+            return
+        self._rotation_failing = False
 
     def _rotate(self) -> None:
         """Closes the active file, shifts and prunes backups, then opens a fresh active file.

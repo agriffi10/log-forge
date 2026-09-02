@@ -718,3 +718,49 @@ def test_a_close_landing_mid_emit_bounds_the_overflow_tail_too(capsys) -> None:
     # well land and re-sending them would duplicate what did (SPEC-018's rule that only provable
     # non-delivery may be retried). What the close cost is the *confirmation*, which is counted as
     # unconfirmed rather than reported as a failure to the worker.
+
+
+def test_close_is_not_bounded_for_a_future_that_cannot_be_waited_on(capsys) -> None:
+    """The documented exception to close()'s bound, pinned so it is a decision and not a surprise.
+
+    A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only
+    wait it accepts and SPEC-036 measured that counting it instead invents loss on publishes that
+    were going to succeed. So a client handing out futures that are BOTH unboundable AND slow holds
+    `close()` for its own deadline, once per future — measured by a reviewer at 27.0 s for nine
+    against a 3 s stand-in. `google-cloud-pubsub`'s own future accepts a timeout, so only an
+    injected `client=` reaches this; `client=` is a frozen public parameter, which is why it is
+    tested rather than assumed away.
+
+    The existing regression test uses a future that returns *immediately*, so unboundable-and-slow
+    was untested until this. Recorded in `architecture.md` §12.
+    """
+    delay = 0.4
+
+    class UnboundableAndSlow:
+        def __init__(self) -> None:
+            self.resolved = 0
+
+        def done(self) -> bool:
+            return False
+
+        def result(self):  # no timeout parameter at all
+            self.resolved += 1
+            time.sleep(delay)
+            return "message-id"
+
+    client = PollablePublisher(lambda _i: UnboundableAndSlow())
+    sink = GooglePubSubSink("t", client=client, max_pending=50, overflow_timeout=0.05)
+    sink.emit([{"i": i} for i in range(3)])
+    began = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - began
+
+    assert elapsed >= delay * 3 * 0.8, (
+        f"close() waits on each unboundable future in turn, unbounded: {elapsed:.2f}s. If this "
+        f"ever fails, the bound was extended to cover them and the docstring must follow."
+    )
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "and they are still not counted as lost -- SPEC-036's rule, which is why they are waited "
+        "on unbounded in the first place"
+    )
+    assert all(f.resolved == 1 for f in client.futures), "every one was actually resolved"

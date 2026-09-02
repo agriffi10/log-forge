@@ -371,8 +371,12 @@ No new types. One new module-level object and one new class in `http.py`:
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl) -> None: ...
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect()).open
+def _no_redirect_opener() -> Callable[..., Any]: ...   # built per sink, not at import
 ```
+
+A first draft of this section put the opener in a module-level constant. It is built per
+construction instead: `python.md` forbids import-time work, and `build_opener` snapshots the proxy
+environment, so an import-time opener ignores a proxy the application sets after import.
 
 Counters that move where they did not before, all already public through `losses()`:
 

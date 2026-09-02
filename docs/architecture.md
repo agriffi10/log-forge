@@ -850,6 +850,25 @@ close it.
   shape FR-002 makes a `ValueError` for the four connect timeouts, in the same constructor, left
   alone because changing it would break a caller passing both today. **Closed by** a major version
   that can refuse it, or by a deprecation warning first.
+- **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
+  A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
+  it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
+  going to succeed. A client handing out futures that are both unboundable *and* slow therefore
+  holds `close()` for its own deadline, once per future: measured 27.0 s for nine against a 3 s
+  stand-in, where the bounded path took 2.0 s for sixty. Strictly better than before SPEC-048,
+  where **every** future took that path, and unreachable through `google-cloud-pubsub`'s own
+  future, which accepts a timeout — but `client=` is a frozen public parameter. **Closed by**
+  resolving them on a joinable thread, which bounds the close at the cost of a thread that may
+  outlive it; waiting on a future is a read and causes no delivery, so SPEC-036's rule forbids
+  *counting* them, not abandoning the wait.
+- **A `RotatingFileSink` whose rotation keeps failing retries it once per event** (SPEC-048
+  FR-006). The absorbed failure re-seeds `_size` from a file already over `max_bytes`, so the size
+  trigger stays true and every later event attempts a close, a rename, a reopen and a `getsize` on
+  the drain thread — measured 598 attempts over 600 events. Nothing is lost or duplicated, and the
+  *diagnostic* is damped to one line per outage on `PostgresSink._reconnect_if_broken`'s rule, so
+  what remains is I/O rather than noise. The time trigger is already damped by its re-arm.
+  **Closed by** deferring the next attempt until the file has grown by another `max_bytes`, which
+  trades a rotation the caller asked for against the retry cost.
 
 ### Resolved
 

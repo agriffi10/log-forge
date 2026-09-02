@@ -586,6 +586,17 @@ class GooglePubSubSink:
         ``overflow_timeout`` on the monotonic clock and deliberately **not** the stop signal;
         :meth:`_resolve_within` records why.
 
+        **The bound does not cover a future that cannot be waited on within a timeout.** One whose
+        ``result()`` takes no ``timeout`` argument is resolved unbounded, because that is the only
+        wait it accepts and SPEC-036 measured that counting it instead invents loss on publishes
+        that were going to succeed. So a client handing out unboundable futures that also do not
+        settle still holds the close for its own deadline, once per future: measured at 27.0 s for
+        nine futures against a 3 s stand-in, where the bounded path took 2.0 s for sixty.
+        ``google-cloud-pubsub``'s own future accepts a timeout, so this is reachable only through
+        an injected ``client=`` that does not — but ``client=`` is a frozen public parameter, which
+        is why it is written down here rather than assumed away. Recorded in ``architecture.md``
+        §12; it is strictly better than before, where **every** future took this path.
+
         Idempotent. The pending list is swapped out under a lock rather than iterated and then
         cleared (SPEC-028 FR-002): ``emit`` appends to it from any thread, so the old
         iterate-then-``clear()`` discarded any future appended after the loop passed its index —

@@ -3,7 +3,8 @@
 ## What was completed?
 
 - **A `3xx` is a counted delivery failure, never a route to follow** (FR-001). `sinks/http.py`
-  gains `_NoRedirect` and `_NO_REDIRECT_OPENER`, the default for every sink in the family; one
+  gains `_NoRedirect` and `_no_redirect_opener()`, called per construction and the default
+  for every sink in the family; one
   site set the opener and one calls it, so the change reaches six subclasses, `LogstashSink`'s
   HTTP backend and `SentrySink`'s fallback untouched. An injected `opener=` is used as given.
 - **A client exception costs its chunk, never the batch** (FR-002). The guard sits *inside* each
@@ -47,10 +48,14 @@ build.
 
 ## Verification
 
-Five gates green by exit code: `ruff` 0, `mypy` 0, `pytest` 0 (1955 passed, 8 skipped — 40 new),
+Five gates green by exit code: `ruff` 0, `mypy` 0, `pytest` 0 (1958 passed, 8 skipped — 43 new),
 `spec-lint` 0, `docs-lint` 0. Collected test names diffed against the parent commit: **0 removed**.
-Twenty-one mutants planted and all twenty-one killed, one per guard whose failure would be
+Twenty-three mutants planted and all twenty-three killed, one per guard whose failure would be
 silent, each asserting a reason rather than an exit code. FR-001 is exercised against two real `http.server`
 origins because every existing HTTP test injects a fake opener and would not touch the fix; the
 FR-002 roster was demonstrated by adding a hypothetical unguarded fifth AWS sink and watching it
-be named. Nothing was deferred to CI.
+be named. The second diff review built eight programs driving these sinks through the worker and
+found no loss or duplication end to end; two residuals it measured are recorded in
+`architecture.md` §12 rather than fixed, with a **Closed by** clause each.
+
+Nothing was deferred to CI.
