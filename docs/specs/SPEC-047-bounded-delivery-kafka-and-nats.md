@@ -80,10 +80,21 @@ one uniform mechanism:
 `DEFAULT_PUBLISH_TIMEOUT` is **10.0 s, not 30**, and the reasoning is `KafkaSink`'s for its own
 `DEFAULT_FLUSH_TIMEOUT`. `_lifecycle.DEFAULT_SHUTDOWN_TIMEOUT` is 30.0, and this budget is spent
 *inside* it: `Worker.shutdown` sets the stop event, joins the drain thread against that deadline,
-and `_final_drain`'s single `emit` runs on that thread. An `emit` allowed to consume the whole 30 s
-expires the join, and an expired shutdown leaves the sink **open** by SPEC-027 FR-004 — so
-`close()`'s drain never runs and the client's outbound buffer dies with the process. Ten leaves
-room for the close that delivers it.
+and `_final_drain`'s single `emit` runs on that thread. An expired join leaves the sink **open** by
+SPEC-027 FR-004, so `close()`'s drain never runs and the client's outbound buffer dies with the
+process.
+
+**One `emit` is not the exit-drain worst case, and the arithmetic is stated rather than assumed.**
+`Worker._emit` retries the whole batch `max_retries + 1` times — four at the default — and its
+inter-attempt wait returns instantly once the stop event is set, so the attempts are back to back.
+Since this deadline deliberately does not consult that event, the exit drain's worst case is
+`(max_retries + 1) × publish_timeout`: **40 s at the defaults, which still exceeds the 30 s join.**
+Ten is chosen on the size of the improvement rather than on fitting inside the join — today the
+same path is *unbounded*, and SPEC-038's measured 5,980-event exit backlog at 5 s an event is 8.3
+hours — and a caller who needs the sequence to fit lowers `publish_timeout` to 7.0 or below. The
+residual is recorded in `architecture.md` §12 by FR-004 AC-4 rather than closed here, because
+closing it means bounding the worker's retry of an already-bounded batch, which is every sink's
+question and not this sink's.
 
 **The deadline is not consulted through the stop signal, and must not be.** That per-event await is
 the *work*, not a wait between attempts, and SPEC-038 FR-001 AC-4a's rule is that a shutdown
@@ -118,16 +129,22 @@ wait, while a JetStream `publish()` sends *and* awaits, so cutting it short skip
 - [ ] AC-5: A set `log_foundry_stop_signal` does not shorten the batch, and `NATSSink` still
       declares no such attribute — asserted with `hasattr`, since that absence is what stops the
       worker offering one.
-- [ ] AC-6: When the budget expires with **nothing** published, `emit` raises `SinkDeliveryError`
-      naming the count not attempted, and moves **no** counter: `Worker._emit` retries the whole
-      batch, so booking those events would report a loss that has not happened — the rule
-      `KafkaSink.flush` already states for its own queued remainder.
-- [ ] AC-7: When the budget expires with **something** published, `emit` returns normally and the
-      unattempted remainder is counted into `losses().failed` — the worker will not retry, so that
-      loss is real.
+- [ ] AC-6: A **never-attempted** event and a **failed** one are counted by different rules, and the
+      existing rule for a failure is unchanged: an event whose publish raised is counted as today
+      (`test_publish_errors_counted` stays green, asserting `failed == 2` on a total failure that
+      also raises). Only the never-attempted remainder is governed by AC-7.
+- [ ] AC-7: When the budget expires with **nothing** published, `emit` raises `SinkDeliveryError`
+      naming the count not attempted, and books **none of the unattempted events**: `Worker._emit`
+      retries the whole batch, so booking them would report a loss that has not happened — the rule
+      `KafkaSink.flush` already states for its own queued remainder. When something *did* publish,
+      `emit` returns normally and the unattempted remainder **is** counted, because the worker will
+      not retry and that loss is real.
 - [ ] AC-8: `publish_timeout` set on a `jetstream=False` sink still delivers a whole batch against
       a healthy server, and bounds one only between events.
 - [ ] AC-9: A non-positive or non-finite `publish_timeout` falls back to `DEFAULT_PUBLISH_TIMEOUT`.
+- [ ] AC-10: `publish_timeout` is accepted alongside `client=` and is **not** one of the arguments
+      FR-002 AC-4 refuses there — it is this sink's own bound and applies to an injected client,
+      which is what every unit test in `tests/test_sinks_nats.py` uses.
 
 ### FR-002: `NATSSink`'s connect and drain bounds are reachable from its constructor
 
@@ -158,9 +175,13 @@ records it rather than this FR claiming to have exposed it.
       nothing is listening on fails in under 5 s rather than ~120 s.
 - [ ] AC-3: Omitting all four passes **no** corresponding kwarg to `nats.connect` — asserted on the
       absence of the keys, not on their values, so today's call is reproduced exactly.
-- [ ] AC-4: Passing any of the four together with `client=` raises `ValueError`; an injected client
-      is already connected and the argument can have no effect (SPEC-043's rule that an argument no
-      backend can consume is an error, not an ignore).
+- [ ] AC-4: Passing any of **those four** together with `client=` raises `ValueError`; an injected
+      client is already connected and the argument can have no effect (SPEC-043's rule that an
+      argument no backend can consume is an error, not an ignore). `publish_timeout` is explicitly
+      outside this set — see FR-001 AC-10.
+- [ ] AC-5: A test drives the *build* path by injecting a fake `nats` module into `sys.modules`,
+      the idiom `tests/test_sinks_postgres.py` and `tests/test_sinks_sqs.py` already use; today no
+      unit test reaches either sink's constructor-built client.
 
 ### FR-003: `KafkaSink` exposes `librdkafka`'s delivery bound instead of adding a second one
 
@@ -199,7 +220,8 @@ a caller whose deadline is shorter than their broker's worst outage is the one w
       constructor received.
 - [ ] AC-2: `producer_config={"bootstrap.servers": "wrong:9092"}` does **not** win — the sink's own
       key does, asserted on the resulting value rather than on the key's presence.
-- [ ] AC-3: `producer_config` passed together with `producer=` raises `ValueError`.
+- [ ] AC-3: `producer_config` passed together with `producer=` raises `ValueError`, asserted by a
+      test rather than only stated.
 - [ ] AC-4: Omitting `producer_config` produces exactly today's config dict, asserted by equality
       against `{"bootstrap.servers": …}`, so no existing caller's producer changes.
 
@@ -209,7 +231,7 @@ a caller whose deadline is shorter than their broker's worst outage is the one w
 
 The claim SPEC-041 declined to narrow becomes true, and the statements this spec's measurements
 found wrong are corrected in place per SPEC-021's rule — struck with the spec that closed them,
-never deleted. Four sites, not three:
+never deleted. Five sites, not three:
 
 1. `NATSSink`'s docstring says a JetStream publish is "bounded by the driver's own timeout (5 s by
    default)". True per event and false per batch, which is the whole of FR-001.
@@ -223,6 +245,11 @@ never deleted. Four sites, not three:
 4. `SPEC-041-sink-integration-verification.md` FR-004 itself, whose text says the NATS answer is
    "bounded, because it never waits". That FR already carries an in-place superseded blockquote for
    its Pub/Sub reversal, so the precedent for striking inside it sits in the same FR.
+5. `README.md`'s queue/stream **table**, which publishes both constructors' full signatures. Five
+   public keyword arguments are added across the two sinks, and nothing catches the drift —
+   `test_the_readme_and_all_cannot_drift` only checks names the README imports against
+   `log_foundry.__all__`, not signatures. Without this the paragraph above the table and the table
+   itself contradict each other inside one section.
 
 #### Acceptance Criteria:
 
@@ -232,9 +259,10 @@ never deleted. Four sites, not three:
 - [ ] AC-3: Both class docstrings state the worst-case total delay using this spec's measured
       figures, and do **not** claim the 30 s `drain_timeout` as `close()`'s bound, since it fired in
       neither measured case.
-- [ ] AC-4: `architecture.md` §12 records the three residuals — the `is_connected` window, a
-      duplicate-safe JetStream retry, and the driver's 10 s flush inside `drain()` being
-      unreachable — each naming what would close it, per §12's own criterion.
+- [ ] AC-4: `architecture.md` §12 records the four residuals — the `is_connected` window, a
+      duplicate-safe JetStream retry, the driver's 10 s flush inside `drain()` being unreachable,
+      and the exit drain's `(max_retries + 1) × publish_timeout` worst case exceeding the 30 s join
+      — each naming what would close it, per §12's own criterion.
 - [ ] AC-5: `poetry run pytest tests/test_sink_concurrency.py` stays green, since that module's
       lints assert literal strings in `KafkaSink`'s class docstring (`**no** transport lock`,
       `SPEC-028 FR-002`) that FR-004 rewrites around.
