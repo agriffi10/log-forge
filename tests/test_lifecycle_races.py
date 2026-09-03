@@ -1039,17 +1039,28 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
 
     It does not, and the reason is worth stating because it is not the obvious one. The refusal
     is grounded in `_owned`, where `configure()` stamped the sink with the **parent's** pid;
-    `_mark_inherited` uses `setdefault`, so it leaves that stamp alone, and `releasable` refuses
-    on `record[0] == pid`. `_inheritance_roots`' own docstring says the same from the other side
-    — `_owned.values()` is its load-bearing entry, and dropping any of the four live handles
-    "changes nothing, since each is itself stamped".
+    `_mark_inherited` uses `setdefault`, so it leaves that stamp alone, and `releasable` answers
+    on `record[0] == pid`, which the parent's stamp fails. `_inheritance_roots`' own docstring
+    says the same from the other side — `_owned.values()` is its load-bearing entry, and dropping
+    any of the four live handles "changes nothing, since each is itself stamped".
 
-    So this is a **regression guard, not a mutation target**, and saying so is the point: no edit
-    to FR-005's opt-out can break it, because `_FORK_SKIP` is read only by
-    `_fork._skipped_names` for the repair walk and the marking path never consults it. What it
-    does catch is a later change that reaches for the sink's record — clearing the slot, or
-    making `_mark_inherited` overwrite rather than `setdefault`. Both grounds are asserted, not
-    only the verdict, so a pass cannot come from the wrong place.
+    No edit to FR-005's opt-out can reach that: `_FORK_SKIP` is read only by
+    `_fork._skipped_names` for the repair walk, and the marking path never consults it. So the
+    two terms the child reports carry different work, and the split is not the obvious one. The
+    **verdict** is the term that sees `releasable` itself weakened while the record stands:
+    drop its `record[0] == pid` and the child answers `releasable,the-parent-s`. A change that
+    *deletes* the record is caught twice over, `releasable,unrecorded` — and only once, on the
+    pid, if the marking walk fails in the same edit, because `_marking_failed` then refuses the
+    unrecorded sink anyway and the verdict stays `refused`.
+
+    The **pid** is the only term that sees a record merely downgraded. A verdict cannot tell
+    `setdefault` from an overwrite: in a process that has just returned from `fork` no record
+    can name the child, so the parent's stamp and an overwriting `_FOREIGN` refuse alike, and
+    the record's only other field — the strong reference `releasable` re-checks identity
+    against — holds the same object under both spellings. Measured at `01fd73c`, where this
+    docstring claimed to catch that very mutant: replacing the `setdefault` with
+    `_owned[id(inherited)] = (_FOREIGN, inherited)` left the whole suite green. Reporting which
+    pid was found, rather than a verdict about it, is what makes a downgraded record redden.
     """
     superseded, live = CountingSink("superseded"), CountingSink("live")
     log_foundry.configure(service="t", sink=superseded)
@@ -1058,6 +1069,7 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     _lifecycle.join_closers(5.0)
     assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
 
+    parent_pid = os.getpid()
     read_fd, write_fd = os.pipe()
     # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
     # fork-unsafe to finalize. `test_every_fork_collects_first` derives this rule.
@@ -1067,20 +1079,27 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
         os.close(read_fd)
         with _lifecycle._owned_lock:
             record = _lifecycle._owned.get(id(superseded))
-        answer = (
-            f"{'releasable' if _lifecycle.releasable(superseded) else 'refused'},"
-            f"{'recorded' if record is not None else 'unrecorded'},"
-            f"{'mine' if record is not None and record[0] == os.getpid() else 'not-mine'}"
-        )
-        os.write(write_fd, answer.encode())
+        if record is None:
+            stamped = "unrecorded"
+        elif record[0] == os.getpid():
+            stamped = "the-child-s"
+        elif record[0] == parent_pid:
+            stamped = "the-parent-s"
+        elif record[0] == _lifecycle._FOREIGN:
+            stamped = "foreign"
+        else:
+            stamped = "another-process"
+        released = "releasable" if _lifecycle.releasable(superseded) else "refused"
+        os.write(write_fd, f"{released},{stamped}".encode())
         os._exit(0)
     os.close(write_fd)
     os.waitpid(pid, 0)
     verdict = os.read(read_fd, 64).decode()
     os.close(read_fd)
-    assert verdict == "refused,recorded,not-mine", (
+    assert verdict == "refused,the-parent-s", (
         f"the child answered {verdict!r}: it must refuse the inherited superseded sink, and "
-        "refuse it because the record says another process acquired it"
+        "refuse it on the stamp `configure()` left in the parent — a record a later edit "
+        "downgrades to `_FOREIGN` refuses too, so only the pid tells the two apart"
     )
 
 
