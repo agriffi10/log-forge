@@ -510,7 +510,7 @@ destroying the parent's transport. Unrecorded has to be unclaimable, not merely 
 """
 
 _MARKING_CEILING = 100_000
-"""Objects the child's marking walk may visit before it gives up and refuses everything.
+"""Objects the child's marking walk may visit before it gives up and refuses the unrecorded.
 
 **A cap is right here where SPEC-039 rejected one, and the difference is the fallback.** That
 spec declined to bound its repair walk because an unfound lock is a child that hangs with no

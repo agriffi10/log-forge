@@ -1275,9 +1275,9 @@ and a third copy is a fork with no merge.
 - **A forked child releases only a transport it acquired in *this* process, and what that
   cannot decide is listed here** (SPEC-042). The record is stamped when the library is handed a
   sink — `configure(sink=…)` and `_ensure_sink()`'s lazy default, over the whole reachable sink
-  graph — and every close the library performs consults it. A child marks everything it
-  inherited that the parent never recorded, before any fork handler runs, so "no record" is
-  unclaimable rather than merely unreleasable. Eight things it does **not** settle:
+  graph — and every close the library performs consults it. A child marks what its walk reaches
+  that the parent never recorded, before any *other* fork handler runs, so "no record" is
+  unclaimable for everything that walk reached. Eight things it does **not** settle:
 
   1. **A sink the parent held only in application state.** Build a connection sink at import in
      a gunicorn master, never hand it to the library, and let the child's `post_fork` call
