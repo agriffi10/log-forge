@@ -2517,6 +2517,223 @@ def test_a_flush_that_arrives_after_the_sweep_is_not_left_waiting(capsys) -> Non
     )
 
 
+def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_is_given_up(capsys) -> None:
+    """FR-001. The wait one line *before* the re-check that exists to prevent it.
+
+    `flush()` puts with the caller's own timeout, so `timeout=None` blocks until the queue has
+    room — and on a full queue behind a permanently wedged sink there never is any. The post-put
+    re-check cannot help, because `_release_waiters` can only answer a marker already queued.
+    Measured at process level on a non-daemon thread: the flusher parked in `Queue.put` for the
+    whole run and the interpreter could not exit, because it joins that thread. Pre-existing
+    rather than introduced by this spec, and reproduced against `main` as a control.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=4)
+    worker.submit(_span("wedge"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain is wedged inside emit"
+    for i in range(8):
+        worker.submit(_span(i))
+    assert worker._queue.full(), "the premise: the queue is full and nothing will drain it"
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert _wait_until(lambda: flusher.is_alive()), "the premise: the flusher is parked in put"
+
+    worker.shutdown(timeout=0.2)
+    flusher.join(timeout=5.0)
+    still_parked = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_parked, "an unbounded put outlived the shutdown that gave up on the drain"
+    assert verdict and verdict[0].reason == "abandoned"
+
+
+def test_flush_with_a_zero_timeout_still_enqueues_its_marker(capsys) -> None:
+    """FR-001. `flush(0)` is "enqueue and do not wait", not "do nothing".
+
+    The sliced put must attempt the put *before* consulting the deadline. Testing the deadline
+    first made `flush(timeout=0)` return without ever queuing a marker, reporting `queue-full` on
+    a queue with 9,999 slots free — a reason naming backpressure that did not exist, on precisely
+    the call SPEC-034 FR-007 introduced `reason` to tell apart from a retired worker. It also
+    silently removed `flush(0)`'s only effect, which is to force the pending batch out.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain is inside emit, so nothing is drained"
+
+    result = worker.flush(timeout=0)
+    with worker._queue.mutex:
+        queued = [i for i in worker._queue.queue if isinstance(i, worker_mod._FlushMarker)]
+
+    assert not worker._queue.full(), "the premise: the queue has room, so this is not backpressure"
+    assert len(queued) == 1, "flush(0) must leave its marker behind for the drain to answer"
+    assert result.reason == "timed-out", f"a queue with room is not queue-full — got {result}"
+
+    sink.release.set()
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
+def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_dies(capsys) -> None:
+    """FR-001. The put's poll asks the re-check's whole question, not only "was it given up".
+
+    A drain killed by a `BaseException` sets **both** flags, so `_given_up()` is false forever —
+    and an unbounded caller blocked on a full queue behind it would park permanently on the
+    narrower test, exactly as it did before the slicing existed. The wait therefore consults
+    `_settled()`: finished, given up, or gone.
+
+    Pre-existing on `main` in the same way the given-up case was, and the reason mapping differs:
+    this one is `thread-died`, because the thread did die.
+    """
+    class _DiesWhenReleased(RecordingSink):
+        """Blocks in emit, then takes the drain thread down when released."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_emit = threading.Event()
+            self.release = threading.Event()
+
+        def emit(self, batch: list[dict]) -> None:
+            """Parks, then raises past `_emit`'s `except Exception` and ends the thread."""
+            self.in_emit.set()
+            self.release.wait(30)
+            raise SystemExit(1)
+
+    sink = _DiesWhenReleased()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=4)
+    worker.submit(_span("wedge"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain is inside emit"
+    for i in range(8):
+        worker.submit(_span(i))
+    assert worker._queue.full(), "the premise: the queue is full and nothing will drain it"
+
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    # The thread is alive here, so `flush`'s early liveness guard lets this through and the
+    # caller parks inside the put — which is the only way to reach the poll at all.
+    assert _wait_until(lambda: flusher.is_alive()), "the premise: the flusher is parked in put"
+
+    sink.release.set()
+    assert _wait_until(lambda: not worker._thread.is_alive()), "the premise: the drain then died"
+    assert not worker._given_up(), "the premise: a dead drain sets both flags, so not 'given up'"
+
+    flusher.join(timeout=5.0)
+    still_parked = flusher.is_alive()
+    capsys.readouterr()
+
+    assert not still_parked, "an unbounded put outlived the drain thread it was waiting on"
+    assert verdict and verdict[0].reason == "thread-died", (
+        f"the drain died rather than being given up on — got {verdict[0]}"
+    )
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
+def test_a_bounded_flush_on_a_full_queue_still_reports_queue_full(capsys) -> None:
+    """FR-001. The slicing must not relabel the outcome a bounded caller already had.
+
+    A bounded caller that cannot get its marker into a full queue before its deadline gets
+    `"queue-full"`, exactly as it did when the put carried the whole timeout in one call.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=4)
+    worker.submit(_span("wedge"))
+    assert sink.in_emit.wait(5.0)
+    for i in range(8):
+        worker.submit(_span(i))
+    assert worker._queue.full(), "the premise: the queue is full"
+
+    result = worker.flush(timeout=0.2)
+    capsys.readouterr()
+
+    assert result.reason == "queue-full", (
+        "a live-but-slow drain is a full queue, not an abandoned one"
+    )
+    sink.release.set()
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
+def test_a_marker_the_drain_delivered_beats_the_given_up_branch(capsys) -> None:
+    """FR-001. `answered and delivered` must be tested before `given_up`, and this is the guard.
+
+    The window: the shutdown expired and set `_drain_settled`, the drain then finished its emit
+    and answered this marker `delivered=True`, and `_run`'s `finally` has not yet set
+    `_drain_finished`. A re-check consulting `given_up` first returns `abandoned` over events the
+    sink demonstrably took — and a false negative there makes `swap_sink` count an
+    `incomplete_swaps`, leave the previous sink open and write a loss line for a swap that
+    completed. That is a wrong verdict, not a wrong reason.
+
+    Reached by parking **after** the put rather than before it, so the marker is queued and the
+    flusher has not yet re-checked. An earlier attempt parked before the put, reached a different
+    window where the sweep answers first, and passed for the wrong reason; it was removed rather
+    than kept. Hoisting `given_up` above the delivered test survives every other test here.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=10, flush_interval=60.0)
+    worker.submit(_span("a"))
+
+    queued, may_recheck = threading.Event(), threading.Event()
+    real_put = worker._queue.put
+
+    def parked_put(item: object, block: bool = True, timeout: float | None = None) -> None:
+        """Returns from the put, then holds the flusher just before its re-check."""
+        real_put(item, block, timeout)
+        if isinstance(item, worker_mod._FlushMarker):
+            queued.set()
+            may_recheck.wait(20)
+
+    worker._queue.put = parked_put  # type: ignore[method-assign]
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=10.0)), daemon=True
+    )
+    flusher.start()
+    assert queued.wait(5.0), "the premise: the marker is queued and the re-check has not run"
+
+    # `_release_marker` runs inside `_final_drain`'s finally, between the marker being answered
+    # `delivered=True` and `_run` setting `_drain_finished`. Slowing it holds that window open;
+    # without this the window is a few instructions wide and the test reaches a different one.
+    real_release = worker._release_marker
+
+    def slow_release(marker: object) -> None:
+        """Holds the drain between answering the marker and ending its loop."""
+        time.sleep(0.6)
+        real_release(marker)  # type: ignore[arg-type]
+
+    worker._release_marker = slow_release  # type: ignore[method-assign]
+
+    shutdown = threading.Thread(target=lambda: worker.shutdown(timeout=0.2), daemon=True)
+    shutdown.start()
+    shutdown.join(timeout=5)
+    assert worker._drain_settled.is_set(), "the premise: the shutdown gave up and set the flag"
+
+    sink.release.set()
+    assert _wait_until(lambda: bool(sink.events)), "the premise: the drain delivered the batch"
+    assert not worker._drain_finished.is_set(), (
+        "the premise: the drain is inside the widened window, so `given_up` is still true"
+    )
+    may_recheck.set()
+    flusher.join(timeout=10)
+    worker._thread.join(timeout=5)
+    capsys.readouterr()
+
+    assert verdict, "the flusher never returned"
+    assert sink.events == [{"message": "a"}], "the premise: the drain did deliver the batch"
+    assert verdict[0].ok is True, (
+        f"the drain adjudicated this marker, so its verdict wins over the sweep's — got {verdict[0]}"
+    )
+
+
 def test_a_flush_arriving_after_a_dead_drain_still_reports_thread_died(capsys) -> None:
     """FR-001. The new condition must not relabel the outcome it was not written for.
 
