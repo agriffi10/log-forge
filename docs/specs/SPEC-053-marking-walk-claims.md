@@ -41,9 +41,9 @@ of them on real prose in this repository.
 - **The other two spellings, and this is measured rather than assumed.** The contrapositive ("an
   unmarked sink is claimable") and the possessive ("the `_FOREIGN` stamp `_mark_inherited` set")
   mostly carry no universal quantifier, so FR-001 cannot see them. It catches 6 sentences at
-  `23fe6cc` while PR #218 touched twelve files, so **most of the population stays outside this
-  check and is meant to.** Widening the anchor to reach them is what produces the false-positive
-  rate in FR-001's table.
+  `23fe6cc` against the thirteen that PR #218's first commit corrected, so **rather less than half
+  the population is inside this check, and that is deliberate.** Widening the anchor to reach them
+  is what produces the false-positive rate FR-001 rejects.
 - **Rewriting `docs/specs/` or `docs/spec-delivery/` to match today's code.** They record what was
   decided and what shipped, at a past moment. FR-001 still *polices* them, which is the point below.
 - **Collapsing the restatements in `tests/`.** Not because test prose is exempt — the first draft of
@@ -70,15 +70,21 @@ phrase "marking walk"), a **universal quantifier** (`every`, `everything`, `all`
 part of the requirement rather than an implementation note: three of the four sweeps run during PR
 #218 failed because of how they built their units, not because of what they matched.
 
-**The anchor decides whether this is a gate or a nuisance.** Measured with the instrument in *Data
-Model*, both trees materialised with `git archive <sha> | tar -x -C <dir>`:
+**The anchor decides whether this is a gate or a nuisance.** This is the **lexical baseline** —
+the instrument exactly as *Data Model* states it, before FR-001's syntactic scoping clause replaces
+the lexical one. Both trees materialised with `git archive <sha> | tar -x -C <dir>`:
 
 | anchor | scoping | `23fe6cc` (pre-fix) | `ac938c0` (post-fix) |
 |---|---|---|---|
 | named | applied | **6** | **0** |
 | named | ignored | 10 | 9 |
-| descriptive | applied | 31 | 22 |
-| descriptive | ignored | 39 | 37 |
+
+A **descriptive** anchor — one that also matches "a forked child", "it inherited", "inherited sink"
+and their neighbours — is rejected, and the reason does not need a precise count: every widening of
+the anchor tried raised the clean-tree figure from 0 into the tens or hundreds against zero true
+positives. An earlier draft of this spec quoted 22 and 31 for it; those numbers were not
+reproducible, because a descriptive anchor is a family rather than a pattern. The principle is what
+survives, and it is what `CLAUDE.md` warns about — half a gate's regressions being false positives.
 
 Three things follow, and each is load-bearing:
 
@@ -86,26 +92,35 @@ Three things follow, and each is load-bearing:
   in `_lifecycle.py` (`_FOREIGN`'s docstring, `_MARKING_CEILING`'s summary, `releasable`'s
   paragraph), one in `docs/decisions.md`, one in `docs/specs/SPEC-050-lifecycle-residue.md`, and
   one in `tests/test_fork_lifecycle.py`. None is an artifact.
-- **The descriptive anchor is where a gate dies**: 22 false positives against zero true ones on a
-  clean tree. That is the shape `CLAUDE.md` warns about — half a gate's regressions being false
-  positives — and it is why the anchor is named symbols only.
-- **The scoping clause is load-bearing**: dropping it takes the clean tree from 0 to 9.
+- **The scoping clause is load-bearing**: dropping it takes `ac938c0` from 0 to 9, and every one of
+  those 9 is correct prose.
 
-**Three known defeats. The implementer must close all three; they are not hypotheticals.**
+**Four known defeats. The implementer must close all four; none is hypothetical, and three were
+measured on real prose in this repository.**
 
-1. **A negated universal reads exactly like the claim it corrects.** Measured on this branch: the
-   one-line fix to `releasable`'s docstring — "Not **every** one of them names the parent: it is the
-   parent's own stamp where `configure()` left one, and `_FOREIGN` where `_mark_inherited` wrote
-   it" — **fires**. It is the correct sentence, written to repair this very defect, and the check
-   cannot tell `every X is Y` from `not every X is Y`. A gate that reddens on the repair trains
-   authors away from the repair.
+1. **`UNIVERSAL` matches words that are not quantifiers, and the correcting sentence is where that
+   bites.** Two mechanisms, both live. A *negated* universal reads exactly like the claim it
+   corrects, so the check cannot tell `every X is Y` from `not every X is Y`. And `\ball\b` matches
+   "at **all**", which quantifies nothing. Both were measured on the same sentence — the repair to
+   `releasable`'s docstring made on this branch fired first on a negated "every", and after that
+   was rewritten it fired again on "a sentinel that is no process at **all**". A gate that reddens
+   twice on two different repairs of the defect it exists to catch trains authors away from
+   repairing it.
 2. **A lexical scoping term is a magic word.** The list is tested against the whole sentence, so a
-   term anywhere excuses a universal anywhere. Inserting `setdefault` into the real `23fe6cc`
-   defect sentence — without touching its claim — silences the check. The word an author reaches
-   for while fixing this defect is the word that defeats the gate.
-3. **Quoting the false claim on purpose has to stay possible.** This spec's own Overview quotes it,
-   and so would any future postmortem or delivery doc. `scripts/docs-lint.sh` already solved this
-   class for check 9 with a fenced-block escape hatch; this check needs the equivalent.
+   term anywhere excuses a universal anywhere: inserting `setdefault` into the real `23fe6cc`
+   defect sentences — without touching their claims — silences 5 of the 6. The word an author
+   reaches for while fixing this defect is the word that defeats the gate. **This is why FR-001
+   requires a syntactic scoping clause**, and why the table above is labelled a baseline.
+3. **Quoting the false claim on purpose has to stay possible.** Five sentences in this spec file
+   fire today — two are quotations of the false claim and three are the spec's own description of
+   the pattern, which a "quotation" escape does not obviously cover. `scripts/docs-lint.sh` solved
+   this class for check 9 with a fenced-block escape at `:742-743`, documented at `:727`; this check
+   needs an equivalent that covers meta-description as well as quotation.
+4. **The length cap is an unconditional escape.** *Data Model* drops sentences over 700 characters
+   before any clause is consulted, so padding a false sentence past the cap silences it with its
+   claim untouched. The six true positives run 85–398 characters, so there is headroom today, but a
+   cap with no stated rationale is the shape `CLAUDE.md` warns about — a threshold that can be
+   invalidated by its own success.
 
 #### Acceptance Criteria:
 
@@ -113,14 +128,22 @@ Three things follow, and each is load-bearing:
       is a historical tree that can pass while the branch carrying the check is red.
 - [ ] On a tree materialised from `23fe6cc` the check reports the **6** violations listed above, by
       file. A check that cannot redden against the defect it was built for is evidence of nothing.
-- [ ] Removing the scoping clause takes the shipping tree from 0 to 9, proving that clause is
-      load-bearing rather than decorative.
-- [ ] **Defeat 1 is closed:** the corrected sentence in `releasable`'s docstring passes, and the
-      `23fe6cc` sentence it replaced still fails.
+- [ ] Removing the scoping clause takes `ac938c0` from 0 to 9 — that figure is pinned to that tree,
+      not to the shipping one, where the spec file and this branch's own corrections move it. On
+      the shipping tree the same removal must yield a non-zero count, every member correct prose.
+- [ ] **The scoping clause is syntactic, not lexical:** a scoping term excuses a universal only in
+      the same clause, and the 9 correct sentences the lexical clause silences on `ac938c0` stay
+      silent. Seven of those nine rest on the literal words `reach` or `setdefault`, so this is the
+      change most likely to move the table and must be re-measured, not assumed.
+- [ ] **Defeat 1 is closed:** both repairs made to `releasable`'s docstring on this branch pass —
+      the negated-universal one and the "at all" one — and the sentence they replaced still fails.
 - [ ] **Defeat 2 is closed:** inserting a scoping term into a false sentence *without changing its
-      claim* does not silence the check. FR-002's `setdefault` null-edit fixture is the proof.
-- [ ] **Defeat 3 is closed:** a documented escape makes a deliberate quotation passable, and this
-      spec's own Overview passes under it.
+      claim* does not silence the check, for all 6 of the `23fe6cc` sentences.
+- [ ] **Defeat 3 is closed:** a documented escape makes both a deliberate quotation and a
+      meta-description passable, and all five currently-firing sentences in this spec file pass
+      under it.
+- [ ] **Defeat 4 is closed:** the length cap either carries a stated rationale with deliberate
+      headroom, or padding a false sentence past it no longer silences the check.
 - [ ] The check names the file, the starting line and the sentence, so the failure is actionable
       without re-running a search by hand.
 - [ ] It runs inside `scripts/docs-lint.sh` and is covered by that script's exit status.
@@ -134,10 +157,12 @@ check against the repository it guards proves the repository passes, not that th
 the corpus asserts failure text on planted violations and asserts **silence** on correct prose.
 
 Silence matters more here than failure. On `ac938c0` the named anchor with the scoping clause
-ignored still reaches 9 sentences, every one of them correct; and the settled decision's own wording
-— "unrecorded **must be** unclaimable, not merely unreleasable" — appears in `CLAUDE.md`,
-`docs/decisions.md` and `architecture.md` §9. A check that reddens on the decision register's
-statement of the decision is worse than no check.
+ignored reaches 9 sentences, every one of them correct. The one that matters most is in the decision
+register itself: `docs/decisions.md`'s "A fork handler marks everything inherited that the parent
+never recorded `_FOREIGN` …" is correct prose that fires on anchor and universal alike, and is
+silenced today **only** by the lexical `setdefault`/`reach` in the same sentence. A syntactic
+scoping clause must keep it silent. A check that reddens on the register's statement of the
+decision is worse than no check.
 
 #### Acceptance Criteria:
 
@@ -146,9 +171,11 @@ statement of the decision is worse than no check.
       this of every check in a gate, not a sample.
 - [ ] A failure fixture for each of the six `23fe6cc` sentences, verbatim from that tree, so the
       corpus is a regression record rather than an invention.
-- [ ] Silence fixtures for: the normative "must be unclaimable" wording; a negated universal
-      (defeat 1); a universal inside a fenced block; inside a Markdown table row; in a heading; and
-      in a sentence with no anchor.
+- [ ] Silence fixtures for: `docs/decisions.md`'s register sentence above; a negated universal and
+      an "at all" (defeat 1, both mechanisms); a universal inside a fenced block; inside a Markdown
+      table row; in a heading; and in a sentence with no named anchor. **Not** the "must be
+      unclaimable" wording — it carries no named anchor at any of its four sites, so it cannot fire
+      whatever the clause does, and a fixture that cannot fail proves nothing.
 - [ ] A failure fixture for the `setdefault` null edit (defeat 2), so a lexical-only scoping
       implementation cannot pass this corpus.
 - [ ] A fixture pinning the wrap behaviour: a violation split across a line break is caught, which
@@ -179,10 +206,13 @@ not be implemented by contorting prose to dodge a check that should not have fir
 #### Acceptance Criteria:
 
 - [ ] `_FOREIGN`'s docstring states what the sentinel **is** and defers to `_mark_inherited` for
-      when it is written, and the resulting text passes FR-001 **without** being reworded to evade
-      it — if it cannot, FR-001's scoping clause is wrong and is fixed first.
-- [ ] `docs/component-inventory.md`'s row describes `_mark_inherited` in one role clause. The row
-      already satisfies this on today's tree, so this criterion is a floor, not a change.
+      when it is written, in a single merged passage, and that passage passes FR-001's **syntactic**
+      clause. It fires under the lexical baseline — both natural merged wordings were built and both
+      fire — so this criterion is the one that proves FR-001 was implemented as specified rather
+      than as the baseline.
+- [ ] `docs/component-inventory.md`'s row names `_mark_inherited`'s role and makes no claim about
+      which pid a given sink's record ends up carrying. The row already satisfies this on today's
+      tree, so this is a regression floor rather than a change.
 - [ ] `_mark_inherited`'s docstring is unchanged — it is what the others defer to.
 - [ ] The docstring assertions in `tests/` still pass; `grep -rn '__doc__' tests/` names sixteen
       sites, one of which reads `_lifecycle.releasable.__doc__`.
@@ -204,9 +234,17 @@ SCOPED    = r"reach|missed|residual|partial|setdefault|item 7"        # see defe
 
 # Population: docs/**/*.md + root *.md + src/**/*.py + tests/**/*.py,
 #   excluding scripts/ and tests/docs-lint/*.case (both self-match; the corpus
-#   deliberately carries the wrong form). This DIFFERS from check 9's population, which
-#   excludes src/, tests/ and docs/specs/ as frozen records — the divergence is
-#   deliberate and belongs in a comment beside both checks.
+#   deliberately carries the wrong form).
+#
+#   This DIFFERS from check 9's population, and check 9 excludes its three for three
+#   DIFFERENT reasons, none of which is "frozen records" alone (scripts/docs-lint.sh:650,
+#   :654, :658): docs/specs and four sibling docs trees are frozen records; src/ is out
+#   because its docstrings anchor to SPEC numbers rather than commits and whether that
+#   counts is a decision nobody has taken; tests/ is out because the .case corpus carries
+#   the wrong form on purpose. Check 9 also EXCLUDES four further docs trees this check
+#   includes, and INCLUDES scripts/, pyproject.toml and .github/*.yml, which this one
+#   must not. Copy the divergence into a comment beside both checks with all three
+#   reasons intact — one reason standing in for three is how the wrong one gets cited.
 
 # Units:
 #   .py  -> ast-extracted docstrings ONLY (module, class, def, and attribute docstrings).
@@ -217,6 +255,9 @@ SCOPED    = r"reach|missed|residual|partial|setdefault|item 7"        # see defe
 #           terminator, so a whole table flattens into one "sentence" pairing any row's
 #           anchor with any other row's universal.
 #   then -> collapse `\n\s*` to one space, split on /(?<=[.!?])\s+/, drop len > 700.
+#           The cap is an unconditional escape (defeat 4): it owes a stated rationale and
+#           deliberate headroom over the 85-398 characters the six true positives occupy,
+#           or it must stop being a bare drop.
 ```
 
 ---
