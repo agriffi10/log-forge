@@ -940,8 +940,10 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     """Whether this process may close a sink (FR-001).
 
     A recorded sink answers for itself: releasable exactly when the record names this process.
-    That is the whole mechanism for the defect — after a fork every stamp names the parent, so a
-    child refuses the object it inherited.
+    That is the whole mechanism for the defect — after a fork no record names *this* process, so
+    a child refuses the object it inherited. Not every one of them names the parent: it is the
+    parent's own stamp where ``configure()`` left one, and ``_FOREIGN`` where
+    :func:`_mark_inherited` wrote it, which is never a real pid at all.
 
     **An *unrecorded* sink inherits the answer from whatever is releasing it**, and that is a
     correction to FR-001's flat "no record means refused". Every lifecycle path stamps: a sink
