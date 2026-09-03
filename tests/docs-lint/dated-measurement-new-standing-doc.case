@@ -1,0 +1,37 @@
+@@@ expect exit=1
+@@@ match carries a dated measurement with no commit
+@@@ match docs/best-practices/shell.md
+@@@ file docs/best-practices/shell.md
+# Shell rulebook
+
+Measured 2026-09-02: 12 scripts in `scripts/` use `set -eu`.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

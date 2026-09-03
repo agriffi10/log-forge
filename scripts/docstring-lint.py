@@ -168,8 +168,10 @@ def check_summary(
 def check_sections(rel: str, node: ast.AST, doc: str | None) -> list[tuple[str, int, str]]:
     """Checks that a function or method documents Args, Returns and Raises.
 
-    Classes are exempt: their sections are ``Attributes:``, and 58 of the 59 classes in
-    this package carry none of the callable trio. ``Yields:`` stands in for ``Returns:``.
+    Classes are exempt: their sections are ``Attributes:``, and all but one of the classes
+    in this package carry none of the callable trio — 58 of 59 when SPEC-052 measured it at
+    ``451edf9``. The exemption rests on the shape a class docstring takes, not on that
+    count, which is why no current one is stated. ``Yields:`` stands in for ``Returns:``.
 
     Args:
       rel: Path of the module, relative to the package root, for the finding.

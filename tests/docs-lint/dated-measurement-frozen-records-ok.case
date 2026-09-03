@@ -1,0 +1,55 @@
+@@@ expect exit=0
+@@@ file docs/audits/2026-08-07-pre-1.0.md
+# Audit
+
+Measured 2026-08-07: 5,980 events in one emit.
+
+@@@ file docs/specs/SPEC-099-example.md
+# SPEC-099
+
+Measured 2026-09-01: 1,398 lines.
+
+@@@ file docs/spec-delivery/SPEC-099-example.md
+# Completed Spec
+
+Measured 2026-09-01: 1,398 lines.
+
+@@@ file docs/release-notes/v1.0.0.md
+# v1.0.0
+
+Measured 2026-09-01: 1,398 lines.
+
+@@@ file docs/templates/spec-template.md
+# Template
+
+Measured 2026-09-01: 1,398 lines.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

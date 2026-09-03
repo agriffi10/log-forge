@@ -1,0 +1,36 @@
+@@@ expect exit=0
+@@@ file docs/process.md
+# Process
+
+**Paid 2026-09-02:** the register is grouped by area, and Key Decisions is its digest.
+The audit ran on 2026-08-07 and the reviews landed on 2026-08-18.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

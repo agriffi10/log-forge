@@ -813,9 +813,12 @@ close it.
   filed two sites that had gone unfiled for two specs. **Closed by** evidence a year of
   maintenance provides — whether any post-SPEC-040 defect was caught by it, or by nothing.
 - **`worker.py` and `_lifecycle.py` are unsplit and unscheduled** (SPEC-040 FR-005 AC-2).
-  Measured 2026-09-01: 1,398 and 1,887 lines — the second has grown 262 lines since SPEC-040
-  stated it, which is the kind of drift that makes a size claim rot, so the date is part of the
-  entry rather than the number standing alone. `Worker` owns the drain thread, the queue, the retry, the counters, the
+  They are the two largest modules in `src/log_foundry/`, and both still grow with the specs
+  that settle lifecycle questions. This entry deliberately carries no line counts:
+  `wc -l src/log_foundry/worker.py src/log_foundry/_lifecycle.py` is the answer. The pair this
+  entry used to carry were written by `dcb07c3` and were already one line stale in the commit
+  that carried them; `a58dfff`, the very next commit, moved one of the two outright, and by
+  `3c973b9` both were wrong. `Worker` owns the drain thread, the queue, the retry, the counters, the
   swap and the shutdown; the questions *inside* it are one object's own state, which is why
   SPEC-035 FR-002 drew the roster's module boundary where it did. Neither is a defect; both are
   recorded so the next reader knows the split was considered. **Closed by** a spec that does it,

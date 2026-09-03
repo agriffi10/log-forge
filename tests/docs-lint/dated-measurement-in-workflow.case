@@ -1,0 +1,50 @@
+@@@ expect exit=1
+@@@ match carries a dated measurement with no commit
+@@@ match .github/workflows/ci.yml
+@@@ match .github/actions/install-poetry/action.yml
+@@@ match .github/dependabot.yaml
+@@@ file .github/workflows/ci.yml
+name: CI
+# Measured 2026-09-05: the matrix takes 6 minutes.
+on: push
+
+@@@ file .github/actions/install-poetry/action.yml
+name: Install
+# Measured 2026-09-05: the install step takes 18 s.
+runs: {}
+
+@@@ file .github/dependabot.yaml
+version: 2
+# Measured 2026-09-05: 14 pinned actions.
+updates: []
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
+
