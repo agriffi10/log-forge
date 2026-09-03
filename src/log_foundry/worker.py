@@ -881,9 +881,7 @@ class Worker:
         Raises:
           None.
         """
-        return (
-            self._drain_finished.is_set() or self._given_up() or not self._thread.is_alive()
-        )
+        return self._drain_finished.is_set() or self._given_up() or not self._thread.is_alive()
 
     def _put_marker(self, marker: _FlushMarker, deadline: float | None) -> bool:
         """Queues a flush marker, giving up if the drain is abandoned while the queue is full.
@@ -905,8 +903,11 @@ class Worker:
         is otherwise unaffected: the deadline still ends it, with the same ``"queue-full"``.
         The slice is a polling granularity on a queue that is *already* full, which is a degraded
         state the caller is being told about either way, and it bounds only the slice — a negative
-        or zero remainder clamps to an immediate attempt rather than raising, which is what
-        ``Raises: None`` said all along.
+        or zero remainder clamps to an immediate attempt rather than raising, where ``Queue.put``
+        rejects a negative timeout before it even looks at capacity. That makes the **put** total,
+        which is what ``Raises: None`` said all along; the *wait* below is unchanged and a timeout
+        large enough to overflow ``time_t`` still raises out of it, on this tree and on every
+        earlier one.
 
         Args:
           marker: The marker to enqueue.

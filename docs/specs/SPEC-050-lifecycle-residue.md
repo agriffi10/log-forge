@@ -142,7 +142,14 @@ deleted; its sentinel half is unchanged and still asserted.
 - [ ] A `flush(timeout=None)` blocked in `Queue.put` on a **full** queue also ends when the drain
       is given up on. The put took the caller's whole timeout in one call, so an unbounded caller
       waited one line *before* the re-check that exists to prevent it, and the re-check cannot
-      help a marker that is not yet queued. A bounded caller still reports `queue-full`.
+      help a marker that is not yet queued. It gives up on the same three conditions the re-check
+      tests, so a *dead* drain ends it too, reported as `thread-died`.
+- [ ] A bounded caller against a **live** drain still reports `queue-full` and still ends at its
+      own deadline; `flush(0)` still enqueues its marker rather than reporting backpressure that
+      does not exist; and a negative timeout is falsy rather than raising out of a call documented
+      `Raises: None`.
+- [ ] The wait polls rather than spins: a bounded flush over a permanently full queue re-attempts
+      the put a countable number of times, not tens of thousands.
 - [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`
       and the drain holding a marker it has not yet recorded, the `flush(timeout=None)` still
       returns `abandoned` rather than waiting on a drain that will never reach its own sweep.

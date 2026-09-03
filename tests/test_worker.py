@@ -2638,6 +2638,71 @@ def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_dies(capsys) -> 
     capsys.readouterr()
 
 
+def test_the_full_queue_wait_polls_rather_than_spins(capsys) -> None:
+    """FR-001. `_PUT_POLL_SECONDS`'s lower bound, which nothing else holds.
+
+    Its docstring claims two things — small enough to notice promptly, large enough not to spin —
+    and only the first was covered. Setting it to `0.0` turns the wait into a busy loop that burns
+    a whole core, and the entire suite stays green: measured 2.0 s of CPU against 2.0 s of wall on
+    a `flush(2.0)` that should cost none.
+
+    Counted rather than timed, because CPU time on a loaded machine is the machine's, and a count
+    of attempts is the mechanism itself. At 0.05 s a half-second flush makes about ten; a spin
+    makes tens of thousands. The bound is deliberately loose in the other direction — this is a
+    guard against a spin, not a latency assertion.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01, max_queue=4)
+    worker.submit(_span("wedge"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain is wedged"
+    for i in range(8):
+        worker.submit(_span(i))
+    assert worker._queue.full(), "the premise: the queue is full for the whole call"
+
+    attempts = 0
+    real_put = worker._queue.put
+
+    def counting_put(item: object, block: bool = True, timeout: float | None = None) -> None:
+        """Counts how many times the wait re-attempts the put."""
+        nonlocal attempts
+        attempts += 1
+        real_put(item, block, timeout)
+
+    worker._queue.put = counting_put  # type: ignore[method-assign]
+    result = worker.flush(timeout=0.5)
+    capsys.readouterr()
+
+    assert result.reason == "queue-full", "the premise: it waited out its budget on a full queue"
+    assert attempts < 200, (
+        f"{attempts} put attempts in 0.5s is a spin, not a poll — the wait must sleep between them"
+    )
+    assert attempts > 1, "and it must actually re-attempt, or the slicing does nothing"
+
+    sink.release.set()
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
+def test_flush_with_a_negative_timeout_is_falsy_rather_than_raising(capsys) -> None:
+    """FR-001. `Queue.put` rejects a negative timeout; `flush` documents `Raises: None`.
+
+    Before the slicing, `flush(-1)` raised `ValueError` out of a method whose `Raises:` says
+    `None`, on an *empty* queue — `Queue.put` validates the argument before it looks at capacity,
+    so it reached every caller and not only backpressured ones. The clamp makes the put total.
+    This is a behaviour change on a public call and it has no other guard: the clamp's mutation
+    coverage comes from the zero-timeout test, which would keep passing if the raise came back.
+    """
+    worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
+    try:
+        result = worker.flush(timeout=-1.0)
+    finally:
+        capsys.readouterr()
+
+    assert result.ok is False, "a negative budget cannot have waited for anything"
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
 def test_a_bounded_flush_on_a_full_queue_still_reports_queue_full(capsys) -> None:
     """FR-001. The slicing must not relabel the outcome a bounded caller already had.
 
