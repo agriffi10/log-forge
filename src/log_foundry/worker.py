@@ -29,6 +29,13 @@ SPEC-034 froze — keeps naming the same object.
 
 _DROP_WARN_EVERY = 1000
 
+_PUT_POLL_SECONDS = 0.05
+"""How long a full-queue ``flush()`` waits before re-asking whether the drain was abandoned.
+
+Small enough that an unbounded caller notices promptly, large enough that a full queue does not
+become a spin. It bounds only the *slice*, never the caller's own deadline (SPEC-050 FR-001).
+"""
+
 DEFAULT_SWAP_TIMEOUT = _lifecycle.DEFAULT_SWAP_TIMEOUT
 """Re-exported from ``_lifecycle``, which owns it (SPEC-040 FR-001).
 
@@ -755,6 +762,30 @@ class Worker:
         ``put`` and the sweep's snapshot both take the queue's own mutex, so a marker either
         lands before the snapshot and is answered, or lands after it and finds the flag set.
 
+        **``_drain_settled`` is the third flag, and an expired ``shutdown()`` sets only that
+        one** (SPEC-050 FR-001). On that path the drain is still alive and still inside ``emit``,
+        so ``_drain_finished`` is clear and ``is_alive()`` is true — a marker landing after that
+        sweep found every existing condition false and waited on a drain the process had already
+        given up on. Measured: the flusher still waiting three seconds later, released only by
+        re-running the sweep by hand. ``timeout=None`` makes it permanent, and in an application
+        that is a non-daemon thread the interpreter joins at exit, so the process does not exit.
+        ``_drain_settled`` set with ``_drain_finished`` clear is *uniquely* that branch — every
+        other setter sets both, and :meth:`_run` sets ``_drain_finished`` **first**, so a true
+        read of settled implies finished was already set — which is what lets this report
+        ``"abandoned"`` rather than ``"thread-died"`` for a thread that is demonstrably alive.
+        Inverting that pair in :meth:`_run` survives the whole suite and would produce the
+        mislabel; it is held by :meth:`_run`'s docstring naming the order rather than by a test,
+        because the consequence is a wrong *reason* on two falsy results and not a wrong verdict.
+
+        **The delivered test comes first, and a test holds it there.** A marker the drain answered
+        ``delivered=True`` between the sweep and ``_drain_finished`` being set must report
+        ``ok=True``, not ``"abandoned"`` — the drain adjudicated it, and a false negative here is
+        what makes :meth:`swap_sink` count an ``incomplete_swaps`` and write a loss line for a swap
+        that completed. A wrong verdict, not a wrong reason. An earlier draft of this docstring
+        called the window unreachable without interposing inside this method; that was wrong twice
+        over — parking after the put reaches it, and holding ``_release_marker`` widens it — and a
+        reviewer built both.
+
         Reporting is by the **marker**, never by the check alone. A drain that answered this
         marker and then exited has delivered, and saying otherwise would be a false failure —
         one ``swap_sink`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
@@ -767,9 +798,17 @@ class Worker:
         Returns:
           A :class:`FlushResult`, truthy once the worker has delivered them and otherwise
           falsy with a ``reason``: ``"timed-out"``, ``"retired"``, ``"thread-died"``,
-          ``"queue-full"``, or ``"abandoned"`` when the drain carrying those events gave up
-          after exhausting retries (SPEC-021 FR-001) — that last case used to return True, a
-          false success exactly where ``flush()`` matters most. **The inner call carries the
+          ``"queue-full"``, or ``"abandoned"``. That last one has **four** producers, not one:
+          the drain carrying those events gave up after exhausting retries (SPEC-021 FR-001,
+          the original — and it used to return True, a false success exactly where ``flush()``
+          matters most); an expiring ``shutdown()`` answered the marker pessimistically rather
+          than leave it on a drain it had abandoned (SPEC-050 FR-001); this call's own marker
+          arrived after that had already happened; or it never reached the queue, because that
+          was full and the drain had already been given up on. Only the first says the drain
+          adjudicated the batch, so ``"abandoned"`` means "not confirmed delivered", never
+          "confirmed lost". ``ok=True`` is unaffected and still means the sink took them:
+          ``delivered`` starts ``False`` and is written only by the drain, only after its emit
+          returned. **The inner call carries the
           type too, not only the public ``log_foundry.flush``** (SPEC-034 FR-007 AC-1b): the
           five outcomes are distinguishable only here, so a public wrapper over a bare ``bool``
           could name none of them without guessing.
@@ -785,22 +824,112 @@ class Worker:
         with self._lock:
             marker = _FlushMarker(self.failed_batches)
         deadline = None if timeout is None else time.monotonic() + timeout
-        try:
-            self._queue.put(marker, timeout=timeout)
-        except queue.Full:
+        if not self._put_marker(marker, deadline):
+            if self._given_up():
+                return FlushResult(ok=False, reason="abandoned")
+            if not self._thread.is_alive() or self._drain_finished.is_set():
+                return FlushResult(ok=False, reason="thread-died")
             return FlushResult(ok=False, reason="queue-full")
-        if self._drain_finished.is_set() or not self._thread.is_alive():
+        given_up = self._given_up()
+        if self._settled():
             answered = marker.event.is_set()
-            delivered = answered and marker.delivered
-            if delivered:
+            if answered and marker.delivered:
                 return FlushResult(ok=True)
-            return FlushResult(ok=False, reason="abandoned" if answered else "thread-died")
+            if answered or given_up:
+                return FlushResult(ok=False, reason="abandoned")
+            return FlushResult(ok=False, reason="thread-died")
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
             return FlushResult(ok=False, reason="timed-out")
         if not marker.delivered:
             return FlushResult(ok=False, reason="abandoned")
         return FlushResult(ok=True)
+
+    def _given_up(self) -> bool:
+        """Whether a bounded ``shutdown()`` expired on a drain that is still running.
+
+        ``_drain_settled`` set with ``_drain_finished`` clear is **uniquely** that branch: every
+        other setter sets both, and :meth:`_run` sets ``_drain_finished`` first, so a true read of
+        settled implies finished was already set. That ordering is what makes this predicate
+        precise rather than merely suggestive, and :meth:`_run` names it in turn.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the drain has been abandoned while still alive.
+
+        Raises:
+          None.
+        """
+        return self._drain_settled.is_set() and not self._drain_finished.is_set()
+
+    def _settled(self) -> bool:
+        """Whether nothing will drain this queue again, for any of the three reasons.
+
+        The disjunction :meth:`flush`'s post-put re-check tests, named once so the pre-put wait
+        and the post-put check cannot drift apart: the drain finished, a bounded ``shutdown()``
+        gave up on it, or the thread is gone. :meth:`_given_up` is the narrower question of *which*
+        of those it was, which only the reason mapping needs.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the drain has stopped, been abandoned, or died.
+
+        Raises:
+          None.
+        """
+        return self._drain_finished.is_set() or self._given_up() or not self._thread.is_alive()
+
+    def _put_marker(self, marker: _FlushMarker, deadline: float | None) -> bool:
+        """Queues a flush marker, giving up if the drain is abandoned while the queue is full.
+
+        A plain ``put`` with ``timeout=None`` blocks until the queue has room, and on a full queue
+        behind a permanently wedged sink there is never any — so the caller waited forever one
+        line *before* the post-put re-check that exists to prevent exactly that. Measured at
+        process level: a non-daemon flusher parked in ``Queue.put`` for the whole run, and an
+        interpreter that could not exit because it joins that thread. The re-check cannot help,
+        because ``_release_waiters`` can only answer a marker that is already in the queue.
+
+        So the wait is taken in slices and :meth:`_settled` is consulted between them — the
+        re-check's own disjunction, not merely :meth:`_given_up`, because a *terminally dead*
+        drain sets both flags and would leave an unbounded caller parked forever on the narrower
+        test. The deadline is consulted **after** a put has been attempted, never before: a
+        ``flush(timeout=0)`` is "enqueue and do not wait", and testing the deadline first turned
+        it into a call that never enqueued at all and reported backpressure that did not exist —
+        which is the one outcome SPEC-034 FR-007 named ``reason`` to tell apart. A bounded caller
+        is otherwise unaffected: the deadline still ends it, with the same ``"queue-full"``.
+        The slice is a polling granularity on a queue that is *already* full, which is a degraded
+        state the caller is being told about either way, and it bounds only the slice — a negative
+        or zero remainder clamps to an immediate attempt rather than raising, where ``Queue.put``
+        rejects a negative timeout before it even looks at capacity. That makes the **put** total,
+        which is what ``Raises: None`` said all along; the *wait* below is unchanged and a timeout
+        large enough to overflow ``time_t`` still raises out of it, on this tree and on every
+        earlier one.
+
+        Args:
+          marker: The marker to enqueue.
+          deadline: The caller's monotonic deadline, or ``None`` for an unbounded caller.
+
+        Returns:
+          Whether the marker reached the queue.
+
+        Raises:
+          None.
+        """
+        while True:
+            slice_seconds = _PUT_POLL_SECONDS
+            if deadline is not None:
+                slice_seconds = min(slice_seconds, max(0.0, deadline - time.monotonic()))
+            try:
+                self._queue.put(marker, timeout=slice_seconds)
+            except queue.Full:
+                if self._settled() or (deadline is not None and time.monotonic() >= deadline):
+                    return False
+            else:
+                return True
 
     def swap_sink(self, new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> bool:
         """Retargets delivery at a new sink, draining and closing the previous one (FR-003).
@@ -1321,7 +1450,13 @@ class Worker:
         would be a worse failure than the one this prevents.
 
         The two ``finally`` blocks are nested rather than merged, and the order they impose is
-        load-bearing twice over. ``_drain_finished`` is set the instant the loop stops reading
+        load-bearing three times over. ``_drain_finished`` is set **before** ``_drain_settled``,
+        and :meth:`_given_up` reads the pair in the opposite order to conclude that a shutdown
+        expired on a live drain — so inverting these two lines would make an ordinary terminal
+        exit indistinguishable from an abandoned one for a moment, and a ``flush()`` landing there
+        would be told ``"abandoned"`` where ``"thread-died"`` is the truth. Both are falsy, so the
+        cost is a wrong reason rather than a wrong verdict, which is why it is recorded here
+        rather than pinned by a test. ``_drain_finished`` is set the instant the loop stops reading
         the queue — *before* :meth:`_terminal_failure`, which writes to stderr and can block on
         a slow reader — so a ``shutdown()`` arriving during that window sees a drain that is
         already finished and declines to queue a sentinel nothing would consume. And it is set
@@ -1403,7 +1538,7 @@ class Worker:
             self._taken_markers = [m for m in self._taken_markers if m is not marker]
 
     def _release_waiters(self) -> None:
-        """Answers every outstanding ``flush()`` marker, so no caller waits out its timeout.
+        """Answers the ``flush()`` markers outstanding at the moment it runs.
 
         **Two populations, and the second is not optional** (SPEC-050 FR-001). A marker still in
         the queue is read from it; a marker the drain thread has already **taken** is read from
@@ -1430,9 +1565,12 @@ class Worker:
         than too long. The marker keeps its pessimistic ``delivered``, which is the honest
         answer: the drain that would have carried it is gone.
 
-        One residual race, stated rather than papered over: a ``flush()`` that passed its
-        liveness check microseconds before *this* sweep can still enqueue a marker after it,
-        and that one waits out its timeout — then returns False, which is correct either way.
+        **It answers a snapshot, so "every" would be the wrong word** and a caller arriving
+        after it is not covered here. A ``flush()`` that passed its guards microseconds before
+        this sweep can still enqueue its marker after it. That caller is answered by
+        :meth:`flush`'s own post-put re-check instead, which consults the same
+        ``_drain_settled`` this path sets — before SPEC-050 FR-001 added it there, such a caller
+        waited out its timeout, and a ``timeout=None`` one waited forever.
         A marker left queued is also still counted by ``health().queued``, which describes
         submissions; removing it would mean deleting a specific item, which ``Queue`` has no
         public way to do, and the read above is the access ``architecture.md`` §13 sanctions.

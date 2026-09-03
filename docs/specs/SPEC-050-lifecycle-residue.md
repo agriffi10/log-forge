@@ -35,6 +35,13 @@ spec stands alone; the identifiers are there so a reader can find the original e
   `tests/test_worker.py::test_submit_returns_before_emit_completes` asserts `< 0.1` against a
   0.3 s emit. A test proving an operation is *not* bounded needs a wide budget-vs-operation gap,
   not a tight budget; the tight one fails on its own setup under load.
+- **Added after the diff gate, said out loud rather than absorbed quietly:** FR-001 grew a fix for
+  a *pre-existing* hang on a different mechanism — `flush(timeout=None)` blocking in `Queue.put`
+  on a full queue, where no marker exists for any sweep to answer. Reproduced against `main` as a
+  control. Recording it as a constraint was the alternative and is what the letter of scope would
+  have given; it was rejected because it is the same caller, the same call and the same
+  never-returns, and shipping the other three orderings while leaving that one would read as
+  complete to anyone who did not read the constraint.
 - **Added by the spec review, said out loud rather than absorbed quietly:** FR-002 was widened
   from the worker path to *both* delivery paths. `_lifecycle._close_orphan_sink` empties
   `_orphan_owed` under the lock and then closes inline, so a second caller finds nothing owed and
@@ -70,6 +77,11 @@ spec stands alone; the identifiers are there so a reader can find the original e
 `Worker.shutdown`'s expiry branch records `stopped_reason`, sets `_drain_settled`, writes its
 line and returns — before `_release_waiters()`, whose own docstring says it exists for this
 caller.
+
+**Three arrival orderings, and the audit's prescribed remedy covered one.** A `flush()`'s marker
+can be queued when the sweep runs, held by the drain thread, or enqueued after the sweep has
+already run — and each needed its own answer. The first two shipped in successive attempts; the
+third was found by a reviewer on the release-notes session and closed in the same way.
 
 **The audit's prescribed remedy did not cover the audit's own probe, and the first attempt
 shipped it anyway.** Calling `_release_waiters()` there answers markers still *in* the queue.
@@ -121,6 +133,23 @@ deleted; its sentinel half is unchanged and still asserted.
       marker rather than the queue, the flush is still answered — asserted separately, because the
       test written from the audit's probe passes with that half reverted.
 - [ ] A marker taken by `_final_drain` rather than by the loop is answered too.
+- [ ] A `flush()` whose marker is enqueued *after* the sweep has run is answered too: its post-put
+      re-check consults `_drain_settled`, which is the only flag the expiry branch sets. It
+      reports `abandoned` rather than `thread-died`, because the thread is alive.
+- [ ] That condition does not relabel a drain that genuinely died, which still reports
+      `thread-died` — asserted through the post-put branch, not the early liveness guard the
+      existing test returns at.
+- [ ] A `flush(timeout=None)` blocked in `Queue.put` on a **full** queue also ends when the drain
+      is given up on. The put took the caller's whole timeout in one call, so an unbounded caller
+      waited one line *before* the re-check that exists to prevent it, and the re-check cannot
+      help a marker that is not yet queued. It gives up on the same three conditions the re-check
+      tests, so a *dead* drain ends it too, reported as `thread-died`.
+- [ ] A bounded caller against a **live** drain still reports `queue-full` and still ends at its
+      own deadline; `flush(0)` still enqueues its marker rather than reporting backpressure that
+      does not exist; and a negative timeout is falsy rather than raising out of a call documented
+      `Raises: None`.
+- [ ] The wait polls rather than spins: a bounded flush over a permanently full queue re-attempts
+      the put a countable number of times, not tens of thousands.
 - [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`
       and the drain holding a marker it has not yet recorded, the `flush(timeout=None)` still
       returns `abandoned` rather than waiting on a drain that will never reach its own sweep.
@@ -363,7 +392,7 @@ configure(sink=B) + shutdown() # closes an unconfirmed-swap sink once the drain 
 
 ## Configuration / Environment
 
-None. No new knobs, constants or extras — FR-002 reuses `DEFAULT_CLOSER_GRACE`.
+No new public knobs or extras — FR-002 reuses `DEFAULT_CLOSER_GRACE`. One private module constant, `worker._PUT_POLL_SECONDS`, added by FR-001's sliced put.
 
 ## File & Folder Structure
 
@@ -396,7 +425,8 @@ tests/
 
 ### Phase 2: The shutdown waits
 
-- FR-001: release waiters on the expiry branch.
+- FR-001: release waiters on the expiry branch; register markers the drain has taken; consult
+  `_drain_settled` in the post-put re-check; slice the put so it can give up too.
 - FR-002: record an in-flight inline close on both paths; have the idempotent path wait on it for
   `min(DEFAULT_CLOSER_GRACE, remaining)`; reset the new state in `Worker._reinit_after_fork`.
 

@@ -1033,7 +1033,11 @@ and a third copy is a fork with no merge.
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —
   to find the `flush()` markers still queued when nothing will ever read them again, so no
-  caller sits out its full timeout, and no caller who passed `timeout=None` waits forever. The
+  caller sits out its full timeout. **It is one of three things that carry that guarantee, not
+  the whole of it** (SPEC-050 FR-001): this sweep answers what is queued *at the moment it runs*,
+  `flush()`'s own re-check answers a marker that arrived after it, and `flush()`'s sliced put
+  answers a caller that could not enqueue one at all. "No caller who passed `timeout=None` waits
+  forever" is the three together; each alone leaves a hole the others cover. The
   audit that produced SPEC-024..031 flagged it; **SPEC-031 FR-005 records it rather than
   changing it**, per SPEC-021's rule that an open item is closed by being fixed, settled, or
   recorded. It is called on the terminal-failure path, on the clean shutdown path since the

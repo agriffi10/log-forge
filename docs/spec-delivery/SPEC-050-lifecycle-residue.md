@@ -10,7 +10,13 @@ it against `eb80099` before the spec was written and re-run against the fix.
   after answering, drops them for a forked child, and self-answers one taken after the sweep has
   already run. The first attempt shipped only the first of those — the audit's prescribed remedy,
   which does not cover the audit's own probe — and a peer session reproduced R3 verbatim against
-  it. The pessimistic-verdict population is correspondingly wider, recorded in `docs/decisions.md`
+  it; a third ordering — a marker enqueued *after* the sweep — was then found by a reviewer and
+  closed by having `flush()`'s post-put re-check consult `_drain_settled`, the only flag the
+  expiry branch sets. A review of *that* then found `flush(timeout=None)` could still wait
+  forever one line earlier, blocked in `Queue.put` on a full queue where no marker exists for the
+  sweep to answer — pre-existing rather than introduced, reproduced against `main` as a control,
+  and closed by taking that wait in slices. New members: `_given_up`, `_settled`, `_take_marker`, `_release_marker`, `_put_marker` and `_PUT_POLL_SECONDS`. One incidental behaviour change on a public call: `flush()` with a **negative** timeout used to raise `ValueError` out of `Queue.put` — on an empty queue, since that argument is validated before capacity is looked at — from a method documented `Raises: None`. It is now falsy. The *wait* below the put is unchanged and a timeout large enough to overflow `time_t` still raises, here as on every earlier tree. The pessimistic-verdict population is correspondingly
+  wider, recorded in `docs/decisions.md`
   as a narrowing of "`flush()` answers from the drain that carried the events"; the converse is
   untouched, since `delivered` is only ever written by the owning drain. A
   `flush(timeout=None)` parked behind a stuck sink used to wait forever on a drain that call had

@@ -55,8 +55,11 @@ class FlushResult(_Result):
     ``"sink-flush"`` is the one SPEC-036 added (FR-002 AC-8) and it is worth distinguishing: the
     queue drained cleanly and the **sink's own client buffer** did not, so the events are past
     this library and inside a driver. ``"abandoned"`` is the neighbouring case where this call
-    could not hand them over at all. New tokens may appear in any release, which is what this
-    type exists for — branch on ``bool()``.
+    could not confirm they were handed over. It has **four** producers — a drain that spent its
+    retries, an expiring ``shutdown()`` answering pessimistically, a marker that arrived after
+    that, and one that never reached the queue at all because it was full — so it means "not
+    confirmed delivered" and never "confirmed lost" (SPEC-050 FR-001). ``ok=True`` carries the guarantee instead: the sink took them. New tokens may appear
+    in any release, which is what this type exists for — branch on ``bool()``.
     """
 
 
