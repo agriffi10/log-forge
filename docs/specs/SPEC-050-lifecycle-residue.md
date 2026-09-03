@@ -146,8 +146,11 @@ deleted; its sentinel half is unchanged and still asserted.
       tests, so a *dead* drain ends it too, reported as `thread-died`.
 - [ ] A bounded caller against a **live** drain still reports `queue-full` and still ends at its
       own deadline; `flush(0)` still enqueues its marker rather than reporting backpressure that
-      does not exist; and a negative timeout is falsy rather than raising out of a call documented
-      `Raises: None`.
+      does not exist; and a negative timeout reports `timed-out` rather than raising out of
+      `Worker.flush`, which documents `Raises: None`. Falsiness is *not* the criterion — the
+      public `log_foundry.flush()` was already falsy there, because `_lifecycle._flush_worker`'s bare
+      `except Exception` turned that raise into `"thread-died"` on a live thread. The token is
+      what changed.
 - [ ] The wait polls rather than spins: a bounded flush over a permanently full queue re-attempts
       the put a countable number of times, not tens of thousands.
 - [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`

@@ -2683,24 +2683,74 @@ def test_the_full_queue_wait_polls_rather_than_spins(capsys) -> None:
     capsys.readouterr()
 
 
-def test_flush_with_a_negative_timeout_is_falsy_rather_than_raising(capsys) -> None:
-    """FR-001. `Queue.put` rejects a negative timeout; `flush` documents `Raises: None`.
+def test_flush_with_a_negative_timeout_reports_a_timeout_rather_than_raising(capsys) -> None:
+    """FR-001. `Queue.put` rejects a negative timeout; `Worker.flush` documents `Raises: None`.
 
-    Before the slicing, `flush(-1)` raised `ValueError` out of a method whose `Raises:` says
-    `None`, on an *empty* queue — `Queue.put` validates the argument before it looks at capacity,
-    so it reached every caller and not only backpressured ones. The clamp makes the put total.
-    This is a behaviour change on a public call and it has no other guard: the clamp's mutation
+    Before the slicing, `Worker.flush(-1)` raised `ValueError` on an *empty* queue — `Queue.put`
+    validates that argument before it looks at capacity — from a method whose `Raises:` says
+    `None`. The clamp makes the put total, and this is its only guard: the clamp's other mutation
     coverage comes from the zero-timeout test, which would keep passing if the raise came back.
-    """
-    worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
-    try:
-        result = worker.flush(timeout=-1.0)
-    finally:
-        capsys.readouterr()
 
-    assert result.ok is False, "a negative budget cannot have waited for anything"
+    **What a caller of the public API saw is a smaller change than "an exception stopped being
+    raised", and an earlier draft of this docstring got it wrong.** `Worker` is not exported, and
+    `_lifecycle._flush_worker`'s bare `except Exception` caught the `ValueError` and returned
+    `reason="thread-died"` — on a thread that was alive, with `stopped_reason=None`, which sends
+    an operator to a field that says nothing is wrong. The public-visible delta is that token
+    becoming `"timed-out"`, which is what an already-expired budget actually is. The token is
+    asserted rather than falsiness — not because the old assertion could not fail here (it could:
+    the raise reached it) but because falsiness is the wrong claim to pin, since the *public* call
+    was falsy on both trees and only the reason moved.
+
+    The sink blocks so the drain cannot answer the marker first. Without that, the drain
+    occasionally wins the race against a zero-length `wait`, which was measured at roughly one run
+    in ten thousand on the version this replaces.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("wedge"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain cannot answer anything"
+
+    result = worker.flush(timeout=-1.0)
+    capsys.readouterr()
+
+    assert result.reason == "timed-out", (
+        f"a negative budget is an expired one, not a dead thread — got {result}"
+    )
+    sink.release.set()
     worker.shutdown(timeout=5.0)
     capsys.readouterr()
+
+
+def test_the_public_flush_never_raised_on_a_negative_timeout() -> None:
+    """FR-001. What a caller of the *public* API gets for a bad argument, which is the improvement.
+
+    `_lifecycle._flush_worker` wraps `Worker.flush` in a bare `except Exception`, so before the
+    clamp the public surface never saw the `ValueError` — it saw `reason="thread-died"` on a live
+    thread with `stopped_reason=None`, which sends an operator to a field that says nothing is
+    wrong. This pins the outcome that replaced it.
+
+    **What it does not guard, stated because an earlier draft of this docstring claimed it did.**
+    It cannot see that `except Exception` narrowing: with the clamp in place `Worker.flush` no
+    longer raises, so the handler is dormant and mutating it to `except RuntimeError` leaves this
+    test green — measured. It guards the conjunction only: a reintroduced raise *and* a narrowed
+    handler would surface here as an error. The prose claim about *why* the public call never
+    raised rests on reading `_flush_worker`, not on this test.
+    """
+    sink = RecordingSink()
+    log_foundry_mod.configure(service="test", sink=sink)
+
+    @log_foundry_mod.trace
+    def work() -> None:
+        log_foundry_mod.info("x")
+
+    work()
+    result = log_foundry_mod.flush(timeout=-1.0)
+
+    assert result.ok is False, "an already-expired budget cannot report success"
+    assert result.reason != "thread-died", (
+        "the public call must not report a dead thread for a bad argument; "
+        f"_flush_worker's except Exception has narrowed or moved — got {result}"
+    )
 
 
 def test_a_bounded_flush_on_a_full_queue_still_reports_queue_full(capsys) -> None:

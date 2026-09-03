@@ -15,7 +15,17 @@ it against `eb80099` before the spec was written and re-run against the fix.
   expiry branch sets. A review of *that* then found `flush(timeout=None)` could still wait
   forever one line earlier, blocked in `Queue.put` on a full queue where no marker exists for the
   sweep to answer — pre-existing rather than introduced, reproduced against `main` as a control,
-  and closed by taking that wait in slices. New members: `_given_up`, `_settled`, `_take_marker`, `_release_marker`, `_put_marker` and `_PUT_POLL_SECONDS`. One incidental behaviour change on a public call: `flush()` with a **negative** timeout used to raise `ValueError` out of `Queue.put` — on an empty queue, since that argument is validated before capacity is looked at — from a method documented `Raises: None`. It is now falsy. The *wait* below the put is unchanged and a timeout large enough to overflow `time_t` still raises, here as on every earlier tree. The pessimistic-verdict population is correspondingly
+  and closed by taking that wait in slices. New members: `_given_up`, `_settled`, `_take_marker`, `_release_marker`, `_put_marker` and `_PUT_POLL_SECONDS`. One incidental
+  behaviour change, corrected here after it was first written down wrong: `Worker.flush()` with a
+  **negative** timeout used to raise `ValueError` out of `Queue.put` — on an *empty* queue, since
+  that argument is validated before capacity is looked at — from a method documented
+  `Raises: None`. `Worker` is not exported, so the **public** `log_foundry.flush()` never raised:
+  `_lifecycle._flush_worker`'s bare `except Exception` caught it and reported `reason="thread-died"` on a
+  thread that was demonstrably alive, with `stopped_reason=None`. The public-visible change is
+  therefore the reason token, `"thread-died"` → `"timed-out"`, not a vanished exception. The
+  *wait* below the put is unchanged and a timeout large enough to overflow `time_t` still raises
+  out of `Worker.flush`, here as on every earlier tree — and is caught by that same
+  `except Exception` before a public caller sees it, so the same distinction applies. The pessimistic-verdict population is correspondingly
   wider, recorded in `docs/decisions.md`
   as a narrowing of "`flush()` answers from the drain that carried the events"; the converse is
   untouched, since `delivered` is only ever written by the owning drain. A

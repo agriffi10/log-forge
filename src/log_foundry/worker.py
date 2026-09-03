@@ -905,9 +905,14 @@ class Worker:
         state the caller is being told about either way, and it bounds only the slice — a negative
         or zero remainder clamps to an immediate attempt rather than raising, where ``Queue.put``
         rejects a negative timeout before it even looks at capacity. That makes the **put** total,
-        which is what ``Raises: None`` said all along; the *wait* below is unchanged and a timeout
-        large enough to overflow ``time_t`` still raises out of it, on this tree and on every
-        earlier one.
+        which is what ``Raises: None`` said all along. That raise was never *public*, on two separate
+        counts: ``Worker`` is not exported, so this is not a public call, and
+        ``_lifecycle._flush_worker``'s bare ``except Exception`` caught that ``ValueError`` and reported
+        ``"thread-died"`` on a live thread with ``stopped_reason`` at ``None``, so what a caller
+        sees change is the token, not an exception. The *wait* below is unchanged and a timeout
+        large enough to overflow ``time_t`` still raises out of **this** method, on this tree and
+        every earlier one — and is caught by that same ``except Exception`` before a public caller
+        sees it, exactly as the ``ValueError`` was. The distinction drawn above holds there too.
 
         Args:
           marker: The marker to enqueue.
