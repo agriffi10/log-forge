@@ -153,9 +153,10 @@ Three properties, each load-bearing:
   arc exists to remove. What shipped: an unrecorded sink inherits the answer from the wrapper
   releasing it, so neither-recorded is the caller's own graph and closes, while a *recorded*
   wrapper may not release an unrecorded member (which keeps AC-6). What makes the relaxation
-  safe is that a forked child marks everything it inherited and the parent never recorded
-  **before any handler runs**, so "unrecorded" is unclaimable there rather than merely
-  unreleasable. See the delivery doc.
+  safe is that a forked child marks what its walk reaches and the parent never recorded
+  **before any other handler runs**, so "unrecorded" is unclaimable there rather than merely
+  unreleasable — for everything the walk reached; what it missed is §13 item 7's residual. See
+  the delivery doc.
 - **A strong reference beside the id**, since an id is reusable once its object dies, and a
   garbage-collected sink closes itself — the same destructive close by another route.
   `_fork._fresh_primitive` already uses that pairing for the same reason.
@@ -428,8 +429,8 @@ def stamp(sink: object) -> None: ...          # configure()/_ensure_sink(), over
                                               # sink graph; never overwrites another pid's stamp
 def reclaim(sink: object) -> None: ...        # FR-005: the hook returned, so it is ours now
 def _mark_inherited() -> None: ...            # a fork handler; setdefaults _FOREIGN over what
-                                              # the parent never recorded, so "no record" is
-                                              # unclaimable in a child
+                                              # its walk reaches that the parent never recorded,
+                                              # so what it reached is unclaimable in a child
 def releasable(sink: object, *, owner: object = None) -> bool: ...
     # Stamped for this pid. An *unrecorded* sink inherits the answer from the wrapper releasing
     # it — no wrapper, or an unrecorded one, means the caller's own object — and only while the

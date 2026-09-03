@@ -1267,6 +1267,10 @@ def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
     assert order.index("_mark_inherited") < order.index("_rebuild_worker_after_fork"), (
         f"the marking handler must be registered first, got {order}"
     )
+    assert order[0] == "_mark_inherited", (
+        f"before *any* other handler, which the pairwise check above does not pin: a fourth "
+        f"handler registered ahead of it passes that and not this. Got {order}"
+    )
 
 
 def test_registering_the_same_handler_twice_is_a_no_op() -> None:

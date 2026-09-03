@@ -129,8 +129,7 @@ class _Lifecycle:
     still reaches an inherited superseded sink and it is still refused (SPEC-042 FR-001) — on the
     stamp ``configure()`` left, since :func:`_mark_inherited` ``setdefault``s and leaves an
     existing record alone rather than writing ``_FOREIGN`` over it — or on ``_FOREIGN``, for a
-    sink held inside it that the bounded stamp walk never reached, which is the case the root
-    exists for.
+    sink held inside it that the bounded stamp walk never reached.
     """
 
     def __init__(self) -> None:
@@ -498,7 +497,8 @@ _FOREIGN = -1
 """The pid a record carries when the sink belongs to some earlier process.
 
 Never a real pid, so it can never match :func:`os.getpid`. Laid down by
-:func:`_mark_inherited` in a forked child over every inherited sink the parent never recorded —
+:func:`_mark_inherited` in a forked child over each inherited sink its walk reaches that the
+parent never recorded —
 it ``setdefault``s, so a sink already carrying the parent's own pid keeps it and is refused by
 that — which is what gives "this process did not acquire it" a **terminal** state.
 
@@ -630,7 +630,7 @@ def _bounded_children(container: object) -> list[object]:
         _diag.absorbed(
             "reading a container while marking a forked child's sinks",
             exc,
-            "what it holds is not marked, so this child has no record of it",
+            "what it holds is not marked by this child",
         )
         return []
 
@@ -775,7 +775,7 @@ def _inheritance_roots() -> list[object]:
 
 
 def _mark_inherited() -> None:
-    """Records the sinks this child inherited, before any handler can reach a release path.
+    """Records the sinks this child inherited, before any other fork handler runs (FR-001).
 
     Registered with ``_fork`` and run in the child, which is why it may take the library's locks:
     they were re-initialised moments earlier. It must run **before** any handler that could reach
@@ -953,7 +953,8 @@ def releasable(sink: object, *, owner: object = None) -> bool:
 
     The wrapper is what makes the two distinguishable, so it is asked:
 
-    - Neither recorded — a graph the library never saw. The caller owns it; honour the close.
+    - Neither recorded — a graph nothing in the record reaches. The caller owns it; honour the
+      close.
     - The child recorded elsewhere — the inherited sink, or one :func:`_mark_inherited` marked
       ``_FOREIGN``. Refused however it was reached, which is what closes the wrapper route
       (FR-002 AC-3).
@@ -963,11 +964,14 @@ def releasable(sink: object, *, owner: object = None) -> bool:
       in §13.
 
     **"Unrecorded is the caller's" is only sound because a fork makes it false first.** In a
-    child, :func:`_mark_inherited` records every inherited sink the parent did not record as
-    ``_FOREIGN`` *before* any handler runs — one the parent *did* record keeps that stamp and is
-    refused on it — so an unrecorded sink there is one built after the fork. If that walk could
-    not finish, :data:`_marking_failed` withdraws the assumption entirely and every unrecorded
-    sink is refused.
+    child, :func:`_mark_inherited` records every inherited sink **its walk reaches** that the
+    parent did not record as ``_FOREIGN``, *before* any other handler runs — one the parent *did*
+    record keeps that stamp and is refused on it. What the walk reached is therefore stamped or
+    ``_FOREIGN``; what it missed stays unrecorded and is the §13 item 7 residual, not a case this
+    closes — measured, a sink built before the fork behind a container that raises is unrecorded
+    in the child, releasable, and closed. If the walk could not finish *at all*,
+    :data:`_marking_failed` withdraws the assumption entirely and every unrecorded sink is
+    refused.
 
     Identity is re-checked against the strong reference rather than trusting the ``id``. The
     reference is what makes an id collision impossible while a record stands, so this can only

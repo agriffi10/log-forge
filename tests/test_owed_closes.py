@@ -546,8 +546,9 @@ def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
     with the reader deleted outright — measured, both mutants passed the whole suite.
 
     So: the second sink is stamped as another process's, the way a `fork` leaves what it
-    inherited recorded under a pid this process cannot match. Reading `True` then requires the reader to consult the record at all — the
-    configured sink is the *first* one and is this process's — and to take the **last** entry.
+    inherited recorded under a pid this process cannot match. Reading `True` then requires the
+    reader to consult the record at all — the configured sink is the *first* one and is this
+    process's — and to take the **last** entry.
     """
     first, second = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=first)
