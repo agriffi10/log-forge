@@ -1,4 +1,5 @@
-@@@ expect exit=0
+@@@ expect exit=1
+@@@ match "### Alpha rule" opens its body with the label "Beta rule"
 @@@ file CLAUDE.md
 # Project
 
@@ -27,5 +28,6 @@ nothing
 
 ### Alpha rule
 
-**Alpha rule** — a correct label under CRLF stays silent.
+**Beta rule** — under CRLF the blank line after a heading is "\r", and reading that as
+the body line switches this check off for the whole file.
 

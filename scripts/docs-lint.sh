@@ -19,9 +19,10 @@
 #
 # FAIL (exit 1): the always-loaded file is over budget or has been removed outright, a
 #   Key Decisions unit has become the reasoning, the register is missing or has inverted
-#   with its digest, an entry is unreachable from the Contents, a Completed spec has no
-#   delivery doc, a delivery doc has become an essay, or a pointer out of CLAUDE.md goes
-#   nowhere.
+#   with its digest, an entry is unreachable from the Contents, a Contents row names one
+#   decision and links to another, an entry body opens with a bold label its own heading
+#   does not match, a Completed spec has no delivery doc, a delivery doc has become an
+#   essay, or a pointer out of CLAUDE.md goes nowhere.
 #
 # There is no WARN tier: `spec-lint.sh` owns the soft per-spec judgements, and every rule
 # here is a shape the layering depends on — a shape is either held or it isn't.
@@ -311,7 +312,7 @@ kd_report=$(awk -v ucap="$DIGEST_MAX_BYTES" -v scap="$KEY_DECISIONS_MAX_BYTES" -
 ' "$CLAUDE")
 [ -z "$kd_report" ] || printf '%s\n' "$kd_report" >> "$FAILS"
 
-# ── 3, 4 & 5. The register: present, not inverted with its digest, all reachable ─
+# ── 3-7. The register: present, not inverted with its digest, reachable, self-consistent ─
 #
 # The inversion is the specific failure this template shipped into a project and did
 # not catch. That repo had no register at all, so its digest WAS the register: every
@@ -330,9 +331,12 @@ else
   # two sets with comm would want process substitution, which is a bashism.
   awk -v claude="$CLAUDE" -v reg="$REGISTER" '
     function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-    function emit(   s, i, j, k, p, pad, orig, label) {
-      if (unit == "" || unit !~ /^- \*\*/) { unit = ""; return }
-      s = unit; sub(/^- \*\*/, "", s)
+    # The label a `**…**` span opens with, given the text AFTER that opening `**`, or ""
+    # when it never closes. Shared by the digest bullet and the register entry body: both
+    # write the same label, so both meet the same two traps, and a second copy of this scan
+    # is a second place for one of them to be fixed and the other left alone.
+    function label_of(body,   s, i, j, k, p, pad) {
+      s = body
       # Blank out inline code spans first: a span containing ** would otherwise close
       # the label early, the same class as the italic-suffix bug below.
       while (match(s, /`[^`]*`/)) {
@@ -349,11 +353,14 @@ else
         if (substr(s, k + 2, 1) != "*") { i = k; break }
         p = k + 1
       }
-      if (i > 1) {
-        orig = unit; sub(/^- \*\*/, "", orig)
-        label = trim(substr(orig, 1, i - 1))
-        if (label !~ /^\(example\)/) digest[label] = 1
-      }
+      if (i > 1) return trim(substr(body, 1, i - 1))
+      return ""
+    }
+    function emit(   s, label) {
+      if (unit == "" || unit !~ /^- \*\*/) { unit = ""; return }
+      s = unit; sub(/^- \*\*/, "", s)
+      label = label_of(s)
+      if (label != "" && label !~ /^\(example\)/) digest[label] = 1
       unit = ""
     }
     function anchor(s,   t) {
@@ -384,10 +391,16 @@ else
     # so an entry absent from the Contents passed while the message said it was there.
     /^## Contents/ { in_toc = 1; next }
     in_toc && /^## / { in_toc = 0 }
-    in_toc && /^[ \t]*---[ \t]*$/ { in_toc = 0 }
+    # `\r?` or the section never closes under CRLF, and every line after the break is eaten
+    # by the in_toc block: the anchors of entries below it join `seen` (the whole-file
+    # collection this rule exists to stop) and the entry-label check never runs at all.
+    # Measured on byte-identical registers whose Contents ends only at the break — LF exits
+    # 1 on a stale label, CRLF exits 0.
+    in_toc && /^[ \t]*---[ \t]*\r?$/ { in_toc = 0 }
     /^### / {
       s = trim(substr($0, 5))
-      if (s !~ /^\(example\)/) { entry[s] = 1; head[anchor(s)] = s }
+      want_label = 0
+      if (s !~ /^\(example\)/) { entry[s] = 1; head[anchor(s)] = s; cur_head = s; want_label = 1 }
       next
     }
     in_toc {
@@ -396,6 +409,72 @@ else
         seen[substr(line, RSTART + 2, RLENGTH - 3)] = 1
         line = substr(line, RSTART + RLENGTH)
       }
+      # Every link on the row is read as a row of its own, so a trailing "see also" link is
+      # checked as though it were one. The Contents is one link per row today, and the shape
+      # that would break this is the shape the layering forbids anyway.
+      #
+      # A link text containing `]` never matches the pattern below and is exempt from the
+      # name check in silence. Reachability is unaffected — the bare-anchor loop above has
+      # already recorded it — and widening the pattern to balance brackets is markdown
+      # parsing, which the section above this one is the standing argument against.
+      #
+      # A SECOND pass over the same line for the row itself, deliberately not folded into
+      # the loop above. Narrowing that one to the full `[text](#anchor)` form would stop a
+      # bare `(#anchor)` reaching `seen`, and the entry it names would then be reported as
+      # absent from a Contents that lists it — weakening a working check in order to add one.
+      line = $0
+      while (match(line, /\[[^]]*\]\(#[a-z0-9_-]+\)/)) {
+        m = substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+        t = m; sub(/^\[/, "", t); sub(/\]\(#[a-z0-9_-]+\)$/, "", t)
+        a = m; sub(/^.*\]\(#/, "", a); sub(/\)$/, "", a)
+        # ONE-BASED, and the increment comes first. An uninitialised awk variable used as a
+        # subscript is the empty string, not zero, so `rowtext[nrow]` with nrow unset stored
+        # the first row under "" and a 0-based loop then read past it — the FIRST Contents
+        # row went unchecked while every later one worked, which is why the single-row
+        # fixture beside this file exists.
+        if (t !~ /^\(example\)/) { nrow++; rowtext[nrow] = t; rowanchor[nrow] = a }
+      }
+      next
+    }
+    # ---- the opening bold label of an entry body ----
+    # A decision heading is written down in FIVE places and three of them were checked: the
+    # Contents anchor, the heading itself, and the digest label in CLAUDE.md. The two added
+    # here are the two nothing else can see. A Contents row can name decision A while
+    # linking to decision B — the link still works, so the register reads as healthy from
+    # either end, and only a reader who trusts the name is misled. An entry can also open
+    # its body with a bold label that disagrees with the heading above it, which costs more
+    # here than it would elsewhere: the whole register model is that a digest line greps
+    # straight to its entry, and that bold label is what such a grep lands on.
+    #
+    # Scoped to DISAGREEMENT, not to presence. An entry opening with plain prose is left
+    # alone: the live register has one (the entry on extra floors as a published contract),
+    # and so does most of the fixture corpus beside this script, so demanding the
+    # restatement would be a gate inventing a rule the register rules header never stated.
+    # The escape is therefore real and deliberate — delete the label and nothing fires —
+    # and it is the right one to leave open. A heading with no restatement contradicts
+    # nothing; a heading with the WRONG restatement contradicts itself.
+    !want_label { next }
+    /^[ \t]*\r?$/ { next }
+    # A superseded marker is a BLOCKQUOTE, and the completion ritual puts one at every doc
+    # site still stating the old claim — so it lands directly under the heading, on exactly
+    # the path this check exists for: superseding is WHEN a heading gets renamed. Read as
+    # the body line it silenced the stale label below it, measured green on a register whose
+    # entry was headed one decision and labelled another.
+    /^[ \t]*>/ { next }
+    {
+      want_label = 0
+      if ($0 !~ /^\*\*/) next
+      # No CR strip here, and none is needed: a trailing CR sits past the closing `**`, so
+      # it is never inside the label, and `trim` would take it anyway. Proved equivalent by
+      # mutation on the one shape where it could matter — a label closing at end of line.
+      s = $0; sub(/^\*\*/, "", s)
+      lab = label_of(s)
+      if (lab == "")
+        printf "FAIL  %s: \"### %s\" opens its body with a `**` that never closes.\n      An unclosed label yields no label at all, so the one line that has to restate the\n      heading is never compared against it. It opens and closes on the FIRST body line: a\n      label wrapped onto a second line reads here as one that never closes.\n", reg, cur_head
+      else if (lab != cur_head)
+        printf "FAIL  %s: \"### %s\" opens its body with the label \"%s\".\n      The bold label opening an entry restates its heading, and is what a digest line greps\n      to. A label that does not match its heading is visible to no other check here: the\n      heading is right, the Contents row is right, and the two disagree only with each other.\n      A superseded marker belongs in a blockquote above the label, where it is skipped.\n", reg, cur_head, lab
+      next
     }
     END {
       emit()
@@ -408,11 +487,21 @@ else
       for (a in head)
         if (!(a in seen))
           printf "FAIL  %s: \"### %s\" is absent from the Contents — findable only by reading the\n      whole file, which is the cost the layering exists to avoid.\n", reg, head[a]
+      # Indexed rather than `for (i in rowtext)`: awk iterates an associative array in an
+      # unspecified order, so two bad rows would report in a different order on a different
+      # awk and the corpus would be flaky on exactly the machines it is meant to protect.
+      for (i = 1; i <= nrow; i++) {
+        if (anchor(rowtext[i]) == rowanchor[i]) continue
+        if (rowanchor[i] in head)
+          printf "FAIL  %s Contents: the row named \"%s\" links to \"#%s\", the anchor of \"### %s\".\n      A row that names one decision and points at another reads as correct from either end,\n      because the link still works — nothing looks broken until a reader trusts the name.\n", reg, rowtext[i], rowanchor[i], head[rowanchor[i]]
+        else
+          printf "FAIL  %s Contents: the row named \"%s\" links to \"#%s\", but its own anchor is\n      \"#%s\". The Contents row is the only place a name and the link under it are written\n      side by side, so a disagreement between the two is checkable nowhere else.\n", reg, rowtext[i], rowanchor[i], anchor(rowtext[i])
+      }
     }
   ' "$CLAUDE" "$REGISTER" >> "$FAILS"
 fi
 
-# ── 6 & 7. The delivery tier ───────────────────────────────────────────────────
+# ── 8 & 9. The delivery tier ───────────────────────────────────────────────────
 # The Status match is deliberately permissive about what sits between "Status" and
 # "Completed" — ": ", " | " in a table row, "**" — because a spec whose header form
 # this fails to recognise is skipped SILENTLY, and a silent skip of the delivery-doc
@@ -448,7 +537,7 @@ if [ -d "$DELIVERY_DIR" ]; then
   done
 fi
 
-# ── 8. Pointers out of the always-loaded file ──────────────────────────────────
+# ── 10. Pointers out of the always-loaded file ─────────────────────────────────
 # CLAUDE.md only, deliberately. A pointer that goes nowhere defeats the layering this
 # file defends: a session sent to a missing register reads the digest and stops there.
 # Link-checking every doc in the repo is a different job with a far wider false-positive

@@ -14,7 +14,11 @@ Rules that keep this file useful:
   spec number. Ordering by spec turns a register into a changelog, and a shape that reads as
   disposable gets treated as disposable.
 - **The heading matches the bold label of its `CLAUDE.md` digest line**, so the line greps straight to
-  its entry. `scripts/docs-lint.sh` checks that correspondence in both directions — run it locally before every push.
+  its entry. `scripts/docs-lint.sh` checks that correspondence in both directions, and two more copies
+  of the same heading inside this file: a Contents row must **name** the entry its link points at, not
+  merely link to a real one, and an entry whose body opens with a bold label — below any superseded
+  marker, which is skipped — must restate its own heading there. Opening with plain prose instead is
+  fine: the check is on disagreement, not on presence. Run it locally before every push.
 - **When a decision reverses an earlier one,** update the entry in place and add a superseded marker
   at every *other* doc site still stating the old claim.
 - **Date-stamp user decisions** (YYYY-MM-DD) so "settled" has a when.
