@@ -15,6 +15,7 @@ would an unforced rate: race 4 measured 0/120 without a preemption point.
 from __future__ import annotations
 
 import ast
+import gc
 import os
 import pathlib
 import threading
@@ -855,6 +856,9 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         _lifecycle._closing_now.add(0xDEADBEEF)
     try:
         read_fd, write_fd = os.pipe()
+        # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
+        # fork-unsafe to finalize. `test_every_fork_collects_first` derives this rule.
+        gc.collect()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - the child never returns to pytest
             os.close(read_fd)
@@ -1015,6 +1019,9 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
 
     read_fd, write_fd = os.pipe()
+    # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
+    # fork-unsafe to finalize. `test_every_fork_collects_first` derives this rule.
+    gc.collect()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
         os.close(read_fd)
@@ -1052,6 +1059,9 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
 
     read_fd, write_fd = os.pipe()
+    # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
+    # fork-unsafe to finalize. `test_every_fork_collects_first` derives this rule.
+    gc.collect()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
         os.close(read_fd)

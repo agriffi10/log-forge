@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import collections
 import faulthandler
+import gc
 import io
 import os
 import pathlib
@@ -158,6 +159,27 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     dealt with even when ``select`` or ``read`` raises — an unreaped child of a test process is
     a stray that outlives the run.
 
+    **The parent collects before it forks, and that is a guard rather than tidiness.** A child
+    that finalizes an object whose finalizer is not fork-safe dies of ``SIGSEGV`` inside whatever
+    it was running -- which here means inside the library's own repair, the child's first
+    substantial allocating work and so usually the pass that trips the collector. Nine unclosed
+    ``sqlite3.Connection`` objects leaked by ``test_sinks_sqlite`` did exactly that, because
+    macOS routes ``sqlite3``'s close through ``os_log``, which is not fork-safe; the crash
+    presented under four different test names, since the frame it lands in is only whichever one
+    the collector interrupted. Collecting here finalizes that garbage in the **parent**, where it
+    is harmless, so nothing is left for the child to finalize. Measured against the nine original
+    leaks: 7 of 8 runs crashed without this line, 0 of 10 with it and no other change -- both
+    from ``pytest -n 0 tests/test_sinks_sqlite.py tests/test_fork_lifecycle.py``, so either half
+    can be re-measured. The cost is one collection per fork, and it is **not** lost in the noise:
+    ``pytest -n 0 tests/test_fork_lifecycle.py`` runs about 4% longer with this line than without,
+    consistently clear of that command's own run-to-run spread. Both halves come from the same
+    command, so the trade is re-measurable rather than asserted. It is deliberately not specific to ``sqlite3``, and not to a Python
+    version: the next fork-unsafe finalizer to be leaked gets the same protection without anyone
+    having to notice it was needed. The rule is **derived, not listed** --
+    :func:`test_every_fork_collects_first` reads every test module and fails on a fork that is
+    not immediately preceded by a bare ``gc.collect()``, so a fifth fork site cannot be added
+    without either the guard or a deliberate argument against it.
+
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
         is sent back as the child's output.
@@ -171,6 +193,7 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
       None.
     """
     read_fd, write_fd = os.pipe()
+    gc.collect()
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -3056,3 +3079,126 @@ def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
         worker.shutdown(timeout=2.0)
 
     assert child.output == "True,True", child.output
+
+
+_TESTS_DIR = pathlib.Path(__file__).parent
+
+_TEST_MODULES = sorted(_TESTS_DIR.rglob("test_*.py"))
+
+
+def _unguarded_forks(source: str) -> list[int]:
+    """Returns the line of every ``os.fork()`` not immediately preceded by ``gc.collect()``.
+
+    Derived rather than listed, for the reason SPEC-038 FR-001 measured: a roster of fork sites
+    is a roster that goes stale the first time somebody adds a fifth one, and the failure is
+    silent — a child left something fork-unsafe to finalize dies of ``SIGSEGV`` in whatever frame
+    the collector happened to interrupt, which is a symptom nobody can search for.
+
+    "Immediately preceded" is deliberately the strict reading. A collect further up the function
+    is not equivalent: anything allocated in between is exactly what the guard exists to have
+    already finalized, and a rule that accepted it would pass a site the guard does not protect.
+    Only real ``ast.Call`` nodes count, so a fork named in a docstring or a string is not a site.
+
+    Args:
+      source: The text of one test module.
+
+    Returns:
+      The 1-based line numbers of the unguarded calls, in the order they appear.
+
+    Raises:
+      SyntaxError: If the source does not parse, which is a broken module rather than a finding.
+    """
+
+    def is_call_to(node: ast.AST, module: str, name: str) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == name
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == module
+        )
+
+    tree = ast.parse(source)
+    statement_of: dict[ast.AST, ast.stmt | None] = {}
+    position: dict[ast.stmt, tuple[list[ast.stmt], int]] = {}
+
+    def descend(node: ast.AST, statement: ast.stmt | None) -> None:
+        for field, value in ast.iter_fields(node):
+            items = value if isinstance(value, list) else [value]
+            body = isinstance(value, list) and field in ("body", "orelse", "finalbody")
+            for index, child in enumerate(items):
+                if not isinstance(child, ast.AST):
+                    continue
+                if body and isinstance(child, ast.stmt):
+                    position[child] = (value, index)
+                    descend(child, child)
+                else:
+                    statement_of[child] = statement
+                    descend(child, statement)
+
+    descend(tree, None)
+    offenders: list[int] = []
+    for node, statement in statement_of.items():
+        if statement is None or not is_call_to(node, "os", "fork"):
+            continue
+        body, index = position[statement]
+        previous = body[index - 1] if index else None
+        guarded = (
+            isinstance(previous, ast.Expr)
+            and is_call_to(previous.value, "gc", "collect")
+            and not previous.value.args
+        )
+        if not guarded:
+            offenders.append(getattr(node, "lineno", 0))
+    return sorted(offenders)
+
+
+@pytest.mark.parametrize("path", _TEST_MODULES, ids=lambda p: p.name)
+def test_every_fork_collects_first(path: pathlib.Path) -> None:
+    """Every fork in the suite empties the parent's garbage before the child inherits it.
+
+    The rule this makes non-optional is stated in full on :func:`run_in_child`: a forked child
+    that finalizes an object whose finalizer is not fork-safe dies, and the crash lands in
+    whatever frame the collector interrupted rather than anywhere near the leak. Collecting in
+    the parent leaves the child nothing to finalize. Four sites satisfy it today, and the point
+    of deriving the roster is the fifth.
+    """
+    offenders = _unguarded_forks(path.read_text(encoding="utf-8"))
+    assert not offenders, (
+        f"{path.name} forks without collecting first, at line(s) "
+        f"{', '.join(str(line) for line in offenders)}. Put a bare `gc.collect()` on the line "
+        f"immediately above each `os.fork()` — see `run_in_child` for why."
+    )
+
+
+def test_the_fork_collection_rule_can_actually_fail() -> None:
+    """The rule above is checked against sources it must reject and sources it must not.
+
+    A lint is not tested by running it on the tree it already passes: that proves the tree is
+    clean, not that the check works. Each rejected sample differs from an accepted one by the
+    single thing the rule is about, so a rule that stopped discriminating fails here rather than
+    going quiet.
+    """
+    accepted = {
+        "guarded": "import gc, os\ngc.collect()\npid = os.fork()\n",
+        "guarded inside a function": (
+            "import gc, os\ndef f():\n    gc.collect()\n    return os.fork()\n"
+        ),
+        "guarded in a finally block": (
+            "import gc, os\ntry:\n    pass\nfinally:\n    gc.collect()\n    os.fork()\n"
+        ),
+        "a fork named only in a string": 'import os\n"os.fork()"\n',
+        "no fork at all": "import gc\ngc.collect()\n",
+    }
+    rejected = {
+        "no collect": "import os\npid = os.fork()\n",
+        "collect too far up": "import gc, os\ngc.collect()\nx = 1\npid = os.fork()\n",
+        "collect after the fork": "import gc, os\npid = os.fork()\ngc.collect()\n",
+        "collect on a generation": "import gc, os\ngc.collect(0)\npid = os.fork()\n",
+        "a different collect": "import os\nother.collect()\npid = os.fork()\n",
+        "guarded in the sibling branch": (
+            "import gc, os\nif x:\n    gc.collect()\nelse:\n    os.fork()\n"
+        ),
+    }
+    assert {name for name, src in accepted.items() if _unguarded_forks(src)} == set()
+    assert {name for name, src in rejected.items() if not _unguarded_forks(src)} == set()
