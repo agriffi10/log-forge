@@ -146,7 +146,8 @@ one sink and takes the most recently armed, which is the one an emit reached las
 - [ ] `flush()` empties the client buffer of every owed sink, not only one, and reports success
       only if it did.
 - [ ] A forked child refuses to close **every** sink the parent had owed, not only the last
-      armed — an unmarked one is claimable and its transport destroyable (SPEC-042 FR-001).
+      armed — one that is neither marked nor recorded is claimable and its transport
+      destroyable (SPEC-042 FR-001).
 - [ ] `health().inherited_sink` still answers from the record's most recently armed entry where
       there is no worker, asserted so that both taking the *first* entry and dropping the reader
       entirely fail — with every sink owned by this process the answer is constant and neither

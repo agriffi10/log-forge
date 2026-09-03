@@ -493,8 +493,9 @@ def test_flush_reaches_every_sink_the_orphan_path_still_owes() -> None:
 def test_a_forked_child_repairs_every_owed_sink_not_only_the_last() -> None:
     """FR-004 AC-2. `_inheritance_roots` reads the record, so it had the same single-slot bound.
 
-    A child must mark every inherited sink foreign, or one it did not see becomes claimable and
-    it can legitimately close the parent's transport (SPEC-042 FR-001).
+    A child's walk must reach every inherited sink, or one it did not see and the parent never
+    recorded becomes claimable and it can legitimately close the parent's transport (SPEC-042
+    FR-001 AC-6).
     """
     from test_fork_lifecycle import run_in_child
 
@@ -544,9 +545,10 @@ def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
     process owned and asserted `False`, which is true whichever end the reader picks and true
     with the reader deleted outright — measured, both mutants passed the whole suite.
 
-    So: the second sink is stamped as another process's, the way a `fork` marks everything
-    inherited. Reading `True` then requires the reader to consult the record at all — the
-    configured sink is the *first* one and is this process's — and to take the **last** entry.
+    So: the second sink is stamped as another process's, the way a `fork` leaves what it
+    inherited recorded under a pid this process cannot match. Reading `True` then requires the
+    reader to consult the record at all — the configured sink is the *first* one and is this
+    process's — and to take the **last** entry.
     """
     first, second = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=first)

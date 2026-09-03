@@ -292,8 +292,9 @@ single slot that a second unconfirmed swap overwrites.
 **The record holds sinks the process has stopped delivering to, so it must not be walked after a
 fork.** That is what `_FORK_SKIP` exists for: `_fork`'s repair walk would otherwise re-enter
 superseded sinks, replace their locks and re-run their fork hooks, and `_lifecycle.reclaim` would
-overwrite the `_FOREIGN` stamp `_mark_inherited` set — leaving a child able to close a sink it
-never acquired. `Worker` declares no `_FORK_SKIP` today and will need one.
+overwrite the foreign-pid record the child holds for it — the parent's own stamp, or the
+`_FOREIGN` `_mark_inherited` `setdefault`s where the parent recorded nothing — leaving a child
+able to close a sink it never acquired. `Worker` declares no `_FORK_SKIP` today and will need one.
 
 This supersedes the "left open" claim at `architecture.md` §7, `docs/decisions.md`'s SPEC-030
 entry (under *The sink contract: waiting, concurrency and shutdown*, **not** the pipeline area),

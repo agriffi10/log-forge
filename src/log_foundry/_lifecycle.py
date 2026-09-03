@@ -125,8 +125,11 @@ class _Lifecycle:
     harmlessly: it is a tuple of strings, which holds no primitive to replace and no sink to
     hook. The module-level tuple is unchanged and still needed; neither is the whole rule.
 
-    Marking is not narrowed: :func:`_inheritance_roots` reads the slot directly, so a child still
-    marks an inherited superseded sink foreign and still refuses to close it (SPEC-042 FR-001).
+    Marking is not narrowed: :func:`_inheritance_roots` reads the slot directly, so the walk
+    still reaches an inherited superseded sink and it is still refused (SPEC-042 FR-001) — on the
+    stamp ``configure()`` left, since :func:`_mark_inherited` ``setdefault``s and leaves an
+    existing record alone rather than writing ``_FOREIGN`` over it — or on ``_FOREIGN``, for a
+    sink held inside it that the bounded stamp walk never reached.
     """
 
     def __init__(self) -> None:
@@ -494,8 +497,10 @@ _FOREIGN = -1
 """The pid a record carries when the sink belongs to some earlier process.
 
 Never a real pid, so it can never match :func:`os.getpid`. Laid down by
-:func:`_mark_inherited` in a forked child over everything the child inherited, which is what
-gives "this process did not acquire it" a **terminal** state.
+:func:`_mark_inherited` in a forked child over each inherited sink its walk reaches that the
+parent never recorded —
+it ``setdefault``s, so a sink already carrying the parent's own pid keeps it and is refused by
+that — which is what gives "this process did not acquire it" a **terminal** state.
 
 Without it the record protects nothing where it is empty: ``stamp`` is write-once, and write-once
 defends only a record that already exists, so a child could ``configure()`` its way into *owning*
@@ -505,7 +510,7 @@ destroying the parent's transport. Unrecorded has to be unclaimable, not merely 
 """
 
 _MARKING_CEILING = 100_000
-"""Objects the child's marking walk may visit before it gives up and refuses everything.
+"""Objects the child's marking walk may visit before it gives up and refuses the unrecorded.
 
 **A cap is right here where SPEC-039 rejected one, and the difference is the fallback.** That
 spec declined to bound its repair walk because an unfound lock is a child that hangs with no
@@ -610,7 +615,9 @@ def _bounded_children(container: object) -> list[object]:
 
     Raises:
       None. A container that raises while being read contributes nothing, as it does in
-        ``_fork``; what it holds is then unmarked, therefore unrecorded, therefore refused.
+        ``_fork``; what it holds is then unmarked. It keeps whatever ``stamp`` recorded, and
+        where nothing did it is unrecorded — refused through a recorded wrapper, and §13 item
+        7's residual otherwise, since absorbing here leaves :data:`_marking_failed` clear.
     """
     try:
         if isinstance(container, dict):
@@ -623,7 +630,7 @@ def _bounded_children(container: object) -> list[object]:
         _diag.absorbed(
             "reading a container while marking a forked child's sinks",
             exc,
-            "what it holds is not marked, so this child will refuse to close it",
+            "what it holds is not marked by this child",
         )
         return []
 
@@ -768,7 +775,7 @@ def _inheritance_roots() -> list[object]:
 
 
 def _mark_inherited() -> None:
-    """Marks every sink this child inherited as foreign, before anything can claim it (FR-001).
+    """Records the sinks this child inherited, before any other fork handler runs (FR-001).
 
     Registered with ``_fork`` and run in the child, which is why it may take the library's locks:
     they were re-initialised moments earlier. It must run **before** any handler that could reach
@@ -863,10 +870,14 @@ def _mark_inherited() -> None:
 def reclaim(sink: object) -> None:
     """Records that a sink re-acquired its transport in this process (SPEC-042 FR-005).
 
-    The one write that **overrides** an existing record, and it has to be: :func:`_mark_inherited`
-    has already stamped everything inherited ``_FOREIGN`` by the time the hook roster is read, so
-    a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
-    forever.
+    The one write that **overrides** an existing record, and it has to be: an inherited sink
+    **the marking walk reached** carries another process's pid by the time the hook roster is
+    read — the parent's own stamp, or the ``_FOREIGN`` :func:`_mark_inherited` ``setdefault``s
+    where the parent recorded nothing — so a ``setdefault`` here would leave a sink that provably
+    holds its own descriptor refused forever. Where the walk did *not* reach it the record is
+    empty and this write is the one that fills it — a walk can miss a sink with no exception at
+    all, and the loop calling this sits outside that walk's ``try`` so it also runs when the walk
+    ended badly.
 
     **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
     inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement
@@ -942,7 +953,8 @@ def releasable(sink: object, *, owner: object = None) -> bool:
 
     The wrapper is what makes the two distinguishable, so it is asked:
 
-    - Neither recorded — a graph the library never saw. The caller owns it; honour the close.
+    - Neither recorded — a graph nothing in the record reaches. The caller owns it; honour the
+      close.
     - The child recorded elsewhere — the inherited sink, or one :func:`_mark_inherited` marked
       ``_FOREIGN``. Refused however it was reached, which is what closes the wrapper route
       (FR-002 AC-3).
@@ -952,10 +964,14 @@ def releasable(sink: object, *, owner: object = None) -> bool:
       in §13.
 
     **"Unrecorded is the caller's" is only sound because a fork makes it false first.** In a
-    child, :func:`_mark_inherited` records everything inherited as ``_FOREIGN`` *before* any
-    handler runs, so an unrecorded sink there is one built after the fork. If that walk could
-    not finish, :data:`_marking_failed` withdraws the assumption entirely and every unrecorded
-    sink is refused.
+    child, :func:`_mark_inherited` records every inherited sink **its walk reaches** that the
+    parent did not record as ``_FOREIGN``, *before* any other handler runs — one the parent *did*
+    record keeps that stamp and is refused on it. What the walk reached is therefore stamped or
+    ``_FOREIGN``; what it missed stays unrecorded and is the §13 item 7 residual, not a case this
+    closes — measured, a sink built before the fork behind a container that raises is unrecorded
+    in the child, releasable, and closed. If the walk could not finish *at all*,
+    :data:`_marking_failed` withdraws the assumption entirely and every unrecorded sink is
+    refused.
 
     Identity is re-checked against the strong reference rather than trusting the ``id``. The
     reference is what makes an id collision impossible while a record stands, so this can only
