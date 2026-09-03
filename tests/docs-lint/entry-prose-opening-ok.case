@@ -1,0 +1,39 @@
+@@@ expect exit=0
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+- **Beta rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+- [Beta rule](#beta-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning that opens with prose rather than restating the heading in bold. That is a
+deliberate exemption, not an oversight: the live register has such an entry, and a heading
+with no restatement contradicts nothing.
+
+### Beta rule
+
+Reasoning that mentions **Alpha rule** in bold partway through, which is emphasis and not a
+label. The check anchors on the START of the line for exactly this reason.

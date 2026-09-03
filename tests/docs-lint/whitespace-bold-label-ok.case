@@ -1,0 +1,33 @@
+@@@ expect exit=0
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+- **  ** — a bold span that closes but holds nothing is no label at all, so it demands no
+  register entry. Reporting it as a digest line carrying "" sent the reader looking for an
+  entry called nothing.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

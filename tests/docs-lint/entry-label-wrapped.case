@@ -1,0 +1,33 @@
+@@@ expect exit=1
+@@@ match "### Alpha rule" opens its body with a
+@@@ match It opens and closes on the FIRST body line
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+**Alpha rule — a label wrapped onto a second line closes on the
+next line**, which reads here as one that never closes at all.

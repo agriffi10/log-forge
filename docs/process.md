@@ -537,8 +537,9 @@ When a spec is done, in the same pass:
    only then, **one line** in CLAUDE.md's Key Decisions under the same area, replacing or extending
    that area's clause rather than appending a new one. Entry first, line second: the digest line is
    **never the only home of a fact**, and it is capped — past `DIGEST_MAX_BYTES` it has stopped being
-   a reminder and become the reasoning, which belongs in the register. A reversal that changes the entry's **heading** must move its Contents row and its
-   digest label with it, or the row points at a dead anchor and docs-lint fails.
+   a reminder and become the reasoning, which belongs in the register. A reversal that changes the entry's **heading** must move three copies of it with the
+   heading — its Contents row, its digest label, and the entry's own opening bold label — or the
+   row points at a dead anchor, the label still names the old decision, and docs-lint fails.
    If the decision **supersedes an earlier one**, add a superseded marker (short
    blockquote: what changed, which spec, where the full entry lives) at every doc site that still
    states the old claim — `architecture.md` sections, `INDEX.md` build-order notes. The new entry
@@ -569,7 +570,10 @@ this way).
   caused it, while they can still fix it silently, rather than on a shared branch where it reds
   someone else's unrelated work and becomes a thing to be waived. It holds `CLAUDE.md` to a byte budget and each Key Decisions
   **unit** — a bullet with its continuations — to a length, and refuses any construct in that section but an area heading, a bullet, a continuation, a blank line and plain intro prose; requires `docs/decisions.md` to carry a `###` entry for every digest line and a
-  digest line for every entry, and to list every entry in its Contents; requires every Completed spec
+  digest line for every entry, to list every entry in its Contents under a name that matches the anchor
+  beside it, and to keep an entry's opening bold label — where it has one, below any superseded
+  marker — equal to its own heading;
+  requires every Completed spec
   to have a delivery doc; and checks that the pointers out of `CLAUDE.md` resolve.
   **`scripts/docs-lint-test.sh` is the corpus that proves those checks still fire** — running the
   linter against the repo's own documents proves the documents pass and nothing about whether any

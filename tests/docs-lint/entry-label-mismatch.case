@@ -1,0 +1,32 @@
+@@@ expect exit=1
+@@@ match "### Alpha rule" opens its body with the label "Beta rule"
+@@@ match A superseded marker belongs in a blockquote above the label
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+**Beta rule** — the heading was renamed and the label under it was not.

@@ -1,4 +1,5 @@
-@@@ expect exit=0
+@@@ expect exit=1
+@@@ match "### Alpha rule" opens its body with the label "Beta rule"
 @@@ file CLAUDE.md
 # Project
 
@@ -23,9 +24,8 @@ nothing
 
 ---
 
-## Area one
-
 ### Alpha rule
 
-**Alpha rule** — a correct label under CRLF stays silent.
+**Beta rule** — under CRLF the break never closed the Contents, so every line below it
+was read as a Contents row and this check never ran at all.
 
