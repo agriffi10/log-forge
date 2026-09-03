@@ -493,8 +493,9 @@ def test_flush_reaches_every_sink_the_orphan_path_still_owes() -> None:
 def test_a_forked_child_repairs_every_owed_sink_not_only_the_last() -> None:
     """FR-004 AC-2. `_inheritance_roots` reads the record, so it had the same single-slot bound.
 
-    A child must mark every inherited sink foreign, or one it did not see becomes claimable and
-    it can legitimately close the parent's transport (SPEC-042 FR-001).
+    A child's walk must reach every inherited sink, or one it did not see and the parent never
+    recorded becomes claimable and it can legitimately close the parent's transport (SPEC-042
+    FR-001 AC-6).
     """
     from test_fork_lifecycle import run_in_child
 

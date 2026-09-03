@@ -866,11 +866,13 @@ def _mark_inherited() -> None:
 def reclaim(sink: object) -> None:
     """Records that a sink re-acquired its transport in this process (SPEC-042 FR-005).
 
-    The one write that **overrides** an existing record, and it has to be: by the time the hook
-    roster is read an inherited sink carries another process's pid — the parent's own stamp, or
-    the ``_FOREIGN`` :func:`_mark_inherited` ``setdefault``s where the parent recorded nothing —
-    so a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
-    forever.
+    The one write that **overrides** an existing record, and it has to be: an inherited sink
+    **the marking walk reached** carries another process's pid by the time the hook roster is
+    read — the parent's own stamp, or the ``_FOREIGN`` :func:`_mark_inherited` ``setdefault``s
+    where the parent recorded nothing — so a ``setdefault`` here would leave a sink that provably
+    holds its own descriptor refused forever. Where the walk did *not* reach it the record is
+    empty and this write is the one that fills it, which is why the loop calling it sits outside
+    that walk's ``try`` and runs however the walk ended.
 
     **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
     inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement

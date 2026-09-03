@@ -1252,14 +1252,15 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
 
 
 def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
-    """SPEC-042 FR-001 requires everything inherited be marked `_FOREIGN` before any other
-    handler runs, and handler order is registration order.
+    """SPEC-042 FR-001 AC-6 requires a sink with no record at all be refused, and the marking
+    that gives "no record" that terminal state runs before any other handler — registration order.
 
     The two registrations used to sit in different modules — `_mark_inherited` at the foot of
     `_lifecycle`, the rebuild at the foot of `decorator` — and the order held only because
     `decorator` imports `_lifecycle`. SPEC-040 put both in one module, where the order is now a
     property of two adjacent lines and nothing else. A rebuild that ran first would repair the
-    worker while the sinks it holds were still unmarked, and an unmarked sink is claimable.
+    worker while the sinks it holds were still unmarked, and a sink that is neither marked nor
+    recorded is claimable.
     """
     order = [handler.__name__ for handler in _fork._child_handlers]
     assert "_mark_inherited" in order and "_rebuild_worker_after_fork" in order, order
@@ -2936,8 +2937,9 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
 
     The hazard `_fork._SKIP_ATTRIBUTE` documents, at a new container: reaching a sink the process
     abandoned replaces its locks — merely wasteful — and runs its fork hooks, which is not, since
-    `_lifecycle.reclaim` then overwrites the `_FOREIGN` stamp `_mark_inherited` set and leaves a
-    child able to release a transport it never acquired.
+    `_lifecycle.reclaim` then overwrites the foreign-pid record the child holds for it — the
+    parent's own stamp, or the `_FOREIGN` `_mark_inherited` `setdefault`s where the parent
+    recorded nothing — and leaves a child able to release a transport it never acquired.
 
     Asserted against the walk itself rather than against a symptom, because the symptom is a
     child closing a parent's connection and there is no in-process way to observe it. A control
@@ -2977,7 +2979,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
 
         # The consequence the opt-out exists for, asserted rather than left to follow. The
         # walk only *collects* hooks; `_fork` then calls them, and `_lifecycle.reclaim` is what
-        # a called hook reaches — the one write that overrides an inherited `_FOREIGN` stamp.
+        # a called hook reaches — the one write that overrides an inherited record.
         # So "the hook did not run in the child" is the step between the walk and `releasable`.
         worker._not_skipped = []  # type: ignore[attr-defined]
         worker._unclosed_swaps = [stranded]

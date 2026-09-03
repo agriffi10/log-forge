@@ -588,10 +588,13 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_inheritance_roots", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
-            "which sinks a forked child must mark _FOREIGN before any other handler runs "
-            "(SPEC-042 FR-001). Existence rather than liveness, deliberately: a retired "
+            "which sinks a forked child's marking walk starts from, before any other handler "
+            "runs (SPEC-042 FR-001). Existence rather than liveness, deliberately: a retired "
             "worker's sink is still a transport this process inherited and must not release, "
-            "and resolving liveness here would leave it unmarked and therefore claimable. "
+            "and resolving liveness here would drop it as a root — leaving whatever it holds "
+            "that the parent's bounded stamp walk never recorded unmarked, and therefore "
+            "claimable. The sink object itself is stamped either way, which is why "
+            "`_inheritance_roots` calls `_owned.values()` the load-bearing entry. "
             "This site is **new to the roster** rather than new to the code - it read "
             "`decorator._worker` directly and composed the question on it, one module away "
             "from a roster that walked only `decorator.py`, so it passed silently for two "
