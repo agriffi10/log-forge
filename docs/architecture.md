@@ -1428,6 +1428,47 @@ and a third copy is a fork with no merge.
   "A worker guard asks one of four questions". It is not in CLAUDE.md: the digest line for that
   entry names none of the three.
 
+- **On macOS a forked child dies of `SIGSEGV` if it finalizes an inherited, unclosed
+  `sqlite3.Connection`** — and the library is neither the cause nor able to fix it. The chain is
+  entirely below Python: `connection_close` reaches `sqlite3_log`, which reaches Apple's `os_log`,
+  which is not fork-safe, and the child faults inside `_os_log_preferences_refresh`. macOS records
+  that native stack for every occurrence in `~/Library/Logs/DiagnosticReports/python3.*.ips` (read
+  the `EXC_BAD_ACCESS` ones — an `EXC_CRASH` entry is the abort *after* faulthandler re-raised),
+  and a script that imports nothing from this package reproduces it on both 3.12 and 3.13: build a
+  `sqlite3.Connection` into a reference cycle, `fork`, and `gc.collect()` in the child.
+  **It is macOS-only in practice** — CI is `ubuntu-latest`, so this never gated a build; it cost
+  three local sessions instead.
+
+  **It needs a connection that was already garbage before the fork**, which is narrower than it
+  first looks. A connection reachable only from a *non-surviving thread's* frame is safe: CPython
+  does not clear those frames in the child, so the reference leaks rather than becoming
+  collectable (measured 0/20, against 13/20 for the same connection made garbage on the main
+  thread). A sink the library was handed is safe for a second, independent reason — `_owned` in
+  `_lifecycle.py` holds a strong reference to every one, superseded sinks included, and never
+  shrinks — so a live `SQLiteSink` is never finalized in a child at all.
+
+  What the library **does** supply is the moment. `_reinit_after_fork` is the first *substantial*
+  allocating work in the child — `threading._after_fork` is registered earlier and allocates a
+  little — so it is usually the pass that trips the collector, and the crash therefore presents
+  inside this package under a rotating set of frames. **A crash whose frame rotates is not located
+  at any of those frames**, which is the trap that cost the three sessions.
+
+  `gc.disable()` around the repair was built and measured, and is **rejected**: it greened the
+  reproducing suite command outright while a child that *keeps running* still died, because the
+  harness's children `os._exit` before collecting anything — and it silently re-enabled the
+  collector in a child whose parent had disabled it. Consumers that fork should close their
+  connections first. The suite does two things rather than one: `tests/test_sinks_sqlite.py` no
+  longer leaks, and **every fork site in the suite collects in the parent before forking**, which
+  is the part that generalises — it leaves the child nothing to finalize whatever leaks later, and
+  is neither sqlite-specific nor version-specific. That rule is derived rather than listed, by a
+  lint over the test modules, because a hand-written roster of fork sites is one that goes stale
+  silently. Detecting the leak instead was built and
+  rejected: the `unclosed database` `ResourceWarning` postdates 3.12, so it covered one leg of a
+  two-leg CI matrix, and under `-n 12` an unraisable raised in a worker's teardown never reaches
+  the session exit code. The rates behind all of this are in the commit that closed it, measured
+  against its parent, rather than restated here where nobody can re-run them.
+  (No spec — a defect fix.)
+
 ---
 
 ## 14. Alignment with observability concepts

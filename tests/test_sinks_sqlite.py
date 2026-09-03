@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from typing import TYPE_CHECKING
 
 import pytest
 
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.sqlite import SQLiteSink
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _ALL_COLUMNS = ("log_id", "trace_id", "span_id", "timestamp", "level", "function", "event")
 
@@ -33,22 +37,47 @@ def make_event(**overrides: object) -> dict[str, object]:
     return event
 
 
+@pytest.fixture
+def conn() -> Iterator[sqlite3.Connection]:
+    """An in-memory connection closed at teardown, which removes a leak rather than a crash.
+
+    A ``sqlite3.Connection`` left unclosed is closed by its finalizer instead, in whichever
+    process collects it — and on macOS a forked child that inherits one segfaults there:
+    ``connection_close`` reaches ``sqlite3_log``, which reaches ``os_log``, which is not
+    fork-safe. Nine connections leaked from this module were what crashed ``test_fork_lifecycle``
+    under a rotating set of test names, whenever ``--dist worksteal`` put the two modules in one
+    worker in that order: measured at 7 of 8 for
+    ``pytest -n 0 tests/test_sinks_sqlite.py tests/test_fork_lifecycle.py`` before this fixture
+    and 0 of 10 after. ``architecture.md`` section 13 carries the mechanism.
+
+    **This fixture is the hygiene half and not the guard.** What makes the crash impossible is
+    that every fork site in the suite collects in the parent first — ``run_in_child`` in
+    ``test_fork_lifecycle`` states why. A ``ResourceWarning``-based gate was built here instead
+    and rejected: the ``unclosed database`` warning does not exist before Python 3.13, so it
+    covered one leg of a two-leg CI matrix, and under the suite's own ``-n 12`` an unraisable
+    raised in a worker's teardown never reaches the session's exit code.
+    """
+    connection = sqlite3.connect(":memory:")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
 # --- FR-003: schema + insert ------------------------------------------------------------
 
 
-def test_is_a_sink() -> None:
-    assert isinstance(SQLiteSink("ignored", connection=sqlite3.connect(":memory:")), Sink)
+def test_is_a_sink(conn: sqlite3.Connection) -> None:
+    assert isinstance(SQLiteSink("ignored", connection=conn), Sink)
 
 
-def test_creates_table_with_expected_columns() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_creates_table_with_expected_columns(conn: sqlite3.Connection) -> None:
     SQLiteSink("ignored", connection=conn)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(log_events)")}
     assert set(_ALL_COLUMNS) <= columns
 
 
-def test_schema_creation_is_idempotent() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_schema_creation_is_idempotent(conn: sqlite3.Connection) -> None:
     SQLiteSink("ignored", connection=conn)
     SQLiteSink("ignored", connection=conn)  # second ensure must not raise
     tables = conn.execute(
@@ -57,8 +86,7 @@ def test_schema_creation_is_idempotent() -> None:
     assert len(tables) == 1
 
 
-def test_emit_inserts_every_event_and_projects_columns() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_emit_inserts_every_event_and_projects_columns(conn: sqlite3.Connection) -> None:
     sink = SQLiteSink("ignored", connection=conn)
     sink.emit([make_event(log_id="a", level="INFO"), make_event(log_id="b", level="ERROR")])
     rows = conn.execute("SELECT log_id, level, event FROM log_events ORDER BY id").fetchall()
@@ -67,8 +95,7 @@ def test_emit_inserts_every_event_and_projects_columns() -> None:
     assert json.loads(rows[0][2])["log_id"] == "a"
 
 
-def test_missing_keys_become_null() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_missing_keys_become_null(conn: sqlite3.Connection) -> None:
     sink = SQLiteSink("ignored", connection=conn)
     sink.emit([{"message": "hi"}])  # no identity/level/function keys
     row = conn.execute(
@@ -78,8 +105,7 @@ def test_missing_keys_become_null() -> None:
     assert json.loads(row[6]) == {"message": "hi"}
 
 
-def test_custom_table_name() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_custom_table_name(conn: sqlite3.Connection) -> None:
     sink = SQLiteSink("ignored", connection=conn, table="events_2")
     sink.emit([make_event(log_id="x")])
     assert conn.execute("SELECT log_id FROM events_2").fetchone()[0] == "x"
@@ -93,8 +119,7 @@ def test_invalid_table_name_raises() -> None:
 # --- FR-003: create_table flag ----------------------------------------------------------
 
 
-def test_create_table_false_runs_no_ddl_and_errors_at_insert() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_create_table_false_runs_no_ddl_and_errors_at_insert(conn: sqlite3.Connection) -> None:
     sink = SQLiteSink("ignored", connection=conn, create_table=False)
     # No table was created…
     assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
@@ -103,8 +128,7 @@ def test_create_table_false_runs_no_ddl_and_errors_at_insert() -> None:
         sink.emit([make_event()])
 
 
-def test_create_table_false_uses_caller_provisioned_table() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_create_table_false_uses_caller_provisioned_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE log_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "log_id TEXT, trace_id TEXT, span_id TEXT, timestamp TEXT, level TEXT, "
@@ -118,8 +142,7 @@ def test_create_table_false_uses_caller_provisioned_table() -> None:
 # --- FR-003: connection ownership + close ----------------------------------------------
 
 
-def test_close_commits_injected_connection_but_does_not_close_it() -> None:
-    conn = sqlite3.connect(":memory:")
+def test_close_commits_injected_connection_but_does_not_close_it(conn: sqlite3.Connection) -> None:
     sink = SQLiteSink("ignored", connection=conn)
     sink.emit([make_event(log_id="x")])
     sink.close()
