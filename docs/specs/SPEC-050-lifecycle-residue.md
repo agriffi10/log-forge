@@ -71,6 +71,11 @@ spec stands alone; the identifiers are there so a reader can find the original e
 line and returns — before `_release_waiters()`, whose own docstring says it exists for this
 caller.
 
+**Three arrival orderings, and the audit's prescribed remedy covered one.** A `flush()`'s marker
+can be queued when the sweep runs, held by the drain thread, or enqueued after the sweep has
+already run — and each needed its own answer. The first two shipped in successive attempts; the
+third was found by a reviewer on the release-notes session and closed in the same way.
+
 **The audit's prescribed remedy did not cover the audit's own probe, and the first attempt
 shipped it anyway.** Calling `_release_waiters()` there answers markers still *in* the queue.
 Which markers those are is a race the caller does not control: a `flush()` whose marker arrives
@@ -121,6 +126,12 @@ deleted; its sentinel half is unchanged and still asserted.
       marker rather than the queue, the flush is still answered — asserted separately, because the
       test written from the audit's probe passes with that half reverted.
 - [ ] A marker taken by `_final_drain` rather than by the loop is answered too.
+- [ ] A `flush()` whose marker is enqueued *after* the sweep has run is answered too: its post-put
+      re-check consults `_drain_settled`, which is the only flag the expiry branch sets. It
+      reports `abandoned` rather than `thread-died`, because the thread is alive.
+- [ ] That condition does not relabel a drain that genuinely died, which still reports
+      `thread-died` — asserted through the post-put branch, not the early liveness guard the
+      existing test returns at.
 - [ ] A marker taken *after* the sweep has already run answers itself: with `shutdown(timeout=0)`
       and the drain holding a marker it has not yet recorded, the `flush(timeout=None)` still
       returns `abandoned` rather than waiting on a drain that will never reach its own sweep.

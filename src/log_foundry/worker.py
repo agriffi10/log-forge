@@ -755,6 +755,17 @@ class Worker:
         ``put`` and the sweep's snapshot both take the queue's own mutex, so a marker either
         lands before the snapshot and is answered, or lands after it and finds the flag set.
 
+        **``_drain_settled`` is the third flag, and an expired ``shutdown()`` sets only that
+        one** (SPEC-050 FR-001). On that path the drain is still alive and still inside ``emit``,
+        so ``_drain_finished`` is clear and ``is_alive()`` is true — a marker landing after that
+        sweep found every existing condition false and waited on a drain the process had already
+        given up on. Measured: the flusher still waiting three seconds later, released only by
+        re-running the sweep by hand. ``timeout=None`` makes it permanent, and in an application
+        that is a non-daemon thread the interpreter joins at exit, so the process does not exit.
+        ``_drain_settled`` set with ``_drain_finished`` clear is *uniquely* that branch — every
+        other setter sets both — which is what lets this report ``"abandoned"`` rather than
+        ``"thread-died"`` for a thread that is demonstrably alive.
+
         Reporting is by the **marker**, never by the check alone. A drain that answered this
         marker and then exited has delivered, and saying otherwise would be a false failure —
         one ``swap_sink`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
@@ -767,9 +778,15 @@ class Worker:
         Returns:
           A :class:`FlushResult`, truthy once the worker has delivered them and otherwise
           falsy with a ``reason``: ``"timed-out"``, ``"retired"``, ``"thread-died"``,
-          ``"queue-full"``, or ``"abandoned"`` when the drain carrying those events gave up
-          after exhausting retries (SPEC-021 FR-001) — that last case used to return True, a
-          false success exactly where ``flush()`` matters most. **The inner call carries the
+          ``"queue-full"``, or ``"abandoned"``. That last one has **three** producers, not one:
+          the drain carrying those events gave up after exhausting retries (SPEC-021 FR-001,
+          the original — and it used to return True, a false success exactly where ``flush()``
+          matters most); an expiring ``shutdown()`` answered the marker pessimistically rather
+          than leave it on a drain it had abandoned (SPEC-050 FR-001); or this call's own marker
+          arrived after that had already happened. Only the first says the drain adjudicated the
+          batch, so ``"abandoned"`` means "not confirmed delivered", never "confirmed lost".
+          ``ok=True`` is unaffected and still means the sink took them: ``delivered`` starts
+          ``False`` and is written only by the drain, only after its emit returned. **The inner call carries the
           type too, not only the public ``log_foundry.flush``** (SPEC-034 FR-007 AC-1b): the
           five outcomes are distinguishable only here, so a public wrapper over a bare ``bool``
           could name none of them without guessing.
@@ -789,12 +806,14 @@ class Worker:
             self._queue.put(marker, timeout=timeout)
         except queue.Full:
             return FlushResult(ok=False, reason="queue-full")
-        if self._drain_finished.is_set() or not self._thread.is_alive():
+        given_up = self._drain_settled.is_set() and not self._drain_finished.is_set()
+        if self._drain_finished.is_set() or given_up or not self._thread.is_alive():
             answered = marker.event.is_set()
-            delivered = answered and marker.delivered
-            if delivered:
+            if answered and marker.delivered:
                 return FlushResult(ok=True)
-            return FlushResult(ok=False, reason="abandoned" if answered else "thread-died")
+            if answered or given_up:
+                return FlushResult(ok=False, reason="abandoned")
+            return FlushResult(ok=False, reason="thread-died")
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
             return FlushResult(ok=False, reason="timed-out")
@@ -1403,7 +1422,7 @@ class Worker:
             self._taken_markers = [m for m in self._taken_markers if m is not marker]
 
     def _release_waiters(self) -> None:
-        """Answers every outstanding ``flush()`` marker, so no caller waits out its timeout.
+        """Answers the ``flush()`` markers outstanding at the moment it runs.
 
         **Two populations, and the second is not optional** (SPEC-050 FR-001). A marker still in
         the queue is read from it; a marker the drain thread has already **taken** is read from
@@ -1430,9 +1449,12 @@ class Worker:
         than too long. The marker keeps its pessimistic ``delivered``, which is the honest
         answer: the drain that would have carried it is gone.
 
-        One residual race, stated rather than papered over: a ``flush()`` that passed its
-        liveness check microseconds before *this* sweep can still enqueue a marker after it,
-        and that one waits out its timeout — then returns False, which is correct either way.
+        **It answers a snapshot, so "every" would be the wrong word** and a caller arriving
+        after it is not covered here. A ``flush()`` that passed its guards microseconds before
+        this sweep can still enqueue its marker after it. That caller is answered by
+        :meth:`flush`'s own post-put re-check instead, which consults the same
+        ``_drain_settled`` this path sets — before SPEC-050 FR-001 added it there, such a caller
+        waited out its timeout, and a ``timeout=None`` one waited forever.
         A marker left queued is also still counted by ``health().queued``, which describes
         submissions; removing it would mean deleting a specific item, which ``Queue`` has no
         public way to do, and the read above is the access ``architecture.md`` §13 sanctions.

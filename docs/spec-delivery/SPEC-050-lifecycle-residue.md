@@ -10,7 +10,9 @@ it against `eb80099` before the spec was written and re-run against the fix.
   after answering, drops them for a forked child, and self-answers one taken after the sweep has
   already run. The first attempt shipped only the first of those — the audit's prescribed remedy,
   which does not cover the audit's own probe — and a peer session reproduced R3 verbatim against
-  it. The pessimistic-verdict population is correspondingly wider, recorded in `docs/decisions.md`
+  it; a third ordering — a marker enqueued *after* the sweep — was then found by a reviewer and
+  closed by having `flush()`'s post-put re-check consult `_drain_settled`, the only flag the
+  expiry branch sets. The pessimistic-verdict population is correspondingly wider, recorded in `docs/decisions.md`
   as a narrowing of "`flush()` answers from the drain that carried the events"; the converse is
   untouched, since `delivered` is only ever written by the owning drain. A
   `flush(timeout=None)` parked behind a stuck sink used to wait forever on a drain that call had

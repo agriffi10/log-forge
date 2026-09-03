@@ -2462,6 +2462,111 @@ def test_the_taken_marker_record_does_not_grow(capsys) -> None:
     assert worker._taken_markers == [], "and the final drain releases the ones it took"
 
 
+def test_a_flush_that_arrives_after_the_sweep_is_not_left_waiting(capsys) -> None:
+    """FR-001. The third arrival ordering: the marker is queued after the sweep has run.
+
+    `flush()`'s post-put re-check tested `_drain_finished` and `is_alive()`. On the expiry path
+    neither holds — the drain is alive and still inside `emit` — so a marker landing after that
+    sweep found every condition false and waited on a drain the process had already given up on.
+    Measured: still waiting three seconds later, and released only by re-running the sweep by
+    hand, which is also the control showing the block is the arrival order and nothing else.
+    With `timeout=None` it is permanent, and on a non-daemon thread the interpreter joins it at
+    exit, so the process does not exit either.
+
+    `_drain_settled` set with `_drain_finished` clear is uniquely the expiry branch, which is why
+    the verdict can be `abandoned` for a thread that is demonstrably alive.
+    """
+    sink = BlockingSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit(_span("a"))
+    assert sink.in_emit.wait(5.0), "the premise: the drain is wedged inside emit"
+
+    at_put, release = threading.Event(), threading.Event()
+    real_put = worker._queue.put
+
+    def parked_put(item: object, block: bool = True, timeout: float | None = None) -> None:
+        """Holds this flush's marker until the shutdown has swept and given up."""
+        if isinstance(item, worker_mod._FlushMarker):
+            at_put.set()
+            release.wait(20)
+        real_put(item, block, timeout)
+
+    worker._queue.put = parked_put  # type: ignore[method-assign]
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
+    )
+    flusher.start()
+    assert at_put.wait(5.0), "the premise: the flusher is past its guards and about to put"
+
+    worker.shutdown(timeout=0.3)
+    assert worker._thread.is_alive() and not worker._drain_finished.is_set(), (
+        "the premise: the expiry branch, where only _drain_settled is set"
+    )
+    release.set()
+    flusher.join(timeout=3.0)
+    still_waiting = flusher.is_alive()
+    sink.release.set()
+    worker._thread.join(timeout=5)
+    flusher.join(timeout=5)
+    capsys.readouterr()
+
+    assert not still_waiting, "a marker queued after the sweep is answered by nobody"
+    assert verdict and verdict[0].reason == "abandoned", (
+        "the drain was given up on, not dead — 'thread-died' would be false of a live thread"
+    )
+
+
+def test_a_flush_arriving_after_a_dead_drain_still_reports_thread_died(capsys) -> None:
+    """FR-001. The new condition must not relabel the outcome it was not written for.
+
+    `given_up` is `_drain_settled` **and not** `_drain_finished`, which is uniquely the expiry
+    branch — every other setter sets both. Dropping the second half survives the rest of the
+    suite, because the sibling test returns at `flush()`'s *early* liveness guard and never
+    reaches the post-put re-check at all. This one does reach it: the marker is held at the put
+    until the drain has died, so `is_alive()` is already false when it lands.
+
+    A drain that died is `"thread-died"` and a drain that was given up on is `"abandoned"`. Both
+    are falsy and a caller branching on `bool()` cannot tell, which is exactly why the reason has
+    to stay truthful for the reader who looks.
+    """
+    sink = TerminalSink(SystemExit(1))
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+
+    at_put, release = threading.Event(), threading.Event()
+    real_put = worker._queue.put
+
+    def parked_put(item: object, block: bool = True, timeout: float | None = None) -> None:
+        """Holds this flush's marker until the drain thread has terminated."""
+        if isinstance(item, worker_mod._FlushMarker):
+            at_put.set()
+            release.wait(20)
+        real_put(item, block, timeout)
+
+    worker._queue.put = parked_put  # type: ignore[method-assign]
+    verdict: list[FlushResult] = []
+    flusher = threading.Thread(
+        target=lambda: verdict.append(worker.flush(timeout=5.0)), daemon=True
+    )
+    flusher.start()
+    assert at_put.wait(5.0), "the premise: the flusher is past its guards"
+
+    worker.submit(_span("a"))  # kills the drain through TerminalSink
+    assert _wait_until(lambda: not worker._thread.is_alive()), "the premise: the drain died"
+    assert worker._drain_finished.is_set() and worker._drain_settled.is_set(), (
+        "the premise: a terminal exit sets both flags, unlike the expiry branch"
+    )
+    release.set()
+    flusher.join(timeout=5.0)
+    capsys.readouterr()
+
+    assert verdict and verdict[0].reason == "thread-died", (
+        "a drain that died is not a drain that was given up on"
+    )
+    worker.shutdown(timeout=5.0)
+    capsys.readouterr()
+
+
 def test_a_marker_taken_after_the_drain_settled_answers_itself(capsys) -> None:
     """FR-001. The last gap: between `Queue.get` returning a marker and it being recorded.
 
