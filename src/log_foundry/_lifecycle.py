@@ -128,7 +128,9 @@ class _Lifecycle:
     Marking is not narrowed: :func:`_inheritance_roots` reads the slot directly, so the walk
     still reaches an inherited superseded sink and it is still refused (SPEC-042 FR-001) — on the
     stamp ``configure()`` left, since :func:`_mark_inherited` ``setdefault``s and leaves an
-    existing record alone rather than writing ``_FOREIGN`` over it.
+    existing record alone rather than writing ``_FOREIGN`` over it — or on ``_FOREIGN``, for a
+    sink held inside it that the bounded stamp walk never reached, which is the case the root
+    exists for.
     """
 
     def __init__(self) -> None:
@@ -613,7 +615,9 @@ def _bounded_children(container: object) -> list[object]:
 
     Raises:
       None. A container that raises while being read contributes nothing, as it does in
-        ``_fork``; what it holds is then unmarked, therefore unrecorded, therefore refused.
+        ``_fork``; what it holds is then unmarked. It keeps whatever ``stamp`` recorded, and
+        where nothing did it is unrecorded — refused through a recorded wrapper, and §13 item
+        7's residual otherwise, since absorbing here leaves :data:`_marking_failed` clear.
     """
     try:
         if isinstance(container, dict):
@@ -626,7 +630,7 @@ def _bounded_children(container: object) -> list[object]:
         _diag.absorbed(
             "reading a container while marking a forked child's sinks",
             exc,
-            "what it holds is not marked, so this child will refuse to close it",
+            "what it holds is not marked, so this child has no record of it",
         )
         return []
 
@@ -771,7 +775,7 @@ def _inheritance_roots() -> list[object]:
 
 
 def _mark_inherited() -> None:
-    """Makes every sink this child inherited unclaimable, before anything can claim it (FR-001).
+    """Records the sinks this child inherited, before any handler can reach a release path.
 
     Registered with ``_fork`` and run in the child, which is why it may take the library's locks:
     they were re-initialised moments earlier. It must run **before** any handler that could reach
@@ -871,8 +875,9 @@ def reclaim(sink: object) -> None:
     read — the parent's own stamp, or the ``_FOREIGN`` :func:`_mark_inherited` ``setdefault``s
     where the parent recorded nothing — so a ``setdefault`` here would leave a sink that provably
     holds its own descriptor refused forever. Where the walk did *not* reach it the record is
-    empty and this write is the one that fills it, which is why the loop calling it sits outside
-    that walk's ``try`` and runs however the walk ended.
+    empty and this write is the one that fills it — a walk can miss a sink with no exception at
+    all, and the loop calling this sits outside that walk's ``try`` so it also runs when the walk
+    ended badly.
 
     **It re-stamps the sink that re-acquired, and nothing above it** (FR-005 AC-8). A child
     inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement

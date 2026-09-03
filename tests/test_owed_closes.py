@@ -545,8 +545,8 @@ def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
     process owned and asserted `False`, which is true whichever end the reader picks and true
     with the reader deleted outright — measured, both mutants passed the whole suite.
 
-    So: the second sink is stamped as another process's, the way a `fork` marks everything
-    inherited. Reading `True` then requires the reader to consult the record at all — the
+    So: the second sink is stamped as another process's, the way a `fork` leaves what it
+    inherited recorded under a pid this process cannot match. Reading `True` then requires the reader to consult the record at all — the
     configured sink is the *first* one and is this process's — and to take the **last** entry.
     """
     first, second = CountingSink("A"), CountingSink("B")

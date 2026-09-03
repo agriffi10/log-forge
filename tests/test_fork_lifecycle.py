@@ -1252,8 +1252,8 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
 
 
 def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
-    """SPEC-042 FR-001 AC-6 requires a sink with no record at all be refused, and the marking
-    that gives "no record" that terminal state runs before any other handler — registration order.
+    """SPEC-042 FR-001 puts a record naming another process on what the child's walk reaches,
+    and it must do that before any other handler runs — handler order is registration order.
 
     The two registrations used to sit in different modules — `_mark_inherited` at the foot of
     `_lifecycle`, the rebuild at the foot of `decorator` — and the order held only because
