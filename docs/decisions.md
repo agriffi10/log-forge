@@ -9,7 +9,7 @@ Rules that keep this file useful:
 - **Entry first, line second.** Write the full entry here *before* adding the one-line digest to
   `CLAUDE.md`. The digest line must never be the only home of a fact — a digest that outgrows its
   register inverts the whole model, which is exactly what this repo did until 2026-09-02: it had no
-  register, so `CLAUDE.md` was the register, and it reached 89,340 bytes.
+  register, so `CLAUDE.md` was the register, and it reached 89,340 bytes at `e60b60d`.
 - **One `###` heading per entry**, listed in the Contents below, and grouped by AREA rather than by
   spec number. Ordering by spec turns a register into a changelog, and a shape that reads as
   disposable gets treated as disposable.

@@ -1,0 +1,39 @@
+@@@ expect exit=1
+@@@ match carries a dated measurement with no commit
+@@@ match pyproject.toml:2
+@@@ file pyproject.toml
+[tool.ruff]
+# Measured 2026-09-05: 86 lines exceed the limit.
+line-length = 100
+# Re-measure the figure above at `3c973b9`.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
+

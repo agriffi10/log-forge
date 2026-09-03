@@ -1,0 +1,40 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/worker.py
+"""Worker.
+
+Measured 2026-09-05: 1,680 lines.
+"""
+
+@@@ file tests/test_worker.py
+"""Measured 2026-09-05: 1,680 lines."""
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
+

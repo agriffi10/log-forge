@@ -244,7 +244,9 @@ it is not a per-spec changelog, and `## Specs` is not one either. Both were exac
 `561a9f6` cut this file to a digest over `@docs/decisions.md` (measure it across that commit
 rather than trusting a number here). The rule had been stated here and in `@docs/process.md` §5
 the whole time and was lost anyway, roughly forty times running. **`scripts/docs-lint.sh` now enforces it — run it locally before every push; it is deliberately not a CI job** — the byte budget, the digest
-line cap, and an entry in the register behind every digest line. A threshold can be invalidated by its own **success** — after a structural cut, re-derive it rather than re-checking it, since a cap that can no longer fire is still advertised as a fence, and one pinned at the measurement leaves the next decision nothing to spend. The delivery cap is a **ratchet**: when it fires, cut
+line cap, an entry in the register behind every digest line, and **an anchor behind a dated
+measurement** — one idiom of it, in the docs and source files the script names — since a date says
+when someone looked and not at what. A threshold can be invalidated by its own **success** — after a structural cut, re-derive it rather than re-checking it, since a cap that can no longer fire is still advertised as a fence, and one pinned at the measurement leaves the next decision nothing to spend. The delivery cap is a **ratchet**: when it fires, cut
 and re-ratchet at the new measurement, never raise it to fit the edit in hand. The byte budget is
 deliberately **not** one — it carries headroom on purpose, because a budget pinned at the measurement
 makes the next spec to settle a decision pay for it by pruning another area's fences. The script says

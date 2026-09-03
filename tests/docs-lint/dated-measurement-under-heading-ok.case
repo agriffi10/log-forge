@@ -1,0 +1,37 @@
+@@@ expect exit=0
+@@@ file docs/architecture.md
+# Architecture
+
+## Measured 2026-09-05: two modules unsplit
+Both figures were taken at `3c973b9` and can be re-measured there.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
+

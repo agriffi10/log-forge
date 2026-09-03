@@ -22,7 +22,8 @@
 #   with its digest, an entry is unreachable from the Contents, a Contents row names one
 #   decision and links to another, an entry body opens with a bold label its own heading
 #   does not match, a Completed spec has no delivery doc, a delivery doc has become an
-#   essay, or a pointer out of CLAUDE.md goes nowhere.
+#   essay, a pointer out of CLAUDE.md goes nowhere, or a standing document dates a
+#   measurement without anchoring it to a commit.
 #
 # There is no WARN tier: `spec-lint.sh` owns the soft per-spec judgements, and every rule
 # here is a shape the layering depends on — a shape is either held or it isn't.
@@ -126,9 +127,11 @@ KEY_DECISIONS_MAX_BYTES=22000
 # section as it stood at e60b60d, which is frozen and can be re-measured by anyone who
 # wants to check the claim. A cap comment is read exactly when someone is about to
 # change what it counts, and process.md §5 forbids a standing rule citing a volatile
-# number for that reason: architecture.md §12 carries "Measured 2026-09-01: 1,398 and
-# 1,887 lines" and one of those files was 2,030 within a commit of it being written.
-# Dating the measurement did not save it — a dated number still reads as current.
+# number for that reason: the architecture.md §12 entry added by dcb07c3 justified
+# leaving two modules unsplit by citing their line counts and the date it measured them.
+# a58dfff, the very next commit, moved one of the two; by 3c973b9 both were wrong. Dating
+# the measurement did not save it — a dated number still reads as current. Check 9 below
+# is that lesson with a gate on it.
 DIGEST_MAX_BYTES=800
 
 # A delivery doc answers "what shipped and what changed"; the completion template aims
@@ -567,5 +570,185 @@ awk '
   [ -n "$p" ] || continue
   [ -e "$p" ] || printf 'FAIL  %s points at "%s", which does not exist.\n' "$CLAUDE" "$p" >> "$FAILS"
 done
+
+# ── 9. A dated measurement in the standing tier carries an anchor ──────────────
+#
+# process.md §5: "Standing rules never cite volatile numbers ... Dating the measurement
+# does not save it." That rule was stated, and violated in the tier it governs, at eight
+# sites at once — including process.md §5 itself, which carried the dated-measurement
+# example AND argued that the date was what made it safe. The architecture.md §12 entry
+# added by dcb07c3 was one line stale in dcb07c3 itself and outright wrong in a58dfff,
+# the very next commit.
+#
+# So this is the half of that rule a script can hold: a dated measurement must carry a
+# commit a reader can re-measure from. A date says WHEN someone looked. It does not say
+# AT WHAT, and a reader who does not check it against a calendar reads it as current.
+#
+# WHAT IT CATCHES, exactly: a bullet, paragraph or comment block in which "measured" or
+# "as of" is followed immediately by an ISO date, with no short SHA or version tag
+# anywhere in that same unit.
+#
+# THAT IS ONE SHAPE, NOT THE POPULATION, and the difference is worth stating plainly
+# because the next person to widen this will read it. Of the eight sites the commit that
+# added this check had to fix, exactly ONE matched — architecture.md §12. Both
+# pyproject.toml sites carried a bare count with no date at all; process.md §4 wrote the
+# date six words from the word; process.md §5 carried a byte pair with no date. So this
+# check does not close the defect class. It closes the sub-shape that DATING creates: a
+# number sitting beside a recent date, which is the form that reads as current and
+# therefore never gets re-checked. An undated number at least still looks like something
+# to verify.
+#
+# Narrow on purpose, and the narrowness is a false-negative choice, not a coverage claim.
+# A trigger wide enough to catch the other seven would have to fire on any number near
+# any date, which is ordinary prose in every one of these files — and a doc gate that
+# fires on ordinary prose is a doc gate that gets commented out. The rest stays with
+# process.md §5, to be caught by reading. If a future sweep finds a second idiom actually
+# in use, add it here and add a fixture for it; do not widen this into a number detector.
+#
+# THE ANCHOR IS SOUGHT OVER THE WHOLE UNIT, not the line, because the anchor and the
+# number routinely wrap apart. That is a deliberate false-NEGATIVE — an unrelated SHA
+# elsewhere in the same unit silences the check for it — and it is only tolerable while a
+# UNIT STAYS SHORT ENOUGH TO READ. So what ends a unit is load-bearing, not incidental:
+# a blank line, a fence, a list marker, a markdown heading, and, outside markdown, ANY
+# LINE THAT IS NOT A COMMENT. That last one was missing when this check first covered
+# .toml/.sh/.yml, and the cost was measured before it was added: sweeping an unanchored
+# measurement through every insertion position of this repo left 27-41% of positions in
+# those files silent, against 8-16% in its markdown, because a comment block ran on
+# across intervening CODE until the next blank line. One SHA in a comment silenced a
+# 15-line array 13 lines below it.
+#
+# What remains unbounded: a run of ordinary non-comment lines is one unit. In markdown
+# that is a paragraph, which is the reading-distance case this rule was designed around.
+# In a source file it is code — and the tempting sentence, that a dated measurement is
+# not written in code, is FALSE and was written here before it was checked. An INLINE
+# comment is not a comment LINE: `fetch-depth: 0  # Measured 2026-09-05: 42 s` joins the
+# surrounding code run, and any SHA in that run silences it. Under .github that is not a
+# corner case but the norm, since every `uses:` pins its action by SHA — measured on
+# release.yml, an inline measurement two lines below a pin is silent while the same text
+# on its own comment line fires.
+#
+# Not closed here, because closing it means telling a comment from a `#` inside a string
+# in four languages. The remedy is one sentence to an author instead: WRITE A MEASUREMENT
+# ON ITS OWN COMMENT LINE, where the bound applies. An unbalanced fence is the other
+# knowing escape — a lone ``` at column 0, in any file type, silences everything below
+# it to EOF, and nothing here notices.
+#
+# ── the population ──
+#
+# NOT MARKDOWN ONLY. §5s neighbouring rule says exactly why: "the pointers that rot
+# unseen are in SOURCE files — .py docstrings, .toml comments, .yml steps. A markdown-only
+# sweep reports the tree clean." Two of the eight sites this check was written for were
+# pyproject.toml comments, and a third was a docstring in scripts/. A gate blind to the
+# files where a quarter of the known instances lived is half a gate.
+#
+#   IN:  every *.md at the root (CLAUDE.md, README.md, SECURITY.md and any that join
+#        them); docs/**.md except the frozen-record trees below; pyproject.toml;
+#        scripts/**; every *.yml and *.yaml under .github, which is workflows AND the
+#        composite actions and dependabot.yml beside them — those pin third-party code
+#        by SHA and carry the same kind of comment. Both spellings of the extension,
+#        because a glob that knows only one silently drops the other.
+#   OUT: docs/audits, docs/specs, docs/spec-delivery, docs/release-notes, docs/templates
+#        — FROZEN RECORDS, not standing rules. An audit dated 2026-08-07 is a report of
+#        what was true then, and demanding an anchor from it demands an anchor from
+#        history.
+#   OUT: src/ — deliberately, and not because it is clean. Its docstrings anchor to SPEC
+#        numbers by convention rather than to commits, which is a different anchoring
+#        scheme; whether a spec number is an acceptable anchor is a decision nobody has
+#        taken, and this check must not take it by accident. Recorded, not chased.
+#   OUT: tests/ — tests/docs-lint/*.case carry the WRONG form on purpose. A gate that
+#        fails on its own fixture corpus is a gate that gets switched off within a week.
+#
+# The docs half is derived BY EXCLUSION so a standing doc written tomorrow, in a
+# directory that does not exist yet, is covered without anyone remembering to list it.
+{
+  for f in *.md; do [ -f "$f" ] && printf '%s\n' "$f"; done
+  [ -f pyproject.toml ] && printf 'pyproject.toml\n'
+  if [ -d docs ];    then find docs -type f -name '*.md' -print | sort; fi
+  if [ -d scripts ]; then find scripts -type f -print | sort; fi
+  if [ -d .github ]; then find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print | sort; fi
+} | while IFS= read -r f; do
+    case "$f" in
+      docs/audits/*|docs/specs/*|docs/spec-delivery/*|docs/release-notes/*|docs/templates/*) continue ;;
+    esac
+    [ -f "$f" ] || continue
+    # `#` opens a heading in markdown and a COMMENT in everything else, and the two want
+    # opposite unit rules: a heading is its own unit, while consecutive comment lines are
+    # one block that an anchor may wrap into. Getting this wrong makes every comment line
+    # its own unit, so an anchor on the next line stops counting — which is precisely how
+    # the pyproject.toml sites are written.
+    md=0
+    case "$f" in *.md) md=1 ;; esac
+    awk -v file="$f" -v md="$md" '
+      # An anchor is a short SHA, and ONLY a short SHA. Two other forms were tried and
+      # rejected on evidence rather than taste. A version TAG names a tree as exactly as
+      # a SHA does, so it looked like an obvious second form — but version numbers appear
+      # in these files for a dozen unrelated reasons, and accepting `vN.N.N` silenced a
+      # 37-line region of pyproject.toml on the strength of two release numbers in a
+      # classifiers block that anchor nothing. A 7-hex token in prose is almost always an
+      # anchor; a version number almost never is. A PR number was never a candidate: it
+      # names a change, not a tree, and cannot be re-measured without the network.
+      #
+      # A short SHA is a hex run of 7+ starting and ending at a non-alphanumeric
+      # boundary, containing at least one DIGIT. The digit is what keeps English out:
+      # "defaced" is seven hex characters and a word, and silencing this check on it
+      # would be a false negative dressed as a feature. A real short SHA without a
+      # digit is possible and vanishingly rare (about one in 700). The converse is
+      # accepted knowingly: a bare seven-digit decimal is all hex characters and would
+      # silence the check too — and the likeliest such number is THE MEASURED VALUE
+      # ITSELF, not some unrelated token elsewhere in the unit, so
+      # "Measured 2026-09-05: 1234567 events" silences its own violation while the same
+      # figure written 1,234,567 does not. Requiring a LETTER as well would close it and
+      # would reject the roughly one short SHA in 25 that is all digits, which is the
+      # worse trade: that failure is loud and fixed by pasting one more character, and
+      # this one is silent.
+      function has_anchor(s,   i, n, c, run, digits, dirty) {
+        n = length(s); run = 0; digits = 0; dirty = 0
+        for (i = 1; i <= n + 1; i++) {
+          c = (i <= n) ? substr(s, i, 1) : " "
+          if (c ~ /^[0-9a-f]$/)        { run++; if (c ~ /^[0-9]$/) digits++ }
+          else if (c ~ /^[0-9A-Za-z]$/) { dirty = 1; run = 0; digits = 0 }
+          else {
+            if (!dirty && run >= 7 && digits > 0) return 1
+            run = 0; digits = 0; dirty = 0
+          }
+        }
+        return 0
+      }
+      # The separators are the ones this repo actually writes: "Measured 2026-09-01",
+      # "Measured, on `f17edd4`", "measured at e565e22". Leaving `at` and the comma out
+      # made the two likeliest honest spellings escape while the rule was being followed.
+      function dated(s) {
+        return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+      }
+      function flush(   where, what) {
+        if (unit != "" && dated(unit) && !has_anchor(unit)) {
+          where = hitline ? hitline : ustart
+          what  = hitline ? hittext : unit
+          printf "FAIL  %s:%d carries a dated measurement with no commit to re-measure from.\n      %s\n      A date says WHEN someone looked, not at what: a dated number still reads as\n      current to anyone not checking it against a calendar. Either drop the number and\n      state the principle, or anchor the evidence to a short commit SHA in the same\n      bullet, paragraph or comment block. A version tag is not accepted; the comment\n      beside this check says why. Quoting the wrong form on purpose? Put it in a fenced\n      block, which this check skips. process.md 5, never cite volatile numbers.\n",
+                 file, where, substr(what, 1, 90)
+        }
+        unit = ""; hitline = 0; ukind = ""
+      }
+      # In a non-markdown file, is this line a comment or is it not? A unit may not span
+      # the two. `kind` reads $0 directly, so it is only meaningful inside a line rule.
+      function kind() { return ($0 ~ /^[ \t]*#/) ? "c" : "p" }
+      function take(   s) {
+        if (unit == "") { unit = $0; ustart = FNR; ukind = kind() }
+        else { s = $0; sub(/^[ \t]+/, "", s); unit = unit " " s }
+        if (!hitline && dated($0)) { hitline = FNR; hittext = $0 }
+      }
+      FNR == 1 { flush(); fence = 0 }
+      { sub(/\r$/, "") }
+      /^[ \t]*(```|~~~)/                { flush(); fence = !fence; next }
+      fence                             { next }
+      /^[ \t]*$/                        { flush(); next }
+      md && /^[ \t]*#/                  { flush(); take(); next }
+      /^[ \t]*([-*+]|[0-9]+[.)])[ \t]/  { flush(); take(); next }
+      !md && unit != "" && kind() != ukind { flush() }
+                                        { take() }
+      END { flush() }
+    ' "$f" >> "$FAILS"
+  done
+
 
 report

@@ -1,0 +1,37 @@
+@@@ expect exit=1
+@@@ match carries a dated measurement with no commit
+@@@ file docs/architecture.md
+# Architecture
+
+Measured 2026-09-01: 41 sink tests, one of them `test_sha256deadbe1`.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
+

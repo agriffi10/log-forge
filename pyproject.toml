@@ -127,12 +127,13 @@ version = "0.0.0"
 pytest = "^9.0"
 pytest-asyncio = "^1.4.0"        # for testing async @trace (guide Phase 8)
 pytest-cov = "^7.1.0"
-# The suite is sleep-bound, not CPU-bound: 1,871 tests spend ~116 s of wall clock at 7%
+# The suite is sleep-bound, not CPU-bound: it spends most of its wall clock at single-digit
 # CPU, because the bounds this library promises (a 30 s shutdown budget, a backoff, a
 # wedged drain) are proved by waiting for them. Two tests block 30 s each. Distributing
-# across processes therefore buys almost the whole wall clock back — measured 125.9 s ->
-# 34.8 s at `-n 12 --dist worksteal` — where caching the dependency install could only ever
-# save the 18 s that install takes.
+# across processes therefore buys almost the whole wall clock back — measured at `e565e22`
+# as 125.9 s -> 34.8 s at `-n 12 --dist worksteal`, where caching the dependency install
+# could only ever save the 18 s that install takes. The test count that stood here is gone:
+# it moved with every spec, and the argument never rested on it.
 pytest-xdist = "^3.8"
 # Bounded to a minor, not left open. Ruff's DEFAULT rule set is not stable across minors —
 # 0.16.0 widened it from 59 rules to 413 — so an open constraint lets a release change what
@@ -230,8 +231,11 @@ select = [
     "F",                    # pyflakes
     "E4", "E7", "E9",       # pycodestyle errors. NOT E5: `line-length` above is advisory
                             # today (it feeds `ruff format`, which this repo does not run) and
-                            # 52 lines in src+tests exceed it. Enforcing it is 52 reflows and
-                            # its own decision.
+                            # enough lines in src+tests exceed it that enforcing it is a reflow
+                            # sweep, which is its own decision. No count here on purpose: the one
+                            # this comment carried was 52, and `3c973b9` measured 86. Get the
+                            # current cost from
+                            # `ruff check --select E5 --statistics src tests` before deciding.
     "W",
     "I",                    # import sorting
     "B",                    # bugbear
