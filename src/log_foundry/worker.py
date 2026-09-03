@@ -290,10 +290,11 @@ class Worker:
     the shape ``_fork._SKIP_ATTRIBUTE`` describes: bookkeeping that pins objects is not live state
     to repair. Without the opt-out the walk reaches a superseded sink, replaces its locks — merely
     wasteful — and runs its fork hooks, which is not: ``_lifecycle.reclaim`` then overwrites the
-    ``_FOREIGN`` stamp ``_mark_inherited`` set, leaving a child able to release a transport it
-    never acquired. Nothing is lost by skipping it, for the reason ``_lifecycle._owned``'s entry
-    gives: a sink that is still *live* is reached through ``self.sink`` and the config, neither of
-    which is opted out.
+    foreign-pid record the child holds for it — the parent's own stamp, or the ``_FOREIGN``
+    ``_mark_inherited`` ``setdefault``s where the parent recorded nothing — leaving a child able
+    to release a transport it never acquired. Nothing is lost by skipping it, for the reason
+    ``_lifecycle._owned``'s entry gives: a sink that is still *live* is reached through
+    ``self.sink`` and the config, neither of which is opted out.
     """
 
     def __init__(

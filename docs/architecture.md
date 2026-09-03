@@ -576,10 +576,10 @@ decorated call ends
   it inherited and closes the one it built itself.
 
   **Unrecorded has to be unclaimable, not merely unreleasable**, which is why the child marks
-  what it inherited *before* any handler runs. Write-once alone defends only a record that
-  already exists, so where the parent's walk recorded nothing a child could `configure()` its
-  way into genuine ownership and destroy the transport legitimately — measured, through a
-  third-party wrapper the stamp walk may not descend into.
+  what it inherited and the parent never recorded, *before* any handler runs. Write-once alone
+  defends only a record that already exists, so where the parent's walk recorded nothing a child
+  could `configure()` its way into genuine ownership and destroy the transport legitimately —
+  measured, through a third-party wrapper the stamp walk may not descend into.
 
   The deployment advice survives as the **recommendation** rather than as an "or else": build a
   connection-holding sink in the worker process. Call `configure()` from gunicorn's `post_fork`
@@ -1276,8 +1276,8 @@ and a third copy is a fork with no merge.
   cannot decide is listed here** (SPEC-042). The record is stamped when the library is handed a
   sink — `configure(sink=…)` and `_ensure_sink()`'s lazy default, over the whole reachable sink
   graph — and every close the library performs consults it. A child marks everything it
-  inherited before any fork handler runs, so "no record" is unclaimable rather than merely
-  unreleasable. Eight things it does **not** settle:
+  inherited that the parent never recorded, before any fork handler runs, so "no record" is
+  unclaimable rather than merely unreleasable. Eight things it does **not** settle:
 
   1. **A sink the parent held only in application state.** Build a connection sink at import in
      a gunicorn master, never hand it to the library, and let the child's `post_fork` call

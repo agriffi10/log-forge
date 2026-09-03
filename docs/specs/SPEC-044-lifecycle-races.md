@@ -216,7 +216,8 @@ slot is an attribute of `_state`, so the module-level declaration never reaches 
 The declaration therefore has to sit where the walk will read it — on the holder of the slot. The
 module-level `_FORK_SKIP = ("_owned",)` stays exactly as it is; this adds a second declaration
 rather than moving the first. Marking is unaffected: `_inheritance_roots` reads the slot directly,
-so an inherited superseded sink is still marked foreign and still refused.
+so the walk still reaches an inherited superseded sink and it is still refused — on the stamp
+`configure()` left, since `_mark_inherited` `setdefault`s rather than overwriting it.
 
 #### Acceptance Criteria:
 
