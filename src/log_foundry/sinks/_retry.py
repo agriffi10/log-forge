@@ -111,3 +111,60 @@ def usable_timeout(value: float, default: float) -> float:
       None.
     """
     return value if 0 < value < float("inf") else default
+
+
+def require_timeout(value: float, name: str, owner: str) -> float:
+    """Returns a timeout that bounds something, or raises (SPEC-049 FR-001).
+
+    **The raising sibling of :func:`usable_timeout`, and the discriminator between them is one
+    rule.** The library *floors* a value that works today and *refuses* one that is already
+    broken; a newly added argument is refused too, having no working configuration to protect.
+    So ``KafkaSink(flush_timeout=-1)`` and ``NATSSink(publish_timeout=-1)`` still fall back to
+    their module defaults through ``usable_timeout`` — those configurations deliver events — while
+    ``HTTPSink(timeout=-1)``, which raised an uncounted ``ValueError`` out of every batch for the
+    life of the process, is refused here. Two functions, one rule, sorted by whether the caller
+    has something to lose.
+
+    The test is ``not (0 < value < inf)``, identical to ``usable_timeout``'s and for its reason:
+    ``NaN`` compares ``False`` to everything, so the obvious pair of comparisons lets it through.
+
+    Args:
+      value: The caller's timeout.
+      name: The argument's name, for the message.
+      owner: The class or function refusing it, for the message.
+
+    Returns:
+      The value unchanged, when it bounds something.
+
+    Raises:
+      ValueError: When the value is zero, negative, infinite or ``NaN``.
+    """
+    if not 0 < value < float("inf"):
+        raise ValueError(
+            f"{owner} {name} must be a positive, finite number of seconds, not {value!r}"
+        )
+    return value
+
+
+def require_positive(value: int, name: str, owner: str) -> int:
+    """Returns a count that can do work, or raises (SPEC-049 FR-002).
+
+    :func:`require_timeout`'s rule applied to a count rather than a duration: refused because a
+    non-positive chunk size is already broken, not merely odd. ``ClickHouseSink(chunk_size=-5)``
+    made the chunker yield nothing, so ``emit`` returned having inserted no rows with ``losses()``
+    at zero — silent total loss — and ``chunk_size=0`` raised out of ``range()`` on every batch.
+
+    Args:
+      value: The caller's count.
+      name: The argument's name, for the message.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The value unchanged, when it is positive.
+
+    Raises:
+      ValueError: When the value is zero or negative.
+    """
+    if value <= 0:
+        raise ValueError(f"{owner} {name} must be a positive integer, not {value!r}")
+    return value

@@ -11,9 +11,10 @@ from base64 import b64encode
 from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypedDict
+from urllib.parse import urlparse
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import clamp_server_delay, wait
+from log_foundry.sinks._retry import clamp_server_delay, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = [
@@ -245,6 +246,89 @@ class HTTPKwargs(HTTPPlatformKwargs, total=False):
     body_format: str
 
 
+_ALLOWED_SCHEMES = ("http", "https")
+
+_CRLF = ("\r", "\n")
+
+
+def _valid_url(url: str, owner: str) -> str:
+    """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
+
+    A scheme ``urllib`` will open but this sink cannot use is a configuration error that surfaced
+    at the first emit and never stopped: ``file:///etc/passwd`` raised a raw ``TypeError`` out of
+    every batch, and ``ftp://`` burned the whole retry budget on each one. Checked on the URL
+    :class:`HTTPSink` receives, which is the URL every subclass has finished building, so no
+    subclass can smuggle one past.
+
+    Args:
+      url: The endpoint as constructed.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The URL unchanged.
+
+    Raises:
+      ValueError: If the scheme is not ``http`` or ``https``.
+    """
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"{owner} url must use http or https, not {scheme or 'no'} scheme: {url!r}"
+        )
+    return url
+
+
+def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
+    """Returns headers that cannot inject a second header, or raises (SPEC-049 FR-001).
+
+    A ``CR`` or ``LF`` in a name or a value makes ``http.client`` raise from inside ``emit``, on
+    every batch, uncounted. Rejecting it here also means the sink cannot be used to smuggle a
+    header a caller did not intend, which is why the check covers names as well as values.
+
+    Args:
+      headers: The caller's headers.
+      owner: The class refusing them, for the message.
+
+    Returns:
+      The headers unchanged.
+
+    Raises:
+      ValueError: If any name or value contains ``CR`` or ``LF``.
+    """
+    for name, value in headers.items():
+        for text, part in ((name, "name"), (str(value), "value")):
+            if any(bad in text for bad in _CRLF):
+                raise ValueError(
+                    f"{owner} header {part} must not contain CR or LF: {name!r}"
+                )
+    return headers
+
+
+def _valid_auth(
+    auth: str | tuple[str, str] | None, owner: str
+) -> str | tuple[str, str] | None:
+    """Returns credentials that cannot inject a header, or raises (SPEC-049 FR-001).
+
+    Only the **bearer-token** form is checked, and the asymmetry is deliberate rather than an
+    oversight: a token is written into ``Authorization`` verbatim, so a ``CR`` in it is the same
+    injection :func:`_valid_headers` refuses, in the argument with the highest consequence. The
+    ``(user, password)`` form is base64-encoded before it reaches the header and cannot carry one.
+
+    Args:
+      auth: The bearer token, the user/password pair, or ``None``.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The credentials unchanged.
+
+    Raises:
+      ValueError: If a bearer token contains ``CR`` or ``LF``.
+    """
+    if isinstance(auth, str) and any(bad in auth for bad in _CRLF):
+        raise ValueError(f"{owner} auth token must not contain CR or LF")
+    return auth
+
+
 def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
     """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
 
@@ -384,12 +468,12 @@ class HTTPSink:
         Raises:
           None.
         """
-        self.url = url
+        self.url = _valid_url(url, type(self).__name__)
         self.method = method
-        self._headers = dict(headers) if headers else {}
-        self._auth = auth
+        self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
+        self._auth = _valid_auth(auth, type(self).__name__)
         self.body_format = body_format
-        self.timeout = timeout
+        self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip
         self.max_retries = max(max_retries, 0)
         self.max_retry_after = max_retry_after

@@ -975,3 +975,50 @@ def test_the_default_is_the_callers_not_a_constant_of_this_module() -> None:
     # hand one sink the other's fallback.
     assert usable_timeout(0, 10.0) == 10.0
     assert usable_timeout(0, 30.0) == 30.0
+
+
+# --- SPEC-049 FR-001: one rule, two functions, and which side each caller sits on -------------
+
+
+@pytest.mark.parametrize("bad", [-1.0, 0.0, float("nan"), float("inf")])
+def test_require_timeout_refuses_what_usable_timeout_floors(bad: float) -> None:
+    """The pair share a test and differ only in what they do with a failure.
+
+    `not (0 < value < inf)` rather than a pair of comparisons, for `usable_timeout`'s reason:
+    `NaN` compares False to everything, so the obvious form lets it through.
+    """
+    from log_foundry.sinks._retry import require_timeout, usable_timeout
+
+    assert usable_timeout(bad, 7.0) == 7.0, "the floor side substitutes"
+    with pytest.raises(ValueError, match="positive, finite"):
+        require_timeout(bad, "timeout", "OwnerSink")
+
+
+def test_require_timeout_passes_a_usable_value_through() -> None:
+    from log_foundry.sinks._retry import require_timeout
+
+    assert require_timeout(2.5, "timeout", "OwnerSink") == 2.5
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_require_positive_refuses_a_non_positive_count(bad: int) -> None:
+    from log_foundry.sinks._retry import require_positive
+
+    with pytest.raises(ValueError, match="positive integer"):
+        require_positive(bad, "chunk_size", "OwnerSink")
+
+
+def test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side() -> None:
+    """SPEC-049 Out of Scope, pinned against a later well-meaning "consistency" change.
+
+    `KafkaSink(flush_timeout=-1)` and `NATSSink(publish_timeout=-1)` fall back to their module
+    defaults and keep delivering. Under FR-001's rule — floor what works, refuse what is already
+    broken — they are on the floor side, and moving them would be a breaking change at 1.0 for a
+    caller whose configuration works. This spec adds refusals; it does not convert these.
+    """
+    from log_foundry.sinks._retry import usable_timeout
+    from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, _usable_timeout
+    from log_foundry.sinks.nats import DEFAULT_PUBLISH_TIMEOUT
+
+    assert _usable_timeout(-1) == DEFAULT_FLUSH_TIMEOUT
+    assert usable_timeout(-1, DEFAULT_PUBLISH_TIMEOUT) == DEFAULT_PUBLISH_TIMEOUT

@@ -771,3 +771,101 @@ def test_a_per_request_content_encoding_does_not_suppress_gzip() -> None:
     call = opener.calls[0]
     assert call["headers"]["content-encoding"] == "gzip", "the sink's own gzip still wins"
     assert gzip.decompress(call["body"])
+
+
+# --- SPEC-049 FR-001: the HTTP family refuses what it cannot use ------------------------------
+
+
+@pytest.mark.parametrize("bad", [-1, 0, float("nan"), float("inf")])
+def test_an_unusable_timeout_is_refused_at_construction(bad: float) -> None:
+    """It used to reach `urlopen` and raise a raw `ValueError` from inside `emit`, every batch.
+
+    Uncounted and forever: nothing but `health().failed_batches` moved, and the caller was
+    standing at `configure()` when the mistake was made and heard nothing about it.
+    """
+    with pytest.raises(ValueError, match="timeout"):
+        HTTPSink("http://x", timeout=bad)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X": "a\r\nInjected: 1"},
+        {"X\r\nInjected": "1"},
+        {"X": "a\nb"},
+        {"X": "a\rb"},
+        {"X\nY": "1"},
+    ],
+)
+def test_a_crlf_header_is_refused_at_construction(headers: dict) -> None:
+    """`http.client` raises on these from inside `emit`; refusing here also stops the injection."""
+    with pytest.raises(ValueError, match="CR or LF"):
+        HTTPSink("http://x", headers=headers)
+
+
+def test_a_crlf_bearer_token_is_refused() -> None:
+    """The token goes into `Authorization` verbatim, so it is the injection with the most at stake."""
+    with pytest.raises(ValueError, match="auth token"):
+        HTTPSink("http://x", auth="tok\r\nInjected: 1")
+
+
+def test_a_basic_auth_pair_containing_crlf_is_accepted() -> None:
+    """The asymmetry is deliberate, and pinned so it does not read as an oversight.
+
+    The `(user, password)` form is base64-encoded before it reaches the header, so a CR in it
+    cannot inject anything. Refusing it would be inventing a rule the wire does not need.
+    """
+    sink = HTTPSink("http://x", auth=("us\r\ner", "pa\nss"), opener=FakeOpener([FakeResponse(200)]))
+    sink.emit([{"a": 1}])
+    header = sink._opener.calls[0]["headers"]["authorization"]
+    assert header.startswith("Basic ") and "\r" not in header and "\n" not in header
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://h/x", "gopher://h", "x", ""])
+def test_a_non_http_url_is_refused_at_construction(url: str) -> None:
+    """`file://` raised a raw `TypeError` per batch; `ftp://` burned the whole retry budget."""
+    with pytest.raises(ValueError, match="http or https"):
+        HTTPSink(url)
+
+
+@pytest.mark.parametrize("url", ["http://h/x", "https://h/x", "HTTP://h/x"])
+def test_an_http_url_constructs(url: str) -> None:
+    assert HTTPSink(url).url == url
+
+
+def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
+    """SPEC-049 FR-001, named rather than floored — the roster test's own rule.
+
+    `test_public_surface.py` already derives this population transitively, because `OpenSearchSink`
+    inherits through `ElasticsearchSink` and is invisible to a direct `class X(HTTPSink)` scan. Its
+    docstring says why a floor is the wrong instrument: "A floor set below the real number lets
+    subclasses leave silently, which is the failure this whole roster exists to prevent." So this
+    names the seven and asserts the derivation still finds exactly them.
+    """
+    from test_public_surface import _http_sink_subclasses
+
+    derived = {f"{module}.{node.name}" for module, node in _http_sink_subclasses()}
+    assert derived == {
+        "datadog.DatadogSink",
+        "elasticsearch.ElasticsearchSink",
+        "elasticsearch.OpenSearchSink",
+        "honeycomb.HoneycombSink",
+        "loki.LokiSink",
+        "newrelic.NewRelicSink",
+        "splunk.SplunkHECSink",
+    }, f"the subclass population moved: {sorted(derived)}"
+
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+    from log_foundry.sinks.honeycomb import HoneycombSink
+    from log_foundry.sinks.loki import LokiSink
+    from log_foundry.sinks.splunk import SplunkHECSink
+
+    for build in (
+        lambda: ElasticsearchSink("http://h", index="i", timeout=-1),
+        lambda: OpenSearchSink("http://h", index="i", timeout=-1),
+        lambda: HoneycombSink("k", dataset="d", timeout=-1),
+        lambda: LokiSink("http://h", timeout=-1),
+        lambda: SplunkHECSink("http://h", token="t", timeout=-1),
+    ):
+        with pytest.raises(ValueError, match="timeout"):
+            build()
