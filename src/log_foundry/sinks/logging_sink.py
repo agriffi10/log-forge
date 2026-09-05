@@ -84,7 +84,11 @@ class LoggingSink:
           None.
 
         Raises:
-          Exception: Whatever the logger's handlers raise.
+          Exception: Only what a handler lets out of its own ``emit``. The stdlib handlers route
+            their failures to ``handleError``, which absorbs by default, so a ``StreamHandler`` on
+            a broken stream is invisible here and this returns normally; a custom handler that
+            raises out of ``emit``, or overrides ``handleError`` to re-raise, does propagate
+            (SPEC-049 FR-007).
         """
         for event in batch:
             self._logger.handle(self._to_record(event))

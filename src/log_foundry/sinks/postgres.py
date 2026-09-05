@@ -268,7 +268,7 @@ class PostgresSink:
         error — a constraint violation, a full disk — does not churn the connection. Both are
         probed by name because this sink accepts any ``psycopg``-shaped object it does not own.
 
-Both diagnostics here are **announced once per outage, not once per attempt**. Unthrottled
+        Both diagnostics here are **announced once per outage, not once per attempt**. Unthrottled
         they fire on every attempt of every batch, so a down server turned one stderr line into
         five per batch, indefinitely — a diagnostic that floods is one an operator stops reading,
         and the batch's own ``_diag.lost`` line already records the loss. The flag covers the

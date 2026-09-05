@@ -314,6 +314,11 @@ class SocketTransport:
         the oversized case first; this is the backstop for a path MTU smaller than the datagram
         limit, which no local check can know.
 
+        The line carries the attempts actually made, ``attempt + 1``, as ``HTTPSink._request``
+        already did (SPEC-049 FR-006): it used to write ``max_retries + 1`` unconditionally, so a
+        message abandoned after **one** send on a permanent errno was reported as four — a count an
+        operator would use to reach the wrong conclusion, and an invariant 11 defect.
+
         Args:
           message: The exact bytes to put on the wire.
 
@@ -340,7 +345,7 @@ class SocketTransport:
                 _diag.lost(
                     "message",
                     1,
-                    f"SocketTransport, {self._max_retries + 1} attempt(s), "
+                    f"SocketTransport, {attempt + 1} attempt(s), "
                     f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                 )
                 return False
