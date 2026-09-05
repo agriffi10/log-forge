@@ -355,7 +355,8 @@ than one per spec with a name negotiated across two drafts. The distinction they
 SPEC-026's test, *would one number hide which fix applies*: `orphan_lost` covers everything inside
 the orphan guard, including a failing `sink.emit`, so it climbing means **the destination or the
 data**; the in-span path cannot lose an event at `emit` (that is `failed_batches`), so `in_span_lost`
-climbing means **the data**, always. Different remediation, two fields.
+climbing means ~~**the data**, always~~ — corrected by SPEC-050 FR-003: the data, or no drain
+thread at all, told apart by the count. Different remediation, two fields.
 
 **The counters are the eleventh and twelfth `Health` fields**, not the tenth and eleventh an earlier
 draft assumed — SPEC-042 has since appended `inherited_sink`. Under SPEC-034's frozen dataclass

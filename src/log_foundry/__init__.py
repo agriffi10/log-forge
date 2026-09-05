@@ -87,8 +87,8 @@ def health() -> Health:
     an event that cannot be *built* never reaches a queue at all — so every other field here
     describes machinery those two losses never touched, and a process that only logs outside a
     span read all zeros over total loss until they existed. They stay separate because one can
-    mean the destination or the data and the other can only mean the data; their sum is a number
-    nobody can act on.
+    mean the destination or the data and the other never the destination — the data, or no drain
+    thread at all (SPEC-050 FR-003); their sum is a number nobody can act on.
 
     ``retired`` alone is not a fault — a process that shuts down and then stops logging is
     doing the right thing, which is why it is paired with the count rather than alerted on.

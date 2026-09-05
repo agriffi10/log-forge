@@ -1049,7 +1049,8 @@ They tell you different things, and they want different responses:
 
 `orphan_lost` and `in_span_lost` are deliberately two fields and their sum is deliberately not
 reported. They aggregate different failure populations — one can mean the destination *or* the
-data, the other can only mean the data — so a single number would hide which fix applies.
+data; the other never the destination — the data, or no drain thread at all (SPEC-050) — so a
+single number would hide which fix applies.
 
 `h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no worker
 exists yet, or when the configured sink reports nothing (`losses()` is optional, and a sink whose

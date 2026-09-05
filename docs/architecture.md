@@ -929,8 +929,8 @@ close it.
   **SPEC-036 FR-003** a process logging only this way reported all zeros over total, permanent
   loss. `orphan_lost` covers everything inside that guard — a sink that fails to construct as well
   as one that raises — and `in_span_lost` is its counterpart for an event that could not be *built*
-  inside a span. Two fields, because one can mean the destination or the data and the other can
-  only mean the data.
+  inside a span. Two fields, because one can mean the destination or the data and the other
+  never the destination — the data, or no drain thread at all (SPEC-050 FR-003).
 - **Console echo defaults** (destination, line format, an `echo_level` threshold) → **shipped in
   SPEC-002**: ~~`console.py` echoes to **stdout**~~ — **corrected by SPEC-031 FR-003**, which
   found the claim false against the code: `ConsoleWriter` has defaulted to **stderr** since it
