@@ -20,6 +20,7 @@ is deliberately small and **must not regrow**.
 |---|---|---|---|
 | Always | `CLAUDE.md` | every session | conventions, the key-decisions **digest**, session workflow |
 | Decisions | `docs/decisions.md` | the entry for the area you are working in | the settled decisions **in full** — reasoning, rejected alternatives, every "do NOT build" fence |
+| Invariants | `docs/invariants.md` | before writing a spec or reviewing a diff | the promises as **observables**, numbered; what every mechanism must keep |
 | Status | `docs/specs/INDEX.md` + each spec header | on demand | spec **status** (one row per spec) |
 | The work | `docs/specs/SPEC-XXX-*.md` | the one you're building | requirements + phases |
 | Why | `docs/architecture.md` | the *section* you need | design rationale + Known Constraints |
@@ -238,7 +239,10 @@ path documented `Raises: None` — and both diff reviews then found more, with n
 **What a diff review checks.** That is the *first* of the two frames a diff gets (§3, *The reviewer
 contract*): the spec's acceptance criteria **and the relevant `best-practices/` rules** (route via
 its INDEX) — not just "does it look fine." The second starts from the system rather than the
-diff, and on code it builds the thing and runs the suites.
+diff, and on code it builds the thing and runs the suites. Its starting point is
+`docs/invariants.md`: for each numbered invariant the diff touches, it asks whether the change
+keeps it on every **twin path** (invariant 6), not only the path the spec names — a fix applied to
+one twin is a recurring shape in this repo's history, and the page names examples.
 
 **Rotating the frame — why round count is the wrong exit criterion**
 
@@ -454,7 +458,9 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
 - **Scope: In / Out** — explicitly list what's *excluded*, especially anything a reader would
   reasonably assume is included.
 - **Functional Requirements** — one FR per discrete, testable behavior, with binary pass/fail
-  **Acceptance Criteria** covering happy path, error path, and edges. Sequential IDs so a prompt can
+  **Acceptance Criteria** covering happy path, error path, and edges, and naming the
+  invariant(s) the FR serves from `docs/invariants.md` by number, so the reviewer knows which
+  promise to check on every twin path. Sequential IDs so a prompt can
   say "implement FR-001 through FR-003 only."
 - **Size: aim for 3–6 FRs, and split above 8.** A spec is one coherent slice of behavior, not a
   feature's whole surface, and a spec past eight is not a big spec — it is a spec that should have
