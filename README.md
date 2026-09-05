@@ -1035,7 +1035,7 @@ They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
-| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions**, one per finished span, so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` sweeps — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |

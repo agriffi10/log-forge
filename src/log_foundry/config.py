@@ -275,7 +275,8 @@ def get_config() -> Config:
     deep**: the mapping is the caller's own, its values are shared with the library, so a nested
     mutable value edited through the copy still reaches every later event (2026-09-04 audit,
     N8). Deep-copying was declined because a default can be any object and copying an arbitrary
-    object can raise or be wrong; a caller who needs isolation for a nested value copies it. A caller who
+    object can raise or be wrong; a caller who needs isolation for a nested value copies it. A
+    caller who
     defeats the freeze — ``object.__setattr__`` reaches through any frozen dataclass — then
     edits an object the library does not read, rather than the live config; and ``defaults`` is
     a plain mutable ``dict``, so sharing it would leave the freeze cosmetic at the one field

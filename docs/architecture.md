@@ -1221,7 +1221,7 @@ and a third copy is a fork with no merge.
   `contextvars.Token` pins its predecessor, so a call nested N deep holds N tuples of up to N
   entries until it unwinds. Irrelevant at real depths — 100 deep is about 50 KB and the stack is
   clean afterwards — and measured so the shape is on record (2026-09-04 audit, N10, at `456e9b7`):
-  `tracemalloc` peak 5.3 MB at depth 1,000, 69 MB at 4,000, 266 MB at 8,000. A depth that makes
+  `tracemalloc` peak 5.3 MB at depth 1,000, 69.2 MB at 4,000, 266.5 MB at 8,000. A depth that makes
   this matter has recursed past anything a trace should describe.
 - **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event

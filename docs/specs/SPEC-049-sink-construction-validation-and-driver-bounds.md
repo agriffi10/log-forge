@@ -60,8 +60,10 @@ reject this.
   does change what reaches the wire under a valid configuration.)
 - Normalising the sink family's argument *names* (`url`/`dsn`/`uri`, `chunk_size`/`max_pending`).
   The audit records that drift as frozen; this spec adds no new spelling and renames nothing.
-- ~~`**http_kwargs: object` on the seven platform sinks. `Unpack[TypedDict]` is additive in 1.x.~~ —
-  already shipped by SPEC-051 (`Unpack[HTTPAuthKwargs]`); struck by the 2026-09-04 audit's N9.
+- ~~`**http_kwargs: object` on the seven platform sinks. `Unpack[TypedDict]` is additive in
+  1.x.~~ — already shipped by SPEC-051, one `Unpack[…]` TypedDict per sink (`HTTPPlatformKwargs`,
+  `HTTPRetryKwargs`, `HTTPAuthKwargs`, `HTTPKwargs` in `http.py`); struck by the 2026-09-04
+  audit's N9.
 - Bounding `pymongo`'s `serverSelectionTimeoutMS` or `pika`'s `socket_timeout`/`stack_timeout`.
   Those defaults are finite (30 s, 10 s, 15 s); they are exposed and recorded, not overridden.
 - Changing where the two existing `usable_timeout` callers sit. `KafkaSink(flush_timeout=-1)` and
@@ -77,7 +79,8 @@ reject this.
 - The measured counts in `src/` docstrings. The audit's C6 called them "anchored to a spec rather
   than a commit" and named four files in `sinks/`; the population is **nineteen sites across nine
   modules** there, and SPEC-052's sweep names three more outside it (`config.py`'s
-  `_config_lock` docstring, `worker.py::Health`, `_lifecycle.py::_live_config_sink`) that the audit's split gave to neither session. They are
+  `_config_lock` docstring, `worker.py::Health`, `_lifecycle.py::_close_orphan_sink`) that the
+  audit's split gave to neither session. They are
   design rationale rather than standing rules — the global rule against volatile numbers governs
   rules, and stripping the evidence from a docstring would remove the reasoning that rule wants
   kept. **The spec ID is the anchor, one hop short of a commit:** that rule's alternative to
@@ -111,7 +114,8 @@ while `RabbitMQSink(blocked_connection_timeout=-1)` will raise: the first works,
 Applied here: `HTTPSink.__init__` stores `timeout`, `headers`, `auth` and `url` verbatim. A
 `timeout` of `-1`, `0`, `nan` or `inf` reaches `urlopen` and raises `ValueError` from inside `emit`
 on every batch; CR or LF in a header name or value does the same from `http.client`; a bearer token
-containing CR/LF is written straight into `Authorization` in `http.py::HTTPSink._apply_auth`, which is the same
+containing CR/LF is written straight into `Authorization` in `http.py::HTTPSink._apply_auth`, which
+is the same
 header injection in the argument with the highest consequence; and a URL whose scheme is not
 `http`/`https` sends the batch somewhere else entirely — `file:///etc/passwd` raises a raw
 `TypeError`, `ftp://` burns the full retry budget on every batch.
@@ -229,7 +233,8 @@ key must all be present.
 (`syslog.py:229`), so whitespace shifts PROCID, MSGID and STRUCTURED-DATA for every message —
 corruption no counter sees. An **empty** `app_name` shifts them identically and is refused on the
 same path. `ElasticsearchSink(index=)` is different, and the difference is stated because the audit
-got it wrong: the action line is built with `json.dumps` (`elasticsearch.py::ElasticsearchSink._render`), so the NDJSON
+got it wrong: the action line is built with `json.dumps`
+(`elasticsearch.py::ElasticsearchSink._render`), so the NDJSON
 frame stays intact and a name the cluster rejects is counted per item. It is refused anyway,
 because an index name the cluster can never accept makes every batch fail for the life of the
 process.
@@ -345,7 +350,8 @@ SPEC-029 put the rules in one module.
 
 #### Description:
 
-`file.py::RotatingFileSink._rollover_seconds` is a `@staticmethod`, which `python.md` §9 forbids; it is the only
+`file.py::RotatingFileSink._rollover_seconds` is a `@staticmethod`, which `python.md` §9 forbids; it
+is the only
 one in the package. And `postgres.py::_reconnect_if_broken`'s docstring has a paragraph dedented to
 column 0 mid-docstring, which renders wrongly in every tool that reads it.
 

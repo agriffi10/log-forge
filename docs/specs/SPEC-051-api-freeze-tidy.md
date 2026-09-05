@@ -65,7 +65,8 @@ flow — and it lands after both, rebasing immediately before its gates.
   and stays that way, per SPEC-021's rule that history is superseded in place, never rewritten.
 - **Console echo.** Still reachable only through `api._console`; additive whenever it is wanted.
 - **`Config.defaults` the field.** Widening the parameter is what a caller needs; the field stays
-  a `dict` because `get_config()` hands the caller their own copy to do as they like with (top-level; nested values are shared, recorded by the 2026-09-04 audit's N8), and
+  a `dict` because `get_config()` hands the caller their own copy to do as they like with
+  (top-level; nested values are shared, recorded by the 2026-09-04 audit's N8), and
   annotating it `Mapping` would take that away to fix nothing.
 
 ---
