@@ -166,11 +166,20 @@ does that one owner cannot is disagree with itself, which probe 1 shows.
 
 #### Description:
 
-`_Lifecycle` holds `retired`, latched under `_lock` on entry to `_shutdown_worker`, and `_stop`,
-the one `threading.Event` every sink and the worker's drain loop wait on. `Worker` loses
-`_shutdown_done`, `retired`, `_stop` and `_offer_stop_signal`: it is handed its event at
-construction, holds that object for the life of its thread, and reads `_lifecycle._state.retired`
-where it read its own flag — `submit`'s two reads, `flush`'s guard, `swap_sink`'s two re-checks.
+`_Lifecycle` holds `retirements`, a count of `shutdown()` entries incremented under `_lock` at
+the top of `_shutdown_worker`, and `_stop`, the one `threading.Event` every sink and the worker's
+drain loop wait on. `health().retired` is `retirements > 0`. `Worker` loses `_shutdown_done`,
+`retired`, `_stop` and `_offer_stop_signal`: it is handed its event at construction, holds that
+object for the life of its thread, records the count at its build as `_epoch`, and where it read
+its own flag — `submit`'s two reads, `flush`'s guard, `swap_sink`'s two re-checks — it reads
+`_lifecycle._state.retirements > self._epoch`. **A count rather than a boolean, because a
+boolean changes what `submitted_after_shutdown` means.** A worker built after a `shutdown()`
+returned still delivers (SPEC-044 FR-001's preserved case), and against a latched boolean every
+event it delivered would be counted as "queued where nothing will drain it" (`Health`'s
+definition, SPEC-030 FR-001). Against the count, that worker's epoch equals the count until the
+*next* `shutdown()` moves it, which is exactly when its submissions start being stranded — the
+same instant today's per-worker flag latches, one call earlier in the same critical section.
+`live_worker` is `_worker` while its epoch is current.
 
 The refresh rule is unchanged (SPEC-033 FR-004): an event that is already set is replaced with a
 fresh one before it is offered, and a worker built after a `shutdown()` returned is handed a
@@ -195,11 +204,13 @@ on the build, not assumed.
       and `grep -n '_stop = threading.Event()' src/log_foundry/worker.py` returns nothing, so no
       stop event is built there. `Worker._stop` survives as
       the reference to the owner's event that the constructor was handed; `_lifecycle._state`
-      holds the only latch and builds the only stop event, and `_worker_health` no longer computes
-      `retired` with an `or`.
+      holds the only latch — the count — and builds the only stop event, and `_worker_health` no
+      longer computes `retired` with an `or`.
 - [ ] After `shutdown()` on a process that only ever logged outside a span, and after one that
       only ever logged inside one, `health().retired` is `True` and comes from the same attribute.
-      Invariant 2.
+      A worker built after that `shutdown()` returned delivers with `submitted_after_shutdown`
+      staying at 0, and a second `shutdown()` then strands and counts its next submission — probe
+      2's worker line, re-run after a prior orphan-only shutdown. Invariant 2.
 - [ ] The tests under `tests/test_orphan_sink_handoff.py`'s FR-004 banner —
       `test_a_sink_emitted_to_after_shutdown_still_backs_off` above all — the tests under
       `tests/test_shutdown_lifecycle.py`'s FR-001 banner, and
@@ -253,16 +264,24 @@ The other observable this changes is a sink written to after a **completed** clo
 the latch refuses the re-arm for that sink and its post-close batch is never flushed; after this
 spec it is re-armed and closed again, which is SPEC-045 FR-002's rule and one close per
 write-epoch rather than a double. **A sink re-armed while its close is still running is not
-closed concurrently.** The closer takes only sinks with no delivery or close in flight against
-them — `in_flight(sink)` (FR-004), the same predicate the signal refresh asks — so an emit that
-lands during a close leaves the sink in the record; the closer that finds it in flight waits out
-the grace and then takes, once more, whatever that wait released. A sink re-armed during *that*
-close stays for a later `shutdown()`, which is the same tail SPEC-050 FR-002's bystander already
-accepts at `atexit`.
+closed concurrently.** The closer takes only sinks that are not `held` — no close registered
+against them and no drain thread that may be inside them (FR-004's second predicate, not the
+refresh's) — so an emit that lands during a close leaves the sink in the record; the closer that
+finds it held waits out the grace and then takes, once more, whatever that wait released. That
+second pass never waits, and a sink re-armed during *it* stays for a later `shutdown()`, which is
+the same tail SPEC-050 FR-002's bystander already accepts at `atexit`.
+
+**A worker's build arms its sink and releases nothing.** Today `_get_worker` releases, detached,
+any orphan-owed sink other than the one it built on (SPEC-044 FR-002); under one record that sink
+simply stays owed, and is released by the `configure()` that superseded it — a swap always
+follows the config write that made the build see a different sink — or at exit. A behaviour that
+disappears, said so rather than left to be discovered.
 
 `sinks/base.py` still asks an implementation to make `close()` idempotent and the library still
-does not rely on it (SPEC-044): every close performed here is against a sink that received
-something since the last one.
+does not rely on it (SPEC-044): every close performed here is either the first close of a sink
+armed by a build, a swap or a landed emit — a live target is closed at exit whether or not
+anything was written since it was installed, the worker path's rule today — or a close that
+follows a write since the previous one. Never two for one write-epoch.
 
 The record is declared in the owner's `_FORK_SKIP`, for the reason `_owned` and
 `Worker._unclosed_swaps` are: it pins superseded sinks, and the repair walk would run their fork
@@ -284,8 +303,10 @@ hooks. A live target is still reached through the config and `worker.sink`, and
       worker registers before the close pass with `closes == 1` unchanged; the one where it is
       built *during* the close (`test_the_racing_shutdown_closes_the_sink_once_when_the_orphan_branch_closes_first`)
       is re-stated to `closes == 2` with the second close after that worker's events landed,
-      asserted by the sink's event count at each close. `assert not _drain_threads()` holds in
-      all three: a worker built during the close is still registered and stopped. Invariant 5.
+      asserted by the sink's event count at each close — and performed by the **first**
+      `shutdown()`'s second pass, so the count is already 2 when that call returns.
+      `assert not _drain_threads()` holds in all three: a worker built during the close is still
+      registered and stopped. Invariant 5.
 - [ ] Two `shutdown()` calls racing while an `info()` outside a span lands on the sink the first
       is closing, with a close the test can release: `close()` is never entered on two threads at
       once, asserted by a sink that counts concurrent entries. Released inside the grace, the
@@ -316,8 +337,8 @@ path. The closer, under `_lock`:
 1. takes every owed sink that is not `held(sink)` (FR-004): a release registered in
    `_closing_now`, or `worker.may_be_inside(sink)` — the worker's answer, true while its thread
    is **alive** for its live sink and for a swapped-out sink whose fence was not confirmed
-   (SPEC-050 FR-004's `_unclosed_swaps`, now a list the worker keeps of sinks its own thread may
-   hold, pruned on a confirmed fence or a re-adoption). Thread liveness, not `draining`: after an
+   (SPEC-050 FR-004's `_unclosed_swaps`, now `Worker._held`, the sinks its own thread may be
+   inside, pruned on a confirmed fence or a re-adoption). Thread liveness, not `draining`: after an
    expired `shutdown()` the thread is alive inside `emit` and the sink is left open (SPEC-027
    FR-004), which is the opposite answer from the one the signal refresh needs in that state.
    The worker asked is `_state._worker`; `_late_worker` is the same object when it is set, and is
@@ -333,18 +354,26 @@ path. The closer, under `_lock`:
    joined in a `finally`. The inline one is the worker's live sink where a worker exists, else the
    configured sink where it is owed, else the most recently armed — so `shutdown()`'s own close
    stays inline on both paths (SPEC-030), which is the risk below.
-4. A sink the worker held at the moment its thread ended — the unconfirmed-swap case — is released
-   **detached** and granted only the grace, keeping SPEC-050 FR-004's decision: it already had the
-   swap's whole budget, so it is far more likely stuck than slow, and joining it would let one
-   stuck swapped-out sink hold the exit where today it costs the grace.
+4. A sink the worker held at the moment its thread ended — in `_held`, not `worker.sink`, with
+   the thread no longer alive, which is the unconfirmed-swap case and is decided at the take —
+   is released **detached** and granted only the grace, by `join_closers` at the end of the
+   call, keeping SPEC-050 FR-004's decision: it already had the swap's whole budget, so it is far
+   more likely stuck than slow, and joining it would let one stuck swapped-out sink hold the
+   exit where today it costs the grace.
 
-A caller that found a sink in flight waits on every event in `_closing_now` for
-`closer_grace(deadline)`, the one arithmetic that replaces `_closer_grace`, `_bystander_grace`
-and `join_closers`'s inline copy: `min(DEFAULT_CLOSER_GRACE, remaining)`, the cap for `None` —
-and then takes once more whatever the wait released and is still owed (FR-002). **The closer
-runs twice per `shutdown()` call, and the second pass is that re-take.** `_shutdown_worker` stops
-the worker it found, runs the first pass, then — with `_shutdown_running` still raised across
-that pass, as it is across today's close, so a worker built meanwhile is registered — reads and
+A caller whose first pass found a sink with a close **registered** waits on every event in
+`_closing_now` for `closer_grace(deadline)`, the one arithmetic that replaces `_closer_grace`,
+`_bystander_grace` and `join_closers`'s inline copy: `min(DEFAULT_CLOSER_GRACE, remaining)`, the
+cap for `None`. No registered event, no wait: a sink held only by a drain thread — the expired
+`shutdown()`, or a late worker mid-drain — costs no grace, since nothing will release it inside
+one. **The second pass runs only when there is something for it to do** — the first pass found a
+held sink, or a late worker was registered — and it never waits. Run unconditionally it defeats
+FR-002's two-caller criterion: the first caller, just out of its own inline close, re-takes the
+re-armed sink before the bystander returns from its wait, on every run of a model built from
+this spec. `_shutdown_worker` stops the worker it found, runs the first pass, then — with
+`_shutdown_running` raised across that pass on the no-worker branch, as it is across today's
+close, so a worker built meanwhile is registered; the worker branch never raises it, because
+`_get_worker` returns the existing retired worker there rather than building one — reads and
 stops the late worker SPEC-044 FR-001 registered, and runs the second pass, which closes what
 that worker's build armed and whatever the first pass's wait released. Nothing runs a third. The process-wide count and idle
 event go, so a worker-path `shutdown()` no longer pays for an orphan close of a sink it never
@@ -358,7 +387,10 @@ arms `new` whether or not the worker adopted it, which is `_adopt_declined_swap`
 adopt, and releases the old sink detached and joined to the budget where fenced, or leaves it in
 the record where not, counting `incomplete_swaps` as today. Every other owed sink that is neither
 the old nor the new one is released detached and joined to the budget, on both branches. With no
-worker the drain step is skipped and nothing else differs.
+worker the drain step is skipped, and `new` is armed **only when something was owed** — today's
+branch, kept, because a `configure(A)` then `configure(B)` with nothing ever written must arm
+nothing (the arming rule in FR-002); a worker's adoption is what arms a sink on the other branch,
+and there is no adoption here.
 
 #### Acceptance Criteria:
 
@@ -419,7 +451,8 @@ lint exists to catch. The three limitations the roster discloses about itself ar
 #### Acceptance Criteria:
 
 - [ ] `grep -n 'worker_owns' src/ tests/` returns nothing, and `_lifecycle._state` has exactly
-      three question methods, each with no lock (the class docstring's rule, unchanged).
+      four question methods — `worker_exists`, `live_worker`, `in_flight`, `held` — over three
+      categories, each with no lock (the class docstring's rule, unchanged).
 - [ ] The roster passes with every remaining row filed under one of three categories, and its
       floor is re-derived: the delivery doc states the new counts per module and the commit they
       were measured at.
@@ -509,7 +542,7 @@ _Lifecycle {
   _worker: Worker | None
   _lock: threading.Lock
   _atexit_registered: bool
-  retired: bool                          // FR-001: the one latch, written under _lock
+  retirements: int                       // FR-001: shutdown() entries, written under _lock; health().retired is > 0
   _stop: threading.Event                 // FR-001: the one signal; replaced when set, never cleared
   _owed: dict[int, Sink]                 // FR-002: every sink owed a close, by identity
   _shutdown_running: int                 // unchanged (SPEC-044 FR-001)
@@ -517,7 +550,7 @@ _Lifecycle {
   _FORK_SKIP = ("_owed",)                // FR-002, FR-006
 
   worker_exists() -> Worker | None       // existence
-  live_worker() -> Worker | None         // liveness: _worker unless retired
+  live_worker() -> Worker | None         // liveness: _worker while its _epoch is current
   in_flight(sink) -> bool                // moment, for the refresh: worker.draining into sink, or a release registered
   held(sink) -> bool                     // moment, for the close: worker.may_be_inside(sink), or a release registered
   refresh_stop_signal() -> Event         // unchanged
@@ -530,9 +563,10 @@ Worker {
   sink: Sink
   _queue, _thread, _lock, counters, _taken_markers, _drain_finished, _drain_settled   // unchanged
   _stop: threading.Event                 // handed in; held for the thread's life
+  _epoch: int                            // FR-001: _state.retirements at build; retired for this worker means it moved
   _held: list[Sink]                      // FR-003: sinks this thread may be inside (live + unfenced)
 
-  submit(events)                         // reads _lifecycle._state.retired
+  submit(events)                         // reads _lifecycle._state.retirements > self._epoch
   flush(timeout) -> FlushResult          // unchanged verdicts
   stop(timeout) -> None                  // what remains of shutdown(): sentinel, join, expiry, waiters
   retarget(new, deadline) -> SwapOutcome // declined | fenced | unfenced
