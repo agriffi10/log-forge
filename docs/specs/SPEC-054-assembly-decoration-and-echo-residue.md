@@ -1,7 +1,7 @@
 # Spec: Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe
 
 **ID:** SPEC-054
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-09-04
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037
 
