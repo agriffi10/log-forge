@@ -851,19 +851,6 @@ close it.
   A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
   (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
   deduplicates, which makes a retry safe and is its own spec.
-- **`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded** (SPEC-047 FR-002).
-  `nats-py` retires a server from its pool only under `if max_reconnect_attempts > 0`, so a
-  non-positive value never retires one and the constructor never returns — measured, both `0` and
-  `-1` still blocking at 30 s, one probe past 400 s, where `1` raises in 2.02 s. It is the value a
-  reader is most likely to reach for from "attempts before giving up", and it makes the block this
-  FR exists to bound *permanent*. Documented rather than corrected, because overriding a driver's
-  documented behaviour surprises a caller who knows it. **Closed by** refusing a non-positive
-  `max_reconnect_attempts` with a `ValueError`, which is a small breaking change for anyone
-  currently passing one.
-- **`NATSSink(client=X, servers=…)` ignores `servers` silently** (SPEC-047, Out of Scope). The same
-  shape FR-002 makes a `ValueError` for the four connect timeouts, in the same constructor, left
-  alone because changing it would break a caller passing both today. **Closed by** a major version
-  that can refuse it, or by a deprecation warning first.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
@@ -885,6 +872,21 @@ close it.
   trades a rotation the caller asked for against the retry cost.
 ### Resolved
 
+- ~~**`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded**~~ (SPEC-047 FR-002;
+  invariant 13) → **closed by SPEC-049 FR-004**. `nats-py` retires a server from its pool only
+  under `if max_reconnect_attempts > 0`, so a non-positive value never retires one and the
+  constructor never returned — measured by SPEC-047, both `0` and `-1` still blocking at 30 s, one
+  probe past 400 s, where `1` raises in 2.02 s. SPEC-047 documented rather than corrected it,
+  because overriding a driver's documented behaviour surprises a caller who knows it, and named a
+  `ValueError` as the closure. 1.0 is the major version that could take the small breaking change:
+  a non-positive value is now refused at construction, and refusing is not the overriding that
+  sentence rejected — the caller is told rather than quietly given different behaviour.
+- ~~**`NATSSink(client=X, servers=…)` ignores `servers` silently**~~ (SPEC-047, Out of Scope;
+  invariant 13) → **closed by SPEC-049 FR-004**. The same shape SPEC-047 FR-002 made a
+  `ValueError` for the four connect timeouts, in the same constructor, left alone because
+  changing it would break a caller passing both. `servers` now joins that conflict message,
+  checked from a structure separate from the forwarded options so `nats.connect(servers or …,
+  **supplied)` never receives it twice.
 - ~~**A lone surrogate leaves `build_event` intact and costs the whole batch in every sink that
   encodes a string strictly**~~ (2026-09-04 audit, N1; invariant 8) → **fixed in SPEC-055
   FR-001**. `sanitize._measured` encoded with `errors="replace"` only to *measure*, so

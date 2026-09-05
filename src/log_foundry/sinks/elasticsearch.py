@@ -54,7 +54,13 @@ class ElasticsearchSink(HTTPSink):
 
         Args:
           url: The cluster base URL, to which ``/_bulk`` is appended.
-          index: The target index named in every action line.
+          index: The target index named in every action line. Whitespace and the empty string
+            are refused (SPEC-049 FR-004). The mechanism is **not** frame corruption — the
+            audit recorded it as such and that does not reproduce, because ``json.dumps``
+            escapes the ``_bulk`` action line correctly and a name the cluster rejects already
+            arrives as a counted per-item error. It is refused because an index name the
+            cluster can never accept makes every batch fail for the life of the process, and a
+            startup error is the honest place to say so.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
             ``HTTPRetryKwargs`` (SPEC-051 FR-005) — every keyword it takes except
@@ -65,8 +71,13 @@ class ElasticsearchSink(HTTPSink):
           None.
 
         Raises:
-          None.
+          ValueError: If the index is empty or contains whitespace.
         """
+        if not index or any(char.isspace() for char in index):
+            raise ValueError(
+                f"ElasticsearchSink index must be non-empty and contain no whitespace, "
+                f"not {index!r}"
+            )
         self._index = index
         super().__init__(
             url.rstrip("/") + "/_bulk", auth=auth, body_format="ndjson", **http_kwargs

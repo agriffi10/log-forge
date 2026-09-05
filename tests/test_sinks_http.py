@@ -783,8 +783,10 @@ def test_an_unusable_timeout_is_refused_at_construction(bad: float) -> None:
     Uncounted and forever: nothing but `health().failed_batches` moved, and the caller was
     standing at `configure()` when the mistake was made and heard nothing about it.
     """
-    with pytest.raises(ValueError, match="timeout"):
+    with pytest.raises(ValueError, match="timeout") as info:
         HTTPSink("http://x", timeout=bad)
+    assert repr(bad) in str(info.value), "the message names the value received"
+
 
 
 @pytest.mark.parametrize(

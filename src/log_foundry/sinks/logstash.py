@@ -85,11 +85,11 @@ class LogstashSink:
         *,
         host: str | None = None,
         port: int | None = None,
-        transport: str = "tcp",
+        transport: str | None = None,
         body_format: str = "json_array",
         timeout: float = 5.0,
         max_retries: int = 3,
-        max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
+        max_datagram_bytes: int | None = None,
         **http_kwargs: Unpack[HTTPAuthKwargs],
     ) -> None:
         """Selects and builds exactly one backend.
@@ -98,7 +98,10 @@ class LogstashSink:
           url: The HTTP endpoint, selecting HTTP mode.
           host: The destination host, selecting socket mode.
           port: The destination port, selecting socket mode.
-          transport: ``"tcp"`` or ``"udp"``, in socket mode.
+          transport: ``"tcp"`` or ``"udp"`` in socket mode, or ``None`` for ``"tcp"``. The
+            default is ``None`` rather than ``"tcp"`` so that an explicitly-passed value is
+            distinguishable from one the caller never gave — SPEC-043's recorded limit, and what
+            makes the refusal below total rather than partial.
           body_format: ``"json_array"`` (the default) or ``"ndjson"``. It selects the HTTP wire
             form and has **no effect** in socket mode, which is always newline-delimited — but it
             is *validated* in both, because a value this class silently ignores in one mode and
@@ -107,9 +110,11 @@ class LogstashSink:
             input already configured with ``additional_codecs``.
           timeout: Seconds allowed per request or connection.
           max_retries: Retries the chosen backend makes.
-          max_datagram_bytes: In UDP socket mode, the largest datagram to attempt; a frame over
-            it is dropped and counted rather than sent, retried and abandoned (SPEC-038 FR-007).
-            Ignored in HTTP mode and over TCP, which is a stream.
+          max_datagram_bytes: In UDP socket mode, the largest datagram to attempt, or ``None``
+            for :data:`DEFAULT_MAX_DATAGRAM_BYTES`; a frame over it is dropped and counted rather
+            than sent, retried and abandoned (SPEC-038 FR-007). ``None`` by default for the reason
+            ``transport`` is. Still ignored over TCP, which is a stream — that is a property of the
+            transport the caller chose, not an argument the backend cannot use.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode,
             typed as ``HTTPAuthKwargs`` (SPEC-051 FR-005) — every keyword it takes except
             ``body_format``, ``timeout`` and ``max_retries``, each a parameter of this sink's
@@ -120,29 +125,61 @@ class LogstashSink:
           None.
 
         Raises:
-          ValueError: If neither a URL nor a host and port were given, or if ``body_format`` is
-            neither ``"json_array"`` nor ``"ndjson"``.
+          ValueError: If neither a URL nor a host and port were given; if ``body_format`` is
+            neither ``"json_array"`` nor ``"ndjson"``; if a socket-only argument accompanies
+            ``url=``; or if an HTTP-only keyword accompanies ``host=``/``port=``. The last two are
+            SPEC-043's rule — an argument no selectable backend can consume is an error, not an
+            ignore — applied in both directions (SPEC-049 FR-004): the four socket arguments this
+            constructor used to discard in HTTP mode, and every ``**http_kwargs`` key, which
+            ``SocketTransport`` takes none of, so a caller who meant one backend and selected the
+            other is told rather than left to wonder. ``body_format`` is outside the second set: it
+            is a documented no-effect switch in socket mode, validated there on purpose.
         """
         if body_format not in _BODY_FORMATS:
             raise ValueError(
                 f"LogstashSink body_format must be one of {sorted(_BODY_FORMATS)}, "
                 f"not {body_format!r}"
             )
+        socket_only = {
+            "host": host,
+            "port": port,
+            "transport": transport,
+            "max_datagram_bytes": max_datagram_bytes,
+        }
         if url is not None:
+            unusable = sorted(n for n, v in socket_only.items() if v is not None)
+            if unusable:
+                raise ValueError(
+                    "LogstashSink cannot apply "
+                    + ", ".join(unusable)
+                    + " to the HTTP backend that url= selects; "
+                    "drop them, or drop url= to use the socket backend"
+                )
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
                 **http_kwargs,
             )
             self._socket: SocketTransport | None = None
         elif host is not None and port is not None:
+            if http_kwargs:
+                raise ValueError(
+                    "LogstashSink cannot apply "
+                    + ", ".join(sorted(http_kwargs))
+                    + " to the socket backend that host= and port= select; "
+                    "drop them, or pass url= to use the HTTP backend"
+                )
             self._http = None
             self._socket = SocketTransport(
                 host,
                 port,
-                transport=transport,
+                transport=transport if transport is not None else "tcp",
                 timeout=timeout,
                 max_retries=max_retries,
-                max_datagram_bytes=max_datagram_bytes,
+                max_datagram_bytes=(
+                    max_datagram_bytes
+                    if max_datagram_bytes is not None
+                    else DEFAULT_MAX_DATAGRAM_BYTES
+                ),
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")

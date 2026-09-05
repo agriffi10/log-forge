@@ -113,3 +113,17 @@ def test_every_chunk_rejecting_every_item_is_a_total_failure() -> None:
     with pytest.raises(SinkDeliveryError, match="delivered none of 2 chunk"):
         sink.emit([{"n": i} for i in range(4)])
     assert sink.item_errors == 4
+
+
+@pytest.mark.parametrize("bad", ["my index", "a\tb", "a\nb", ""])
+def test_a_whitespace_or_empty_index_is_refused(bad: str) -> None:
+    """SPEC-049 FR-004, and the mechanism is NOT the one the audit recorded.
+
+    The audit called this frame corruption; it is not. `json.dumps` escapes the `_bulk` action
+    line correctly, so the NDJSON frame stays intact, and an index name the cluster rejects
+    already arrives as a counted per-item error. It is refused because a name the cluster can
+    never accept makes every batch fail for the life of the process, and a startup error is the
+    honest place to say so.
+    """
+    with pytest.raises(ValueError, match="index"):
+        ElasticsearchSink("http://h", index=bad)

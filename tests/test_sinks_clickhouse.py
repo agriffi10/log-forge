@@ -123,3 +123,35 @@ def test_owned_client_is_closed(monkeypatch) -> None:
     sink = ClickHouseSink("log_events", dsn="clickhouse://x")
     sink.close()
     assert client.closed is True
+
+
+# --- SPEC-049 FR-002 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
+    """`0` raised out of `range()` per batch; a negative was the silent one.
+
+    A negative made the chunker yield nothing, so `emit` returned having inserted no rows with
+    `losses()` at zero -- silent total loss, which is the condition SPEC-026 exists to end.
+    """
+    with pytest.raises(ValueError, match="chunk_size"):
+        ClickHouseSink("t", client=FakeClickHouse(), chunk_size=bad)
+
+
+def test_a_batch_that_produces_no_chunk_raises_rather_than_returning(monkeypatch) -> None:
+    """The branch, not the route -- and the route the first draft named cannot reach it.
+
+    Refusing a non-positive `chunk_size` closes the only known way into `chunks == 0`, but the
+    branch stays unguarded and a future chunker change walks back into it. Reached here by
+    patching the chunker itself: monkeypatching `_chunk_size` after construction, which this
+    spec's first draft specified, now raises a raw `ValueError` out of the first `next()` inside
+    the emit lock and never gets here -- the two changes cancelled each other.
+    """
+    client = FakeClickHouse()
+    sink = ClickHouseSink("t", client=client)
+    monkeypatch.setattr("log_foundry.sinks.clickhouse.chunk_list", lambda items, size: iter(()))
+
+    with pytest.raises(SinkDeliveryError, match="no chunk"):
+        sink.emit([{"i": 1}, {"i": 2}])
+    assert client.inserts == [], "and nothing was sent"

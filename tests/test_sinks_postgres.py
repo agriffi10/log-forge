@@ -491,3 +491,13 @@ def test_the_borrowed_clause_appears_only_when_the_connection_is_broken(
     with pytest.raises(SinkDeliveryError):
         PostgresSink("logs", connection=broken, max_retries=0).emit([{"a": 1}])
     assert "may not reopen it" in capsys.readouterr().err
+
+
+# --- SPEC-049 FR-002 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
+    """`0` spent the full retry budget and its backoffs on every batch, failing the same way."""
+    with pytest.raises(ValueError, match="PostgresSink chunk_size must be a positive integer"):
+        PostgresSink("logs", connection=FakeConnection(), chunk_size=bad)

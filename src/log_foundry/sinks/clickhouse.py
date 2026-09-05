@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["ClickHouseSink"]
@@ -72,7 +72,10 @@ class ClickHouseSink:
           create_table: An idempotent ``MergeTree`` convenience, off by default. Every extracted
             column is nullable, to tolerate missing keys — a span-start event has no
             ``duration_ms`` or ``status``.
-          chunk_size: How many rows go in one insert call.
+          chunk_size: How many rows go in one insert call. Refused when non-positive
+            (SPEC-049 FR-002): ``0`` raised out of ``range()`` on every batch, and a **negative**
+            was the silent one — the chunker yielded nothing, so ``emit`` returned having inserted
+            no rows with ``losses()`` at zero.
           max_retries: Retries per chunk, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned from ``_insert`` having attempted nothing, and
             reported success.
@@ -81,11 +84,12 @@ class ClickHouseSink:
           None.
 
         Raises:
-          ValueError: If the table name is not a plain SQL identifier.
+          ValueError: If the table name is not a plain SQL identifier, or the chunk size is not
+            positive.
           ImportError: If the ``clickhouse`` extra is not installed.
         """
         self._table = valid_identifier(table)
-        self._chunk_size = chunk_size
+        self._chunk_size = require_positive(chunk_size, "chunk_size", "ClickHouseSink")
         self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
@@ -132,7 +136,10 @@ class ClickHouseSink:
           SinkDeliveryError: When every chunk failed (SPEC-026 FR-001), which is the whole batch
             for any batch that fits one chunk, the ordinary case. A partially-inserted batch does
             not raise: the chunks that landed are committed, and the worker's retry would
-            duplicate them.
+            duplicate them. **Also when a non-empty batch produced no chunk at all** — that
+            returned normally, having sent nothing, with no counter moved (SPEC-049 FR-002).
+            Refusing a non-positive ``chunk_size`` closes the only known route in; this closes the
+            *branch*, so a future chunker change cannot walk back into it.
         """
         if not batch:
             return
@@ -145,7 +152,11 @@ class ClickHouseSink:
             for chunk in chunk_list(batch, self._chunk_size):
                 chunks += 1
                 inserted += self._insert([self._row(event) for event in chunk])
-        if chunks and not inserted:
+        if not chunks:
+            raise SinkDeliveryError(
+                f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was sent"
+            )
+        if not inserted:
             raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
 
     def close(self) -> None:

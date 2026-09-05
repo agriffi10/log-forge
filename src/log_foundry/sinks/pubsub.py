@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["GooglePubSubSink"]
@@ -115,9 +115,17 @@ class GooglePubSubSink:
           max_pending: Outstanding futures held before :meth:`emit` waits on the oldest, or
             ``None`` for :data:`DEFAULT_MAX_PENDING`. Floored at one, since a bound of zero would
             make every publish synchronous and defeat the client's own batching.
-          overflow_timeout: Seconds to wait on one over-bound publish before putting it back.
-            The wait runs on the worker's single drain thread, so it is bounded by SPEC-027's
-            rule that no sink wait may be unbounded or uninterruptible.
+          overflow_timeout: Seconds to wait on one over-bound publish before putting it back,
+            and since SPEC-048 the bound on ``close()`` too. The wait runs on the worker's single
+            drain thread, so it is bounded by SPEC-027's rule that no sink wait may be unbounded
+            or uninterruptible. **Floored** to :data:`DEFAULT_OVERFLOW_TIMEOUT` when it cannot
+            bound anything (SPEC-049 FR-002) — ``nan`` made every deadline comparison ``False``,
+            so the loop that bounds ``flush()``, ``close()`` and ``_await_overflow`` had no bound
+            at all, and ``inf`` removed it outright. Floored rather than refused because it is an
+            *existing* argument some of whose degenerate values deliver against a healthy client,
+            exactly ``KafkaSink(flush_timeout=)``'s shape, and SPEC-047 floored every one of those
+            through :func:`~log_foundry.sinks._retry.usable_timeout`; refusing ``inf`` here while
+            flooring it there would be two rules for one value.
 
         Returns:
           None.
@@ -132,7 +140,7 @@ class GooglePubSubSink:
         self.topic = topic
         self.client = client
         self.max_pending = max(max_pending if max_pending is not None else DEFAULT_MAX_PENDING, 1)
-        self.overflow_timeout = overflow_timeout
+        self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.rejected = 0

@@ -7,7 +7,7 @@ import socket
 import threading
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
@@ -140,7 +140,11 @@ class SocketTransport:
           host: The destination host.
           port: The destination port.
           transport: ``"tcp"`` or ``"udp"``.
-          timeout: Seconds allowed for a TCP connection.
+          timeout: Seconds allowed for a TCP connection. Refused at construction when it cannot
+            bound anything (SPEC-049 FR-002): it reached ``create_connection`` and raised from
+            inside ``send_all`` on every message. **This is a new refusal over UDP**, where the
+            value was previously unused and a junk one was harmless — stated rather than
+            discovered, since a UDP caller passing one has been silently fine until now.
           max_retries: Reconnect retries per message, floored at zero for the reason
             ``Worker._emit`` floors its own (SPEC-021) — a negative value made no attempt at all
             and abandoned the message without moving ``failed``.
@@ -151,14 +155,15 @@ class SocketTransport:
           None.
 
         Raises:
-          ValueError: If the transport is neither TCP nor UDP.
+          ValueError: If the transport is neither TCP nor UDP, or if the timeout cannot bound
+            anything.
         """
         if transport not in ("tcp", "udp"):
             raise ValueError(f"invalid transport {transport!r}; expected 'tcp' or 'udp'")
         self._host = host
         self._port = port
         self._transport = transport
-        self._timeout = timeout
+        self._timeout = require_timeout(timeout, "timeout", "SocketTransport")
         self._max_retries = max(max_retries, 0)
         self._max_datagram_bytes = max_datagram_bytes
         self._sock: socket.socket | None = None

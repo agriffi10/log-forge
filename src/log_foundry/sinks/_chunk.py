@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, TypeVar
 
+from log_foundry.sinks._retry import require_positive
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
@@ -28,6 +30,7 @@ def chunk_list(items: list[_T], size: int) -> Iterator[list[_T]]:
     Raises:
       ValueError: If the size is not positive, from ``range``.
     """
+    require_positive(size, "size", "chunk_list")
     for start in range(0, len(items), size):
         yield items[start : start + size]
 

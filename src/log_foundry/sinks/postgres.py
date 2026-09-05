@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["PostgresSink"]
@@ -81,7 +81,9 @@ class PostgresSink:
           dsn: The connection string used when opening a connection.
           create_table: An idempotent convenience, off by default because the user owns their
             schema and indexes.
-          chunk_size: How many rows go in one driver statement.
+          chunk_size: How many rows go in one driver statement. Refused when non-positive
+            (SPEC-049 FR-002): it spent the full retry budget and its backoffs on every
+            batch, failing the same way each time.
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned having attempted no insert at all, and
             reported success.
@@ -101,7 +103,7 @@ class PostgresSink:
           ImportError: If the ``postgres`` extra is not installed.
         """
         self._table = valid_identifier(table)
-        self._chunk_size = chunk_size
+        self._chunk_size = require_positive(chunk_size, "chunk_size", "PostgresSink")
         self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0

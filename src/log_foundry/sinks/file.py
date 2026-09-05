@@ -9,6 +9,7 @@ import time
 from typing import TextIO
 
 from log_foundry import _diag
+from log_foundry.sinks._retry import require_positive
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["FileSink", "RotatingFileSink"]
@@ -19,6 +20,37 @@ _WHEN_SECONDS = {
     "H": 60 * 60,
     "D": 60 * 60 * 24,
 }
+
+
+def _rollover_seconds(when: str | None, interval: int) -> float | None:
+    """Translates a unit code and interval into a rollover period in seconds.
+
+    A module-level function rather than a ``@staticmethod``, which ``python.md`` §9 forbids and
+    which this was the only instance of in the package (SPEC-049 FR-007).
+
+    Args:
+      when: The unit code, or ``None`` for no time trigger.
+      interval: How many units make up one period.
+
+    Returns:
+      The period in seconds, or ``None`` when there is no time trigger.
+
+    Raises:
+      ValueError: If the unit code is unrecognized, so a typo fails loudly at construction rather
+        than silently at runtime, or if the interval is not positive. The interval is checked even
+        when there is no time trigger, because an interval that means nothing is a caller who
+        believes one is armed (SPEC-049 FR-003).
+    """
+    require_positive(interval, "interval", "RotatingFileSink")
+    if when is None:
+        return None
+    try:
+        unit = _WHEN_SECONDS[when.upper()]
+    except KeyError:
+        raise ValueError(
+            f"invalid 'when' unit {when!r}; expected one of {sorted(_WHEN_SECONDS)}"
+        ) from None
+    return unit * interval
 
 
 def _reopen_discarding(stream: TextIO, path: str, encoding: str) -> TextIO:
@@ -251,20 +283,32 @@ class RotatingFileSink:
             writes.
           when: The time-trigger unit code, matched case-insensitively, or ``None`` to disable
             it. The vocabulary mirrors a subset of the stdlib ``TimedRotatingFileHandler``'s.
-          interval: How many units make up one rollover period.
+          interval: How many units make up one rollover period. **Refused when non-positive**
+            (SPEC-049 FR-003), and refused even when ``when`` is ``None``, where it is inert: an
+            interval that means nothing is a caller who believes a time trigger is armed. Zero or
+            negative put the rollover deadline permanently in the past, so ``_should_rotate`` fired
+            on every event — measured, three emits of five events left **two** lines on disk out of
+            fifteen.
+
+            ``max_bytes`` and ``backup_count`` are **floored at zero rather than refused**, which
+            is the other half of SPEC-049 FR-001's rule. A negative of either *works* today:
+            ``_should_rotate`` tests ``self._max_bytes > 0`` and ``_rotate`` tests
+            ``self._backup_count > 0``, so it behaves exactly as the documented ``0`` — nothing is
+            lost, nothing raises, no counter moves. Refusing a configuration that works would be a
+            breaking change; flooring is a no-op that makes the value legible.
 
         Returns:
           None.
 
         Raises:
-          ValueError: If the unit code is unrecognized.
+          ValueError: If the unit code is unrecognized, or the interval is not positive.
           OSError: If the file cannot be opened.
         """
         self._path = path
         self._encoding = "utf-8"
-        self._max_bytes = max_bytes
-        self._backup_count = backup_count
-        self._interval_seconds = self._rollover_seconds(when, interval)
+        self._max_bytes = max(max_bytes, 0)
+        self._backup_count = max(backup_count, 0)
+        self._interval_seconds = _rollover_seconds(when, interval)
         self._stream: TextIO = open(path, "a", encoding=self._encoding)
         self._size = os.path.getsize(path) if os.path.exists(path) else 0
         self._next_rollover = self._schedule_next()
@@ -368,30 +412,6 @@ class RotatingFileSink:
             self._stream.flush()
             self._stream.close()
 
-    @staticmethod
-    def _rollover_seconds(when: str | None, interval: int) -> float | None:
-        """Translates a unit code and interval into a rollover period in seconds.
-
-        Args:
-          when: The unit code, or ``None`` for no time trigger.
-          interval: How many units make up one period.
-
-        Returns:
-          The period in seconds, or ``None`` when there is no time trigger.
-
-        Raises:
-          ValueError: If the unit code is unrecognized, so a typo fails loudly at construction
-            rather than silently at runtime.
-        """
-        if when is None:
-            return None
-        try:
-            unit = _WHEN_SECONDS[when.upper()]
-        except KeyError:
-            raise ValueError(
-                f"invalid 'when' unit {when!r}; expected one of {sorted(_WHEN_SECONDS)}"
-            ) from None
-        return unit * interval
 
     def _schedule_next(self) -> float | None:
         """Returns the monotonic-clock deadline for the next time-based rotation (SPEC-031).
