@@ -142,10 +142,10 @@ through (SPEC-017, SPEC-020, SPEC-025, SPEC-034).
 `json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
 substitution (a type-name placeholder is visible on its own and does not set it), and no
 top-level key was overwritten. A lone surrogate is replaced by U+FFFD and marked; a key that
-cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-054).
+cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-055).
 *Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
-(invariant 13), but an over-long one is stamped unbounded (SPEC-054, Out of Scope).
+(invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope).
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
 by `tests/test_public_surface.py`, and `tests/test_sanitize_corpus.py`, which holds every
 hostile value to the whole observable on both delivery paths.
@@ -184,7 +184,7 @@ many attempts, on which path — is true, or the line is a defect.
 statement finds nothing; every count a line carries reproduces from the ledger.
 *Guarded:* `tests/test_diag.py` (a roster over every site) for the first half; the second is
 asserted line by line in the tests of the site that writes it, and the throttle by
-`tests/test_worker.py` and `tests/test_console_echo.py` (SPEC-054).
+`tests/test_worker.py` and `tests/test_console_echo.py` (SPEC-055).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
@@ -207,5 +207,5 @@ SPEC-049 extends the run-time rule to timeouts, chunk sizes, rotation bounds, he
 having delivered nothing; no argument is silently ignored because another was given.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and `tests/test_decorator_sync.py` for what
-`@trace` refuses (SPEC-054); the wider population is SPEC-049's (Draft), whose Overview is the
+`@trace` refuses (SPEC-055); the wider population is SPEC-049's (Draft), whose Overview is the
 measured list of what still constructs and should not.

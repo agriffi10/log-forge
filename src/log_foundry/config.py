@@ -89,7 +89,7 @@ def _require_positive(name: str, value: int | None) -> None:
 
 
 def _require_text(name: str, value: object) -> str | None:
-    """Rejects a stamp that is not a ``str`` or cannot encode as UTF-8 (SPEC-054 FR-001).
+    """Rejects a stamp that is not a ``str`` or cannot encode as UTF-8 (SPEC-055 FR-001).
 
     ``service``, ``version`` and ``env`` are copied from the config into every event without
     passing through ``sanitize`` — the one route by which a string reaches an event unbounded
@@ -197,7 +197,7 @@ def configure(
 
     Raises:
       ValueError: If any ceiling is less than 1, or a stamp does not encode as UTF-8.
-      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-054 FR-001).
+      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001).
     """
     _require_positive("max_value_bytes", max_value_bytes)
     _require_positive("max_stack_bytes", max_stack_bytes)

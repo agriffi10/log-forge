@@ -306,7 +306,7 @@ async def test_async_emits_exactly_one_end_event_on_each_path(lf, fake_sink) -> 
     assert by_fn["bad_call"]["status"] == "error"
 
 
-# -- SPEC-054 FR-002: the async twin of the decoration-time rules ------------------------------
+# -- SPEC-055 FR-002: the async twin of the decoration-time rules ------------------------------
 
 
 async def test_a_partial_of_a_coroutine_function_takes_the_async_wrapper(lf, fake_sink) -> None:

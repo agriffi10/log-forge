@@ -109,7 +109,7 @@ def test_the_stdout_sink_binds_its_stream_at_construction_too() -> None:
     assert "y" in explicit.getvalue()
 
 
-# -- SPEC-054 FR-005: the writer owns its stream's failures ------------------------------------
+# -- SPEC-055 FR-005: the writer owns its stream's failures ------------------------------------
 
 
 class _FaultingStream:

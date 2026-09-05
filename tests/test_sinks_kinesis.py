@@ -388,7 +388,7 @@ def test_a_partition_key_is_charged_and_bounded_in_utf8_bytes() -> None:
 def test_a_lone_surrogate_in_the_partition_key_does_not_raise_out_of_emit() -> None:
     """A bare encode on a lone surrogate raises, and the key is built after assembly's guarantee.
 
-    Assembly replaces a lone surrogate (SPEC-054 FR-001), but this event dict never went through
+    Assembly replaces a lone surrogate (SPEC-055 FR-001), but this event dict never went through
     it -- a `TransformSink` or a caller's own sink can hand `emit` a rewritten batch -- and a
     `UnicodeEncodeError` escaping `emit` is precisely the raw, uncounted failure SPEC-048
     exists to remove. Both encodes carry `errors=` for this.

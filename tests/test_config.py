@@ -824,7 +824,7 @@ def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:
     assert "closing a swapped-out sink" in capsys.readouterr().err
 
 
-# -- SPEC-054 FR-001: the three stamps are refused at the door, since they bypass sanitize ------
+# -- SPEC-055 FR-001: the three stamps are refused at the door, since they bypass sanitize ------
 
 
 @pytest.mark.parametrize("name", ["service", "version", "env"])

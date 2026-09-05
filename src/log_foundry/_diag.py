@@ -25,7 +25,7 @@ import sys
 __all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "rejected"]
 
 WARN_EVERY = 1000
-"""The period of every per-event throttle in the library (SPEC-017 FR-005, SPEC-054 FR-005).
+"""The period of every per-event throttle in the library (SPEC-017 FR-005, SPEC-055 FR-005).
 
 A site that can fail once per event writes its line on the first failure and then on every
 ``WARN_EVERY``-th, carrying the running total, because a line per failure is its own outage and

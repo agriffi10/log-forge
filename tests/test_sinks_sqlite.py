@@ -166,7 +166,7 @@ def test_close_closes_the_owned_connection_and_commits(tmp_path) -> None:
     sink.close()  # idempotent, even though the owned connection is already closed
 
 
-# -- SPEC-054 FR-001 AC-4: the surrogate that cost the batch no longer reaches the column --------
+# -- SPEC-055 FR-001 AC-4: the surrogate that cost the batch no longer reaches the column --------
 
 
 def test_a_lone_surrogate_in_the_span_name_no_longer_costs_the_batch() -> None:

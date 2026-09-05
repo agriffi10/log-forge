@@ -3522,7 +3522,7 @@ def test_a_submission_dropped_while_racing_shutdown_is_not_counted_as_stranded(c
     worker._thread.join(timeout=5)
 
 
-# -- SPEC-054 FR-005: one throttle period, defined in _diag and read by every site -------------
+# -- SPEC-055 FR-005: one throttle period, defined in _diag and read by every site -------------
 
 
 def test_the_throttle_period_is_read_from_diag(capsys, monkeypatch) -> None:

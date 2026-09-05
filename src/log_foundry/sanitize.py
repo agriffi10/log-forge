@@ -42,7 +42,7 @@ The same reasoning as :data:`_INT_LT` beside it, and as ``_placeholder``'s refus
 """
 
 _STR_STR = str.__str__
-"""``str.__str__``, unbound, so a ``str`` subclass cannot divert the measurement (SPEC-054 FR-001).
+"""``str.__str__``, unbound, so a ``str`` subclass cannot divert the measurement (SPEC-055 FR-001).
 
 On an exact ``str`` it is the identity, so the hot path pays nothing; on a subclass it returns a
 plain copy without consulting the subclass's own ``__str__`` or ``encode``. Measured before it:
@@ -54,7 +54,7 @@ must be computed by the library.
 
 _SURROGATES = re.compile("[\ud800-\udfff]")
 _REPLACEMENT = "\ufffd"
-"""One U+FFFD per lone surrogate, which neither built-in error handler gives (SPEC-054 FR-001).
+"""One U+FFFD per lone surrogate, which neither built-in error handler gives (SPEC-055 FR-001).
 
 ``errors="replace"`` on an *encode* writes ``?`` and loses the byte; a ``surrogatepass`` encode
 followed by a ``replace`` decode writes three U+FFFD for one surrogate, because the decoder
@@ -96,7 +96,7 @@ def _measured(value: str) -> tuple[str, bytes, bool]:
 
     A string carrying an unpaired surrogate — anything that went through ``surrogateescape``,
     such as ``os.fsdecode`` of an undecodable filename — raises ``UnicodeEncodeError`` on a bare
-    ``.encode("utf-8")``. Before SPEC-054 this tolerated that with ``errors="replace"`` to
+    ``.encode("utf-8")``. Before SPEC-055 this tolerated that with ``errors="replace"`` to
     *measure* the string and then returned the caller's string unchanged, so the surrogate left
     assembly intact: the JSON sinks escaped it, and every sink that hands a raw ``str`` to a
     driver — ``SQLiteSink``'s ``function`` column above all — raised on it and cost the whole
@@ -135,7 +135,7 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     the honest answer.
 
     The result is an exact ``str`` that encodes as UTF-8 strictly, never the caller's own object
-    (SPEC-054 FR-001): a lone surrogate is replaced by U+FFFD before the measurement, and the
+    (SPEC-055 FR-001): a lone surrogate is replaced by U+FFFD before the measurement, and the
     flag is therefore "the string was altered" rather than only "the ceiling fired" — a
     substitution nobody can see is a silent change to the data, which is the rule
     :meth:`_Coercer.real` already applies to a non-finite float.
@@ -325,7 +325,7 @@ class _Coercer:
     def _decoded(self, value: bytes) -> str:
         """Decodes bytes as UTF-8, replacing what does not decode and recording that it did.
 
-        Strict first, and only on ``UnicodeDecodeError`` with ``errors="replace"`` (SPEC-054
+        Strict first, and only on ``UnicodeDecodeError`` with ``errors="replace"`` (SPEC-055
         FR-001): before this the replacement was unconditional and silent, so the same
         undecodable byte was marked when it arrived as a ``str`` and unmarked when it arrived as
         ``bytes``. The rule is the one every other substitution here follows — a change nobody
@@ -407,7 +407,7 @@ class _Coercer:
             self._parents.pop()
 
     def key(self, key: object) -> str:
-        """Coerces a mapping key to a bounded string, and is total (SPEC-054 FR-004).
+        """Coerces a mapping key to a bounded string, and is total (SPEC-055 FR-004).
 
         Whatever the key's own ``__str__``, ``bit_length`` or ``__lt__`` raises is caught here
         rather than in :meth:`value`, whose guard sits around the *enclosing* mapping: measured,
@@ -559,7 +559,7 @@ class _Coercer:
         argument and return values so the library cannot leak secrets or PII, and ``repr()`` of
         an arbitrary object routinely prints attribute values — a credential held on a client
         object would land in the log. The placeholder goes through :meth:`text` like any other
-        string (SPEC-054 FR-004): ``type.__name__`` is writable, so a type named with more than
+        string (SPEC-055 FR-004): ``type.__name__`` is writable, so a type named with more than
         ``max_value_bytes`` would otherwise be the one string in the event no ceiling reached.
 
         Args:

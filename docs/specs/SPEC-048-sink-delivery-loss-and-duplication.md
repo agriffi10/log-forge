@@ -175,7 +175,7 @@ count, so a multi-byte key under-charges the request budget too. The `[:256]` tr
 multi-byte characters exceeds the service's own 256-byte key limit.
 
 **Every encode here passes `errors="replace"`.** ~~`sanitize.coerce` passes a lone surrogate through
-unchanged~~ — corrected by SPEC-054 FR-001, which replaces it at assembly; the guard here stays
+unchanged~~ — corrected by SPEC-055 FR-001, which replaces it at assembly; the guard here stays
 because the key is derived from a batch a `TransformSink` may have rewritten after assembly — so
 a bare `.encode("utf-8")` on a caller's `trace_id` raises `UnicodeEncodeError` — a raw exception
 out of `emit`, which is the failure this whole spec exists to remove, introduced by its

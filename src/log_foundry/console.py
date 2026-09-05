@@ -25,7 +25,7 @@ class ConsoleWriter:
     cites — logs on stderr, the application's own output on stdout — so an echo cannot corrupt
     a program whose stdout is a data stream someone pipes.
 
-    **The writer owns its stream's failures** (SPEC-054 FR-005). ``api._log`` used to absorb
+    **The writer owns its stream's failures** (SPEC-055 FR-005). ``api._log`` used to absorb
     them one line at a time: measured, 200,000 echoed events piped into ``head -1`` wrote
     199,970 identical stderr lines, one per event, forever. A ``BrokenPipeError``, or the
     ``ValueError`` a closed file raises, is a stream that will not come back, so it is announced

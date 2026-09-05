@@ -15,7 +15,7 @@
   untouched: SPEC-018's "unadjudicable" describes a *response*, and an exception is not one.
 - **Kinesis charges the partition key in UTF-8 bytes** (FR-003), in the per-record ceiling and in
   `_record_size`. New `_partition_key` / `MAX_PARTITION_KEY_BYTES`; both encodes carry
-  `errors="replace"`, since ~~`sanitize` passes a lone surrogate through~~ (corrected by SPEC-054
+  `errors="replace"`, since ~~`sanitize` passes a lone surrogate through~~ (corrected by SPEC-055
   FR-001, which replaces it at assembly; the guard stays for a batch rewritten after assembly)
   and a bare encode would raise out of `emit`. `sanitize.truncate_str` is rejected in writing — its marker changes the
   shard.

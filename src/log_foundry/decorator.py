@@ -630,7 +630,7 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
 
 
 def _refuse_unusable(fn: object) -> None:
-    """Refuses, at decoration, a callable ``@trace`` could not trace (SPEC-054 FR-002).
+    """Refuses, at decoration, a callable ``@trace`` could not trace (SPEC-055 FR-002).
 
     Invariant 13: a bad argument is refused where it is written, never on the first call. A
     ``classmethod`` or ``staticmethod`` object is a decorator applied in the wrong order —
@@ -667,7 +667,7 @@ def _refuse_unusable(fn: object) -> None:
 
 
 def _span_name(fn: object) -> str:
-    """Resolves the span name once, at decoration, from any callable (SPEC-054 FR-002).
+    """Resolves the span name once, at decoration, from any callable (SPEC-055 FR-002).
 
     ``fn.__qualname__`` where the callable has one, else its type's name — so a
     ``functools.partial`` traces as ``partial`` and a callable instance as its class, where
@@ -691,7 +691,7 @@ def _span_name(fn: object) -> str:
 
 
 def _is_async(fn: object) -> bool:
-    """Decides the async wrapper, consulting a callable instance's ``__call__`` (SPEC-054 FR-002).
+    """Decides the async wrapper, consulting a callable instance's ``__call__`` (SPEC-055 FR-002).
 
     ``asyncio.iscoroutinefunction`` sees through a ``functools.partial`` but reads a callable
     instance whose ``__call__`` is ``async def`` as synchronous, so accepting instances at all
@@ -737,7 +737,7 @@ def trace(
       func: The function being decorated when used bare, otherwise ``None``.
       name: Overrides the span name, which defaults to ``func.__qualname__`` where the callable
         has one and to its type's name otherwise — ``partial`` for a ``functools.partial``, the
-        class name for a callable instance (SPEC-054 FR-002).
+        class name for a callable instance (SPEC-055 FR-002).
       defaults: Per-decorator default fields added to every event on the span. Any
         ``Mapping`` is accepted, and a copy is taken **once here**, at decoration — not per
         call. Before SPEC-051 FR-002 the caller's own object was bound to every span and read
@@ -750,7 +750,7 @@ def trace(
     Raises:
       TypeError: At decoration, for a ``classmethod`` or ``staticmethod`` object (the decorators
         are in the wrong order), a ``str`` (``name=`` was meant), anything not callable, or a
-        ``name=`` that is not a ``str`` (SPEC-054 FR-002, invariant 13).
+        ``name=`` that is not a ``str`` (SPEC-055 FR-002, invariant 13).
     """
     span_defaults = None if defaults is None else dict(defaults)
 
@@ -762,7 +762,7 @@ def trace(
         sync/async split is a hard boundary, and ``contextvars`` already propagates the span
         stack and baggage across ``await`` points and concurrent tasks (arch §5), so the async
         span opens when the coroutine actually runs and closes when it finishes. The span name
-        is resolved here, once, rather than read from ``fn`` on every call (SPEC-054 FR-002).
+        is resolved here, once, rather than read from ``fn`` on every call (SPEC-055 FR-002).
 
         Args:
           fn: The function to wrap.

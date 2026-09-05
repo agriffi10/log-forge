@@ -1024,7 +1024,7 @@ def test_a_bad_value_is_absorbed_inside_a_span(lf, fake_sink, capsys) -> None:
     assert ends[-1]["status"] == "ok", "the function returned; the span did not fail"
     assert "error" not in ends[-1], "a library-internal failure is not the caller's error"
     assert "(TypeError)" in capsys.readouterr().err, (
-        "and it is still announced by type: str.__str__ refuses a non-str (SPEC-054 FR-001)"
+        "and it is still announced by type: str.__str__ refuses a non-str (SPEC-055 FR-001)"
     )
 
 
@@ -1058,7 +1058,7 @@ def test_the_absorbed_failure_is_announced_once_by_type_only(lf, fake_sink, caps
     work()
     err = capsys.readouterr().err
     assert err.count("absorbed a failure while building an in-span log") == 1
-    assert "(TypeError)" in err, "str.__str__ refuses a non-str message (SPEC-054 FR-001)"
+    assert "(TypeError)" in err, "str.__str__ refuses a non-str message (SPEC-055 FR-001)"
     assert "a secret the message would leak" not in err
 
 

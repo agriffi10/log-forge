@@ -289,7 +289,7 @@ def _partition_key(raw: str) -> str:
     """Bounds a partition key to the service's 256 **bytes**, never 256 characters.
 
     Both encodes carry an ``errors=`` and both are load-bearing. Assembly replaces a lone
-    surrogate since SPEC-054 FR-001, so an event field cannot carry one — but this key is derived
+    surrogate since SPEC-055 FR-001, so an event field cannot carry one — but this key is derived
     from whatever field the caller named, on a batch a ``TransformSink`` or a caller's own
     ``Sink`` may have rewritten after assembly, and a bare ``encode("utf-8")`` on a surrogate
     raises ``UnicodeEncodeError`` — a raw exception out of ``emit``, which is the failure SPEC-048

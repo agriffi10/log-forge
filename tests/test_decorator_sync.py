@@ -611,7 +611,7 @@ def test_a_swept_span_cannot_be_double_counted_by_the_reordered_flush() -> None:
     )
 
 
-# -- SPEC-054 FR-001 AC-3: the error sub-document is assembled through the clippers too ---------
+# -- SPEC-055 FR-001 AC-3: the error sub-document is assembled through the clippers too ---------
 
 
 def test_a_surrogate_in_the_exception_is_replaced_in_the_end_event(fake_sink) -> None:
@@ -642,7 +642,7 @@ def test_a_surrogate_in_the_exception_is_replaced_in_the_end_event(fake_sink) ->
     assert end["truncated"] is True
 
 
-# -- SPEC-054 FR-002: the span name is resolved once, and a misordered descriptor is refused ----
+# -- SPEC-055 FR-002: the span name is resolved once, and a misordered descriptor is refused ----
 
 
 def _spans_named(fake_sink) -> set[str]:

@@ -206,7 +206,7 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
 ```
 
 - **Auto-capture:** the decorator captures the **function name** only (`func.__qualname__`
-  where the callable has one, its type's name otherwise — SPEC-054), resolved once at
+  where the callable has one, its type's name otherwise — SPEC-055), resolved once at
   decoration and used as both the span name and the `function` field. *(Decision: function name only — no
   automatic capture of arguments or return values, to avoid leaking secrets/PII.)*
 - **Span boundary events:** span start and span end are themselves log events.
@@ -886,7 +886,7 @@ close it.
 ### Resolved
 
 - ~~**A lone surrogate leaves `build_event` intact and costs the whole batch in every sink that
-  encodes a string strictly**~~ (2026-09-04 audit, N1; invariant 8) → **fixed in SPEC-054
+  encodes a string strictly**~~ (2026-09-04 audit, N1; invariant 8) → **fixed in SPEC-055
   FR-001**. `sanitize._measured` encoded with `errors="replace"` only to *measure*, so
   `os.fsdecode(b"file-\xff.txt")` left assembly intact; the JSON sinks escaped it and every sink
   binding `function` as a raw column raised on it, measured on `SQLiteSink` at `98c7e78` as
@@ -897,14 +897,14 @@ close it.
   every sink the entry listed. The four prose sites that asserted the pass-through were
   reworded with the fix. Full reasoning: `decisions.md` ("An event is safe by construction").
 - ~~**`service`, `version` and `env` reach the event without passing through `sanitize`**~~
-  (invariant 8) → **half fixed in SPEC-054 FR-001, half recorded**. `configure()` now refuses a
+  (invariant 8) → **half fixed in SPEC-055 FR-001, half recorded**. `configure()` now refuses a
   stamp that is not a `str` (`TypeError`) or does not encode as UTF-8 (`ValueError`), naming the
   argument, before the sink is stamped into the ownership record, and stores `str.__str__` of
   it (invariant 13's shape); the surrogate route to the column sinks is closed. What stays is
   the ceiling: an over-long stamp is copied unbounded, recorded on `invariants.md` §8 as an
   exception rather than clipped, because it is a value the caller wrote once and can see.
 - ~~**A mapping key whose `__str__` raises replaces the whole sibling mapping, unmarked**~~
-  (2026-09-04 audit, N4; invariant 8) → **fixed in SPEC-054 FR-004**. `key()` is total: a key
+  (2026-09-04 audit, N4; invariant 8) → **fixed in SPEC-055 FR-004**. `key()` is total: a key
   whose rendering raises becomes `<unserializable key: T>` and sets `truncated`, so the siblings
   keep their values, nested and at the top level of `fields`. The collision the entry asked the
   spec to settle is accepted rather than numbered — two hostile keys of one type collapse onto

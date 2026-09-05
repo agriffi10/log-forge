@@ -1,6 +1,6 @@
 # Spec: Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe
 
-**ID:** SPEC-054
+**ID:** SPEC-055
 **Status:** In Progress
 **Last Updated:** 2026-09-04
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037
@@ -57,7 +57,7 @@ options, both complete:
   counts suspended time; a generator finalised by the collector runs its close in whatever
   context happens to be current, where the span-stack token belongs to another context; and the
   decorator gains two more twin paths for invariant 6 to police. Chosen, it is a spec of its own
-  — SPEC-055, beside this one as an arc — and FR-003 below is replaced by a refusal-free dispatch
+  — SPEC-056, beside this one as an arc — and FR-003 below is replaced by a refusal-free dispatch
   to it.
 
 **Recommendation: Option A, now.** It closes the wrong-data defect before the tag at the cost of
@@ -82,7 +82,7 @@ built regardless.
 
 ### Out of Scope
 
-- **Wrapping a generator's iteration** — Option B above. If chosen, it is SPEC-055.
+- **Wrapping a generator's iteration** — Option B above. If chosen, it is SPEC-056.
 - **Detecting a plain function that *returns* a generator object.** FR-003 tests the code flags
   at decoration, which is where invariant 13 refuses; a wrapper whose own body is not a generator
   is indistinguishable from any other function there, and a call-time check would be a refusal

@@ -1,4 +1,4 @@
-"""SPEC-054 FR-006 — the adversarial assembly corpus, asserting invariant 8 value by value.
+"""SPEC-055 FR-006 — the adversarial assembly corpus, asserting invariant 8 value by value.
 
 Every row is driven through both delivery paths (invariant 6) — `lf.info` inside a `@trace`,
 delivered by the worker, and `lf.info` with no span open, emitted synchronously — and every row
@@ -208,7 +208,7 @@ ROWS: list[Row] = [
     Row("int_4999_over_interpreter_limit", "value", 10**4999, True, _is_placeholder("int")),
     Row("int_4000_renders", "value", 10**4000, False, 10**4000),
     Row("big_key_str", "key", "k" * 20_000, True, _pinned(lambda v: isinstance(v, dict))),
-    # SPEC-054's additions
+    # SPEC-055's additions
     Row("fsdecode_value", "value", _BAD, True, "file-�.txt"),
     Row("fsdecode_key", "key", _BAD, True, {"file-�.txt": 1}),
     Row("fsdecode_message", "message", _BAD, True, "file-�.txt"),

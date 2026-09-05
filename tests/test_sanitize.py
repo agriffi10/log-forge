@@ -316,9 +316,9 @@ def test_truncate_str_with_a_ceiling_smaller_than_the_marker(ceiling: int) -> No
 
 
 def test_a_lone_surrogate_is_replaced_not_passed_through() -> None:
-    """SPEC-054 FR-001 AC-1/AC-2: one U+FFFD per surrogate, an exact str, strictly encodable.
+    """SPEC-055 FR-001 AC-1/AC-2: one U+FFFD per surrogate, an exact str, strictly encodable.
 
-    Before SPEC-054 this test asserted only that the call returned; the surrogate left assembly
+    Before SPEC-055 this test asserted only that the call returned; the surrogate left assembly
     intact and cost `SQLiteSink` the whole batch.
     """
     bad = os.fsdecode(b"file-\xff.txt")
@@ -774,7 +774,7 @@ def test_the_finite_path_is_not_measurably_more_expensive() -> None:
     )
 
 
-# -- SPEC-054 FR-001 / FR-004: surrogates, hostile str subclasses, hostile keys ---------------
+# -- SPEC-055 FR-001 / FR-004: surrogates, hostile str subclasses, hostile keys ---------------
 
 
 class _BadEncode(str):
