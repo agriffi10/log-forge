@@ -58,6 +58,7 @@ to status only — no prose.
 | [SPEC-052](SPEC-052-docstring-rule-and-test-scaffolding.md) | The Ungated Docstring Rule, and the Scaffolding It Left Behind | Completed | None |
 | [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | Completed | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
 | [SPEC-053](SPEC-053-marking-walk-claims.md) | The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them | Draft | SPEC-042, SPEC-052 |
+| [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Draft | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
 
 ## Arcs (build order)
 
@@ -281,3 +282,16 @@ Group related specs and record the order to build them in. Keep this section: a 
   construction-time open items `architecture.md` §12 records from SPEC-047 and defers to "a major
   version that can refuse it" — 1.0 is that version, and a spec claiming every construction-time
   refusal cannot leave the identical case open two sections away.
+
+- **One lifecycle owner:** SPEC-054 — the question SPEC-040 was named for and did not answer.
+  That spec moved the orphan path's seven globals onto one object and left the worker's twin
+  state on `Worker`, so every lifecycle decision still exists twice: measured at `98c7e78`,
+  thirteen twin mechanisms, 13 of the 36 FRs across the seven lifecycle-fixing specs edited both
+  sides, and a probe found `health().sink` reported on one path and `None` on the other against
+  the same sink. Build it **after SPEC-050** (done) and after nothing else: it depends on the
+  owed-close record being a set (SPEC-045), the closes running concurrently (SPEC-046) and the
+  in-flight gate existing on both paths (SPEC-050), all of which it merges rather than
+  re-derives. It is four phases, each leaving `main` and `tests/test_invariants_model.py` green,
+  and the two emit paths — synchronous outside a span, queued inside one — are out of its scope
+  by decision (SPEC-028, SPEC-030), so invariant 6 keeps them as twins. It supersedes the
+  four-question guard set (SPEC-035 FR-002, SPEC-040 FR-002) with three, and says so.
