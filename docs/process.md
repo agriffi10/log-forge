@@ -242,7 +242,7 @@ its INDEX) — not just "does it look fine." The second starts from the system r
 diff, and on code it builds the thing and runs the suites. Its starting point is
 `docs/invariants.md`: for each numbered invariant the diff touches, it asks whether the change
 keeps it on every **twin path** (invariant 6), not only the path the spec names — a fix applied to
-one twin is a recurring shape in this repo's history, and the page names three.
+one twin is a recurring shape in this repo's history, and the page names examples.
 
 **Rotating the frame — why round count is the wrong exit criterion**
 

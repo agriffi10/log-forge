@@ -1,13 +1,15 @@
 """The model test behind ``docs/invariants.md``: random interleavings, one accounting identity.
 
-Every lifecycle race this repo has shipped a fix for — SPEC-033's two same-day regressions,
-SPEC-044's five, SPEC-045's owed-close slot — was found by a scratch fuzz *after* the diff
-reviews had passed, and was then pinned by a test written from its own reproduction. A test
-written that way inherits the reproduction's blind spot (``tests/README.md``, and the memory
-this repo keeps of it), and the fuzz that found the defect was thrown away each time. This file
-is that fuzz made permanent, and it pins no single defect: it drives random interleavings of the
-public lifecycle calls from several threads and checks the invariants that hold *regardless* of
-the interleaving — the ones ``docs/invariants.md`` numbers, cited beside each assertion.
+The lifecycle defects this repo has fixed came in two classes. One needs an injected preemption
+point — a window a few instructions wide, which `tests/test_lifecycle_races.py` pins race by race
+(its own docstring measures 0 of 120 unforced runs for one of them). The other is reached at an
+unforced rate under ordinary concurrency: SPEC-045's single-slot owed-close record was found by a
+scratch fuzz losing on 31 of 80 seeds after four reviews had passed the diff, and that fuzz was
+then thrown away, with the defect pinned by a test written from its own reproduction. This file
+is that second class made permanent. It drives random interleavings of the public lifecycle calls
+from several threads and checks the invariants that hold *regardless* of the interleaving — the
+ones ``docs/invariants.md`` numbers, cited beside each assertion. It cannot see the first class,
+and does not claim to.
 
 What it is not: a bound test. The timeouts here are generous on purpose, because a tight budget
 fails on its setup under a loaded ``-n 12`` run (``tests/test_worker.py`` measures the bounds
@@ -20,7 +22,9 @@ the whole ledger so the interleaving can be replayed from the seed alone.
 
 from __future__ import annotations
 
+import pathlib
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,6 +33,7 @@ import pytest
 
 import log_foundry
 from conftest import run_concurrently
+from log_foundry import _lifecycle
 
 SEEDS = range(16)
 THREADS = 4
@@ -37,6 +42,9 @@ FLUSH_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 3.0
 FINAL_SHUTDOWN_TIMEOUT = 5.0
 BOUND_SLACK = 10.0
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+_PAGE = _REPO / "docs" / "invariants.md"
 
 
 class Recorder:
@@ -141,6 +149,23 @@ def _actor(ledger: Ledger, rng: random.Random, *, shutdown_in_mix: bool) -> None
             ledger.timed("slowest_shutdown", time.monotonic() - started)
 
 
+def _stranded_markers() -> int:
+    """Counts the flush markers left on the retired worker's queue after the final shutdown.
+
+    ``Health.queued`` is ``qsize()`` and counts them alongside real submissions — a ``flush()``
+    marker stranded by a racing ``shutdown()`` is answered and then counted for the life of the
+    process, as its docstring says (SPEC-050 FR-001). The identity subtracts them: they are not
+    spans, and a marker's own ``FlushResult`` cannot be used instead, since a stranded one may
+    have been answered ``retired`` or ``ok`` before the sweep. Measured before this existed: about
+    one seed in eight read ``queued`` one or two markers high and the ledger did not balance.
+    """
+    worker = _lifecycle._state.worker_exists()
+    if worker is None:
+        return 0
+    with worker._queue.mutex:
+        return sum(1 for item in worker._queue.queue if not isinstance(item, list))
+
+
 @pytest.mark.parametrize("seed", SEEDS)
 def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> None:
     """Invariants 1, 2, 3, 5 and 6 of ``docs/invariants.md``, over one seeded interleaving.
@@ -162,25 +187,28 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     escaped = run_concurrently(work, threads=THREADS)
     log_foundry.shutdown(timeout=FINAL_SHUTDOWN_TIMEOUT)
     health = log_foundry.health()
+    markers = _stranded_markers()
+    queued = health.queued - markers
 
     ends = sum(sink.count("span.end") for sink in ledger.sinks)
     orphans = sum(sink.count("orphan") for sink in ledger.sinks)
     unclosed = [i for i, sink in enumerate(ledger.sinks) if sink.events and sink.closes == 0]
     picture = (
         f"seed={seed} spans={ledger.spans} span.end={ends} queued={health.queued} "
-        f"dropped={health.dropped} in_span_lost={health.in_span_lost} | "
+        f"markers={markers} dropped={health.dropped} in_span_lost={health.in_span_lost} | "
         f"orphans={ledger.orphans} delivered={orphans} orphan_lost={health.orphan_lost} | "
         f"failed_batches={health.failed_batches} incomplete_swaps={health.incomplete_swaps} "
-        f"sinks={len(ledger.sinks)} unclosed={unclosed} escaped={escaped!r}"
+        f"after_shutdown={health.submitted_after_shutdown} sinks={len(ledger.sinks)} "
+        f"unclosed={unclosed} escaped={escaped!r}"
     )
 
     assert not escaped, f"invariant 1 (never fail the caller): {picture}"
     assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
     assert health.failed_batches == 0, f"the recorder never raises: {picture}"
-    assert ends + health.queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
+    assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
     assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
     assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
-    assert health.submitted_after_shutdown >= health.queued, (
+    assert health.submitted_after_shutdown >= queued, (
         f"invariant 2 (what a shutdown left queued was counted as submitted after it): {picture}"
     )
     assert not unclosed, f"invariant 5 (every sink written to is closed): {picture}"
@@ -188,3 +216,23 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
         f"invariant 3 (shutdown): {picture}"
     )
+
+
+def test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do() -> None:
+    """The page's ``Guarded:`` paths and this file's ``invariant N`` labels cannot rot silently.
+
+    A renamed test file would otherwise leave the page pointing at nothing, and a renumbered
+    invariant would leave an assertion message naming the wrong promise; neither fails anything
+    on its own. The failure text names the missing path or number.
+    """
+    page = _PAGE.read_text(encoding="utf-8")
+    missing = sorted(
+        {path for path in re.findall(r"`(tests/[\w./-]+)`", page) if not (_REPO / path).exists()}
+    )
+    assert not missing, f"docs/invariants.md cites tests that do not exist: {missing}"
+
+    headings = {int(n) for n in re.findall(r"^## (\d+)\. ", page, flags=re.MULTILINE)}
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    cited = {int(n) for n in re.findall(r"invariant (\d+)", source)}
+    assert cited <= headings, f"this file cites invariants the page lacks: {sorted(cited - headings)}"
+    assert headings == set(range(1, max(headings) + 1)), f"the page's numbering has a gap: {headings}"

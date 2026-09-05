@@ -28,8 +28,11 @@ exception is re-raised unchanged, with the span recorded as an error. The guards
 raised inside a library fault still reaches the caller, because those are the operator's or the
 runtime's intent (SPEC-025).
 
-*Observable:* no exception whose innermost frame is in `log_foundry` reaches application code, on
-any input, on any thread, in any lifecycle state.
+*Observable:* once a call has been accepted, no exception whose innermost frame is in
+`log_foundry` reaches application code, on any input, on any thread, in any lifecycle state.
+*Recorded exceptions:* a constructor, `configure()` or `@trace` may refuse an unusable argument
+at the call that supplies it — that is invariant 13, and it is the *opposite* promise for the
+moment of construction.
 *Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`;
 `tests/test_invariants_model.py` asserts it over random interleavings.
 
@@ -45,9 +48,10 @@ and nothing is counted twice.
 spans started; for orphan logs, delivered + `orphan_lost` equals calls made; an event that could
 not be *built* is in `in_span_lost` or `orphan_lost`; loss a sink absorbed is in `health().sink`.
 *Recorded exceptions:* `dropped` counts submissions, not events, and a sink's `failed` is an upper
-bound (`health()` docstring); three losses are counted but never retried, because a retry would
-duplicate — an unadjudicable batch response, an SQS sender fault, an oversized event (SPEC-018,
-SPEC-016, SPEC-017).
+bound (`health()` docstring); `queued` also counts a `flush()` marker stranded by a racing
+`shutdown()`, for the life of the process (`Health.queued` docstring, SPEC-050 FR-001); three
+losses are counted but never retried, because a retry would duplicate — an unadjudicable batch
+response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017).
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`; `tests/test_invariants_model.py`
 is the identity itself.
 
@@ -97,16 +101,20 @@ owed a second close, which is correct rather than a double (SPEC-045).
 
 ## 6. Twin paths keep the same promises
 
-The library has pairs of code paths that must behave identically under invariants 1–5 and 7–8:
+The library has pairs of code paths that must behave identically under invariants 1–5, 7–8 and
+13:
 the **worker** path and the **orphan** path; the **sync** and **async** decorator bodies; a sink's
-`emit` and its `flush`; the `_drain` loop and `_final_drain`. A fix applied to one twin is a
+`emit` and its `flush`; the `_drain` loop and `_final_drain`; `flush()` and `shutdown()` as the
+two answerers of a flush marker. A fix applied to one twin is a
 recurring shape in this repo's history — SPEC-033's two same-day regressions, the SPEC-035 guard
 sites, SPEC-050's daemon-thread close on both paths. This invariant is a review obligation rather
 than a mechanism: a spec names the twins its FRs touch, and the system-frame reviewer checks each.
 
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
-than a hand list; `tests/test_invariants_model.py` drives both delivery paths in one run.
+than a hand list; `tests/test_invariants_model.py` drives both delivery paths in one run and
+catches the races reached at an unforced rate — a window a few instructions wide needs an
+injected preemption point, which is `tests/test_lifecycle_races.py`'s job, one race at a time.
 
 ## 7. A sink that delivered nothing raises; one that delivered something reports
 
@@ -128,8 +136,8 @@ each *value*, not the event; an unserializable value becomes a type name, never 
 number too large to render is replaced, never clipped; a reserved word has exactly one route
 through (SPEC-017, SPEC-020, SPEC-025, SPEC-034).
 
-*Observable:* for any value, the call returns, `json.dumps(event, allow_nan=False)` succeeds,
-every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
+*Observable:* for any value, the call returns, every string in the event encodes as UTF-8 and
+`json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
 substitution (a type-name placeholder is visible on its own and does not set it), and no
 top-level key was overwritten.
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, and the reserved-word route-through
@@ -158,15 +166,17 @@ runs against every later release of the same major; mutating anything a getter r
 no later event.
 *Guarded:* `tests/test_public_surface.py`, `tests/typed_consumer/` (SPEC-051).
 
-## 11. A diagnostic names a type, never a value, and one module writes them all
+## 11. A diagnostic names a type, never a value, says what happened, and one module writes them all
 
 Every stderr line the library writes about itself goes through `_diag`, is throttled where it can
 repeat, and names an exception by `type(exc).__name__` — never `repr`, which reprints a psycopg
-statement with its bound parameters (SPEC-029).
+statement with its bound parameters (SPEC-029). What the line says happened — how many, after how
+many attempts, on which path — is true, or the line is a defect.
 
 *Observable:* `grep` of the library's stderr output for any caller value, header, token, URL or
-statement finds nothing.
-*Guarded:* `tests/test_diag.py` (a roster over every site).
+statement finds nothing; every count a line carries reproduces from the ledger.
+*Guarded:* `tests/test_diag.py` (a roster over every site) for the first half; the second is
+asserted line by line in the tests of the site that writes it.
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
@@ -176,3 +186,15 @@ for a C-level fork; a value the child inherits is stranded, not detached (SPEC-0
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
 *Guarded:* `tests/test_fork_lifecycle.py`, `tests/test_sink_ownership.py`.
+## 13. A bad argument is refused where it is written, never later on the drain thread
+
+A constructor, `configure()` or `@trace` that is handed an argument no backend can use raises at
+that call — `TypeError` or `ValueError`, with the argument named — rather than accepting it and
+failing on every `emit` for the life of the process, or silently delivering nothing (SPEC-043,
+SPEC-051; SPEC-049 extends it to timeouts, chunk sizes, rotation bounds, headers and URLs).
+
+*Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
+having delivered nothing; no argument is silently ignored because another was given.
+*Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
+tests; the wider population is SPEC-049's, and until it lands the gap is this invariant's open
+item in `architecture.md` §12.
