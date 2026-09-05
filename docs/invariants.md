@@ -102,13 +102,12 @@ owed a second close, which is correct rather than a double (SPEC-045).
 ## 6. Twin paths keep the same promises
 
 The library has pairs of code paths that must behave identically under invariants 1–5, 7–8 and
-13:
-the **worker** path and the **orphan** path; the **sync** and **async** decorator bodies; a sink's
-`emit` and its `flush`; the `_drain` loop and `_final_drain`; `flush()` and `shutdown()` as the
-two answerers of a flush marker. A fix applied to one twin is a
-recurring shape in this repo's history — SPEC-033's two same-day regressions, the SPEC-035 guard
-sites, SPEC-050's daemon-thread close on both paths. This invariant is a review obligation rather
-than a mechanism: a spec names the twins its FRs touch, and the system-frame reviewer checks each.
+13: the **worker** path and the **orphan** path; the **sync** and **async** decorator bodies; a
+sink's `emit` and its `flush`; the `_drain` loop and `_final_drain`; `flush()` and `shutdown()`
+as the two answerers of a flush marker. A fix applied to one twin is a recurring shape in this
+repo's history — SPEC-033's two same-day regressions, the SPEC-035 guard sites, SPEC-050's
+daemon-thread close on both paths. This invariant is a review obligation rather than a mechanism:
+a spec names the twins its FRs touch, and the system-frame reviewer checks each.
 
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
@@ -186,15 +185,17 @@ for a C-level fork; a value the child inherits is stranded, not detached (SPEC-0
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
 *Guarded:* `tests/test_fork_lifecycle.py`, `tests/test_sink_ownership.py`.
+
 ## 13. A bad argument is refused where it is written, never later on the drain thread
 
 A constructor, `configure()` or `@trace` that is handed an argument no backend can use raises at
 that call — `TypeError` or `ValueError`, with the argument named — rather than accepting it and
-failing on every `emit` for the life of the process, or silently delivering nothing (SPEC-043,
-SPEC-051; SPEC-049 extends it to timeouts, chunk sizes, rotation bounds, headers and URLs).
+failing on every `emit` for the life of the process, or silently delivering nothing (SPEC-043 at
+run time; SPEC-051 for the static half, where a mistyped forwarded keyword is a `mypy` error;
+SPEC-049 extends the run-time rule to timeouts, chunk sizes, rotation bounds, headers and URLs).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
-tests; the wider population is SPEC-049's, and until it lands the gap is this invariant's open
-item in `architecture.md` §12.
+tests; the wider population is SPEC-049's (Draft), whose Overview is the measured list of what
+still constructs and should not.

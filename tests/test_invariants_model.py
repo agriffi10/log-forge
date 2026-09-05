@@ -3,10 +3,11 @@
 The lifecycle defects this repo has fixed came in two classes. One needs an injected preemption
 point — a window a few instructions wide, which `tests/test_lifecycle_races.py` pins race by race
 (its own docstring measures 0 of 120 unforced runs for one of them). The other is reached at an
-unforced rate under ordinary concurrency: SPEC-045's single-slot owed-close record was found by a
-scratch fuzz losing on 31 of 80 seeds after four reviews had passed the diff, and that fuzz was
-then thrown away, with the defect pinned by a test written from its own reproduction. This file
-is that second class made permanent. It drives random interleavings of the public lifecycle calls
+unforced rate under ordinary concurrency: during SPEC-045 a candidate fix that refused a repeat
+close was built and lost on 31 of 80 seeds of a scratch fuzz, in the second diff review, after
+the reading passes had accepted it — and that fuzz was then thrown away, with the shipped fix
+pinned by a test written from its own reproduction. This file is that second class made
+permanent. It drives random interleavings of the public lifecycle calls
 from several threads and checks the invariants that hold *regardless* of the interleaving — the
 ones ``docs/invariants.md`` numbers, cited beside each assertion. It cannot see the first class,
 and does not claim to.
@@ -155,9 +156,12 @@ def _stranded_markers() -> int:
     ``Health.queued`` is ``qsize()`` and counts them alongside real submissions — a ``flush()``
     marker stranded by a racing ``shutdown()`` is answered and then counted for the life of the
     process, as its docstring says (SPEC-050 FR-001). The identity subtracts them: they are not
-    spans, and a marker's own ``FlushResult`` cannot be used instead, since a stranded one may
-    have been answered ``retired`` or ``ok`` before the sweep. Measured before this existed: about
-    one seed in eight read ``queued`` one or two markers high and the ledger did not balance.
+    spans, and a marker's own ``FlushResult`` cannot be used instead, since the ledger keeps no
+    per-call results and a stranded marker's caller reads ``thread-died`` or ``abandoned``, the
+    same words a swept one can read. Measured before this existed: about one seed in eight read
+    ``queued`` one or two markers high and the ledger did not balance. The ``_SHUTDOWN`` sentinel
+    is counted too — it is stranded only by a terminal drain failure, which the recorder cannot
+    cause, and it is not a span either.
     """
     worker = _lifecycle._state.worker_exists()
     if worker is None:
@@ -198,7 +202,8 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
         f"markers={markers} dropped={health.dropped} in_span_lost={health.in_span_lost} | "
         f"orphans={ledger.orphans} delivered={orphans} orphan_lost={health.orphan_lost} | "
         f"failed_batches={health.failed_batches} incomplete_swaps={health.incomplete_swaps} "
-        f"after_shutdown={health.submitted_after_shutdown} sinks={len(ledger.sinks)} "
+        f"stopped_reason={health.stopped_reason} after_shutdown={health.submitted_after_shutdown} "
+        f"sinks={len(ledger.sinks)} "
         f"unclosed={unclosed} escaped={escaped!r}"
     )
 
@@ -231,8 +236,12 @@ def test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do(
     )
     assert not missing, f"docs/invariants.md cites tests that do not exist: {missing}"
 
-    headings = {int(n) for n in re.findall(r"^## (\d+)\. ", page, flags=re.MULTILINE)}
+    headings = [int(n) for n in re.findall(r"^## (\d+)\. ", page, flags=re.MULTILINE)]
     source = pathlib.Path(__file__).read_text(encoding="utf-8")
     cited = {int(n) for n in re.findall(r"invariant (\d+)", source)}
-    assert cited <= headings, f"this file cites invariants the page lacks: {sorted(cited - headings)}"
-    assert headings == set(range(1, max(headings) + 1)), f"the page's numbering has a gap: {headings}"
+    assert cited <= set(headings), (
+        f"this file cites invariants the page lacks: {sorted(cited - set(headings))}"
+    )
+    assert headings == list(range(1, len(headings) + 1)), (
+        f"the page's numbering is not 1..n in order without repeats: {headings}"
+    )
