@@ -306,8 +306,13 @@ def handler(): ...
 def process(): ...
 ```
 
-- `name` — override the span name (defaults to the function's `__qualname__`).
+- `name` — override the span name (defaults to the function's `__qualname__`; a callable with
+  none — a `functools.partial`, a callable instance — is named after its type).
 - `defaults` — per-decorator fields merged into every event this span emits.
+
+`@trace` refuses at decoration what it cannot trace, with a `TypeError` naming the function:
+a `@classmethod` or `@staticmethod` written *below* it (put them above), a bare string
+(`@trace("checkout")` meant `@trace(name="checkout")`), and anything not callable.
 
 The **outermost** decorated call starts a new trace; every nested decorated call becomes a
 child span within it. On an exception, the decorator records `status="error"` plus an `error`
@@ -364,7 +369,9 @@ def process_payment(user_id: int) -> str:
   [`reset_context()`](#clearing-context-in-a-long-lived-process).
 - **`echo=True`** — *additionally* write a human-readable `LEVEL   message` line to the console
   (`sys.stderr` by default), synchronously, without waiting for the async flush. The event
-  still rides the normal pipeline to the sink — echo never redirects.
+  still rides the normal pipeline to the sink — echo never redirects. A console that has gone
+  away for good (a broken pipe, a closed stream) is announced once and echo is switched off for
+  the rest of the process; any other console fault is announced on a throttle.
 - **`fields={...}`** — the escape hatch. `message`, `echo` and `fields` are **reserved**: they
   are parameters, so `info("x", echo="the payload we echoed back")` would switch on the console
   line instead of recording a field. Pass them — and any key that is not a Python identifier —

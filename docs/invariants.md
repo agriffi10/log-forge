@@ -141,9 +141,14 @@ through (SPEC-017, SPEC-020, SPEC-025, SPEC-034).
 *Observable:* for any value, the call returns, every string in the event encodes as UTF-8 and
 `json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
 substitution (a type-name placeholder is visible on its own and does not set it), and no
-top-level key was overwritten.
-*Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, and the reserved-word route-through
-by `tests/test_public_surface.py`.
+top-level key was overwritten. A lone surrogate is replaced by U+FFFD and marked; a key that
+cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-054).
+*Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
+the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
+(invariant 13), but an over-long one is stamped unbounded (SPEC-054, Out of Scope).
+*Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
+by `tests/test_public_surface.py`, and `tests/test_sanitize_corpus.py`, which holds every
+hostile value to the whole observable on both delivery paths.
 
 ## 9. Context is scoped, and an adopted context confers nothing
 
@@ -178,7 +183,8 @@ many attempts, on which path — is true, or the line is a defect.
 *Observable:* `grep` of the library's stderr output for any caller value, header, token, URL or
 statement finds nothing; every count a line carries reproduces from the ledger.
 *Guarded:* `tests/test_diag.py` (a roster over every site) for the first half; the second is
-asserted line by line in the tests of the site that writes it.
+asserted line by line in the tests of the site that writes it, and the throttle by
+`tests/test_worker.py` and `tests/test_console_echo.py` (SPEC-054).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
@@ -200,5 +206,6 @@ SPEC-049 extends the run-time rule to timeouts, chunk sizes, rotation bounds, he
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
-tests; the wider population is SPEC-049's (Draft), whose Overview is the measured list of what
-still constructs and should not.
+tests; `tests/test_config.py` for the stamps and `tests/test_decorator_sync.py` for what
+`@trace` refuses (SPEC-054); the wider population is SPEC-049's (Draft), whose Overview is the
+measured list of what still constructs and should not.
