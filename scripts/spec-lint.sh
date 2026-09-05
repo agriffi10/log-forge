@@ -118,7 +118,9 @@ for f in $specs; do
   #     (inv. 13)             inv. 3, 11                 invariants 3 & 11
   #
   # The keyword is `invariant`, `invariants` or `inv.`, then one number, then any run of
-  # further numbers joined by a comma, `and`, `&` or `, and`. The list ends at the first
+  # further numbers joined by a comma, `and`, `&`, `/`, `or` or `, and` — `/` and `or`
+  # because an author reaches for `3/11`, and a joiner the parser does not know ends the
+  # list with the rest unread, which passed `3/99` as checked. The list ends at the first
   # token that is none of those. A RANGE IS REFUSED — `invariants 1–5`, with a hyphen, an
   # en dash or an em dash — rather than read as its first number: a range names an interior
   # nobody checked, and reading it as `1` would silently pass a dash over a number the page
@@ -127,20 +129,24 @@ for f in $specs; do
   # says its own rules judge — writes the exact phrase `serves no invariant` instead,
   # with its reason, and the spec reviewer accepts or rejects that the way the FR ceiling
   # is accepted or rejected. An FR that both cites a number and says it serves none is
-  # contradicting itself and fails.
+  # contradicting itself and fails. Every match here is case-insensitive.
   #
   # COMPLETED SPECS ARE EXEMPT. They predate the page: docs/invariants.md arrived at
   # 98c7e78 with fifty-odd specs already Completed, and a rule that reddens frozen history
   # is a rule that gets switched off within the week. The exemption keys on the word
-  # `Completed` in the first Status line outside a fence; a spec whose status is anything
-  # else — Draft, In Progress, misspelled or absent — is checked, because the exemption
-  # must fail closed. What ends an FR is the next level 1–3 heading; what opens its
+  # `Completed`, in any case, in the first Status line outside a fence or an HTML comment —
+  # the comment skip because commenting out an old header line while flipping a status
+  # exempted the spec silently; a spec whose status is anything else — Draft, In Progress,
+  # misspelled or absent — is checked, because the exemption must fail closed. What ends an FR is the next level 1–3 heading; what opens its
   # Acceptance Criteria is any heading containing those words, and what closes that block
   # is the next heading of any level — so a citation sitting in the Description does not
   # count, which is the point: the criteria are what the reviewer reads.
   status=$(awk '
+    in_comment { if ($0 ~ /-->/) in_comment = 0; next }
     /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
     fence { next }
+    { gsub(/<!--[^>]*-->/, "") }
+    /<!--/ { in_comment = 1; next }
     tolower($0) ~ /^[^a-z]*status[^a-z]+(draft|in progress|completed)/ {
       s = tolower($0); sub(/^[^a-z]*status[^a-z]+/, "", s)
       if (s ~ /^completed/) print "completed"; else if (s ~ /^in progress/) print "in progress"; else print "draft"
@@ -164,7 +170,7 @@ for f in $specs; do
           s = substr(s, RSTART + RLENGTH)
           cited++; if (!(k in exists)) bogus = bogus " " k
           if (match(s, /^[ \t]*(-|–|—)[ \t]*[0-9]+/)) range = k substr(s, RSTART, RLENGTH)
-          while (match(s, /^[ \t]*(,[ \t]*(and[ \t]+)?|&[ \t]*|and[ \t]+)[0-9]+/)) {
+          while (match(s, /^[ \t]*(,[ \t]*(and[ \t]+)?|&[ \t]*|\/[ \t]*|and[ \t]+|or[ \t]+)[0-9]+/)) {
             k = substr(s, RSTART, RLENGTH); sub(/.*[^0-9]/, "", k)
             s = substr(s, RSTART + RLENGTH)
             cited++; if (!(k in exists)) bogus = bogus " " k
@@ -173,7 +179,7 @@ for f in $specs; do
         }
         optout = (tolower(ac) ~ /serves no invariant/)
         if (!seen_ac)
-          printf "FAIL  %s: %s has no Acceptance Criteria block, so it names no invariant.\n      Every FR of a spec not marked Completed — the exemption keys on that exact word — carries\n      criteria naming the invariant(s) it serves — %s — from %s, which numbers %s.\n", file, fr, forms, page, pretty
+          printf "FAIL  %s: %s has no Acceptance Criteria block, so it names no invariant.\n      Every FR of a spec not marked Completed — the exemption keys on that one word — carries\n      criteria naming the invariant(s) it serves — %s — from %s, which numbers %s.\n", file, fr, forms, page, pretty
         else if (range != "")
           printf "FAIL  %s: %s cites a range of invariants (%s).\n      A range names an interior nobody checked. List each number: %s.\n", file, fr, range, forms
         else if (bogus != "")
@@ -181,7 +187,7 @@ for f in $specs; do
         else if (cited && optout)
           printf "FAIL  %s: %s cites an invariant and also says it serves no invariant.\n      One or the other: name the number(s) the FR keeps, or say why it keeps none.\n", file, fr
         else if (!cited && !optout)
-          printf "FAIL  %s: %s names no invariant in its Acceptance Criteria.\n      Every FR of a spec not marked Completed — the exemption keys on that exact word — names\n      the invariant(s) it serves — %s — from %s, which numbers %s. A prose or lint FR that\n      keeps none says so with the exact phrase `serves no invariant`, and its reason. A\n      citation in the Description does not count: the criteria are what the reviewer reads.\n", file, fr, forms, page, pretty
+          printf "FAIL  %s: %s names no invariant in its Acceptance Criteria.\n      Every FR of a spec not marked Completed — the exemption keys on that one word — names\n      the invariant(s) it serves — %s — from %s, which numbers %s. A prose or lint FR that\n      keeps none says so with the exact phrase `serves no invariant`, and its reason. A\n      citation in the Description does not count: the criteria are what the reviewer reads.\n", file, fr, forms, page, pretty
         fr = ""; ac = ""; seen_ac = 0; in_ac = 0
       }
       { line = $0; sub(/\r$/, "", line) }

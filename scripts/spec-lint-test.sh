@@ -139,10 +139,16 @@ echo "spec-lint-test: $pass passed, $fail failed."
 [ "$fail" -eq 0 ] || exit 1
 
 # A FLOOR, NOT AN EXIT CODE. Every mechanical way to lose the corpus — a renamed directory,
-# a glob that stops matching, a filter typo — ends with zero cases run and `0 passed, 0
-# failed`, which exits 0 and prints a success line. Deliberately BELOW the measurement so
-# adding cases needs no edit here; removing them does, and that is the point. Not applied
-# to the self-test invocation, which runs a handful of planted cases.
+# a glob that stops matching — ends with zero cases run and `0 passed, 0 failed`, which
+# exits 0 and prints a success line. Deliberately BELOW the measurement so adding cases
+# needs no edit here; removing them does, and that is the point. Not applied to the
+# self-test invocation, which runs a handful of planted cases. A filter typo is the same
+# shape at a smaller scale and gets its own line: a filtered run that matched nothing has
+# proved nothing, and it used to print the success line.
+if [ -n "$FILTER" ] && [ "$pass" -eq 0 ]; then
+  echo "spec-lint-test: the filter '$FILTER' matched no case. Nothing ran, so nothing passed."
+  exit 1
+fi
 CASES_MIN=20
 if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "spec-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"

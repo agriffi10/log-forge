@@ -40,7 +40,7 @@ the purpose after reading this section alone.
   reviewer knows which promise to check on every twin path. Accepted
   spellings, case-insensitive, and a citation may wrap across a line:
       invariant 13 / invariants 3 and 11 / invariants 3, 11 and 13 / (inv. 13)
-  A list runs on commas, "and" or "&"; a range (1-5) is refused, because
+  A list runs on commas, "and", "&", "/" or "or"; a range (1-5) is refused, because
   it names an interior nobody checked - list each number. An FR that
   keeps no invariant - prose, lint or
   hygiene, which the page says its own rules judge - writes the exact
