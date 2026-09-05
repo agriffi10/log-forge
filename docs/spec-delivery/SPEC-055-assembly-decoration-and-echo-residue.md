@@ -21,7 +21,8 @@ at the two edges the library promises most about: what leaves `build_event` and 
   `<unserializable key: T>` and marked; both placeholders go through `text()`.
 - **Echo owns its stream faults** (FR-005): `ConsoleWriter` disables echo after one line on a broken pipe
   or closed file and throttles anything else on `_diag.WARN_EVERY`, the one period the worker reads too.
-- **The assembly corpus** (FR-006): `tests/test_sanitize_corpus.py`, 52 rows through both delivery paths.
+- **The assembly corpus** (FR-006): `tests/test_sanitize_corpus.py`, every hostile value the audit used
+  plus this spec's, driven through both delivery paths.
 
 Deviations, one line each: a `UnicodeEncodeError` is a `ValueError` and is throttled, not latched (found
 by the first diff review); `@trace(name=1)` is refused too (found by the second); the accepted limit that two

@@ -12,7 +12,7 @@ promises most about — what leaves `build_event`, and what `@trace` accepts —
 is visible to `health()`. Every one was reproduced at `456e9b7` and again at `98c7e78`, the tree
 this spec is written on. The audit itself is landed by `02a8ac5` as
 `docs/audits/2026-09-04-pre-1.0-audit-round-2.md`, which also files the first and fourth findings
-below in `architecture.md` §12; this spec is self-contained without it.
+below in `architecture.md` §12, and the config stamps beside them; this spec is self-contained without it.
 
 - **A lone surrogate survives assembly.** `sanitize._measured` encodes with `errors="replace"`
   to *measure* a string, never to replace it, so the `surrogateescape` case its own docstring
