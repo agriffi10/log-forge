@@ -14,9 +14,10 @@ at the two edges the library promises most about: what leaves `build_event` and 
   non-`str` `name=` raise `TypeError` where they are written. The async dispatch consults the type's
   `__call__`. (New helpers: `_refuse_unusable`, `_span_name`, `_is_async`.)
 - **A generator function is refused at decoration** (FR-003, Option A, decided 2026-09-05): `TypeError`
-  for a sync or async generator function, a `partial` of one, or an instance whose `__call__` is one; a
-  function that merely returns a generator object is a stated limit. Wrapping the iteration is deferred, not
-  rejected, and the reasoning is in the register.
+  for a sync or async generator function, a `partial` of one, one behind `@contextmanager`, `@lru_cache` or a
+  `wraps` wrapper (found by the second diff review, each measured recording the orphaned event), or an instance
+  whose `__call__` is one; a function that returns a generator object without advertising it is a stated
+  limit. Wrapping the iteration is deferred, not rejected, and the reasoning is in the register.
 - **A hostile key costs itself** (FR-004): `_Coercer.key()` is total, the placeholder is
   `<unserializable key: T>` and marked; both placeholders go through `text()`.
 - **Echo owns its stream faults** (FR-005): `ConsoleWriter` disables echo after one line on a broken pipe

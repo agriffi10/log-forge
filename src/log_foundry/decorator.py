@@ -643,9 +643,12 @@ def _refuse_unusable(fn: object) -> None:
     body runs after the wrapper has returned the generator object, so the span would open and
     close before a single line of it ran, and every event the body logged would be an orphan on
     a fresh trace — measured, ``['span.start', 'span.end']`` before the first ``next()``. The
-    check is the code flags, on ``fn`` and on the type's ``__call__`` for a callable instance,
-    and both see through a ``functools.partial``; a plain function that merely *returns* a
-    generator object is indistinguishable here and is not detected, which is a stated limit
+    check is the code flags, on ``fn``, on whatever ``fn`` advertises through ``__wrapped__``
+    — so ``@trace`` above ``@contextmanager``, ``@lru_cache`` or any ``functools.wraps`` wrapper
+    of a generator is refused too, each measured recording the same orphaned ``inside`` event —
+    and on the type's ``__call__`` for a callable instance; all of them see through a
+    ``functools.partial``. A plain function that merely *returns* a generator object without
+    advertising it is indistinguishable here and is not detected, which is a stated limit
     rather than a gap to close at call time, where invariant 13 does not refuse. Wrapping the
     iteration instead — a span per generator, pushed around every resumption — was considered
     and deferred: a refusal can be lifted into a wrap later without breaking anyone, while a
@@ -680,7 +683,7 @@ def _refuse_unusable(fn: object) -> None:
         raise TypeError(
             f"@trace cannot trace the iteration of the generator function {_span_name(fn)}: its "
             f"body runs after the wrapper has returned, so the span would close before it "
-            f"starts. Trace the consumer, or open the span around the loop"
+            f"starts. Trace the consumer instead: the function that iterates it"
         )
 
 
@@ -688,8 +691,12 @@ def _is_generator_function(fn: object) -> bool:
     """Reports whether a callable's body is a generator or async generator (SPEC-055 FR-003).
 
     The same shape as :func:`_is_async`: the code flags of ``fn`` itself, which see through a
-    ``functools.partial``, and for anything that is not a plain function the type's
-    ``__call__`` as well, so a callable instance whose ``__call__`` yields is caught too.
+    ``functools.partial``; then of whatever ``fn`` advertises through ``__wrapped__``, which is
+    how ``@contextmanager``, ``@lru_cache`` and every ``functools.wraps`` wrapper point back at
+    the generator they wrap; and for anything that is not a plain function the type's
+    ``__call__`` as well, so a callable instance whose ``__call__`` yields is caught too. The
+    unwrap is guarded because :func:`inspect.unwrap` raises ``ValueError`` on a ``__wrapped__``
+    cycle, and a cycle is not a generator.
 
     Args:
       fn: The callable being decorated.
@@ -698,15 +705,35 @@ def _is_generator_function(fn: object) -> bool:
       Whether ``fn`` would return a generator or async generator object when called.
 
     Raises:
-      Exception: Whatever the callable's own ``__class__`` or ``__call__`` lookup raises, at
-        decoration, in the caller's frame.
+      Exception: Whatever the callable's own ``__class__``, ``__call__`` or ``__wrapped__``
+        lookup raises, at decoration, in the caller's frame.
     """
-    if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+    if _yields(fn):
+        return True
+    try:
+        target = inspect.unwrap(cast("Callable[..., Any]", fn))
+    except ValueError:
+        target = fn
+    if target is not fn and _yields(target):
         return True
     if inspect.isfunction(fn):
         return False
-    call = type(fn).__call__
-    return inspect.isgeneratorfunction(call) or inspect.isasyncgenfunction(call)
+    return _yields(type(fn).__call__)
+
+
+def _yields(fn: object) -> bool:
+    """Reads a callable's code flags for a generator or async generator body.
+
+    Args:
+      fn: The callable to inspect.
+
+    Returns:
+      Whether its body is a generator or an async generator.
+
+    Raises:
+      None.
+    """
+    return inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn)
 
 
 def _span_name(fn: object) -> str:

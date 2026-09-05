@@ -296,7 +296,7 @@ lands can arrive at a sink whose close has already run, and nothing owes that si
 
 ### `@trace`
 
-Decorate any **synchronous** function. Usable bare or with arguments:
+Decorate a function, sync or async. Usable bare or with arguments:
 
 ```python
 @lf.trace                                  # span name = func.__qualname__
@@ -313,8 +313,9 @@ def process(): ...
 `@trace` refuses at decoration what it cannot trace, with a `TypeError` naming the function:
 a `@classmethod` or `@staticmethod` written *below* it (put them above), a bare string
 (`@trace("checkout")` meant `@trace(name="checkout")`), anything not callable, and a
-**generator function** (sync or async) — its body runs after the wrapper has returned, so the
-span would close before it started. Trace the consumer, or open the span around the loop.
+**generator function** (sync or async, including one behind `@contextmanager`, `@lru_cache` or
+any `functools.wraps` wrapper) — its body runs after the wrapper has returned, so the span would
+close before it started. Trace the consumer instead: the function that iterates it.
 
 The **outermost** decorated call starts a new trace; every nested decorated call becomes a
 child span within it. On an exception, the decorator records `status="error"` plus an `error`
