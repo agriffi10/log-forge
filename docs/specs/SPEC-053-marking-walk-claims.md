@@ -2,7 +2,7 @@
 
 **ID:** SPEC-053
 **Status:** Draft
-**Last Updated:** 2026-09-03
+**Last Updated:** 2026-09-04
 **Depends On:** SPEC-042, SPEC-052
 
 ## Overview
@@ -147,6 +147,8 @@ measured on real prose in this repository.**
 - [ ] The check names the file, the starting line and the sentence, so the failure is actionable
       without re-running a search by hand.
 - [ ] It runs inside `scripts/docs-lint.sh` and is covered by that script's exit status.
+- [ ] Serves no invariant: a gate over prose, which `docs/invariants.md` says is judged by
+      `process.md` §5's rules rather than by a promise on that page.
 
 ### FR-002: A corpus proving the check fires, and proving it stays silent
 
@@ -184,6 +186,7 @@ decision is worse than no check.
       carry the anchor pattern and prose describing it. `scripts/docs-lint-test.sh` already warns
       that `scripts/` sits inside check 9's population; this check must exclude it or be written so
       it cannot self-match.
+- [ ] Serves no invariant: the corpus proves FR-001's gate, and that gate polices prose.
 
 ### FR-003: One authoritative statement in `src`, and pointers to it
 
@@ -216,6 +219,8 @@ not be implemented by contorting prose to dodge a check that should not have fir
 - [ ] `_mark_inherited`'s docstring is unchanged — it is what the others defer to.
 - [ ] The docstring assertions in `tests/` still pass; `grep -rn '__doc__' tests/` names sixteen
       sites, one of which reads `_lifecycle.releasable.__doc__`.
+- [ ] Serves no invariant: this FR changes which docstring is authoritative, not what
+      `_mark_inherited` does.
 
 ---
 

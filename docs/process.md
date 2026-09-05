@@ -329,10 +329,10 @@ So the loop rotates the frame instead of adding rounds:
   check that fails for the wrong reason gets "fixed" by changing the wrong thing. Include cases that
   assert **silence** — a corpus of only-failures cannot see a false positive, and false positives are
   a large share of what a gate gets wrong. Prove the corpus bites by defeating each check in turn and watching it redden.
-  Measured here, not carried: `scripts/docs-lint.sh` and `scripts/docstring-lint.py` each have a
-  corpus of their own, and `scripts/spec-lint.sh` has none. Two of its five branches can fail a build and three only warn, and nothing proves any of
-  the five still fires. It is paths-filtered in CI (`docs/specs/**` and its own script), so it did not
-  even run on the pull request that added this rule. Two gates here are proved and the third is not.
+  Measured here, not carried: `scripts/docs-lint.sh`, `scripts/docstring-lint.py` and
+  `scripts/spec-lint.sh` each have a corpus of their own. The last arrived only with the
+  invariant-citation check, and its first run found a parser defect the live specs could not
+  show — every second FR skipped — which is the argument for a corpus in one line.
 - **One fixture per guard is not enough when the guard has more than one exit.** A check with two
   terminating conditions is satisfied by a fixture exercising either, so the mutant that breaks the
   other survives with the suite green. Count the ways a check can stop, and write that many cases.
@@ -460,7 +460,11 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
 - **Functional Requirements** — one FR per discrete, testable behavior, with binary pass/fail
   **Acceptance Criteria** covering happy path, error path, and edges, and naming the
   invariant(s) the FR serves from `docs/invariants.md` by number, so the reviewer knows which
-  promise to check on every twin path. Sequential IDs so a prompt can
+  promise to check on every twin path. `scripts/spec-lint.sh` fails a Draft or In Progress spec
+  whose FR cites none, or cites a number the page does not have; an FR that keeps no invariant —
+  prose, lint, hygiene — says so with the exact phrase `serves no invariant`, and the spec
+  reviewer accepts or rejects that as they do the FR ceiling. Completed specs are exempt because
+  they predate the page. The spellings are in the template. Sequential IDs so a prompt can
   say "implement FR-001 through FR-003 only."
 - **Size: aim for 3–6 FRs, and split above 8.** A spec is one coherent slice of behavior, not a
   feature's whole surface, and a spec past eight is not a big spec — it is a spec that should have
@@ -521,11 +525,13 @@ and these rotted the moment SPEC-036 was right-sized before its build. So:
   run against that bug.*
 
 `scripts/spec-lint.sh` enforces the structural side of this in CI: it **fails** a spec that is missing
-a required section or that contains an "Open Questions" / "Checkpoint" heading, and **warns** on
-unfilled placeholders, a spec with FRs but no acceptance criteria anywhere in it, and a spec
-carrying more than 8 FRs. It cannot see a vacuous acceptance criterion, an acceptance criterion
-missing from one FR while its neighbours have them, or a decision promised in a declarative
-sentence — that is what the reviewer gate is for.
+a required section, one that contains an "Open Questions" / "Checkpoint" heading, and a Draft or
+In Progress spec whose FR names no invariant in its Acceptance Criteria — or has no such block at
+all — or names one `docs/invariants.md` does not number; it **warns** on unfilled placeholders, a
+spec with FRs but no acceptance criteria anywhere in it, and a spec carrying more than 8 FRs. It
+cannot see a vacuous acceptance criterion, a citation of the wrong invariant, or a decision
+promised in a declarative sentence — that is what the reviewer gate is for.
+`scripts/spec-lint-test.sh` is its fixture corpus, run in CI beside it.
 
 ---
 

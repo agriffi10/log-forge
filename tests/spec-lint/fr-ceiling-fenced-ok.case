@@ -1,0 +1,75 @@
+@@@ expect exit=0
+@@@ absent over the 3 ceiling
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Completed
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- a
+
+### FR-002: Thing 2
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- a
+
+### FR-003: Thing 3
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- a
+
+## Implementation Phases
+
+prose
+
+```
+### FR-004: quoted
+```
+<!-- ### FR-005: out -->
+<!--
+### FR-006: out
+-->

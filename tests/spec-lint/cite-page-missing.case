@@ -1,0 +1,33 @@
+@@@ expect exit=1
+@@@ match FAIL  docs/invariants.md is missing.
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariant 1
+
+## Implementation Phases
+
+prose

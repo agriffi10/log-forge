@@ -1,0 +1,54 @@
+@@@ expect exit=1
+@@@ match FR-002 has no Acceptance Criteria block, so it names no invariant.
+@@@ absent FR-001
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariant 1
+
+### FR-002: Thing 2
+
+#### Description:
+
+What it does.
+
+## Implementation Phases
+
+prose

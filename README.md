@@ -1315,8 +1315,8 @@ poetry run python scripts/docstring-lint.py   # the docstring rule over src/ —
 All six run before a push. The last two are the ones to remember, because they are deliberately
 not CI jobs: they hold the documentation and the docstrings to rules a reviewer would otherwise
 have to carry, and keeping them local means the failure lands on whoever caused it rather than on
-a shared branch. Each has a `-test.sh` beside it that proves its own checks still fire; run that
-one too if you change the linter.
+a shared branch. Each of the three linters has a `-test.sh` beside it that proves its own checks
+still fire; run that one too if you change the linter.
 
 The library uses a src layout (`src/log_foundry/`) with a single concept per module: `config`,
 `ids`, `model`, `context`, `decorator`, `api`, `console`, `worker`, `sanitize` and `results`,

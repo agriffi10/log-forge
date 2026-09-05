@@ -1,0 +1,71 @@
+@@@ expect exit=1
+@@@ match docs/specs/SPEC-001-x.md: FR-002 names no invariant in its Acceptance Criteria.
+@@@ match `invariant 13`, `invariants 3 and 11` or `(inv. 13)`
+@@@ match which numbers 1, 2, 3.
+@@@ absent FR-001 names
+@@@ absent FR-003 names
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] a, invariant 1
+
+### FR-002: Thing 2
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] b
+
+### FR-003: Thing 3
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] c, invariant 3
+
+## Implementation Phases
+
+prose

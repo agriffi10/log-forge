@@ -1,0 +1,60 @@
+@@@ expect exit=0
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariant 1
+
+## Implementation Phases
+
+prose
+
+## Appendix
+
+```
+### FR-009: quoted
+
+#### Acceptance Criteria:
+
+- [ ] none
+```
+
+<!--
+### FR-008: commented out
+-->
