@@ -771,6 +771,12 @@ def test_a_non_callable_is_refused_naming_its_type() -> None:
         log_foundry.trace(object())  # type: ignore[type-var]
 
 
+def test_a_non_str_name_is_refused_at_decoration() -> None:
+    """`@trace(name=1)` used to decorate happily and then run every call untraced, forever."""
+    with pytest.raises(TypeError, match="name= must be a str, got int"):
+        log_foundry.trace(name=1)(lambda: None)  # type: ignore[arg-type]
+
+
 def test_a_string_is_refused_with_the_name_hint() -> None:
     """`@trace("checkout")` is the slip; the message says what was meant."""
     with pytest.raises(TypeError, match=r"name='checkout'"):

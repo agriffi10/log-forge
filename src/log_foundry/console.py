@@ -93,7 +93,7 @@ class ConsoleWriter:
                 _diag.absorbed(
                     "echoing to the console",
                     exc,
-                    "echo is disabled for the rest of the process; events still reach the sink",
+                    "echo is disabled for the life of this writer; events still reach the sink",
                 )
                 return
             with self._lock:

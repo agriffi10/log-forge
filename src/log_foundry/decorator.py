@@ -648,6 +648,8 @@ def _refuse_unusable(fn: object) -> None:
     Raises:
       TypeError: If ``fn`` is a ``classmethod`` or ``staticmethod`` object, a ``str``, or not
         callable at all.
+      Exception: Whatever the callable's own attribute access raises — a ``__class__`` property,
+        say — at decoration, in the caller's frame, which is invariant 13's moment.
     """
     if isinstance(fn, (classmethod, staticmethod)):
         kind = type(fn).__name__
@@ -681,7 +683,8 @@ def _span_name(fn: object) -> str:
       The span name.
 
     Raises:
-      None.
+      Exception: Whatever the callable's own ``__qualname__`` lookup raises other than
+        ``AttributeError``, at decoration, in the caller's frame.
     """
     qualname = getattr(fn, "__qualname__", None)
     return qualname if isinstance(qualname, str) else type(fn).__name__
@@ -704,7 +707,8 @@ def _is_async(fn: object) -> bool:
       Whether the async wrapper applies.
 
     Raises:
-      None.
+      Exception: Whatever the callable's own ``__class__`` or ``__call__`` lookup raises, at
+        decoration, in the caller's frame.
     """
     if asyncio.iscoroutinefunction(fn):
         return True
@@ -745,8 +749,8 @@ def trace(
 
     Raises:
       TypeError: At decoration, for a ``classmethod`` or ``staticmethod`` object (the decorators
-        are in the wrong order), a ``str`` (``name=`` was meant), or anything not callable
-        (SPEC-054 FR-002, invariant 13).
+        are in the wrong order), a ``str`` (``name=`` was meant), anything not callable, or a
+        ``name=`` that is not a ``str`` (SPEC-054 FR-002, invariant 13).
     """
     span_defaults = None if defaults is None else dict(defaults)
 
@@ -770,6 +774,8 @@ def trace(
           TypeError: From :func:`_refuse_unusable`, at decoration.
         """
         _refuse_unusable(fn)
+        if name is not None and not isinstance(name, str):
+            raise TypeError(f"@trace name= must be a str, got {type(name).__name__}")
         span_name = name or _span_name(fn)
         if _is_async(fn):
 

@@ -230,7 +230,8 @@ first call.
       body execution, the message naming the function and the correct order; `@classmethod` above
       `@trace` keeps working, as does `@staticmethod` above `@trace` (invariant 13).
 - [ ] `trace(object())` raises `TypeError` naming the type; `trace("checkout")` raises
-      `TypeError` whose message contains `name=`.
+      `TypeError` whose message contains `name=`; `trace(name=1)` raises `TypeError` at
+      decoration rather than running every call untraced.
 - [ ] `iscoroutinefunction` dispatch is unchanged: a partial of an `async def` still takes the
       async wrapper.
 - [ ] Removing the `__call__` consultation reddens the async-instance criterion; removing the
