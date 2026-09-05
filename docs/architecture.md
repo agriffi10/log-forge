@@ -929,8 +929,8 @@ close it.
   **SPEC-036 FR-003** a process logging only this way reported all zeros over total, permanent
   loss. `orphan_lost` covers everything inside that guard — a sink that fails to construct as well
   as one that raises — and `in_span_lost` is its counterpart for an event that could not be *built*
-  inside a span. Two fields, because one can mean the destination or the data and the other can
-  only mean the data.
+  inside a span. Two fields, because one can mean the destination or the data and the other
+  never the destination — the data, or no drain thread at all (SPEC-050 FR-003).
 - **Console echo defaults** (destination, line format, an `echo_level` threshold) → **shipped in
   SPEC-002**: ~~`console.py` echoes to **stdout**~~ — **corrected by SPEC-031 FR-003**, which
   found the claim false against the code: `ConsoleWriter` has defaulted to **stderr** since it
@@ -1217,9 +1217,17 @@ and a third copy is a fork with no merge.
   `continue_trace()` on the entry point's first line, inside the span — is unaffected, and
   `reset_context()` is the remedy for a caller who adopts before dispatching.
 
+- **Nested-span memory is O(depth²).** The span stack is a copied tuple and each
+  `contextvars.Token` pins its predecessor, so a call nested N deep holds N tuples of up to N
+  entries until it unwinds. Irrelevant at real depths — 100 deep is about 50 KB and the stack is
+  clean afterwards — and measured so the shape is on record (2026-09-04 audit, N10, at `456e9b7`):
+  `tracemalloc` peak 5.3 MB at depth 1,000, 69.2 MB at 4,000, 266.5 MB at 8,000. A depth that makes
+  this matter has recursed past anything a trace should describe.
 - **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event
-  can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB. Acceptable because
+  can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB — measured at
+  `456e9b7` as a 2,060,506-byte event, serializable and marked `truncated` (2026-09-04 audit,
+  N11). Acceptable because
   it is *visible* — a sink with a hard limit drops the event and counts `dropped_oversized`, so
   the loss is signalled where it happens rather than passed downstream silently. A per-event byte
   ceiling was deferred by SPEC-017, again by SPEC-020, and deliberately again by SPEC-021: it is a

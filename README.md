@@ -1035,7 +1035,7 @@ They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
-| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` sweeps — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused outright. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
@@ -1044,12 +1044,13 @@ They tell you different things, and they want different responses:
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
 | `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
 | `orphan_lost` | An event logged **with no open span** never reached the sink. That call emits on your own thread with no worker behind it, so no other field here can carry it — it is not a batch, there was no retry, and there may be no worker at all. Covers a sink that failed to *construct* as well as one that raised. | Fix the destination, or the data. The stderr line names the exception type. If a process logs this way at all, this is the field to alert on: nothing else describes that path. |
-| `in_span_lost` | An event logged **inside a span** could not be built — a value that could not be turned into an event. Always the data, never the destination: the in-span path cannot fail at delivery, which is `failed_batches`. | Fix the call site. Passing a non-string message (an exception object, say) is the common cause. |
+| `in_span_lost` | An event logged **inside a span** was lost before delivery, for one of two reasons the count tells apart: **the data** — a value that could not be turned into an event, one per call — or **no drain thread at all** — the process could not start the worker, and the span's whole buffer is counted at once (SPEC-050). Never a destination that failed at delivery; that is `failed_batches`. | One event at a time: fix the call site — a non-string message (an exception object, say) is the common cause. A whole buffer at once: the process cannot start a thread; the stderr line names it. |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter. It and `queued` are the two fields here that fall as well as rise; the other integer counters only climb. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
 
 `orphan_lost` and `in_span_lost` are deliberately two fields and their sum is deliberately not
 reported. They aggregate different failure populations — one can mean the destination *or* the
-data, the other can only mean the data — so a single number would hide which fix applies.
+data; the other never the destination — the data, or no drain thread at all (SPEC-050) — so a
+single number would hide which fix applies.
 
 `h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no worker
 exists yet, or when the configured sink reports nothing (`losses()` is optional, and a sink whose

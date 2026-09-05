@@ -282,11 +282,15 @@ class KinesisSink:
 
 
 MAX_PARTITION_KEY_BYTES = 256
-"""The service's ceiling on a ``PutRecords`` partition key, in UTF-8 bytes."""
+"""This sink's ceiling on a ``PutRecords`` partition key, in UTF-8 bytes.
+
+At or below the service's own limit, which its API reference states as 256 **characters**: a
+byte bound is stricter for any non-ASCII key and therefore safe (2026-09-04 audit, N12).
+"""
 
 
 def _partition_key(raw: str) -> str:
-    """Bounds a partition key to the service's 256 **bytes**, never 256 characters.
+    """Bounds a partition key to 256 UTF-8 **bytes**, at or below the service's 256-character limit.
 
     Both encodes carry an ``errors=`` and both are load-bearing. Assembly replaces a lone
     surrogate since SPEC-055 FR-001, so an event field cannot carry one — but this key is derived
@@ -319,7 +323,8 @@ def _record_size(record: dict[str, Any]) -> int:
     """Measures one request entry, partition key included (SPEC-038 FR-009).
 
     ``PutRecords`` charges the partition key against the 5 MiB request limit, and a key may be up
-    to 256 bytes, so a 500-record request could understate itself by ~128 KB — enough to have the
+    to 256 characters at the service (bounded here to 256 bytes), so a 500-record request could
+    understate itself by ~128 KB — enough to have the
     service reject a chunk this sink believed was inside the budget. ``SQSSink`` charges its FIFO
     ids for the same reason and records the same rationale.
 

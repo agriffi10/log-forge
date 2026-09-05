@@ -172,7 +172,10 @@ The key must be charged in **UTF-8 bytes**, and in two places: the new per-recor
 `_record_size` (`kinesis.py:271`), which today adds `len(record["PartitionKey"])` — a character
 count, so a multi-byte key under-charges the request budget too. The `[:256]` truncation at
 `kinesis.py:193` is likewise characters and must become a byte bound, or a 256-character key of
-multi-byte characters exceeds the service's own 256-byte key limit.
+multi-byte characters exceeds ~~the service's own 256-byte key limit~~ — corrected by the
+2026-09-04 audit's N12: the API reference states the limit in **characters**, so the byte bound
+shipped is stricter than the service's and safe; only a non-ASCII key between 256 bytes and 256
+characters lands on a different shard than an unbounded one would.
 
 **Every encode here passes `errors="replace"`.** ~~`sanitize.coerce` passes a lone surrogate through
 unchanged~~ — corrected by SPEC-055 FR-001, which replaces it at assembly; the guard here stays
