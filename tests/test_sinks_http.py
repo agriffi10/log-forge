@@ -857,17 +857,23 @@ def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
         "splunk.SplunkHECSink",
     }, f"the subclass population moved: {sorted(derived)}"
 
+    from log_foundry.sinks.datadog import DatadogSink
     from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
     from log_foundry.sinks.honeycomb import HoneycombSink
     from log_foundry.sinks.loki import LokiSink
+    from log_foundry.sinks.newrelic import NewRelicSink
     from log_foundry.sinks.splunk import SplunkHECSink
 
-    for build in (
+    builders = (
+        lambda: DatadogSink("k", timeout=-1),
         lambda: ElasticsearchSink("http://h", index="i", timeout=-1),
         lambda: OpenSearchSink("http://h", index="i", timeout=-1),
         lambda: HoneycombSink("k", dataset="d", timeout=-1),
         lambda: LokiSink("http://h", timeout=-1),
+        lambda: NewRelicSink("k", timeout=-1),
         lambda: SplunkHECSink("http://h", token="t", timeout=-1),
-    ):
+    )
+    assert len(builders) == len(derived), "every named subclass is built, not a sample of them"
+    for build in builders:
         with pytest.raises(ValueError, match="timeout"):
             build()

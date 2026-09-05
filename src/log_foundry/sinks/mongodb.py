@@ -179,10 +179,8 @@ class MongoDBSink:
         )
         if client is not None and supplied:
             raise ValueError(
-                "MongoDBSink cannot apply "
-                + ", ".join(supplied)
-                + " to an injected client, which is already connected; "
-                "pass them where the client is built, or drop client="
+                f"MongoDBSink cannot apply {', '.join(supplied)} to an injected client, which is "
+                "already connected; pass them where the client is built, or drop client="
             )
         self._owns_client = client is None
         if client is None:

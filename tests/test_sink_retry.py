@@ -1004,8 +1004,9 @@ def test_require_timeout_passes_a_usable_value_through() -> None:
 def test_require_positive_refuses_a_non_positive_count(bad: int) -> None:
     from log_foundry.sinks._retry import require_positive
 
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="OwnerSink chunk_size must be a positive integer") as info:
         require_positive(bad, "chunk_size", "OwnerSink")
+    assert repr(bad) in str(info.value), "the message names the value received"
 
 
 def test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side() -> None:
@@ -1015,6 +1016,9 @@ def test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side() -> None
     defaults and keep delivering. Under FR-001's rule — floor what works, refuse what is already
     broken — they are on the floor side, and moving them would be a breaking change at 1.0 for a
     caller whose configuration works. This spec adds refusals; it does not convert these.
+
+    Asserted on the helpers; the constructor-level pins are SPEC-047's own, in
+    `test_sinks_kafka.py` and `test_sinks_nats.py`, which construct each sink with 0, -1, inf and nan.
     """
     from log_foundry.sinks._retry import usable_timeout
     from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, _usable_timeout

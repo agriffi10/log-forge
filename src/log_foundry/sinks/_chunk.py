@@ -28,7 +28,9 @@ def chunk_list(items: list[_T], size: int) -> Iterator[list[_T]]:
       An iterator over the slices.
 
     Raises:
-      ValueError: If the size is not positive, from ``range``.
+      ValueError: If the size is not positive, raised at the first ``next()`` because this is a
+        generator (SPEC-049 FR-002) — ``range`` used to raise its own for ``0`` and yield nothing
+        for a negative.
     """
     require_positive(size, "size", "chunk_list")
     for start in range(0, len(items), size):

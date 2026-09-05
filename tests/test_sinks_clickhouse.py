@@ -135,8 +135,9 @@ def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
     A negative made the chunker yield nothing, so `emit` returned having inserted no rows with
     `losses()` at zero -- silent total loss, which is the condition SPEC-026 exists to end.
     """
-    with pytest.raises(ValueError, match="chunk_size"):
+    with pytest.raises(ValueError, match="ClickHouseSink chunk_size") as info:
         ClickHouseSink("t", client=FakeClickHouse(), chunk_size=bad)
+    assert repr(bad) in str(info.value)
 
 
 def test_a_batch_that_produces_no_chunk_raises_rather_than_returning(monkeypatch) -> None:

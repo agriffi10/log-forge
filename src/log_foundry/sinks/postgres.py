@@ -99,7 +99,8 @@ class PostgresSink:
           None.
 
         Raises:
-          ValueError: If the table name is not a plain SQL identifier.
+          ValueError: If the table name is not a plain SQL identifier, or the chunk size is not
+            positive.
           ImportError: If the ``postgres`` extra is not installed.
         """
         self._table = valid_identifier(table)

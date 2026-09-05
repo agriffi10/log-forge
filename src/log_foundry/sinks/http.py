@@ -466,7 +466,10 @@ class HTTPSink:
           None.
 
         Raises:
-          None.
+          ValueError: If the URL's scheme is not ``http`` or ``https``, a header name or value or
+            a bearer token contains CR or LF, or the timeout cannot bound anything — each refused
+            here rather than raised out of every ``emit`` for the life of the process (SPEC-049
+            FR-001), and inherited by every subclass, whose own name the message carries.
         """
         self.url = _valid_url(url, type(self).__name__)
         self.method = method

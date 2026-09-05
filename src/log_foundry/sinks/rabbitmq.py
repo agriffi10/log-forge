@@ -99,10 +99,9 @@ class RabbitMQSink:
         supplied = sorted(name for name, value in bounds.items() if value is not None)
         if connection is not None and supplied:
             raise ValueError(
-                "RabbitMQSink cannot apply "
-                + ", ".join(supplied)
-                + " to an injected connection, which is already connected; "
-                "pass them where the connection is built, or drop connection="
+                f"RabbitMQSink cannot apply {', '.join(supplied)} to an injected connection, "
+                "which is already connected; pass them where the connection is built, or drop "
+                "connection="
             )
         self._bounds = {
             name: require_timeout(value, name, "RabbitMQSink")

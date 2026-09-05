@@ -499,5 +499,6 @@ def test_the_borrowed_clause_appears_only_when_the_connection_is_broken(
 @pytest.mark.parametrize("bad", [0, -1, -5])
 def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
     """`0` spent the full retry budget and its backoffs on every batch, failing the same way."""
-    with pytest.raises(ValueError, match="PostgresSink chunk_size must be a positive integer"):
+    with pytest.raises(ValueError, match="PostgresSink chunk_size must be a positive integer") as info:
         PostgresSink("logs", connection=FakeConnection(), chunk_size=bad)
+    assert repr(bad) in str(info.value)

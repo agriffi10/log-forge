@@ -150,10 +150,8 @@ class LogstashSink:
             unusable = sorted(n for n, v in socket_only.items() if v is not None)
             if unusable:
                 raise ValueError(
-                    "LogstashSink cannot apply "
-                    + ", ".join(unusable)
-                    + " to the HTTP backend that url= selects; "
-                    "drop them, or drop url= to use the socket backend"
+                    f"LogstashSink cannot apply {', '.join(unusable)} to the HTTP backend that "
+                    "url= selects; drop them, or drop url= to use the socket backend"
                 )
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
@@ -163,10 +161,9 @@ class LogstashSink:
         elif host is not None and port is not None:
             if http_kwargs:
                 raise ValueError(
-                    "LogstashSink cannot apply "
-                    + ", ".join(sorted(http_kwargs))
-                    + " to the socket backend that host= and port= select; "
-                    "drop them, or pass url= to use the HTTP backend"
+                    f"LogstashSink cannot apply {', '.join(sorted(http_kwargs))} to the socket "
+                    "backend that host= and port= select; drop them, or pass url= to use the "
+                    "HTTP backend"
                 )
             self._http = None
             self._socket = SocketTransport(

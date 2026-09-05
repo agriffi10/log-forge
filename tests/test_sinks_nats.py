@@ -584,7 +584,7 @@ def test_a_non_positive_reconnect_bound_is_refused(monkeypatch, bad: int) -> Non
     faithfully and documented the hazard; section 12 recorded that refusing it was "a small
     breaking change" waiting for a major version, and 1.0 is that version.
     """
-    with pytest.raises(ValueError, match="max_reconnect_attempts"):
+    with pytest.raises(ValueError, match="max_reconnect_attempts must be positive"):
         _build(monkeypatch, max_reconnect_attempts=bad)
 
 

@@ -869,7 +869,8 @@ close it.
   *diagnostic* is damped to one line per outage on `PostgresSink._reconnect_if_broken`'s rule, so
   what remains is I/O rather than noise. The time trigger is already damped by its re-arm.
   **Closed by** deferring the next attempt until the file has grown by another `max_bytes`, which
-  trades a rotation the caller asked for against the retry cost.- **`MongoDBSink` bounds `pymongo`'s socket wait at 30 s; the server-selection wait stays the
+  trades a rotation the caller asked for against the retry cost.
+- **`MongoDBSink` bounds `pymongo`'s socket wait at 30 s; the server-selection wait stays the
   driver's** (SPEC-049 FR-005). `pymongo`'s `socketTimeoutMS` default is `None` — a read that
   never returns holds the drain thread for good; SPEC-049's authoring measured `emit` at 60.66 s
   for two attempts against a peer that accepts TCP and never replies, 3.12 s with a bound. The
