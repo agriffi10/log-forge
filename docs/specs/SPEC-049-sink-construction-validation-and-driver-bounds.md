@@ -1,8 +1,8 @@
 # Spec: Sink Construction Validation and Driver Bounds
 
 **ID:** SPEC-049
-**Status:** Draft
-**Last Updated:** 2026-09-04
+**Status:** Completed
+**Last Updated:** 2026-09-05
 **Depends On:** SPEC-021, SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048
 
 ## Overview
@@ -31,9 +31,10 @@ recorded and deferred to "a major version that can refuse it" — which 1.0 is.
 
 ### In Scope
 
-- Construction-time refusal of degenerate timeouts, chunk sizes and rotation bounds across
-  `HTTPSink`, `SocketTransport`, `ClickHouseSink`, `PostgresSink`, `GooglePubSubSink` and
-  `RotatingFileSink`, under the floor-vs-refuse rule FR-001 states once for all of them.
+- Construction-time refusal of degenerate timeouts, chunk sizes and the one rotation bound that
+  destroys data, across `HTTPSink`, `SocketTransport`, `ClickHouseSink`, `PostgresSink`,
+  `GooglePubSubSink` and `RotatingFileSink`, under the floor-vs-refuse rule FR-001 states once
+  for all of them — which also sorts two `RotatingFileSink` bounds onto the *floor* side (FR-003).
 - Rejection of CR/LF in a caller's header name, header value **or bearer token**, and of a URL
   whose scheme is not `http`/`https`.
 - Extending SPEC-043's rule — an argument no backend can use is an error, not a silent ignore — to
@@ -46,11 +47,13 @@ recorded and deferred to "a major version that can refuse it" — which 1.0 is.
 - Two literal prose defects in `sinks/`: a `@staticmethod`, and a docstring paragraph dedented to
   column 0.
 
-**Above the 3–6 aim at seven FRs, deliberately.** Six are one rule — *the library refuses at
-construction what it cannot make work* — applied to six populations that share a test corpus and a
-single new helper; splitting them would put the same helper's fixture corpus in two specs. The
-seventh (FR-007) is prose only and rides along because it touches the same files. The reviewer may
-reject this.
+**Above the 3–6 aim at seven FRs, deliberately.** Four (FR-001–004) are one rule — *the library
+refuses at construction what it cannot make work* — applied to four populations that share one
+mutation corpus and one new helper; splitting them would put the same helper's corpus in two specs.
+FR-005 adds the three arguments that rule refuses when new, and depends on the helper. FR-006 and
+FR-007 are a diagnostic count and prose, riding along because they touch the same files. Were it
+ever split, the seam is FR-005 with its §12 rows as a driver-bounds spec; it is not required here.
+The reviewer may reject this.
 
 ### Out of Scope
 
@@ -70,7 +73,8 @@ reject this.
   `NATSSink(publish_timeout=-1)` keep falling back to their module defaults, because that
   configuration **works today** and FR-001's rule protects it. This is the answer to "two rules
   for one question": there is one rule, stated in FR-001, and those two are on the floor side of
-  it.
+  it — and FR-002 puts `GooglePubSubSink(overflow_timeout=)` beside them as a third caller, for
+  the same reason.
 - Validating an Elasticsearch index name beyond whitespace. The audit recorded whitespace there as
   frame corruption; it is not — `json.dumps` escapes the `_bulk` action line correctly and a name
   the cluster rejects already arrives as a counted per-item error. The refusal is kept because it
@@ -97,7 +101,8 @@ reject this.
 #### Description:
 
 **The rule, stated once for this whole spec.** The library already *floors* several degenerate
-arguments — `max_retries` at zero in six sinks, `max_batch_count` at one, `PostgresSink`'s
+arguments — `max_retries` at zero in every sink with a retry loop (`grep 'max(max_retries, 0)'
+src/log_foundry/sinks/`), `max_batch_count` at one, `PostgresSink`'s
 `connect_timeout` at libpq's minimum of two, and `KafkaSink`/`NATSSink`'s timeouts back to their
 module defaults through `_retry.usable_timeout`. That is not a second rule competing with this
 spec's refusals; it is the same rule's other half:
@@ -112,8 +117,10 @@ no working configuration to break. That is why `KafkaSink(flush_timeout=-1)` kee
 while `RabbitMQSink(blocked_connection_timeout=-1)` will raise: the first works, the second is new.
 
 Applied here: `HTTPSink.__init__` stores `timeout`, `headers`, `auth` and `url` verbatim. A
-`timeout` of `-1`, `0`, `nan` or `inf` reaches `urlopen` and raises `ValueError` from inside `emit`
-on every batch; CR or LF in a header name or value does the same from `http.client`; a bearer token
+`timeout` of `-1` or `nan` reaches `urlopen` and raises a raw `ValueError` from inside `emit` on
+every batch, `inf` raises a raw `OverflowError` from the same place, and `0` fails every connection
+before it opens — four values, none of which delivers, so none is a floor candidate; CR or LF in a
+header name or value raises a raw `ValueError` from `http.client`; a bearer token
 containing CR/LF is written straight into `Authorization` in `http.py::HTTPSink._apply_auth`, which
 is the same
 header injection in the argument with the highest consequence; and a URL whose scheme is not
@@ -135,7 +142,9 @@ so the obvious pair of comparisons lets it through).
       base64-encoded before it reaches the header — a test pins that, so the asymmetry is
       deliberate rather than an oversight.
 - [ ] `HTTPSink("file:///etc/passwd")` and `HTTPSink("ftp://h/x")` raise `ValueError` naming the
-      scheme; `http://` and `https://` construct.
+      scheme; `http://` and `https://` construct. `HTTPSink("http:///x")` — a scheme and no host —
+      raises too, and `HTTPSink(url, timeout=None)` raises a `TypeError` naming `timeout` rather
+      than an unnamed one from the comparison (both added by the system-frame diff review).
 - [ ] Every sink built on `HTTPSink` inherits the refusal — a roster test derived from the module
       list asserts each subclass rejects `timeout=-1`, so a new subclass cannot opt out.
 - [ ] `KafkaSink(flush_timeout=-1)` and `NATSSink(publish_timeout=-1)` still construct and still
@@ -158,6 +167,15 @@ backoffs per batch failing the same way. `GooglePubSubSink(overflow_timeout=nan)
 `_out_of_time` compare against `nan`, which is `False` forever, so the deadline loop that bounds
 `flush()` and `_await_overflow` has no bound at all.
 
+`overflow_timeout` is **floored, not refused**, and is the one argument in this FR on that side of
+FR-001's rule. Measured: `inf` and `nan` *deliver* against a healthy client — six of six, `losses()`
+at zero — because the bound they remove only matters once the client stalls; `0` fails every
+`flush()` with publishes in flight. That is exactly `KafkaSink(flush_timeout=)`'s shape, an existing
+timeout whose degenerate values include some that work, and SPEC-047 floored every one of them to
+the module default through `_retry.usable_timeout` rather than sorting them. Refusing `inf` here
+while flooring it there would be two rules for one value, so `GooglePubSubSink` becomes the third
+`usable_timeout` caller: `nan`, `inf`, `0` and negatives fall back to `DEFAULT_OVERFLOW_TIMEOUT`.
+
 **Refusing the argument closes the route, not the shape.** `chunk_list` yields nothing for a
 negative size, so `ClickHouseSink.emit` reaches `if chunks and not inserted` with `chunks == 0`,
 returns normally, and a whole batch is gone with `losses()` at zero. Refusing `chunk_size <= 0`
@@ -172,26 +190,47 @@ gains the `ValueError` its own docstring already claims it raises.
       for both `transport="tcp"` and `transport="udp"`.
 - [ ] `ClickHouseSink(chunk_size=n)` and `PostgresSink(chunk_size=n)` raise `ValueError` for `0`
       and for any negative `n`; a positive value constructs.
-- [ ] With `chunk_size` monkeypatched to `-5` **after** construction — the route the refusal cannot
-      close — `ClickHouseSink.emit` of a non-empty batch raises `SinkDeliveryError` rather than
-      returning, and the message says no chunk was produced.
+- [ ] With `clickhouse.chunk_list` patched to yield nothing, `ClickHouseSink.emit` of a non-empty
+      batch raises `SinkDeliveryError` and the message says no chunk was produced. ~~With
+      `chunk_size` monkeypatched to `-5` after construction~~ — struck, see Revision history: that
+      route now raises a raw `ValueError` out of `chunk_list` before the guard is reached.
 - [ ] `chunk_list(items, 0)` and `chunk_list(items, -1)` raise `ValueError`, making the existing
       docstring true.
-- [ ] `GooglePubSubSink(overflow_timeout=t)` raises `ValueError` for `nan`, `inf`, `0` and
-      negatives.
+- [ ] With `postgres.chunk_list` patched to yield nothing, `PostgresSink.emit` of a non-empty batch
+      raises `SinkDeliveryError` saying no chunk was produced and commits nothing — the
+      `ClickHouseSink` guard's twin, which the first draft named as a chunking twin and did not
+      guard (system-frame diff review).
+- [ ] The rule's other sibling sites, found by the same review by sweeping every numeric
+      constructor argument in `sinks/` and running each degenerate value: `SocketTransport(port=)`
+      outside `0`–`65535` and `(max_datagram_bytes<=0)` raise (the first raised a raw
+      `OverflowError` out of every UDP `sendto`, the second delivered nothing over UDP);
+      `HTTPSink(max_batch_bytes<=0)` raises rather than flooring to `1`, which delivered nothing;
+      `RedisStreamsSink(maxlen<=0)`, `RedisListSink(maxlen<=0)` and `MemorySink(maxlen<=0)` raise
+      (a negative list `maxlen` became `LTRIM key N -1` and emptied a short list on every batch);
+      `HTTPSink(body_format="xml")` raises as `LogstashSink` already did.
+- [ ] `GooglePubSubSink(overflow_timeout=t)` **constructs** for `nan`, `inf`, `0` and `-1`, with
+      `overflow_timeout == DEFAULT_OVERFLOW_TIMEOUT`, and `overflow_timeout=2.5` is kept — the
+      third floor-side pin beside FR-001's two.
 - [ ] Every message names the offending argument and the value received.
-- [ ] Serves invariants 13 and 7: the refusals are at construction, and the `chunks == 0` guard
-      makes a batch that produced no chunks raise rather than return having delivered nothing.
+- [ ] Serves invariants 13, 7 and 3: the refusals are at construction, the `chunks == 0` guard
+      makes a batch that produced no chunks raise rather than return having delivered nothing, and
+      the floored `overflow_timeout` keeps every pubsub wait bounded.
 
 ### FR-003: `RotatingFileSink` refuses a rotation bound that destroys data
 
 #### Description:
 
-`RotatingFileSink` accepts `interval<=0`, `max_bytes<0` and `backup_count<0`. `interval=0` and
-negatives put the rollover deadline permanently in the past, so `_should_rotate` fires on every
-event: measured, three emits of five events left **two** lines on disk out of fifteen. A negative
-`max_bytes` disables the size trigger by accident rather than by the documented `0`, and a negative
-`backup_count` behaves identically to `0` while reading as "keep some".
+`RotatingFileSink` accepts `interval<=0`, `max_bytes<0` and `backup_count<0`, and **FR-001's rule
+sorts them into two groups, not one.** `interval=0` and negatives put the rollover deadline
+permanently in the past, so `_should_rotate` fires on every event: measured, three emits of five
+events left **two** lines on disk out of fifteen. That destroys data, so it is refused.
+
+`max_bytes<0` and `backup_count<0` are **floored to `0`, not refused.** Both *work* today:
+`_should_rotate` tests `self._max_bytes > 0` and `_rotate` tests `self._backup_count > 0`, so a
+negative behaves identically to the documented `0` — measured, a sink built with `-1` and one built
+with `0` leave the same files at the same sizes. Under FR-001's rule they are on the floor side, and
+refusing a configuration that delivers would be the breaking change at 1.0 that rule exists to
+prevent; flooring is a behavioural no-op that makes the stored value legible.
 
 `max_bytes=0` and `backup_count=0` stay valid: both are documented switches, not mistakes.
 
@@ -205,11 +244,13 @@ time trigger is armed, and named here so it is a decision rather than a side eff
       `interval=1` constructs.
 - [ ] `RotatingFileSink(path, when=None, interval=0)` also raises, and the message says the
       interval is invalid regardless of whether a unit was given.
-- [ ] `RotatingFileSink(path, max_bytes=-1)` and `(path, backup_count=-1)` each raise `ValueError`;
-      `max_bytes=0` and `backup_count=0` construct and behave exactly as documented.
+- [ ] `RotatingFileSink(path, max_bytes=-1)` and `(path, backup_count=-1)` **construct**, floored to
+      `0`, and behave exactly as `0` does — asserted on the files left on disk, not on the attribute
+      alone. `max_bytes=0` and `backup_count=0` are unchanged.
 - [ ] The existing rotation suite passes unchanged.
-- [ ] Serves invariants 13 and 2: a rotation bound that would delete written events is refused
-      where it is written, so no accepted event is lost to it.
+- [ ] Serves invariants 13 and 2: the rotation bound that would delete written events is refused
+      where it is written, so no accepted event is lost to it, and the two that work are floored
+      rather than refused, keeping invariant 13's rule to arguments *no backend can use*.
 
 ### FR-004: An argument no backend can use is an error, not a silent ignore
 
@@ -222,16 +263,25 @@ SPEC-043 settled this and `NATSSink` partly implements it. Six violations remain
 `transport` and `max_datagram_bytes` have non-`None` defaults, which is SPEC-043's own recorded
 limit — an explicit value is indistinguishable from the default — so both become `str | None` and
 `int | None`, as `host` and `port` already are, which is what makes the rule total rather than
-partial.
+partial. The rule has a reverse direction too: `LogstashSink(host=…, port=…, auth="tok")`,
+`headers=`, `gzip=` or any other `**http_kwargs` key constructs into socket mode and the keyword is
+never forwarded, because `SocketTransport` takes none of them. That is the same silent ignore with
+the backends swapped, and is refused on the same path. `body_format` is not in that set: it is a
+documented no-effect switch in socket mode, validated in both modes on purpose (the class docstring
+says why), so passing it there is not an argument no backend can use.
 
 `SentrySink._parse_dsn` documents `Raises: ValueError: If the DSN cannot be parsed as a URL`, but
 `urlparse` almost never raises: `"https:///project"` yields no host and `"https://host/1"` yields
-no public key, and the sink then posts every event to a URL that cannot exist. Scheme, host and
-key must all be present.
+no public key, and the sink then posts every event to a URL that cannot exist. Scheme, host, key
+and project id must all be present. The DSN is validated **where it is parsed**, which is every
+construction that builds the HTTP fallback — and not on `backend="sdk"`, where `_parse_dsn` is
+never called and `_dsn` is never read (the envelope header that carries it belongs to the fallback
+that backend does not build). Refusing a value that has no effect would invent a failure rather
+than report one, the opposite of this spec's rule.
 
 `SyslogSink(app_name=)` is interpolated raw into a space-delimited RFC 5424 header
-(`syslog.py:229`), so whitespace shifts PROCID, MSGID and STRUCTURED-DATA for every message —
-corruption no counter sees. An **empty** `app_name` shifts them identically and is refused on the
+(`syslog.py::SyslogSink._frame`), so whitespace shifts PROCID, MSGID and STRUCTURED-DATA for every
+message — corruption no counter sees. An **empty** `app_name` shifts them identically and is refused on the
 same path. `ElasticsearchSink(index=)` is different, and the difference is stated because the audit
 got it wrong: the action line is built with `json.dumps`
 (`elasticsearch.py::ElasticsearchSink._render`), so the NDJSON
@@ -253,6 +303,9 @@ SPEC-021.
       `port=`, `transport=` and `max_datagram_bytes=`, each passed explicitly.
 - [ ] `LogstashSink(url=…, transport="tcp")` — the *default* value, passed explicitly — raises,
       which is the case the `str | None` change exists to make reachable.
+- [ ] `LogstashSink(host=…, port=…, auth="t")`, `(…, headers={"X": "1"})` and `(…, gzip=True)`
+      each raise `ValueError` naming the HTTP-only argument; `(host=…, port=…, body_format="ndjson")`
+      still constructs.
 - [ ] `LogstashSink(url=…)` alone and `LogstashSink(host=…, port=…)` alone both construct, and the
       socket backend still receives the transport and datagram bound it did before.
 - [ ] `SentrySink(dsn="https:///project")` and `SentrySink(dsn="https://host/1")` raise
@@ -262,9 +315,20 @@ SPEC-021.
 - [ ] A well-formed DSN produces exactly the ingest URL and auth header it produces today, pinned
       as two literal strings.
 - [ ] `SyslogSink(app_name="my app")`, `("my\tapp")`, `("a\nb")` and `("")` each raise `ValueError`.
-- [ ] `ElasticsearchSink(index="my index")` raises on the same whitespace test.
+- [ ] `ElasticsearchSink(index="my index")` and `ElasticsearchSink(index="")` raise on the same
+      test as `SyslogSink`'s — an empty name is one the cluster can never accept either.
 - [ ] `NATSSink(client=X, servers=…)` raises, joining the four connect arguments already refused
-      there; `NATSSink(max_reconnect_attempts=n)` raises for `0` and negatives.
+      there. `servers` is checked from a structure separate from the forwarded `supplied` dict,
+      because `nats.connect(servers or …, **supplied)` would otherwise receive it twice.
+- [ ] `NATSSink(max_reconnect_attempts=n)` raises for `0` and negatives, built **without**
+      `client=` through the `nats` stand-in `test_a_falsy_connect_bound_is_still_forwarded` uses,
+      asserting the new message — with `client=` the SPEC-043 conflict guard raises first and a
+      type-only assertion would pass against the wrong guard. This **supersedes** SPEC-047, which
+      forwarded a falsy value deliberately and measured why: that test and the constructor
+      docstring's sentence "Passed through rather than corrected here, because overriding a
+      driver's documented behaviour would surprise a caller who knows it." are struck in place per
+      SPEC-021, never deleted — a newly false docstring shipped in the same diff as FR-007 would be
+      the defect that FR exists to remove.
 - [ ] `architecture.md` §12's two entries are struck through in place and marked closed by
       SPEC-049, rather than deleted.
 - [ ] Every refusal is at construction, not at first emit.
@@ -293,9 +357,26 @@ exposed on the same `None`-default terms.
 
 `pika.URLParameters` takes only a URL — the option is an attribute, and pika parses
 `?blocked_connection_timeout=` out of the URL query into it. So the library's default applies only
-when the URL named nothing, rather than overriding a value the caller wrote. That is deliberately
-*not* `PostgresSink`'s behaviour, which documents that it overrides a DSN's `connect_timeout`: pika
-lets the two be told apart and libpq did not.
+when the URL named nothing, rather than overriding a value the caller wrote; an **explicit** keyword
+does override the URL, as setting the attribute after parsing always has. The bound is applied
+inside `RabbitMQSink._connect`, which has two callers — `__init__` and the reconnect path in
+`_active_channel` — and two parameter constructors, `URLParameters(url)` and a bare
+`ConnectionParameters()` when no URL was given; placing it there is what makes a reconnect keep it
+and the no-URL path get it. That is deliberately *not* `PostgresSink`'s behaviour, which documents
+that it overrides a DSN's `connect_timeout`: pika lets the two be told apart and libpq did not.
+
+`pymongo` has the same question and the obvious implementation answers it wrongly: measured,
+`MongoClient("mongodb://h/?socketTimeoutMS=5000", socketTimeoutMS=30000)` resolves to **30 s**, so
+a keyword silently overrides a URI option the caller wrote. The same precedence as pika, then: the
+library's default applies only when the URI's query names no `socketTimeoutMS` (matched
+case-insensitively, since pymongo does), an explicit `socket_timeout=` overrides the URI, and the
+same for `server_selection_timeout=`. The query is read with `urllib.parse`, not
+`pymongo.uri_parser.parse_uri`, because the latter resolves `mongodb+srv://` over DNS and a
+constructor must not. `socket_timeout` is `socketTimeoutMS` in this library's units and case —
+seconds, snake case, forwarded as `int(seconds * 1000)` — because every sibling timeout in the
+package is seconds and a milliseconds keyword would be the only one; the register's
+vendor-spelling clause froze the existing names rather than mandating a vendor's casing for a new
+one.
 
 Every new argument follows SPEC-043: passing one alongside `client=`/`connection=` raises, because
 an already-connected client cannot consume it. The `None` default is what makes that decidable —
@@ -305,12 +386,16 @@ instead, which the docstring says.
 
 #### Acceptance Criteria:
 
-- [ ] `MongoDBSink(uri=…)` with no client passes `socketTimeoutMS` derived from
-      `DEFAULT_SOCKET_TIMEOUT` to `MongoClient`, asserted through an injected client factory rather
-      than a live server.
+- [ ] `MongoDBSink(uri="mongodb://h/db")` with no client passes the literal
+      `socketTimeoutMS=30000` to `MongoClient`, asserted through an injected client factory rather
+      than a live server; `uri="mongodb://h/db?socketTimeoutMS=5000"` passes **no**
+      `socketTimeoutMS` keyword; `socket_timeout=2.0` beside that URI passes `2000`.
 - [ ] `RabbitMQSink(url=…)` with no connection sets `blocked_connection_timeout` on the parameters
-      object; a URL carrying `?blocked_connection_timeout=60` keeps `60`, asserted through an
-      injected `pika` stand-in.
+      object; a URL carrying `?blocked_connection_timeout=60` keeps `60`; an explicit
+      `blocked_connection_timeout=7` beside that URL sets `7`; with **no** URL the bare
+      `ConnectionParameters()` gets the default too — all through an injected `pika` stand-in.
+- [ ] The bound is set on the parameters `_connect` builds for a **reconnect** as well as at
+      construction, asserted by dropping the connection and emitting again.
 - [ ] `ClickHouseSink(send_receive_timeout=30)` forwards `send_receive_timeout=30`;
       `ClickHouseSink()` with no value forwards **no** `send_receive_timeout` key at all.
 - [ ] Passing any new argument alongside `client=`/`connection=` raises `ValueError` naming them,
@@ -331,8 +416,8 @@ instead, which the docstring says.
 
 #### Description:
 
-`SocketTransport._send_one` writes `{self._max_retries + 1} attempt(s)` unconditionally
-(`_socket.py:338`), so a message abandoned after **one** send on a permanent errno — the
+`SocketTransport._send_one` writes `{self._max_retries + 1} attempt(s)` unconditionally in its
+abandonment line, so a message abandoned after **one** send on a permanent errno — the
 `_PERMANENT_ERRNOS` branch, which skips the remaining attempts by design — is reported as four.
 `HTTPSink._request` already passes `attempt + 1` and reports the truth. A diagnostic that
 overstates is one an operator uses to reach the wrong conclusion, which is the whole reason
@@ -340,7 +425,9 @@ SPEC-029 put the rules in one module.
 
 #### Acceptance Criteria:
 
-- [ ] A UDP send failing with `EMSGSIZE` on the first attempt writes `1 attempt(s)`.
+- [ ] A UDP send failing with `EMSGSIZE` on the first attempt writes `1 attempt(s)` — injected as
+      an `OSError(errno.EMSGSIZE)` from the socket for a frame **under** `max_datagram_bytes`,
+      because an oversized frame is dropped by `_sendable` and never reaches an attempt.
 - [ ] A send failing with a retryable errno on every attempt still writes `max_retries + 1`.
 - [ ] The two cases are asserted in one test file with the same `max_retries`, so a change that
       collapses them fails.
@@ -371,9 +458,12 @@ extreme.
 
 - [ ] `_rollover_seconds` is a module-level function, and no `@staticmethod` remains in
       `src/log_foundry/`, asserted by an AST test rather than by grep.
-- [ ] `_reconnect_if_broken`'s docstring has no line at column 0 after the opening quotes;
-      an AST test over `src/` asserts that of every docstring, so the class is closed rather than
-      the instance.
+- [ ] `_reconnect_if_broken`'s docstring has no line at column 0 after the opening quotes; an
+      AST test over `src/` asserts that of every **class, function and method** docstring, so the
+      class is closed rather than the instance. Module docstrings and module-level attribute
+      docstrings are excluded by construction — both legitimately sit at column 0 — and the test
+      is a pytest test rather than a `docstring-lint.py` check because pytest runs in CI and that
+      linter is local-only.
 - [ ] `LoggingSink.emit`'s docstring names the default-`handleError` case as unobservable and the
       re-raising case as observable, and a test exercises both: a handler absorbing its own failure
       leaves `emit` returning, and one re-raising propagates.
@@ -392,7 +482,7 @@ def require_timeout(value: float, name: str, owner: str) -> float: ...
 def require_positive(value: int, name: str, owner: str) -> int: ...
 
 # sinks/mongodb.py
-DEFAULT_SOCKET_TIMEOUT = 30.0                # pymongo's own default is None
+DEFAULT_SOCKET_TIMEOUT = 30.0                # seconds; forwarded as socketTimeoutMS=30000 — pymongo's own default is None
 
 # sinks/rabbitmq.py
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 30.0    # pika's own default is None
@@ -457,12 +547,16 @@ docs/architecture.md   # FR-004 strikes in §12, FR-005 rows in §12
 - `require_timeout` / `require_positive` in `_retry.py`, with tests including `NaN`, and the
   floor-vs-refuse rule written into `require_timeout`'s docstring beside `usable_timeout`'s.
 - Apply to `HTTPSink` (timeout, headers, auth, URL scheme); add the subclass roster test and the
-  two floor-side pins.
+  two floor-side pins. The roster is **named, not floored**, and reuses
+  `tests/test_public_surface.py::_http_sink_subclasses()`, which walks inheritance transitively:
+  `OpenSearchSink` inherits through `ElasticsearchSink` and is invisible to a direct scan of
+  `class X(HTTPSink)`, so a scan-derived roster would silently be one short.
 
 ### Phase 2: The remaining refusals (FR-002, FR-003, FR-004)
 
 - `SocketTransport`, `ClickHouseSink` (plus the `chunks == 0` guard), `PostgresSink`,
-  `GooglePubSubSink`, `chunk_list`, `RotatingFileSink`.
+  `GooglePubSubSink`, `chunk_list`, `RotatingFileSink` (`interval` refused; `max_bytes` and
+  `backup_count` floored).
 - `LogstashSink` (four arguments, two default changes), `SentrySink`'s DSN, `SyslogSink`,
   `ElasticsearchSink`, and the two `NATSSink` items with their §12 strikes.
 
@@ -488,6 +582,55 @@ against the wrong guard firing. Restore each mutant by copying from the scratchp
 `git checkout --`.
 
 ## Revision history
+
+**Revised 2026-09-05, before its build, on `main` at `212fd16`.** Every construction the Overview
+and the FRs name was re-probed there and still constructs; `ClickHouseSink(chunk_size=-5)` still
+returns from `emit` with zero inserts and `losses()` at zero; `interval=0` still leaves two of
+fifteen lines; and the three drivers' defaults were re-read from the installed packages
+(`pymongo` `socketTimeoutMS` `None`, `pika` `blocked_connection_timeout` `None` and parsed from the
+URL query, `clickhouse-connect` `send_receive_timeout` `300`). Four corrections were folded in,
+each originating in the plan review of an earlier, unpushed build attempt (2026-09-02) and each
+re-verified here rather than carried: **FR-003** now floors `max_bytes<0` and `backup_count<0`
+instead of refusing them, because a sink built with `-1` is measurably indistinguishable from one
+built with `0` and FR-001's own rule puts a working value on the floor side — the first draft
+refused two values that work in the same breath as it asserted "floor what works". **FR-002**'s
+criterion that monkeypatched `chunk_size` to `-5` after construction was unsatisfiable: once
+`chunk_list` refuses a non-positive size, that route raises a raw `ValueError` out of the
+generator's first `next()`, inside the emit lock, before `emit` reaches the `chunks == 0` guard —
+the two changes in the FR cancelled each other, so the test patches `chunk_list` instead.
+**FR-004** now says the Sentry DSN is validated where it is parsed rather than on every backend
+(`backend="sdk"` never parses or reads it), and says out loud that the NATS refusal supersedes a
+shipped SPEC-047 test and docstring, which the earlier text did not. **FR-001**'s description
+said all four degenerate timeouts raise `ValueError`; measured, `inf` raises `OverflowError` and
+`0` fails the connection instead, so the sentence now says what each does. The two remaining line
+anchors (`syslog.py:229`, `_socket.py:338`) became symbol anchors, finishing what the 2026-09-04
+audit's N9 started.
+
+**Diff reviews (criteria frame at `4c79af6`, system frame at `35a1892`):** the first found the
+`HTTPSink` constructor still documenting `Raises: None.` and the subclass roster building five of
+the seven sinks it named; both fixed. The second swept every numeric constructor argument in
+`sinks/` (52 sites), ran each degenerate value, and found the rule left unapplied on six sibling
+sites and one named twin — `PostgresSink`'s chunk loop committed an empty transaction with the
+chunker yielding nothing, `SocketTransport`'s `port` and `max_datagram_bytes`, `HTTPSink`'s
+`max_batch_bytes` (whose floor at `1` delivered nothing, so the docstring's "for the same reason"
+as the count floor was false), the two Redis sinks' and `MemorySink`'s `maxlen`, and
+`HTTPSink(body_format=)`. All are refused now, under FR-001's rule, and listed under FR-001,
+FR-002 and FR-004 above so the criteria describe what shipped. Rejected in one sentence: naming the
+wrapper rather than `SocketTransport` in a refusal reached through `SyslogSink` or `LogstashSink`
+— the argument name is right and the inner class is real, so triplicating the check buys nothing.
+
+**Spec review of the 2026-09-05 revision:** one blocking finding, seven should-fix, five nits;
+all accepted but half of one. The blocking one was an Open Question in declarative clothes:
+FR-005 decided URL-versus-keyword precedence for `pika` and said nothing for `pymongo`, where the
+obvious implementation lets a keyword silently override a URI option the caller wrote (measured).
+The should-fix that changed behaviour was FR-002's `overflow_timeout`: `inf` and `nan` *deliver*
+against a healthy client, so under FR-001's rule they are floor candidates, and refusing them while
+`KafkaSink` floors the same values would have been two rules for one value — it is now floored, the
+third `usable_timeout` caller. FR-004 gained the reverse direction of the Logstash silent ignore
+(HTTP-only keywords in socket mode), which the "total rather than partial" sentence had claimed and
+not delivered. The half rejected: moving FR-007's column-0 check into `docstring-lint.py` — pytest
+runs in CI and that linter does not, so the pytest test is the stronger gate; the scoping to
+class and function docstrings was taken.
 
 Revised, not replaced, after its spec review; four blocking findings and nine should-fix, all
 accepted.

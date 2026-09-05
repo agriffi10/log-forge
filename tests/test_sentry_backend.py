@@ -667,3 +667,28 @@ def test_the_close_flush_is_not_suppressed_on_a_repeat_close() -> None:
     sink.close()
     assert client.flushes == 2, "the second close flushes what the second emit captured"
     assert len(client.events) == 2
+
+
+# --- SPEC-049 FR-004: the DSN refusal that makes _parse_dsn's docstring true --------------------
+
+
+@pytest.mark.parametrize(
+    ("dsn", "missing"),
+    [
+        ("not-a-dsn", "scheme"),
+        ("https:///project", "host"),
+        ("https://host/1", "public key"),
+        ("https://key@host/", "project id"),
+    ],
+)
+def test_a_malformed_dsn_is_refused_at_construction(dsn: str, missing: str) -> None:
+    """`_parse_dsn` documented a ValueError and `urlparse` almost never raises one.
+
+    A DSN with no scheme, host or public key parsed happily into `://None/api//envelope/` with an
+    auth header reading `sentry_key=None`, and the sink posted every event to a URL that cannot
+    exist, for the life of the process. Asserting the **DSN message** rather than just the type
+    matters here: FR-001's scheme check would refuse `"not-a-dsn"` anyway, so a type-only
+    assertion on that case would be testing FR-001.
+    """
+    with pytest.raises(ValueError, match=f"dsn is missing its.*{missing}"):
+        SentrySink(dsn=dsn, backend="http", opener=FakeOpener())

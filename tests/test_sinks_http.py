@@ -427,9 +427,17 @@ def test_a_413_is_not_split_for_a_caller_that_cannot_split(capsys) -> None:
     assert "HTTP 413" in capsys.readouterr().err
 
 
-def test_max_batch_bounds_are_floored_so_a_zero_cannot_discard_the_batch() -> None:
-    sink = HTTPSink("http://x", max_batch_count=0, max_batch_bytes=-5)
-    assert (sink.max_batch_count, sink.max_batch_bytes) == (1, 1)
+def test_max_batch_count_is_floored_so_a_zero_cannot_discard_the_batch() -> None:
+    """~~`max_batch_count=0, max_batch_bytes=-5` both floor to 1.~~
+
+    **Superseded in part by SPEC-049** (system-frame diff review): the count half stands — a count
+    of one still delivers one event per request, so it is on FR-001's floor side — but the bytes
+    half is struck, because a one-byte body ceiling made every event oversized and delivered
+    nothing. A floor that lands on a value that delivers nothing is a refusal in a floor's clothes,
+    so `max_batch_bytes<=0` is refused now (`test_a_non_positive_byte_ceiling_is_refused_not_floored`).
+    """
+    sink = HTTPSink("http://x", max_batch_count=0)
+    assert sink.max_batch_count == 1
 
 
 def test_six_thousand_events_in_one_emit_become_many_bounded_real_requests() -> None:
@@ -771,3 +779,143 @@ def test_a_per_request_content_encoding_does_not_suppress_gzip() -> None:
     call = opener.calls[0]
     assert call["headers"]["content-encoding"] == "gzip", "the sink's own gzip still wins"
     assert gzip.decompress(call["body"])
+
+
+# --- SPEC-049 FR-001: the HTTP family refuses what it cannot use ------------------------------
+
+
+@pytest.mark.parametrize("bad", [-1, 0, float("nan"), float("inf")])
+def test_an_unusable_timeout_is_refused_at_construction(bad: float) -> None:
+    """It used to reach `urlopen` and raise a raw `ValueError` from inside `emit`, every batch.
+
+    Uncounted and forever: nothing but `health().failed_batches` moved, and the caller was
+    standing at `configure()` when the mistake was made and heard nothing about it.
+    """
+    with pytest.raises(ValueError, match="timeout") as info:
+        HTTPSink("http://x", timeout=bad)
+    assert repr(bad) in str(info.value), "the message names the value received"
+
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X": "a\r\nInjected: 1"},
+        {"X\r\nInjected": "1"},
+        {"X": "a\nb"},
+        {"X": "a\rb"},
+        {"X\nY": "1"},
+    ],
+)
+def test_a_crlf_header_is_refused_at_construction(headers: dict) -> None:
+    """`http.client` raises on these from inside `emit`; refusing here also stops the injection."""
+    with pytest.raises(ValueError, match="CR or LF"):
+        HTTPSink("http://x", headers=headers)
+
+
+def test_a_crlf_bearer_token_is_refused() -> None:
+    """The token goes into `Authorization` verbatim, so it is the injection with the most at stake."""
+    with pytest.raises(ValueError, match="auth token"):
+        HTTPSink("http://x", auth="tok\r\nInjected: 1")
+
+
+def test_a_basic_auth_pair_containing_crlf_is_accepted() -> None:
+    """The asymmetry is deliberate, and pinned so it does not read as an oversight.
+
+    The `(user, password)` form is base64-encoded before it reaches the header, so a CR in it
+    cannot inject anything. Refusing it would be inventing a rule the wire does not need.
+    """
+    sink = HTTPSink("http://x", auth=("us\r\ner", "pa\nss"), opener=FakeOpener([FakeResponse(200)]))
+    sink.emit([{"a": 1}])
+    header = sink._opener.calls[0]["headers"]["authorization"]
+    assert header.startswith("Basic ") and "\r" not in header and "\n" not in header
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://h/x", "gopher://h", "x", ""])
+def test_a_non_http_url_is_refused_at_construction(url: str) -> None:
+    """`file://` raised a raw `TypeError` per batch; `ftp://` burned the whole retry budget."""
+    with pytest.raises(ValueError, match="http or https"):
+        HTTPSink(url)
+
+
+@pytest.mark.parametrize("url", ["http://h/x", "https://h/x", "HTTP://h/x"])
+def test_an_http_url_constructs(url: str) -> None:
+    assert HTTPSink(url).url == url
+
+
+def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
+    """SPEC-049 FR-001, named rather than floored — the roster test's own rule.
+
+    `test_public_surface.py` already derives this population transitively, because `OpenSearchSink`
+    inherits through `ElasticsearchSink` and is invisible to a direct `class X(HTTPSink)` scan. Its
+    docstring says why a floor is the wrong instrument: "A floor set below the real number lets
+    subclasses leave silently, which is the failure this whole roster exists to prevent." So this
+    names the seven and asserts the derivation still finds exactly them.
+    """
+    from test_public_surface import _http_sink_subclasses
+
+    derived = {f"{module}.{node.name}" for module, node in _http_sink_subclasses()}
+    assert derived == {
+        "datadog.DatadogSink",
+        "elasticsearch.ElasticsearchSink",
+        "elasticsearch.OpenSearchSink",
+        "honeycomb.HoneycombSink",
+        "loki.LokiSink",
+        "newrelic.NewRelicSink",
+        "splunk.SplunkHECSink",
+    }, f"the subclass population moved: {sorted(derived)}"
+
+    from log_foundry.sinks.datadog import DatadogSink
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+    from log_foundry.sinks.honeycomb import HoneycombSink
+    from log_foundry.sinks.loki import LokiSink
+    from log_foundry.sinks.newrelic import NewRelicSink
+    from log_foundry.sinks.splunk import SplunkHECSink
+
+    builders = (
+        lambda: DatadogSink("k", timeout=-1),
+        lambda: ElasticsearchSink("http://h", index="i", timeout=-1),
+        lambda: OpenSearchSink("http://h", index="i", timeout=-1),
+        lambda: HoneycombSink("k", dataset="d", timeout=-1),
+        lambda: LokiSink("http://h", timeout=-1),
+        lambda: NewRelicSink("k", timeout=-1),
+        lambda: SplunkHECSink("http://h", token="t", timeout=-1),
+    )
+    assert len(builders) == len(derived), "every named subclass is built, not a sample of them"
+    for build in builders:
+        with pytest.raises(ValueError, match="timeout"):
+            build()
+
+
+# --- SPEC-049, system-frame review: the family's other degenerate arguments ---------------------
+
+
+@pytest.mark.parametrize("url", ["http:///x", "http:", "https://"])
+def test_a_host_less_url_is_refused_at_construction(url: str) -> None:
+    """It passed the scheme check and failed every request with a counted URLError, forever."""
+    with pytest.raises(ValueError, match="url names no host"):
+        HTTPSink(url)
+
+
+def test_an_unknown_body_format_is_refused_rather_than_silently_rendered_as_ndjson() -> None:
+    """`LogstashSink(url=…, body_format="xml")` already refused this; the class it wraps did not."""
+    with pytest.raises(ValueError, match="HTTPSink body_format must be one of"):
+        HTTPSink("http://x", body_format="xml")
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_a_non_positive_byte_ceiling_is_refused_not_floored(bad: int) -> None:
+    """The floor at one was not the count floor's twin: a one-byte body delivers nothing.
+
+    Measured before the fix, `max_batch_bytes` of 0, -5 and 1 each dropped every event as
+    oversized and made zero requests, while `max_batch_count` floored to 1 still delivered one
+    event per request — so only the count is on FR-001's floor side.
+    """
+    with pytest.raises(ValueError, match="HTTPSink max_batch_bytes must be a positive integer") as info:
+        HTTPSink("http://x", max_batch_bytes=bad)
+    assert repr(bad) in str(info.value)
+
+
+def test_a_positive_byte_ceiling_and_none_still_construct() -> None:
+    assert HTTPSink("http://x", max_batch_bytes=2048).max_batch_bytes == 2048
+    assert HTTPSink("http://x").max_batch_bytes == HTTPSink.MAX_BATCH_BYTES

@@ -7,7 +7,7 @@ import socket
 import threading
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
@@ -140,7 +140,11 @@ class SocketTransport:
           host: The destination host.
           port: The destination port.
           transport: ``"tcp"`` or ``"udp"``.
-          timeout: Seconds allowed for a TCP connection.
+          timeout: Seconds allowed for a TCP connection. Refused at construction when it cannot
+            bound anything (SPEC-049 FR-002): it reached ``create_connection`` and raised from
+            inside ``send_all`` on every message. **This is a new refusal over UDP**, where the
+            value was previously unused and a junk one was harmless — stated rather than
+            discovered, since a UDP caller passing one has been silently fine until now.
           max_retries: Reconnect retries per message, floored at zero for the reason
             ``Worker._emit`` floors its own (SPEC-021) — a negative value made no attempt at all
             and abandoned the message without moving ``failed``.
@@ -151,16 +155,27 @@ class SocketTransport:
           None.
 
         Raises:
-          ValueError: If the transport is neither TCP nor UDP.
+          ValueError: If the transport is neither TCP nor UDP, the timeout cannot bound anything,
+            the port is outside ``0``–``65535``, or the datagram bound is not positive. The last
+            two are SPEC-049's system-frame findings: an out-of-range port raised a raw
+            ``OverflowError`` out of every UDP ``sendto`` — not an ``OSError``, so the retry guard
+            never saw it — where TCP counted the same value as a resolution failure; and a
+            non-positive datagram bound made every UDP frame oversized, so ``emit`` returned having
+            delivered nothing. Both are refused over TCP too, where they are inert or already
+            counted, for the reason the timeout is.
         """
         if transport not in ("tcp", "udp"):
             raise ValueError(f"invalid transport {transport!r}; expected 'tcp' or 'udp'")
+        if not 0 <= port <= 65535:
+            raise ValueError(f"SocketTransport port must be 0-65535, not {port!r}")
         self._host = host
         self._port = port
         self._transport = transport
-        self._timeout = timeout
+        self._timeout = require_timeout(timeout, "timeout", "SocketTransport")
         self._max_retries = max(max_retries, 0)
-        self._max_datagram_bytes = max_datagram_bytes
+        self._max_datagram_bytes = require_positive(
+            max_datagram_bytes, "max_datagram_bytes", "SocketTransport"
+        )
         self._sock: socket.socket | None = None
         self.failed = 0
         self.dropped_oversized = 0
@@ -309,6 +324,11 @@ class SocketTransport:
         the oversized case first; this is the backstop for a path MTU smaller than the datagram
         limit, which no local check can know.
 
+        The line carries the attempts actually made, ``attempt + 1``, as ``HTTPSink._request``
+        already did (SPEC-049 FR-006): it used to write ``max_retries + 1`` unconditionally, so a
+        message abandoned after **one** send on a permanent errno was reported as four — a count an
+        operator would use to reach the wrong conclusion, and an invariant 11 defect.
+
         Args:
           message: The exact bytes to put on the wire.
 
@@ -335,7 +355,7 @@ class SocketTransport:
                 _diag.lost(
                     "message",
                     1,
-                    f"SocketTransport, {self._max_retries + 1} attempt(s), "
+                    f"SocketTransport, {attempt + 1} attempt(s), "
                     f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                 )
                 return False

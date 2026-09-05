@@ -851,19 +851,6 @@ close it.
   A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
   (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
   deduplicates, which makes a retry safe and is its own spec.
-- **`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded** (SPEC-047 FR-002).
-  `nats-py` retires a server from its pool only under `if max_reconnect_attempts > 0`, so a
-  non-positive value never retires one and the constructor never returns — measured, both `0` and
-  `-1` still blocking at 30 s, one probe past 400 s, where `1` raises in 2.02 s. It is the value a
-  reader is most likely to reach for from "attempts before giving up", and it makes the block this
-  FR exists to bound *permanent*. Documented rather than corrected, because overriding a driver's
-  documented behaviour surprises a caller who knows it. **Closed by** refusing a non-positive
-  `max_reconnect_attempts` with a `ValueError`, which is a small breaking change for anyone
-  currently passing one.
-- **`NATSSink(client=X, servers=…)` ignores `servers` silently** (SPEC-047, Out of Scope). The same
-  shape FR-002 makes a `ValueError` for the four connect timeouts, in the same constructor, left
-  alone because changing it would break a caller passing both today. **Closed by** a major version
-  that can refuse it, or by a deprecation warning first.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
@@ -883,8 +870,54 @@ close it.
   what remains is I/O rather than noise. The time trigger is already damped by its re-arm.
   **Closed by** deferring the next attempt until the file has grown by another `max_bytes`, which
   trades a rotation the caller asked for against the retry cost.
+- **`MongoDBSink` bounds `pymongo`'s socket wait at 30 s; the server-selection wait stays the
+  driver's** (SPEC-049 FR-005). `pymongo`'s `socketTimeoutMS` default is `None` — a read that
+  never returns holds the drain thread for good; SPEC-049's authoring measured `emit` at 60.66 s
+  for two attempts against a peer that accepts TCP and never replies, 3.12 s with a bound. The
+  library forwards `socketTimeoutMS=30000` (`DEFAULT_SOCKET_TIMEOUT`) only when neither
+  `socket_timeout=` nor the URI's query names one — the default never overrides a value the caller
+  wrote, an explicit keyword does (pika's precedence, not psycopg's, because the URI lets the two be
+  told apart). `serverSelectionTimeoutMS` (driver default 30 s, finite) is exposed as
+  `server_selection_timeout` and not overridden. **Closed by** a deployment measurement showing 30 s
+  is the wrong side of the line, which supersedes the number in place.
+- **`RabbitMQSink` bounds `pika`'s blocked-connection wait at 30 s; `socket_timeout` and
+  `stack_timeout` stay the driver's** (SPEC-049 FR-005). `pika`'s `blocked_connection_timeout`
+  default is `None`: a broker under a memory or disk alarm sends `Connection.Blocked` and every
+  publish then waits indefinitely on the drain thread. `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` is set
+  on the parameters `_connect` builds — the URL and the no-URL constructor alike, and on every
+  reconnect — only when the URL's query named no `blocked_connection_timeout`; an explicit keyword
+  overrides the URL. **Recorded from the driver's documented default and not executed by
+  SPEC-049:** neither the blocking behaviour nor pika's parsing of `?blocked_connection_timeout=`
+  from the URL query into the attribute was measured against a broker here — both were re-read from
+  the installed package (pika 1.4.4), and the unit tests encode that premise through a stand-in.
+  `socket_timeout` (10 s) and `stack_timeout` (15 s) are finite and exposed on the same terms.
+  **Closed by** an integration run against a broker under a memory alarm, which supersedes this
+  entry in place rather than leaving it read as settled.
+- **`ClickHouseSink` exposes `clickhouse-connect`'s 300 s `send_receive_timeout` rather than
+  overriding it** (SPEC-049 FR-005). The driver's default is finite, so FR-001's rule leaves it with
+  the driver — SPEC-049's authoring measured one call at 300.01 s against a non-replying peer versus
+  3.00 s with an explicit bound, and `_insert` makes `max_retries + 1` such attempts per chunk on the
+  drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
+  library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
+  decision `psycopg`'s `connect_timeout` took in SPEC-041.
+
 ### Resolved
 
+- ~~**`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded**~~ (SPEC-047 FR-002;
+  invariant 13) → **closed by SPEC-049 FR-004**. `nats-py` retires a server from its pool only
+  under `if max_reconnect_attempts > 0`, so a non-positive value never retires one and the
+  constructor never returned — measured by SPEC-047, both `0` and `-1` still blocking at 30 s, one
+  probe past 400 s, where `1` raises in 2.02 s. SPEC-047 documented rather than corrected it,
+  because overriding a driver's documented behaviour surprises a caller who knows it, and named a
+  `ValueError` as the closure. 1.0 is the major version that could take the small breaking change:
+  a non-positive value is now refused at construction, and refusing is not the overriding that
+  sentence rejected — the caller is told rather than quietly given different behaviour.
+- ~~**`NATSSink(client=X, servers=…)` ignores `servers` silently**~~ (SPEC-047, Out of Scope;
+  invariant 13) → **closed by SPEC-049 FR-004**. The same shape SPEC-047 FR-002 made a
+  `ValueError` for the four connect timeouts, in the same constructor, left alone because
+  changing it would break a caller passing both. `servers` now joins that conflict message,
+  checked from a structure separate from the forwarded options so `nats.connect(servers or …,
+  **supplied)` never receives it twice.
 - ~~**A lone surrogate leaves `build_event` intact and costs the whole batch in every sink that
   encodes a string strictly**~~ (2026-09-04 audit, N1; invariant 8) → **fixed in SPEC-055
   FR-001**. `sanitize._measured` encoded with `errors="replace"` only to *measure*, so

@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["ClickHouseSink"]
@@ -62,6 +62,7 @@ class ClickHouseSink:
         create_table: bool = False,
         chunk_size: int = 1000,
         max_retries: int = 3,
+        send_receive_timeout: float | None = None,
     ) -> None:
         """Connects to the server and, optionally, provisions the schema.
 
@@ -72,20 +73,40 @@ class ClickHouseSink:
           create_table: An idempotent ``MergeTree`` convenience, off by default. Every extracted
             column is nullable, to tolerate missing keys — a span-start event has no
             ``duration_ms`` or ``status``.
-          chunk_size: How many rows go in one insert call.
+          chunk_size: How many rows go in one insert call. Refused when non-positive
+            (SPEC-049 FR-002): ``0`` raised out of ``range()`` on every batch, and a **negative**
+            was the silent one — the chunker yielded nothing, so ``emit`` returned having inserted
+            no rows with ``losses()`` at zero.
           max_retries: Retries per chunk, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned from ``_insert`` having attempted nothing, and
             reported success.
+          send_receive_timeout: Seconds one request to the server may take, forwarded to
+            ``get_client`` only when given (SPEC-049 FR-005). ``clickhouse-connect``'s own default
+            is a finite 300 s, so it is exposed rather than overridden — but ``_insert`` makes
+            ``max_retries + 1`` such attempts per chunk on the drain thread, which is why the
+            argument exists.
 
         Returns:
           None.
 
         Raises:
-          ValueError: If the table name is not a plain SQL identifier.
+          ValueError: If the table name is not a plain SQL identifier, the chunk size is not
+            positive, ``send_receive_timeout`` cannot bound anything, or it is passed alongside
+            ``client=``, which is already built and cannot consume it (SPEC-043's rule).
           ImportError: If the ``clickhouse`` extra is not installed.
         """
+        if client is not None and send_receive_timeout is not None:
+            raise ValueError(
+                "ClickHouseSink cannot apply send_receive_timeout to an injected client, which "
+                "is already built; pass it where the client is built, or drop client="
+            )
+        bounds: dict[str, float] = {}
+        if send_receive_timeout is not None:
+            bounds["send_receive_timeout"] = require_timeout(
+                send_receive_timeout, "send_receive_timeout", "ClickHouseSink"
+            )
         self._table = valid_identifier(table)
-        self._chunk_size = chunk_size
+        self._chunk_size = require_positive(chunk_size, "chunk_size", "ClickHouseSink")
         self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
@@ -96,7 +117,7 @@ class ClickHouseSink:
         if client is None:
             import clickhouse_connect  # type: ignore[import-not-found]
 
-            client = clickhouse_connect.get_client(dsn=dsn)
+            client = clickhouse_connect.get_client(dsn=dsn, **bounds)
         self.client = client
         if create_table:
             self._ensure_schema()
@@ -132,7 +153,10 @@ class ClickHouseSink:
           SinkDeliveryError: When every chunk failed (SPEC-026 FR-001), which is the whole batch
             for any batch that fits one chunk, the ordinary case. A partially-inserted batch does
             not raise: the chunks that landed are committed, and the worker's retry would
-            duplicate them.
+            duplicate them. **Also when a non-empty batch produced no chunk at all** — that
+            returned normally, having sent nothing, with no counter moved (SPEC-049 FR-002).
+            Refusing a non-positive ``chunk_size`` closes the only known route in; this closes the
+            *branch*, so a future chunker change cannot walk back into it.
         """
         if not batch:
             return
@@ -145,7 +169,11 @@ class ClickHouseSink:
             for chunk in chunk_list(batch, self._chunk_size):
                 chunks += 1
                 inserted += self._insert([self._row(event) for event in chunk])
-        if chunks and not inserted:
+        if not chunks:
+            raise SinkDeliveryError(
+                f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was sent"
+            )
+        if not inserted:
             raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
 
     def close(self) -> None:

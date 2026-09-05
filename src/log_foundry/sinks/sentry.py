@@ -122,9 +122,15 @@ class SentrySink:
 
         Raises:
           ValueError: If ``backend`` is not one of the three names; if an argument cannot be used
-            by any backend this construction can select; or if the selection cannot be built —
+            by any backend this construction can select; if the selection cannot be built —
             ``"sdk"`` with no client available, ``"http"`` with no DSN, or the default with
-            neither.
+            neither; or if a DSN that **will be used** is malformed (SPEC-049 FR-004).
+
+            That last is deliberately narrow. ``backend="sdk"`` never parses the DSN and never
+            reads it — the envelope header that uses ``_dsn`` belongs to the HTTP fallback, which
+            that backend does not build — so a malformed one there has no effect, and refusing it
+            would invent a failure rather than report one. It is validated wherever it is actually
+            parsed, which is every construction that builds the fallback.
         """
         if backend not in _BACKENDS:
             raise ValueError(f"SentrySink backend must be one of {_BACKENDS!r}, not {backend!r}")
@@ -579,7 +585,13 @@ def _import_sdk() -> Any:
 
 
 def _parse_dsn(dsn: str) -> tuple[str, str]:
-    """Derives the ingest URL and auth header from a Sentry DSN.
+    """Derives the ingest URL and auth header from a Sentry DSN, or refuses it.
+
+    **The refusal is what makes this docstring true** (SPEC-049 FR-004). It has always documented
+    a ``ValueError``, and ``urlparse`` almost never raises one: a DSN with no scheme, no host or no
+    public key parsed happily into an ingest URL of ``://None/api//envelope/`` and an auth header
+    reading ``sentry_key=None``, and the sink then posted every event to a URL that cannot exist,
+    for the life of the process. All four parts are required here instead.
 
     Args:
       dsn: The Sentry DSN.
@@ -588,10 +600,24 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
       The envelope ingest URL and the ``X-Sentry-Auth`` header value.
 
     Raises:
-      ValueError: If the DSN cannot be parsed as a URL.
+      ValueError: If the DSN lacks a scheme, a host, a public key or a project id.
     """
     parsed = urlparse(dsn)
     project = parsed.path.lstrip("/")
+    missing = [
+        name
+        for name, value in (
+            ("scheme", parsed.scheme),
+            ("host", parsed.hostname),
+            ("public key", parsed.username),
+            ("project id", project),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            f"SentrySink dsn is missing its {', '.join(missing)}: {dsn!r}"
+        )
     port = f":{parsed.port}" if parsed.port else ""
     ingest_url = f"{parsed.scheme}://{parsed.hostname}{port}/api/{project}/envelope/"
     auth_header = f"Sentry sentry_key={parsed.username}, sentry_version=7, sentry_client=log-foundry"

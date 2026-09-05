@@ -429,3 +429,16 @@ def test_emsgsize_is_not_retried_while_a_transient_errno_still_is(monkeypatch, c
     with pytest.raises(SinkDeliveryError):
         retrying.emit([{"level": "INFO", "message": "x"}])
     assert len(transient.sent) == 4, "a destination that may come back is still retried"
+
+
+@pytest.mark.parametrize("bad", ["my app", "my\tapp", "a\nb", "", " "])
+def test_a_whitespace_or_empty_app_name_is_refused(bad: str) -> None:
+    """SPEC-049 FR-004. RFC 5424's header is space-delimited and this value goes into it raw.
+
+    Measured before the fix: `app_name="my app"` produced
+    `<14>1 <ts> <host> my app 22113 - - {json}`, so a receiver reads `app` as PROCID and `22113`
+    as MSGID -- every field after APP-NAME shifts, for every message the sink ever sends, and no
+    counter sees it because the frame still arrives.
+    """
+    with pytest.raises(ValueError, match="app_name"):
+        SyslogSink("127.0.0.1", 514, app_name=bad)

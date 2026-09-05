@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["PostgresSink"]
@@ -81,7 +81,9 @@ class PostgresSink:
           dsn: The connection string used when opening a connection.
           create_table: An idempotent convenience, off by default because the user owns their
             schema and indexes.
-          chunk_size: How many rows go in one driver statement.
+          chunk_size: How many rows go in one driver statement. Refused when non-positive
+            (SPEC-049 FR-002): it spent the full retry budget and its backoffs on every
+            batch, failing the same way each time.
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned having attempted no insert at all, and
             reported success.
@@ -97,11 +99,12 @@ class PostgresSink:
           None.
 
         Raises:
-          ValueError: If the table name is not a plain SQL identifier.
+          ValueError: If the table name is not a plain SQL identifier, or the chunk size is not
+            positive.
           ImportError: If the ``postgres`` extra is not installed.
         """
         self._table = valid_identifier(table)
-        self._chunk_size = chunk_size
+        self._chunk_size = require_positive(chunk_size, "chunk_size", "PostgresSink")
         self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
@@ -181,16 +184,24 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent.
+          SinkDeliveryError: When the retry bound is spent, or when a non-empty batch produced no
+            chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049 FR-002, found by the
+            system-frame review): with the chunker yielding nothing this committed an empty
+            transaction and returned, having sent nothing, with every counter at zero. Raised
+            outside the retry loop, because a chunker that yields nothing will yield nothing four
+            times.
         """
         for attempt in range(self.max_retries + 1):
             try:
                 self._reconnect_if_broken()
+                chunks = 0
                 with self._conn.cursor() as cur:
                     for chunk in chunk_list(batch, self._chunk_size):
+                        chunks += 1
                         cur.executemany(self._insert_sql, [self._row(event) for event in chunk])
-                self._conn.commit()
-                return
+                if chunks:
+                    self._conn.commit()
+                    return
             except Exception as err:
                 self._rollback()
                 if attempt < self.max_retries:
@@ -211,6 +222,9 @@ class PostgresSink:
                 raise SinkDeliveryError(
                     f"PostgresSink inserted none of {len(batch)} event(s)"
                 ) from None
+            raise SinkDeliveryError(
+                f"PostgresSink produced no chunk for {len(batch)} event(s); nothing was sent"
+            )
 
     def _connect(self) -> Any:
         """Opens a connection to the configured DSN, bounded by :attr:`connect_timeout`.
@@ -266,7 +280,7 @@ class PostgresSink:
         error — a constraint violation, a full disk — does not churn the connection. Both are
         probed by name because this sink accepts any ``psycopg``-shaped object it does not own.
 
-Both diagnostics here are **announced once per outage, not once per attempt**. Unthrottled
+        Both diagnostics here are **announced once per outage, not once per attempt**. Unthrottled
         they fire on every attempt of every batch, so a down server turned one stderr line into
         five per batch, indefinitely — a diagnostic that floods is one an operator stops reading,
         and the batch's own ``_diag.lost`` line already records the loss. The flag covers the

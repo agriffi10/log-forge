@@ -7,13 +7,21 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RabbitMQSink"]
 
 _BACKOFF_BASE = 0.1
 _PERSISTENT = 2
+
+DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 30.0
+"""Seconds a broker may hold the connection blocked before ``pika`` gives up (SPEC-049 FR-005).
+
+``pika``'s own default is ``None``: a broker under a memory or disk alarm sends
+``Connection.Blocked`` and every publish then waits indefinitely, on the worker's single drain
+thread. Applied only when the AMQP URL's query named no ``blocked_connection_timeout``.
+"""
 
 
 class _PersistentProperties:
@@ -49,6 +57,9 @@ class RabbitMQSink:
         connection: Any = None,
         url: str | None = None,
         max_retries: int = 3,
+        blocked_connection_timeout: float | None = None,
+        socket_timeout: float | None = None,
+        stack_timeout: float | None = None,
     ) -> None:
         """Binds the sink to an exchange and connects if no connection was injected.
 
@@ -60,14 +71,43 @@ class RabbitMQSink:
           max_retries: Reconnect retries per message, floored at zero as ``Worker._emit`` floors
             its own (SPEC-021) — a negative value abandoned each message with no attempt made and
             no counter moved.
+          blocked_connection_timeout: Seconds a blocked broker may hold the connection, or
+            ``None`` for :data:`DEFAULT_BLOCKED_CONNECTION_TIMEOUT` unless the URL's query names
+            ``blocked_connection_timeout`` itself (SPEC-049 FR-005) — the library's default never
+            overrides a value the caller wrote, an explicit keyword does. ``pika``'s own default is
+            unbounded. A caller who wants that injects their own connection.
+          socket_timeout: Seconds for one socket operation, or ``None`` to keep the driver's
+            finite 10 s default.
+          stack_timeout: Seconds for the full connection handshake, or ``None`` to keep the
+            driver's finite 15 s default.
 
         Returns:
           None.
 
         Raises:
+          ValueError: If a bound cannot bound anything, or if one is passed alongside
+            ``connection=``, which is already connected and cannot consume it — SPEC-043's rule
+            that an argument no backend can use is an error rather than a silent ignore.
           ImportError: If the ``amqp`` extra is not installed.
           Exception: Whatever ``pika`` raises when connecting.
         """
+        bounds = {
+            "blocked_connection_timeout": blocked_connection_timeout,
+            "socket_timeout": socket_timeout,
+            "stack_timeout": stack_timeout,
+        }
+        supplied = sorted(name for name, value in bounds.items() if value is not None)
+        if connection is not None and supplied:
+            raise ValueError(
+                f"RabbitMQSink cannot apply {', '.join(supplied)} to an injected connection, "
+                "which is already connected; pass them where the connection is built, or drop "
+                "connection="
+            )
+        self._bounds = {
+            name: require_timeout(value, name, "RabbitMQSink")
+            for name, value in bounds.items()
+            if value is not None
+        }
         self._exchange = exchange
         self._routing_key = routing_key
         self._url = url
@@ -239,6 +279,14 @@ class RabbitMQSink:
     def _connect(self) -> Any:
         """Opens a blocking connection from the configured URL, or the defaults.
 
+        The timeout bounds are applied here rather than in ``__init__`` because this has two
+        callers — construction and :meth:`_active_channel`'s reconnect — and two parameter
+        constructors, ``URLParameters`` and a bare ``ConnectionParameters``; a bound applied
+        anywhere else would be lost on the first reconnect while every test at construction still
+        passed (SPEC-049 FR-005). The library's blocked-connection default is set only when the
+        parameters ``pika`` parsed from the URL carry ``None``, so ``?blocked_connection_timeout=``
+        in the URL survives; an explicit keyword is set unconditionally and so wins.
+
         Args:
           None.
 
@@ -252,6 +300,10 @@ class RabbitMQSink:
         import pika  # type: ignore[import-not-found]
 
         params = pika.URLParameters(self._url) if self._url else pika.ConnectionParameters()
+        for name, value in self._bounds.items():
+            setattr(params, name, value)
+        if params.blocked_connection_timeout is None:
+            params.blocked_connection_timeout = DEFAULT_BLOCKED_CONNECTION_TIMEOUT
         return pika.BlockingConnection(params)
 
     def _persistent_properties(self) -> Any:

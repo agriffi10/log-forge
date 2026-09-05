@@ -141,7 +141,10 @@ def test_sentry_http_envelope_fallback() -> None:
     assert sink.skipped == 1
     call = opener.calls[0]
     assert call["url"] == "https://o123.ingest.sentry.io/api/456/envelope/"
-    assert call["headers"]["x-sentry-auth"].startswith("Sentry sentry_key=pubkey")
+    # Two literals, not a prefix: SPEC-049 FR-004's DSN refusal must not move either of them.
+    assert call["headers"]["x-sentry-auth"] == (
+        "Sentry sentry_key=pubkey, sentry_version=7, sentry_client=log-foundry"
+    )
     lines = call["body"].decode("utf-8").strip().split("\n")
     assert len(lines) == 3  # envelope header, item header, payload
     assert json.loads(lines[1]) == {"type": "event"}

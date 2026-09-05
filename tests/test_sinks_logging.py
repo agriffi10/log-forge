@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.logging_sink import LoggingSink
 
@@ -154,3 +156,54 @@ def test_formatter_can_read_structured_data() -> None:
     # A json formatter reads flat record attributes; here it reproduces the field + identity.
     formatted = logging.Formatter("%(trace_id)s %(user)s %(message)s").format(rec)
     assert formatted == "t bob hi"
+
+
+# --- SPEC-049 FR-007: what `emit` can observe of a failing handler -----------------------------
+
+
+class _AbsorbingHandler(logging.Handler):
+    """Fails the stdlib way: the failure goes to ``handleError``, which absorbs by default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            raise RuntimeError("stream is gone")
+        except Exception:
+            self.failures += 1
+            self.handleError(record)
+
+
+class _RaisingHandler(logging.Handler):
+    """Lets its exception out of ``emit``, as a custom handler may."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        raise RuntimeError("handler refused the record")
+
+
+def test_a_handler_absorbing_its_own_failure_leaves_emit_returning(monkeypatch, capsys) -> None:
+    """The default-`handleError` case is unobservable from this sink: nothing raises here."""
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    logger = logging.getLogger("lf.test.absorbing")
+    logger.handlers.clear()
+    logger.propagate = False
+    handler = _AbsorbingHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    LoggingSink(logger=logger).emit([ev(), ev()])
+    assert handler.failures == 2, "the handler failed on both records and told nobody"
+
+
+def test_a_handler_raising_out_of_emit_propagates() -> None:
+    """The observable case: a handler that lets its exception out reaches the caller of `emit`."""
+    logger = logging.getLogger("lf.test.raising")
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.addHandler(_RaisingHandler())
+    logger.setLevel(logging.DEBUG)
+
+    with pytest.raises(RuntimeError, match="handler refused the record"):
+        LoggingSink(logger=logger).emit([ev()])

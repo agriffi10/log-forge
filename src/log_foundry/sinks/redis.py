@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
@@ -215,10 +215,16 @@ class RedisStreamsSink(_RedisSink):
           None.
 
         Raises:
+          ValueError: If ``maxlen`` is given and not positive — ``redis-py`` refuses a negative
+            ``XADD MAXLEN`` client-side on every emit, and ``0`` trims every entry the moment it
+            lands, so neither has a working configuration to protect (SPEC-049, system-frame
+            review).
           ImportError: If the ``redis`` extra is not installed.
         """
         self._stream = stream
-        self.maxlen = maxlen
+        self.maxlen = (
+            require_positive(maxlen, "maxlen", "RedisStreamsSink") if maxlen is not None else None
+        )
         super().__init__(client=client, url=url, max_retries=max_retries)
 
     def _stage(self, pipe: Any, event: dict[str, object]) -> None:
@@ -282,10 +288,17 @@ class RedisListSink(_RedisSink):
           None.
 
         Raises:
+          ValueError: If ``maxlen`` is given and not positive. A negative became
+            ``LTRIM key N -1`` after every push — removing the *oldest* N rather than keeping the
+            newest, so a short list was emptied on every batch with every counter at zero — and
+            ``0`` became ``LTRIM 0 -1``, a no-op that reads as a ceiling and is not (SPEC-049,
+            system-frame review).
           ImportError: If the ``redis`` extra is not installed.
         """
         self._key = key
-        self.maxlen = maxlen
+        self.maxlen = (
+            require_positive(maxlen, "maxlen", "RedisListSink") if maxlen is not None else None
+        )
         super().__init__(client=client, url=url, max_retries=max_retries)
 
     def _stage(self, pipe: Any, event: dict[str, object]) -> None:

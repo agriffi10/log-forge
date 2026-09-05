@@ -213,3 +213,26 @@ def test_trimming_moves_no_loss_counter_because_it_happens_at_the_destination() 
     sink = RedisStreamsSink("s", client=client, maxlen=1)
     sink.emit([{"a": i} for i in range(50)])
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+# --- SPEC-049, system-frame review: a maxlen that cannot bound anything ------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_a_non_positive_stream_maxlen_is_refused(bad: int) -> None:
+    """redis-py refused a negative XADD MAXLEN client-side on every emit; 0 trims what just landed."""
+    with pytest.raises(ValueError, match="RedisStreamsSink maxlen must be a positive integer"):
+        RedisStreamsSink("s", client=FakeRedis(), maxlen=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_a_non_positive_list_maxlen_is_refused(bad: int) -> None:
+    """`LTRIM key 5 -1` after every push removed the oldest five — the newest batches gone, counters
+    at zero — and `LTRIM 0 -1` was a no-op reading as a ceiling."""
+    with pytest.raises(ValueError, match="RedisListSink maxlen must be a positive integer"):
+        RedisListSink("l", client=FakeRedis(), maxlen=bad)
+
+
+def test_a_positive_maxlen_and_none_still_construct() -> None:
+    assert RedisListSink("l", client=FakeRedis(), maxlen=10).maxlen == 10
+    assert RedisStreamsSink("s", client=FakeRedis()).maxlen is None

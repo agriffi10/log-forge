@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 
 
@@ -92,3 +94,26 @@ def test_an_unusable_field_routes_to_unadjudicated_not_an_exception() -> None:
     verdict = adjudicate_positional(records, usable_results(None))
     assert verdict.retry == []
     assert verdict.unadjudicated == 2
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_chunk_list_refuses_a_non_positive_size(bad: int) -> None:
+    """SPEC-049 FR-002, making `chunk_list`'s own `Raises:` true.
+
+    Two things make this test's shape non-obvious, and both are the reason it asserts the
+    **message** rather than the type. `chunk_list` is a generator, so the guard raises at the
+    first `next()` and not at the call -- `pytest.raises` around the bare call would not fire, so
+    the list() is load-bearing. And `chunk_list(items, 0)` *already* raised `ValueError` today,
+    from `range()`, so removing the new guard leaves a type-only assertion green: this is the one
+    guard in this spec that is provably vacuous without a message assertion.
+    """
+    from log_foundry.sinks._chunk import chunk_list
+
+    with pytest.raises(ValueError, match="size must be a positive integer"):
+        list(chunk_list([1, 2, 3], bad))
+
+
+def test_chunk_list_still_chunks_a_positive_size() -> None:
+    from log_foundry.sinks._chunk import chunk_list
+
+    assert list(chunk_list([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]

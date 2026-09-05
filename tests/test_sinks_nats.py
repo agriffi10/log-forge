@@ -557,12 +557,35 @@ def test_a_falsy_connect_bound_is_still_forwarded(monkeypatch) -> None:
     # them apart. Both zeros reach the driver and change its behaviour, so dropping them is a
     # silent loss of what the caller asked for: `reconnect_time_wait=0` means retry immediately
     # (measured, dropping it made a failure 100x slower -- 2.03 s against 0.02 s), and
-    # `max_reconnect_attempts=0` makes the connect loop unbounded, which the constructor's
+    # ~~`max_reconnect_attempts=0` makes the connect loop unbounded, which the constructor's
     # docstring warns about. Forwarding zero faithfully is the point either way -- this test is
-    # about the boundary, not an endorsement of the value.
-    module = _build(monkeypatch, max_reconnect_attempts=0, reconnect_time_wait=0)
+    # about the boundary, not an endorsement of the value.~~
+    #
+    # **Superseded in part by SPEC-049 FR-004**, which architecture.md section 12 had already
+    # named as this item's closure: `max_reconnect_attempts=0` is REFUSED now, because "forwarding
+    # faithfully" forwarded a value that never terminates the connect loop. The reasoning above is
+    # struck rather than deleted (SPEC-021) because the *boundary* it pins is still the point, and
+    # `reconnect_time_wait=0` still demonstrates it -- that one works, so SPEC-049 FR-001's rule
+    # leaves it alone. The refusal has its own test below.
+    module = _build(monkeypatch, reconnect_time_wait=0)
     _, kwargs = module.calls[0]
-    assert kwargs == {"max_reconnect_attempts": 0, "reconnect_time_wait": 0}
+    assert kwargs == {"reconnect_time_wait": 0}, (
+        "a falsy value the driver can use is still forwarded, which is the boundary this pins"
+    )
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_non_positive_reconnect_bound_is_refused(monkeypatch, bad: int) -> None:
+    """SPEC-049 FR-004, closing the architecture.md section 12 item SPEC-047 opened.
+
+    `nats-py` retires a server from its pool only under `max_reconnect_attempts > 0`, so a
+    non-positive value never retires one and the connect loop does not terminate -- measured, both
+    0 and -1 were still blocking at 30 s and one probe of 0 ran past 400 s. SPEC-047 forwarded it
+    faithfully and documented the hazard; section 12 recorded that refusing it was "a small
+    breaking change" waiting for a major version, and 1.0 is that version.
+    """
+    with pytest.raises(ValueError, match="max_reconnect_attempts must be positive"):
+        _build(monkeypatch, max_reconnect_attempts=bad)
 
 
 @pytest.mark.parametrize(
@@ -662,3 +685,17 @@ def test_every_connect_kwarg_we_forward_is_one_the_driver_accepts() -> None:
     accepted = set(inspect.signature(Client.connect).parameters)
     unknown = _forwarded_connect_kwargs() - accepted
     assert not unknown, f"NATSSink forwards {unknown}, which nats.connect does not accept"
+
+
+def test_servers_alongside_an_injected_client_is_refused() -> None:
+    """SPEC-049 FR-004, closing the second architecture.md section 12 item SPEC-047 opened.
+
+    `servers` was silently ignored beside `client=` — the same shape the four connect timeouts
+    already refuse, in the same constructor. It is checked from a structure separate from the
+    forwarded `supplied` dict, because `nats.connect(servers or ..., **supplied)` would otherwise
+    receive it twice; this asserts the message names it beside a forwarded argument.
+    """
+    with pytest.raises(ValueError, match="cannot apply connect_timeout, servers to an injected"):
+        NATSSink("logs", client=FakeNATS(), servers="nats://x:4222", connect_timeout=1.0)
+    with pytest.raises(ValueError, match="cannot apply servers to an injected client"):
+        NATSSink("logs", client=FakeNATS(), servers="nats://x:4222")

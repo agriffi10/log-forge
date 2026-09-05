@@ -11,9 +11,10 @@ from base64 import b64encode
 from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypedDict
+from urllib.parse import urlparse
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import clamp_server_delay, wait
+from log_foundry.sinks._retry import clamp_server_delay, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = [
@@ -245,6 +246,96 @@ class HTTPKwargs(HTTPPlatformKwargs, total=False):
     body_format: str
 
 
+_ALLOWED_SCHEMES = ("http", "https")
+
+_BODY_FORMATS = ("ndjson", "json_array")
+
+_CRLF = ("\r", "\n")
+
+
+def _valid_url(url: str, owner: str) -> str:
+    """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
+
+    A scheme ``urllib`` will open but this sink cannot use is a configuration error that surfaced
+    at the first emit and never stopped: ``file:///etc/passwd`` raised a raw ``TypeError`` out of
+    every batch, and ``ftp://`` burned the whole retry budget on each one. Checked on the URL
+    :class:`HTTPSink` receives, which is the URL every subclass has finished building, so no
+    subclass can smuggle one past.
+
+    Args:
+      url: The endpoint as constructed.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The URL unchanged.
+
+    Raises:
+      ValueError: If the scheme is not ``http`` or ``https``, or the URL names no host — every
+        request to ``http:///x`` fails with a counted ``URLError`` for the life of the process,
+        which is knowable here (SPEC-049, system-frame review).
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"{owner} url must use http or https, not {scheme or 'no'} scheme: {url!r}"
+        )
+    if not parsed.netloc:
+        raise ValueError(f"{owner} url names no host: {url!r}")
+    return url
+
+
+def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
+    """Returns headers that cannot inject a second header, or raises (SPEC-049 FR-001).
+
+    A ``CR`` or ``LF`` in a name or a value makes ``http.client`` raise from inside ``emit``, on
+    every batch, uncounted. Rejecting it here also means the sink cannot be used to smuggle a
+    header a caller did not intend, which is why the check covers names as well as values.
+
+    Args:
+      headers: The caller's headers.
+      owner: The class refusing them, for the message.
+
+    Returns:
+      The headers unchanged.
+
+    Raises:
+      ValueError: If any name or value contains ``CR`` or ``LF``.
+    """
+    for name, value in headers.items():
+        for text, part in ((name, "name"), (str(value), "value")):
+            if any(bad in text for bad in _CRLF):
+                raise ValueError(
+                    f"{owner} header {part} must not contain CR or LF: {name!r}"
+                )
+    return headers
+
+
+def _valid_auth(
+    auth: str | tuple[str, str] | None, owner: str
+) -> str | tuple[str, str] | None:
+    """Returns credentials that cannot inject a header, or raises (SPEC-049 FR-001).
+
+    Only the **bearer-token** form is checked, and the asymmetry is deliberate rather than an
+    oversight: a token is written into ``Authorization`` verbatim, so a ``CR`` in it is the same
+    injection :func:`_valid_headers` refuses, in the argument with the highest consequence. The
+    ``(user, password)`` form is base64-encoded before it reaches the header and cannot carry one.
+
+    Args:
+      auth: The bearer token, the user/password pair, or ``None``.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The credentials unchanged.
+
+    Raises:
+      ValueError: If a bearer token contains ``CR`` or ``LF``.
+    """
+    if isinstance(auth, str) and any(bad in auth for bad in _CRLF):
+        raise ValueError(f"{owner} auth token must not contain CR or LF")
+    return auth
+
+
 def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
     """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
 
@@ -372,7 +463,10 @@ class HTTPSink:
             :attr:`MAX_BATCH_COUNT`. Floored at one, since a zero or negative bound would make
             every event oversized and discard the batch.
           max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
-            :attr:`MAX_BATCH_BYTES`. Floored at one for the same reason.
+            :attr:`MAX_BATCH_BYTES`. **Refused** when not positive rather than floored (SPEC-049,
+            system-frame review): the floor at one this used to apply is not the count floor's
+            twin, because a one-byte body ceiling makes every event oversized and delivers
+            nothing, where a count of one still delivers one event per request.
           opener: A ``urlopen``-shaped callable, which a test can inject to assert on the
             request without any network access. Defaults to :func:`_no_redirect_opener` rather
             than ``urlopen`` (SPEC-048 FR-001); an injected one is used exactly as given, since
@@ -382,22 +476,34 @@ class HTTPSink:
           None.
 
         Raises:
-          None.
+          ValueError: If the URL's scheme is not ``http`` or ``https`` or it names no host, a
+            header name or value or a bearer token contains CR or LF, the timeout cannot bound
+            anything, ``body_format`` is neither of the two this class renders, or
+            ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
+            ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
+            FR-004), and inherited by every subclass, whose own name the message carries.
         """
-        self.url = url
+        self.url = _valid_url(url, type(self).__name__)
+        if body_format not in _BODY_FORMATS:
+            raise ValueError(
+                f"{type(self).__name__} body_format must be one of {sorted(_BODY_FORMATS)}, "
+                f"not {body_format!r}"
+            )
         self.method = method
-        self._headers = dict(headers) if headers else {}
-        self._auth = auth
+        self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
+        self._auth = _valid_auth(auth, type(self).__name__)
         self.body_format = body_format
-        self.timeout = timeout
+        self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip
         self.max_retries = max(max_retries, 0)
         self.max_retry_after = max_retry_after
         self.max_batch_count = max(
             max_batch_count if max_batch_count is not None else self.MAX_BATCH_COUNT, 1
         )
-        self.max_batch_bytes = max(
-            max_batch_bytes if max_batch_bytes is not None else self.MAX_BATCH_BYTES, 1
+        self.max_batch_bytes = (
+            require_positive(max_batch_bytes, "max_batch_bytes", type(self).__name__)
+            if max_batch_bytes is not None
+            else self.MAX_BATCH_BYTES
         )
         self.log_foundry_stop_signal: threading.Event | None = None
         self._opener = opener if opener is not None else _no_redirect_opener()

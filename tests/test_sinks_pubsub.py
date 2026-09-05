@@ -10,7 +10,7 @@ import pytest
 
 from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.pubsub import GooglePubSubSink
+from log_foundry.sinks.pubsub import DEFAULT_OVERFLOW_TIMEOUT, GooglePubSubSink
 
 
 class FakeFuture:
@@ -764,3 +764,23 @@ def test_close_is_not_bounded_for_a_future_that_cannot_be_waited_on(capsys) -> N
         "on unbounded in the first place"
     )
     assert all(f.resolved == 1 for f in client.futures), "every one was actually resolved"
+
+
+# --- SPEC-049 FR-002: overflow_timeout is floored, the third usable_timeout caller -------------
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_degenerate_overflow_timeout_is_floored_not_refused(bad: float) -> None:
+    """Floored, for `KafkaSink(flush_timeout=)`'s reason and by the same helper.
+
+    `nan` made every deadline comparison False and `inf` removed the bound outright, yet both
+    *deliver* against a healthy client, so under FR-001's rule they are floor candidates; refusing
+    them here while `usable_timeout` floors them for Kafka would be two rules for one value.
+    """
+    sink = GooglePubSubSink("projects/p/topics/t", client=FakePublisher(), overflow_timeout=bad)
+    assert sink.overflow_timeout == DEFAULT_OVERFLOW_TIMEOUT
+
+
+def test_a_usable_overflow_timeout_is_kept() -> None:
+    sink = GooglePubSubSink("projects/p/topics/t", client=FakePublisher(), overflow_timeout=2.5)
+    assert sink.overflow_timeout == 2.5

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.rabbitmq import RabbitMQSink
+from log_foundry.sinks.rabbitmq import DEFAULT_BLOCKED_CONNECTION_TIMEOUT, RabbitMQSink
 
 
 class FakeChannel:
@@ -93,3 +96,112 @@ def test_close_closes_channel_and_connection() -> None:
     assert channel.closed is True
     assert conn.closed is True
     sink.close()  # idempotent
+
+
+# --- SPEC-049 FR-005: pika's unbounded blocked-connection wait is bounded ---------------------
+
+
+class FakeParameters:
+    """A ``pika`` parameters stand-in with the driver's documented defaults.
+
+    ``URLParameters`` parses ``?blocked_connection_timeout=`` from the URL query into the
+    attribute; that is the driver's documented behaviour re-read from pika 1.4.4 and encoded
+    here, not measured against a broker (architecture.md §12 records it as such).
+    """
+
+    def __init__(self, url: str | None = None) -> None:
+        self.url = url
+        self.blocked_connection_timeout: float | None = None
+        self.socket_timeout = 10.0
+        self.stack_timeout = 15.0
+        if url is not None:
+            query = parse_qs(urlsplit(url).query)
+            if "blocked_connection_timeout" in query:
+                self.blocked_connection_timeout = float(query["blocked_connection_timeout"][0])
+
+
+def _pika_stub(monkeypatch, connections: list[FakeConnection] | None = None) -> list:
+    """Installs a ``pika`` stand-in; returns the parameters each ``BlockingConnection`` received."""
+    built: list = []
+    pool = list(connections or [])
+
+    def blocking_connection(params):
+        built.append(params)
+        return pool.pop(0) if pool else FakeConnection()
+
+    module = types.SimpleNamespace(
+        URLParameters=FakeParameters,
+        ConnectionParameters=lambda: FakeParameters(),
+        BlockingConnection=blocking_connection,
+        BasicProperties=lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "pika", module)
+    return built
+
+
+def test_a_url_naming_no_bound_gets_the_library_default(monkeypatch) -> None:
+    built = _pika_stub(monkeypatch)
+    RabbitMQSink(exchange="logs", routing_key="rk", url="amqp://h/")
+    assert built[0].blocked_connection_timeout == DEFAULT_BLOCKED_CONNECTION_TIMEOUT == 30.0
+    assert (built[0].socket_timeout, built[0].stack_timeout) == (10.0, 15.0), "driver's, untouched"
+
+
+def test_a_url_naming_the_bound_keeps_it(monkeypatch) -> None:
+    """The library's default never overrides a value the caller wrote — pika lets the two be told
+    apart where libpq did not, which is why this is not `PostgresSink`'s behaviour."""
+    built = _pika_stub(monkeypatch)
+    RabbitMQSink(exchange="logs", routing_key="rk", url="amqp://h/?blocked_connection_timeout=60")
+    assert built[0].blocked_connection_timeout == 60.0
+
+
+def test_an_explicit_bound_overrides_the_url(monkeypatch) -> None:
+    built = _pika_stub(monkeypatch)
+    RabbitMQSink(
+        exchange="logs",
+        routing_key="rk",
+        url="amqp://h/?blocked_connection_timeout=60",
+        blocked_connection_timeout=7,
+    )
+    assert built[0].blocked_connection_timeout == 7
+
+
+def test_no_url_at_all_gets_the_default_too(monkeypatch) -> None:
+    """The bare ``ConnectionParameters()`` path is the twin of the URL one."""
+    built = _pika_stub(monkeypatch)
+    RabbitMQSink(exchange="logs", routing_key="rk", socket_timeout=3, stack_timeout=4)
+    assert built[0].url is None
+    assert built[0].blocked_connection_timeout == 30.0
+    assert (built[0].socket_timeout, built[0].stack_timeout) == (3, 4)
+
+
+def test_a_reconnect_carries_the_bound(monkeypatch) -> None:
+    """The bound is set inside ``_connect``, so a connection reopened after a failure has it too.
+
+    Set anywhere else it would be lost on the first reconnect while every construction-time
+    assertion stayed green — the twin the plan review named.
+    """
+    built = _pika_stub(monkeypatch, [FakeConnection(fail_channels=1), FakeConnection()])
+    sink = RabbitMQSink(exchange="logs", routing_key="rk", url="amqp://h/")
+    sink.emit([{"a": 1}])
+    assert len(built) == 2, "the failed channel dropped the owned connection and reconnected"
+    assert [p.blocked_connection_timeout for p in built] == [30.0, 30.0]
+
+
+@pytest.mark.parametrize("name", ["blocked_connection_timeout", "socket_timeout", "stack_timeout"])
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_an_unusable_bound_is_refused(monkeypatch, name: str, bad: float) -> None:
+    built = _pika_stub(monkeypatch)
+    with pytest.raises(ValueError, match=f"RabbitMQSink {name}"):
+        RabbitMQSink(exchange="logs", routing_key="rk", url="amqp://h/", **{name: bad})
+    assert built == [], "refused before any connection was opened"
+
+
+def test_a_bound_alongside_an_injected_connection_is_refused() -> None:
+    with pytest.raises(ValueError, match="cannot apply blocked_connection_timeout, stack_timeout"):
+        RabbitMQSink(
+            exchange="logs",
+            routing_key="rk",
+            connection=FakeConnection(),
+            blocked_connection_timeout=1,
+            stack_timeout=1,
+        )

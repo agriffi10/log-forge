@@ -483,3 +483,50 @@ def test_the_rotation_diagnostic_speaks_again_after_a_recovery(tmp_path, capsys)
 
     lines = [line for line in capsys.readouterr().err.splitlines() if "rotating" in line]
     assert len(lines) == 2, f"one line per outage, and there were two; got {len(lines)}"
+
+
+# --- SPEC-049 FR-003: refuse what destroys data, floor what merely reads oddly -----------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -60])
+def test_a_non_positive_interval_is_refused(tmp_path, bad: int) -> None:
+    """The one rotation bound that destroys data, so the one that is refused.
+
+    Zero and negatives put the rollover deadline permanently in the past, so `_should_rotate`
+    fires on every event and the backup ring eats the batch: measured, three emits of five events
+    left **two** lines on disk out of fifteen.
+    """
+    with pytest.raises(ValueError, match="interval"):
+        RotatingFileSink(str(tmp_path / "a.log"), when="S", interval=bad)
+
+
+def test_an_interval_is_refused_even_with_no_time_trigger(tmp_path) -> None:
+    """It is inert without `when`, and refused anyway: a caller who passes it believes one is armed."""
+    with pytest.raises(ValueError, match="interval"):
+        RotatingFileSink(str(tmp_path / "b.log"), interval=0)
+
+
+def test_a_negative_size_or_backup_bound_is_floored_not_refused(tmp_path) -> None:
+    """SPEC-049 FR-001's other half, and the correction its plan review forced.
+
+    A negative `max_bytes` or `backup_count` **works** today: `_should_rotate` tests
+    `self._max_bytes > 0` and `_rotate` tests `self._backup_count > 0`, so each behaves exactly as
+    the documented `0` -- nothing lost, nothing raised, no counter moved. Under FR-001's rule they
+    are on the floor side, and refusing a configuration that works would be a breaking change at
+    1.0. The first draft of this spec refused them, which would have made its own register entry
+    false in the same breath.
+
+    Asserted on behaviour, not on the attribute alone: flooring must be indistinguishable from
+    passing `0`.
+    """
+    negative = RotatingFileSink(str(tmp_path / "neg.log"), max_bytes=-1, backup_count=-1)
+    zero = RotatingFileSink(str(tmp_path / "zero.log"), max_bytes=0, backup_count=0)
+    assert (negative._max_bytes, negative._backup_count) == (0, 0)
+
+    for sink in (negative, zero):
+        sink.emit([{"i": i, "pad": "x" * 40} for i in range(10)])
+        sink.close()
+    assert read_events(str(tmp_path / "neg.log")) == read_events(str(tmp_path / "zero.log")), (
+        "a floored negative must be indistinguishable from the documented zero"
+    )
+    assert not os.path.exists(str(tmp_path / "neg.log.1")), "the size trigger stays off, as at 0"

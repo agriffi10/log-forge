@@ -77,7 +77,11 @@ class SyslogSink:
           port: The syslog port.
           transport: ``"udp"`` or ``"tcp"``, which also selects the framing.
           facility: An RFC 5424 facility keyword.
-          app_name: The ``APP-NAME`` field of every message.
+          app_name: The ``APP-NAME`` field of every message. Whitespace and the empty string
+            are refused (SPEC-049 FR-004): RFC 5424's header is space-delimited and this value
+            is interpolated into it raw, so either shifts ``PROCID``, ``MSGID`` and
+            ``STRUCTURED-DATA`` for every message the sink ever sends — corruption no counter
+            sees, since the frame still arrives.
           timeout: Seconds allowed for a TCP connection.
           max_retries: Reconnect retries per message.
           max_datagram_bytes: The largest UDP datagram to attempt; a frame over it is dropped
@@ -88,10 +92,16 @@ class SyslogSink:
           None.
 
         Raises:
-          ValueError: If the facility is not one of the supported keywords.
+          ValueError: If the facility is not one of the supported keywords, or ``app_name`` is
+            empty or contains whitespace.
         """
         if facility not in _FACILITY:
             raise ValueError(f"invalid facility {facility!r}; expected one of {sorted(_FACILITY)}")
+        if not app_name or any(char.isspace() for char in app_name):
+            raise ValueError(
+                f"SyslogSink app_name must be non-empty and contain no whitespace, "
+                f"not {app_name!r}"
+            )
         self._facility = _FACILITY[facility]
         self._app_name = app_name
         self._transport = transport

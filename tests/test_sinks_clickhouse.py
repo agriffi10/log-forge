@@ -118,8 +118,81 @@ def test_owned_client_is_closed(monkeypatch) -> None:
     monkeypatch.setitem(
         sys.modules,
         "clickhouse_connect",
-        types.SimpleNamespace(get_client=lambda dsn=None: client),
+        types.SimpleNamespace(get_client=lambda dsn=None, **kwargs: client),
     )
     sink = ClickHouseSink("log_events", dsn="clickhouse://x")
     sink.close()
     assert client.closed is True
+
+
+# --- SPEC-049 FR-002 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
+    """`0` raised out of `range()` per batch; a negative was the silent one.
+
+    A negative made the chunker yield nothing, so `emit` returned having inserted no rows with
+    `losses()` at zero -- silent total loss, which is the condition SPEC-026 exists to end.
+    """
+    with pytest.raises(ValueError, match="ClickHouseSink chunk_size") as info:
+        ClickHouseSink("t", client=FakeClickHouse(), chunk_size=bad)
+    assert repr(bad) in str(info.value)
+
+
+def test_a_batch_that_produces_no_chunk_raises_rather_than_returning(monkeypatch) -> None:
+    """The branch, not the route -- and the route the first draft named cannot reach it.
+
+    Refusing a non-positive `chunk_size` closes the only known way into `chunks == 0`, but the
+    branch stays unguarded and a future chunker change walks back into it. Reached here by
+    patching the chunker itself: monkeypatching `_chunk_size` after construction, which this
+    spec's first draft specified, now raises a raw `ValueError` out of the first `next()` inside
+    the emit lock and never gets here -- the two changes cancelled each other.
+    """
+    client = FakeClickHouse()
+    sink = ClickHouseSink("t", client=client)
+    monkeypatch.setattr("log_foundry.sinks.clickhouse.chunk_list", lambda items, size: iter(()))
+
+    with pytest.raises(SinkDeliveryError, match="no chunk"):
+        sink.emit([{"i": 1}, {"i": 2}])
+    assert client.inserts == [], "and nothing was sent"
+
+
+# --- SPEC-049 FR-005: clickhouse-connect's finite 300 s is exposed, not overridden ------------
+
+
+def _clickhouse_stub(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
+
+    def get_client(dsn=None, **kwargs):
+        calls.append({"dsn": dsn, **kwargs})
+        return FakeClickHouse()
+
+    monkeypatch.setitem(sys.modules, "clickhouse_connect", types.SimpleNamespace(get_client=get_client))
+    return calls
+
+
+def test_send_receive_timeout_is_forwarded_when_given(monkeypatch) -> None:
+    calls = _clickhouse_stub(monkeypatch)
+    ClickHouseSink("t", dsn="clickhouse://x", send_receive_timeout=30)
+    assert calls == [{"dsn": "clickhouse://x", "send_receive_timeout": 30}]
+
+
+def test_no_send_receive_timeout_forwards_no_key_at_all(monkeypatch) -> None:
+    """The driver's default is finite, so it stays the driver's: exposed rather than overridden."""
+    calls = _clickhouse_stub(monkeypatch)
+    ClickHouseSink("t", dsn="clickhouse://x")
+    assert calls == [{"dsn": "clickhouse://x"}]
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_an_unusable_send_receive_timeout_is_refused(monkeypatch, bad: float) -> None:
+    calls = _clickhouse_stub(monkeypatch)
+    with pytest.raises(ValueError, match="ClickHouseSink send_receive_timeout"):
+        ClickHouseSink("t", dsn="clickhouse://x", send_receive_timeout=bad)
+    assert calls == []
+
+
+def test_send_receive_timeout_alongside_an_injected_client_is_refused() -> None:
+    with pytest.raises(ValueError, match="cannot apply send_receive_timeout to an injected client"):
+        ClickHouseSink("t", client=FakeClickHouse(), send_receive_timeout=1)

@@ -134,8 +134,15 @@ class NATSSink:
             non-positive value never retires one and the connect loop does not terminate;
             measured, both ``0`` and ``-1`` were still blocking at 30 s and one probe of ``0``
             ran past 400 s. The smallest value that bounds anything is ``1`` (measured 2.02 s
-            against a dead server). Passed through rather than corrected here, because
-            overriding a driver's documented behaviour would surprise a caller who knows it.
+            against a dead server).
+
+            ~~Passed through rather than corrected here, because overriding a driver's documented
+            behaviour would surprise a caller who knows it.~~ **Superseded by SPEC-049 FR-004**,
+            which ``architecture.md`` §12 had already named as this item's closure: a non-positive
+            value is now **refused**. Refusing is not the overriding that sentence rejected — the
+            caller is told rather than quietly given different behaviour — and 1.0 is the major
+            version §12 said the change was waiting for. ``reconnect_time_wait=0`` is untouched:
+            it works, and is on the floor side of SPEC-049 FR-001's rule.
           reconnect_time_wait: Seconds between reconnect attempts, or ``None`` to pass nothing.
           drain_timeout: Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
             forwarded because it does bound the driver's subscription drain, but it is **not**
@@ -150,11 +157,22 @@ class NATSSink:
         Raises:
           ValueError: If a connect-time argument is passed alongside ``client=``, which cannot
             consume it — SPEC-043's rule that an argument no backend can use is an error rather
-            than a silent ignore. ``publish_timeout`` is deliberately outside that set: it is
-            this sink's own bound and applies to any client.
+            than a silent ignore. ``servers`` joins that set in SPEC-049 FR-004, closing the last
+            of the §12 items; it is checked separately from ``supplied`` rather than added to it,
+            because ``nats.connect(servers or …, **supplied)`` would then pass it twice.
+            ``publish_timeout`` is deliberately outside the set: it is this sink's own bound and
+            applies to any client. Also if ``max_reconnect_attempts`` is non-positive.
           ImportError: If the ``nats`` extra is not installed.
           Exception: Whatever the driver raises when connecting.
         """
+        if max_reconnect_attempts is not None and max_reconnect_attempts <= 0:
+            raise ValueError(
+                f"NATSSink max_reconnect_attempts must be positive, not "
+                f"{max_reconnect_attempts!r}: nats-py retires a server from its pool only under "
+                f"`max_reconnect_attempts > 0`, so a non-positive value never terminates the "
+                f"connect loop (measured: 0 and -1 both still blocking at 30 s, one probe past "
+                f"400 s). 1 is the smallest value that bounds anything."
+            )
         options: dict[str, object] = {
             "connect_timeout": connect_timeout,
             "max_reconnect_attempts": max_reconnect_attempts,
@@ -162,10 +180,11 @@ class NATSSink:
             "drain_timeout": drain_timeout,
         }
         supplied = {name: value for name, value in options.items() if value is not None}
-        if client is not None and supplied:
+        conflicting = sorted([*supplied, *(["servers"] if servers is not None else [])])
+        if client is not None and conflicting:
             raise ValueError(
                 "NATSSink cannot apply "
-                + ", ".join(sorted(supplied))
+                + ", ".join(conflicting)
                 + " to an injected client, which is already connected; "
                 "pass them where the client is built, or drop client="
             )

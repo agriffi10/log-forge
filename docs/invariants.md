@@ -201,11 +201,14 @@ A constructor, `configure()` or `@trace` that is handed an argument no backend c
 that call — `TypeError` or `ValueError`, with the argument named — rather than accepting it and
 failing on every `emit` for the life of the process, or silently delivering nothing (SPEC-043 at
 run time; SPEC-051 for the static half, where a mistyped forwarded keyword is a `mypy` error;
-SPEC-049 extends the run-time rule to timeouts, chunk sizes, rotation bounds, headers and URLs).
+SPEC-049 extended the run-time rule to timeouts, chunk sizes, the rotation interval, headers, URLs,
+the Sentry DSN and an argument the selected backend cannot consume, and floored what still works).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and `tests/test_decorator_sync.py` for what
-`@trace` refuses (SPEC-055); the wider population is SPEC-049's (Draft), whose Overview is the
+`@trace` refuses (SPEC-055); the wider population is SPEC-049's — `tests/test_socket_transport.py`,
+the per-sink refusal tests it added, and the floor-side pins in `tests/test_sink_retry.py` and
+`tests/test_sinks_pubsub.py` — whose spec Overview was the
 measured list of what still constructs and should not.
