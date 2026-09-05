@@ -364,3 +364,33 @@ async def test_the_async_wrapper_names_a_callable_once_at_decoration(lf, fake_si
     assert {e["function"] for e in fake_sink.events if e["message"] == "span.start"} == {
         "Handler"
     }
+
+
+# -- SPEC-055 FR-003: the async twin --------------------------------------------------------------
+
+
+def test_an_async_generator_function_is_refused_at_decoration(lf) -> None:
+    with pytest.raises(TypeError, match=r"generator function .*agen\b"):
+
+        @lf.trace
+        async def agen():  # type: ignore[no-untyped-def]
+            yield 1
+
+
+def test_a_partial_of_an_async_generator_function_is_refused(lf) -> None:
+    import functools
+
+    async def agen(n: int):  # type: ignore[no-untyped-def]
+        yield n
+
+    with pytest.raises(TypeError, match="generator function"):
+        lf.trace(functools.partial(agen, 1))
+
+
+def test_an_instance_whose_call_is_an_async_generator_is_refused(lf) -> None:
+    class Producer:
+        async def __call__(self):  # type: ignore[no-untyped-def]
+            yield 1
+
+    with pytest.raises(TypeError, match="generator function"):
+        lf.trace(Producer())

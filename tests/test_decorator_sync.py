@@ -781,3 +781,48 @@ def test_a_string_is_refused_with_the_name_hint() -> None:
     """`@trace("checkout")` is the slip; the message says what was meant."""
     with pytest.raises(TypeError, match=r"name='checkout'"):
         log_foundry.trace("checkout")  # type: ignore[type-var]
+
+
+# -- SPEC-055 FR-003: a generator function is refused at decoration -----------------------------
+
+
+def test_a_generator_function_is_refused_at_decoration() -> None:
+    """The span would open and close before the body ran; every event inside would be an orphan."""
+    with pytest.raises(TypeError, match=r"generator function .*gen\b.*Trace the consumer"):
+
+        @log_foundry.trace
+        def gen():  # type: ignore[no-untyped-def]
+            yield 1
+
+
+def test_a_partial_of_a_generator_function_is_refused() -> None:
+    import functools
+
+    def gen(n: int):  # type: ignore[no-untyped-def]
+        yield n
+
+    with pytest.raises(TypeError, match="generator function"):
+        log_foundry.trace(functools.partial(gen, 1))
+
+
+def test_an_instance_whose_call_is_a_generator_is_refused() -> None:
+    class Producer:
+        def __call__(self):  # type: ignore[no-untyped-def]
+            yield 1
+
+    with pytest.raises(TypeError, match="generator function"):
+        log_foundry.trace(Producer())
+
+
+def test_a_function_that_returns_a_generator_object_is_accepted(fake_sink) -> None:
+    """The stated limit: a plain function's code flags say nothing about what it returns."""
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    def gen():  # type: ignore[no-untyped-def]
+        yield 1
+
+    @log_foundry.trace
+    def make():  # type: ignore[no-untyped-def]
+        return gen()
+
+    assert list(make()) == [1]

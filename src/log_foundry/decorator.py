@@ -639,6 +639,18 @@ def _refuse_unusable(fn: object) -> None:
     ``self`` to a function declared without one. A ``str`` is the slip ``@trace("checkout")``,
     which meant ``name=``. Anything else that is not callable is refused by type.
 
+    A generator function or an async generator function is refused too (SPEC-055 FR-003): its
+    body runs after the wrapper has returned the generator object, so the span would open and
+    close before a single line of it ran, and every event the body logged would be an orphan on
+    a fresh trace — measured, ``['span.start', 'span.end']`` before the first ``next()``. The
+    check is the code flags, on ``fn`` and on the type's ``__call__`` for a callable instance,
+    and both see through a ``functools.partial``; a plain function that merely *returns* a
+    generator object is indistinguishable here and is not detected, which is a stated limit
+    rather than a gap to close at call time, where invariant 13 does not refuse. Wrapping the
+    iteration instead — a span per generator, pushed around every resumption — was considered
+    and deferred: a refusal can be lifted into a wrap later without breaking anyone, while a
+    wrap shipped first freezes its semantics at 1.0.
+
     Args:
       fn: Whatever was handed to the decorator.
 
@@ -646,8 +658,8 @@ def _refuse_unusable(fn: object) -> None:
       None.
 
     Raises:
-      TypeError: If ``fn`` is a ``classmethod`` or ``staticmethod`` object, a ``str``, or not
-        callable at all.
+      TypeError: If ``fn`` is a ``classmethod`` or ``staticmethod`` object, a ``str``, not
+        callable at all, or a generator function or async generator function.
       Exception: Whatever the callable's own attribute access raises — a ``__class__`` property,
         say — at decoration, in the caller's frame, which is invariant 13's moment.
     """
@@ -664,6 +676,37 @@ def _refuse_unusable(fn: object) -> None:
         )
     if not callable(fn):
         raise TypeError(f"@trace needs a callable, got {type(fn).__name__}")
+    if _is_generator_function(fn):
+        raise TypeError(
+            f"@trace cannot trace the iteration of the generator function {_span_name(fn)}: its "
+            f"body runs after the wrapper has returned, so the span would close before it "
+            f"starts. Trace the consumer, or open the span around the loop"
+        )
+
+
+def _is_generator_function(fn: object) -> bool:
+    """Reports whether a callable's body is a generator or async generator (SPEC-055 FR-003).
+
+    The same shape as :func:`_is_async`: the code flags of ``fn`` itself, which see through a
+    ``functools.partial``, and for anything that is not a plain function the type's
+    ``__call__`` as well, so a callable instance whose ``__call__`` yields is caught too.
+
+    Args:
+      fn: The callable being decorated.
+
+    Returns:
+      Whether ``fn`` would return a generator or async generator object when called.
+
+    Raises:
+      Exception: Whatever the callable's own ``__class__`` or ``__call__`` lookup raises, at
+        decoration, in the caller's frame.
+    """
+    if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+        return True
+    if inspect.isfunction(fn):
+        return False
+    call = type(fn).__call__
+    return inspect.isgeneratorfunction(call) or inspect.isasyncgenfunction(call)
 
 
 def _span_name(fn: object) -> str:
@@ -749,8 +792,10 @@ def trace(
 
     Raises:
       TypeError: At decoration, for a ``classmethod`` or ``staticmethod`` object (the decorators
-        are in the wrong order), a ``str`` (``name=`` was meant), anything not callable, or a
-        ``name=`` that is not a ``str`` (SPEC-055 FR-002, invariant 13).
+        are in the wrong order), a ``str`` (``name=`` was meant), anything not callable, a
+        ``name=`` that is not a ``str`` (SPEC-055 FR-002), or a generator function, whose
+        iteration cannot be traced by a wrapper around the call (SPEC-055 FR-003) — invariant
+        13.
     """
     span_defaults = None if defaults is None else dict(defaults)
 

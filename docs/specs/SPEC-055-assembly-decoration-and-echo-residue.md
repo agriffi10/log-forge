@@ -1,8 +1,8 @@
 # Spec: Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe
 
 **ID:** SPEC-055
-**Status:** In Progress
-**Last Updated:** 2026-09-04
+**Status:** Completed
+**Last Updated:** 2026-09-05
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037
 
 ## Overview
@@ -63,7 +63,7 @@ options, both complete:
 **Recommendation: Option A, now.** It closes the wrong-data defect before the tag at the cost of
 a `TypeError` a consumer meets at import, and it leaves Option B open at zero cost. FR-003 is
 written as Option A; it is built only once the decision is made, and the other five FRs are
-built regardless.
+built regardless. **Decided 2026-09-05: Option A**, and built in the spec's second PR.
 
 ## Scope
 

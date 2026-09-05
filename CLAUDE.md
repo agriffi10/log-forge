@@ -119,7 +119,7 @@ carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@do
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
-**Current work:** SPEC-055 — assembly, decoration and echo residue.
+**Current work:** none in flight — SPEC-055 completed 2026-09-05.
 
 ## Key Decisions (settled — don't re-litigate)
 
@@ -131,7 +131,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 ### The trace model and its context
 
-- **Unit of work = a decorated call** — `@log_foundry.trace`; the outermost call starts a trace, every call is a span within it. Named once at decoration, where a misordered descriptor or non-callable is refused. (arch §4, SPEC-055)
+- **Unit of work = a decorated call** — `@log_foundry.trace`; the outermost call starts a trace, every call is a span within it. Named once at decoration, where a misordered descriptor, a non-callable or a generator function is refused. (arch §4, SPEC-055)
 - **IDs are W3C Trace Context compatible** — `trace_id` 16B/32hex, `span_id` 8B/16hex, `log_id` UUID, so adopting tracing later stays cheap. (arch §3.1)
 - **Context via `contextvars`** — not thread-locals — correct under threads and asyncio; holds a span stack plus baggage. (arch §5)
 - **Cross-process traces are adopted explicitly, never auto-instrumented** — no client patching or middleware, which would need the deps the core refuses. Inbound context is untrusted and confers no authority. (SPEC-014)

@@ -312,7 +312,9 @@ def process(): ...
 
 `@trace` refuses at decoration what it cannot trace, with a `TypeError` naming the function:
 a `@classmethod` or `@staticmethod` written *below* it (put them above), a bare string
-(`@trace("checkout")` meant `@trace(name="checkout")`), and anything not callable.
+(`@trace("checkout")` meant `@trace(name="checkout")`), anything not callable, and a
+**generator function** (sync or async) — its body runs after the wrapper has returned, so the
+span would close before it started. Trace the consumer, or open the span around the loop.
 
 The **outermost** decorated call starts a new trace; every nested decorated call becomes a
 child span within it. On an exception, the decorator records `status="error"` plus an `error`
