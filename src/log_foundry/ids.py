@@ -137,7 +137,9 @@ def parse_traceparent(value: object) -> tuple[str, str] | None:
     its own identity.
 
     Args:
-      value: An inbound header value of any type, from outside the process.
+      value: An inbound header value of any type, from outside the process. Surrounding
+        whitespace is stripped before parsing, since a header value arrives trimmed from some
+        transports and not others; whitespace anywhere else is a malformed field.
 
     Returns:
       A ``(trace_id, span_id)`` tuple, or ``None`` if the value is unusable.

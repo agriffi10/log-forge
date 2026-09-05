@@ -286,7 +286,7 @@ MAX_PARTITION_KEY_BYTES = 256
 
 
 def _partition_key(raw: str) -> str:
-    """Bounds a partition key to the service's 256 **bytes**, never 256 characters.
+    """Bounds a partition key to 256 UTF-8 **bytes**, at or below the service's 256-character limit.
 
     Both encodes carry an ``errors=`` and both are load-bearing. Assembly replaces a lone
     surrogate since SPEC-055 FR-001, so an event field cannot carry one — but this key is derived
