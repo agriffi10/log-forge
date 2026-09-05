@@ -178,8 +178,11 @@ fresh one for the same reason a sink adopted then is — it delivers, and a set 
 every backoff to zero. A worker that already holds the set event keeps it: a retired worker is
 never restarted (SPEC-019), so the replacement can only ever reach a later deliverer. The skip
 rule is unchanged too (SPEC-035 FR-001, SPEC-044 FR-003): the sink's signal is not replaced while
-a delivery or a close is in flight against it, which is `in_flight(sink)` in FR-004 — the same
-predicate `worker_owns_now(sink) or _closing(sink)` computes today, asked once.
+the worker is still *draining* into it or a close of it is running, which is `in_flight(sink)` in
+FR-004 — the same predicate `worker_owns_now(sink) or _closing(sink)` computes today. It reads
+`worker.draining`, not thread liveness, on purpose: an abandoned drain counts as not draining, so
+a sink still written to after an expired `shutdown()` gets a fresh event rather than SPEC-033
+FR-004's tight retry loop.
 
 Measured cost of the read that moves: a `self` attribute read is 4.1 ns and a read through the
 module global is 5.9 ns on this machine, so `submit` costs under 2 ns more on each of two reads.
@@ -189,8 +192,8 @@ on the build, not assumed.
 #### Acceptance Criteria:
 
 - [ ] `grep -n '_shutdown_done\|_orphan_retired\|_orphan_stop' src/log_foundry/` returns nothing,
-      and `grep -c 'threading.Event()' src/log_foundry/worker.py` is exactly 3 — the two drain
-      events and the flush marker's — so no stop event is built there. `Worker._stop` survives as
+      and `grep -n '_stop = threading.Event()' src/log_foundry/worker.py` returns nothing, so no
+      stop event is built there. `Worker._stop` survives as
       the reference to the owner's event that the constructor was handed; `_lifecycle._state`
       holds the only latch and builds the only stop event, and `_worker_health` no longer computes
       `retired` with an `or`.
@@ -236,12 +239,16 @@ about re-arming, and two mechanisms that contradict it are retired, said out lou
   against a sink the drain thread may still be inside — is answered at close time by the moment
   question (FR-003), not by refusing the arming.
 - **`Worker(sink_released=…)`** (SPEC-044 FR-001) made a worker built during a `shutdown()`
-  inherit a discharged close for a sink that shutdown's orphan branch had just closed. The
-  ordering that needed it no longer exists: the merged `_shutdown_worker` performs its one close
-  **after every drain, the late worker's included** (FR-003), so a late worker's sink is armed by
-  its build, drained, and closed once, in either registration order.
+  inherit a discharged close for a sink that shutdown's orphan branch had just closed. Under one
+  record the flag has no work to do: the late worker's sink is armed by its build, and the
+  closer's second pass (FR-003) closes it after that worker's drain. Where the worker registered
+  before the first pass took anything, that is the sink's only close; where it was built *during*
+  the first pass's close — the ordering the flag existed for, which is possible because
+  `_shutdown_running` spans the close, exactly as today — the sink is closed a second time, after
+  the events that worker delivered into it, which SPEC-045 FR-002 says is one close per
+  write-epoch and not a double.
 
-The one observable this changes is a sink written to after a **completed** close: an explicit
+The other observable this changes is a sink written to after a **completed** close: an explicit
 `shutdown()`, then an `info()` outside a span to a sink that still accepts, then `atexit`. Today
 the latch refuses the re-arm for that sink and its post-close batch is never flushed; after this
 spec it is re-armed and closed again, which is SPEC-045 FR-002's rule and one close per
@@ -273,14 +280,18 @@ hooks. A live target is still reached through the config and `worker.sink`, and
       orphan emit resolving A before a swap and emitting after it — ends with A closed **twice**,
       the second close *after* the late event landed, asserted by recording the sink's event count
       at each close. Not `A.closes == 1`, which is the assertion this supersedes. Invariant 5.
-- [ ] SPEC-044 FR-001's three race tests in `tests/test_lifecycle_races.py` pass with their
-      "closed once" assertions **unchanged**, in both registration orders, because the one close
-      now runs after the late worker's drain; and a fourth assertion in the orphan-closes-first
-      test records that the close ran after that worker's events landed. Invariant 5.
+- [ ] SPEC-044 FR-001's three race tests in `tests/test_lifecycle_races.py`: the two where the
+      worker registers before the close pass with `closes == 1` unchanged; the one where it is
+      built *during* the close (`test_the_racing_shutdown_closes_the_sink_once_when_the_orphan_branch_closes_first`)
+      is re-stated to `closes == 2` with the second close after that worker's events landed,
+      asserted by the sink's event count at each close. `assert not _drain_threads()` holds in
+      all three: a worker built during the close is still registered and stopped. Invariant 5.
 - [ ] Two `shutdown()` calls racing while an `info()` outside a span lands on the sink the first
-      is closing: `close()` is never entered on two threads at once, asserted by a sink that
-      counts concurrent entries, and the sink is closed again after the emit landed — by the
-      second caller after its wait, or by a later `shutdown()`. Invariant 5.
+      is closing, with a close the test can release: `close()` is never entered on two threads at
+      once, asserted by a sink that counts concurrent entries. Released inside the grace, the
+      **second caller** performs the sink's next close after its wait; held past the grace, the
+      second caller returns with the sink still in the record and a **later** `shutdown()` closes
+      it. Two tests, one per branch. Invariant 5.
 - [ ] `tests/test_lifecycle_races.py`'s two lints on the record —
       `test_every_site_that_clears_the_orphan_record_declares_its_disposition` and
       `test_the_owed_close_record_is_only_ever_mutated_in_place` — are re-keyed to the new record
@@ -302,16 +313,22 @@ hooks. A live target is still reached through the config and `worker.sink`, and
 record `ShutdownTimeout` and release waiters on expiry, wait on `_drain_settled` on the idempotent
 path. The closer, under `_lock`:
 
-1. takes every owed sink with nothing in flight against it — `in_flight(sink)` (FR-004): a
-   release registered in `_closing_now`, or `worker.may_be_inside(sink)`, the worker's answer,
-   true while its thread is alive for its live sink and for a swapped-out sink whose fence was
-   not confirmed (SPEC-050 FR-004's `_unclosed_swaps`, now a list the worker keeps of sinks its
-   own thread may hold, pruned on a confirmed fence or a re-adoption). The worker asked is
-   `_state._worker`; `_late_worker` is the same object when it is set, and is never the only
-   handle consulted;
+1. takes every owed sink that is not `held(sink)` (FR-004): a release registered in
+   `_closing_now`, or `worker.may_be_inside(sink)` — the worker's answer, true while its thread
+   is **alive** for its live sink and for a swapped-out sink whose fence was not confirmed
+   (SPEC-050 FR-004's `_unclosed_swaps`, now a list the worker keeps of sinks its own thread may
+   hold, pruned on a confirmed fence or a re-adoption). Thread liveness, not `draining`: after an
+   expired `shutdown()` the thread is alive inside `emit` and the sink is left open (SPEC-027
+   FR-004), which is the opposite answer from the one the signal refresh needs in that state.
+   The worker asked is `_state._worker`; `_late_worker` is the same object when it is set, and is
+   never the only handle consulted;
 2. registers each in `_closing_now`, which becomes `dict[int, threading.Event]` so a bystander
    has something to wait on — the per-sink registration `release()` already brackets (SPEC-044
-   FR-003), carrying an event instead of nothing;
+   FR-003), carrying an event instead of nothing. **The discharge and the registration are one
+   critical section, performed by the thread that decides the close**, a detached one included:
+   today a detached `release()` registers on the daemon thread it starts, after the caller has
+   released `_lock`, and with the latch gone that gap is a sink neither owed nor in flight, which
+   a preempted orphan emit re-arms and a racing `shutdown()` then closes alongside;
 3. closes them the way SPEC-046 settled: one on the calling thread, the rest on threads that are
    joined in a `finally`. The inline one is the worker's live sink where a worker exists, else the
    configured sink where it is owed, else the most recently armed — so `shutdown()`'s own close
@@ -324,10 +341,12 @@ path. The closer, under `_lock`:
 A caller that found a sink in flight waits on every event in `_closing_now` for
 `closer_grace(deadline)`, the one arithmetic that replaces `_closer_grace`, `_bystander_grace`
 and `join_closers`'s inline copy: `min(DEFAULT_CLOSER_GRACE, remaining)`, the cap for `None` —
-and then takes once more whatever the wait released and is still owed (FR-002). The closer runs
-**once per `shutdown()` call, after every drain**: `_shutdown_worker` stops the worker it found,
-then the late worker SPEC-044 FR-001 registered, then closes — where today `_close_orphan_sink`
-runs before the late worker's own shutdown and that shutdown closes its sink itself. The process-wide count and idle
+and then takes once more whatever the wait released and is still owed (FR-002). **The closer
+runs twice per `shutdown()` call, and the second pass is that re-take.** `_shutdown_worker` stops
+the worker it found, runs the first pass, then — with `_shutdown_running` still raised across
+that pass, as it is across today's close, so a worker built meanwhile is registered — reads and
+stops the late worker SPEC-044 FR-001 registered, and runs the second pass, which closes what
+that worker's build armed and whatever the first pass's wait released. Nothing runs a third. The process-wide count and idle
 event go, so a worker-path `shutdown()` no longer pays for an orphan close of a sink it never
 touched (twin 6's recorded cost) — it waits only on closes in flight, which is what both
 docstrings say the wait is for. `join_closers` is granted once, at the end of `_shutdown_worker`,
@@ -377,11 +396,16 @@ worker the drain step is skipped and nothing else differs.
 
 With one record, "who owns this sink's close" has one answer and is no longer a question a call
 site can get wrong. What remains is **existence** (`worker_exists`), **liveness**
-(`live_worker`, now `_worker` unless `retired`), and the **moment** — `in_flight(sink)`, true
-while the worker is draining into the sink (`worker.draining`, unchanged) or a release of it is
-registered in `_closing_now` — asked at the two sites that act on a sink, the signal refresh
-and the closer's take. `worker_owns` and
-`worker_owns_now` are deleted. This supersedes the four-question set of SPEC-035 FR-002 and
+(`live_worker`, now `_worker` unless `retired`), and the **moment**, which is one category with
+**two predicates**, because an abandoned drain answers them oppositely and that has to be said
+at the category rather than rediscovered at a site. `in_flight(sink)` — the worker is
+*draining* into the sink (`worker.draining`, unchanged) or a release is registered in
+`_closing_now` — is asked by the signal refresh, where an abandoned drain must count as over so
+the sink gets a fresh event (SPEC-033 FR-004). `held(sink)` — the worker's thread is *alive* and
+the sink is one it may be inside, or a release is registered — is asked by the closer's take,
+where an abandoned drain must count as still inside so the sink is left open (SPEC-027 FR-004).
+Both were measured on the expired-shutdown state: SPEC-033 FR-002 closing under a live writer,
+SPEC-035 FR-001 the fresh event never arriving. `worker_owns` and `worker_owns_now` are deleted. This supersedes the four-question set of SPEC-035 FR-002 and
 SPEC-040 FR-002 and the "ownership, not liveness" slogan, and says so where those are recorded:
 arch §9.2, `decisions.md`'s guard entry, and the roster test's own docstring.
 
@@ -413,12 +437,16 @@ lint exists to catch. The three limitations the roster discloses about itself ar
 
 `_worker_health` assembles the snapshot once: the worker's counters where a worker exists and
 zeros where not, and — on **both** branches — `retired` from the owner, `sink` from
-`read_losses` over the **configured** sink — SPEC-030's definition of the field, and the same
+`read_losses` over the **configured** sink — the field is SPEC-026 FR-003's, and this is the same
 authority FR-005 uses for `inherited_sink` — `closing_sinks` from the registry, `inherited_sink`
 from the config (arch §12's prescribed answer, taken because the record entry it used to read no
 longer exists), and the two loss counters from `decorator`. The worker path reads `worker.sink`
-today, which differs from the config only inside a swap; the config wins there because arch §12
-already names it the authority for "installed". `_worker_health`'s docstring claim that
+today, and the two differ in three states, not one: inside a swap, briefly; **permanently** after
+a declined swap (SPEC-035 FR-003: the worker retired mid-swap and keeps A while B is delivered
+to); and permanently after any `configure(sink=…)` on a retired worker (SPEC-033 FR-002). In the
+last two `health().sink` today reports A's losses while every event goes to B; after this spec it
+reports B's. That is an observable change on the worker path, taken because arch §12 already
+names the config the authority for "installed" and B is the sink being delivered to. `_worker_health`'s docstring claim that
 "`worker.py` imports nothing from this module" is false at `98c7e78` (`worker.py:11`) and is
 struck in the same edit. `Worker.health()` returns its own
 counters only and stops reaching into `_lifecycle`. `_flush_live_sink` drains the sinks the record
@@ -490,10 +518,11 @@ _Lifecycle {
 
   worker_exists() -> Worker | None       // existence
   live_worker() -> Worker | None         // liveness: _worker unless retired
-  in_flight(sink) -> bool                // moment: worker.draining into sink, or a release registered
+  in_flight(sink) -> bool                // moment, for the refresh: worker.draining into sink, or a release registered
+  held(sink) -> bool                     // moment, for the close: worker.may_be_inside(sink), or a release registered
   refresh_stop_signal() -> Event         // unchanged
 }
-_closing_now: dict[int, threading.Event]   // FR-003: release() registers; a bystander waits
+_closing_now: dict[int, threading.Event]   // FR-003: registered with the discharge, under _lock; a bystander waits
 closer_grace(deadline) -> float            // FR-003: the one arithmetic
 
 // src/log_foundry/worker.py
@@ -553,7 +582,7 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - Write the one closer with per-sink in-flight events and the one grace; reduce
   `Worker.shutdown` to `stop`; make `_swap_sink` one function over `retarget`.
 - Declare the record in `_FORK_SKIP`; collapse the two residue handlers; run the fork suite.
-- FR-004's code half: delete `worker_owns` and `worker_owns_now`, add `in_flight`, re-derive
+- FR-004's code half: delete `worker_owns` and `worker_owns_now`, add `in_flight` and `held`, re-derive
   the roster floor from the merged tree and state the count it came from.
 - Re-key the three derived lints; plant the mutants each FR names.
 
@@ -586,10 +615,11 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - **A refactor silently shrinks a derived guard.** Three lints are keyed on names this spec
   deletes. Each phase re-keys them and plants a mutant; a green suite after a rename is not
   evidence (SPEC-040's own history, recorded in `decisions.md`).
-- **The late-worker double close.** FR-002's second retirement changes an observable count from 1
-  to 2 for a sink that accepts after `close()`. It is the rule SPEC-045 already settled, applied
-  to the one site that still contradicted it; the criterion pins the second close *after* the
-  delivery it discharges.
+- **Two closes that used to be one.** FR-002 changes two observable counts from 1 to 2: a late
+  worker built during the first pass's close (SPEC-044 FR-001's third race test), and a sink
+  written to after a completed close. Both are SPEC-045 FR-002's rule applied to the sites that
+  still contradicted it; each criterion pins the second close *after* the delivery it
+  discharges. `sinks/base.py` already requires the second to be safe.
 - **The record in the fork walk.** A new global holding sinks needs `_FORK_SKIP` or the walk
   re-hooks superseded sinks (SPEC-044 FR-005's hazard, twice avoided in SPEC-050 by the same
   declaration). FR-006 names it; the fork suite's opt-out lint is the gate.
