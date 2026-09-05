@@ -166,8 +166,12 @@ does that one owner cannot is disagree with itself, which probe 1 shows.
 
 #### Description:
 
-`_Lifecycle` holds `retirements`, a count of `shutdown()` entries incremented under `_lock` at
-the top of `_shutdown_worker`, and `_stop`, the one `threading.Event` every sink and the worker's
+`_Lifecycle` holds `retirements`, a count incremented under `_lock` at the top of
+`_shutdown_worker` and **once more, under the same lock, immediately before that call stops a
+late worker** (FR-003) — a late worker records the already-incremented count at its build, so
+without the second move the call that stops it would leave it reading as live, delivering
+nothing, with its next submission uncounted and a later swap waiting a whole budget for a fence
+it cannot confirm, all three measured on a model built from this spec — and `_stop`, the one `threading.Event` every sink and the worker's
 drain loop wait on. `health().retired` is `retirements > 0`. `Worker` loses `_shutdown_done`,
 `retired`, `_stop` and `_offer_stop_signal`: it is handed its event at construction, holds that
 object for the life of its thread, records the count at its build as `_epoch`, and where it read
@@ -330,8 +334,11 @@ hooks. A live target is still reached through the config and `worker.sink`, and
 
 `_lifecycle._close_owed(deadline)` replaces `Worker._close_if_owed`, `Worker._close_sink`,
 `_close_orphan_sink` and `_close_owed`. `_shutdown_worker` calls it on both paths after the drain
-— `Worker.stop(timeout)`, which is what remains of `Worker.shutdown`: queue the sentinel, join,
-record `ShutdownTimeout` and release waiters on expiry, wait on `_drain_settled` on the idempotent
+— `Worker.stop(timeout)`, which is what remains of `Worker.shutdown`: **set the event it holds**
+— the owner set `_state._stop` at the top of the call, but a late worker's build refreshed it, so
+a late worker and its sink hold an event nothing else will set; measured, a 3 s backoff bounded
+the stop at 3.01 s against 0.06 s with the set in place — queue the sentinel, join, record
+`ShutdownTimeout` and release waiters on expiry, wait on `_drain_settled` on the idempotent
 path. The closer, under `_lock`:
 
 1. takes every owed sink that is not `held(sink)` (FR-004): a release registered in
@@ -374,7 +381,8 @@ this spec. `_shutdown_worker` stops the worker it found, runs the first pass, th
 `_shutdown_running` raised across that pass on the no-worker branch, as it is across today's
 close, so a worker built meanwhile is registered; the worker branch never raises it, because
 `_get_worker` returns the existing retired worker there rather than building one — reads and
-stops the late worker SPEC-044 FR-001 registered, and runs the second pass, which closes what
+moves `retirements` once more under `_lock` and stops the late worker SPEC-044 FR-001
+registered, and runs the second pass, which closes what
 that worker's build armed and whatever the first pass's wait released. Nothing runs a third. The process-wide count and idle
 event go, so a worker-path `shutdown()` no longer pays for an orphan close of a sink it never
 touched (twin 6's recorded cost) — it waits only on closes in flight, which is what both
@@ -428,7 +436,7 @@ and there is no adoption here.
 
 With one record, "who owns this sink's close" has one answer and is no longer a question a call
 site can get wrong. What remains is **existence** (`worker_exists`), **liveness**
-(`live_worker`, now `_worker` unless `retired`), and the **moment**, which is one category with
+(`live_worker`, now `_worker` while its epoch is current), and the **moment**, which is one category with
 **two predicates**, because an abandoned drain answers them oppositely and that has to be said
 at the category rather than rediscovered at a site. `in_flight(sink)` — the worker is
 *draining* into the sink (`worker.draining`, unchanged) or a release is registered in
