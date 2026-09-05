@@ -123,7 +123,10 @@ surrogate, never the `?` that `errors="replace"` writes on encode and never the 
 returned. The second element of the returned pair widens from "the ceiling fired" to "the string
 was altered", so `_Coercer.text()` sets `truncated` for a replacement as it does for a clip: a
 substitution nobody can see is a silent change to the data, which is the rule `real()` already
-applies to a non-finite float.
+applies to a non-finite float. The same rule reaches `bytes`: a `bytes`, `bytearray` or
+`memoryview` value is decoded strictly first, and only on `UnicodeDecodeError` decoded with
+`errors="replace"` and marked — today the same undecodable byte is marked when it arrives as a
+`str` and silent when it arrives as `bytes`.
 
 Every string `build_event` writes reaches one of the two clippers — `message`, `function`, every
 field key and value, every baggage value, and the four `error.*` strings — except the three
@@ -131,8 +134,18 @@ config stamps `service`, `version` and `env`, which are copied raw on the hottes
 refused at `configure()` instead: a value that is not a `str` is a `TypeError` and one that does
 not encode strictly is a `ValueError`, each naming the argument, checked beside the ceiling
 checks — before `_lifecycle.stamp(sink)` and before anything is assigned — so a rejected call
-leaves the config and the ownership record exactly as it found them. That is invariant 13's
-door, and it keeps the per-event path at zero extra encodes.
+leaves the config and the ownership record exactly as it found them. What is stored is
+`str.__str__(value)`, an exact `str`, so a `StrEnum` member stays an acceptable `env` and a
+`str` subclass instance never reaches an event through the config either. That is invariant
+13's door, and it keeps the per-event path at zero extra encodes.
+
+Three existing tests change meaning under this and are rewritten rather than left passing:
+`tests/test_api.py::test_a_bad_value_is_absorbed_inside_a_span` and
+`::test_the_absorbed_failure_is_announced_once_by_type_only` assert the library's own fault on
+`info(ValueError(...))` is an `AttributeError`, and it becomes a `TypeError` from `str.__str__`
+— still absorbed, still announced by type, a non-`str` message is still a slip and not a
+coercion; and `tests/test_sanitize.py::test_lone_surrogate_does_not_raise`, whose second
+assertion cannot fail once the value is replaced, is replaced by one that pins the replacement.
 
 #### Acceptance Criteria:
 
@@ -144,8 +157,11 @@ door, and it keeps the per-event path at zero extra encodes.
 - [ ] `truncate_tail` gives the same answers at the tail, and a lone surrogate in an
       `error.stack` is replaced in the `span.end` event.
 - [ ] `@trace(name=bad)` and `lf.info(bad, path=bad)` on `SQLiteSink`, where `bad` is the
-      `fsdecode` value above, deliver all three events with `failed_batches == 0`, and the stored
-      `function`, `message` and `fields.path` carry U+FFFD.
+      `fsdecode` value above and the connection was opened `check_same_thread=False` (the worker
+      inserts from its own thread), deliver all three events with `failed_batches == 0`, and the
+      stored `function`, `message` and `fields.path` carry U+FFFD.
+- [ ] `b"\xff\xfe\x80"` as a field value coerces to three U+FFFD with `truncated == True`;
+      `b"plain"` coerces with it absent.
 - [ ] A `str` subclass whose `encode` raises `RuntimeError`, passed as the message, is delivered
       as its plain text with `type(event["message"]) is str`, and costs nothing in
       `in_span_lost` or `orphan_lost`; the same object as a mapping key renders as its plain
@@ -154,11 +170,17 @@ door, and it keeps the per-event path at zero extra encodes.
       when the same event carries only ordinary text (invariant 8).
 - [ ] `configure(service="\udcff")` raises `ValueError` naming `service`; `configure(env=7)`
       raises `TypeError` naming `env`; `version` behaves the same; `get_config()` is unchanged
-      after each refusal; and `configure(service="\udcff", sink=s)` leaves `s` unstamped
+      after each refusal; `configure(service="\udcff", sink=s)` leaves `s` unstamped; and
+      `configure(env=SomeStrEnum.PROD)` is accepted with `type(get_config().env) is str`
       (invariant 13).
 - [ ] The `sinks/kinesis.py` docstring claiming `sanitize.coerce` passes a lone surrogate through
       is corrected, and its test's docstring with it; the guard in `_partition_key` stays,
-      because that key is derived from an event field a `TransformSink` may have rewritten.
+      because that key is derived from an event field a `TransformSink` may have rewritten. The
+      same claim in `docs/specs/SPEC-048-*.md` (FR-003's description) and
+      `docs/spec-delivery/SPEC-048-*.md` is struck in place with this spec's number, per
+      SPEC-021's rule.
+- [ ] The three rewritten tests named above are the only existing tests that change, checked
+      by diffing `pytest --collect-only -q` before and after.
 - [ ] Reverting the replacement while keeping the strict-encode fast path reddens the SQLite
       criterion and the corpus (FR-006); reverting `str.__str__` reddens the subclass criterion.
 - [ ] Serves invariant 8 on both delivery paths (invariant 6: the in-span build and the orphan
@@ -169,10 +191,20 @@ door, and it keeps the per-event path at zero extra encodes.
 #### Description:
 
 The span name is resolved when `decorate` runs, not on every call: the explicit `name` if one
-was given, else `fn.__qualname__` when that attribute exists and is a `str`, else the callable's
-type name. A `functools.partial` therefore traces as `partial` and a callable instance as its
-class, and neither raises. Both wrappers read the resolved name from their closure, which also
-removes an attribute lookup from the per-call path.
+was given, else `fn.__qualname__` when the callable has one, else the callable's type name. A
+`functools.partial` therefore traces as `partial` and a callable instance as its class, and
+neither raises. A `__qualname__` that exists but is not a `str` needs no clause of its own:
+`functools.wraps` copies the attribute onto the wrapper and Python refuses a non-`str` there
+with `TypeError` before any wrapper exists, which is a refusal at decoration already. Both
+wrappers read the resolved name from their closure, which also removes an attribute lookup from
+the per-call path.
+
+Accepting a callable instance opens one door the old `AttributeError` kept shut: an instance
+whose `__call__` is `async def` reads as synchronous to `asyncio.iscoroutinefunction`, so it
+would take the sync wrapper and close the span before the coroutine ran — the generator
+finding's shape again. The dispatch therefore consults the bound `__call__` too, on any callable
+that is not a plain function: `iscoroutinefunction(fn) or iscoroutinefunction(fn.__call__)`.
+FR-003's generator test consults `__call__` the same way.
 
 A `classmethod` or `staticmethod` object handed to `@trace` is a decorator applied in the wrong
 order, and it is refused at decoration with a `TypeError` that names the underlying function and
@@ -189,8 +221,11 @@ first call.
 - [ ] `trace(functools.partial(f, 1))()` returns `f(1)` and emits a span named `partial`;
       `trace(C())()` on a callable instance returns its result and emits a span named `C`
       (invariant 1).
-- [ ] An explicit `name=` still wins over both, and a `__qualname__` that is not a `str` falls
-      through to the type name rather than reaching `Span.name`.
+- [ ] An explicit `name=` still wins over both, and an instance carrying a non-`str`
+      `__qualname__` is refused at decoration by `functools.wraps` itself, with `TypeError`.
+- [ ] A callable instance whose `__call__` is `async def` takes the async wrapper: the span
+      closes after the coroutine's body ran, and an event logged inside it carries the span's
+      `span_id`.
 - [ ] `@trace` above `@classmethod` and above `@staticmethod` each raise `TypeError` at class
       body execution, the message naming the function and the correct order; `@classmethod` above
       `@trace` keeps working, as does `@staticmethod` above `@trace` (invariant 13).
@@ -198,7 +233,7 @@ first call.
       `TypeError` whose message contains `name=`.
 - [ ] `iscoroutinefunction` dispatch is unchanged: a partial of an `async def` still takes the
       async wrapper.
-- [ ] Removing the `isinstance(__qualname__, str)` check reddens its criterion; removing the
+- [ ] Removing the `__call__` consultation reddens the async-instance criterion; removing the
       `staticmethod` clause reddens the misorder criterion while the `classmethod` half stays
       red on its own.
 - [ ] Serves invariants 1 and 13 on both wrappers (invariant 6: sync and async).
@@ -209,7 +244,8 @@ first call.
 
 *Option A above; built only once the decision is made.* `decorate` tests
 `inspect.isgeneratorfunction` and `inspect.isasyncgenfunction` — both see through a
-`functools.partial` — and raises `TypeError` naming the function and saying that a generator's
+`functools.partial`, and both are also asked of the bound `__call__` of a callable instance, as
+FR-002's dispatch is — and raises `TypeError` naming the function and saying that a generator's
 body runs after the wrapper has returned, so the span would close before it starts; the message
 points at tracing the consumer or opening the span around the loop. Nothing else changes:
 today's behaviour for a generator is a span of the *call*, which is wrong data on a fresh trace
@@ -218,8 +254,8 @@ for every event the body logs, and no consumer can be relying on it knowingly.
 #### Acceptance Criteria:
 
 - [ ] `@trace` on a `def` containing `yield` raises `TypeError` at decoration, naming the
-      function; the same for `async def` with `yield`, and for a `partial` of either
-      (invariant 13).
+      function; the same for `async def` with `yield`, for a `partial` of either, and for an
+      instance whose `__call__` is a generator function (invariant 13).
 - [ ] A function that returns a generator object without being one is accepted, and the
       limitation is stated in the docstring rather than closed.
 - [ ] The README's `@trace` section says generators are refused and what to do instead.
@@ -298,8 +334,9 @@ still bound at construction (SPEC-031 FR-003); nothing here re-resolves it.
 - [ ] A `KeyboardInterrupt` from the stream still reaches the caller.
 - [ ] `test_api.py`'s existing echo tests pass unchanged, including the one asserting the
       `OSError` line's text.
-- [ ] `worker.py` reads its period from `_diag.WARN_EVERY` and the two throttle criteria in
-      `test_worker.py` still pass.
+- [ ] `worker.py` reads its period from `_diag.WARN_EVERY`: with `WARN_EVERY` patched to 5,
+      both worker sites write at totals 1, 5 and 10, and `worker._DROP_WARN_EVERY` no longer
+      exists. The two existing throttle criteria in `test_worker.py` pass unchanged.
 - [ ] Removing the disable flag reddens the first criterion by line count; removing the modulo
       reddens the `OSError` criterion; removing the lock is the one mutant no criterion above is
       promised to catch — a lost increment shifts a line, and the threaded criterion is
@@ -337,7 +374,10 @@ a hostile key beside a sibling; a type whose `__name__` is longer than `max_valu
 key and as a value; and a control row of ordinary text expecting `truncated` absent.
 
 The walker is a test helper, not library code; a library function to "check an event" would be
-a second implementation of the invariant for a reviewer to reconcile with the first.
+a second implementation of the invariant for a reviewer to reconcile with the first. Its failure
+messages render the offending value through `ascii()`: a failing assertion whose message carries
+a lone surrogate crashes the xdist worker that tries to report it, so a plain `repr` would make
+the FR-001 mutant readable only under `-n 0`.
 
 #### Acceptance Criteria:
 
@@ -345,7 +385,8 @@ a second implementation of the invariant for a reviewer to reconcile with the fi
       least ten rows expect it absent.
 - [ ] Every row passes on both routes, and the routes share one assertion function.
 - [ ] The walker reaches keys as well as values, and at least one row fails the strict-encode
-      check when FR-001's replacement is reverted while every other check still passes.
+      check when FR-001's replacement is reverted while every other check still passes — and
+      that failure is reported, not an `INTERNALERROR`, under the default `-n 12`.
 - [ ] Reverting FR-004's guard fails at least one row on its pinned value, not on an exception.
 - [ ] Serves invariant 8 on both delivery paths (invariant 6).
 
@@ -364,6 +405,10 @@ def _measured(value: str) -> tuple[str, bytes, bool]:
     # and whether a surrogate was replaced
 def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]   # bool now means "altered"
 def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]  # same widening; exact str out
+# _Coercer._dispatch: bytes/bytearray/memoryview decode strictly, then with "replace" + truncated
+
+# src/log_foundry/config.py — configure() only; Config unchanged
+def _require_text(name: str, value: object) -> str | None   # TypeError / ValueError; str.__str__ out
 
 # src/log_foundry/console.py — ConsoleWriter, new private state
 _disabled: bool                   # latched on BrokenPipeError / ValueError; write() returns early
@@ -420,6 +465,8 @@ docs/
 ├── invariants.md              # the Guarded lines for 8, 11, 13; a Recorded exception on 8 for the stamps
 ├── decisions.md               # event-assembly area extended; one trace-model entry; one diag entry
 ├── architecture.md            # §12: the two entries 02a8ac5 files, struck in place; §6 auto-capture line
+├── specs/SPEC-048-*.md        # FR-001: the surrogate claim, struck in place
+├── spec-delivery/SPEC-048-*.md  # same
 └── specs/INDEX.md
 README.md                      # the @trace section: name fallback, refusals; the echo bullet
 ```
@@ -429,23 +476,24 @@ README.md                      # the @trace section: name fallback, refusals; th
 ### Phase 1: Assembly
 
 - FR-001's assembly half: `_measured` returns the exact, replaced string; `str.__str__`; both
-  clippers.
+  clippers; the strict-then-replace `bytes` decode.
+- The three rewritten tests, and the `--collect-only` diff that proves they are the only ones.
 - FR-004: `key()` total, the key placeholder, both placeholders through `text()`.
-- Correct `_measured`'s and `key()`'s docstrings, `test_sanitize.py`'s surrogate test, and the
-  `kinesis.py` claim.
+- Correct `_measured`'s and `key()`'s docstrings, `test_sanitize.py`'s surrogate test, the
+  `kinesis.py` claim, and the two SPEC-048 prose sites.
 - FR-006: the corpus, both routes, the walker.
 
 ### Phase 2: The stamps
 
-- FR-001's `configure()` half: type and encode checks beside `_require_positive`, before the
-  ownership stamp; tests in `test_config.py`.
+- FR-001's `configure()` half: `_require_text` beside `_require_positive`, before the
+  ownership stamp, storing `str.__str__(value)`; tests in `test_config.py`.
 - The SQLite end-to-end criterion.
 
 ### Phase 3: Decoration
 
 - FR-002: resolve the name once; refuse `classmethod`, `staticmethod` and non-callables, with
-  the `name=` hint for a `str`.
-- FR-003, once decided: the generator refusal, both flags.
+  the `name=` hint for a `str`; consult `__call__` in the async dispatch.
+- FR-003, once decided: the generator refusal, both flags, `__call__` consulted.
 - README `@trace` section; `architecture.md` §6's auto-capture line.
 
 ### Phase 4: Echo
