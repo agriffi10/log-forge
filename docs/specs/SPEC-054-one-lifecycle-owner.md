@@ -19,9 +19,10 @@ lists three occasions. This spec measured the shape before proposing to change i
 
 **Measured at `98c7e78`, by reading both modules end to end.** Thirteen twin pairs, each a
 mechanism implemented once per path, listed with `file:line` under *The twins* below. Across the
-seven specs that fixed lifecycle defects (SPEC-030, 033, 035, 044, 045, 046, 050), **15 of their
+seven specs that fixed lifecycle defects (SPEC-030, 033, 035, 044, 045, 046, 050), **13 of their
 36 functional requirements** edited a mechanism on both sides or added a guard on one side that
-reads the other side's state; the per-spec table is under *The twins*. SPEC-040 is excluded from
+reads the other side's state; the per-spec table is under *The twins*, with the rule applied
+strictly — an FR *measured* on both paths whose edit landed on one side does not count. SPEC-040 is excluded from
 that count because it moved rather than fixed: it put the orphan side's seven globals onto one
 object and left the worker's on `Worker`, so "one owner" has been the name of a file since
 2026-08-11 and not yet a fact. In the two modules, docstrings run to roughly 2,600 of 4,041
@@ -44,8 +45,8 @@ counts `submitted_after_shutdown=1`. That difference is SPEC-030's fence and thi
 
 **The conclusion is that the merge is worth making, and that it is four phases rather than one.**
 The alternative — record the duplication as a constraint — was weighed against the numbers above
-and against the cost of the merge, which is real: 200 sites in 14 test files name the internals
-that go away, three derived lints are keyed on them, and the guard roster loses two of its four
+and against the cost of the merge, which is real: about 200 sites in 14 test files name the internals
+that go away (the pattern is stated under *Risks*), three derived lints are keyed on them, and the guard roster loses two of its four
 categories. The case for building it is that the invariant-6 review obligation is currently the
 *only* thing keeping the twins in step, and the probe shows it has already missed one. After
 this spec the two emit paths still exist and invariant 6 still applies to them; what stops
@@ -135,11 +136,11 @@ side that reads the other side's state. Documentation-only FRs never count.
 | SPEC-030 | 4 | 0 | — |
 | SPEC-033 | 7 | 4 | FR-002 (swap keyed on `_worker.sink`), FR-003 (closer moved off `Worker` for both), FR-004 (orphan signal skipped on worker ownership), FR-005 (one module, both callers) |
 | SPEC-035 | 5 | 3 | FR-001 (`Worker.draining` added for the orphan site), FR-002 (roster over both), FR-003 (`swap_sink` returns, `_swap_sink` re-homes) |
-| SPEC-044 | 6 | 5 | FR-001 (depth counter plus `Worker(sink_released=)`), FR-002, FR-003 (measured on both paths), FR-004 (worker branch latches the orphan slot), FR-006 (pinned on both paths) |
+| SPEC-044 | 6 | 3 | FR-001 (depth counter plus `Worker(sink_released=)`), FR-002 (`_get_worker` decides the orphan record's close), FR-004 (worker branch latches the orphan slot). Not FR-003, whose edit is `_lifecycle` alone though it was measured on both paths, and not FR-006, which is documentation and a test |
 | SPEC-045 | 5 | 1 | FR-001 (consumers include `_get_worker` and the swap's worker branch) |
 | SPEC-046 | 4 | 0 | — |
 | SPEC-050 | 5 | 2 | FR-002 (widened to both paths by its own spec review), FR-004 (`_unclosed_swaps` on the worker, `discharge_owed` on the orphan record) |
-| **Total** | **36** | **15** | |
+| **Total** | **36** | **13** | |
 
 **The probe.** Two scripts, each running one scenario per delivery path in a fresh interpreter;
 the implementer re-runs both against the tree the build starts from and again at the end.
@@ -181,15 +182,18 @@ a delivery or a close is in flight against it, which is `in_flight(sink)` in FR-
 predicate `worker_owns_now(sink) or _closing(sink)` computes today, asked once.
 
 Measured cost of the read that moves: a `self` attribute read is 4.1 ns and a read through the
-module global is 5.9 ns on this machine, so `submit` gains under 2 ns on each of two reads.
+module global is 5.9 ns on this machine, so `submit` costs under 2 ns more on each of two reads.
 SPEC-040 held the traced call to a ~6.6 ns addition; this is inside that and must be re-measured
 on the build, not assumed.
 
 #### Acceptance Criteria:
 
-- [ ] `grep -n '_shutdown_done\|_orphan_retired\|_orphan_stop\|self\._stop\b' src/log_foundry/`
-      returns nothing; `_lifecycle._state.retired` and `_lifecycle._state._stop` are the only
-      latch and the only event, and `_worker_health` no longer computes `retired` with an `or`.
+- [ ] `grep -n '_shutdown_done\|_orphan_retired\|_orphan_stop' src/log_foundry/` returns nothing,
+      and `grep -c 'threading.Event()' src/log_foundry/worker.py` is exactly 3 — the two drain
+      events and the flush marker's — so no stop event is built there. `Worker._stop` survives as
+      the reference to the owner's event that the constructor was handed; `_lifecycle._state`
+      holds the only latch and builds the only stop event, and `_worker_health` no longer computes
+      `retired` with an `or`.
 - [ ] After `shutdown()` on a process that only ever logged outside a span, and after one that
       only ever logged inside one, `health().retired` is `True` and comes from the same attribute.
       Invariant 2.
@@ -232,12 +236,22 @@ about re-arming, and two mechanisms that contradict it are retired, said out lou
   against a sink the drain thread may still be inside — is answered at close time by the moment
   question (FR-003), not by refusing the arming.
 - **`Worker(sink_released=…)`** (SPEC-044 FR-001) made a worker built during a `shutdown()`
-  inherit a discharged close for a sink that shutdown's orphan branch had just closed. Under one
-  record that worker's sink is armed by its build and closed by its own shutdown — a second close
-  on a sink the worker delivered into after the first, which SPEC-045 FR-002 says is one close per
-  write-epoch and not a double. The one measurable difference is for a sink that keeps accepting
-  after `close()`: today its post-close batch lands and is never flushed; after this spec it is
-  flushed by the second close.
+  inherit a discharged close for a sink that shutdown's orphan branch had just closed. The
+  ordering that needed it no longer exists: the merged `_shutdown_worker` performs its one close
+  **after every drain, the late worker's included** (FR-003), so a late worker's sink is armed by
+  its build, drained, and closed once, in either registration order.
+
+The one observable this changes is a sink written to after a **completed** close: an explicit
+`shutdown()`, then an `info()` outside a span to a sink that still accepts, then `atexit`. Today
+the latch refuses the re-arm for that sink and its post-close batch is never flushed; after this
+spec it is re-armed and closed again, which is SPEC-045 FR-002's rule and one close per
+write-epoch rather than a double. **A sink re-armed while its close is still running is not
+closed concurrently.** The closer takes only sinks with no delivery or close in flight against
+them — `in_flight(sink)` (FR-004), the same predicate the signal refresh asks — so an emit that
+lands during a close leaves the sink in the record; the closer that finds it in flight waits out
+the grace and then takes, once more, whatever that wait released. A sink re-armed during *that*
+close stays for a later `shutdown()`, which is the same tail SPEC-050 FR-002's bystander already
+accepts at `atexit`.
 
 `sinks/base.py` still asks an implementation to make `close()` idempotent and the library still
 does not rely on it (SPEC-044): every close performed here is against a sink that received
@@ -260,9 +274,13 @@ hooks. A live target is still reached through the config and `worker.sink`, and
       the second close *after* the late event landed, asserted by recording the sink's event count
       at each close. Not `A.closes == 1`, which is the assertion this supersedes. Invariant 5.
 - [ ] SPEC-044 FR-001's three race tests in `tests/test_lifecycle_races.py` pass with their
-      "closed once" assertions re-stated as "closed once per write-epoch": a late worker that
-      delivered nothing closes its sink once in total; one that delivered closes it once more,
-      after the delivery. Invariant 5.
+      "closed once" assertions **unchanged**, in both registration orders, because the one close
+      now runs after the late worker's drain; and a fourth assertion in the orphan-closes-first
+      test records that the close ran after that worker's events landed. Invariant 5.
+- [ ] Two `shutdown()` calls racing while an `info()` outside a span lands on the sink the first
+      is closing: `close()` is never entered on two threads at once, asserted by a sink that
+      counts concurrent entries, and the sink is closed again after the emit landed — by the
+      second caller after its wait, or by a later `shutdown()`. Invariant 5.
 - [ ] `tests/test_lifecycle_races.py`'s two lints on the record —
       `test_every_site_that_clears_the_orphan_record_declares_its_disposition` and
       `test_the_owed_close_record_is_only_ever_mutated_in_place` — are re-keyed to the new record
@@ -284,10 +302,13 @@ hooks. A live target is still reached through the config and `worker.sink`, and
 record `ShutdownTimeout` and release waiters on expiry, wait on `_drain_settled` on the idempotent
 path. The closer, under `_lock`:
 
-1. takes every owed sink the worker's thread cannot be inside — `worker.may_be_inside(sink)` is
-   the worker's answer, true while its thread is alive for its live sink and for a swapped-out
-   sink whose fence was not confirmed (SPEC-050 FR-004's `_unclosed_swaps`, now a list the worker
-   keeps of sinks its own thread may hold, pruned on a confirmed fence or a re-adoption);
+1. takes every owed sink with nothing in flight against it — `in_flight(sink)` (FR-004): a
+   release registered in `_closing_now`, or `worker.may_be_inside(sink)`, the worker's answer,
+   true while its thread is alive for its live sink and for a swapped-out sink whose fence was
+   not confirmed (SPEC-050 FR-004's `_unclosed_swaps`, now a list the worker keeps of sinks its
+   own thread may hold, pruned on a confirmed fence or a re-adoption). The worker asked is
+   `_state._worker`; `_late_worker` is the same object when it is set, and is never the only
+   handle consulted;
 2. registers each in `_closing_now`, which becomes `dict[int, threading.Event]` so a bystander
    has something to wait on — the per-sink registration `release()` already brackets (SPEC-044
    FR-003), carrying an event instead of nothing;
@@ -300,9 +321,13 @@ path. The closer, under `_lock`:
    swap's whole budget, so it is far more likely stuck than slow, and joining it would let one
    stuck swapped-out sink hold the exit where today it costs the grace.
 
-A caller that took nothing waits on every event in `_closing_now` for `closer_grace(deadline)`,
-the one arithmetic that replaces `_closer_grace`, `_bystander_grace` and `join_closers`'s inline
-copy: `min(DEFAULT_CLOSER_GRACE, remaining)`, the cap for `None`. The process-wide count and idle
+A caller that found a sink in flight waits on every event in `_closing_now` for
+`closer_grace(deadline)`, the one arithmetic that replaces `_closer_grace`, `_bystander_grace`
+and `join_closers`'s inline copy: `min(DEFAULT_CLOSER_GRACE, remaining)`, the cap for `None` —
+and then takes once more whatever the wait released and is still owed (FR-002). The closer runs
+**once per `shutdown()` call, after every drain**: `_shutdown_worker` stops the worker it found,
+then the late worker SPEC-044 FR-001 registered, then closes — where today `_close_orphan_sink`
+runs before the late worker's own shutdown and that shutdown closes its sink itself. The process-wide count and idle
 event go, so a worker-path `shutdown()` no longer pays for an orphan close of a sink it never
 touched (twin 6's recorded cost) — it waits only on closes in flight, which is what both
 docstrings say the wait is for. `join_closers` is granted once, at the end of `_shutdown_worker`,
@@ -324,8 +349,8 @@ worker the drain step is skipped and nothing else differs.
       asserted by the sink recording `threading.get_ident()` inside `close()`. Invariant 5 and the
       SPEC-028 objection.
 - [ ] Four owed sinks with 2-second closes on the worker path: `shutdown()` returns in under 4 s
-      and all four closes complete — SPEC-046 FR-001's two criteria, which today hold only on the
-      orphan path. Invariant 3.
+      and all four closes complete — SPEC-046 FR-001's two criteria, which
+      `tests/test_concurrent_owed_closes.py` tests only on the orphan path today. Invariant 3.
 - [ ] A second `shutdown()` arriving while the first is inside an inline close waits for it up to
       `min(DEFAULT_CLOSER_GRACE, remaining)`, on both paths —
       `tests/test_worker.py::test_a_second_shutdown_waits_for_an_inline_close_it_did_not_claim` and
@@ -354,7 +379,8 @@ With one record, "who owns this sink's close" has one answer and is no longer a 
 site can get wrong. What remains is **existence** (`worker_exists`), **liveness**
 (`live_worker`, now `_worker` unless `retired`), and the **moment** — `in_flight(sink)`, true
 while the worker is draining into the sink (`worker.draining`, unchanged) or a release of it is
-registered in `_closing_now` — asked at the one site that refreshes a signal. `worker_owns` and
+registered in `_closing_now` — asked at the two sites that act on a sink, the signal refresh
+and the closer's take. `worker_owns` and
 `worker_owns_now` are deleted. This supersedes the four-question set of SPEC-035 FR-002 and
 SPEC-040 FR-002 and the "ownership, not liveness" slogan, and says so where those are recorded:
 arch §9.2, `decisions.md`'s guard entry, and the roster test's own docstring.
@@ -387,9 +413,14 @@ lint exists to catch. The three limitations the roster discloses about itself ar
 
 `_worker_health` assembles the snapshot once: the worker's counters where a worker exists and
 zeros where not, and — on **both** branches — `retired` from the owner, `sink` from
-`read_losses` over the sink last delivered to, `closing_sinks` from the registry, `inherited_sink`
+`read_losses` over the **configured** sink — SPEC-030's definition of the field, and the same
+authority FR-005 uses for `inherited_sink` — `closing_sinks` from the registry, `inherited_sink`
 from the config (arch §12's prescribed answer, taken because the record entry it used to read no
-longer exists), and the two loss counters from `decorator`. `Worker.health()` returns its own
+longer exists), and the two loss counters from `decorator`. The worker path reads `worker.sink`
+today, which differs from the config only inside a swap; the config wins there because arch §12
+already names it the authority for "installed". `_worker_health`'s docstring claim that
+"`worker.py` imports nothing from this module" is false at `98c7e78` (`worker.py:11`) and is
+struck in the same edit. `Worker.health()` returns its own
 counters only and stops reaching into `_lifecycle`. `_flush_live_sink` drains the sinks the record
 names, with no branch on which path armed them.
 
@@ -514,7 +545,7 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - Re-run probe 2 as a control: the post-shutdown behaviour of both paths is unchanged.
 - Measure `submit` before and after.
 
-### Phase 2: The record and the closer (FR-002, FR-003, FR-006)
+### Phase 2: The record and the closer (FR-002, FR-003, FR-006, and FR-004's code)
 
 - Merge the four records into `_owed` with the arming and discharge rules; add `Worker._held`
   and `may_be_inside`; retire the closed-sink latch and `sink_released`, updating the SPEC-044
@@ -522,6 +553,8 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - Write the one closer with per-sink in-flight events and the one grace; reduce
   `Worker.shutdown` to `stop`; make `_swap_sink` one function over `retarget`.
 - Declare the record in `_FORK_SKIP`; collapse the two residue handlers; run the fork suite.
+- FR-004's code half: delete `worker_owns` and `worker_owns_now`, add `in_flight`, re-derive
+  the roster floor from the merged tree and state the count it came from.
 - Re-key the three derived lints; plant the mutants each FR names.
 
 ### Phase 3: The readers (FR-005)
@@ -529,7 +562,7 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - Assemble `Health` once; answer `inherited_sink` from the config and strike arch §12's item;
   make `_flush_live_sink` read the record; re-run probe 1.
 
-### Phase 4: The record (FR-004's supersession, and the ritual)
+### Phase 4: The record (FR-004's documentation half, and the ritual)
 
 - arch §9.2 to three questions; superseded markers in `decisions.md` (guard entry) and the
   digest line, with heading, Contents row and label moved together; `docs/invariants.md` §6's
@@ -560,7 +593,11 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 - **The record in the fork walk.** A new global holding sinks needs `_FORK_SKIP` or the walk
   re-hooks superseded sinks (SPEC-044 FR-005's hazard, twice avoided in SPEC-050 by the same
   declaration). FR-006 names it; the fork suite's opt-out lint is the gate.
-- **Test churn.** 200 sites in 14 test files name the internals that go away. Diff test *names*
+- **Test churn.** Measured at `98c7e78` with one `grep -o` over `tests/*.py` for the names FR-001
+  to FR-003 delete — the four `_orphan_*` fields, `_orphan_closing`, `_orphan_idle`,
+  `_shutdown_done`, `_sink_closed`, `_unclosed_swaps`, `._closing`, `worker_owns`,
+  `take_orphan_owed`, `discharge_owed`, the two grace helpers, the two closers and
+  `sink_released` — 200 sites in 14 files; `conftest.py` names nine more. Diff test *names*
   with `--collect-only` after each phase, never pass counts: a scripted rename can delete a test
   and leave the suite green.
 - **Two lock orders meet.** `_close_if_owed` takes `_state._lock` then `worker._lock`;

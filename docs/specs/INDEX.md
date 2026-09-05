@@ -286,7 +286,7 @@ Group related specs and record the order to build them in. Keep this section: a 
 - **One lifecycle owner:** SPEC-054 — the question SPEC-040 was named for and did not answer.
   That spec moved the orphan path's seven globals onto one object and left the worker's twin
   state on `Worker`, so every lifecycle decision still exists twice: measured at `98c7e78`,
-  thirteen twin mechanisms, 15 of the 36 FRs across the seven lifecycle-fixing specs edited both
+  thirteen twin mechanisms, 13 of the 36 FRs across the seven lifecycle-fixing specs edited both
   sides, and a probe found `health().sink` reported on one path and `None` on the other against
   the same sink. Build it **after SPEC-050** (done) and after nothing else: it depends on the
   owed-close record being a set (SPEC-045), the closes running concurrently (SPEC-046) and the
