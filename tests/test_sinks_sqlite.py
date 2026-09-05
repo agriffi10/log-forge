@@ -164,3 +164,42 @@ def test_close_closes_the_owned_connection_and_commits(tmp_path) -> None:
     assert verify.execute("SELECT log_id FROM log_events").fetchone()[0] == "x"
     verify.close()
     sink.close()  # idempotent, even though the owned connection is already closed
+
+
+# -- SPEC-054 FR-001 AC-4: the surrogate that cost the batch no longer reaches the column --------
+
+
+def test_a_lone_surrogate_in_the_span_name_no_longer_costs_the_batch() -> None:
+    """The audit's reproduction: `lost 3 event(s); batch abandoned after 4 emit attempts`.
+
+    The worker inserts from its own thread, so the connection is opened `check_same_thread=False`;
+    the module's `conn` fixture would fail every insert for an unrelated reason.
+    """
+    import os
+
+    import log_foundry as lf
+
+    bad = os.fsdecode(b"file-\xff.txt")
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    try:
+        sink = SQLiteSink("ignored", connection=connection)
+        lf.configure(sink=sink)
+
+        @lf.trace(name=bad)
+        def work() -> None:
+            lf.info(bad, path=bad)
+
+        work()
+        assert lf.flush(timeout=10)
+        assert lf.health().failed_batches == 0
+        rows = connection.execute("SELECT function, event FROM log_events").fetchall()
+        assert len(rows) == 3
+        assert {row[0] for row in rows} == {"file-�.txt"}
+        payloads = [json.loads(row[1]) for row in rows]
+        logged = next(p for p in payloads if p["message"] not in ("span.start", "span.end"))
+        assert logged["message"] == "file-�.txt"
+        assert logged["fields"]["path"] == "file-�.txt"
+        assert all(p["truncated"] is True for p in payloads)
+    finally:
+        lf.shutdown()
+        connection.close()

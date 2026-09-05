@@ -88,6 +88,40 @@ def _require_positive(name: str, value: int | None) -> None:
         raise ValueError(f"{name} must be >= 1, got {value}")
 
 
+def _require_text(name: str, value: object) -> str | None:
+    """Rejects a stamp that is not a ``str`` or cannot encode as UTF-8 (SPEC-054 FR-001).
+
+    ``service``, ``version`` and ``env`` are copied from the config into every event without
+    passing through ``sanitize`` — the one route by which a string reaches an event unbounded
+    and uncoerced, which is deliberate on the hottest path in the library. So the check is at
+    the door instead (invariant 13): a lone surrogate here would otherwise cost every batch on
+    every sink that binds ``service`` as a column, for the life of the process, and an ``int``
+    would land in a ``str`` field. What is stored is ``str.__str__(value)``, an exact ``str``,
+    so a ``StrEnum`` member is accepted and a ``str`` subclass instance never reaches an event.
+
+    Args:
+      name: The setting's name, used in the error message.
+      value: The proposed stamp, or ``None`` to skip the check.
+
+    Returns:
+      The stamp as an exact ``str``, or ``None`` when it was not supplied.
+
+    Raises:
+      TypeError: If the value is present and not a ``str``.
+      ValueError: If the value is present and does not encode as UTF-8.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {type(value).__name__}")
+    plain = str.__str__(value)
+    try:
+        plain.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{name} must be encodable as UTF-8; it carries a lone surrogate") from None
+    return plain
+
+
 def configure(
     *,
     service: str | None = None,
@@ -104,8 +138,9 @@ def configure(
 
     Only the arguments passed are applied, so repeated calls compose rather than reset. If
     no sink has ever been set, this defaults to :class:`~log_foundry.sinks.stdout.StdoutSink`,
-    the zero-dependency dev default (arch §8). Every ceiling is validated before anything is
-    assigned, so a rejected call leaves the config exactly as it found it.
+    the zero-dependency dev default (arch §8). Every ceiling and every stamp is validated before
+    anything is assigned — and before the sink is stamped into the ownership record — so a
+    rejected call leaves the config and the record exactly as it found them.
 
     A ``sink=`` passed after logging has already started is the one argument that needs more
     than an assignment, because whatever is delivering captured its sink before the call
@@ -161,12 +196,16 @@ def configure(
       None.
 
     Raises:
-      ValueError: If any ceiling is less than 1.
+      ValueError: If any ceiling is less than 1, or a stamp does not encode as UTF-8.
+      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-054 FR-001).
     """
     _require_positive("max_value_bytes", max_value_bytes)
     _require_positive("max_stack_bytes", max_stack_bytes)
     _require_positive("max_keys", max_keys)
     _require_positive("max_depth", max_depth)
+    service = _require_text("service", service)
+    version = _require_text("version", version)
+    env = _require_text("env", env)
 
     changed: dict[str, object] = {
         name: value

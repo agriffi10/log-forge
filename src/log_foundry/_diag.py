@@ -22,7 +22,17 @@ from __future__ import annotations
 
 import sys
 
-__all__ = ["absorbed", "errno_of", "lost", "rejected"]
+__all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "rejected"]
+
+WARN_EVERY = 1000
+"""The period of every per-event throttle in the library (SPEC-017 FR-005, SPEC-054 FR-005).
+
+A site that can fail once per event writes its line on the first failure and then on every
+``WARN_EVERY``-th, carrying the running total, because a line per failure is its own outage and
+silence is how the failure survives to production. One definition, here, because the worker's
+queue-full and post-shutdown sites and the console writer's stream-fault site all throttle on
+the same period, and two constants stating one number disagree eventually.
+"""
 
 _MAX_DETAIL = 200
 

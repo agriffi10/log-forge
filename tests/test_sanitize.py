@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import enum
 import json
+import os
 import sys
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -314,11 +315,23 @@ def test_truncate_str_with_a_ceiling_smaller_than_the_marker(ceiling: int) -> No
     assert out == TRUNCATION_MARKER
 
 
-def test_lone_surrogate_does_not_raise() -> None:
-    """A str from surrogateescape raises on a bare .encode("utf-8") — inside a total function."""
-    value = "\ud800" * 10
-    assert truncate_str(value, 4)[1] is True
-    assert _one(value) is not None  # no exception
+def test_a_lone_surrogate_is_replaced_not_passed_through() -> None:
+    """SPEC-054 FR-001 AC-1/AC-2: one U+FFFD per surrogate, an exact str, strictly encodable.
+
+    Before SPEC-054 this test asserted only that the call returned; the surrogate left assembly
+    intact and cost `SQLiteSink` the whole batch.
+    """
+    bad = os.fsdecode(b"file-\xff.txt")
+    out, altered = truncate_str(bad, 8192)
+    assert (out, altered) == ("file-\ufffd.txt", True)
+    assert type(out) is str
+    out.encode("utf-8")
+
+    ten = "\ud800" * 10
+    assert truncate_str(ten, 4) == (TRUNCATION_MARKER, True)
+    clipped, flag = truncate_str("x" * 20 + ten, 20)
+    assert flag is True and "\ud800" not in clipped
+    clipped.encode("utf-8")
 
 
 # -- public helpers ----------------------------------------------------------------------
@@ -759,3 +772,127 @@ def test_the_finite_path_is_not_measurably_more_expensive() -> None:
         f"the float path cost {float_cost:.4f}s against the integer path's {int_cost:.4f}s; "
         "a finite float should take one isfinite() call, not a rendering-size computation"
     )
+
+
+# -- SPEC-054 FR-001 / FR-004: surrogates, hostile str subclasses, hostile keys ---------------
+
+
+class _BadEncode(str):
+    """A str subclass whose own text operations raise — the measurement must not consult them."""
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        raise RuntimeError("encode boom")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str boom")
+
+
+class _KeyBoom:
+    def __str__(self) -> str:
+        raise RuntimeError("keyboom")
+
+    def __hash__(self) -> int:
+        return 1
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+
+class _BadInt(int):
+    def __str__(self) -> str:
+        raise RuntimeError("no digits for you")
+
+
+def test_truncate_tail_replaces_a_surrogate() -> None:
+    """FR-001 AC-3, the unit half: the tail clipper gives the same answers as the head clipper."""
+    bad = os.fsdecode(b"file-\xff.txt")
+    assert truncate_tail(bad, 8192) == ("file-\ufffd.txt", True)
+    out, flag = truncate_tail("\ud800" * 10 + "y" * 20, 20)
+    assert flag is True and "\ud800" not in out
+    out.encode("utf-8")
+
+
+def test_a_str_subclass_cannot_divert_the_measurement() -> None:
+    """FR-001 AC-5: `str.__str__` is unbound, so a hostile `encode`/`__str__` never runs."""
+    out, altered = truncate_str(_BadEncode("hello"), 100)
+    assert (out, altered) == ("hello", False)
+    assert type(out) is str
+    assert type(truncate_tail(_BadEncode("hello"), 100)[0]) is str
+
+
+def test_a_str_subclass_value_whose_str_raises_is_plain_text() -> None:
+    """FR-001: the value branch no longer calls `str(value)`, which ran the subclass's `__str__`."""
+    assert _one(_BadEncode("val")) == "val"
+    assert type(_one(_BadEncode("val"))) is str
+    assert _truncated(_BadEncode("val")) is False
+
+
+def test_the_replacement_sets_truncated() -> None:
+    """FR-001 AC-6, the unit half: a substitution nobody can see is a change to the data."""
+    assert _truncated("\udcff") is True
+    assert _truncated("plain") is False
+    assert _one("a\udcffb") == "a\ufffdb"
+
+
+def test_undecodable_bytes_are_replaced_and_marked() -> None:
+    """FR-001: the same byte is marked whether it arrives as str or as bytes."""
+    assert _one(b"\xff\xfe\x80") == "\ufffd\ufffd\ufffd"
+    assert _truncated(b"\xff\xfe\x80") is True
+    assert _truncated(bytearray(b"\xff")) is True
+    assert _truncated(memoryview(b"\xff")) is True
+
+
+def test_plain_bytes_are_not_marked() -> None:
+    assert _one(b"plain") == "plain"
+    assert _truncated(b"plain") is False
+
+
+def test_a_hostile_key_costs_only_itself() -> None:
+    """FR-004 AC-1: the audit's `{'boom': '<unserializable: dict>'}` becomes a key placeholder."""
+    fields, flag = sanitize_fields({"boom": {"sib": 1, _KeyBoom(): 2}}, cfg=CFG)
+    assert fields == {"boom": {"sib": 1, "<unserializable key: _KeyBoom>": 2}}
+    assert flag is True
+
+
+def test_an_int_subclass_key_whose_str_raises_gets_the_key_placeholder() -> None:
+    """FR-004 AC-2: the integer branch's own `str()` is inside the guard too."""
+    fields, flag = sanitize_fields({"m": {"sib": 1, _BadInt(5): 2}}, cfg=CFG)
+    assert fields == {"m": {"sib": 1, "<unserializable key: _BadInt>": 2}}
+    assert flag is True
+
+
+def test_a_str_subclass_key_renders_as_plain_text() -> None:
+    """FR-004 AC-2, the other half: FR-001's `str.__str__` reaches the key before the guard does."""
+    fields, flag = sanitize_fields({"m": {_BadEncode("k"): 1}}, cfg=CFG)
+    assert fields == {"m": {"k": 1}}
+    assert flag is False
+
+
+def test_a_hostile_key_is_isolated_at_any_depth() -> None:
+    """FR-004 AC-3: at the top level of `fields=` and three levels down."""
+    top, top_flag = sanitize_fields({"sib": 1, _KeyBoom(): 2}, cfg=CFG)
+    assert top == {"sib": 1, "<unserializable key: _KeyBoom>": 2} and top_flag is True
+    deep, deep_flag = sanitize_fields({"a": {"b": {"c": {"sib": 1, _KeyBoom(): 2}}}}, cfg=CFG)
+    assert deep == {"a": {"b": {"c": {"sib": 1, "<unserializable key: _KeyBoom>": 2}}}}
+    assert deep_flag is True
+
+
+def test_two_hostile_keys_of_one_type_collide_and_the_collision_is_marked() -> None:
+    """The accepted limit, pinned so it is a decision: the later wins, and `truncated` is set."""
+    fields, flag = sanitize_fields({"m": {"sib": 1, _KeyBoom(): 2, _KeyBoom(): 3}}, cfg=CFG)
+    assert fields == {"m": {"sib": 1, "<unserializable key: _KeyBoom>": 3}}
+    assert flag is True
+
+
+def test_a_placeholder_honours_the_ceiling_on_both_forms() -> None:
+    """FR-004 AC-4: `type.__name__` is writable, so the placeholder goes through `text()` too."""
+    huge = type("X" * 9000, (), {})
+    hostile = type("Y" * 9000, (), {"__str__": lambda self: (_ for _ in ()).throw(RuntimeError())})
+    cfg = Config(max_value_bytes=64)
+    fields, flag = sanitize_fields({"v": huge(), "k": {hostile(): 1}}, cfg=cfg)
+    value_form = fields["v"]
+    assert isinstance(value_form, str)
+    assert len(value_form.encode("utf-8")) <= 64 and value_form.endswith(TRUNCATION_MARKER)
+    (key_form,) = fields["k"]  # type: ignore[misc]
+    assert len(key_form.encode("utf-8")) <= 64 and key_form.endswith(TRUNCATION_MARKER)
+    assert flag is True

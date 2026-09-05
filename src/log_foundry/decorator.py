@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import threading
 from collections.abc import Callable
 from time import monotonic
@@ -628,6 +629,90 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
     _flush(span)
 
 
+def _refuse_unusable(fn: object) -> None:
+    """Refuses, at decoration, a callable ``@trace`` could not trace (SPEC-054 FR-002).
+
+    Invariant 13: a bad argument is refused where it is written, never on the first call. A
+    ``classmethod`` or ``staticmethod`` object is a decorator applied in the wrong order —
+    ``classmethod`` is not callable, so the wrapper would fail every call, and ``staticmethod``
+    *is* callable but the wrapper replaces the descriptor, so an instance call would hand
+    ``self`` to a function declared without one. A ``str`` is the slip ``@trace("checkout")``,
+    which meant ``name=``. Anything else that is not callable is refused by type.
+
+    Args:
+      fn: Whatever was handed to the decorator.
+
+    Returns:
+      None.
+
+    Raises:
+      TypeError: If ``fn`` is a ``classmethod`` or ``staticmethod`` object, a ``str``, or not
+        callable at all.
+    """
+    if isinstance(fn, (classmethod, staticmethod)):
+        kind = type(fn).__name__
+        inner = getattr(fn.__func__, "__qualname__", "the function")
+        raise TypeError(
+            f"@trace cannot wrap the {kind} object around {inner}; put @{kind} above @trace, "
+            f"so that @trace decorates the plain function"
+        )
+    if isinstance(fn, str):
+        raise TypeError(
+            f"@trace needs a callable, got str; pass a span name as @trace(name={fn!r})"
+        )
+    if not callable(fn):
+        raise TypeError(f"@trace needs a callable, got {type(fn).__name__}")
+
+
+def _span_name(fn: object) -> str:
+    """Resolves the span name once, at decoration, from any callable (SPEC-054 FR-002).
+
+    ``fn.__qualname__`` where the callable has one, else its type's name — so a
+    ``functools.partial`` traces as ``partial`` and a callable instance as its class, where
+    reading the attribute per call inside the wrapper raised ``AttributeError`` into the
+    application on every call. A ``__qualname__`` that exists but is not a ``str`` needs no
+    clause: ``functools.wraps`` copies it onto the wrapper and Python refuses a non-``str``
+    there before any wrapper exists.
+
+    Args:
+      fn: The callable being decorated.
+
+    Returns:
+      The span name.
+
+    Raises:
+      None.
+    """
+    qualname = getattr(fn, "__qualname__", None)
+    return qualname if isinstance(qualname, str) else type(fn).__name__
+
+
+def _is_async(fn: object) -> bool:
+    """Decides the async wrapper, consulting a callable instance's ``__call__`` (SPEC-054 FR-002).
+
+    ``asyncio.iscoroutinefunction`` sees through a ``functools.partial`` but reads a callable
+    instance whose ``__call__`` is ``async def`` as synchronous, so accepting instances at all
+    (FR-002) would have handed one the sync wrapper and closed the span before the coroutine
+    ran — the generator finding's shape again. The type's ``__call__`` is asked too, for
+    anything that is not a plain function; a ``partial``'s or a class's is a slot wrapper and
+    reads as synchronous, which is correct.
+
+    Args:
+      fn: The callable being decorated.
+
+    Returns:
+      Whether the async wrapper applies.
+
+    Raises:
+      None.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return True
+    if inspect.isfunction(fn):
+        return False
+    return asyncio.iscoroutinefunction(type(fn).__call__)
+
+
 @overload
 def trace(func: F) -> F: ...
 @overload
@@ -646,7 +731,9 @@ def trace(
 
     Args:
       func: The function being decorated when used bare, otherwise ``None``.
-      name: Overrides the span name, which defaults to ``func.__qualname__``.
+      name: Overrides the span name, which defaults to ``func.__qualname__`` where the callable
+        has one and to its type's name otherwise — ``partial`` for a ``functools.partial``, the
+        class name for a callable instance (SPEC-054 FR-002).
       defaults: Per-decorator default fields added to every event on the span. Any
         ``Mapping`` is accepted, and a copy is taken **once here**, at decoration — not per
         call. Before SPEC-051 FR-002 the caller's own object was bound to every span and read
@@ -657,18 +744,21 @@ def trace(
       The wrapped function, or a decorator when called with arguments.
 
     Raises:
-      None.
+      TypeError: At decoration, for a ``classmethod`` or ``staticmethod`` object (the decorators
+        are in the wrong order), a ``str`` (``name=`` was meant), or anything not callable
+        (SPEC-054 FR-002, invariant 13).
     """
     span_defaults = None if defaults is None else dict(defaults)
 
     def decorate(fn: F) -> F:
         """Wraps one function, selecting the sync or async wrapper at decoration time.
 
-        :func:`asyncio.iscoroutinefunction` makes the choice once. The two wrappers are
+        :func:`_is_async` makes the choice once. The two wrappers are
         deliberate near-duplicates — the only difference is ``await fn(...)`` — because the
         sync/async split is a hard boundary, and ``contextvars`` already propagates the span
         stack and baggage across ``await`` points and concurrent tasks (arch §5), so the async
-        span opens when the coroutine actually runs and closes when it finishes.
+        span opens when the coroutine actually runs and closes when it finishes. The span name
+        is resolved here, once, rather than read from ``fn`` on every call (SPEC-054 FR-002).
 
         Args:
           fn: The function to wrap.
@@ -677,9 +767,11 @@ def trace(
           The wrapper, typed as the original function.
 
         Raises:
-          None.
+          TypeError: From :func:`_refuse_unusable`, at decoration.
         """
-        if asyncio.iscoroutinefunction(fn):
+        _refuse_unusable(fn)
+        span_name = name or _span_name(fn)
+        if _is_async(fn):
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -704,7 +796,7 @@ def trace(
                 Raises:
                   BaseException: Whatever the wrapped coroutine raises, unchanged.
                 """
-                span, token, scope = _begin(name or fn.__qualname__, span_defaults)
+                span, token, scope = _begin(span_name, span_defaults)
                 status, error = "ok", None
                 try:
                     result = await fn(*args, **kwargs)
@@ -740,7 +832,7 @@ def trace(
             Raises:
               BaseException: Whatever the wrapped function raises, unchanged.
             """
-            span, token, scope = _begin(name or fn.__qualname__, span_defaults)
+            span, token, scope = _begin(span_name, span_defaults)
             status, error = "ok", None
             try:
                 result = fn(*args, **kwargs)

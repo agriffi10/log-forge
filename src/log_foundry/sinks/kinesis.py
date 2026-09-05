@@ -288,11 +288,13 @@ MAX_PARTITION_KEY_BYTES = 256
 def _partition_key(raw: str) -> str:
     """Bounds a partition key to the service's 256 **bytes**, never 256 characters.
 
-    Both encodes carry an ``errors=`` and both are load-bearing. ``sanitize.coerce`` passes a lone
-    surrogate through unchanged, so a bare ``encode("utf-8")`` on a caller's ``trace_id`` raises
-    ``UnicodeEncodeError`` — a raw exception out of ``emit``, which is the failure SPEC-048 exists
-    to remove rather than introduce. ``errors="ignore"`` on the decode drops a character the byte
-    cut landed inside, so the result always decodes cleanly.
+    Both encodes carry an ``errors=`` and both are load-bearing. Assembly replaces a lone
+    surrogate since SPEC-054 FR-001, so an event field cannot carry one — but this key is derived
+    from whatever field the caller named, on a batch a ``TransformSink`` or a caller's own
+    ``Sink`` may have rewritten after assembly, and a bare ``encode("utf-8")`` on a surrogate
+    raises ``UnicodeEncodeError`` — a raw exception out of ``emit``, which is the failure SPEC-048
+    exists to remove rather than introduce. ``errors="ignore"`` on the decode drops a character
+    the byte cut landed inside, so the result always decodes cleanly.
 
     ``sanitize.truncate_str`` is the inventoried byte-bounded clipper and is deliberately **not**
     reused: it appends a truncation marker, and a marker inside a partition key changes the shard

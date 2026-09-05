@@ -822,3 +822,45 @@ def test_a_sink_that_cannot_close_does_not_fail_configure(capsys) -> None:
 
     assert config.get_config().sink is new
     assert "closing a swapped-out sink" in capsys.readouterr().err
+
+
+# -- SPEC-054 FR-001: the three stamps are refused at the door, since they bypass sanitize ------
+
+
+@pytest.mark.parametrize("name", ["service", "version", "env"])
+def test_a_stamp_that_cannot_encode_is_rejected(name: str) -> None:
+    """A lone surrogate in a stamp would cost every batch on every column-binding sink."""
+    with pytest.raises(ValueError, match=name):
+        config.configure(**{name: "\udcff"})
+
+
+@pytest.mark.parametrize("name", ["service", "version", "env"])
+def test_a_non_str_stamp_is_rejected(name: str) -> None:
+    with pytest.raises(TypeError, match=name):
+        config.configure(**{name: 7})
+
+
+def test_a_rejected_stamp_leaves_the_config_and_the_sink_unstamped() -> None:
+    """The checks run before the ownership stamp, so a refused call records nothing."""
+    from log_foundry import _lifecycle
+    from log_foundry.sinks.null import NullSink
+
+    config.configure(service="before")
+    sink = NullSink()
+    with pytest.raises(ValueError):
+        config.configure(service="\udcff", sink=sink)
+    assert config.get_config().service == "before"
+    with _lifecycle._owned_lock:
+        assert id(sink) not in _lifecycle._owned, "a refused call must not stamp the sink"
+
+
+def test_a_str_enum_stamp_is_accepted_and_stored_plain() -> None:
+    """`str.__str__` is what is stored: a StrEnum member stays acceptable, and never a subclass."""
+    from enum import StrEnum
+
+    class Env(StrEnum):
+        PROD = "prod"
+
+    config.configure(env=Env.PROD)
+    assert config.get_config().env == "prod"
+    assert type(config.get_config().env) is str
