@@ -5,6 +5,7 @@ on:
     paths:
       - "docs/specs/**"
       - "docs/invariants.md"
+      - "docs/templates/spec-template.md"
       - "scripts/spec-lint.sh"
       - "scripts/spec-lint-test.sh"
       - "tests/spec-lint/**"
@@ -18,6 +19,7 @@ on:
     paths:
       - "docs/specs/**"
       - "docs/invariants.md"
+      - "docs/templates/spec-template.md"
       - "scripts/spec-lint.sh"
       - "scripts/spec-lint-test.sh"
       - "tests/spec-lint/**"

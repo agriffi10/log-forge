@@ -115,6 +115,25 @@ for case_file in "$CASES"/*.case; do
   fi
 done
 
+# The live template, as a case of its own. Its comment says a copy left unfilled must not
+# pass the gate — a placeholder line carrying a number or the opt-out phrase would let one
+# through — and a rule stated in a comment is the kind this corpus exists to gate. Run
+# under the same filter as the cases, so `sh scripts/spec-lint-test.sh template` reaches it.
+if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && case template-unfilled in *"$FILTER"*) true ;; *) false ;; esac; then
+  rm -rf "$WORK"; mkdir -p "$WORK/scripts" "$WORK/docs/specs"
+  cp "$ROOT/scripts/spec-lint.sh" "$WORK/scripts/spec-lint.sh"
+  cp "$ROOT/docs/templates/spec-template.md" "$WORK/docs/specs/SPEC-000-template.md"
+  printf '# Invariants\n\n## 1. One\n\n## 2. Two\n\n## 3. Three\n\n## 11. Eleven\n\n## 13. Thirteen\n' > "$WORK/docs/invariants.md"
+  got=$(cd "$WORK" && sh scripts/spec-lint.sh 2>&1) && rc=0 || rc=$?
+  case "$rc:$got" in
+    1:*"SPEC-000-template.md: FR-001 names no invariant in its Acceptance Criteria."*)
+      pass=$((pass + 1)); echo "ok    template-unfilled" ;;
+    *)
+      fail=$((fail + 1)); echo "FAIL  template-unfilled: exit $rc; an unfilled copy of the template must fail on FR-001"
+      printf '%s\n' "$got" | sed 's/^/        /' | head -8 ;;
+  esac
+fi
+
 echo "----"
 echo "spec-lint-test: $pass passed, $fail failed."
 [ "$fail" -eq 0 ] || exit 1

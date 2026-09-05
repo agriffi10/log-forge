@@ -119,8 +119,10 @@ for f in $specs; do
   #
   # The keyword is `invariant`, `invariants` or `inv.`, then one number, then any run of
   # further numbers joined by a comma, `and`, `&` or `, and`. The list ends at the first
-  # token that is none of those, so `invariants 1–5` cites 1 and nothing else: a range
-  # names an interior nobody checked, and each number is listed on purpose. An FR that
+  # token that is none of those. A RANGE IS REFUSED — `invariants 1–5`, with a hyphen, an
+  # en dash or an em dash — rather than read as its first number: a range names an interior
+  # nobody checked, and reading it as `1` would silently pass a dash over a number the page
+  # does not have. Each number is listed on purpose. An FR that
   # serves no invariant — a prose, lint or hygiene requirement, which docs/invariants.md
   # says its own rules judge — writes the exact phrase `serves no invariant` instead,
   # with its reason, and the spec reviewer accepts or rejects that the way the FR ceiling
@@ -154,28 +156,32 @@ for f in $specs; do
       }
       # Everything an FR owes is decided when it closes, so a wrapped citation has been
       # joined by then. `ac` is the Acceptance Criteria text with newlines turned to spaces.
-      function close_fr(   s, k, cited, bogus, optout) {
+      function close_fr(   s, k, cited, bogus, optout, range) {
         if (fr == "") return
-        s = tolower(ac); cited = 0; bogus = ""
+        s = tolower(ac); cited = 0; bogus = ""; range = ""
         while (match(s, /(^|[^a-z0-9_])(invariants?|inv\.)[ \t]+[0-9]+/)) {
           k = substr(s, RSTART, RLENGTH); sub(/.*[ \t]/, "", k)
           s = substr(s, RSTART + RLENGTH)
           cited++; if (!(k in exists)) bogus = bogus " " k
+          if (match(s, /^[ \t]*(-|–|—)[ \t]*[0-9]+/)) range = k substr(s, RSTART, RLENGTH)
           while (match(s, /^[ \t]*(,[ \t]*(and[ \t]+)?|&[ \t]*|and[ \t]+)[0-9]+/)) {
             k = substr(s, RSTART, RLENGTH); sub(/.*[^0-9]/, "", k)
             s = substr(s, RSTART + RLENGTH)
             cited++; if (!(k in exists)) bogus = bogus " " k
+            if (match(s, /^[ \t]*(-|–|—)[ \t]*[0-9]+/)) range = k substr(s, RSTART, RLENGTH)
           }
         }
         optout = (tolower(ac) ~ /serves no invariant/)
         if (!seen_ac)
-          printf "FAIL  %s: %s has no Acceptance Criteria block, so it names no invariant.\n      Every FR of a Draft or In Progress spec carries criteria naming the invariant(s) it\n      serves — %s — from %s, which numbers %s.\n", file, fr, forms, page, pretty
+          printf "FAIL  %s: %s has no Acceptance Criteria block, so it names no invariant.\n      Every FR of a spec not marked Completed — the exemption keys on that exact word — carries\n      criteria naming the invariant(s) it serves — %s — from %s, which numbers %s.\n", file, fr, forms, page, pretty
+        else if (range != "")
+          printf "FAIL  %s: %s cites a range of invariants (%s).\n      A range names an interior nobody checked. List each number: %s.\n", file, fr, range, forms
         else if (bogus != "")
           printf "FAIL  %s: %s cites invariant%s%s, which %s does not have.\n      The page numbers %s. A citation the reader cannot follow is worse than none:\n      it reads as checked. Cite a number from the page, or fix the page first.\n", file, fr, (split(bogus, tmp, " ") > 1 ? "s" : ""), bogus, page, pretty
         else if (cited && optout)
           printf "FAIL  %s: %s cites an invariant and also says it serves no invariant.\n      One or the other: name the number(s) the FR keeps, or say why it keeps none.\n", file, fr
         else if (!cited && !optout)
-          printf "FAIL  %s: %s names no invariant in its Acceptance Criteria.\n      Every FR of a Draft or In Progress spec names the invariant(s) it serves — %s —\n      from %s, which numbers %s. A prose or lint FR that keeps none says so with the\n      exact phrase `serves no invariant`, and its reason. A citation in the Description\n      does not count: the criteria are what the reviewer reads.\n", file, fr, forms, page, pretty
+          printf "FAIL  %s: %s names no invariant in its Acceptance Criteria.\n      Every FR of a spec not marked Completed — the exemption keys on that exact word — names\n      the invariant(s) it serves — %s — from %s, which numbers %s. A prose or lint FR that\n      keeps none says so with the exact phrase `serves no invariant`, and its reason. A\n      citation in the Description does not count: the criteria are what the reviewer reads.\n", file, fr, forms, page, pretty
         fr = ""; ac = ""; seen_ac = 0; in_ac = 0
       }
       { line = $0; sub(/\r$/, "", line) }

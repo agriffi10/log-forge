@@ -371,8 +371,9 @@ extreme.
       re-raising case as observable, and a test exercises both: a handler absorbing its own failure
       leaves `emit` returning, and one re-raising propagates.
 - [ ] `ruff`, `mypy --strict` and `docs-lint` stay green.
-- [ ] Serves no invariant: a `@staticmethod`, a dedented paragraph and a docstring's `Raises:`
-      are prose and layout, which `docs/invariants.md` leaves to `process.md` §5's own rules.
+- [ ] Serves no invariant: the `@staticmethod`, the dedent and the `Raises:` line are prose and
+      layout, which `docs/invariants.md` leaves to `process.md` §5's own rules, and the handler
+      test pins behaviour that already holds rather than changing what a caller observes.
 
 ---
 
