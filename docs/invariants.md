@@ -7,7 +7,10 @@ register (`decisions.md` holds the *fences*: what was built, what was rejected a
 not the constraints list (`architecture.md` §13 holds what the design accepts it cannot do). A
 fence explains a mechanism; an invariant is what every mechanism, present and future, must keep.
 
-**How it is used.** A spec's acceptance criteria name the invariant(s) each FR serves, by number.
+**How it is used.** A spec's acceptance criteria name the invariant(s) each FR serves, by number
+— `scripts/spec-lint.sh` fails a Draft or In Progress spec whose FR names none, or names a number
+this page lacks; an FR that keeps no invariant says so with the exact phrase `serves no invariant`,
+and the template gives the spellings.
 The second diff reviewer — the one that starts from the system rather than the change
 (`process.md` §3) — starts from this page: for each invariant the diff touches, it asks whether
 the change keeps it on **every twin path** (invariant 6), not only the one the spec names. An

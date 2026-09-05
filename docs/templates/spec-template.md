@@ -35,6 +35,23 @@ the purpose after reading this section alone.
   pair as an arc in docs/specs/INDEX.md - don't grow this one. The second
   spec restarts at FR-001; IDs are spec-local.
 
+  Invariants: every FR's Acceptance Criteria name the invariant(s) it
+  serves, by number from docs/invariants.md, so the system-frame diff
+  reviewer knows which promise to check on every twin path. Accepted
+  spellings, case-insensitive, and a citation may wrap across a line:
+      invariant 13 / invariants 3 and 11 / invariants 3, 11 and 13 / (inv. 13)
+  A list runs on commas, "and", "&", "/" or "or"; a range (1-5) is refused, because
+  it names an interior nobody checked - list each number. An FR that
+  keeps no invariant - prose, lint or
+  hygiene, which the page says its own rules judge - writes the exact
+  phrase "serves no invariant" with its reason, and the spec reviewer
+  accepts or rejects that as they would the FR ceiling. The citation must
+  sit in the Acceptance Criteria, not the Description. scripts/spec-lint.sh
+  FAILS a Draft or In Progress spec on a missing or unknown citation;
+  Completed specs are exempt because they predate the page. Keep the
+  numbers and the opt-out phrase out of these placeholder lines: a copy of
+  the template left unfilled must not pass the gate.
+
   spec-lint WARNS above 8 rather than failing, because a genuinely
   indivisible spec may sit above the line. If yours does, say so in one
   line under Scope > In Scope and let the reviewer accept or reject it -
@@ -52,7 +69,8 @@ What the system must do.
 - [ ] Testable condition written from the user/caller's perspective
 - [ ] Each criterion is a binary pass/fail — no ambiguous language
 - [ ] Cover the happy path, error path, and any edge cases
-- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md`
+- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md` — the
+      comment above gives the accepted spellings and the opt-out for an FR that keeps none
 
 ### FR-002: [Requirement Name]
 
@@ -65,7 +83,8 @@ What the system must do.
 - [ ] Testable condition written from the user/caller's perspective
 - [ ] Each criterion is a binary pass/fail — no ambiguous language
 - [ ] Cover the happy path, error path, and any edge cases
-- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md`
+- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md` — the
+      comment above gives the accepted spellings and the opt-out for an FR that keeps none
 
 <!-- Add more FRs as needed -->
 

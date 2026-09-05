@@ -1,0 +1,106 @@
+@@@ expect exit=0
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariant 1
+
+### FR-002: Thing 2
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariants 1 and 2
+
+### FR-003: Thing 3
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariants 1, 2 and 3
+
+### FR-004: Thing 4
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] (inv. 3)
+
+### FR-005: Thing 5
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] inv. 1, 2
+
+### FR-006: Thing 6
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] invariants 2 & 3
+
+### FR-007: Thing 7
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] Invariant 2; INVARIANTS 1, 3
+
+## Implementation Phases
+
+prose

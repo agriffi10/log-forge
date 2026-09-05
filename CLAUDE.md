@@ -86,7 +86,8 @@ poetry run pytest                  # test (parallel by default: -n 12 — serial
 poetry run pytest -n 0             # ...serially — REQUIRED for --pdb and -s (xdist discards -s output silently)
 poetry run ruff check .            # lint
 poetry run mypy                    # typecheck (src)
-sh scripts/spec-lint.sh            # lint specs (structure + banned headers)
+sh scripts/spec-lint.sh            # lint specs (structure, banned headers, invariant citations)
+sh scripts/spec-lint-test.sh       # prove its checks still fire (if you changed it)
 sh scripts/docs-lint.sh            # the always-loaded tier: shape + budgets (run before every push)
 sh scripts/docs-lint-test.sh       # prove docs-lint's own checks still fire (if you changed it)
 poetry run python scripts/docstring-lint.py   # the docstring rule over src/ (before every push)

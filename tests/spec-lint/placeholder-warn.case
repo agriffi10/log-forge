@@ -1,0 +1,39 @@
+@@@ expect exit=0
+@@@ match WARN  docs/specs/SPEC-001-x.md: unfilled template placeholder(s)
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Completed
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+## Implementation Phases
+
+prose
+
+See SPEC-XXX.

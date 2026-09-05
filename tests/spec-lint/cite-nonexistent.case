@@ -1,0 +1,48 @@
+@@@ expect exit=1
+@@@ match FR-001 cites invariant 4, which docs/invariants.md does not have.
+@@@ match The page numbers 1, 2, 3.
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Draft
+
+## Overview
+
+prose
+
+## Scope
+
+prose
+
+## Functional Requirements
+
+prose
+
+### FR-001: Thing 1
+
+#### Description:
+
+What it does.
+
+#### Acceptance Criteria:
+
+- [ ] a, invariant 4
+
+## Implementation Phases
+
+prose

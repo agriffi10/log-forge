@@ -2,7 +2,7 @@
 
 **ID:** SPEC-049
 **Status:** Draft
-**Last Updated:** 2026-09-02
+**Last Updated:** 2026-09-04
 **Depends On:** SPEC-021, SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048
 
 ## Overview
@@ -137,6 +137,8 @@ so the obvious pair of comparisons lets it through).
       fall back to their module defaults, pinning the floor side of the rule against a later
       well-meaning "consistency" change.
 - [ ] `require_timeout` has its own tests including `nan`, and `usable_timeout` is unchanged.
+- [ ] Serves invariant 13: each refusal is at the constructor, and the two floor-side pins keep
+      `usable_timeout`'s callers on the working side of the rule the page records.
 
 ### FR-002: Degenerate bounds are refused where they are written, and the shape they exploited is closed
 
@@ -173,6 +175,8 @@ gains the `ValueError` its own docstring already claims it raises.
 - [ ] `GooglePubSubSink(overflow_timeout=t)` raises `ValueError` for `nan`, `inf`, `0` and
       negatives.
 - [ ] Every message names the offending argument and the value received.
+- [ ] Serves invariants 13 and 7: the refusals are at construction, and the `chunks == 0` guard
+      makes a batch that produced no chunks raise rather than return having delivered nothing.
 
 ### FR-003: `RotatingFileSink` refuses a rotation bound that destroys data
 
@@ -199,6 +203,8 @@ time trigger is armed, and named here so it is a decision rather than a side eff
 - [ ] `RotatingFileSink(path, max_bytes=-1)` and `(path, backup_count=-1)` each raise `ValueError`;
       `max_bytes=0` and `backup_count=0` construct and behave exactly as documented.
 - [ ] The existing rotation suite passes unchanged.
+- [ ] Serves invariants 13 and 2: a rotation bound that would delete written events is refused
+      where it is written, so no accepted event is lost to it.
 
 ### FR-004: An argument no backend can use is an error, not a silent ignore
 
@@ -256,6 +262,8 @@ SPEC-021.
 - [ ] `architecture.md` §12's two entries are struck through in place and marked closed by
       SPEC-049, rather than deleted.
 - [ ] Every refusal is at construction, not at first emit.
+- [ ] Serves invariant 13, whose second observable — no argument silently ignored because another
+      was given — is this FR's whole subject.
 
 ### FR-005: The three remaining drivers' waits are bounded or recorded
 
@@ -310,6 +318,8 @@ instead, which the docstring says.
 - [ ] The `pika` entry states that the blocking behaviour is recorded from the driver's documented
       default and was **not executed** by SPEC-049, and cites SPEC-049, so a later measurement
       supersedes it in place rather than reading as permanently settled.
+- [ ] Serves invariants 3 and 13: the three drivers' waits on the drain thread become bounded,
+      and each new argument is refused, or refused beside `client=`, at construction.
 
 ### FR-006: An abandonment line reports the attempts actually made
 
@@ -328,6 +338,7 @@ SPEC-029 put the rules in one module.
 - [ ] A send failing with a retryable errno on every attempt still writes `max_retries + 1`.
 - [ ] The two cases are asserted in one test file with the same `max_retries`, so a change that
       collapses them fails.
+- [ ] Serves invariant 11: the attempt count the line carries reproduces from what was tried.
 
 ### FR-007: Three literal prose defects in `sinks/`
 
@@ -360,6 +371,9 @@ extreme.
       re-raising case as observable, and a test exercises both: a handler absorbing its own failure
       leaves `emit` returning, and one re-raising propagates.
 - [ ] `ruff`, `mypy --strict` and `docs-lint` stay green.
+- [ ] Serves no invariant: the `@staticmethod`, the dedent and the `Raises:` line are prose and
+      layout, which `docs/invariants.md` leaves to `process.md` §5's own rules, and the handler
+      test pins behaviour that already holds rather than changing what a caller observes.
 
 ---
 
