@@ -329,8 +329,8 @@ def test_a_lone_surrogate_is_replaced_not_passed_through() -> None:
 
     ten = "\ud800" * 10
     assert truncate_str(ten, 4) == (TRUNCATION_MARKER, True)
-    clipped, flag = truncate_str("x" * 20 + ten, 20)
-    assert flag is True and "\ud800" not in clipped
+    clipped, flag = truncate_str("a\ud800" + "x" * 30, 20)
+    assert (clipped, flag) == ("a\ufffdxx" + TRUNCATION_MARKER, True), "6 bytes kept beside the marker"
     clipped.encode("utf-8")
 
 
@@ -807,8 +807,8 @@ def test_truncate_tail_replaces_a_surrogate() -> None:
     """FR-001 AC-3, the unit half: the tail clipper gives the same answers as the head clipper."""
     bad = os.fsdecode(b"file-\xff.txt")
     assert truncate_tail(bad, 8192) == ("file-\ufffd.txt", True)
-    out, flag = truncate_tail("\ud800" * 10 + "y" * 20, 20)
-    assert flag is True and "\ud800" not in out
+    out, flag = truncate_tail("y" * 30 + "\ud800a", 20)
+    assert (out, flag) == (TRUNCATION_MARKER + "yy\ufffda", True), "6 bytes kept beside the marker"
     out.encode("utf-8")
 
 

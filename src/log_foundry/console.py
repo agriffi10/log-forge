@@ -87,14 +87,15 @@ class ConsoleWriter:
         try:
             self._stream.write(f"{level:<7} {message}\n")
             self._stream.flush()
-        except (BrokenPipeError, ValueError) as exc:
-            self._disabled = True
-            _diag.absorbed(
-                "echoing to the console",
-                exc,
-                "echo is disabled for the rest of the process; events still reach the sink",
-            )
         except Exception as exc:
+            if _is_permanent(exc):
+                self._disabled = True
+                _diag.absorbed(
+                    "echoing to the console",
+                    exc,
+                    "echo is disabled for the rest of the process; events still reach the sink",
+                )
+                return
             with self._lock:
                 self._failures += 1
                 total = self._failures
@@ -104,3 +105,27 @@ class ConsoleWriter:
                     exc,
                     f"{total} echo(es) failed; count is cumulative",
                 )
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """Decides whether a stream fault means the stream will not come back.
+
+    A ``BrokenPipeError`` is a reader that has gone, and the ``ValueError`` a closed file raises
+    is a stream nothing will reopen. ``UnicodeEncodeError`` is *also* a ``ValueError`` and is
+    neither: it is one message a strict-ASCII console could not render, and the next plain
+    message would write fine — measured, a bare ``except ValueError`` latched echo off for the
+    rest of the process on the first ``"café"``. So the ``UnicodeError`` family is excluded and
+    takes the throttle with every other transient fault.
+
+    Args:
+      exc: The exception the stream raised.
+
+    Returns:
+      Whether to disable echo for the life of the writer.
+
+    Raises:
+      None.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return isinstance(exc, ValueError) and not isinstance(exc, UnicodeError)

@@ -313,14 +313,18 @@ async def test_a_partial_of_a_coroutine_function_takes_the_async_wrapper(lf, fak
     import functools
 
     async def add(a: int, b: int) -> int:
+        lf.info("inside")
         return a + b
 
     traced = lf.trace(functools.partial(add, 1, b=2))
     assert await traced() == 3
     lf.shutdown()
-    assert {e["function"] for e in fake_sink.events if e["message"] == "span.start"} == {
-        "partial"
-    }
+    starts = [e for e in fake_sink.events if e["message"] == "span.start"]
+    inside = [e for e in fake_sink.events if e["message"] == "inside"]
+    assert [e["function"] for e in starts] == ["partial"]
+    assert inside and inside[0]["span_id"] == starts[0]["span_id"], (
+        "the sync wrapper would have closed the span before the coroutine body ran"
+    )
 
 
 async def test_an_instance_with_an_async_call_takes_the_async_wrapper(lf, fake_sink) -> None:

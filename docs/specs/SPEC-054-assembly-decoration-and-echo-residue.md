@@ -202,8 +202,8 @@ the per-call path.
 Accepting a callable instance opens one door the old `AttributeError` kept shut: an instance
 whose `__call__` is `async def` reads as synchronous to `asyncio.iscoroutinefunction`, so it
 would take the sync wrapper and close the span before the coroutine ran — the generator
-finding's shape again. The dispatch therefore consults the bound `__call__` too, on any callable
-that is not a plain function: `iscoroutinefunction(fn) or iscoroutinefunction(fn.__call__)`.
+finding's shape again. The dispatch therefore consults the type's `__call__` too, on any callable
+that is not a plain function: `iscoroutinefunction(fn) or iscoroutinefunction(type(fn).__call__)`.
 FR-003's generator test consults `__call__` the same way.
 
 A `classmethod` or `staticmethod` object handed to `@trace` is a decorator applied in the wrong
@@ -387,7 +387,8 @@ the FR-001 mutant readable only under `-n 0`.
 - [ ] The walker reaches keys as well as values, and at least one row fails the strict-encode
       check when FR-001's replacement is reverted while every other check still passes — and
       that failure is reported, not an `INTERNALERROR`, under the default `-n 12`.
-- [ ] Reverting FR-004's guard fails at least one row on its pinned value, not on an exception.
+- [ ] Reverting FR-004's guard fails at least one row on a readable assertion, not on an
+      exception.
 - [ ] Serves invariant 8 on both delivery paths (invariant 6).
 
 ---

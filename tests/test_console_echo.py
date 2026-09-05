@@ -157,6 +157,21 @@ def test_a_closed_stream_disables_echo_the_same_way(capsys) -> None:
     assert "(ValueError)" in err and "echo is disabled" in err
 
 
+def test_an_unencodable_message_does_not_disable_echo(capsys) -> None:
+    """`UnicodeEncodeError` is a `ValueError`, and it is one message, not a dead stream."""
+    import io
+
+    strict = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+    writer = console_mod.ConsoleWriter(stream=strict)
+    writer.write({"level": "INFO", "message": "café"})
+    writer.write({"level": "INFO", "message": "plain"})
+    strict.flush()
+    assert b"plain" in strict.buffer.getvalue(), "the stream is still written after the fault"
+    err = capsys.readouterr().err
+    assert "(UnicodeEncodeError)" in err and "echo is disabled" not in err
+    assert writer._failures == 1
+
+
 def test_a_transient_fault_is_throttled(capsys) -> None:
     """2,500 `OSError`s produce lines at totals 1, 1000 and 2000, and every call is attempted."""
     stream = _FaultingStream(OSError(28, "No space left on device"))
