@@ -142,7 +142,9 @@ so the obvious pair of comparisons lets it through).
       base64-encoded before it reaches the header — a test pins that, so the asymmetry is
       deliberate rather than an oversight.
 - [ ] `HTTPSink("file:///etc/passwd")` and `HTTPSink("ftp://h/x")` raise `ValueError` naming the
-      scheme; `http://` and `https://` construct.
+      scheme; `http://` and `https://` construct. `HTTPSink("http:///x")` — a scheme and no host —
+      raises too, and `HTTPSink(url, timeout=None)` raises a `TypeError` naming `timeout` rather
+      than an unnamed one from the comparison (both added by the system-frame diff review).
 - [ ] Every sink built on `HTTPSink` inherits the refusal — a roster test derived from the module
       list asserts each subclass rejects `timeout=-1`, so a new subclass cannot opt out.
 - [ ] `KafkaSink(flush_timeout=-1)` and `NATSSink(publish_timeout=-1)` still construct and still
@@ -194,6 +196,18 @@ gains the `ValueError` its own docstring already claims it raises.
       route now raises a raw `ValueError` out of `chunk_list` before the guard is reached.
 - [ ] `chunk_list(items, 0)` and `chunk_list(items, -1)` raise `ValueError`, making the existing
       docstring true.
+- [ ] With `postgres.chunk_list` patched to yield nothing, `PostgresSink.emit` of a non-empty batch
+      raises `SinkDeliveryError` saying no chunk was produced and commits nothing — the
+      `ClickHouseSink` guard's twin, which the first draft named as a chunking twin and did not
+      guard (system-frame diff review).
+- [ ] The rule's other sibling sites, found by the same review by sweeping every numeric
+      constructor argument in `sinks/` and running each degenerate value: `SocketTransport(port=)`
+      outside `0`–`65535` and `(max_datagram_bytes<=0)` raise (the first raised a raw
+      `OverflowError` out of every UDP `sendto`, the second delivered nothing over UDP);
+      `HTTPSink(max_batch_bytes<=0)` raises rather than flooring to `1`, which delivered nothing;
+      `RedisStreamsSink(maxlen<=0)`, `RedisListSink(maxlen<=0)` and `MemorySink(maxlen<=0)` raise
+      (a negative list `maxlen` became `LTRIM key N -1` and emptied a short list on every batch);
+      `HTTPSink(body_format="xml")` raises as `LogstashSink` already did.
 - [ ] `GooglePubSubSink(overflow_timeout=t)` **constructs** for `nan`, `inf`, `0` and `-1`, with
       `overflow_timeout == DEFAULT_OVERFLOW_TIMEOUT`, and `overflow_timeout=2.5` is kept — the
       third floor-side pin beside FR-001's two.
@@ -591,6 +605,19 @@ said all four degenerate timeouts raise `ValueError`; measured, `inf` raises `Ov
 `0` fails the connection instead, so the sentence now says what each does. The two remaining line
 anchors (`syslog.py:229`, `_socket.py:338`) became symbol anchors, finishing what the 2026-09-04
 audit's N9 started.
+
+**Diff reviews (criteria frame at `4c79af6`, system frame at `35a1892`):** the first found the
+`HTTPSink` constructor still documenting `Raises: None.` and the subclass roster building five of
+the seven sinks it named; both fixed. The second swept every numeric constructor argument in
+`sinks/` (52 sites), ran each degenerate value, and found the rule left unapplied on six sibling
+sites and one named twin — `PostgresSink`'s chunk loop committed an empty transaction with the
+chunker yielding nothing, `SocketTransport`'s `port` and `max_datagram_bytes`, `HTTPSink`'s
+`max_batch_bytes` (whose floor at `1` delivered nothing, so the docstring's "for the same reason"
+as the count floor was false), the two Redis sinks' and `MemorySink`'s `maxlen`, and
+`HTTPSink(body_format=)`. All are refused now, under FR-001's rule, and listed under FR-001,
+FR-002 and FR-004 above so the criteria describe what shipped. Rejected in one sentence: naming the
+wrapper rather than `SocketTransport` in a refusal reached through `SyslogSink` or `LogstashSink`
+— the argument name is right and the inner class is real, so triplicating the check buys nothing.
 
 **Spec review of the 2026-09-05 revision:** one blocking finding, seven should-fix, five nits;
 all accepted but half of one. The blocking one was an Open Question in declarative clothes:

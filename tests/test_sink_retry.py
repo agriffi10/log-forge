@@ -1026,3 +1026,14 @@ def test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side() -> None
 
     assert _usable_timeout(-1) == DEFAULT_FLUSH_TIMEOUT
     assert usable_timeout(-1, DEFAULT_PUBLISH_TIMEOUT) == DEFAULT_PUBLISH_TIMEOUT
+
+
+@pytest.mark.parametrize("bad", [None, "5"])
+def test_a_non_number_is_a_type_error_naming_the_argument(bad: object) -> None:
+    """`timeout=None` was a runtime-working 0.x spelling; the bare `<` raised an unnamed TypeError."""
+    from log_foundry.sinks._retry import require_positive, require_timeout
+
+    with pytest.raises(TypeError, match="OwnerSink timeout must be a number of seconds, not"):
+        require_timeout(bad, "timeout", "OwnerSink")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="OwnerSink chunk_size must be an integer, not"):
+        require_positive(bad, "chunk_size", "OwnerSink")  # type: ignore[arg-type]

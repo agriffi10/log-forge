@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from log_foundry.sinks._retry import require_positive
+
 __all__ = ["MemorySink"]
 
 
@@ -32,10 +34,11 @@ class MemorySink:
           None.
 
         Raises:
-          None.
+          ValueError: If ``maxlen`` is given and not positive — ``0`` and every negative kept
+            nothing at all, which is not a ring (SPEC-049, system-frame review).
         """
         self.events: list[dict[str, object]] = []
-        self._maxlen = maxlen
+        self._maxlen = require_positive(maxlen, "maxlen", "MemorySink") if maxlen is not None else None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Appends the batch in order, trimming to the most recent events if bounded (FR-006).

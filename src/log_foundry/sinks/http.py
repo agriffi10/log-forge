@@ -14,7 +14,7 @@ from typing import Any, NoReturn, TypedDict
 from urllib.parse import urlparse
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import clamp_server_delay, require_timeout, wait
+from log_foundry.sinks._retry import clamp_server_delay, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = [
@@ -248,6 +248,8 @@ class HTTPKwargs(HTTPPlatformKwargs, total=False):
 
 _ALLOWED_SCHEMES = ("http", "https")
 
+_BODY_FORMATS = ("ndjson", "json_array")
+
 _CRLF = ("\r", "\n")
 
 
@@ -268,13 +270,18 @@ def _valid_url(url: str, owner: str) -> str:
       The URL unchanged.
 
     Raises:
-      ValueError: If the scheme is not ``http`` or ``https``.
+      ValueError: If the scheme is not ``http`` or ``https``, or the URL names no host — every
+        request to ``http:///x`` fails with a counted ``URLError`` for the life of the process,
+        which is knowable here (SPEC-049, system-frame review).
     """
-    scheme = urlparse(url).scheme.lower()
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(
             f"{owner} url must use http or https, not {scheme or 'no'} scheme: {url!r}"
         )
+    if not parsed.netloc:
+        raise ValueError(f"{owner} url names no host: {url!r}")
     return url
 
 
@@ -456,7 +463,10 @@ class HTTPSink:
             :attr:`MAX_BATCH_COUNT`. Floored at one, since a zero or negative bound would make
             every event oversized and discard the batch.
           max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
-            :attr:`MAX_BATCH_BYTES`. Floored at one for the same reason.
+            :attr:`MAX_BATCH_BYTES`. **Refused** when not positive rather than floored (SPEC-049,
+            system-frame review): the floor at one this used to apply is not the count floor's
+            twin, because a one-byte body ceiling makes every event oversized and delivers
+            nothing, where a count of one still delivers one event per request.
           opener: A ``urlopen``-shaped callable, which a test can inject to assert on the
             request without any network access. Defaults to :func:`_no_redirect_opener` rather
             than ``urlopen`` (SPEC-048 FR-001); an injected one is used exactly as given, since
@@ -466,12 +476,19 @@ class HTTPSink:
           None.
 
         Raises:
-          ValueError: If the URL's scheme is not ``http`` or ``https``, a header name or value or
-            a bearer token contains CR or LF, or the timeout cannot bound anything — each refused
-            here rather than raised out of every ``emit`` for the life of the process (SPEC-049
-            FR-001), and inherited by every subclass, whose own name the message carries.
+          ValueError: If the URL's scheme is not ``http`` or ``https`` or it names no host, a
+            header name or value or a bearer token contains CR or LF, the timeout cannot bound
+            anything, ``body_format`` is neither of the two this class renders, or
+            ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
+            ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
+            FR-004), and inherited by every subclass, whose own name the message carries.
         """
         self.url = _valid_url(url, type(self).__name__)
+        if body_format not in _BODY_FORMATS:
+            raise ValueError(
+                f"{type(self).__name__} body_format must be one of {sorted(_BODY_FORMATS)}, "
+                f"not {body_format!r}"
+            )
         self.method = method
         self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
         self._auth = _valid_auth(auth, type(self).__name__)
@@ -483,8 +500,10 @@ class HTTPSink:
         self.max_batch_count = max(
             max_batch_count if max_batch_count is not None else self.MAX_BATCH_COUNT, 1
         )
-        self.max_batch_bytes = max(
-            max_batch_bytes if max_batch_bytes is not None else self.MAX_BATCH_BYTES, 1
+        self.max_batch_bytes = (
+            require_positive(max_batch_bytes, "max_batch_bytes", type(self).__name__)
+            if max_batch_bytes is not None
+            else self.MAX_BATCH_BYTES
         )
         self.log_foundry_stop_signal: threading.Event | None = None
         self._opener = opener if opener is not None else _no_redirect_opener()

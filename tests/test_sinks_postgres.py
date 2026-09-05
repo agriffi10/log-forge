@@ -502,3 +502,20 @@ def test_a_non_positive_chunk_size_is_refused(bad: int) -> None:
     with pytest.raises(ValueError, match="PostgresSink chunk_size must be a positive integer") as info:
         PostgresSink("logs", connection=FakeConnection(), chunk_size=bad)
     assert repr(bad) in str(info.value)
+
+
+def test_a_batch_that_produces_no_chunk_raises_rather_than_committing_nothing(monkeypatch) -> None:
+    """`ClickHouseSink.emit`'s branch guard has its twin here (SPEC-049 FR-002, system frame).
+
+    With the chunker yielding nothing this committed an empty transaction and returned, having
+    sent nothing, with every counter at zero. Raised outside the retry loop, because a chunker
+    that yields nothing will yield nothing four times.
+    """
+    conn = FakeConnection()
+    sink = PostgresSink("logs", connection=conn)
+    monkeypatch.setattr("log_foundry.sinks.postgres.chunk_list", lambda items, size: iter(()))
+
+    with pytest.raises(SinkDeliveryError, match="produced no chunk for 2 event"):
+        sink.emit([{"i": 1}, {"i": 2}])
+    assert conn.executemany_calls == [], "nothing was sent"
+    assert conn.commits == 0, "and no empty transaction was committed"

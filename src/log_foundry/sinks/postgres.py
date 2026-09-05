@@ -184,16 +184,24 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent.
+          SinkDeliveryError: When the retry bound is spent, or when a non-empty batch produced no
+            chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049 FR-002, found by the
+            system-frame review): with the chunker yielding nothing this committed an empty
+            transaction and returned, having sent nothing, with every counter at zero. Raised
+            outside the retry loop, because a chunker that yields nothing will yield nothing four
+            times.
         """
         for attempt in range(self.max_retries + 1):
             try:
                 self._reconnect_if_broken()
+                chunks = 0
                 with self._conn.cursor() as cur:
                     for chunk in chunk_list(batch, self._chunk_size):
+                        chunks += 1
                         cur.executemany(self._insert_sql, [self._row(event) for event in chunk])
-                self._conn.commit()
-                return
+                if chunks:
+                    self._conn.commit()
+                    return
             except Exception as err:
                 self._rollback()
                 if attempt < self.max_retries:
@@ -214,6 +222,9 @@ class PostgresSink:
                 raise SinkDeliveryError(
                     f"PostgresSink inserted none of {len(batch)} event(s)"
                 ) from None
+            raise SinkDeliveryError(
+                f"PostgresSink produced no chunk for {len(batch)} event(s); nothing was sent"
+            )
 
     def _connect(self) -> Any:
         """Opens a connection to the configured DSN, bounded by :attr:`connect_timeout`.

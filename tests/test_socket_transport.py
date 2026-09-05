@@ -81,3 +81,24 @@ def test_a_retryable_errno_still_reports_every_attempt(monkeypatch, capsys) -> N
     assert sock.attempts == 4
     lines = _abandonment_lines(capsys)
     assert len(lines) == 1 and "4 attempt(s)" in lines[0], lines
+
+
+# --- SPEC-049, system-frame review: the port and the datagram bound ---------------------------
+
+
+@pytest.mark.parametrize("port", [-1, 65536, 70000])
+def test_an_out_of_range_port_is_refused(port: int) -> None:
+    """UDP raised a raw OverflowError out of every `sendto` — not an OSError, so the retry guard
+    never saw it — while TCP counted the same value as a resolution failure."""
+    with pytest.raises(ValueError, match="SocketTransport port must be 0-65535") as info:
+        SocketTransport("h", port, transport="udp")
+    assert repr(port) in str(info.value)
+
+
+@pytest.mark.parametrize("transport", ["tcp", "udp"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_non_positive_datagram_bound_is_refused(transport: str, bad: int) -> None:
+    """Over UDP every frame was over the limit, so `emit` returned having delivered nothing."""
+    with pytest.raises(ValueError, match="SocketTransport max_datagram_bytes") as info:
+        SocketTransport("h", 9, transport=transport, max_datagram_bytes=bad)
+    assert repr(bad) in str(info.value)

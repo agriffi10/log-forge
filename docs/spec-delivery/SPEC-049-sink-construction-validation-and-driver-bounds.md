@@ -25,6 +25,11 @@ floors a value that works today, refuses one that is already broken, and refuses
   socket_timeout=, stack_timeout=)` applied inside `_connect` so a reconnect keeps it, URL value
   preserved; `ClickHouseSink(send_receive_timeout=)` forwarded only when given. Each refused beside an
   injected client. Three `architecture.md` §12 entries; the pika one says it was not executed.
+- **Sibling sites the system-frame review found** by sweeping every numeric constructor argument in
+  `sinks/` and running each degenerate value: `PostgresSink`'s no-chunk twin guard; `SocketTransport`
+  `port` range and `max_datagram_bytes`; `HTTPSink` `max_batch_bytes` (refused, not floored to a
+  delivering-nothing `1`), `body_format`, a host-less URL, and a `TypeError` naming the argument for a
+  non-number; `RedisStreamsSink`/`RedisListSink`/`MemorySink` `maxlen`.
 - **`SocketTransport`'s abandonment line** reports the attempts actually made (FR-006).
 - **Prose** (FR-007): `_rollover_seconds` is module-level; `_reconnect_if_broken`'s dedent fixed;
   `LoggingSink.emit`'s `Raises:` says what it can observe; `tests/test_prose_layout.py` closes both classes.
@@ -38,7 +43,7 @@ floors a value that works today, refuses one that is already broken, and refuses
 
 ## Verification
 
-Six local gates green on every commit; 40 mutants planted and restored from a scratchpad copy — 39
+Six local gates green on every commit; 51 mutants planted and restored from a scratchpad copy — 39
 reddened on the message assertion, the one expected-equivalent retry case stayed green; `--collect-only`
 diffed against `212fd16` (one superseded test renamed, all else additions). Premises re-probed at
 `212fd16` before the build; one spec review, one plan review, two diff frames before the push. Not

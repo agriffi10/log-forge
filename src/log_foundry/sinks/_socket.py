@@ -7,7 +7,7 @@ import socket
 import threading
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import require_timeout, wait
+from log_foundry.sinks._retry import require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SocketTransport"]
@@ -155,17 +155,27 @@ class SocketTransport:
           None.
 
         Raises:
-          ValueError: If the transport is neither TCP nor UDP, or if the timeout cannot bound
-            anything.
+          ValueError: If the transport is neither TCP nor UDP, the timeout cannot bound anything,
+            the port is outside ``0``–``65535``, or the datagram bound is not positive. The last
+            two are SPEC-049's system-frame findings: an out-of-range port raised a raw
+            ``OverflowError`` out of every UDP ``sendto`` — not an ``OSError``, so the retry guard
+            never saw it — where TCP counted the same value as a resolution failure; and a
+            non-positive datagram bound made every UDP frame oversized, so ``emit`` returned having
+            delivered nothing. Both are refused over TCP too, where they are inert or already
+            counted, for the reason the timeout is.
         """
         if transport not in ("tcp", "udp"):
             raise ValueError(f"invalid transport {transport!r}; expected 'tcp' or 'udp'")
+        if not 0 <= port <= 65535:
+            raise ValueError(f"SocketTransport port must be 0-65535, not {port!r}")
         self._host = host
         self._port = port
         self._transport = transport
         self._timeout = require_timeout(timeout, "timeout", "SocketTransport")
         self._max_retries = max(max_retries, 0)
-        self._max_datagram_bytes = max_datagram_bytes
+        self._max_datagram_bytes = require_positive(
+            max_datagram_bytes, "max_datagram_bytes", "SocketTransport"
+        )
         self._sock: socket.socket | None = None
         self.failed = 0
         self.dropped_oversized = 0

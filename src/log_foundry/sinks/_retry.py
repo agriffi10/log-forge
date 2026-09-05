@@ -137,8 +137,15 @@ def require_timeout(value: float, name: str, owner: str) -> float:
       The value unchanged, when it bounds something.
 
     Raises:
+      TypeError: When the value is not a number — ``None`` was a runtime-working, ``mypy``-invalid
+        0.x spelling of "no bound", and the bare comparison would have raised an unnamed
+        ``TypeError`` from inside ``<`` (SPEC-049, system-frame review).
       ValueError: When the value is zero, negative, infinite or ``NaN``.
     """
+    if not isinstance(value, int | float):
+        raise TypeError(
+            f"{owner} {name} must be a number of seconds, not {type(value).__name__}"
+        )
     if not 0 < value < float("inf"):
         raise ValueError(
             f"{owner} {name} must be a positive, finite number of seconds, not {value!r}"
@@ -163,8 +170,12 @@ def require_positive(value: int, name: str, owner: str) -> int:
       The value unchanged, when it is positive.
 
     Raises:
+      TypeError: When the value is not an integer, so the argument is named rather than the
+        comparison raising an unnamed one.
       ValueError: When the value is zero or negative.
     """
+    if not isinstance(value, int):
+        raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
     if value <= 0:
         raise ValueError(f"{owner} {name} must be a positive integer, not {value!r}")
     return value

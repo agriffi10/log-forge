@@ -427,9 +427,17 @@ def test_a_413_is_not_split_for_a_caller_that_cannot_split(capsys) -> None:
     assert "HTTP 413" in capsys.readouterr().err
 
 
-def test_max_batch_bounds_are_floored_so_a_zero_cannot_discard_the_batch() -> None:
-    sink = HTTPSink("http://x", max_batch_count=0, max_batch_bytes=-5)
-    assert (sink.max_batch_count, sink.max_batch_bytes) == (1, 1)
+def test_max_batch_count_is_floored_so_a_zero_cannot_discard_the_batch() -> None:
+    """~~`max_batch_count=0, max_batch_bytes=-5` both floor to 1.~~
+
+    **Superseded in part by SPEC-049** (system-frame diff review): the count half stands — a count
+    of one still delivers one event per request, so it is on FR-001's floor side — but the bytes
+    half is struck, because a one-byte body ceiling made every event oversized and delivered
+    nothing. A floor that lands on a value that delivers nothing is a refusal in a floor's clothes,
+    so `max_batch_bytes<=0` is refused now (`test_a_non_positive_byte_ceiling_is_refused_not_floored`).
+    """
+    sink = HTTPSink("http://x", max_batch_count=0)
+    assert sink.max_batch_count == 1
 
 
 def test_six_thousand_events_in_one_emit_become_many_bounded_real_requests() -> None:
@@ -877,3 +885,37 @@ def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
     for build in builders:
         with pytest.raises(ValueError, match="timeout"):
             build()
+
+
+# --- SPEC-049, system-frame review: the family's other degenerate arguments ---------------------
+
+
+@pytest.mark.parametrize("url", ["http:///x", "http:", "https://"])
+def test_a_host_less_url_is_refused_at_construction(url: str) -> None:
+    """It passed the scheme check and failed every request with a counted URLError, forever."""
+    with pytest.raises(ValueError, match="url names no host"):
+        HTTPSink(url)
+
+
+def test_an_unknown_body_format_is_refused_rather_than_silently_rendered_as_ndjson() -> None:
+    """`LogstashSink(url=…, body_format="xml")` already refused this; the class it wraps did not."""
+    with pytest.raises(ValueError, match="HTTPSink body_format must be one of"):
+        HTTPSink("http://x", body_format="xml")
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_a_non_positive_byte_ceiling_is_refused_not_floored(bad: int) -> None:
+    """The floor at one was not the count floor's twin: a one-byte body delivers nothing.
+
+    Measured before the fix, `max_batch_bytes` of 0, -5 and 1 each dropped every event as
+    oversized and made zero requests, while `max_batch_count` floored to 1 still delivered one
+    event per request — so only the count is on FR-001's floor side.
+    """
+    with pytest.raises(ValueError, match="HTTPSink max_batch_bytes must be a positive integer") as info:
+        HTTPSink("http://x", max_batch_bytes=bad)
+    assert repr(bad) in str(info.value)
+
+
+def test_a_positive_byte_ceiling_and_none_still_construct() -> None:
+    assert HTTPSink("http://x", max_batch_bytes=2048).max_batch_bytes == 2048
+    assert HTTPSink("http://x").max_batch_bytes == HTTPSink.MAX_BATCH_BYTES
