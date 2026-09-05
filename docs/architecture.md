@@ -882,6 +882,78 @@ close it.
   what remains is I/O rather than noise. The time trigger is already damped by its re-arm.
   **Closed by** deferring the next attempt until the file has grown by another `max_bytes`, which
   trades a rotation the caller asked for against the retry cost.
+- **A lone surrogate leaves `build_event` intact and costs the whole batch in every sink that
+  encodes a string strictly** (2026-09-04 audit, N1; invariant 8). `sanitize._measured` encodes
+  with `errors="replace"` only to *measure*, so the `surrogateescape` string its own docstring
+  names — `os.fsdecode(b"file-\xff.txt")` — comes back from `coerce` as the same object, and
+  invariant 8's observable that every string in the event encodes as UTF-8 is false for it. The
+  JSON document survives, because `json.dumps` escapes the surrogate under `ensure_ascii`, so
+  `StdoutSink` and every sink that ships the rendered document deliver it. The sinks that do not
+  are the ones that hand a raw `str` to a driver, found by sweeping `sinks/` for every encode
+  and column projection at `98c7e78`: `SQLiteSink` projects `function` into a column,
+  `PostgresSink` and `ClickHouseSink` project `function` and `service` (`_COLUMNS` in each),
+  `MongoDBSink` hands the whole dict to `insert_many`, where BSON's strict UTF-8 makes every
+  string field a vector, `KafkaSink` with a non-default `key_field` bare-encodes the key in
+  `_key`, outside its per-event guard, and `LoggingSink` behind a strict handler — stdlib
+  `FileHandler` by default — hands the record to `logging`'s own error handler, which prints
+  `--- Logging error ---` and drops it with `orphan_lost=0`, so on that sink alone the loss is
+  uncounted by the library. Measured against `SQLiteSink` at `98c7e78`, on both twin paths
+  (invariant 6). Inside a span, `@trace(name=bad)` around one clean `info()` →
+  `lost 3 event(s); batch abandoned after 4 emit attempts`, `flush()` → `abandoned`,
+  `failed_batches=1`, zero rows, while the same string as the *message* lands, because `message`
+  is not a SQLite column. Outside a span the same `info(bad)` is lost — `orphan_lost=1`,
+  `absorbed a failure while emitting an orphan log (UnicodeEncodeError)` — because the orphan
+  path names its one-event span after the message (`api._log`), so there the message *is*
+  `function`. On SQLite the loss is counted and announced on both paths (invariant 2 holds
+  there; the logging sink above is where it does not); what breaks everywhere is invariant 8's
+  "once, at assembly" (SPEC-017): the failure is per sink again, and on the worker path the
+  clean events sharing the batch pay for it through the retry. Postgres, ClickHouse, Mongo and
+  Kafka by reading and by calling the helper in isolation; none of those extras was installed.
+  A surrogate in `configure(service=…)` lands on SQLite only because SQLite has no such column;
+  that field reaches the event by the separate route the next entry files. **Closed by** the
+  clip helpers in `sanitize.py` returning the *replaced* decode rather than the caller's string —
+  built in review, that alone clears the surrogate from `function`, `message`, `fields` (keys and
+  values), baggage, `defaults` and the `error` sub-document on both paths, and so from every
+  sink above. Two things the spec must settle rather than inherit from here: which replacement
+  — `errors="replace"` on *encode* yields `?` and loses the byte, `backslashreplace` yields a
+  literal `\udcff` and keeps it recoverable, and neither is U+FFFD — and whether the replacement
+  sets `truncated`. Four sites assert the pass-through as load-bearing and must be reworded
+  with the fix: the `_partition_key` docstring in `sinks/kinesis.py`, SPEC-048's "every encode
+  here passes `errors="replace"`" paragraph and its delivery doc, and the docstring of the
+  surrogate test in `tests/test_sinks_kinesis.py`, which builds its event dict directly and so
+  stays green while its claim goes false.
+- **`service`, `version` and `env` reach the event without passing through `sanitize`**
+  (found filing the entry above; invariant 8). `build_event` copies the three from the config
+  into the event literal, so no ceiling and no coercion applies to them: measured at `98c7e78`,
+  `configure(service="s" * 100000)` stamps a 100,000-character `service` on every event with
+  `truncated` unset against `max_value_bytes=8192`, and `configure(version=12345)` lands an
+  `int` in a `str` field. That is invariant 8's "every configured ceiling holds exactly", broken
+  today without any hostile input, and it is the route by which a surrogate in `service` reaches
+  the column sinks once the entry above is closed. `configure()` validates nothing about the
+  three, so this would be their first check of any kind. **Closed by** a bound at `configure()`,
+  where the spec chooses between refusing an unusable value with the argument named (invariant
+  13's shape) and clipping it at assembly like every other string.
+- **A mapping key whose `__str__` raises replaces the whole sibling mapping, unmarked**
+  (2026-09-04 audit, N4; invariant 8). `key()`'s docstring says its integer branch exists because
+  otherwise "one hostile key would take every sibling with it, unmarked"; its fallthrough for a
+  key that is neither `str`, `int` nor `float` is `self.text(str(key))`, which has exactly that
+  shape — `str(key)` raises, `mapping()` propagates, and the guard in `value()` replaces the
+  *enclosing* mapping with `<unserializable: dict>` and leaves `truncated` unset. A hostile
+  *value* is isolated to its own key, so the two halves of one rule disagree. Measured at
+  `98c7e78`: `fields={"boom": {"sib": 1, KeyBoom(): 2}}` reaches the sink as
+  `{'boom': '<unserializable: dict>'}` with `truncated=None`, where `{"sib": 1, "k": ValBoom()}`
+  gives `{'sib': 1, 'k': '<unserializable: ValBoom>'}`; at the *top level* of `fields` the guard
+  is `sanitize_fields`'s, which empties every field to `{}` with `truncated=True` — marked, but
+  every sibling still gone. Both delivery paths share the one assembly, so the twin is the same.
+  The observable broken is invariant 8's "`truncated` marks every cut": a sibling that was fine
+  is gone, and the nested placeholder names the wrong thing. **Closed by** guarding that branch
+  the way `value()` guards a member — a type-name placeholder for the key, on `_placeholder`'s
+  no-`repr` rule. Built in review: the siblings survive, nested and top-level, and `Enum`,
+  `UUID`, `None`, float and bool keys render as before. What the spec must settle: two hostile
+  keys of one type collapse onto one placeholder — built, `{"sib": 1, "<unserializable:
+  KeyBoom>": 3}` with the value `2` lost and `truncated` unset, a smaller instance of the same
+  defect — so either the placeholder is numbered or the collision sets `truncated`; `key()`
+  already lets `{1: …, "1": …}` collide silently today, so the spec decides for both.
 
 ### Resolved
 
