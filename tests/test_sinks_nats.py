@@ -685,3 +685,17 @@ def test_every_connect_kwarg_we_forward_is_one_the_driver_accepts() -> None:
     accepted = set(inspect.signature(Client.connect).parameters)
     unknown = _forwarded_connect_kwargs() - accepted
     assert not unknown, f"NATSSink forwards {unknown}, which nats.connect does not accept"
+
+
+def test_servers_alongside_an_injected_client_is_refused() -> None:
+    """SPEC-049 FR-004, closing the second architecture.md section 12 item SPEC-047 opened.
+
+    `servers` was silently ignored beside `client=` — the same shape the four connect timeouts
+    already refuse, in the same constructor. It is checked from a structure separate from the
+    forwarded `supplied` dict, because `nats.connect(servers or ..., **supplied)` would otherwise
+    receive it twice; this asserts the message names it beside a forwarded argument.
+    """
+    with pytest.raises(ValueError, match="cannot apply connect_timeout, servers to an injected"):
+        NATSSink("logs", client=FakeNATS(), servers="nats://x:4222", connect_timeout=1.0)
+    with pytest.raises(ValueError, match="cannot apply servers to an injected client"):
+        NATSSink("logs", client=FakeNATS(), servers="nats://x:4222")
