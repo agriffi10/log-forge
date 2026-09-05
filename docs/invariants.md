@@ -11,8 +11,9 @@ fence explains a mechanism; an invariant is what every mechanism, present and fu
 The second diff reviewer — the one that starts from the system rather than the change
 (`process.md` §3) — starts from this page: for each invariant the diff touches, it asks whether
 the change keeps it on **every twin path** (invariant 6), not only the one the spec names. An
-audit's "not covered" list is a list of invariants nobody has measured lately. A finding that does
-not break an invariant here is either a new invariant or not a defect.
+audit's "not covered" list is a list of invariants nobody has measured lately. A *behavioural*
+finding that breaks no invariant here is a candidate for a new one; prose, lint and hygiene
+findings are judged by their own rules (`process.md` §5).
 
 **Where an open defect against an invariant lives:** `architecture.md` §12, never here. This page
 states what is true when the library is correct; it does not carry a changelog.
@@ -22,9 +23,10 @@ states what is true when the library is correct; it does not carry a changelog.
 ## 1. The library never fails the caller
 
 Every public call returns normally on a fault of the library's own. A `@trace`d function's own
-exception is re-raised unchanged, with the span recorded as an error. Only `KeyboardInterrupt`
-and `SystemExit` pass through a library fault, because they are the operator's or the runtime's
-intent (SPEC-025).
+exception is re-raised unchanged, with the span recorded as an error. The guards catch
+`Exception`, never `BaseException`, so a `KeyboardInterrupt`, `SystemExit` or `CancelledError`
+raised inside a library fault still reaches the caller, because those are the operator's or the
+runtime's intent (SPEC-025).
 
 *Observable:* no exception whose innermost frame is in `log_foundry` reaches application code, on
 any input, on any thread, in any lifecycle state.
@@ -34,8 +36,10 @@ any input, on any thread, in any lifecycle state.
 ## 2. Every accepted event is delivered, or counted and announced — exactly once
 
 Once a level call or a span close has returned, the event has one of three futures: it reaches
-the sink, or it is counted in exactly one loss term and announced by one stderr line, or it is
-still queued where a `shutdown()` left it. Nothing is lost silently and nothing is counted twice.
+the sink, or it is counted in exactly one loss term and announced on stderr (throttled where it
+can repeat, invariant 11), or it is still queued where a `shutdown()` left it — in which case
+`retired` is set and `submitted_after_shutdown` counts it (SPEC-030). Nothing is lost silently
+and nothing is counted twice.
 
 *Observable:* the ledger balances. For spans, `span.end` delivered + `queued` + `dropped` equals
 spans started; for orphan logs, delivered + `orphan_lost` equals calls made; an event that could
@@ -58,7 +62,9 @@ Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdow
 *Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths;
 what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
-*Guarded:* `tests/test_worker.py` (against a wedged sink), `tests/test_sink_retry.py`.
+*Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink) and
+`tests/test_sink_retry.py`; the CPU half only by `tests/test_sinks_pubsub.py` — `flush()` and
+`shutdown()` have no CPU-time assertion, listed so the gap is visible.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -93,10 +99,10 @@ owed a second close, which is correct rather than a double (SPEC-045).
 
 The library has pairs of code paths that must behave identically under invariants 1–5 and 7–8:
 the **worker** path and the **orphan** path; the **sync** and **async** decorator bodies; a sink's
-`emit` and its `flush`; the `_drain` loop and `_final_drain`. Most fix-introduced defects in this
-repo's history were a fix applied to one twin (SPEC-033's two regressions, the SPEC-035 guard
-sites, SPEC-050's daemon-thread close). This invariant is a review obligation rather than a
-mechanism: a spec names the twins its FRs touch, and the system-frame reviewer checks each one.
+`emit` and its `flush`; the `_drain` loop and `_final_drain`. A fix applied to one twin is a
+recurring shape in this repo's history — SPEC-033's two same-day regressions, the SPEC-035 guard
+sites, SPEC-050's daemon-thread close on both paths. This invariant is a review obligation rather
+than a mechanism: a spec names the twins its FRs touch, and the system-frame reviewer checks each.
 
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
@@ -112,7 +118,7 @@ released nothing keeps accepting (SPEC-032).
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
-*Guarded:* `tests/test_sink_losses.py` (a roster over every shipped sink), the per-sink tests,
+*Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/integration/` against real services (SPEC-041).
 
 ## 8. An event is safe by construction, once, at assembly
@@ -123,10 +129,11 @@ number too large to render is replaced, never clipped; a reserved word has exact
 through (SPEC-017, SPEC-020, SPEC-025, SPEC-034).
 
 *Observable:* for any value, the call returns, `json.dumps(event, allow_nan=False)` succeeds,
-every configured ceiling holds exactly, `truncated` is set if and only if something was cut, and
-no top-level key was overwritten.
-*Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`. Two open defects against this
-invariant are recorded by the 2026-09-04 audit and belong in `architecture.md` §12.
+every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
+substitution (a type-name placeholder is visible on its own and does not set it), and no
+top-level key was overwritten.
+*Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, and the reserved-word route-through
+by `tests/test_public_surface.py`.
 
 ## 9. Context is scoped, and an adopted context confers nothing
 
@@ -146,8 +153,9 @@ Every public dataclass is keyword-only and grows by appending; results grow by n
 `Mapping` in, copies out; `Sink`'s members are abstract so a typo cannot instantiate; the worker's
 tunables are unreachable from `configure()` (SPEC-034, SPEC-051).
 
-*Observable:* a typed consumer written against `1.0.0` type-checks and runs against every later
-`1.x`; mutating anything a getter returned changes no later event.
+*Observable:* a typed consumer written against the frozen surface (SPEC-034) type-checks and
+runs against every later release of the same major; mutating anything a getter returned changes
+no later event.
 *Guarded:* `tests/test_public_surface.py`, `tests/typed_consumer/` (SPEC-051).
 
 ## 11. A diagnostic names a type, never a value, and one module writes them all

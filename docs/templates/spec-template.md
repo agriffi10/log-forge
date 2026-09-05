@@ -52,6 +52,7 @@ What the system must do.
 - [ ] Testable condition written from the user/caller's perspective
 - [ ] Each criterion is a binary pass/fail — no ambiguous language
 - [ ] Cover the happy path, error path, and any edge cases
+- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md`
 
 ### FR-002: [Requirement Name]
 
@@ -64,6 +65,7 @@ What the system must do.
 - [ ] Testable condition written from the user/caller's perspective
 - [ ] Each criterion is a binary pass/fail — no ambiguous language
 - [ ] Cover the happy path, error path, and any edge cases
+- [ ] Name the invariant(s) this FR serves, by number from `docs/invariants.md`
 
 <!-- Add more FRs as needed -->
 

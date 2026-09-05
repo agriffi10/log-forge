@@ -179,6 +179,10 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     assert health.failed_batches == 0, f"the recorder never raises: {picture}"
     assert ends + health.queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
     assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
+    assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
+    assert health.submitted_after_shutdown >= health.queued, (
+        f"invariant 2 (what a shutdown left queued was counted as submitted after it): {picture}"
+    )
     assert not unclosed, f"invariant 5 (every sink written to is closed): {picture}"
     assert ledger.slowest_flush < FLUSH_TIMEOUT + BOUND_SLACK, f"invariant 3 (flush): {picture}"
     assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
