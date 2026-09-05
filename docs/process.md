@@ -238,7 +238,10 @@ path documented `Raises: None` — and both diff reviews then found more, with n
 **What a diff review checks.** That is the *first* of the two frames a diff gets (§3, *The reviewer
 contract*): the spec's acceptance criteria **and the relevant `best-practices/` rules** (route via
 its INDEX) — not just "does it look fine." The second starts from the system rather than the
-diff, and on code it builds the thing and runs the suites.
+diff, and on code it builds the thing and runs the suites. Its starting point is
+`docs/invariants.md`: for each numbered invariant the diff touches, it asks whether the change
+keeps it on every **twin path** (invariant 6), not only the path the spec names — most of this
+repo's fix-introduced defects were a fix applied to one twin.
 
 **Rotating the frame — why round count is the wrong exit criterion**
 

@@ -4,6 +4,7 @@ Loaded every session — keep it lean. Deep docs live in `docs/` and are pulled 
 `process.md`, which is the contract this file summarises:
 - `@docs/process.md` — how we work: spec lifecycle, session rhythm, completion ritual (**read every session**)
 - `@docs/decisions.md` — the settled decisions in full; Key Decisions below is its one-line digest (read the entry for your area before working in it)
+- `@docs/invariants.md` — the twelve promises as observables; a spec's criteria and the system-frame diff review cite them by number (read before writing or reviewing either)
 - `@docs/architecture.md` — system design + Known Constraints / Non-goals (read the section you need)
 - `@docs/implementation-guide.md` — phase-by-phase build guide that mirrors architecture.md (reference)
 - `@docs/specs/INDEX.md` — the spec index + status (one row per spec)
