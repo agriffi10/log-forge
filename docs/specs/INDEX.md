@@ -59,6 +59,7 @@ to status only — no prose.
 | [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | Completed | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
 | [SPEC-053](SPEC-053-marking-walk-claims.md) | The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them | Draft | SPEC-042, SPEC-052 |
 | [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Draft | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
+| [SPEC-054](SPEC-054-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Draft | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 
 ## Arcs (build order)
 
@@ -295,3 +296,11 @@ Group related specs and record the order to build them in. Keep this section: a 
   and the two emit paths — synchronous outside a span, queued inside one — are out of its scope
   by decision (SPEC-028, SPEC-030), so invariant 6 keeps them as twins. It supersedes the
   four-question guard set (SPEC-035 FR-002, SPEC-040 FR-002) with three, and says so.
+- **Assembly, decoration and echo residue:** SPEC-054 — the five runtime findings of the second
+  round of the 2026-09-02 pre-1.0 audit, at the two edges the library promises most about: what
+  leaves `build_event` and what `@trace` accepts. Standalone; nothing depends on it, and its four
+  edge fixes are independent of one another. One FR carries a product decision that is not the
+  spec's to make — whether a generator function is *refused* at decoration or its iteration is
+  *wrapped* — and the spec recommends refusing, because a refusal can later be lifted into a wrap
+  while a wrap shipped first freezes its semantics at 1.0. If wrapping is chosen it is a spec of
+  its own, SPEC-055, built after SPEC-054 and replacing its FR-003.
