@@ -1,8 +1,8 @@
 # Spec: Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe
 
 **ID:** SPEC-055
-**Status:** In Progress
-**Last Updated:** 2026-09-04
+**Status:** Completed
+**Last Updated:** 2026-09-05
 **Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037
 
 ## Overview
@@ -12,7 +12,7 @@ promises most about — what leaves `build_event`, and what `@trace` accepts —
 is visible to `health()`. Every one was reproduced at `456e9b7` and again at `98c7e78`, the tree
 this spec is written on. The audit itself is landed by `02a8ac5` as
 `docs/audits/2026-09-04-pre-1.0-audit-round-2.md`, which also files the first and fourth findings
-below in `architecture.md` §12; this spec is self-contained without it.
+below in `architecture.md` §12, and the config stamps beside them; this spec is self-contained without it.
 
 - **A lone surrogate survives assembly.** `sanitize._measured` encodes with `errors="replace"`
   to *measure* a string, never to replace it, so the `surrogateescape` case its own docstring
@@ -63,7 +63,7 @@ options, both complete:
 **Recommendation: Option A, now.** It closes the wrong-data defect before the tag at the cost of
 a `TypeError` a consumer meets at import, and it leaves Option B open at zero cost. FR-003 is
 written as Option A; it is built only once the decision is made, and the other five FRs are
-built regardless.
+built regardless. **Decided 2026-09-05: Option A**, and built in the spec's second PR.
 
 ## Scope
 
@@ -83,10 +83,14 @@ built regardless.
 ### Out of Scope
 
 - **Wrapping a generator's iteration** — Option B above. If chosen, it is SPEC-056.
-- **Detecting a plain function that *returns* a generator object.** FR-003 tests the code flags
-  at decoration, which is where invariant 13 refuses; a wrapper whose own body is not a generator
-  is indistinguishable from any other function there, and a call-time check would be a refusal
-  on the drain-thread side of the line that invariant draws.
+- **Detecting a plain function that *returns* a generator object without advertising it.**
+  FR-003 tests the code flags at decoration, which is where invariant 13 refuses — on the
+  callable, on what it advertises through `__wrapped__` (so `@contextmanager`, `@lru_cache` and a
+  `functools.wraps` wrapper *are* refused; PR 2's system-frame review measured all three
+  recording the orphaned event), and on a callable instance's `__call__`. A function that
+  returns a generator object and advertises nothing is indistinguishable from any other function
+  there, and a call-time check would be a refusal on the drain-thread side of the line that
+  invariant draws.
 - **`StdoutSink`/`StderrSink` against a broken pipe.** A sink's `emit` raising reaches the
   worker's retry, which already announces once per abandoned *batch*; that is a different site
   with a different existing throttle, and it is not the per-event flood FR-005 fixes.
@@ -248,7 +252,8 @@ first call.
 `functools.partial`, and both are also asked of the bound `__call__` of a callable instance, as
 FR-002's dispatch is — and raises `TypeError` naming the function and saying that a generator's
 body runs after the wrapper has returned, so the span would close before it starts; the message
-points at tracing the consumer or opening the span around the loop. Nothing else changes:
+points at tracing the consumer, the function that iterates it (there is no public span API to
+open one around a loop). Nothing else changes:
 today's behaviour for a generator is a span of the *call*, which is wrong data on a fresh trace
 for every event the body logs, and no consumer can be relying on it knowingly.
 
@@ -257,8 +262,10 @@ for every event the body logs, and no consumer can be relying on it knowingly.
 - [ ] `@trace` on a `def` containing `yield` raises `TypeError` at decoration, naming the
       function; the same for `async def` with `yield`, for a `partial` of either, and for an
       instance whose `__call__` is a generator function (invariant 13).
-- [ ] A function that returns a generator object without being one is accepted, and the
-      limitation is stated in the docstring rather than closed.
+- [ ] A function that returns a generator object without being one, and without advertising it
+      through `__wrapped__`, is accepted, and the limitation is stated in the docstring rather
+      than closed; one that advertises it — `@contextmanager`, `@lru_cache`, a `wraps` wrapper —
+      is refused.
 - [ ] The README's `@trace` section says generators are refused and what to do instead.
 - [ ] Removing the async-generator half of the check reddens its criterion while the sync half
       stays red on its own.

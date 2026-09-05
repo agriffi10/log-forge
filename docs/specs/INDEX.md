@@ -59,7 +59,7 @@ to status only — no prose.
 | [SPEC-051](SPEC-051-api-freeze-tidy.md) | API Freeze Tidy | Completed | SPEC-034, SPEC-036, SPEC-040, SPEC-042 |
 | [SPEC-053](SPEC-053-marking-walk-claims.md) | The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them | Draft | SPEC-042, SPEC-052 |
 | [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Draft | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
-| [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | In Progress | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
+| [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 
 ## Arcs (build order)
 
