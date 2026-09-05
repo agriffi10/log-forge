@@ -8,7 +8,7 @@ import types
 import pytest
 
 from log_foundry.sinks.base import Sink, SinkDeliveryError
-from log_foundry.sinks.mongodb import MongoDBSink
+from log_foundry.sinks.mongodb import DEFAULT_SOCKET_TIMEOUT, MongoDBSink
 
 
 class FakeBulkWriteError(Exception):
@@ -124,8 +124,108 @@ def test_injected_client_not_closed() -> None:
 def test_owned_client_is_closed(monkeypatch) -> None:
     client = FakeMongoClient(FakeCollection())
     monkeypatch.setitem(
-        sys.modules, "pymongo", types.SimpleNamespace(MongoClient=lambda uri: client)
+        sys.modules, "pymongo", types.SimpleNamespace(MongoClient=lambda uri, **kwargs: client)
     )
     sink = MongoDBSink(uri="mongodb://x", database="logs", collection="events")
     sink.close()
     assert client.closed is True
+
+
+# --- SPEC-049 FR-005: pymongo's unbounded socket wait is bounded, the URI's own value wins ------
+
+
+def _pymongo_stub(monkeypatch) -> list[tuple]:
+    """Installs a ``pymongo`` stand-in whose ``MongoClient`` records ``(uri, kwargs)``."""
+    calls: list[tuple] = []
+
+    def make_client(uri, **kwargs):
+        calls.append((uri, kwargs))
+        return FakeMongoClient(FakeCollection())
+
+    monkeypatch.setitem(sys.modules, "pymongo", types.SimpleNamespace(MongoClient=make_client))
+    return calls
+
+
+def test_an_owned_client_gets_the_socket_bound_as_a_literal(monkeypatch) -> None:
+    """The literal, not something derived from the constant: 30.0 forwarded raw is a 30 ms bound.
+
+    pymongo's own ``socketTimeoutMS`` default is ``None`` — a read that never returns holds the
+    drain thread for good — so the library supplies one when nobody else did.
+    """
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(uri="mongodb://h/db", database="logs", collection="events")
+    assert calls == [("mongodb://h/db", {"socketTimeoutMS": 30000})]
+    assert DEFAULT_SOCKET_TIMEOUT == 30.0
+
+
+def test_no_uri_at_all_still_gets_the_bound(monkeypatch) -> None:
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(database="logs", collection="events")
+    assert calls[0][1] == {"socketTimeoutMS": 30000}
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mongodb://h/db?socketTimeoutMS=5000",
+        "mongodb://h/db?sockettimeoutms=5000",
+        "mongodb://h/db?retryWrites=true;socketTimeoutMS=5000",
+        "mongodb://u:p@h1:27017,h2:27018/db?replicaSet=rs&socketTimeoutMS=5000",
+    ],
+)
+def test_a_uri_that_names_the_option_is_not_overridden(monkeypatch, uri: str) -> None:
+    """pika's precedence, not psycopg's: the library default never overrides a value the caller
+    wrote. Measured, ``MongoClient(uri, socketTimeoutMS=30000)`` lets the keyword win over the
+    URI, so the default has to be *withheld* rather than passed; case-insensitive and on either
+    separator because pymongo accepts both, and multi-host URIs are legal."""
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(uri=uri, database="logs", collection="events")
+    assert calls[0][1] == {}, "the URI's own socketTimeoutMS stands"
+
+
+def test_an_explicit_socket_timeout_overrides_the_uri(monkeypatch) -> None:
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(
+        uri="mongodb://h/db?socketTimeoutMS=5000",
+        database="logs",
+        collection="events",
+        socket_timeout=2.0,
+    )
+    assert calls[0][1] == {"socketTimeoutMS": 2000}
+
+
+def test_a_sub_millisecond_bound_rounds_up_rather_than_to_zero(monkeypatch) -> None:
+    """``int(0.0004 * 1000)`` is ``0``, which pymongo reads as *no* timeout — the hole reopened."""
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(uri="mongodb://h/db", database="logs", collection="events", socket_timeout=0.0004)
+    assert calls[0][1] == {"socketTimeoutMS": 1}
+
+
+def test_server_selection_is_forwarded_only_when_given(monkeypatch) -> None:
+    calls = _pymongo_stub(monkeypatch)
+    MongoDBSink(
+        uri="mongodb://h/db", database="logs", collection="events", server_selection_timeout=1.5
+    )
+    assert calls[0][1] == {"socketTimeoutMS": 30000, "serverSelectionTimeoutMS": 1500}
+
+
+@pytest.mark.parametrize("name", ["socket_timeout", "server_selection_timeout"])
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_an_unusable_bound_is_refused(monkeypatch, name: str, bad: float) -> None:
+    """New arguments have no working configuration to protect, so FR-001's rule refuses them."""
+    calls = _pymongo_stub(monkeypatch)
+    with pytest.raises(ValueError, match=f"MongoDBSink {name}"):
+        MongoDBSink(uri="mongodb://h/db", database="logs", collection="events", **{name: bad})
+    assert calls == [], "refused before any client was built"
+
+
+def test_a_bound_alongside_an_injected_client_is_refused() -> None:
+    """SPEC-043's rule: an already-connected client cannot consume a connect-time argument."""
+    with pytest.raises(ValueError, match="cannot apply server_selection_timeout, socket_timeout"):
+        MongoDBSink(
+            client=FakeMongoClient(FakeCollection()),
+            database="logs",
+            collection="events",
+            socket_timeout=1.0,
+            server_selection_timeout=1.0,
+        )

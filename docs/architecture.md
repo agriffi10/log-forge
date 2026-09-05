@@ -869,7 +869,37 @@ close it.
   *diagnostic* is damped to one line per outage on `PostgresSink._reconnect_if_broken`'s rule, so
   what remains is I/O rather than noise. The time trigger is already damped by its re-arm.
   **Closed by** deferring the next attempt until the file has grown by another `max_bytes`, which
-  trades a rotation the caller asked for against the retry cost.
+  trades a rotation the caller asked for against the retry cost.- **`MongoDBSink` bounds `pymongo`'s socket wait at 30 s; the server-selection wait stays the
+  driver's** (SPEC-049 FR-005). `pymongo`'s `socketTimeoutMS` default is `None` — a read that
+  never returns holds the drain thread for good; SPEC-049's authoring measured `emit` at 60.66 s
+  for two attempts against a peer that accepts TCP and never replies, 3.12 s with a bound. The
+  library forwards `socketTimeoutMS=30000` (`DEFAULT_SOCKET_TIMEOUT`) only when neither
+  `socket_timeout=` nor the URI's query names one — the default never overrides a value the caller
+  wrote, an explicit keyword does (pika's precedence, not psycopg's, because the URI lets the two be
+  told apart). `serverSelectionTimeoutMS` (driver default 30 s, finite) is exposed as
+  `server_selection_timeout` and not overridden. **Closed by** a deployment measurement showing 30 s
+  is the wrong side of the line, which supersedes the number in place.
+- **`RabbitMQSink` bounds `pika`'s blocked-connection wait at 30 s; `socket_timeout` and
+  `stack_timeout` stay the driver's** (SPEC-049 FR-005). `pika`'s `blocked_connection_timeout`
+  default is `None`: a broker under a memory or disk alarm sends `Connection.Blocked` and every
+  publish then waits indefinitely on the drain thread. `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` is set
+  on the parameters `_connect` builds — the URL and the no-URL constructor alike, and on every
+  reconnect — only when the URL's query named no `blocked_connection_timeout`; an explicit keyword
+  overrides the URL. **Recorded from the driver's documented default and not executed by
+  SPEC-049:** neither the blocking behaviour nor pika's parsing of `?blocked_connection_timeout=`
+  from the URL query into the attribute was measured against a broker here — both were re-read from
+  the installed package (pika 1.4.4), and the unit tests encode that premise through a stand-in.
+  `socket_timeout` (10 s) and `stack_timeout` (15 s) are finite and exposed on the same terms.
+  **Closed by** an integration run against a broker under a memory alarm, which supersedes this
+  entry in place rather than leaving it read as settled.
+- **`ClickHouseSink` exposes `clickhouse-connect`'s 300 s `send_receive_timeout` rather than
+  overriding it** (SPEC-049 FR-005). The driver's default is finite, so FR-001's rule leaves it with
+  the driver — SPEC-049's authoring measured one call at 300.01 s against a non-replying peer versus
+  3.00 s with an explicit bound, and `_insert` makes `max_retries + 1` such attempts per chunk on the
+  drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
+  library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
+  decision `psycopg`'s `connect_timeout` took in SPEC-041.
+
 ### Resolved
 
 - ~~**`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded**~~ (SPEC-047 FR-002;

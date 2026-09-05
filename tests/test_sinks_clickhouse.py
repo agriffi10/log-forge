@@ -118,7 +118,7 @@ def test_owned_client_is_closed(monkeypatch) -> None:
     monkeypatch.setitem(
         sys.modules,
         "clickhouse_connect",
-        types.SimpleNamespace(get_client=lambda dsn=None: client),
+        types.SimpleNamespace(get_client=lambda dsn=None, **kwargs: client),
     )
     sink = ClickHouseSink("log_events", dsn="clickhouse://x")
     sink.close()
@@ -155,3 +155,43 @@ def test_a_batch_that_produces_no_chunk_raises_rather_than_returning(monkeypatch
     with pytest.raises(SinkDeliveryError, match="no chunk"):
         sink.emit([{"i": 1}, {"i": 2}])
     assert client.inserts == [], "and nothing was sent"
+
+
+# --- SPEC-049 FR-005: clickhouse-connect's finite 300 s is exposed, not overridden ------------
+
+
+def _clickhouse_stub(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
+
+    def get_client(dsn=None, **kwargs):
+        calls.append({"dsn": dsn, **kwargs})
+        return FakeClickHouse()
+
+    monkeypatch.setitem(sys.modules, "clickhouse_connect", types.SimpleNamespace(get_client=get_client))
+    return calls
+
+
+def test_send_receive_timeout_is_forwarded_when_given(monkeypatch) -> None:
+    calls = _clickhouse_stub(monkeypatch)
+    ClickHouseSink("t", dsn="clickhouse://x", send_receive_timeout=30)
+    assert calls == [{"dsn": "clickhouse://x", "send_receive_timeout": 30}]
+
+
+def test_no_send_receive_timeout_forwards_no_key_at_all(monkeypatch) -> None:
+    """The driver's default is finite, so it stays the driver's: exposed rather than overridden."""
+    calls = _clickhouse_stub(monkeypatch)
+    ClickHouseSink("t", dsn="clickhouse://x")
+    assert calls == [{"dsn": "clickhouse://x"}]
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_an_unusable_send_receive_timeout_is_refused(monkeypatch, bad: float) -> None:
+    calls = _clickhouse_stub(monkeypatch)
+    with pytest.raises(ValueError, match="ClickHouseSink send_receive_timeout"):
+        ClickHouseSink("t", dsn="clickhouse://x", send_receive_timeout=bad)
+    assert calls == []
+
+
+def test_send_receive_timeout_alongside_an_injected_client_is_refused() -> None:
+    with pytest.raises(ValueError, match="cannot apply send_receive_timeout to an injected client"):
+        ClickHouseSink("t", client=FakeClickHouse(), send_receive_timeout=1)
