@@ -29,11 +29,8 @@ implementation against the design in `architecture.md`.
   `log_foundry` — install and import names match. The project was originally named `log-forge`,
   which PyPI rejects as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
-  `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}`. SPEC-001 shipped `config`, `ids`, `model`,
-  `context`, `decorator`, `sinks/{base,stdout}` + the `configure`/`trace` façade; SPEC-002 added
-  `api` (emitters + `set_baggage`) and `console` (echo); SPEC-003 made `@trace` async-aware;
-  SPEC-004 added `worker` (background flush) + `shutdown`; SPEC-005 added `sinks/sqs` (`SQSSink`,
-  optional `aws` extra — renamed from `sqs` in SPEC-010). Plus three leaf helpers no module map
+  `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}` — shipped across SPEC-001–005 (`docs/spec-delivery/`
+  says which; `sinks/sqs` is the optional `aws` extra). Plus three leaf helpers no module map
   anticipated, none of which imports anything from the package at runtime: `sanitize` (SPEC-017),
   `_diag` (SPEC-025, owned by SPEC-029) and `results` (SPEC-034 FR-007 — `FlushResult` /
   `ContinueResult`). Plus two the map did not anticipate that are **not** leaves by that same
@@ -165,6 +162,7 @@ for an area before working in it. A line here is **never the only home of a fact
 - **A sink that released its transport refuses; one that released nothing keeps accepting** — both halves bind — three shipped sinks lost every post-`close()` event, while making the stateless sinks refuse would invent loss where a batch would have landed. (SPEC-032)
 - **A destination's limit is found by halving the *budget*, not the chunk** — recursive chunk-halving is `2N-1` requests because each accepted size is rediscovered in every branch; capping the recursion *depth* instead is the trap — a cap of 4 against a 250x ratio delivered 2 events of 2,000. (SPEC-038)
 - **A sink's constructor keeps the vendor's own spelling, and types what it forwards** — `servers`, `queue_url` and `bootstrap_servers` are the vendors' own words, so the names are frozen rather than normalised; the forwarded HTTP keywords are typed instead. (SPEC-051)
+- **A bad argument is floored if it works and refused if it is already broken; a new one is refused** — an unusable timeout, a CRLF header or token, a non-`http` URL, a non-positive chunk size or interval, a bad DSN and an argument the chosen backend cannot use raise at construction; `max_bytes<0`, `overflow_timeout=inf` and the `usable_timeout` callers floor, since those deliver. (SPEC-049)
 
 ### The sink contract: waiting, concurrency and shutdown
 
