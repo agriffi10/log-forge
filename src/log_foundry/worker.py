@@ -27,7 +27,6 @@ module at module scope. Re-exported rather than relocated outright so that
 SPEC-034 froze — keeps naming the same object.
 """
 
-_DROP_WARN_EVERY = 1000
 
 _PUT_POLL_SECONDS = 0.05
 """How long a full-queue ``flush()`` waits before re-asking whether the drain was abandoned.
@@ -567,7 +566,7 @@ class Worker:
             with self._lock:
                 self.dropped += 1
                 total = self.dropped
-            if total == 1 or total % _DROP_WARN_EVERY == 0:
+            if total == 1 or total % _diag.WARN_EVERY == 0:
                 _diag.lost("submission", total, "log queue full; count is cumulative")
             return
         if not retired and self._shutdown_done:
@@ -594,7 +593,7 @@ class Worker:
         with self._lock:
             self.submitted_after_shutdown += 1
             total = self.submitted_after_shutdown
-        if total == 1 or total % _DROP_WARN_EVERY == 0:
+        if total == 1 or total % _diag.WARN_EVERY == 0:
             _diag.lost(
                 "submission",
                 total,

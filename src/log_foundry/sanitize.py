@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
@@ -40,6 +41,27 @@ The same reasoning as :data:`_INT_LT` beside it, and as ``_placeholder``'s refus
 ``repr()``: what the library writes about a value must be computed by the library.
 """
 
+_STR_STR = str.__str__
+"""``str.__str__``, unbound, so a ``str`` subclass cannot divert the measurement (SPEC-055 FR-001).
+
+On an exact ``str`` it is the identity, so the hot path pays nothing; on a subclass it returns a
+plain copy without consulting the subclass's own ``__str__`` or ``encode``. Measured before it:
+``info(BadEncode("x"))``, where ``encode`` raises, cost the event — absorbed and announced, but
+lost — because ``truncate_str`` called the value's own ``encode`` to measure it. The same
+reasoning as :data:`_INT_LT` and :data:`_FLOAT_REPR`: what the library measures about a value
+must be computed by the library.
+"""
+
+_SURROGATES = re.compile("[\ud800-\udfff]")
+_REPLACEMENT = "\ufffd"
+"""One U+FFFD per lone surrogate, which neither built-in error handler gives (SPEC-055 FR-001).
+
+``errors="replace"`` on an *encode* writes ``?`` and loses the byte; a ``surrogatepass`` encode
+followed by a ``replace`` decode writes three U+FFFD for one surrogate, because the decoder
+rejects each of the three bytes separately. The substitution runs only after a strict encode has
+already failed, so the common case never reaches it.
+"""
+
 _PLAIN_SCALARS: frozenset[type] = frozenset({int, bool})
 
 _TEXTLIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
@@ -69,25 +91,38 @@ def _int_digit_ceiling(max_value_bytes: int) -> int:
     return max_value_bytes if limit <= 0 else min(max_value_bytes, limit)
 
 
-def _measured(value: str) -> bytes:
-    """Returns the UTF-8 bytes of a string, tolerating lone surrogates.
+def _measured(value: str) -> tuple[str, bytes, bool]:
+    """Returns a string as an exact ``str`` that encodes strictly, its bytes, and whether it changed.
 
-    A string carrying an unpaired surrogate — anything that went through
-    ``surrogateescape``, such as ``os.fsdecode`` of an undecodable filename — raises
-    ``UnicodeEncodeError`` on a bare ``.encode("utf-8")``, inside a module contracted never to
-    raise. ``errors="replace"`` is the same tolerance ``context`` applies when measuring an
-    inbound baggage header.
+    A string carrying an unpaired surrogate — anything that went through ``surrogateescape``,
+    such as ``os.fsdecode`` of an undecodable filename — raises ``UnicodeEncodeError`` on a bare
+    ``.encode("utf-8")``. Before SPEC-055 this tolerated that with ``errors="replace"`` to
+    *measure* the string and then returned the caller's string unchanged, so the surrogate left
+    assembly intact: the JSON sinks escaped it, and every sink that hands a raw ``str`` to a
+    driver — ``SQLiteSink``'s ``function`` column above all — raised on it and cost the whole
+    batch its innocent neighbours. Invariant 8 says every string in the event encodes as UTF-8,
+    so the replaced string is what is returned now, and the flag reports the substitution.
+
+    The strict encode is tried first, because it is the common case and the C-level fast path;
+    the regex runs only after it has failed. The value is first passed through
+    :data:`_STR_STR`, so what is measured, and what is returned, is always an exact ``str``.
 
     Args:
       value: The string to measure.
 
     Returns:
-      The encoded bytes.
+      The exact ``str`` as measured, its strict UTF-8 bytes, and ``True`` when a surrogate was
+      replaced.
 
     Raises:
       None.
     """
-    return value.encode("utf-8", errors="replace")
+    plain = _STR_STR(value)
+    try:
+        return plain, plain.encode("utf-8"), False
+    except UnicodeEncodeError:
+        clean = _SURROGATES.sub(_REPLACEMENT, plain)
+        return clean, clean.encode("utf-8"), True
 
 
 def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
@@ -99,19 +134,25 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     mid-sequence; where there is no room for anything but the marker, a marker alone is still
     the honest answer.
 
+    The result is an exact ``str`` that encodes as UTF-8 strictly, never the caller's own object
+    (SPEC-055 FR-001): a lone surrogate is replaced by U+FFFD before the measurement, and the
+    flag is therefore "the string was altered" rather than only "the ceiling fired" — a
+    substitution nobody can see is a silent change to the data, which is the rule
+    :meth:`_Coercer.real` already applies to a non-finite float.
+
     Args:
       value: The string to clip.
       max_bytes: The ceiling, in UTF-8 bytes.
 
     Returns:
-      The clipped string and whether the ceiling fired.
+      The clipped string and whether it was altered — clipped, or a surrogate replaced.
 
     Raises:
       None.
     """
-    raw = _measured(value)
+    plain, raw, replaced = _measured(value)
     if len(raw) <= max_bytes:
-        return value, False
+        return plain, replaced
     budget = max_bytes - _MARKER_BYTES
     if budget <= 0:
         return TRUNCATION_MARKER, True
@@ -125,21 +166,22 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
     message and the innermost frames last, so the head of an over-long traceback is the least
     useful part of it. The zero-budget guard is not merely defensive — ``raw[-budget:]`` would
     return the whole string at a budget of zero, and ``max_stack_bytes`` may legally be smaller
-    than the marker.
+    than the marker. The result is an exact, strictly encodable ``str`` on the same terms as
+    :func:`truncate_str`.
 
     Args:
       value: The string to clip.
       max_bytes: The ceiling, in UTF-8 bytes.
 
     Returns:
-      The clipped string and whether the ceiling fired.
+      The clipped string and whether it was altered — clipped, or a surrogate replaced.
 
     Raises:
       None.
     """
-    raw = _measured(value)
+    plain, raw, replaced = _measured(value)
     if len(raw) <= max_bytes:
-        return value, False
+        return plain, replaced
     budget = max_bytes - _MARKER_BYTES
     if budget <= 0:
         return TRUNCATION_MARKER, True
@@ -269,9 +311,9 @@ class _Coercer:
         if isinstance(value, Decimal):
             return self.text(str(value))
         if isinstance(value, (bytes, bytearray, memoryview)):
-            return self.text(bytes(value).decode("utf-8", errors="replace"))
+            return self.text(self._decoded(bytes(value)))
         if isinstance(value, str):
-            return self.text(str(value))
+            return self.text(value)
         if isinstance(value, Mapping):
             return self.mapping(value, depth)
         if isinstance(value, (set, frozenset)):
@@ -279,6 +321,30 @@ class _Coercer:
         if isinstance(value, Sequence) and not isinstance(value, _TEXTLIKE):
             return self.members(value, depth)
         return self._placeholder(value)
+
+    def _decoded(self, value: bytes) -> str:
+        """Decodes bytes as UTF-8, replacing what does not decode and recording that it did.
+
+        Strict first, and only on ``UnicodeDecodeError`` with ``errors="replace"`` (SPEC-055
+        FR-001): before this the replacement was unconditional and silent, so the same
+        undecodable byte was marked when it arrived as a ``str`` and unmarked when it arrived as
+        ``bytes``. The rule is the one every other substitution here follows — a change nobody
+        can see is a change that sets ``truncated``.
+
+        Args:
+          value: The bytes to decode.
+
+        Returns:
+          The decoded text, with U+FFFD where a byte sequence was not UTF-8.
+
+        Raises:
+          None.
+        """
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            self.truncated = True
+            return value.decode("utf-8", errors="replace")
 
     def mapping(self, value: Mapping[Any, object], depth: int) -> object:
         """Coerces a mapping, capping it at ``max_keys`` and guarding against a cycle.
@@ -341,12 +407,46 @@ class _Coercer:
             self._parents.pop()
 
     def key(self, key: object) -> str:
-        """Coerces a mapping key to a bounded string, since JSON object keys are always strings.
+        """Coerces a mapping key to a bounded string, and is total (SPEC-055 FR-004).
+
+        Whatever the key's own ``__str__``, ``bit_length`` or ``__lt__`` raises is caught here
+        rather than in :meth:`value`, whose guard sits around the *enclosing* mapping: measured,
+        ``{"sib": 1, KeyBoom(): 2}`` reached the sink as ``<unserializable: dict>`` with
+        ``truncated`` unset, so one hostile key took every sibling with it — the exact outcome
+        the integer branch below was written to prevent for one kind of key. The key becomes a
+        ``<unserializable key: T>`` placeholder naming its type, on :meth:`_placeholder`'s
+        no-``repr`` rule, and ``truncated`` is set: a value placeholder is visible on its own,
+        but a key that could not be rendered is a substitution the reader must be told about.
+
+        Two hostile keys of one type collide on one placeholder and the later wins, which is
+        accepted: the alternative is a placeholder carrying something of the key's identity,
+        which is what arch §6 forbids, and the collision is still marked because each replaced
+        key sets ``truncated``. The guard is here rather than in :meth:`mapping`'s loop because
+        the loop's other two failures — the ``max_keys`` cap and a value that cannot be coerced
+        — already have owners, and a third ``try`` around the loop would hide which one fired.
+
+        Args:
+          key: The mapping key, of any type.
+
+        Returns:
+          The bounded string form of the key, or the key placeholder.
+
+        Raises:
+          None.
+        """
+        try:
+            return self._key(key)
+        except Exception:
+            self.truncated = True
+            return self.text(f"<unserializable key: {_type_name(key)}>")
+
+    def _key(self, key: object) -> str:
+        """Renders one mapping key, since JSON object keys are always strings.
 
         An integer key goes through :meth:`integer` first. A bare ``str()`` here would raise on
         an over-long one — the very ``ValueError`` this module exists to keep away from a sink
-        — and the failure would be caught up in :meth:`value`, replacing the whole mapping with
-        a placeholder, so one hostile key would take every sibling with it, unmarked. ``bool``
+        — and the failure would be caught up in :meth:`key`, replacing the key with a
+        placeholder where its digits would have done. ``bool``
         is excluded because ``True`` must render as the key ``"True"``, not ``"1"``.
 
         A float key goes through :meth:`real` for the same reason, and its ``text()`` wrap is
@@ -362,7 +462,7 @@ class _Coercer:
           The bounded string form of the key.
 
         Raises:
-          Exception: Whatever the key's own ``__str__`` raises; :meth:`value` is the guard.
+          Exception: Whatever the key's own ``__str__`` raises; :meth:`key` is the guard.
         """
         if isinstance(key, str):
             return self.text(key)
@@ -458,7 +558,9 @@ class _Coercer:
         A type name rather than ``repr(value)`` on purpose: arch §6 refuses to auto-capture
         argument and return values so the library cannot leak secrets or PII, and ``repr()`` of
         an arbitrary object routinely prints attribute values — a credential held on a client
-        object would land in the log.
+        object would land in the log. The placeholder goes through :meth:`text` like any other
+        string (SPEC-055 FR-004): ``type.__name__`` is writable, so a type named with more than
+        ``max_value_bytes`` would otherwise be the one string in the event no ceiling reached.
 
         Args:
           value: The value that could not be coerced.
@@ -469,11 +571,28 @@ class _Coercer:
         Raises:
           None. A pathological metaclass is still not this module's problem.
         """
-        try:
-            name = type(value).__name__
-        except Exception:
-            name = "?"
-        return f"<unserializable: {name}>"
+        return self.text(f"<unserializable: {_type_name(value)}>")
+
+
+def _type_name(value: object) -> str:
+    """Returns a value's type name, or ``"?"`` when even that cannot be read.
+
+    Shared by both placeholders so the no-``repr`` rule has one implementation. A metaclass
+    whose ``__name__`` is a raising property is the case the fallback exists for.
+
+    Args:
+      value: The value whose type is named.
+
+    Returns:
+      The type's ``__name__``, or ``"?"``.
+
+    Raises:
+      None.
+    """
+    try:
+        return str(type(value).__name__)
+    except Exception:
+        return "?"
 
 
 def coerce(value: object, *, cfg: Config) -> object:

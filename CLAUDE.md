@@ -37,8 +37,7 @@ implementation against the design in `architecture.md`.
   anticipated, none of which imports anything from the package at runtime: `sanitize` (SPEC-017),
   `_diag` (SPEC-025, owned by SPEC-029) and `results` (SPEC-034 FR-007 — `FlushResult` /
   `ContinueResult`). Plus two the map did not anticipate that are **not** leaves by that same
-  test, importing from the package at runtime: `_lifecycle` (SPEC-033) and `_fork` (SPEC-039). The full module map
-  is now built; the setup-phase `core.py` + `modules/v1/` have been removed.
+  test, importing from the package at runtime: `_lifecycle` (SPEC-033) and `_fork` (SPEC-039).
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -120,7 +119,7 @@ carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@do
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
-**Current work:** SPEC-052 — the docstring gate and the test-scaffolding sweep.
+**Current work:** SPEC-055 — assembly, decoration and echo residue.
 
 ## Key Decisions (settled — don't re-litigate)
 
@@ -132,7 +131,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 ### The trace model and its context
 
-- **Unit of work = a decorated call** — `@log_foundry.trace`; the outermost call starts a trace, every call is a span within it. (arch §4)
+- **Unit of work = a decorated call** — `@log_foundry.trace`; the outermost call starts a trace, every call is a span within it. Named once at decoration, where a misordered descriptor or non-callable is refused. (arch §4, SPEC-055)
 - **IDs are W3C Trace Context compatible** — `trace_id` 16B/32hex, `span_id` 8B/16hex, `log_id` UUID, so adopting tracing later stays cheap. (arch §3.1)
 - **Context via `contextvars`** — not thread-locals — correct under threads and asyncio; holds a span stack plus baggage. (arch §5)
 - **Cross-process traces are adopted explicitly, never auto-instrumented** — no client patching or middleware, which would need the deps the core refuses. Inbound context is untrusted and confers no authority. (SPEC-014)
@@ -152,7 +151,7 @@ for an area before working in it. A line here is **never the only home of a fact
 ### Event assembly: safety and bounds
 
 - **A reserved word needs exactly one route through, including its own name** — `fields` is the third reserved word and `fields={"fields": …}` must work. The keyword form wins a collision, and the merge **absorbs** a non-mapping rather than raising. (SPEC-025, SPEC-034)
-- **An event is safe by construction — coerced and bounded once at assembly, not per sink** — `build_event` runs every value through `sanitize.py`, so the bare `json.dumps` calls in `sinks/` are correct by consequence. The unserializable fallback is a type name, never `repr()`. Ceilings bound per *value*. (SPEC-017)
+- **An event is safe by construction — coerced and bounded once at assembly, not per sink** — `build_event` runs every value through `sanitize.py`, so the bare `json.dumps` calls in `sinks/` are correct by consequence. The unserializable fallback is a type name, never `repr()`. Ceilings bound per *value*. A surrogate becomes U+FFFD, marked; a hostile key costs only itself. (SPEC-017, SPEC-055)
 - **A value too large to *render* is replaced, never clipped** — an over-long int becomes `<int: ~N digits>`; a truncated number is silently wrong. Detection is `bit_length()`, never `len(str(v))` — the obvious check raises the very error it prevents. (SPEC-020)
 
 ### The sink contract: delivery and its verdict
@@ -181,7 +180,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 - **A dead worker is reported, not restarted — and as a *reason*, not a liveness flag** — `Health.stopped_reason` is `None` for a live worker, a never-created one, **and** a cleanly shut-down one, so it extends the alert idiom by a term. No auto-restart: a thread that resurrects itself fights a process trying to exit. (SPEC-019)
 - **Every path the caller stands on is total, and a swallowed fault is announced by *type*** — never `BaseException` — a `KeyboardInterrupt` or `SystemExit` is the operator's or the runtime's intent and must reach the caller. (SPEC-025)
-- **One module writes every diagnostic, so the rules are applied once rather than remembered twenty-eight times** — `_diag` owns `absorbed`/`lost`/`rejected`, and an exception is named by `type(exc).__name__`, never `repr(exception)`. Twelve sites printed the repr and two were unguarded before the rules had one home. (SPEC-029)
+- **One module writes every diagnostic, so the rules are applied once rather than remembered twenty-eight times** — `_diag` owns `absorbed`/`lost`/`rejected`, and an exception is named by `type(exc).__name__`, never `repr(exception)`. Twelve sites printed the repr and two were unguarded before the rules had one home. Per-event lines share one throttle period; a dead echo stream is announced once, then disabled. (SPEC-029, SPEC-055)
 
 ### The public API surface
 

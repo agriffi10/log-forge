@@ -609,3 +609,175 @@ def test_a_swept_span_cannot_be_double_counted_by_the_reordered_flush() -> None:
     assert "_note_in_span_loss" not in source, (
         "the sweep gained a loss count, so a span it and _flush both touch can now be counted twice"
     )
+
+
+# -- SPEC-055 FR-001 AC-3: the error sub-document is assembled through the clippers too ---------
+
+
+def test_a_surrogate_in_the_exception_is_replaced_in_the_end_event(fake_sink) -> None:
+    """A message from `surrogateescape` reaches `error.message` and `error.stack` as U+FFFD.
+
+    `_error_fields` routes all four strings through `truncate_str`/`truncate_tail`, so the fix
+    in the clippers reaches the span.end event without any change here; this pins that it does.
+    """
+    import os
+
+    log_foundry.configure(service="t", sink=fake_sink)
+    bad = os.fsdecode(b"file-\xff.txt")
+
+    @log_foundry.trace
+    def boom() -> None:
+        raise RuntimeError(bad)
+
+    with pytest.raises(RuntimeError):
+        contextvars.copy_context().run(boom)
+    log_foundry.shutdown()
+
+    end = [e for e in fake_sink.events if e.get("status") == "error"][-1]
+    error = end["error"]
+    assert error["message"] == "file-�.txt"
+    assert "file-�.txt" in error["stack"] and "\udcff" not in error["stack"]
+    for text in (error["message"], error["stack"], end["function"]):
+        text.encode("utf-8")
+    assert end["truncated"] is True
+
+
+# -- SPEC-055 FR-002: the span name is resolved once, and a misordered descriptor is refused ----
+
+
+def _spans_named(fake_sink) -> set[str]:
+    return {e["function"] for e in fake_sink.events if e["message"] == "span.start"}
+
+
+def test_a_partial_is_traced_under_its_type_name(fake_sink) -> None:
+    """`functools.partial` has no `__qualname__`; the wrapper used to raise AttributeError."""
+    import functools
+
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    def add(a: int, b: int = 2) -> int:
+        return a + b
+
+    assert log_foundry.trace(functools.partial(add, 1))() == 3
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {"partial"}
+
+
+def test_a_callable_instance_is_traced_under_its_class(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    class Handler:
+        def __call__(self) -> str:
+            return "called"
+
+    assert log_foundry.trace(Handler())() == "called"
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {"Handler"}
+
+
+def test_the_name_is_resolved_once_at_decoration(fake_sink) -> None:
+    """A `__qualname__` given to the instance after decoration is never read by the wrapper."""
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    class Handler:
+        def __call__(self) -> int:
+            return 1
+
+    instance = Handler()
+    traced = log_foundry.trace(instance)
+    instance.__qualname__ = "renamed.after.decoration"  # type: ignore[attr-defined]
+    assert traced() == 1
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {"Handler"}
+
+
+def test_an_explicit_name_still_wins_over_the_fallback(fake_sink) -> None:
+    import functools
+
+    log_foundry.configure(service="t", sink=fake_sink)
+    log_foundry.trace(name="explicit")(functools.partial(lambda: 1))()
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {"explicit"}
+
+
+def test_a_non_str_qualname_is_refused_by_wraps_at_decoration() -> None:
+    """The fallthrough that a non-str `__qualname__` would need never runs: `wraps` refuses first."""
+
+    class Handler:
+        def __call__(self) -> None:
+            pass
+
+    instance = Handler()
+    instance.__qualname__ = 5  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="__qualname__"):
+        log_foundry.trace(instance)
+
+
+def test_trace_above_classmethod_is_refused_at_decoration() -> None:
+    with pytest.raises(TypeError, match=r"classmethod.*K\.m.*above @trace"):
+
+        class K:
+            @log_foundry.trace
+            @classmethod
+            def m(cls) -> None:
+                pass
+
+
+def test_trace_above_staticmethod_is_refused_at_decoration() -> None:
+    """Refused even though a staticmethod object is callable: the wrapper replaces the descriptor."""
+    with pytest.raises(TypeError, match=r"staticmethod.*K\.s.*above @trace"):
+
+        class K:
+            @log_foundry.trace
+            @staticmethod
+            def s() -> None:
+                pass
+
+
+def test_classmethod_above_trace_still_works(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    class K:
+        @classmethod
+        @log_foundry.trace
+        def m(cls) -> str:
+            return cls.__name__
+
+    assert K.m() == "K"
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {
+        "test_classmethod_above_trace_still_works.<locals>.K.m"
+    }
+
+
+def test_staticmethod_above_trace_still_works(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    class K:
+        @staticmethod
+        @log_foundry.trace
+        def s() -> str:
+            return "s"
+
+    assert K().s() == "s"
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {
+        "test_staticmethod_above_trace_still_works.<locals>.K.s"
+    }
+
+
+def test_a_non_callable_is_refused_naming_its_type() -> None:
+    with pytest.raises(TypeError, match="got object"):
+        log_foundry.trace(object())  # type: ignore[type-var]
+
+
+def test_a_non_str_name_is_refused_at_decoration() -> None:
+    """`@trace(name=1)` used to decorate happily and then run every call untraced, forever."""
+    with pytest.raises(TypeError, match="name= must be a str, got int"):
+        log_foundry.trace(name=1)(lambda: None)  # type: ignore[arg-type]
+
+
+def test_a_string_is_refused_with_the_name_hint() -> None:
+    """`@trace("checkout")` is the slip; the message says what was meant."""
+    with pytest.raises(TypeError, match=r"name='checkout'"):
+        log_foundry.trace("checkout")  # type: ignore[type-var]

@@ -304,3 +304,63 @@ async def test_async_emits_exactly_one_end_event_on_each_path(lf, fake_sink) -> 
     assert len(ends) == 2
     assert by_fn["ok_call"]["status"] == "ok"
     assert by_fn["bad_call"]["status"] == "error"
+
+
+# -- SPEC-055 FR-002: the async twin of the decoration-time rules ------------------------------
+
+
+async def test_a_partial_of_a_coroutine_function_takes_the_async_wrapper(lf, fake_sink) -> None:
+    import functools
+
+    async def add(a: int, b: int) -> int:
+        lf.info("inside")
+        return a + b
+
+    traced = lf.trace(functools.partial(add, 1, b=2))
+    assert await traced() == 3
+    lf.shutdown()
+    starts = [e for e in fake_sink.events if e["message"] == "span.start"]
+    inside = [e for e in fake_sink.events if e["message"] == "inside"]
+    assert [e["function"] for e in starts] == ["partial"]
+    assert inside and inside[0]["span_id"] == starts[0]["span_id"], (
+        "the sync wrapper would have closed the span before the coroutine body ran"
+    )
+
+
+async def test_an_instance_with_an_async_call_takes_the_async_wrapper(lf, fake_sink) -> None:
+    """`asyncio.iscoroutinefunction(instance)` is False; the type's `__call__` says otherwise.
+
+    Without the consultation the sync wrapper would return the coroutine object with the span
+    already closed, and the event logged inside it would be an orphan on a fresh trace.
+    """
+    import asyncio
+
+    class Handler:
+        async def __call__(self) -> str:
+            await asyncio.sleep(0)
+            lf.info("inside")
+            return "done"
+
+    assert await lf.trace(Handler())() == "done"
+    lf.shutdown()
+    starts = [e for e in fake_sink.events if e["message"] == "span.start"]
+    inside = [e for e in fake_sink.events if e["message"] == "inside"]
+    assert [e["function"] for e in starts] == ["Handler"]
+    assert inside and inside[0]["span_id"] == starts[0]["span_id"]
+
+
+async def test_the_async_wrapper_names_a_callable_once_at_decoration(lf, fake_sink) -> None:
+    """The name comes from the closure: a `__qualname__` given to the instance later is not read."""
+
+    class Handler:
+        async def __call__(self) -> int:
+            return 1
+
+    instance = Handler()
+    traced = lf.trace(instance)
+    instance.__qualname__ = "renamed.after.decoration"  # type: ignore[attr-defined]
+    assert await traced() == 1
+    lf.shutdown()
+    assert {e["function"] for e in fake_sink.events if e["message"] == "span.start"} == {
+        "Handler"
+    }

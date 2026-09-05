@@ -3520,3 +3520,37 @@ def test_a_submission_dropped_while_racing_shutdown_is_not_counted_as_stranded(c
     )
     sink.release.set()
     worker._thread.join(timeout=5)
+
+
+# -- SPEC-055 FR-005: one throttle period, defined in _diag and read by every site -------------
+
+
+def test_the_throttle_period_is_read_from_diag(capsys, monkeypatch) -> None:
+    """With the period patched to 5, both worker sites write at totals 1, 5 and 10."""
+    from log_foundry import _diag
+    from log_foundry import worker as worker_mod
+
+    monkeypatch.setattr(_diag, "WARN_EVERY", 5)
+    assert not hasattr(worker_mod, "_DROP_WARN_EVERY"), "the worker's own constant is gone"
+
+    sink = BlockingSink()
+    w = Worker(sink, batch_size=1, max_queue=1)
+    try:
+        w.submit(_span("a"))
+        sink.in_emit.wait(2.0)
+        w.submit(_span("filler"))
+        for i in range(12):
+            w.submit(_span(i))
+        err = capsys.readouterr().err
+        assert w.dropped == 12
+        assert err.count("log queue full") == 3
+    finally:
+        sink.release.set()
+        w.shutdown()
+
+    w2 = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
+    w2.shutdown()
+    capsys.readouterr()
+    for i in range(12):
+        w2.submit(_span(i))
+    assert capsys.readouterr().err.count("logged after shutdown()") == 3
