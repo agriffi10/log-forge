@@ -1,0 +1,44 @@
+@@@ expect exit=1
+@@@ match src/log_foundry/_lifecycle.py:7 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match records everything inherited as
+@@@ file src/log_foundry/_lifecycle.py
+"""Lifecycle."""
+
+
+def releasable(sink):
+    """Whether this process may close a sink.
+
+    **"Unrecorded is the caller's" is only sound because a fork makes it false first.**
+    In a child, :func:`_mark_inherited` records everything inherited as ``_FOREIGN`` *before*
+    any handler runs, so an unrecorded sink there is one built after the fork.
+    """
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

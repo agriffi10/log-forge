@@ -32,7 +32,13 @@
 # qualified in one of them and read from the other.
 #
 # Usage: sh scripts/docs-lint.sh          (run from anywhere; resolves its own root)
-# POSIX sh — no bashisms, no dependencies; runs anywhere /bin/sh exists.
+# POSIX sh — no bashisms. One dependency, and only for check 11: `python3`, because that
+# check reads .py DOCSTRINGS and nothing but docstrings, which needs `ast`. The line
+# heuristic that would have let awk do it was measured and rejected — it wrongly keeps
+# 58.6% of code lines and wrongly drops 0.5% of docstring lines, splitting wrapped prose at
+# exactly the sentences that check is about. Every other check here is awk, and a missing
+# python3 is reported as a FAIL rather than skipped: a gate that goes quiet when its
+# interpreter is absent is indistinguishable from a gate that found nothing.
 #
 # NOTE for maintainers: the awk programs below are single-quoted. An apostrophe anywhere
 # inside one — including in a comment — closes the quote, and the shell then parses awk
@@ -749,6 +755,267 @@ done
       END { flush() }
     ' "$f" >> "$FAILS"
   done
+
+
+# ── 11. A universal claim about the marking walk carries its scope ─────────────
+#
+# `_lifecycle._mark_inherited()` is described in prose across sixteen files in src/, docs/ and
+# tests/, and a large share of those descriptions said the same false thing: that it stamps
+# EVERYTHING a forked child inherited `_FOREIGN`. It `setdefault`s, so a sink `configure()`
+# already stamped keeps the parent's real pid. PR #218 corrected it across twelve files over four
+# rounds and three fresh-context review frames, every round finding defects in the previous
+# round's fixes — including two in src/ that all three frames read past. Nothing mechanical
+# noticed that sixteen descriptions of one mechanism disagreed with the code and with each other.
+# This is the one spelling that recurred, where a script can see it (SPEC-053 FR-001).
+#
+# WHAT IT CATCHES, exactly: a sentence that NAMES the mechanism, quantifies what the walk acts on
+# with a bare universal, and attaches no restriction to it. All four parts are load-bearing and
+# each was measured; the numbers below are reproducible with `git archive <sha> | tar -x`.
+#
+#   ANCHOR    _mark_inherited, `_FOREIGN`, ``_FOREIGN``, or the phrase "marking walk". NAMED
+#             symbols only. A descriptive anchor — one that also matches "a forked child",
+#             "it inherited", "inherited sink" — is rejected: every widening tried took the
+#             clean-tree count from 0 into the tens or hundreds against zero true positives,
+#             which is the shape process.md 5 warns about, half a gate's regressions being
+#             false positives.
+#   UNIVERSAL every, everything, all. NOT any/always/never, and that is measured rather than
+#             assumed: they buy no true positive this rule can discriminate and they are the
+#             mechanism of every false positive on the corrected tree — "before ANY other
+#             handler runs" appears identically in the false register sentence and in its
+#             correction, "far above ANY real graph" is correct prose, and "a sink it NEVER
+#             acquired" is correct in three of the nine sentences that fire without scoping.
+#   SUBJECT   the universal must quantify what the walk ACTS ON — a sink, a record, something
+#             inherited or stamped, a transport, a descriptor, an object — or be governed
+#             directly by a marking verb, as in "refuses everything". Without this the rule
+#             needs only an anchor and a universal to CO-OCCUR, and it then fires on ordinary
+#             prose that happens to mention the walk: "all of the buffer repair happens after
+#             it", "every one of the sixteen files describing the marking walk was corrected".
+#             Measured: adding this clause took the shipping tree from 3 hits to 1.
+#   SCOPE     a restriction inside the QUANTIFIED NOUN PHRASE excuses the universal — a relative
+#             (that/which/whose/it/its) or one of the scoping words this repo actually writes
+#             (reach, missed, residual, partial, setdefault, item 7).
+#
+# THE SCOPE TEST IS POSITIONAL, AND THAT IS THE WHOLE DIFFERENCE BETWEEN A GATE AND A NUISANCE.
+# Tested against the whole sentence — the obvious spelling — a scoping word ANYWHERE excuses a
+# universal ANYWHERE, so the word an author reaches for while fixing this very defect is the word
+# that silences the check. Measured twice over: inserting a scoping clause into the six known-bad
+# sentences, WITHOUT touching their claims, silences the sentence-wide form on 6 of 6, while the
+# positional form survives 17 of 18 insertions (the 18th lands inside a word of the quantified
+# noun phrase, which is not a null edit). And it already happened for real: `reclaim`'s docstring
+# said "_mark_inherited has already stamped everything inherited ``_FOREIGN``" and the
+# sentence-wide form MISSED it, silenced by the word `setdefault` fourteen words later in its own
+# sentence. The positional form catches it.
+#
+# NEGATED UNIVERSALS AND "AT ALL" ARE NOT CLAIMS. A negated universal reads exactly like the claim
+# it corrects, and `all` matches "at all", which quantifies nothing. Both were measured on one
+# sentence — the repair to `releasable`'s docstring fired first on a negated "every" and, once
+# rewritten, again on "at all". A gate that reddens on two successive repairs of the defect it
+# exists to catch trains authors away from repairing it.
+#
+# NO LENGTH CAP. An earlier draft dropped sentences over 700 characters, which is an unconditional
+# escape: padding a false sentence past the cap silences it with its claim untouched. Removing it
+# was measured to move no count on any of the three trees, so it is gone rather than justified.
+#
+# QUOTING THE FALSE CLAIM ON PURPOSE stays possible two ways: a fenced block, which the population
+# below skips, and the literal escape `docs-lint: marking-walk` anywhere in the unit. The escape
+# is a magic word and that is deliberate — it is EXPLICIT and greppable, so nobody reaches it while
+# paraphrasing, which is exactly how the scoping words above defeat a sentence-wide test. It
+# covers the unit it appears in and never a file.
+#
+# ── the population ──
+#
+# IN:  every *.md at the root; docs/**.md; src/**.py; tests/**.py.
+# OUT: scripts/ — this check's own patterns and the prose describing them live here, so the check
+#      would fail on itself. Note there is no exclusion to mutate: the population is built from
+#      four INCLUSION globs that never reach scripts/, and tests/docs-lint/*.case is likewise out
+#      by extension before its directory is skipped.
+#
+# THIS POPULATION DIFFERS FROM CHECK 9's, and check 9 excludes its three trees for three DIFFERENT
+# reasons, none of which is "frozen records" alone (see :650, :654, :658 above): docs/specs and
+# four sibling docs trees are frozen records; src/ is out because its docstrings anchor to SPEC
+# numbers rather than commits and whether that counts is a decision nobody has taken; tests/ is
+# out because the .case corpus carries the wrong form on purpose. This check INCLUDES all three —
+# docs/specs and tests/ are exactly where the false claim was restated, and a frozen record that
+# states a false universal is still read as a description of today's code — and EXCLUDES
+# scripts/, pyproject.toml and .github/*.yml, which check 9 includes. One reason standing in for
+# three is how the wrong one gets cited later, so all three are written out here.
+#
+# KNOWN AND STATED, not discovered later: a markdown TABLE ROW is dropped (a table has no sentence
+# terminator, so a whole table flattens into one "sentence" pairing any row's anchor with any
+# other row's universal), which means docs/component-inventory.md's row — one of the three places
+# that restate this mechanism — cannot be policed here. An overt relative pronoun excuses a
+# universal, so "marks everything THAT the child inherited" would pass while being as false as the
+# sentence it replaces. This check catches the BARE universal, which is the one spelling that
+# recurred; the contrapositive ("an unmarked sink is claimable") and the possessive ("the
+# `_FOREIGN` stamp `_mark_inherited` set") carry no universal and are out of reach by construction.
+if ! command -v python3 >/dev/null 2>&1; then
+  note "check 11 (the marking walk) needs python3 and it is not on PATH — the check did NOT run."
+else
+  python3 - . >> "$FAILS" 2>/dev/null <<'PYEOF' || note "check 11 (the marking walk) failed to run; its findings, if any, are NOT in this report."
+"""SPEC-053 FR-001. Reads the tree given as argv[1]; prints FAIL lines; never exits non-zero."""
+import ast
+import os
+import re
+import sys
+
+ANCHOR = re.compile(r"_mark_inherited|``_FOREIGN``|`_FOREIGN`|marking walk")
+UNIVERSAL = re.compile(r"\b(every|everything|all)\b", re.IGNORECASE)
+SUBJECT = re.compile(
+    r"\b(sink|sinks|record|records|recorded|inherit\w*|stamp\w*|transport\w*"
+    r"|descriptor\w*|object|objects)\b",
+    re.IGNORECASE,
+)
+VERB = re.compile(
+    r"\b(mark|marks|marked|record|records|recorded|stamp|stamps|stamped"
+    r"|refuse|refuses|refused|claim|claims|claimed)\s+(\w+\s+){0,1}$",
+    re.IGNORECASE,
+)
+RESTRICT = re.compile(
+    r"\b(that|which|whose|it|its)\b|reach|missed|residual|partial|setdefault|item 7",
+    re.IGNORECASE,
+)
+NEGATED = re.compile(r"\b(not|no|never|nothing|rather than)\s+(\w+\s+){0,1}$", re.IGNORECASE)
+AT_ALL = re.compile(r"\bat\s+$", re.IGNORECASE)
+NP_END = re.compile(r"[,;:.()—–]")
+ESCAPE = "docs-lint: marking-walk"
+LIST_ITEM = re.compile(r"^[ \t]*([-*+]|[0-9]+[.)])[ \t]")
+SENTENCE = re.compile(r"(?<=[.!?])[*_`\"')\]]*\s+")
+
+
+def violates(sentence):
+    """Whether one sentence makes an unrestricted universal claim about the marking walk.
+
+    The escape is not consulted here. It covers the whole UNIT — a paragraph, a bullet, one
+    docstring paragraph — because a marker written as its own sentence would otherwise excuse
+    only itself, which is the one sentence that never violates.
+    """
+    if not ANCHOR.search(sentence):
+        return False
+    for found in UNIVERSAL.finditer(sentence):
+        before = sentence[max(0, found.start() - 24):found.start()]
+        if found.group(1).lower() == "all" and AT_ALL.search(before):
+            continue
+        if NEGATED.search(before):
+            continue
+        end = NP_END.search(sentence, found.end())
+        phrase = sentence[found.start():end.start()] if end else sentence[found.start():]
+        if not (SUBJECT.search(phrase) or VERB.search(before)):
+            continue
+        if RESTRICT.search(phrase[found.end() - found.start():]):
+            continue
+        return True
+    return False
+
+
+def population(root):
+    """Every file this check reads, as paths relative to root."""
+    for name in sorted(os.listdir(root)):
+        if name.endswith(".md") and os.path.isfile(os.path.join(root, name)):
+            yield name
+    for sub, suffix in (("docs", ".md"), ("src", ".py"), ("tests", ".py")):
+        for dirpath, dirnames, filenames in os.walk(os.path.join(root, sub)):
+            dirnames.sort()
+            if os.path.basename(dirpath) == "docs-lint":
+                continue
+            for name in sorted(filenames):
+                if name.endswith(suffix):
+                    yield os.path.relpath(os.path.join(dirpath, name), root)
+
+
+def blocks(lines, first, markdown):
+    """Split lines into units at blank lines, list markers, and (in markdown) headings/rows."""
+    held, start, fenced = [], None, False
+    for number, line in enumerate(lines, first):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if held:
+                yield start, "\n".join(held)
+            held, start, fenced = [], None, not fenced
+            continue
+        if fenced:
+            continue
+        if not stripped or (markdown and (stripped.startswith("#") or stripped.startswith("|"))):
+            if held:
+                yield start, "\n".join(held)
+            held, start = [], None
+            continue
+        if LIST_ITEM.match(line):
+            if held:
+                yield start, "\n".join(held)
+            held, start = [line], number
+            continue
+        if not held:
+            start = number
+        held.append(line)
+    if held:
+        yield start, "\n".join(held)
+
+
+def docstrings(text):
+    """Every docstring in a module: def, class and module bodies, plus attribute docstrings."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            found = ast.get_docstring(node, clean=False)
+            if found:
+                yield node.body[0].lineno, found
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for index, statement in enumerate(body):
+            if not index or not isinstance(statement, ast.Expr):
+                continue
+            value = statement.value
+            if (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                    and isinstance(body[index - 1], (ast.Assign, ast.AnnAssign))):
+                yield statement.lineno, value.value
+
+
+def units(relative, text):
+    """The prose units of one file, as (starting line, text) pairs."""
+    if relative.endswith(".py"):
+        for line, found in docstrings(text):
+            yield from blocks(found.splitlines(), line, False)
+    else:
+        yield from blocks(text.splitlines(), 1, True)
+
+
+def main(root):
+    """Print one FAIL block per violating sentence."""
+    for relative in population(root):
+        try:
+            with open(os.path.join(root, relative), encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line, block in units(relative, text):
+            if ESCAPE in block:
+                continue
+            for sentence in SENTENCE.split(re.sub(r"\n\s*", " ", block).strip()):
+                sentence = sentence.strip()
+                if not sentence or not violates(sentence):
+                    continue
+                print(
+                    "FAIL  %s:%d claims the marking walk acts on EVERYTHING, with no scope.\n"
+                    "      %s\n"
+                    "      `_mark_inherited` ``setdefault``s: a sink `configure()` already stamped\n"
+                    "      keeps the parent's real pid, and ``_FOREIGN`` lands only where nothing\n"
+                    "      was recorded. Say what the universal is restricted TO, inside the same\n"
+                    "      noun phrase — \"every inherited sink its walk reaches\", \"everything\n"
+                    "      inherited that the parent never recorded\". A scoping word elsewhere in\n"
+                    "      the sentence does NOT count and is not meant to. Quoting the false claim\n"
+                    "      on purpose? Use a fenced block, or put `docs-lint: marking-walk` in the\n"
+                    "      same paragraph. SPEC-053 FR-001."
+                    % (relative, line, sentence[:160])
+                )
+
+
+main(sys.argv[1])
+PYEOF
+fi
 
 
 report

@@ -20,7 +20,8 @@
 # and every register fixture uses one.
 #
 # Usage: sh scripts/docs-lint-test.sh [case-name-substring]
-# POSIX sh — no dependencies.
+# POSIX sh. It inherits docs-lint.sh's one dependency — `python3`, for check 11 — because it
+# runs that script; see the note in its header.
 
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

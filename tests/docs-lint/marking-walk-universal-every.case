@@ -1,0 +1,37 @@
+@@@ expect exit=1
+@@@ match docs/architecture.md:3 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match marks every inherited sink
+@@@ file docs/architecture.md
+# Architecture
+
+`_mark_inherited` marks every inherited sink `_FOREIGN`.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

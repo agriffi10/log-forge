@@ -7,6 +7,7 @@
 
 ## Overview
 
+<!-- docs-lint: marking-walk — the next sentence quotes the false claim on purpose. -->
 `_lifecycle._mark_inherited()` is described in prose across sixteen files in `src/`, `docs/` and
 `tests/`, and a large share of those descriptions said the same false thing: that it stamps
 **everything** a forked child inherited `_FOREIGN`. It `setdefault`s, so a sink `configure()`

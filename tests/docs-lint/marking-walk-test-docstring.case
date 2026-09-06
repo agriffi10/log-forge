@@ -1,0 +1,43 @@
+@@@ expect exit=1
+@@@ match tests/test_fork_lifecycle.py:7 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match requires everything inherited be marked
+@@@ file tests/test_fork_lifecycle.py
+"""Fork lifecycle."""
+
+
+def test_handler_order():
+    """The marking handler runs first.
+
+    SPEC-042 FR-001 requires everything inherited be marked `_FOREIGN` before any other handler
+    runs, and handler order is registration order.
+    """
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

@@ -1,0 +1,39 @@
+@@@ expect exit=1
+@@@ match docs/architecture.md:6 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ file docs/architecture.md
+# Architecture
+
+<!-- docs-lint: marking-walk -->
+This paragraph is excused and says `_mark_inherited` stamps everything inherited `_FOREIGN`.
+
+The next one is not, and it says `_mark_inherited` stamps everything inherited `_FOREIGN` too.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
