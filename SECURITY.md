@@ -11,9 +11,11 @@ path is forward.
 | Latest release | ✅ |
 | Anything older | ❌ — upgrade to the latest release |
 
-Development pre-releases (`X.Y.Z.devN`) are published to PyPI on every merge to `main` so the
-publish path stays exercised. They are not intended for production and are not supported;
-`pip install log-foundry` does not select them.
+Development pre-releases (`X.Y.Z.devN`) were published to PyPI on every merge to `main` so the
+publish path stayed exercised. **That is suspended**: `publish-dev` is disabled in
+`release.yml`, which says why and how to restore it, so no new `.devN` is being published. Those
+already on PyPI are not intended for production and are not supported; `pip install log-foundry`
+does not select them.
 
 ## Reporting a vulnerability
 

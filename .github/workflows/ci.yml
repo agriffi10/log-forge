@@ -21,9 +21,11 @@ on:
   pull_request:
   workflow_call:   # allow release.yml to run this same gate before publishing
   # Restores a side-effect-free way to re-run this gate on `main`. Without it, dropping the push
-  # trigger left re-running `Release` as the only option — and that job chain ends in
-  # `publish-dev`, holding `id-token: write` against PyPI. It is safe to re-run (`skip-existing`),
-  # but exercising the publish path to answer a test question is the wrong tool. The concurrency
+  # trigger left re-running `Release` as the only option — and that job chain ended in
+  # `publish-dev`, holding `id-token: write` against PyPI. That job is disabled for now, so the
+  # chain currently ends nowhere on main and the hazard is dormant rather than gone: it returns
+  # with the job. Exercising a publish path to answer a test question is the wrong tool either
+  # way, and this trigger is what makes not doing so free. The concurrency
   # group below needs no change: a dispatch is not a `pull_request`, so it takes the unique
   # `run_id` branch and cannot displace anything.
   workflow_dispatch:
@@ -41,8 +43,9 @@ permissions:
 # `refs/heads/main`. So the obvious `${{ github.workflow }}-${{ github.ref }}` collapses every
 # merge to main into ONE group — and a queued run is not merely delayed, it is displaced: GitHub
 # cancels a `pending` run when a newer one arrives in its group. Merges A, B, C landing together
-# would cancel B's `test`, which skips `build` (`needs: test`) and therefore `publish-dev`, so B
-# would never be tested on main and never ship its `devN`. That would be this workflow cancelling
+# would cancel B's `test`, which skips `build` (`needs: test`), so B would never be tested on
+# main — and, while `publish-dev` was live, never shipped its `devN` either. That would be this
+# workflow cancelling
 # the very gate the dropped `push` trigger above delegates to.
 #
 # Hence the literal `ci-` prefix and the `run_id` fallback. A pull request keys on its own ref and

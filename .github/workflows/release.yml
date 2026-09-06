@@ -65,8 +65,11 @@ jobs:
           python -m pip install build==1.6.0 twine==7.0.0
           python -m build
 
-      # Every merge publishes, so a bad artifact turns main red at upload time.
-      # Catch the common rejections here instead, where the error is legible:
+      # A bad artifact turns a release red at upload time. This ran on every merge while
+      # `publish-dev` did, which caught such an artifact one merge after it was built; with that
+      # job disabled below the check still runs here, but the first upload it now guards is a
+      # TAG. Cheap, and the only thing still standing between a bad artifact and a release.
+      # Catch the common rejections here, where the error is legible:
       #   - a local version segment (+<hash>), which PyPI refuses outright
       #   - malformed metadata or a README that fails to render on the project page
       - name: Verify distributions are publishable
@@ -129,10 +132,41 @@ jobs:
           path: sbom.cdx.json
 
   publish-dev:
-    # Every merge to main ships an X.Y.Z.devN pre-release to PyPI. pip ignores pre-releases
-    # unless --pre is passed, so `pip install log-foundry` still resolves to the stable release.
-    # This keeps the upload path exercised, so a tagged release is never the first attempt.
-    if: github.ref == 'refs/heads/main'
+    # WHAT THIS JOB IS FOR, in the past tense because it is switched off below. Every merge to
+    # main shipped an X.Y.Z.devN pre-release to PyPI. pip ignores pre-releases unless --pre is
+    # passed, so `pip install log-foundry` still resolved to the stable release. It kept the
+    # upload path exercised, so a tagged release was never the first attempt.
+    #
+    # ── DISABLED, TEMPORARILY, AND NOT BECAUSE THE JOB IS WRONG ──────────────────────────
+    # The `pypi` environment gained a deployment-branch policy admitting only `v*` TAGS, so a
+    # deployment from `refs/heads/main` is refused before the job's first step runs: it fails in
+    # about a second with no steps and no log, and every merge to main has been red since. The
+    # job body is left standing rather than deleted, for its `environment:` block, its reasoning
+    # and plain legibility — not to preserve the action pin, which `publish-release` carries
+    # identically a few lines below.
+    #
+    # TO RESTORE, and the branch policy is NOT the only thing in the way. That environment
+    # carries TWO protection rules: the `v*` tag policy above, and `required_reviewers`. Admitting
+    # `main` and restoring the `if:` therefore turns a red main into a main that sits in Waiting
+    # for a manual deployment approval on EVERY merge, which is arguably worse. The two ways out:
+    #
+    #   - accept an approval per merge, or
+    #   - give this job an environment of its own, without the reviewer rule. Before assuming
+    #     that needs work on PyPI's side, CHECK: the environment name is an OPTIONAL claim in
+    #     Trusted Publishing, verified only when the publisher was registered with one. If the
+    #     `log-foundry` publisher has its Environment field blank, no PyPI-side change is needed
+    #     at all; if it is set to `pypi`, ADD a second publisher for the new name. Do not take
+    #     this comment's word for which case applies — it was written without PyPI access.
+    #
+    # Then put `if: github.ref == 'refs/heads/main'` back.
+    #
+    # What this costs while it is off: merges to main publish no `X.Y.Z.devN` pre-release, so the
+    # settled decision that "merges to `main` publish a `.devN` pre-release" (SPEC-012) is
+    # suspended, and the upload path is no longer exercised between tags — which means the next
+    # `v*` tag IS the first attempt, the exact thing this job exists to prevent. Deliberate and
+    # temporary; the tag path itself is untouched, since `publish-release` and `github-release`
+    # depend on `build` and on each other, never on this job.
+    if: false
     needs: build
     runs-on: ubuntu-latest
     environment:
