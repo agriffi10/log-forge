@@ -94,6 +94,17 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
   committed and reviewed locally before the next push, rather than each one going up as it lands.
 - **Every PR is watched to completion and merged as soon as CI is green** — never open a PR and walk
   away. A spec's PR merges only on green.
+- **The merge takes the owner bypass, and that is the normal path here, not an escape hatch.** The
+  `main` ruleset squash-merges only and sets `require_last_push_approval`, which asks for an approval
+  from someone who did not push — so a PR authored and pushed by the only account on this repo can
+  never obtain one, whatever `required_approving_review_count` says. `gh pr merge <n> --squash`
+  refuses with "the base branch policy prohibits the merge"; the merge is
+  `gh pr merge <n> --squash --admin --delete-branch`, and the hundred most recent merged PRs carry
+  zero reviews between them because of it — #230, merged as `3a4d337`, is the one this paragraph was
+  written from. **The bypass replaces the branch protection, never the review gate** — the two
+  fresh-context diff reviews happened before the push and are what makes the merge safe. If
+  `--delete-branch` reports it cannot remove the local branch, a worktree still holds it; remove the
+  worktree, then the branch.
 - **Key the watch on the current head sha, never a bare `gh pr checks --watch`** — it can exit clean
   against the **previous** commit's checks, and a hand-written shell condition can invert and print
   "settled" while a job is still running. Both report a green that is not there.

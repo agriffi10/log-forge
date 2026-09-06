@@ -80,6 +80,17 @@ Including failure, including abandonment, including "I am stuck and asking the h
 a session that has stopped is the one failure this design has — and the stale-lock rule below only
 clears it after 90 minutes.
 
+**Know what releasing early costs, and take it anyway.** `turn` and `acquire` refuse while any
+non-draft PR is open on the remote, and neither exempts the caller's own PR — so a session that
+releases *after* opening its PR cannot take the lock back until that PR is merged or closed. Measured
+with PR #230 open, before it merged as `3a4d337`: `turn` returned `WAIT — a PR is open on the remote`
+naming that PR, and `acquire` returned `BUSY` for the same reason. Releasing is still the right move
+when you stop, because a stale lock blocks everyone and this blocks only you; what changes is the
+recovery. **Finish the lifecycle without the lock** — your PR is the one open PR and no peer can have
+taken a turn behind it, so the invariant holds — then drop the ticket. Do not close and reopen the PR
+to get the lock back: that loses the checks and the review trail to work around a lock whose job is
+already done.
+
 ## What is enforced, and what is not
 
 A `pre-push` hook refuses a push of any ref matching `enforce-branches` unless that branch holds the
