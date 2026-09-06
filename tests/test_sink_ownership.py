@@ -1196,6 +1196,35 @@ def test_health_reports_an_inherited_sink() -> None:
     assert run_in_child(replaced).output == "False"
 
 
+def test_health_reports_an_inherited_sink_on_the_worker_path_too() -> None:
+    """SPEC-054 FR-005 AC-3. The same two answers where a worker exists, from one authority.
+
+    The field used to read `worker.sink` where a worker existed and the owed record's last entry
+    where none did — two readers, and neither was the authority for "installed"
+    (`architecture.md` §12). It answers from the **config** on both paths now, which is what
+    closes that open item, so the worker path owes the same pair of answers as the orphan one.
+    """
+    log_foundry.configure(service="own", sink=RecordingSink())
+
+    @log_foundry.trace
+    def work() -> None:
+        """Builds the process worker, so the child inherits one."""
+
+    work()
+    assert _lifecycle._state._worker is not None, "the precondition: a worker exists"
+    assert log_foundry.health().inherited_sink is False
+
+    def inherited() -> str:
+        return f"{log_foundry.health().inherited_sink},{_lifecycle._state._worker is not None}"
+
+    def replaced() -> str:
+        log_foundry.configure(sink=RecordingSink())
+        return f"{log_foundry.health().inherited_sink},{_lifecycle._state._worker is not None}"
+
+    assert run_in_child(inherited).output == "True,True"
+    assert run_in_child(replaced).output == "False,True"
+
+
 def test_health_answers_the_inherited_question_with_no_worker() -> None:
     """FR-004 AC-3. Synthesized as `retired` already is; no worker is created to answer it."""
     log_foundry.configure(service="own", sink=RecordingSink())

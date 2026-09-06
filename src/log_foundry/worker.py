@@ -120,10 +120,15 @@ class Health:
         stopped a forked child's rebuild from starting a thread at all (SPEC-039 FR-002) — a
         case where the drain thread never ran rather than died. All three are the same thing to
         a reader, which is why they share the field: nothing is delivering.
-      sink: The configured sink's own loss counters, or ``None`` when there is no worker or
-        the sink reports nothing (SPEC-026 FR-003). Nested rather than folded into the
+      sink: The configured sink's own loss counters, or ``None`` when the sink reports
+        nothing (SPEC-026 FR-003). Nested rather than folded into the
         integers above because they count different things: ``dropped`` here is backpressure
         at this queue, ``dropped`` on the sink is an event that never reached the wire.
+        ~~or ``None`` when there is no worker~~ — struck (SPEC-021): that was the two-owner
+        shape describing itself as the contract. Measured against a ``MultiSink`` with one
+        raising child, an ``info()`` outside a span reported ``None`` here while the sink's own
+        ``losses()`` read ``failed=1``, which contradicts ``docs/invariants.md`` §2. SPEC-054
+        FR-005 fills it from the configured sink on every path.
       retired: Whether ``shutdown()`` has been called. It describes an action the
         caller took, not a failure the library detected, which is why it is a boolean where
         ``stopped_reason`` is a string — SPEC-019 rejected an ``alive`` flag because it would
@@ -641,7 +646,12 @@ class Worker:
         return not self._drain_settled.is_set()
 
     def health(self) -> Health:
-        """Snapshots the delivery counters (SPEC-017 FR-005, SPEC-019 FR-003).
+        """Snapshots this worker's own counters, and nothing else (SPEC-054 FR-005).
+
+        The fields a *process* answers — ``retired``, ``sink``, ``closing_sinks``,
+        ``inherited_sink`` and the two loss counters — are left at their defaults and filled by
+        ``_lifecycle._worker_health``, which is the one place a ``Health`` is assembled. Two
+        assemblers is what let ``sink`` be filled on the worker path only.
 
         This stays valid after :meth:`shutdown`: the counters are plain integers that outlive
         the thread, and the final drain consumes the queue. ``queued`` therefore reads 0 for a
@@ -657,12 +667,11 @@ class Worker:
           None.
 
         Returns:
-          The snapshot, including the sink's own losses when it reports any.
+          The counter half of a snapshot; the rest is the lifecycle owner's to fill.
 
         Raises:
           None.
         """
-        retired = _lifecycle_state.retirements > self._epoch
         with self._lock:
             dropped, failed_batches = self.dropped, self.failed_batches
             stopped_reason = self.stopped_reason
@@ -673,12 +682,8 @@ class Worker:
             dropped=dropped,
             failed_batches=failed_batches,
             stopped_reason=stopped_reason,
-            sink=self._sink_losses(),
-            retired=retired,
             submitted_after_shutdown=submitted_after_shutdown,
             incomplete_swaps=incomplete_swaps,
-            closing_sinks=_lifecycle.closing_count(),
-            inherited_sink=not _lifecycle.releasable(self.sink),
         )
 
     def _sink_losses(self) -> SinkLosses | None:

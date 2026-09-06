@@ -285,33 +285,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "counted only predicates would not notice."
         ),
     ),
-    ("_delivering_to_an_inherited_sink", "_state.worker_exists()", 0): (
-        EXISTENCE,
-        (
-            "which of the three delivery targets to ask about, for Health.inherited_sink "
-            "(SPEC-042 FR-004 AC-3). Existence, not liveness, and the distinction bites: a "
-            "*retired* worker still holds the sink this process last delivered through, and "
-            "whether that sink was inherited is exactly what the field reports. Answering it "
-            "with liveness would fall through to the orphan record after shutdown() and "
-            "describe a different object than the one the events went to. No worker is created "
-            "to answer it, the same refusal _worker_health and _flush_worker already make."
-        ),
-    ),
-    (
-        "_delivering_to_an_inherited_sink",
-        "worker.sink if worker is not None else owed or _live_config().sink",
-        0,
-    ): (
-        EXISTENCE,
-        (
-            "the same question, consuming the snapshot the row above took rather than "
-            "re-reading the global - a re-read could see _get_worker assign between the two "
-            "and report on a sink that is not the one the first branch selected. The three "
-            "candidates are in delivery order because SPEC-033 measured them disagreeing, and "
-            "AC-1 requires the field to name which one it describes."
-        ),
-    ),
-    ("_swap_sink", "worker is not None", 0): (
+            ("_swap_sink", "worker is not None", 0): (
         LIVENESS,
         (
             "the in-lock branch: a live worker means the orphan path relinquishes its record, "
@@ -347,7 +321,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "leaves SPEC-030's retired-plus-submitted pair with a term that can never fire."
         ),
     ),
-    ("_worker_health", "worker.health()", 0): (
+    ("_worker_health", "None if worker is None else worker.health()", 0): (
         LIVENESS,
         (
             "the snapshot whose retired field the row below reads, and the reason this "
@@ -356,11 +330,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "choice between them."
         ),
     ),
-    ("_worker_health", "worker is None", 0): (
-        EXISTENCE,
-        "health() creates no worker; the zeros describe a process that never logged.",
-    ),
-    ("_flush_worker", "worker is not None", 0): (
+        ("_flush_worker", "worker is not None", 0): (
         EXISTENCE,
         (
             "is there a queue to drain at all. Was `worker is None` guarding an early return; "
@@ -971,10 +941,10 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 45, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 42, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
 
-**Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 45 and the
+**Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 42 and the
 whole of the difference is accounted for below, measured by deriving the site list from both
 trees with this file's own `_sites` and diffing it per scope:
 
@@ -983,14 +953,24 @@ trees with this file's own `_sites` and diffing it per scope:
     +4  _close_owed                 -1  _close_orphan_sink
     +1  _inline_close_choice        -3  _flush_live_sink
     +1  _shutdown_worker            -1  _get_worker
-    +1  _swap_sink (the `held` guard)   -3  _swap_sink
+                                    -2  _swap_sink (net, after the `held` guard)
+                                    -2  _delivering_to_an_inherited_sink
+                                    -1  _worker_health
 
 The four questions became three (FR-004), which is a wash: two predicates replace two. The
-**net** loss is three functions that stopped asking anything. `_flush_live_sink` no longer
-branches on which path armed a sink — it drains the one record (FR-005) — `_get_worker` no
-longer releases a sink its build did not adopt (FR-002), and `_swap_sink` is one function over
-one record where it was two branches keeping two in step (FR-003). Each is a guard that is gone
-because the thing it guarded is gone, which is the only reason a derived floor may fall.
+**net** loss is five functions that stopped asking about the worker at all, each because the
+thing they asked about is gone:
+
+- `_flush_live_sink` no longer branches on which path armed a sink — it drains the one record.
+- `_delivering_to_an_inherited_sink` and one of `_worker_health`'s reads answer from the
+  **config** rather than from the worker, which is FR-005 and closes `architecture.md` §12's
+  open item; the worker was never the authority for "installed".
+- `_get_worker` no longer releases a sink its build did not adopt (FR-002).
+- `_swap_sink` is one function over one record where it was two branches keeping two in step,
+  and it gained the `held` guard in the same change (FR-003).
+
+Each is a guard that is gone because the thing it guarded is gone, which is the only reason a
+derived floor may fall.
 
 A refactor that relocates guards can shrink a derived roster silently, which is the one failure
 a roster cannot catch about itself. **Per module, and keyed by name, because a single total is

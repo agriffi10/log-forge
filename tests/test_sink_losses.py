@@ -12,7 +12,9 @@ import json
 
 import pytest
 
+import log_foundry
 import log_foundry.sinks._socket as socket_mod
+from conftest import install_worker
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.multi import MultiSink
@@ -124,25 +126,37 @@ def test_a_non_callable_losses_attribute_is_refused() -> None:
 
 
 def test_health_reports_the_configured_sinks_losses() -> None:
-    worker = Worker(CountingSink(dropped=4, failed=5), batch_size=1)
+    """SPEC-054 FR-005: the field reads the **configured** sink, on either delivery path.
+
+    It was `worker.health().sink`, filled from `worker.sink`. The two differ after a declined
+    swap and after any `configure()` on a retired worker, and the config is what
+    `architecture.md` §12 names the authority for "installed" — so the sink is configured here
+    rather than only handed to a worker.
+    """
+    sink = CountingSink(dropped=4, failed=5)
+    log_foundry.configure(service="t", sink=sink)
+    worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink == SinkLosses(dropped=4, failed=5)
+        assert log_foundry.health().sink == SinkLosses(dropped=4, failed=5)
     finally:
         worker.stop()
 
 
 def test_health_sink_is_none_when_the_sink_reports_nothing() -> None:
     worker = Worker(QuietSink(), batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink is None
+        assert log_foundry.health().sink is None
     finally:
         worker.stop()
 
 
 def test_health_never_raises_on_a_broken_accessor() -> None:
     worker = Worker(BrokenLossesSink(), batch_size=1)
+    install_worker(worker)
     try:
-        health = worker.health()
+        health = log_foundry.health()
     finally:
         worker.stop()
     assert health.sink is None
@@ -151,11 +165,13 @@ def test_health_never_raises_on_a_broken_accessor() -> None:
 
 def test_health_sink_tracks_the_counters_live() -> None:
     sink = CountingSink()
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink == SinkLosses(dropped=0, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=0, failed=0)
         sink._losses = SinkLosses(dropped=7, failed=0)
-        assert worker.health().sink == SinkLosses(dropped=7, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=7, failed=0)
     finally:
         worker.stop()
 
@@ -496,11 +512,13 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     sink = SyslogSink("loghost", transport="udp", max_retries=0)
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1, max_retries=0)
+    install_worker(worker)
     try:
         worker.submit(_span("a"))
         assert not worker.flush(timeout=2.0)
-        health = worker.health()
+        health = log_foundry.health()
     finally:
         worker.stop()
     assert health.failed_batches == 1
@@ -658,15 +676,17 @@ def test_losses_is_safe_to_call_concurrently_with_emit() -> None:
             return SinkLosses(dropped=0, failed=self.failed)
 
     sink = SlowSink()
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
         worker.submit(_span("a"))
         assert started.wait(2.0), "the emit is in flight"
-        assert worker.health().sink == SinkLosses(dropped=0, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=0, failed=0)
         release.set()
     finally:
         worker.stop()
-    assert worker.health().sink == SinkLosses(dropped=0, failed=1)
+    assert log_foundry.health().sink == SinkLosses(dropped=0, failed=1)
 
 
 # --- review follow-ups: wrappers, the SDK path, an all-rejected bulk ----------------------

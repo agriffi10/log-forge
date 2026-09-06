@@ -564,35 +564,40 @@ def test_the_record_is_opted_out_of_the_repair_walk() -> None:
     )
 
 
-def test_health_still_answers_from_the_record_and_from_its_last_entry() -> None:
-    """FR-004 AC-4. Both halves are discriminating, and the first draft was neither.
+def test_health_answers_the_inherited_question_from_the_config_not_the_record() -> None:
+    """SPEC-054 FR-005 supersedes SPEC-045 FR-004 AC-4, and closes `architecture.md` §12's item.
 
-    `health().inherited_sink` asks whether the sink this process is delivering to is one it may
-    not release. With no worker it consults the owed record. A first draft armed two sinks this
-    process owned and asserted `False`, which is true whichever end the reader picks and true
-    with the reader deleted outright — measured, both mutants passed the whole suite.
+    ~~`health().inherited_sink` … with no worker it consults the owed record … and takes the
+    **last** entry.~~ — struck (SPEC-021). That reader could name a sink this process had stopped
+    delivering to: `_swap_sink` inserts the new sink and a preempted emit then appends the
+    superseded one, so the order can be `[live, superseded]`. Arming order is emit order, which
+    is a different question from "installed", and §12 already named the config as the authority.
 
-    So: the second sink is stamped as another process's, the way a `fork` leaves what it
-    inherited recorded under a pid this process cannot match. Reading `True` then requires the
-    reader to consult the record at all — the configured sink is the *first* one and is this
-    process's — and to take the **last** entry.
+    Both halves stay discriminating, which is why the arrangement is inverted rather than the
+    assertions flipped. A draft that stamped a *record* entry foreign and asserted `False` would
+    be true with the reader deleted outright. So the **configured** sink is the one stamped as
+    another process's — the way a `fork` leaves what it inherited recorded under a pid this
+    process cannot match — and a second, owed-but-not-configured sink is stamped foreign too:
+    reading `True` requires the reader to consult the config, and reading `False` after only the
+    config's stamp is restored requires it to consult **nothing else**.
     """
-    first, second = CountingSink("A"), CountingSink("B")
-    log_foundry.configure(service="t", sink=first)
+    configured, owed_only = CountingSink("A"), CountingSink("B")
+    log_foundry.configure(service="t", sink=configured)
     log_foundry.info("to A")
-    _lifecycle._note_orphan_emit(second)
+    _lifecycle._note_orphan_emit(owed_only)
     with _lifecycle._owned_lock:
-        _lifecycle._owned[id(second)] = (_lifecycle._FOREIGN, second)
+        _lifecycle._owned[id(configured)] = (_lifecycle._FOREIGN, configured)
+        _lifecycle._owned[id(owed_only)] = (_lifecycle._FOREIGN, owed_only)
 
     assert log_foundry.health().inherited_sink is True, (
-        "the reader consults the record's last entry: the configured sink is A, which this "
-        "process owns, so answering from the config or from the record's first entry reads False"
+        "the reader consults the configured sink, which is stamped as another process's"
     )
 
     with _lifecycle._owned_lock:
-        _lifecycle._owned[id(second)] = (os.getpid(), second)
+        _lifecycle._owned[id(configured)] = (os.getpid(), configured)
     assert log_foundry.health().inherited_sink is False, (
-        "and the answer follows the record rather than being constant"
+        "and only the configured sink: B is still owed and still stamped foreign, so a reader "
+        "that consulted the record at all would answer True here"
     )
 
 

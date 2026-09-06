@@ -6,7 +6,6 @@ import atexit
 import os
 import threading
 import types
-from dataclasses import replace
 from itertools import islice
 from time import monotonic
 from typing import TYPE_CHECKING
@@ -2061,25 +2060,23 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         return FlushResult(ok=False, reason="sink-flush")
     return drained
 def _delivering_to_an_inherited_sink() -> bool:
-    """Whether the sink this process last installed for delivery is one it may not release.
+    """Whether the sink this process delivers to was handed over by another one (SPEC-042).
 
-    Answerable with **no worker**, which is what makes it truthful in a process that only ever
-    logs outside a span — the same refusal :func:`_worker_health` already makes for ``retired``,
-    and for the same reason: standing up a thread to answer ``health()`` is forbidden.
+    ``health().inherited_sink``. A forked child that inherits its parent's sink object refuses to
+    close it, and this is what says so before the close would have happened: a `True` here in a
+    process that did not `configure()` after forking is the deployment `architecture.md` §9 warns
+    about, and the answer a reader needs is about the **one** sink being delivered to.
 
-    The three candidates are asked in delivery order: the worker's sink if a worker exists,
-    else the sink an orphan emit reached most recently, else the configured one. SPEC-033's
-    measured disagreement is worker-versus-config, which the **first** term already covers.
+    **Answered from the config** (SPEC-054 FR-005), which closes ``architecture.md`` §12's open
+    item. It read the owed record's last entry, and arming order does not make a sink the
+    installed one: ``_swap_sink`` inserts the new sink and a preempted emit then appends the
+    *superseded* one, so the order can be ``[live, superseded]`` and the field could name a sink
+    this process had stopped delivering to. Neither end of the record is authoritative for
+    "installed" — arming order is emit order, which is a different question — and §12 already
+    names the config as the authority.
 
-    The middle term takes the **last** entry of ``_state._orphan_owed``, and that is continuity
-    with the single slot it replaced rather than a claim that the last entry is the sink being
-    delivered to. It is not: ``_swap_sink`` inserts the new sink into a freshly emptied record and
-    a preempted emit then appends the *superseded* one, so in this spec's own primary scenario the
-    order is ``[live, superseded]``. Neither end of the record is authoritative for "installed" —
-    arming order is emit order, which is a different question — and the config is. The answer is
-    therefore unchanged from before SPEC-045 and can still name a superseded sink; that limit is
-    an open item in ``architecture.md`` §12 rather than quietly fixed here, because correcting it
-    changes a documented ``Health`` field on a path that spec did not otherwise touch.
+    It is the same authority :func:`_worker_health` uses for ``sink``, deliberately: both fields
+    describe the destination, and answering them from two places is what let them disagree.
 
     With no sink resolved at all there is nothing installed and nothing inherited, so the answer
     is ``False`` rather than a guess.
@@ -2088,7 +2085,7 @@ def _delivering_to_an_inherited_sink() -> bool:
       None.
 
     Returns:
-      Whether that one sink carries another process's ownership record.
+      Whether the configured sink carries another process's ownership record.
 
     Raises:
       None. ``health()`` is a diagnostic and must not be the reason a caller fails; an
@@ -2098,14 +2095,14 @@ def _delivering_to_an_inherited_sink() -> bool:
     from log_foundry.config import _live_config
 
     try:
-        worker = _state.worker_exists()
-        owed = next(reversed(_state._owed.values()), None)
-        sink = worker.sink if worker is not None else (owed or _live_config().sink)
+        sink = _live_config().sink
         return sink is not None and not releasable(sink)
     except Exception:
         return False
+
+
 def _worker_health() -> Health:
-    """Snapshots the process worker's counters, or zeros if none was ever created.
+    """Assembles the process's health snapshot once, from one record (SPEC-054 FR-005).
 
     Like :func:`_flush_worker` this deliberately does not call :func:`_get_worker`: starting a
     thread and registering an ``atexit`` drain in order to report an empty snapshot would be
@@ -2113,61 +2110,81 @@ def _worker_health() -> Health:
     created has not died, which is why SPEC-019 reports the terminal failure as a reason
     rather than an ``alive`` flag.
 
-    ``retired`` is the one field synthesized rather than zeroed (SPEC-031 FR-006). It records
-    an action the caller took, not a state of the worker, so it stays true in a process that
-    called ``shutdown()`` without ever building one — where it was previously vacuous, and the
-    whole snapshot read all-clear over a sink that had just been closed.
-    ``submitted_after_shutdown`` is deliberately **not** synthesized alongside it: SPEC-030
-    defines that count as submissions queued where nothing will drain them, and a later orphan
-    log is refused at the closed sink and announced instead. The two are not the same claim.
+    **One construction site, and every field has one authority.** The worker contributes its own
+    counters and nothing else; ``retired`` is the owner's count; ``sink`` is ``read_losses`` over
+    the **configured** sink; ``closing_sinks`` is the closer registry; ``inherited_sink`` is the
+    config; and the two loss counters are ``decorator``'s. Two branches assembling eight fields
+    apiece is what let ``sink`` be filled on one path only — measured against a ``MultiSink``
+    with one raising child, ``health().sink`` read ``SinkLosses(dropped=0, failed=3)`` inside a
+    span and ``None`` outside one while the sink's own ``losses()`` read ``failed=1``, which
+    contradicts ``docs/invariants.md`` §2's observable that loss a sink absorbed is in
+    ``health().sink``.
 
-    The two loss counters are synthesized on **both** branches, for the reason ``retired`` is on
-    one: they describe the caller's own path, not the worker's, and ``Worker`` cannot report them
-    because it does not know they exist — ``worker.py`` imports nothing from this module, and the
-    reverse read would be a cycle. A process that only ever logged outside a span has no worker
-    and is exactly the process whose loss they exist to show (SPEC-036 FR-003 AC-7).
+    ``sink`` reads the **configured** sink rather than ``worker.sink``, and the two differ in
+    three states: briefly inside a swap, permanently after a declined swap (SPEC-035 FR-003, the
+    worker retired mid-swap and keeps A while B is delivered to), and permanently after any
+    ``configure(sink=…)`` on a retired worker (SPEC-033 FR-002). In the last two the worker path
+    used to report A's losses while every event went to B. The config is what
+    ``architecture.md`` §12 already names the authority for "installed", and B is the sink being
+    delivered to, so that is an observable change taken deliberately.
 
-    The synthesis also survives a worker built *after* that shutdown, which is why it is an
-    ``or`` rather than a fallback. An orphan-only ``shutdown()`` leaves ``_state._worker`` unset, so a
-    later ``@trace`` constructs a fresh worker whose own epoch is current — and reading
-    that alone would say the process was never shut down, contradicting this function's own
-    guarantee one call earlier. The events that worker carries are not lost silently: against a
-    sink that guards its post-close state they raise and land in ``failed_batches`` (measured),
-    and against one that releases nothing on ``close()`` they genuinely still deliver. So the
-    detection is ``failed_batches`` there rather than SPEC-030's ``retired`` +
-    ``submitted_after_shutdown`` pair, which stays the signal for the path it was built for.
+    ``retired`` records an action the caller took, not a state of the worker, so it stays true in
+    a process that called ``shutdown()`` without ever building one — where it was previously
+    vacuous, and the whole snapshot read all-clear over a sink that had just been closed. It also
+    survives a worker built *after* that shutdown: the count is the process's, and that worker's
+    epoch merely tells it apart from a stranded one. The events such a worker carries are not
+    lost silently — against a sink that guards its post-close state they raise and land in
+    ``failed_batches`` (measured), and against one that releases nothing on ``close()`` they
+    genuinely still deliver — so the detection there is ``failed_batches`` rather than SPEC-030's
+    ``retired`` + ``submitted_after_shutdown`` pair, which stays the signal for the path it was
+    built for.
+
+    ``submitted_after_shutdown`` is deliberately **not** synthesized where no worker exists:
+    SPEC-030 defines that count as submissions queued where nothing will drain them, and a later
+    orphan log is delivered or refused at the sink and announced instead. The two are not the
+    same claim.
+
+    The ``retired`` binding is load-bearing rather than style: the roster's ``_boolean_positions``
+    does not file a keyword argument, so writing it inline in the one ``Health`` construction
+    would drop
+    this module's only retirement guard out of ``tests/test_worker_predicate_roster.py`` and take
+    its count from 45 to 44 with nothing red.
 
     Args:
       None.
 
     Returns:
-      The worker's health snapshot, backing :func:`log_foundry.health` (SPEC-017 FR-005).
+      The process's health snapshot, backing :func:`log_foundry.health` (SPEC-017 FR-005).
 
     Raises:
       None.
     """
+    from log_foundry.config import _live_config
     from log_foundry.decorator import _read_losses
+    from log_foundry.sinks.base import read_losses
     from log_foundry.worker import Health
 
     worker = _state.worker_exists()
+    counters = None if worker is None else worker.health()
     orphan_lost, in_span_lost = _read_losses()
     retired = _state.retirements > 0
-    if worker is None:
-        return Health(
-            queued=0,
-            dropped=0,
-            failed_batches=0,
-            retired=retired,
-            closing_sinks=closing_count(),
-            inherited_sink=_delivering_to_an_inherited_sink(),
-            orphan_lost=orphan_lost,
-            in_span_lost=in_span_lost,
-        )
-    health = worker.health()
-    return replace(
-        health, retired=retired, orphan_lost=orphan_lost, in_span_lost=in_span_lost
+    configured = _live_config().sink
+    return Health(
+        queued=0 if counters is None else counters.queued,
+        dropped=0 if counters is None else counters.dropped,
+        failed_batches=0 if counters is None else counters.failed_batches,
+        stopped_reason=None if counters is None else counters.stopped_reason,
+        sink=None if configured is None else read_losses(configured),
+        retired=retired,
+        submitted_after_shutdown=(
+            0 if counters is None else counters.submitted_after_shutdown
+        ),
+        incomplete_swaps=0 if counters is None else counters.incomplete_swaps,
+        closing_sinks=closing_count(),
+        inherited_sink=_delivering_to_an_inherited_sink(),
+        orphan_lost=orphan_lost,
+        in_span_lost=in_span_lost,
     )
-
 
 _fork.register_child_handler(_mark_inherited)
 _fork.register_child_handler(_clear_after_fork)
