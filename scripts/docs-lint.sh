@@ -1008,7 +1008,8 @@ fi
 # AT WHAT, and a reader who does not check it against a calendar reads it as current.
 #
 # WHAT IT CATCHES, exactly: a bullet, paragraph or comment block in which "measured" or
-# "as of" is followed immediately by an ISO date, with no short SHA or version tag
+# "as of" is followed by an ISO date — immediately, or across one adverb of time from a
+# closed set (here, again, once, twice, already) — with no short SHA or version tag
 # anywhere in that same unit.
 #
 # THAT IS ONE SHAPE, NOT THE POPULATION, and the difference is worth stating plainly
@@ -1158,22 +1159,24 @@ fi
       # The separators are the ones this repo actually writes: "Measured 2026-09-01",
       # "Measured, on `f17edd4`", "measured at e565e22". Leaving `at` and the comma out
       # made the two likeliest honest spellings escape while the rule was being followed.
-      # ONE short word may sit between the verb and the date. The gap was found while the
-      # queue paragraphs in docs/process/ were being drafted: both were first written as
-      # "Measured <one word> on <date>" with no SHA, this check stayed silent on them, and a
-      # read of the draft caught what the gate had not. Those sentences were anchored before
-      # they committed, so the evidence a reader can re-run is the FIXTURE PAIR, not the
-      # history — dated-measurement-one-word-gap fires, dated-measurement-clause-gap-ok does
-      # not. Bounded to a single [a-z] run of at most eight characters and no punctuation:
-      # that admits "here", "again", "once", and stops well short of a clause, which is
-      # where an unrelated date later in the sentence would start matching.
+      # ONE ADVERB OF TIME may sit between the verb and the date, from a closed set. The gap
+      # was found while the queue paragraphs in docs/process/ were being drafted: both were
+      # first written as "Measured here on <date>" with no SHA, this check stayed silent on
+      # them, and a read of the draft caught what the gate had not. Those sentences were
+      # anchored before they committed, so the evidence a reader can re-run is the FIXTURE
+      # SET, not the history.
       #
-      # The bound uses an ERE interval, the only one in this script; the header above reasons
-      # about awk dialects and this is the one dependency it did not name. An awk without
-      # interval support fails the optional group open rather than closed, degrading dated()
-      # to its old behaviour silently — which is what the firing fixture is there to catch.
+      # A CLOSED SET, not a bounded run of letters, and the difference is the whole design.
+      # The bounded version was built first and rejected on a real false positive: "as of the
+      # 2026-08-04 correction below" — a date that NAMES A THING rather than recording when
+      # someone looked — fired, and so would "measured against the 2026-08-01 baseline". The
+      # FAIL text has no remedy to offer such a sentence (there is no number to drop and no
+      # tree to anchor), so the only moves left are a decorative SHA or learning to skip a
+      # local gate, which is the specific damage this check exists to avoid. The set below
+      # admits the spelling that escaped and nothing that reads as a noun phrase; the
+      # `as of the …` silence case beside the firing one is what holds it there.
       function dated(s) {
-        return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*([a-z]{1,8}[ \t]+)?((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+        return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*((here|again|once|twice|already)[ \t]+)?((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
       }
       function flush(   where, what) {
         if (unit != "" && dated(unit) && !has_anchor(unit)) {

@@ -80,23 +80,25 @@ Including failure, including abandonment, including "I am stuck and asking the h
 a session that has stopped is the one failure this design has — and the stale-lock rule below only
 clears it after 90 minutes.
 
-**Know what releasing early costs.** `turn` and `acquire` refuse while any **non-draft** PR is open
-on the remote, and neither exempts the caller's own — so a session that releases *after* opening its
-PR cannot take the lock back until that PR lands. `release` also drops the ticket, so the first
-`turn` afterwards answers `NO_TICKET` (exit 3); re-run `ticket` and it then reports
-`WAIT — a PR is open on the remote`, naming your own PR. Measured with PR #230 open in `log-forge`,
-before it merged as `3a4d337`.
+**Know what releasing early costs.** `turn` and `acquire` refuse while any non-draft PR is open and
+neither exempts the caller's own, and `release` drops the ticket as well as the lock. A session that
+releases *after* opening its PR therefore cannot simply resume: it re-enters the queue at the current
+high-water mark, behind anyone who ticketed while it held the lock, and the first `turn` after a
+release needs a fresh `ticket` before it means anything.
 
-Releasing is still the right move when you stop, because a stale lock blocks every peer while this
-blocks only you. What it costs is the rest of the lifecycle:
+Release anyway when you stop. Not because it frees your peers — while your PR is open they wait
+either way — but because the block then ends when the PR lands instead of outliving your session, and
+an abandoned lock clears only on the stale-entry timer below. What it costs is the rest of your own
+lifecycle:
 
 - **Merging needs no lock.** Green CI, then merge, confirm `main`, drop the ticket.
-- **Pushing does.** `pre-push` compares the pushed branch against the lock holder's, so with the lock
-  free every participating branch is refused — and a red CI that needs a fix push is exactly that
-  case. `PR_QUEUE_BYPASS=1` is the documented way through it; say so when you use it.
-- **A DRAFT PR breaks the safety argument.** Drafts are filtered out of the open-PR check, so
-  releasing with one open lets a peer acquire and open a second PR; un-drafting and merging then
-  moves `main` under their branch. Keep the lock, or close the draft.
+- **Every push does**, `git push origin --delete <branch>` included, because the hook compares the
+  pushed branch against the holder's. A red CI needing a fix push is that case; `PR_QUEUE_BYPASS=1`
+  is the way through, and the section below asks you to say you used it. What counts as a
+  participating branch is `enforce-branches` and nothing else — the installer default is `^spec-`,
+  which matches neither `spec/…` nor `docs/…`, so an install that took it enforces nothing on those.
+- **A draft PR breaks the safety of releasing at all.** Drafts are filtered out of the open-PR check,
+  so a peer can acquire behind your draft and open a second PR. Keep the lock, or close the draft.
 
 Never close and reopen a PR to reclaim the lock: that discards the checks and the review trail to
 work around a lock whose job is already done.
