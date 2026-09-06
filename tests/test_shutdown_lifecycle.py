@@ -807,6 +807,49 @@ def test_an_interrupt_after_the_take_does_not_leak_a_close_registration() -> Non
     )
 
 
+def test_an_interrupt_after_the_take_leaves_the_sinks_owed_for_a_later_shutdown() -> None:
+    """The other half of the discharge guarantee, found by SPEC-054's second diff review.
+
+    Discharging the registration is not enough on its own. The take has already removed each sink
+    from the owed record, so an interrupt between the take and the close left them **owed by
+    nobody**: closed by nobody, and unreachable by a later `shutdown()` because nothing names
+    them any more. Measured before the fix at three sinks, `closes=[0, 0, 0]`, record empty.
+
+    The registry half is asserted by the sibling test above; this one asserts the record half and
+    then drives the recovery, which is the point — a sink put back is only useful if the next
+    call closes it.
+    """
+    first, second = CountingSink("A"), CountingSink("B")
+    log_foundry.configure(service="t", sink=first)
+    log_foundry.info("arms A")
+    _lifecycle._note_orphan_emit(second)
+    assert len(_lifecycle._state._owed) == 2, "the premise: two sinks are owed"
+
+    real_choice = _lifecycle._inline_close_choice
+
+    def interrupted(owed: list[object], worker: object) -> object:
+        """Stands in for an async interrupt landing after the take, before any close."""
+        raise KeyboardInterrupt
+
+    _lifecycle._inline_close_choice = interrupted  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _lifecycle._close_owed()
+    finally:
+        _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
+
+    assert (first.closed, second.closed) == (0, 0), "the premise: neither close ran"
+    assert not _lifecycle._closing_now, "the registrations were discharged"
+    assert {id(first), id(second)} <= set(_lifecycle._state._owed), (
+        "and both sinks are owed again, so a later shutdown can still close them"
+    )
+
+    log_foundry.shutdown(timeout=5.0)
+    assert (first.closed, second.closed) == (1, 1), (
+        f"which it does — got A={first.closed} B={second.closed}"
+    )
+
+
 def test_a_forks_clear_inside_a_close_leaves_the_registry_consistent() -> None:
     """SPEC-050 FR-002's shape at SPEC-054 FR-003's registry, where the count could go negative.
 

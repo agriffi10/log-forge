@@ -39,6 +39,14 @@ from log_foundry import _lifecycle
 SEEDS = range(16)
 THREADS = 4
 OPS_PER_THREAD = 60
+CLOSE_SECONDS = 0.002
+"""How long a ``Recorder.close()`` takes, so two of them can be observed overlapping.
+
+Small enough not to slow the run — the closes are concurrent by design — and large enough that
+an overlap is reachable at all: at zero the window is a few bytecodes and the counter measures
+nothing. Measured at this value, the defect the counter exists for failed 180 of 601 seeds.
+"""
+
 FLUSH_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 3.0
 FINAL_SHUTDOWN_TIMEOUT = 5.0
@@ -49,7 +57,19 @@ _PAGE = _REPO / "docs" / "invariants.md"
 
 
 class Recorder:
-    """A sink that keeps every event, counts closes, and can be slow, so the drain has a window.
+    """A sink that keeps every event, counts closes, and records whether two ever overlapped.
+
+    The overlap counter is not decoration. `invariant 5`'s headline is that a sink is closed
+    "**once**, by one owner, and a close in flight is waited for", and the assertion below used
+    to read `sink.events and sink.closes == 0` — it could see a sink closed **zero** times and
+    nothing else, so a sink closed twice, or closed twice *at the same instant*, passed. That is
+    an assertion coarser than the claim it cites. With the counter, `_swap_sink`'s fenced branch
+    releasing a sink another caller was already closing failed 180 of 601 seeds against a 2 ms
+    `close()` (SPEC-054, second diff review); the fix is one `held` term, and this is what would
+    have caught it.
+
+    `close()` takes measurable time for the same reason: an instantaneous close cannot overlap
+    with anything, so a zero-cost double is indistinguishable from correct behaviour.
 
     It keeps accepting after ``close()`` — the ``MemorySink`` half of SPEC-032's rule — because
     the library is *allowed* to write to a closed sink on the orphan path (SPEC-030 accepts
@@ -64,6 +84,8 @@ class Recorder:
     def __init__(self, emit_delay: float) -> None:
         self.events: list[dict[str, object]] = []
         self.closes = 0
+        self.inside = 0
+        self.overlapped = 0
         self.emit_delay = emit_delay
         self._lock = threading.Lock()
 
@@ -76,6 +98,12 @@ class Recorder:
     def close(self) -> None:
         with self._lock:
             self.closes += 1
+            self.inside += 1
+            if self.inside > 1:
+                self.overlapped += 1
+        time.sleep(CLOSE_SECONDS)
+        with self._lock:
+            self.inside -= 1
 
     def count(self, message: str) -> int:
         with self._lock:
@@ -197,6 +225,7 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     ends = sum(sink.count("span.end") for sink in ledger.sinks)
     orphans = sum(sink.count("orphan") for sink in ledger.sinks)
     unclosed = [i for i, sink in enumerate(ledger.sinks) if sink.events and sink.closes == 0]
+    overlapped = [i for i, sink in enumerate(ledger.sinks) if sink.overlapped]
     picture = (
         f"seed={seed} spans={ledger.spans} span.end={ends} queued={health.queued} "
         f"markers={markers} dropped={health.dropped} in_span_lost={health.in_span_lost} | "
@@ -204,7 +233,7 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
         f"failed_batches={health.failed_batches} incomplete_swaps={health.incomplete_swaps} "
         f"stopped_reason={health.stopped_reason} after_shutdown={health.submitted_after_shutdown} "
         f"sinks={len(ledger.sinks)} "
-        f"unclosed={unclosed} escaped={escaped!r}"
+        f"unclosed={unclosed} overlapped={overlapped} escaped={escaped!r}"
     )
 
     assert not escaped, f"invariant 1 (never fail the caller): {picture}"
@@ -217,6 +246,9 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
         f"invariant 2 (what a shutdown left queued was counted as submitted after it): {picture}"
     )
     assert not unclosed, f"invariant 5 (every sink written to is closed): {picture}"
+    assert not overlapped, (
+        f"invariant 5 (closed **once**, and a close in flight is waited for): {picture}"
+    )
     assert ledger.slowest_flush < FLUSH_TIMEOUT + BOUND_SLACK, f"invariant 3 (flush): {picture}"
     assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
         f"invariant 3 (shutdown): {picture}"

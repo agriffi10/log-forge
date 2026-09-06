@@ -210,15 +210,17 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "because rebinding is how a guard changes category without its text changing."
         ),
     ),
-    ("_Lifecycle.live_worker", "worker is None or worker._epoch != self.retirements", 0): (
+    ("_Lifecycle.live_worker", "worker is None or self.retirements > worker._epoch", 0): (
         LIVENESS,
         (
             "the definition of the liveness helper itself, rather than a consumer of it. "
             "SPEC-054 FR-001 replaced the per-worker latch it read with the owner's count: a "
-            "worker is live while the count is still the one it recorded at its build. A count "
-            "rather than a boolean because a worker built after a shutdown() returned still "
-            "delivers, and against a latch every event it delivered would be counted as "
-            "stranded."
+            "worker is live while the count has not moved past the one it recorded at its "
+            "build. A count rather than a boolean because a worker built after a shutdown() "
+            "returned still delivers, and against a latch every event it delivered would be "
+            "counted as stranded. Spelled `>` rather than `!=`, matching worker.py's five "
+            "reads: the two are equivalent only because the count is monotonic, which is a "
+            "property of the current source and not of the design."
         ),
     ),
                             ("_shutdown_worker", "_state.worker_exists()", 0): (
@@ -553,6 +555,25 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "writer — SPEC-033 FR-002's measured defect at a new site, which two records hid "
             "because the stranded sink lived on the worker and this loop only saw the orphan "
             "one. Reproduced at `A.closes == 2`."
+        ),
+    ),
+    (
+        "_swap_sink",
+        (
+            "outcome.verdict == 'fenced' and previous is not None and "
+            "(previous is not new_sink) and (not _state.held(previous))"
+        ),
+        0,
+    ): (
+        MOMENT,
+        (
+            "the fence says nothing of the **worker's** can still be inside the old sink; this "
+            "asks whether anything else can. `retarget` drops the sink from the worker's held "
+            "set when it confirms the fence, and this branch then re-takes the lock — in that "
+            "gap the sink is owed and unheld, so a concurrent shutdown() takes it and starts "
+            "closing it, and `_register_closing` hands this branch the *same* registration, so a "
+            "detached release starts a second closer into a close already running. Measured at "
+            "two overlapping closes with a preemption point, and 13 of 120 seeds unforced."
         ),
     ),
     ("_swap_sink", "worker.retarget(new_sink, deadline)", 0): (
@@ -941,10 +962,10 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 42, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 43, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
 
-**Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 42 and the
+**Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 43 and the
 whole of the difference is accounted for below, measured by deriving the site list from both
 trees with this file's own `_sites` and diffing it per scope:
 
@@ -953,7 +974,7 @@ trees with this file's own `_sites` and diffing it per scope:
     +4  _close_owed                 -1  _close_orphan_sink
     +1  _inline_close_choice        -3  _flush_live_sink
     +1  _shutdown_worker            -1  _get_worker
-                                    -2  _swap_sink (net, after the `held` guard)
+                                    -1  _swap_sink (net, after two `held` guards)
                                     -2  _delivering_to_an_inherited_sink
                                     -1  _worker_health
 
@@ -967,7 +988,11 @@ thing they asked about is gone:
   open item; the worker was never the authority for "installed".
 - `_get_worker` no longer releases a sink its build did not adopt (FR-002).
 - `_swap_sink` is one function over one record where it was two branches keeping two in step,
-  and it gained the `held` guard in the same change (FR-003).
+  and it gained **two** `held` guards — one on the loop that releases superseded sinks, one on
+  the fenced branch that releases the sink the worker just displaced. Both were added during the
+  build rather than designed in, each closing a close that ran under something still using the
+  sink; the second was found by the spec's own diff review and reproduced at two overlapping
+  `close()` calls (FR-003).
 
 Each is a guard that is gone because the thing it guarded is gone, which is the only reason a
 derived floor may fall.
@@ -1150,16 +1175,18 @@ def test_the_roster_finds_a_verdict_carried_by_a_return_value() -> None:
     `SwapOutcome` bound to `outcome`, caught because the **value** does. The value-side match is
     the stronger of the two, since it does not depend on what the author called the variable.
 
-    The negative below is limitation 3 of `_sites`, pinned rather than left to be discovered: the
-    *use* of a filed binding is not followed, so `outcome.verdict == "fenced"` carries no
-    sentinel and is not a row. Filing the binding is what makes the category reviewable; it does
-    not make every later reference so.
+    The negative below is limitation 3 of `_sites`, pinned rather than left to be discovered: a
+    use of a filed binding that carries **no sentinel of its own** is not followed. It is
+    asserted on synthetic source rather than on the live module, because `_swap_sink`'s one
+    reference to `outcome.verdict` sits inside a larger expression that *does* carry a sentinel
+    (`_state.held`) and is therefore filed — which is the limitation's shape exactly, and would
+    make an assertion over the real tree read as the opposite of what it means.
     """
     found = _numbered()
     assert ("_swap_sink", "worker.retarget(new_sink, deadline)", 0) in found
-    assert not any(
-        "outcome.verdict" in expression for _scope, expression, _n in found
-    ), "limitation 3: the use of a filed binding is not followed, and this states so"
+    assert not _sites(
+        ast.parse('def f():\n    outcome = g()\n    if outcome.verdict == "fenced":\n        pass\n')
+    ), "limitation 3: a use carrying no sentinel of its own is not followed, stated rather than assumed"
 
 
 def _walk_source(source: str) -> set[str]:

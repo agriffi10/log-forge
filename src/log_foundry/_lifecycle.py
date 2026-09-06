@@ -197,8 +197,12 @@ class _Lifecycle:
         Reading the retirement count in order to *report* it, as :func:`_worker_health` does, is
         this same question asked for a different purpose rather than a fifth category.
 
-        A worker is live while its ``_epoch`` — :attr:`retirements` as it stood at that worker's
-        build — is still current (SPEC-054 FR-001). A **count** rather than a latch, because a
+        A worker is live while :attr:`retirements` has not moved past its ``_epoch`` — the count
+        as it stood at that worker's build (SPEC-054 FR-001). Spelled ``>`` here and at the five
+        reads in ``worker.py``, deliberately one way: ``!=`` is equivalent **only** because the
+        count is monotonic, and the only thing making it monotonic is that this module contains
+        one ``= 0`` at init and two ``+= 1`` in :func:`_shutdown_worker`. That is a property of
+        the current source rather than of the design, so the comparison does not rest on it. A **count** rather than a latch, because a
         latch changes what ``submitted_after_shutdown`` means: a worker built after a
         ``shutdown()`` returned still delivers (SPEC-044 FR-001), and against a latched boolean
         every event it delivered would be counted as queued where nothing will drain it. Against
@@ -230,7 +234,7 @@ class _Lifecycle:
           None.
         """
         worker = self._worker
-        return None if worker is None or worker._epoch != self.retirements else worker
+        return None if worker is None or self.retirements > worker._epoch else worker
 
     def refresh_stop_signal(self) -> threading.Event:
         """Returns the process's stop signal, replacing it first if it is already set.
@@ -1676,16 +1680,23 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
     two-caller criterion: the first caller, just out of its own inline close,
     re-takes the re-armed sink before the bystander returns from its wait.
 
-    **A registration this call did not hand off is discharged on the way out**, however it
-    leaves. A ``KeyboardInterrupt`` delivered between the take and a close would otherwise leave
-    an entry nobody sets: that sink is then skipped by the signal refresh forever, never taken by
-    a later closer, and every later bystander waits out the whole grace on it. Each entry is
-    dropped from that set immediately **before** its close is handed off, and the ``try`` opens
-    on the line after the take rather than after the inline choice — a ``KeyboardInterrupt``
-    landing inside :func:`_inline_close_choice` leaked every registration the take had just made.
-    The residual window is the few bytecodes between the drop and the call — the same narrow shape SPEC-050 FR-002
-    accepted for the count this replaced, and for the same reason: it contains no call, so
-    nothing but a real signal storm can land in it.
+    **A sink this call did not hand off is put back and its registration discharged**, however
+    the call leaves. Two halves, and the second was found by this spec's own second diff review.
+    A ``KeyboardInterrupt`` delivered between the take and a close would otherwise leave an entry
+    nobody sets — that sink is then skipped by the signal refresh forever, never taken by a later
+    closer, and every later bystander waits out the whole grace on it. Discharging alone is not
+    enough: the take has already removed the sink from the record, so an interrupt there left it
+    **owed by nobody**, closed by nobody and unreachable by a later ``shutdown()``. Measured with
+    an interrupt injected at :func:`_inline_close_choice`: three sinks, ``closes=[0, 0, 0]``, the
+    record empty. ``setdefault`` rather than assignment, so a re-arm that landed meanwhile keeps
+    its own entry.
+
+    Each entry is dropped from that set immediately **before** its close is handed off, and the
+    ``try`` opens on the line after the take rather than after the inline choice — an interrupt
+    inside :func:`_inline_close_choice` leaked every registration the take had just made. The
+    residual window is the few bytecodes between the drop and the call — the same narrow shape
+    SPEC-050 FR-002 accepted for the count this replaced, and for the same reason: it contains no
+    call, so nothing but a real signal storm can land in it.
 
     Args:
       deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
@@ -1753,8 +1764,11 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
                 del undischarged[id(sink)]
                 _close_taken(sink, closing)
     finally:
-        for sink, closing in undischarged.values():
-            _finish_closing(sink, closing)
+        if undischarged:
+            with _state._lock:
+                for sink, closing in undischarged.values():
+                    _state._owed.setdefault(id(sink), sink)
+                    _finish_closing(sink, closing)
         for closer in started:
             closer.join()
     if not waiting:
@@ -1868,9 +1882,19 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     it** — which is what ``_adopt_declined_swap`` was for, with nothing left to adopt — and
     decides the old sink:
 
-    - **fenced** — the worker confirmed its drain reached the new sink, so nothing can still be
-      inside the old one. It leaves the record and is released detached, joined to this call's
-      budget.
+    - **fenced** — the worker confirmed its drain reached the new sink, so nothing *of the
+      worker's* can still be inside the old one. Where :meth:`_Lifecycle.held` also says nothing
+      else is, it leaves the record and is released detached, joined to this call's budget.
+
+      **The ``held`` term is not redundant with the fence**, and leaving it out is a second close
+      running *concurrently* with a first. ``retarget`` takes the old sink out of the worker's
+      own held set when it confirms the fence, and this branch then re-takes ``_lock``; in that
+      gap the sink is owed and no longer held, so a concurrent ``shutdown()`` takes it, registers
+      it and starts closing it. :func:`_register_closing` hands this branch back that *same*
+      registration — it is one per sink by design — so the detached release starts a second
+      closer into a ``close()`` already in flight. Measured with an injected preemption point at
+      two overlapping closes, and at 13 of 120 seeds unforced against a 2 ms ``close()``;
+      ``sinks/base.py`` documents tolerance for a *sequential* second close, never two at once.
     - **unfenced** — the drain could not be confirmed within the budget, so the old sink stays in
       the record and the worker keeps it among the sinks it may be inside. A later ``shutdown()``
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
@@ -1955,7 +1979,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 _register_exit_handler()
                 _state._owed[id(new_sink)] = new_sink
                 previous = outcome.previous
-                if outcome.verdict == "fenced" and previous is not None and previous is not new_sink:
+                fenced_out = (
+                    outcome.verdict == "fenced"
+                    and previous is not None
+                    and previous is not new_sink
+                    and not _state.held(previous)
+                )
+                if fenced_out and previous is not None:
                     _state._owed.pop(id(previous), None)
                     closer = release(
                         previous, detached=True, closing=_register_closing(previous)

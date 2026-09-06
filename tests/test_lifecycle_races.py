@@ -566,11 +566,24 @@ def test_a_second_shutdown_strands_and_counts_the_late_workers_next_submission()
     )
 
 
-_UNDER_LOCK_OFFENDERS = frozenset({"_close_orphan_sink", "join_closers", "_close_owed"})
+_UNDER_LOCK_OFFENDERS = frozenset({"join_closers", "_close_owed"})
 """Calls that must never appear inside a `with _state._lock` body.
 
-Every one performs or waits on a sink `close()`. A name is added here whenever a helper starts
-wrapping one, because this lint matches on the name and cannot see through a rename.
+Every one performs or waits on a sink `close()` or on a drain. A name is added here whenever a
+helper starts wrapping one, because this lint matches on the **name** and cannot see through a
+rename — which is not hypothetical: SPEC-054 renamed `Worker.shutdown` to `Worker.stop`, and the
+suffix rule below went silent until this list was updated with it. Planting
+`worker.stop(timeout)` inside `_shutdown_worker`'s critical section passed the lint, with
+`join_closers(deadline)` in the same place still failing it — so the gate discriminated and the
+escape was real. `_close_orphan_sink` is dropped because the function is gone and a
+forbidden-name list carries no dead names; `retarget` is added because it waits on two drains.
+"""
+
+_UNDER_LOCK_METHOD_SUFFIXES = (".stop", ".retarget", ".shutdown", ".join")
+"""Method calls forbidden under the lock, matched by suffix so any receiver is caught.
+
+`.shutdown` stays although no library method is called that today: a third-party sink may carry
+one, and a suffix that costs nothing is cheaper than rediscovering why it was removed.
 """
 
 
@@ -585,9 +598,12 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
 
     The offender set is a **name** list, so a helper that wraps an inline release is invisible to
     it until it is named — which is how a refactor shrinks a derived guard as silently as a
-    deletion. `_close_owed` is the case: SPEC-046 moved `_close_orphan_sink`'s inline
-    `release()` into it, and without the entry below this lint would pass against that call
-    reappearing under the lock.
+    deletion. Two cases on record. `_close_owed`: SPEC-046 moved the orphan closer's inline
+    `release()` into it, and without the entry this lint would pass against that call reappearing
+    under the lock. `Worker.stop`: SPEC-054 renamed `shutdown` to `stop`, and the suffix rule
+    kept matching `.shutdown` — mutation-tested, `worker.stop(timeout)` planted inside
+    `_shutdown_worker`'s critical section **passed**, while `join_closers(deadline)` in the same
+    place failed. A rename is a deletion as far as this lint is concerned.
     """
     tree = ast.parse(_LIFECYCLE_SRC.read_text())
     offenders: list[str] = []
@@ -603,7 +619,7 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
             if not isinstance(inner, ast.Call):
                 continue
             name = ast.unparse(inner.func)
-            if name in _UNDER_LOCK_OFFENDERS or name.endswith(".shutdown"):
+            if name in _UNDER_LOCK_OFFENDERS or name.endswith(_UNDER_LOCK_METHOD_SUFFIXES):
                 offenders.append(name)
             if name == "release" and not any(kw.arg == "detached" for kw in inner.keywords):
                 offenders.append("inline release()")
@@ -736,6 +752,12 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "removed per sink — the one closer performs that sink's close, and it removes and "
             "registers the close in the **same** critical section, so there is no instant at "
             "which the sink is neither owed nor in flight (SPEC-054 FR-003)"
+        ),
+        ("_close_owed", "_state._owed.setdefault"): (
+            "re-armed — a sink this call took but never handed to a closer is put back, so an "
+            "interrupt between the take and the close leaves it owed rather than owed by nobody. "
+            "`setdefault`, so a re-arm that landed meanwhile keeps its own entry. Measured "
+            "before it: three sinks, `closes=[0, 0, 0]`, and an empty record"
         ),
         ("_swap_sink", "_state._owed[id(stale)]"): (
             "removed per sink — the swap releases a superseded sink itself, detached, and "

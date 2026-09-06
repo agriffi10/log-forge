@@ -91,6 +91,38 @@ still asserting a deleted mechanism in the **present** tense, three of them newl
 this build, including `_get_worker` claiming it "latch[es] it and release[s] it detached" beside
 a body that arms and releases nothing. Those were the real finding and are fixed.
 
+## What the second diff review found
+
+The execution frame built a randomized lifecycle model, instrumented every lock, and forked. It
+confirmed no lock-order cycle, nothing closing or joining under `_state._lock`, and that the base
+commit produces five `OWED_AFTER_SHUTDOWN` faults this merge does not. It also found one real
+invariant-5 breach and the two guards that should have caught it:
+
+- **A fenced swap could start a *second, concurrent* `close()` on the sink it displaced.**
+  `retarget` drops the old sink from the worker's held set when it confirms the fence, and
+  `_swap_sink` then re-takes the lock; in that gap the sink is owed and unheld, so a concurrent
+  `shutdown()` takes it and starts closing it, and `_register_closing` hands the swap back that
+  *same* registration — so the detached release starts a second closer into a close already
+  running. Reproduced deterministically, and at 13 of 120 seeds unforced. Fixed by the `held`
+  term the loop three lines above already used. Pre-existing rather than introduced: the base
+  commit reproduces the class at a higher rate.
+- **The model's invariant-5 assertion was coarser than invariant 5.** It read
+  `sink.events and sink.closes == 0` — it could see a sink closed *zero* times and nothing else,
+  so a sink closed twice, or twice at once, passed. `Recorder` now counts overlapping closes and
+  its `close()` takes measurable time; with the `held` term removed, **180 of 601 seeds fail**.
+- **`test_no_close_or_drain_is_performed_under_the_lifecycle_lock` went partly silent** when this
+  spec renamed `Worker.shutdown` to `stop` — the lint matched the suffix `.shutdown`. Planting
+  `worker.stop(timeout)` inside `_shutdown_worker`'s critical section **passed** it, with
+  `join_closers` in the same place still failing, so the gate discriminated and the escape was
+  real. It matches `.stop`, `.retarget`, `.shutdown` and `.join` now, and both mutants die.
+
+Two observations were taken rather than deferred, on the standing preference to guard a mode
+rather than record it: an interrupt between the take and the close left the taken sinks **owed by
+nobody** — discharging the registration was not enough, because the take had already removed
+them — so they are put back in the same `finally`; and the epoch test, spelled `!=` in one place
+and `>` in five, is now `>` everywhere, since the two agree only because the count happens to be
+monotonic.
+
 ## Verification
 
 All six gates green locally on the branch: `ruff`, `mypy`, `pytest`, `spec-lint.sh`,
@@ -111,9 +143,9 @@ reads — inside the 10 ns budget. Reached through the module rather than bound 
 spreads ~20 ns across repeated runs of one tree, and an earlier version of it reported +14 ns for a
 change that is +3 ns, which was a deque growing to a million entries inside the timer.
 
-**The roster floor is re-derived, not lowered.** `log_foundry._lifecycle` 46 → 42, accounted for
+**The roster floor is re-derived, not lowered.** `log_foundry._lifecycle` 46 → 43, accounted for
 per scope in `_SITE_FLOOR`'s docstring by deriving the site list from both trees and diffing it.
-Categories: 22 existence, 14 liveness, 8 moment.
+Categories: 22 existence, 14 liveness, 9 moment.
 
 **Ten mutants planted and killed**, one at a time, in place: three roster categories (FR-004 AC-3),
 a record rebind and an out-of-transition clear (FR-002 AC-6), the fork opt-out (FR-006 AC-1), a
