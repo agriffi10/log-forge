@@ -4,8 +4,10 @@ When a spec is done, in the same pass:
 1. Set the spec file header `Status: Completed`.
 2. Update its one-line row in `docs/specs/INDEX.md` (**status only** — no prose).
 3. Write a **short** delivery doc at `docs/spec-delivery/SPEC-XXX-<name>.md` from
-   `docs/templates/spec-completion-template.md` — *what shipped + what changed*, under ~40 lines, **no
-   code/config pasted** (the code + component-inventory are the source of truth for reuse).
+   `docs/templates/spec-completion-template.md` — *what shipped + what changed*, aimed well under a
+   page, **no code/config pasted** (the code + component-inventory are the source of truth for
+   reuse). `DELIVERY_MAX_LINES` in `scripts/docs-lint.sh` is a ratchet set by one frozen historical
+   doc, not a target: it means nobody may lengthen that doc, never that a new one may run to it.
 4. If reusable modules/services/components were added, add a **one-line** row to
    `docs/component-inventory.md`.
 5. A *new architectural decision* gets its **full `###` entry in its area file under

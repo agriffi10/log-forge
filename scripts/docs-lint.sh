@@ -7,8 +7,9 @@
 # `docs/decisions/INDEX.md`) — and several were violated here anyway. This repo's
 # `CLAUDE.md` grew from 7,350 bytes at `ad898fc8` to 89,340 at `e60b60d`, more than
 # tenfold — most of it while the repo carried only a TWO-SENTENCE version of the rule,
-# naming no shape, no register and no budget. The full set landed two days before the cut
-# and did not stop the next edit either. It was cut back to a digest over its register at
+# naming no shape, no register and no budget. The full set arrived at `690d2a55`, days
+# before the cut, named the violation in the present tense and correctly, and did not stop
+# the next edit either. It was cut back to a digest over its register at
 # `561a9f6`, the change that first ran this script, and the digest itself then moved out
 # beside its reasoning when the process tier was routed. Both ends are anchored to commits
 # rather than restated: an earlier version of this comment carried three numbers, and two
@@ -72,9 +73,10 @@ cd "$ROOT"
 # room deliberately, stated in words rather than as a second number that goes stale.
 #
 # RE-DERIVE, DON'T RE-CHECK, after any further structural change. A cap that can no longer
-# fire is still advertised as a fence: `DIGEST_MAX_BYTES` was 1400 against a section whose
-# longest unit the cut took to 550, twice the worst thing it governed, until it was
-# re-derived to 800 at `74c928d`. A check that passes proves nothing about a cap that
+# fire is still advertised as a fence: `DIGEST_MAX_BYTES` was an inherited 1400, and the cut
+# at `561a9f6` — which took the section's longest unit to 550 — would have left it several
+# times above anything it governed, so that same commit re-derived it to 800 rather than
+# checking it and finding it green. A check that passes proves nothing about a cap that
 # cannot fail.
 
 # CLAUDE.md alone. Measured at the routing cut, where the file went from the always-loaded
@@ -92,8 +94,8 @@ ALWAYS_LOADED_MAX_BYTES=38000
 
 # The whole Key Decisions section, measured as bytes. Since the fences left CLAUDE.md the
 # section is an intro paragraph and one row per AREA, so this bounds the number of AREAS,
-# not the number of decisions: the intro is a kilobyte and a row is about a hundred bytes,
-# leaving room for roughly ten more areas. It sits WELL under CLAUDE_MAX_BYTES on purpose —
+# not the number of decisions: the intro is well under a kilobyte and a row about eighty
+# bytes, leaving room for a dozen more areas. It sits WELL under CLAUDE_MAX_BYTES on purpose —
 # the previous value (22000) was inside a file capped at 36000 and could be reached only by
 # a file that had already failed check 1, so it was a fence that could not fire.
 KEY_DECISIONS_MAX_BYTES=2500
@@ -106,8 +108,11 @@ KEY_DECISIONS_MAX_BYTES=2500
 #
 # UNCHANGED ACROSS THE ROUTING CUT, deliberately and after re-derivation rather than by
 # omission: that cut moved the fences from CLAUDE.md into their area files without
-# rewriting one of them, so the population this cap measures is the same population it was
-# derived against at `74c928d`. The longest fence today is well inside it.
+# rewriting one of them, so what this cap measures is the same KIND of unit it was derived
+# against at `561a9f6` — 48 fences there, longest 550. The population has grown since
+# rather than shrunk (55 fences on this branch, longest 553), which is the direction that
+# leaves a cap able to fire, so the re-derivation ends at the same number instead of a new
+# one. A cut that shrinks the fences again re-derives it downward.
 #
 # BYTES, not characters: awk length() is byte-based in the one-true-awk that ships on
 # BSD and macOS, so em dashes and smart quotes count for more than one. Named DIGEST for
