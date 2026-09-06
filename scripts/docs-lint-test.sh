@@ -131,15 +131,18 @@ echo "docs-lint-test: $pass passed, $fail failed."
 # here. Removing them does, and that is the point: a case pruned on purpose is a
 # one-line, deliberate lowering in the same change; a case lost by accident reds the run.
 # Not applied to the self-test invocation, which runs a handful of planted cases.
-# Raised from 80 with SPEC-053's corpus (86 cases at `212fd16` -> 146 at `fe54f6a`; the 137
-# written here while that change was in flight was stale before it merged). The old floor was slack enough that
+# Raised from 80 with SPEC-053's corpus — 86 cases at `212fd16`, 146 at `fe54f6a`; the 137 written
+# here while that change was in flight was stale before it merged. The old floor was slack enough that
 # deleting EVERY marking-walk case left 86 cases running, a success line and exit 0 — measured,
 # which is the whole failure this floor is written against. It stays deliberately below the
 # measurement so adding cases needs no edit here; it just is not 36 cases below any more.
 #
 # RE-DERIVED, not re-checked, when the routed-tier and per-area checks brought their own cases in
-# from the template (146 at `fe54f6a` -> 222 here): a floor left at 125 could no longer fire on losing either whole
-# group, which is the same defect one tier up — a fence that cannot fail is still advertised as one.
+# from the template: the corpus was 146 at `fe54f6a`, and a floor left at 125 could no longer fire on
+# losing either whole group, which is the same defect one tier up — a fence that cannot fail is still
+# advertised as one. The count as it stands is not restated here: it moves with every case added, and
+# a transition written with one end anchored and the other on the word "here" went stale one commit
+# after it was written, which is how this sentence came to be phrased against a single fixed point.
 CASES_MIN=200
 if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "docs-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"

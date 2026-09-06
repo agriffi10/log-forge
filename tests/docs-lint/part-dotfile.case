@@ -1,7 +1,5 @@
 @@@ expect exit=1
-@@@ match has no `## The table` section with backticked agent names
-@@@ match The heading is a parse anchor
-@@@ match docs-lint: 1 check(s) failed.
+@@@ match docs/process/.rogue.md is not a row in the router One-file-per-part table
 @@@ file CLAUDE.md
 # P
 
@@ -78,7 +76,7 @@ text
 @@@ file docs/process/model-routing.md
 # Model routing
 
-## The routing table
+## The table
 
 | Job | Model | Agent |
 |---|---|---|
@@ -109,3 +107,7 @@ description: i
 model: opus
 ---
 body
+@@@ file docs/process/.rogue.md
+# Rogue
+
+text

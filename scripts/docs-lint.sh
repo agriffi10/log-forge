@@ -196,6 +196,23 @@ check_pointers() {
   done
 }
 
+# The four governed trees — docs/process/, docs/decisions/, .claude/rules/ and
+# .claude/agents/ — are each ONE FLAT SET, and each is enumerated through this pair so the
+# set cannot differ by tree. It differed three times: a glob skipped the dotfiles in two
+# trees, `ls` skipped them in a third, and a subdirectory was invisible in two. Each miss
+# has the same shape — a file Claude Code loads and no check here sees — and each was found
+# one tree later than the last, which is why this is a helper and not a third fix.
+#
+# `find -maxdepth 1` takes dotfiles; the glob and `ls` do not. Callers read it through a
+# `while IFS= read -r`, which runs in a subshell: safe here because every caller reports
+# through `note`, which appends to a FILE, and none of them accumulates a variable.
+list_flat_md() { find "$1" -maxdepth 1 -name '*.md' | sort; }
+refuse_deep_md() {
+  find "$1" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
+    note "$deep is in a subdirectory of $1/. $2"
+  done
+}
+
 # ── 0. The always-loaded file exists ───────────────────────────────────────────
 # A repo with no docs/ yet is simply not scaffolded, and there is nothing to hold. But
 # once docs/ exists, a MISSING CLAUDE.md is a deletion rather than a pre-scaffold state,
@@ -369,11 +386,9 @@ else
 
   # Every area file is a row, every row a file — and the register is one flat set, so it can be
   # enumerated by eye and by this loop; a file one directory deeper is invisible to both.
-  find "$REGISTER_DIR" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
-    note "$deep is in a subdirectory of $REGISTER_DIR/. Area files are one flat set, one per table row;
+  refuse_deep_md "$REGISTER_DIR" "Area files are one flat set, one per table row;
       a file a level down is a register nothing checks."
-  done
-  find "$REGISTER_DIR" -maxdepth 1 -name '*.md' | sort | while IFS= read -r f; do
+  list_flat_md "$REGISTER_DIR" | while IFS= read -r f; do
     [ -f "$f" ] || continue
     [ "$f" = "$REGISTER_INDEX" ] && continue
     slug=$(basename "$f" .md)
@@ -802,11 +817,9 @@ if [ -d "$PROCESS_DIR" ]; then
 # 10a / 10b — router rows and part files are the same set. Flat, and enumerated with find
     # rather than a glob: a part one directory down is where the next paragraph of process
     # accretes unread, which is the reason 10a exists, and a dotfile is invisible to `*.md`.
-    find "$PROCESS_DIR" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
-      note "$deep is in a subdirectory of $PROCESS_DIR/. The method is one flat set, one file per
-      router row; a part a level down is routed by nothing and read by no one."
-    done
-    find "$PROCESS_DIR" -maxdepth 1 -name '*.md' | sort | while IFS= read -r f; do
+    refuse_deep_md "$PROCESS_DIR" "The method is one flat set, one file per router row;
+      a part a level down is routed by nothing and read by no one."
+    list_flat_md "$PROCESS_DIR" | while IFS= read -r f; do
       [ -f "$f" ] || continue
       [ "$f" = "$ROUTER" ] && continue
       grep -qxF "$f" "$LOADED" && continue   # always-loaded parts are routed by the OTHER table
@@ -842,10 +855,9 @@ if [ -d "$PROCESS_DIR" ]; then
           *)           grep -qxF "$1" "$FILES" ;;
         esac
       }
-      find "$RULES_DIR" -name '*.md' | sort | while IFS= read -r r; do
-        rel="${r#$RULES_DIR/}"
-        case "$rel" in */*) note "$r is in a subdirectory of $RULES_DIR/. Rules are one flat set, one per governed
-      tree, so the set can be enumerated by eye and by this script."; continue ;; esac
+      refuse_deep_md "$RULES_DIR" "Rules are one flat set, one per governed tree, so the set can be
+      enumerated by eye and by this script."
+      list_flat_md "$RULES_DIR" | while IFS= read -r r; do
         # 12a — frontmatter opens the file. Anything before it makes the rule ALWAYS-loaded.
         if [ "$(sed -n '1p' "$r" | tr -d '\r')" != "---" ]; then
           note "$r does not open with frontmatter at byte 0. Without it Claude Code loads the rule
@@ -933,31 +945,29 @@ if [ -d "$PROCESS_DIR" ]; then
       if [ ! -s "$ROUTED" ]; then
         have_routing_table=0
         note "$ROUTING has no \`## The table\` section with backticked agent names in its Agent column.
-      The heading is a parse anchor: with no roster, every check on the agent files reports a
-      falsehood instead of naming this."
+      The heading is a parse anchor: with no roster, every check that depends on it reports a
+      falsehood — one \"not named in the routing table\" per role — instead of naming this."
       fi
       while IFS= read -r n; do
         [ -n "$n" ] || continue
         [ -f "$AGENTS_DIR/$n.md" ] || note "$ROUTING routes to agent \`$n\`, but $AGENTS_DIR/$n.md does not exist."
       done < "$ROUTED"
     fi
-    # 13g — one flat set, the same guard the two neighbouring trees carry (12g, and the
-    # register's above). Claude Code scans this directory RECURSIVELY, so a file one level
-    # down is loaded into a session while every check below — allowed model, name equals
-    # stem, named by the routing table — enumerates only the top level and never sees it.
+    # 13g — one flat set, the same guard the other three trees carry. Claude Code scans this
+    # directory RECURSIVELY, so a file one level down is loaded into a session while every
+    # check below — allowed model, name equals stem, named by the routing table — would
+    # never see it; a dotfile role escaped the same way until this used list_flat_md.
     if [ -d "$AGENTS_DIR" ]; then
-      find "$AGENTS_DIR" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
-        note "$deep is in a subdirectory of $AGENTS_DIR/. Roles are one flat set, one per row of the
-      routing table: Claude Code loads a role a level down, and every check here enumerates only the
-      top level, so the file is live and unchecked at the same time."
-      done
+      refuse_deep_md "$AGENTS_DIR" "Roles are one flat set, one per row of the routing table:
+      Claude Code loads a role a level down, and the checks here would not see it, so the file would
+      be live and unchecked at the same time."
     fi
-    if [ -d "$AGENTS_DIR" ] && ls "$AGENTS_DIR"/*.md >/dev/null 2>&1; then
+    if [ -d "$AGENTS_DIR" ] && [ -n "$(list_flat_md "$AGENTS_DIR")" ]; then
       if [ ! -f "$ROUTING" ]; then
         note "$AGENTS_DIR/ has agent files but $ROUTING does not exist. The routing table is what says
       which job each agent and model is for; agents without it are habit, not routing."
       else
-        for a in "$AGENTS_DIR"/*.md; do
+        list_flat_md "$AGENTS_DIR" | while IFS= read -r a; do
           stem=$(basename "$a" .md)
           if [ "$(sed -n '1p' "$a" | tr -d '\r')" != "---" ]; then
             note "$a has no frontmatter at byte 0, so it declares no name and no model — the
@@ -1012,6 +1022,17 @@ fi
 # to verify.
 #
 # Narrow on purpose, and the narrowness is a false-negative choice, not a coverage claim.
+# A SIBLING TRIGGER WAS BUILT AND REJECTED ON MEASUREMENT, not on taste: a transition
+# ("146 -> 222") whose unit carries fewer than two distinct SHAs. It failed both ways at
+# once. It fired on CODE — an awk program inside this script and two in spec-lint.sh, where
+# a digit, a `->` and another digit share a block — and it stayed SILENT on the exact site
+# it was written for, because the unit is the whole comment block and a neighbouring
+# sentence three lines up carried two SHAs of its own. Catching that site needs
+# sentence-granularity, which is the machinery check 15 pays python3 for. What replaced it
+# is a rule rather than a check: a standing comment states the current measurement with one
+# anchor, or states the principle — it does not write a transition with one end anchored
+# and the other on the word "here", which is the shape that went stale one commit later.
+#
 # A trigger wide enough to catch the other seven would have to fire on any number near
 # any date, which is ordinary prose in every one of these files — and a doc gate that
 # fires on ordinary prose is a doc gate that gets commented out. The rest stays with
@@ -1091,6 +1112,13 @@ fi
     # the pyproject.toml sites are written.
     md=0
     case "$f" in *.md) md=1 ;; esac
+    # A NUMERIC TRANSITION ("N -> M") is held only where the commit-anchor convention is
+    # settled: the two linters and the always-loaded files. The register is out for the same
+    # reason src/ is out of the check above — its entries anchor to SPEC numbers by
+    # convention, and whether a spec number counts as an anchor is a decision nobody has
+    # taken; taking it here by accident is what that exclusion exists to prevent. Recorded,
+    # not chased. The scope is exactly where the class recurred: both sites that shipped an
+    # unanchored transition were in these files.
     awk -v file="$f" -v md="$md" '
       # An anchor is a short SHA, and ONLY a short SHA. Two other forms were tried and
       # rejected on evidence rather than taste. A version TAG names a tree as exactly as
@@ -1137,7 +1165,7 @@ fi
         if (unit != "" && dated(unit) && !has_anchor(unit)) {
           where = hitline ? hitline : ustart
           what  = hitline ? hittext : unit
-          printf "FAIL  %s:%d carries a dated measurement with no commit to re-measure from.\n      %s\n      A date says WHEN someone looked, not at what: a dated number still reads as\n      current to anyone not checking it against a calendar. Either drop the number and\n      state the principle, or anchor the evidence to a short commit SHA in the same\n      bullet, paragraph or comment block. A version tag is not accepted; the comment\n      beside this check says why. Quoting the wrong form on purpose? Put it in a fenced\n      block, which this check skips. process.md 5, never cite volatile numbers.\n",
+          printf "FAIL  %s:%d carries a dated measurement with no commit to re-measure from.\n      %s\n      A date says WHEN someone looked, not at what: a dated number still reads as\n      current to anyone not checking it against a calendar. Either drop the number and\n      state the principle, or anchor the evidence to a short commit SHA in the same\n      bullet, paragraph or comment block. A version tag is not accepted; the comment\n      beside this check says why. Quoting the wrong form on purpose? Put it in a fenced\n      block, which this check skips. See completion-ritual.md, never cite volatile numbers.\n",
                  file, where, substr(what, 1, 90)
         }
         unit = ""; hitline = 0; ukind = ""

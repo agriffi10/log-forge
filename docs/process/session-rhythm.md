@@ -40,8 +40,11 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
 - Every file-changing task is done on its **own branch** and opened as a **PR** — automatically, without
   waiting to be asked. Never commit to `main` directly.
 - **The diff reviews run BEFORE the push, not before the merge — and there are two of them.** Commit
-  locally, run the gates, send the diff to **two** fresh-context reviewers in **different frames**,
-  fix or explicitly reject every finding — *then* push and open the PR. Pushing first and reviewing
+  locally, run the gates, send the diff to **two** fresh-context reviewers in **different frames** —
+  one reading the change against the spec's criteria and the Python rulebook, the other starting from
+  the system and, for each numbered promise in `docs/invariants.md` the change touches, asking
+  whether it still holds on every twin path — fix or explicitly reject every finding, *then* push and
+  open the PR. Pushing first and reviewing
   after inverts the gate: the branch is already public, the fixes
   arrive as follow-up commits, and the review reads as commentary on something that has already
   happened rather than as the thing that decides whether it should. Rotating the frame (`reviewer-contract.md`) happens

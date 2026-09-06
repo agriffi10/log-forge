@@ -34,7 +34,7 @@ target in at launch too, through recursion, which is the cost this layout exists
 | `docs/process/model-routing.md` | which model does which job, the complexity rule for Fable, the step-up rule, the agent roles | before delegating any artifact to a subagent |
 | `docs/process/several-agents.md` | running N sessions on one repo: the PR queue, what the lock covers, briefing each session | when more than one session shares this repo |
 | `docs/process/completion-ritual.md` | the five steps at spec completion, and the anti-regrowth & doc-hygiene rules | at spec completion, and before any edit to a file in the table above |
-| `docs/process/operational-traps.md` | traps that pass locally and bite in CI or on deploy — this repo's, seeded as they bit | before the first CI- or deploy-dependent step of a build |
+| `docs/process/operational-traps.md` | traps that pass locally and bite in CI or on deploy — this repo's, seeded as they bit | before the first build step **in a new worktree**, and before any CI- or deploy-dependent step |
 | `docs/process/ground-rules.md` | the project's load-bearing constraints | when adding a dependency or a constraint |
 
 Every `*.md` in this directory other than the router is a row in one of the two tables above, and
