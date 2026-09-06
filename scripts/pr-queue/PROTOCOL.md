@@ -80,16 +80,26 @@ Including failure, including abandonment, including "I am stuck and asking the h
 a session that has stopped is the one failure this design has — and the stale-lock rule below only
 clears it after 90 minutes.
 
-**Know what releasing early costs, and take it anyway.** `turn` and `acquire` refuse while any
-non-draft PR is open on the remote, and neither exempts the caller's own PR — so a session that
-releases *after* opening its PR cannot take the lock back until that PR is merged or closed. Measured
-with PR #230 open, before it merged as `3a4d337`: `turn` returned `WAIT — a PR is open on the remote`
-naming that PR, and `acquire` returned `BUSY` for the same reason. Releasing is still the right move
-when you stop, because a stale lock blocks everyone and this blocks only you; what changes is the
-recovery. **Finish the lifecycle without the lock** — your PR is the one open PR and no peer can have
-taken a turn behind it, so the invariant holds — then drop the ticket. Do not close and reopen the PR
-to get the lock back: that loses the checks and the review trail to work around a lock whose job is
-already done.
+**Know what releasing early costs.** `turn` and `acquire` refuse while any **non-draft** PR is open
+on the remote, and neither exempts the caller's own — so a session that releases *after* opening its
+PR cannot take the lock back until that PR lands. `release` also drops the ticket, so the first
+`turn` afterwards answers `NO_TICKET` (exit 3); re-run `ticket` and it then reports
+`WAIT — a PR is open on the remote`, naming your own PR. Measured with PR #230 open in `log-forge`,
+before it merged as `3a4d337`.
+
+Releasing is still the right move when you stop, because a stale lock blocks every peer while this
+blocks only you. What it costs is the rest of the lifecycle:
+
+- **Merging needs no lock.** Green CI, then merge, confirm `main`, drop the ticket.
+- **Pushing does.** `pre-push` compares the pushed branch against the lock holder's, so with the lock
+  free every participating branch is refused — and a red CI that needs a fix push is exactly that
+  case. `PR_QUEUE_BYPASS=1` is the documented way through it; say so when you use it.
+- **A DRAFT PR breaks the safety argument.** Drafts are filtered out of the open-PR check, so
+  releasing with one open lets a peer acquire and open a second PR; un-drafting and merging then
+  moves `main` under their branch. Keep the lock, or close the draft.
+
+Never close and reopen a PR to reclaim the lock: that discards the checks and the review trail to
+work around a lock whose job is already done.
 
 ## What is enforced, and what is not
 

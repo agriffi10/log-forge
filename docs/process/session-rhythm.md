@@ -96,12 +96,16 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
   away. A spec's PR merges only on green.
 - **The merge takes the owner bypass, and that is the normal path here, not an escape hatch.** The
   `main` ruleset squash-merges only and sets `require_last_push_approval`, which asks for an approval
-  from someone who did not push — so a PR authored and pushed by the only account on this repo can
-  never obtain one, whatever `required_approving_review_count` says. `gh pr merge <n> --squash`
+  from someone who did not push — unobtainable for a PR authored and pushed by the only account on
+  this repo, whatever `required_approving_review_count` says. `gh pr merge <n> --squash`
   refuses with "the base branch policy prohibits the merge"; the merge is
-  `gh pr merge <n> --squash --admin --delete-branch`, and the hundred most recent merged PRs carry
-  zero reviews between them because of it — #230, merged as `3a4d337`, is the one this paragraph was
-  written from. **The bypass replaces the branch protection, never the review gate** — the two
+  `gh pr merge <n> --squash --admin --delete-branch` — #230, merged as `3a4d337`, is the one this
+  paragraph was written from, and no PR merged between #121 and #231 carries a GitHub review at all.
+  That count is not evidence the bypass was forced: reviews here happen as fresh-context diff reviews
+  before the push, so none was ever requested on the platform. The refusal names the base branch
+  policy rather than a clause, and the same rule also sets `required_review_thread_resolution` and
+  `require_extra_approval_for_unattributed_changes`, so treat the approval requirement as the reason
+  rather than any one parameter. **The bypass replaces the branch protection, never the review gate** — the two
   fresh-context diff reviews happened before the push and are what makes the merge safe. If
   `--delete-branch` reports it cannot remove the local branch, a worktree still holds it; remove the
   worktree, then the branch.

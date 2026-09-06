@@ -20,15 +20,22 @@ order agents asked, with `main` settled and green before the next**.
 - **The lock covers the whole PR lifecycle** — rebase, push, open, watch to green, merge, confirm
   `main` — not just the push. One ticket per PR, released between them, so a multi-PR spec does not
   hold the line for its whole duration.
-- **Releasing it early cannot be undone while your PR is open.** `turn` and `acquire` both refuse
-  while *any* non-draft PR is open on the remote, and they do not exempt your own: a session that
-  releases after opening its PR is locked out of the lock it needs to merge that PR. Measured with
-  PR #230 open, before it merged as `3a4d337`: `turn` returned `WAIT — a PR is open on the remote`
-  naming that PR, and `acquire` returned `BUSY` for the same reason. The invariant is unharmed (your PR is the one
-  open PR, and nobody else can have taken a turn), so finish the lifecycle without the lock and drop
-  the ticket after. Release early anyway when you stop — a stale lock blocks every peer, and this
-  blocks only you — but expect the re-acquire to fail and take the recovery rather than closing the
-  PR to get the lock back.
+- **Releasing it early costs more than the lock.** `turn` and `acquire` refuse while any
+  **non-draft** PR is open on the remote and do not exempt your own, so a session that releases
+  after opening its PR cannot take the lock back until that PR lands. `release` drops your ticket
+  too, so `turn` answers `NO_TICKET` until you `ticket` again — re-ticket first, and then it names
+  your own PR back to you. Measured with PR #230 open, before it merged as `3a4d337`.
+- **What you can still finish without the lock, and what you cannot.** Merging needs no lock, so a
+  session whose CI is green can watch, merge and drop the ticket. **A push does need it**: the
+  pre-push hook compares the pushed branch against the lock holder's, and with the lock free every
+  `spec/` or `docs/` branch is refused — which is exactly the case a red CI puts you in. That push
+  takes `PR_QUEUE_BYPASS=1`, and `scripts/pr-queue/PROTOCOL.md` asks you to say you used it. The
+  safe order is therefore to release only when you are stopping, and to expect the bypass if you
+  release and then have to fix something.
+- **The recovery above does not hold for a DRAFT PR.** Drafts are invisible to `turn`, so releasing
+  with a draft open lets a peer take the lock and open a second PR; when you then un-draft and
+  merge, you move `main` under their green branch — the race the queue exists to prevent. With a
+  draft open, keep the lock or close the draft.
 - **The queue is not a review.** It is the last thing between an already-reviewed branch and the
   remote. This repo's gates and both diff reviews still come first, in that order.
 - **Every remote check fails closed; enforcement fails open.** The lock only orders the agents that

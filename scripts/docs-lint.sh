@@ -1158,12 +1158,20 @@ fi
       # The separators are the ones this repo actually writes: "Measured 2026-09-01",
       # "Measured, on `f17edd4`", "measured at e565e22". Leaving `at` and the comma out
       # made the two likeliest honest spellings escape while the rule was being followed.
-      # ONE short word may sit between the verb and the date, because two sentences written
-      # while this very rule was being documented spelled it "Measured here on 2026-09-06"
-      # and escaped — a false negative found by reading the diff, which is the reader this
-      # check exists to relieve. Bounded to a single [a-z]+ of at most eight characters and
-      # no punctuation: that admits "here", "again", "once", and stops well short of a
-      # clause, which is where an unrelated date in the same sentence would start matching.
+      # ONE short word may sit between the verb and the date. The gap was found while the
+      # queue paragraphs in docs/process/ were being drafted: both were first written as
+      # "Measured <one word> on <date>" with no SHA, this check stayed silent on them, and a
+      # read of the draft caught what the gate had not. Those sentences were anchored before
+      # they committed, so the evidence a reader can re-run is the FIXTURE PAIR, not the
+      # history — dated-measurement-one-word-gap fires, dated-measurement-clause-gap-ok does
+      # not. Bounded to a single [a-z] run of at most eight characters and no punctuation:
+      # that admits "here", "again", "once", and stops well short of a clause, which is
+      # where an unrelated date later in the sentence would start matching.
+      #
+      # The bound uses an ERE interval, the only one in this script; the header above reasons
+      # about awk dialects and this is the one dependency it did not name. An awk without
+      # interval support fails the optional group open rather than closed, degrading dated()
+      # to its old behaviour silently — which is what the firing fixture is there to catch.
       function dated(s) {
         return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*([a-z]{1,8}[ \t]+)?((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
       }
