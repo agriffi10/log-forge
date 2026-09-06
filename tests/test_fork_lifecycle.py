@@ -962,6 +962,33 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
     assert path.read_text(encoding="utf-8") == "", "the retired child delivered"
 
 
+def test_a_retired_parent_forks_a_retired_child_with_no_worker_built() -> None:
+    """SPEC-054 FR-006 AC-3's other half: the same answer on the orphan path, from the one latch.
+
+    The worker-path test above reads retirement through `_state._worker`, so it cannot say where
+    the answer comes from. This one shuts down a process that only ever logged **outside a span**,
+    so there is no worker in the parent and none is built in the child — the child's `retired` can
+    only be the owner's count, which the fork copies like any other attribute.
+
+    That is what having one latch buys. Before SPEC-054 the answer was `_orphan_retired or
+    worker.retired`, and a child on this path was answered by the first term alone; a fix to
+    either term left the other untouched, which is `docs/invariants.md` invariant 6's shape.
+    """
+    log_foundry.configure(service="fork", version="0", env="test", sink=MemorySink())
+    log_foundry.info("an orphan log, so the shutdown has something to retire")
+    log_foundry.shutdown()
+    assert _lifecycle._state._worker is None, "the premise: no worker was ever built"
+    assert log_foundry.health().retired is True, "and the parent is retired"
+
+    def report() -> str:
+        """Reports the child's retirement and that answering it built no worker."""
+        health = log_foundry.health()
+        return f"{health.retired},{_lifecycle._state._worker is None}"
+
+    child = run_in_child(report)
+    assert child.output == "True,True", child.output
+
+
 def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: pathlib.Path) -> None:
     """FR-002 AC-4's other half: a retired child must not wait for a drain that cannot happen.
 

@@ -611,7 +611,8 @@ class Worker:
         to be the moment.
 
         An abandoned drain counts as not draining. The thread is wedged and the shutdown has
-        already given up on it (``_close_orphan_sink`` and SPEC-027 FR-004 leave the sink open
+        already given up on it (:meth:`~log_foundry._lifecycle._Lifecycle.held` and SPEC-027
+        FR-004 leave the sink open
         for that reason), so nothing further will cut its backoff — where SPEC-033's tight retry
         loop would go on costing the still-running application every emit.
 
@@ -752,7 +753,7 @@ class Worker:
         **The delivered test comes first, and a test holds it there.** A marker the drain answered
         ``delivered=True`` between the sweep and ``_drain_finished`` being set must report
         ``ok=True``, not ``"abandoned"`` — the drain adjudicated it, and a false negative here is
-        what makes :meth:`swap_sink` count an ``incomplete_swaps`` and write a loss line for a swap
+        what makes :meth:`retarget` count an ``incomplete_swaps`` and write a loss line for a swap
         that completed. A wrong verdict, not a wrong reason. An earlier draft of this docstring
         called the window unreachable without interposing inside this method; that was wrong twice
         over — parking after the put reaches it, and holding ``_release_marker`` widens it — and a
@@ -760,7 +761,7 @@ class Worker:
 
         Reporting is by the **marker**, never by the check alone. A drain that answered this
         marker and then exited has delivered, and saying otherwise would be a false failure —
-        one ``swap_sink`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
+        one ``retarget`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
         the previous sink open and writing a loss line for a swap that in fact completed.
 
         Args:
@@ -981,7 +982,7 @@ class Worker:
 
         Takes no lock, which is arch §9.2's rule for a question. ``_held`` is **rebound** rather
         than mutated in place, so a read is one atomic reference load and the list this iterates
-        cannot change under it — the same property ``worker_owns_now`` relied on before it.
+        cannot change under it — the same property the deleted ``worker_owns_now`` relied on.
 
         Args:
           sink: The sink the closer is deciding whether to take.
@@ -1032,7 +1033,7 @@ class Worker:
         **The sink is also recorded, not merely announced** (SPEC-050 FR-004). It is owed a close
         that cannot be performed now — the drain thread may still be inside its ``emit``, which is
         SPEC-027 FR-004's reasoning — but that objection expires when the thread does, so
-        :meth:`_close_if_owed` performs it once ``is_alive()`` reads ``False``. Recorded by
+        ``_lifecycle._close_owed`` performs it once ``is_alive()`` reads ``False``. Recorded by
         identity, at most once. That dedup is defensive rather than reached: the same object can
         only be ``old`` twice if it was re-adopted as ``self.sink`` in between, and every
         re-adoption prunes it — so under the documented single-threaded ``configure()`` contract

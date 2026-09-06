@@ -409,26 +409,6 @@ def test_one_owed_sink_creates_no_thread() -> None:
 # --------------------------------------------------------------------------- SPEC-054 FR-003
 
 
-def _reset() -> None:
-    """Puts the process back in the cold state between the two paths of one test.
-
-    The autouse fixture in `conftest.py` runs per test, not per loop iteration, and a test that
-    drives both delivery paths needs the second to start where the first did.
-
-    Args:
-      None.
-
-    Returns:
-      None.
-
-    Raises:
-      None.
-    """
-    from conftest import _reset_worker
-
-    _reset_worker()
-
-
 def _wait_for_the_drain_to_end(worker: Worker, timeout: float = 10.0) -> None:
     """Waits until the worker's drain thread has ended, so a stranded sink becomes takeable.
 
@@ -590,7 +570,10 @@ def test_a_worker_path_shutdown_with_no_close_in_flight_pays_no_grace() -> None:
     assert spent < 0.1, f"and it idled rather than spun — {spent:.3f}s of CPU"
 
 
-def test_a_keyboardinterrupt_during_the_fan_out_joins_every_close_it_started() -> None:
+@pytest.mark.parametrize("on_the_worker_path", [False, True], ids=["orphan", "worker"])
+def test_a_keyboardinterrupt_during_the_fan_out_joins_every_close_it_started(
+    on_the_worker_path: bool,
+) -> None:
     """FR-003 AC-6. SPEC-046 put the join in a `finally`; nothing in `tests/` pinned it.
 
     Measured on the unjoined shape when SPEC-046 was written: four closes abandoned mid-write.
@@ -598,35 +581,35 @@ def test_a_keyboardinterrupt_during_the_fan_out_joins_every_close_it_started() -
     and the one place a `BaseException` can escape while fan-out threads are still running.
 
     Both paths, because the closer is one function now and the claim is about that function.
-    `KeyboardInterrupt` is caught here rather than allowed to propagate: an escaping one aborts
-    the whole pytest session instead of failing this test.
+    **Parametrized rather than looped**: a loop reports one failure and stops, so a regression on
+    the orphan pass would hide whatever the worker pass would have said.
+
+    `KeyboardInterrupt` is caught by `pytest.raises` rather than allowed to propagate: an escaping
+    one aborts the whole session instead of failing this test.
     """
-    for on_the_worker_path in (False, True):
-        live = SlowCloseSink("live", seconds=0.0)
-        others = [SlowCloseSink(f"s{i}", seconds=0.4) for i in range(3)]
+    live = SlowCloseSink("live", seconds=0.0)
+    others = [SlowCloseSink(f"s{i}", seconds=0.4) for i in range(3)]
 
-        def interrupting_close(sink: SlowCloseSink = live) -> None:
-            """Stands in for an interrupt landing inside the inline close."""
-            sink.closes += 1
-            raise KeyboardInterrupt
+    def interrupting_close() -> None:
+        """Stands in for an interrupt landing inside the inline close."""
+        live.closes += 1
+        raise KeyboardInterrupt
 
-        live.close = interrupting_close  # type: ignore[method-assign]
-        if on_the_worker_path:
-            _arm_on_the_worker_path(live, *others)
-        else:
-            _arm(live, *others)
+    live.close = interrupting_close  # type: ignore[method-assign]
+    if on_the_worker_path:
+        _arm_on_the_worker_path(live, *others)
+    else:
+        _arm(live, *others)
 
-        with pytest.raises(KeyboardInterrupt):
-            log_foundry.shutdown(timeout=5.0)
+    with pytest.raises(KeyboardInterrupt):
+        log_foundry.shutdown(timeout=5.0)
 
-        assert all(sink.closes == 1 for sink in others), (
-            f"every started close was joined before the interrupt reached the caller "
-            f"(worker path: {on_the_worker_path}) — got {others}"
-        )
-        assert all(sink.finished_at is not None for sink in others), (
-            f"and each ran to completion rather than being abandoned mid-write — got {others}"
-        )
-        _reset()
+    assert all(sink.closes == 1 for sink in others), (
+        f"every started close was joined before the interrupt reached the caller — got {others}"
+    )
+    assert all(sink.finished_at is not None for sink in others), (
+        f"and each ran to completion rather than being abandoned mid-write — got {others}"
+    )
 
 
 def test_a_stranded_close_that_outlasts_the_grace_does_not_hold_the_shutdown() -> None:

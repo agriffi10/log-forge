@@ -176,10 +176,65 @@ def test_health_sink_tracks_the_counters_live() -> None:
         worker.stop()
 
 
-def test_no_worker_reports_no_sink_losses() -> None:
+def test_no_sink_configured_reports_no_sink_losses() -> None:
+    """The field is `None` because nothing is configured, not because no worker exists.
+
+    Named for the causation since SPEC-054 FR-005: `health().sink` is filled from the
+    **configured** sink on both delivery paths, so "no worker" stopped being the reason for a
+    `None` here. The test below is the one that pins the path this used to describe.
+    """
     import log_foundry
 
     assert log_foundry.health().sink is None
+
+
+def test_health_reports_a_sinks_losses_with_no_worker_at_all() -> None:
+    """SPEC-054 FR-005 AC-1 — probe 1, as a regression guard rather than as prose.
+
+    The divergence that motivated the whole FR: against a `MultiSink` whose first child raises,
+    one `info()` **inside** a span reported `SinkLosses(dropped=0, failed=N)` while the same call
+    **outside** one reported `None`, with the sink's own `losses()` reading `failed=1`. That
+    contradicts `docs/invariants.md` §2's observable — loss a sink absorbed is in `health().sink`
+    — and it was the two-owner shape describing itself as the contract: `_worker_health`'s
+    no-worker branch synthesized eight fields and not that one.
+
+    Every other `health().sink` assertion in this file installs a worker, so **none of them
+    discriminates**: reverting `_worker_health` to `sink=None` where no worker exists left the
+    full suite green, measured. This one is on the orphan path with no worker built, and it
+    asserts the sink's own `losses()` alongside, so the two cannot disagree silently again.
+    """
+    import log_foundry
+    from log_foundry import _lifecycle
+    from log_foundry.sinks.memory import MemorySink
+    from log_foundry.sinks.multi import MultiSink
+
+    class Raising(Sink):
+        """A child that fails every batch, so the wrapper absorbs and counts one loss."""
+
+        def emit(self, events: list[dict[str, object]]) -> None:
+            """Fails, which `MultiSink` isolates and counts."""
+            raise RuntimeError("this child is down")
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    sink = MultiSink(Raising(), MemorySink())
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("outside a span, so no worker is ever built")
+
+    assert _lifecycle._state.worker_exists() is None, (
+        "the premise: this is the orphan path, where the field used to read None"
+    )
+    health = log_foundry.health()
+    assert health.sink == SinkLosses(dropped=0, failed=1), (
+        f"loss a sink absorbed is in health().sink on this path too — got {health.sink}"
+    )
+    assert health.sink == read_losses(sink), (
+        "and it is the sink's own answer, not a second opinion"
+    )
+    assert health.orphan_lost == 0, (
+        "the wrapper absorbed the child's failure, so nothing was lost to the caller"
+    )
 
 
 def test_health_sink_defaults_to_none_for_third_party_construction() -> None:

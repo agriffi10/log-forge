@@ -74,6 +74,23 @@ are unchanged):
 - **FR-003's "arm `new` whether or not the worker adopted it" contradicts FR-002's "never two for
   one write-epoch"** on a declined swap. Resolved in FR-003's favour, for the reason above.
 
+## The three grep criteria, and why they still return hits
+
+FR-002 AC-1, FR-003 AC-1 and FR-004 AC-1 are written as greps over `src/` that must "return
+nothing". Every deleted name is gone from the **code**; what the greps still find is
+supersession prose — `sink_released=` "used to sit here and is retired", "three copies of this
+stood in the tree before SPEC-054 FR-003", "it replaces `Worker._close_if_owed`,
+`Worker._close_sink`, `_close_orphan_sink`". That is SPEC-021's rule, which outranks the greps: a
+superseded decision is struck in place and marked with the spec that closed it, never deleted,
+because a note merely removed takes its reasoning with it.
+
+The criteria cannot express that distinction, so the greps are answered rather than satisfied,
+and the answer is checkable: every remaining hit is inside a strike-through or an explicitly
+past-tense clause. The first diff reviewer found the **opposite** case at six sites — docstrings
+still asserting a deleted mechanism in the **present** tense, three of them newly authored by
+this build, including `_get_worker` claiming it "latch[es] it and release[s] it detached" beside
+a body that arms and releases nothing. Those were the real finding and are fixed.
+
 ## Verification
 
 All six gates green locally on the branch: `ruff`, `mypy`, `pytest`, `spec-lint.sh`,
