@@ -8,15 +8,15 @@
   trees materialised with `git archive`: **6** violations at `23fe6cc`, **0** at `ac938c0`, **0**
   here. It is the one check in that script that shells to `python3`, because it reads `.py`
   **docstrings and nothing else**, which needs `ast`.
-- **`tests/docs-lint/marking-walk-*.case`** — 25 fixtures. Six failure cases verbatim from
+- **`tests/docs-lint/marking-walk-*.case`** — 30 fixtures. Six failure cases verbatim from
   `23fe6cc`, one per pipeline branch that carries them; silence cases for the register's own
-  statement of the decision, both defeat-1 mechanisms, fences, table rows, headings, a sentence
-  with no anchor, and a universal that names the walk without quantifying what it acts on.
+  statement of the decision, the negated universal, fences, table rows, headings, a sentence with
+  no anchor, and a universal that names the walk without quantifying what it acts on.
 - **A `python3` self-test in `scripts/docs-lint-test.sh`** — one fixture tree run twice, clean with
   a working interpreter and red with a shim that exits 127, asserting the did-not-run report.
-- **FR-003** — `_FOREIGN`'s docstring states what the sentinel is and defers to `_mark_inherited`
-  for when it is written, instead of restating the walk's rule four hundred lines from it.
-  `docs/component-inventory.md`'s row was already compliant and is untouched.
+- **FR-003** — `_FOREIGN`'s docstring states what the sentinel is, keeps one restricted clause for
+  what a child lays it over, and defers to `_mark_inherited` for **when**, which is the half that
+  docstring actually answers. `docs/component-inventory.md`'s row was already compliant, untouched.
 
 ## What changed from earlier specs?
 
@@ -50,12 +50,25 @@ silences the lexical baseline on **6 of 6**, not 5; **four** sentences in the sp
 five; and defeat 4's 700-character cap is **deleted** rather than justified, on the measurement
 that removing it moves no count on any of the three trees.
 
+The spec's *Data Model* now carries **two** rules — the draft's and the shipped one — because the
+first diff review found the normative block still describing an instrument that had not shipped:
+`any|always|never` are gone from the universal, the about-the-claim clause is not in the draft at
+all, the restriction is tested inside the noun phrase and gains the relatives, and `` ``_FOREIGN`` ``
+was dead alternation (`` `_FOREIGN` `` is a substring of it). The same review found **two pipeline
+steps surviving mutation** — the population's root-`*.md` branch and the list-marker unit split,
+both now fixtured — and two clauses that were wrong rather than untested: the negation guard
+reached a negator plus one word, which left five of eight ordinary corrections reddening, and
+`RESTRICT` carried `it|its`, which are not relatives, so any comma-free continuation carrying "it"
+silenced a claim. The separate "at all" guard is **deleted**: it went on passing with the guard
+removed, and where "at all" is not idiomatic it is a preposition before a real universal
+("looks at all inherited sinks"), which that guard silenced wrongly. None of those four changes
+moves the 6 / 0 / 0 table.
+
 ## Two things worth carrying forward
 
 - **A scoping test must bind to what it scopes.** Tested sentence-wide, the excusing word is the
   vocabulary of the repair, so the gate goes quiet exactly when someone fixes the defect. Bound to
-  the noun phrase the universal quantifies, 17 of 18 scoping-clause insertions leave the sentence
-  firing; the 18th lands inside a word.
+  the noun phrase the universal quantifies, an insertion anywhere OUTSIDE the quantified noun phrase leaves the sentence firing, and one inside it silences the check by construction — which is what "bound to the noun phrase" means, not a leak in it.
 - **A universal must be *about* the mechanism.** Requiring only that a name and a universal
   co-occur fires on "all of the buffer repair happens after it". Adding that clause took the live
   tree from 3 findings to 1.
@@ -72,16 +85,23 @@ that removing it moves no count on any of the three trees.
 - The escape `docs-lint: marking-walk` is a magic word by design — explicit and greppable, so
   unlike `setdefault` nobody reaches it while paraphrasing — but it is the one clause an author can
   reach for instead of fixing a claim. It covers the unit that carries it and no other, and a
-  fixture pins that.
+  fixture pins that. A consequence worth knowing: any unit that merely **names** the literal is
+  silenced, so this decision's own register entry and this document are outside the gate. Both were
+  checked to be silent without it.
+- An overt relative pronoun is not the only excuse a paraphrase can reach: `reach`, `missed`,
+  `residual`, `partial`, `setdefault` and `item 7` still excuse a universal when they sit **inside**
+  its noun phrase. That is the bound, not a leak — the null edit that defeats a sentence-wide test
+  cannot reach inside the phrase without changing the claim — but it is the surface to watch.
 
 ## Verification
 
-Six gates green locally: `ruff`, `mypy --strict`, `pytest` (2552 passed, 10 skipped, exit 0),
-`spec-lint.sh`, `docs-lint.sh`, `docstring-lint.py`. `docs-lint-test.sh`: 111 cases, the three
-fixture guards, and the interpreter self-test. **Twenty-one mutants — nine rule clauses, four
-regex members and eight pipeline steps — each redden a *named* fixture and none survives**; two
-survived the first sweep and both were fixtures that could not fail (a silence case subsumed by
-another clause, and a wrapped case asserting only a FAIL line and never the collapsed sentence).
+Six gates green locally, on exit codes rather than summary lines: `ruff`, `mypy --strict`, `pytest`
+(2552 passed, 10 skipped), `spec-lint.sh`, `docs-lint.sh`, `docstring-lint.py`. `docs-lint-test.sh`:
+116 cases, the three fixture guards, and the interpreter self-test. **Every clause and every
+pipeline step is mutation-tested and each mutant reddens a *named* fixture; none survives.** Three
+survived along the way and all three were fixtures that could not fail — a silence case subsumed by
+a clause beside it, a wrapped case asserting only a FAIL line and never the collapsed sentence, and
+the "at all" guard, whose survival was the evidence that deleted it.
 
 `CLAUDE.md` closes at 35,970 of its 36,000-byte budget. That is 30 bytes, which is the state the
 budget's own comment calls the mistake — the next spec to settle a decision cannot close without

@@ -9,7 +9,7 @@ _FOREIGN = -1
 
 Never a real pid, so it can never match os.getpid. Laid down by
 :func:`_mark_inherited` in a forked child over everything the child inherited, which is what
-gives "this process did not acquire it" a terminal state.
+gives "this process did not acquire it" a **terminal** state.
 """
 
 @@@ file CLAUDE.md

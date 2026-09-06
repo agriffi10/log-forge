@@ -800,17 +800,35 @@ done
 # universal ANYWHERE, so the word an author reaches for while fixing this very defect is the word
 # that silences the check. Measured twice over: inserting a scoping clause into the six known-bad
 # sentences, WITHOUT touching their claims, silences the sentence-wide form on 6 of 6, while the
-# positional form survives 17 of 18 insertions (the 18th lands inside a word of the quantified
-# noun phrase, which is not a null edit). And it already happened for real: `reclaim`'s docstring
+# positional form survives every insertion a null edit can make. And it already happened for
+# real: `reclaim`'s docstring
 # said "_mark_inherited has already stamped everything inherited ``_FOREIGN``" and the
 # sentence-wide form MISSED it, silenced by the word `setdefault` fourteen words later in its own
 # sentence. The positional form catches it.
 #
-# NEGATED UNIVERSALS AND "AT ALL" ARE NOT CLAIMS. A negated universal reads exactly like the claim
-# it corrects, and `all` matches "at all", which quantifies nothing. Both were measured on one
-# sentence — the repair to `releasable`'s docstring fired first on a negated "every" and, once
-# rewritten, again on "at all". A gate that reddens on two successive repairs of the defect it
-# exists to catch trains authors away from repairing it.
+# The positional form's own bound is stated as a property rather than a score, because a score
+# here names no instrument: an insertion anywhere OUTSIDE the quantified noun phrase leaves the
+# sentence firing, and one inside it silences the check by construction. That is what "bound to
+# the noun phrase" means; it is not a leak in it. Anyone can re-derive it from the rule.
+#
+# A NEGATED UNIVERSAL IS NOT A CLAIM, and it is the CORRECTING sentence that needs this. "does not
+# stamp every inherited sink" reads to a regex exactly like the false claim it replaces, so without
+# this the gate reddens on the repair — measured on the real one: `releasable`'s docstring fired
+# first on a negated "every" and, once rewritten, again on "at all". A gate that reddens on two
+# successive repairs of the defect it exists to catch trains authors away from repairing it.
+#
+# The negator's reach is ITS OWN CLAUSE — up to 40 characters, no sentence punctuation, and no
+# coordinating conjunction. Both bounds were measured. A negator plus at most one word (the first
+# spelling) leaves five of eight ordinary corrections reddening, including "does not, as the old
+# docstring said, mark every inherited sink"; letting it cross an `and` makes "the next one is not,
+# and it says X stamps everything inherited" read as a correction of itself.
+#
+# "AT ALL" NEEDS NO GUARD OF ITS OWN, and the one written here was deleted rather than kept. The
+# idiom means "whatsoever" and only ever appears inside a negated clause, which the rule above
+# already covers — measured, its own fixture went on passing with the guard gone, which is the
+# definition of a check that cannot fire. Where "at all" is NOT idiomatic it is a preposition
+# followed by a real universal ("looks at all inherited sinks"), and a guard there would silence a
+# genuine claim. A clause that is dead where it is right and wrong where it is live is not a fence.
 #
 # NO LENGTH CAP. An earlier draft dropped sentences over 700 characters, which is an unconditional
 # escape: padding a false sentence past the cap silences it with its claim untouched. Removing it
@@ -863,7 +881,7 @@ import os
 import re
 import sys
 
-ANCHOR = re.compile(r"_mark_inherited|``_FOREIGN``|`_FOREIGN`|marking walk")
+ANCHOR = re.compile(r"_mark_inherited|`_FOREIGN`|marking walk")
 UNIVERSAL = re.compile(r"\b(every|everything|all)\b", re.IGNORECASE)
 SUBJECT = re.compile(
     r"\b(sink|sinks|record|records|recorded|inherit\w*|stamp\w*|transport\w*"
@@ -876,11 +894,13 @@ VERB = re.compile(
     re.IGNORECASE,
 )
 RESTRICT = re.compile(
-    r"\b(that|which|whose|it|its)\b|reach|missed|residual|partial|setdefault|item 7",
+    r"\b(that|which|whose)\b|reach|missed|residual|partial|setdefault|item 7",
     re.IGNORECASE,
 )
-NEGATED = re.compile(r"\b(not|no|never|nothing|rather than)\s+(\w+\s+){0,1}$", re.IGNORECASE)
-AT_ALL = re.compile(r"\bat\s+$", re.IGNORECASE)
+NEGATED = re.compile(
+    r"\b(not|no|never|nothing|rather than)\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$",
+    re.IGNORECASE,
+)
 NP_END = re.compile(r"[,;:.()—–]")
 ESCAPE = "docs-lint: marking-walk"
 LIST_ITEM = re.compile(r"^[ \t]*([-*+]|[0-9]+[.)])[ \t]")
@@ -897,9 +917,7 @@ def violates(sentence):
     if not ANCHOR.search(sentence):
         return False
     for found in UNIVERSAL.finditer(sentence):
-        before = sentence[max(0, found.start() - 24):found.start()]
-        if found.group(1).lower() == "all" and AT_ALL.search(before):
-            continue
+        before = sentence[max(0, found.start() - 60):found.start()]
         if NEGATED.search(before):
             continue
         end = NP_END.search(sentence, found.end())
@@ -1013,7 +1031,8 @@ def main(root):
                     "      inherited that the parent never recorded\". A scoping word elsewhere in\n"
                     "      the sentence does NOT count and is not meant to. Quoting the false claim\n"
                     "      on purpose? Use a fenced block, or put `docs-lint: marking-walk` in the\n"
-                    "      same paragraph. SPEC-053 FR-001."
+                    "      same unit — the paragraph, or the single bullet, that carries it, since a\n"
+                    "      bullet is a unit of its own. SPEC-053 FR-001."
                     % (relative, line, sentence[:160])
                 )
 

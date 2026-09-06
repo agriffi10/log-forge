@@ -8,7 +8,7 @@
 def reclaim(sink):
     """Records that a sink re-acquired its transport in this process.
 
-    The one write that overrides an existing record, and it has to be: :func:`_mark_inherited`
+    The one write that **overrides** an existing record, and it has to be: :func:`_mark_inherited`
     has already stamped everything inherited ``_FOREIGN`` by the time the hook roster is read, so
     a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
     forever.

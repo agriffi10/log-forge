@@ -66,8 +66,9 @@ of them on real prose in this repository.
 #### Description:
 
 A sentence violates when it carries a **named** anchor (`_mark_inherited`, `` `_FOREIGN` ``, or the
-phrase "marking walk"), a **universal quantifier** (`every`, `everything`, `all`, `any`, `always`,
-`never`), and **no scoping term**. Sentences are built by the pipeline in *Data Model*, which is
+phrase "marking walk"), a **universal quantifier**, and **no scoping term**. That is the shape; the
+word lists live in *Data Model*, which carries **two** — the draft's, and the narrower one that
+shipped, with the four measured differences between them. Sentences are built by the pipeline in *Data Model*, which is
 part of the requirement rather than an implementation note: three of the four sweeps run during PR
 #218 failed because of how they built their units, not because of what they matched.
 
@@ -269,9 +270,44 @@ not be implemented by contorting prose to dodge a check that should not have fir
 # The instrument. This is part of FR-001, not an implementation note: three of the four
 # sweeps run during PR #218 failed on how they built units, not on what they matched.
 
-ANCHOR    = r"_mark_inherited|``_FOREIGN``|`_FOREIGN`|marking walk"   # named symbols only
-UNIVERSAL = r"\b(every|everything|all|any|always|never)\b"            # re.IGNORECASE required
-SCOPED    = r"reach|missed|residual|partial|setdefault|item 7"        # see defeat 2
+# THE SHIPPED RULE. The draft's version is kept underneath it, because the differences
+# are the spec's own findings and a reader comparing them should see both.
+
+ANCHOR    = r"_mark_inherited|`_FOREIGN`|marking walk"                # named symbols only
+UNIVERSAL = r"\b(every|everything|all)\b"                             # re.IGNORECASE required
+SUBJECT   = r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*\b"
+VERB      = r"\b(mark|record|stamp|refuse|claim)\w*\s+(\w+\s+){0,1}$"
+RESTRICT  = r"\b(that|which|whose)\b|reach|missed|residual|partial|setdefault|item 7"
+NEGATED   = r"\b(not|no|never|nothing|rather than)\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$"
+NP_END    = r"[,;:.()...]"
+
+# A universal violates when its NOUN PHRASE — itself, up to the next NP_END — names what
+# the walk acts on (SUBJECT) or has a marking VERB governing it, and nothing inside that
+# phrase RESTRICTs it. Four differences from the draft, each measured, each recorded in
+# *The six the shipped check reports* or in the acceptance criteria:
+#
+#   1. `any|always|never` are gone. They buy no true positive the rule can discriminate,
+#      and they are the mechanism of every false positive on the corrected tree.
+#   2. SUBJECT/VERB is new. Without it the rule needs only a name and a universal to
+#      CO-OCCUR, and fires on "all of the buffer repair happens after it". Adding it took
+#      the live tree from 3 findings to 1.
+#   3. RESTRICT is tested inside the noun phrase, not the sentence, and gains the
+#      relatives. `it|its` were tried and removed: they are not relatives, so any
+#      comma-free continuation carrying "it" silenced the claim.
+#   4. ``_FOREIGN`` leaves ANCHOR as dead alternation — `_FOREIGN` is a substring of it,
+#      so the longer form can never be the only match.
+#
+# NEGATED reaches only its own clause. A negator plus at most one word left five of eight
+# ordinary corrections reddening; letting it cross an `and` made "the next one is not, and
+# it says X stamps everything inherited" read as a correction of itself. The draft's
+# separate "at all" guard is NOT here: the idiom occurs only inside a negated clause,
+# which NEGATED already covers, and where "at all" is a preposition plus a real universal
+# ("looks at all inherited sinks") a guard would silence a genuine claim.
+
+# ── the draft's version, kept for the comparison ──
+# ANCHOR    = r"_mark_inherited|``_FOREIGN``|`_FOREIGN`|marking walk"
+# UNIVERSAL = r"\b(every|everything|all|any|always|never)\b"
+# SCOPED    = r"reach|missed|residual|partial|setdefault|item 7"   # tested sentence-wide
 
 # `must be` / `has to be` are NOT scoping terms: ordinary English carrying no scoping
 # force, and including them excuses a false universal outright.
@@ -298,10 +334,12 @@ SCOPED    = r"reach|missed|residual|partial|setdefault|item 7"        # see defe
 #   .md  -> fenced blocks, headings and table rows dropped. A table has no sentence
 #           terminator, so a whole table flattens into one "sentence" pairing any row's
 #           anchor with any other row's universal.
-#   then -> collapse `\n\s*` to one space, split on /(?<=[.!?])\s+/, drop len > 700.
-#           The cap is an unconditional escape (defeat 4): it owes a stated rationale and
-#           deliberate headroom over the 85-398 characters the six true positives occupy,
-#           or it must stop being a bare drop.
+#   then -> collapse `\n\s*` to one space, split into sentences, NO length cap. The draft
+#           dropped anything over 700 characters, which is an unconditional escape
+#           (defeat 4); removing it moves no count on any of the three trees, so it is
+#           deleted rather than justified. The split tolerates trailing markup after the
+#           terminator, because `fork.** That` is two sentences and the bare
+#           /(?<=[.!?])\s+/ joins them — the table flattening again, in another costume.
 ```
 
 ---

@@ -497,11 +497,11 @@ _FOREIGN = -1
 """The pid a record carries when the sink belongs to some earlier process.
 
 Never a real pid, so it can never match :func:`os.getpid`, which is what gives "this process did
-not acquire it" a **terminal** state. When a child writes it, and over which of the sinks it
-inherited, belongs to :func:`_mark_inherited`: that docstring is the authoritative account and
-this one deliberately does not restate it (SPEC-053 FR-003). A restatement here was one of the
-sixteen sites that drifted, and it drifted while sitting four hundred lines from the function it
-described.
+not acquire it" a **terminal** state. A forked child lays it over each inherited sink its walk
+reaches that the parent never recorded; **when** that happens is :func:`_mark_inherited`'s to
+state, and this docstring defers rather than restating it (SPEC-053 FR-003). The restatement that
+stood here was one of the twelve sites PR #218 had to correct, and it drifted out of step with a
+function in its own module.
 
 Without it the record protects nothing where it is empty: ``stamp`` is write-once, and write-once
 defends only a record that already exists, so a child could ``configure()`` its way into *owning*
