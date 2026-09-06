@@ -19,8 +19,9 @@ When a spec is done, in the same pass:
    `DIGEST_MAX_BYTES` it has stopped being a reminder and become the reasoning, which belongs behind
    it — and **never a line in `CLAUDE.md`**. Only a new *area* touches `CLAUDE.md`: a row in its Key
    Decisions table, mirrored — with its *Governs* column — in `docs/decisions/INDEX.md` in the same
-   order, a file copied from an existing area's, and a `.claude/rules/decisions-<slug>.md` carrying
-   exactly the globs *Governs* names. A reversal that changes an entry's **heading** must move three
+   order, a file copied from an existing area's, and — only when the area governs a tree — a
+   `.claude/rules/decisions-<slug>.md` carrying exactly the globs *Governs* names. An area whose
+   *Governs* is `none` has no rule, and docs-lint refuses one. A reversal that changes an entry's **heading** must move three
    copies of it with the heading — its Contents row, its fence label, and the entry's own opening
    bold label — or the row points at a dead anchor, the label still names the old decision, and
    docs-lint fails. If the decision **supersedes an earlier one**, update the old entry in place and

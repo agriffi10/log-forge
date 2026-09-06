@@ -373,7 +373,7 @@ else
     note "$deep is in a subdirectory of $REGISTER_DIR/. Area files are one flat set, one per table row;
       a file a level down is a register nothing checks."
   done
-  for f in "$REGISTER_DIR"/*.md; do
+  find "$REGISTER_DIR" -maxdepth 1 -name '*.md' | sort | while IFS= read -r f; do
     [ -f "$f" ] || continue
     [ "$f" = "$REGISTER_INDEX" ] && continue
     slug=$(basename "$f" .md)
@@ -497,7 +497,12 @@ else
         if (!example_file || s !~ /^\(example\)/) { entry_lbl[s] = 1; head[anchor(s)] = s; cur_head = s; want_label = 1 }
         next
       }
-      !in_fences && !in_toc && /^- \*\*[^*]+\*\* — / {
+      # The label is `.+`, not `[^*]+`: nine fences in this very register carry an italic or a
+      # code span inside the label, and excluding `*` let every one of those shapes be restated
+      # outside `## Fences`, where nothing cross-checks it — the plain-label control was caught
+      # and the italic one was not. Greedy is right here because only the EXISTENCE of the fence
+      # signature matters, not which `**` pair closes the label.
+      !in_fences && !in_toc && /^- \*\*.+\*\* — / {
         printf "FAIL  %s, line %d: a fence-shaped bullet (`- **Label** — …`) outside `## Fences`. A fence stated\n      anywhere else is a fence nothing cross-checks; move it under Fences, or write the entry text\n      without the fence signature.\n", file, FNR; next
       }
       in_fences {
@@ -794,8 +799,14 @@ if [ -d "$PROCESS_DIR" ]; then
       the router, or shorten what the table names — and re-ratchet with headroom, never to fit the
       edit in hand."
     fi
-# 10a / 10b — router rows and part files are the same set.
-    for f in "$PROCESS_DIR"/*.md; do
+# 10a / 10b — router rows and part files are the same set. Flat, and enumerated with find
+    # rather than a glob: a part one directory down is where the next paragraph of process
+    # accretes unread, which is the reason 10a exists, and a dotfile is invisible to `*.md`.
+    find "$PROCESS_DIR" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
+      note "$deep is in a subdirectory of $PROCESS_DIR/. The method is one flat set, one file per
+      router row; a part a level down is routed by nothing and read by no one."
+    done
+    find "$PROCESS_DIR" -maxdepth 1 -name '*.md' | sort | while IFS= read -r f; do
       [ -f "$f" ] || continue
       [ "$f" = "$ROUTER" ] && continue
       grep -qxF "$f" "$LOADED" && continue   # always-loaded parts are routed by the OTHER table
@@ -811,6 +822,11 @@ if [ -d "$PROCESS_DIR" ]; then
 
     # 12 — rules: one path-scoped pointer per governed tree, body equal to the template.
     if [ -d "$RULES_DIR" ]; then
+      # The WORKING TREE, not the tracked set: `git ls-files` would be deterministic, and would
+      # also be empty in the corpus harness, which runs this script over a plain directory. The
+      # cost is stated rather than hidden — a glob matching only untracked or ignored files
+      # (a venv, a build dir) passes here and fails on a clean checkout, so 12d means "matches
+      # a file you have", not "matches a file the repo has".
       FILES="${TMPDIR:-/tmp}/docs-lint-files.$$"
       find . -path ./.git -prune -o -type f -print | sed 's|^\./||' > "$FILES"
       # Does any file match a glob of one of the four allowed forms? Anchored on a literal
@@ -900,6 +916,7 @@ if [ -d "$PROCESS_DIR" ]; then
     # roles directory gone entirely, a table routing to four ghosts must still fail.
     ROUTED="${TMPDIR:-/tmp}/docs-lint-routed.$$"
     : > "$ROUTED"
+    have_routing_table=1
     if [ -f "$ROUTING" ]; then
       awk -F'|' '
         index($0, "## The table") == 1 { t = 1; next }
@@ -909,10 +926,31 @@ if [ -d "$PROCESS_DIR" ]; then
           while (match(c, /`[a-z][a-z0-9-]*`/)) { print substr(c, RSTART + 1, RLENGTH - 2); c = substr(c, RSTART + RLENGTH) }
         }
       ' "$ROUTING" | sort -u > "$ROUTED"
+      # 13f — the heading is a PARSE ANCHOR (exact text, exact case), like the two in the
+      # router. Renaming it yields an empty roster, and an empty roster makes 13e report one
+      # confident falsehood per agent file — "not named in the routing table" for a table that
+      # names them all. Assert the anchor and skip what depends on it.
+      if [ ! -s "$ROUTED" ]; then
+        have_routing_table=0
+        note "$ROUTING has no \`## The table\` section with backticked agent names in its Agent column.
+      The heading is a parse anchor: with no roster, every check on the agent files reports a
+      falsehood instead of naming this."
+      fi
       while IFS= read -r n; do
         [ -n "$n" ] || continue
         [ -f "$AGENTS_DIR/$n.md" ] || note "$ROUTING routes to agent \`$n\`, but $AGENTS_DIR/$n.md does not exist."
       done < "$ROUTED"
+    fi
+    # 13g — one flat set, the same guard the two neighbouring trees carry (12g, and the
+    # register's above). Claude Code scans this directory RECURSIVELY, so a file one level
+    # down is loaded into a session while every check below — allowed model, name equals
+    # stem, named by the routing table — enumerates only the top level and never sees it.
+    if [ -d "$AGENTS_DIR" ]; then
+      find "$AGENTS_DIR" -mindepth 2 -name '*.md' | sort | while IFS= read -r deep; do
+        note "$deep is in a subdirectory of $AGENTS_DIR/. Roles are one flat set, one per row of the
+      routing table: Claude Code loads a role a level down, and every check here enumerates only the
+      top level, so the file is live and unchecked at the same time."
+      done
     fi
     if [ -d "$AGENTS_DIR" ] && ls "$AGENTS_DIR"/*.md >/dev/null 2>&1; then
       if [ ! -f "$ROUTING" ]; then
@@ -934,6 +972,7 @@ if [ -d "$PROCESS_DIR" ]; then
             *) note "$a declares model \"$model\". Allowed: sonnet, opus, haiku, fable. \`inherit\` and an empty
       model both take whatever the parent runs on, which is exactly what routing by job exists to stop." ;;
           esac
+          [ "$have_routing_table" -eq 1 ] || continue   # a missing anchor is reported once above, not once per agent
           grep -qxF "$stem" "$ROUTED" || note "$a is not named in $ROUTING (## The table, Agent column). An agent the table
       does not route to is a role nobody is told to use."
         done
@@ -947,9 +986,9 @@ fi
 
 # ── 14. A dated measurement in the standing tier carries an anchor ────────────
 #
-# process.md §5: "Standing rules never cite volatile numbers ... Dating the measurement
+# completion-ritual.md: "Standing rules never cite volatile numbers ... Dating the measurement
 # does not save it." That rule was stated, and violated in the tier it governs, at eight
-# sites at once — including process.md §5 itself, which carried the dated-measurement
+# sites at once — including that section itself, which carried the dated-measurement
 # example AND argued that the date was what made it safe. The architecture.md §12 entry
 # added by dcb07c3 was one line stale in dcb07c3 itself and outright wrong in a58dfff,
 # the very next commit.
@@ -965,8 +1004,8 @@ fi
 # THAT IS ONE SHAPE, NOT THE POPULATION, and the difference is worth stating plainly
 # because the next person to widen this will read it. Of the eight sites the commit that
 # added this check had to fix, exactly ONE matched — architecture.md §12. Both
-# pyproject.toml sites carried a bare count with no date at all; process.md §4 wrote the
-# date six words from the word; process.md §5 carried a byte pair with no date. So this
+# pyproject.toml sites carried a bare count with no date at all; the spec-authoring rules wrote the
+# date six words from the word; the completion ritual carried a byte pair with no date. So this
 # check does not close the defect class. It closes the sub-shape that DATING creates: a
 # number sitting beside a recent date, which is the form that reads as current and
 # therefore never gets re-checked. An undated number at least still looks like something
@@ -976,7 +1015,7 @@ fi
 # A trigger wide enough to catch the other seven would have to fire on any number near
 # any date, which is ordinary prose in every one of these files — and a doc gate that
 # fires on ordinary prose is a doc gate that gets commented out. The rest stays with
-# process.md §5, to be caught by reading. If a future sweep finds a second idiom actually
+# completion-ritual.md, to be caught by reading. If a future sweep finds a second idiom actually
 # in use, add it here and add a fixture for it; do not widen this into a number detector.
 #
 # THE ANCHOR IS SOUGHT OVER THE WHOLE UNIT, not the line, because the anchor and the
@@ -1224,8 +1263,9 @@ fi
 #      plants. The skip does not prune the walk, so a subdirectory of one is still descended into;
 #      nothing puts prose there today and this says so rather than implying otherwise.
 #
-# THIS POPULATION DIFFERS FROM CHECK 9's, and check 9 excludes its three trees for three DIFFERENT
-# reasons, none of which is "frozen records" alone (see :650, :654, :658 above): docs/specs and
+# THIS POPULATION DIFFERS FROM CHECK 14's, and check 14 excludes its three trees for three DIFFERENT
+# reasons, none of which is "frozen records" alone (the three `OUT:` bullets under check 14 above):
+# docs/specs and
 # four sibling docs trees are frozen records; src/ is out because its docstrings anchor to SPEC
 # numbers rather than commits and whether that counts is a decision nobody has taken; tests/ is
 # out because the .case corpus carries the wrong form on purpose. This check INCLUDES all three —
@@ -1270,7 +1310,7 @@ fi
 # check that could not run must never read as a check that found nothing. stderr is deliberately
 # NOT swallowed — the note says the check did not run, and the traceback or the shell's own
 # "command not found" beside it is the only thing that says why.
-python3 - . >> "$FAILS" <<'PYEOF' || note "check 11 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
+python3 - . >> "$FAILS" <<'PYEOF' || note "check 15 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
 """SPEC-053 FR-001. Reads the tree given as argv[1]; prints FAIL lines; never exits non-zero."""
 import ast
 import os

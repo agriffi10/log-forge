@@ -54,7 +54,7 @@ rules match *Governs*.
 | Event assembly: safety and bounds | `docs/decisions/event-assembly.md#fences` | `src/log_foundry/model.py`, `src/log_foundry/sanitize.py` |
 | Sink contract: delivery and its verdict | `docs/decisions/sink-delivery.md#fences` | `src/log_foundry/sinks/**` |
 | Sink contract: waiting, concurrency and shutdown | `docs/decisions/sink-lifecycle.md#fences` | `src/log_foundry/sinks/**` |
-| Failure paths and diagnostics | `docs/decisions/failure-paths.md#fences` | `src/log_foundry/_diag.py`, `src/log_foundry/results.py` |
+| Failure paths and diagnostics | `docs/decisions/failure-paths.md#fences` | `src/log_foundry/_diag.py`, `src/log_foundry/results.py`, `src/log_foundry/console.py` |
 | Public API surface | `docs/decisions/public-api.md#fences` | `src/log_foundry/__init__.py`, `src/log_foundry/api.py`, `src/log_foundry/config.py` |
 | Release, supply chain and naming | `docs/decisions/release-supply-chain.md#fences` | `.github/workflows/**`, `scripts/make-sbom.py`, `pyproject.toml` |
 | Working rules: findings, rosters and testing bounds | `docs/decisions/working-rules.md#fences` | `tests/**`, `scripts/*.sh`, `scripts/*.py` |
