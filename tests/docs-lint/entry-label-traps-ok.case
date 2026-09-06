@@ -4,28 +4,40 @@
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Use `a**b` as the marker** — settled.
-- **A shutdown shortens a *wait*; it never skips *work*** — fence.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Use `a**b` as the marker](#use-ab-as-the-marker)
 - [A shutdown shortens a *wait*; it never skips *work*](#a-shutdown-shortens-a-wait-it-never-skips-work)
 
----
+## Fences
 
-## Area one
+- **Use `a**b` as the marker** — settled.
+- **A shutdown shortens a *wait*; it never skips *work*** — fence.
+
+---
 
 ### Use `a**b` as the marker
 

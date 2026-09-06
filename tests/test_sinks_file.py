@@ -322,7 +322,7 @@ def test_a_failed_rename_neither_loses_nor_duplicates_the_batch(tmp_path, capsys
 
     seen = [event["i"] for event in _all_events(str(tmp_path))]
     assert sorted(seen) == list(range(8)), f"every event exactly once, got {sorted(seen)}"
-    # The concrete OSError subclass is per-platform (process.md §6), so derive it rather than
+    # The concrete OSError subclass is per-platform (`docs/process/operational-traps.md`), so derive it rather than
     # hardcode it: errno 13 is PermissionError here and need not be everywhere.
     expected = type(OSError(13, "Permission denied")).__name__
     assert f"rotating RotatingFileSink ({expected})" in capsys.readouterr().err, (

@@ -9,26 +9,39 @@ The docstring used to say `_mark_inherited` marks every inherited sink.
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
+
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Alpha rule](#alpha-rule)
 
----
+## Fences
 
-## Area one
+- **Alpha rule** — short claim and its fence.
+
+---
 
 ### Alpha rule
 

@@ -57,7 +57,7 @@ spec stands alone; the identifiers are there so a reader can find the original e
   *pair* `retired and submitted_after_shutdown`, which correctly stays silent. Measured: the fresh
   worker's events are not lost silently either — against a guarding sink they land in
   `failed_batches` with a line, and `flush()` returns `abandoned`. The reasoning goes into
-  `docs/decisions.md` so a later reader stops here rather than re-finding it.
+  `docs/decisions/` so a later reader stops here rather than re-finding it.
 - Bounding `Sink.close()`. It is unbounded on both paths by architecture §13. FR-002 and FR-004
   make a *caller* wait for a close within a budget; neither bounds the close.
 - Any change to `sinks/`, the public dataclasses' shape, `pyproject.toml`, or `README.md` — all
@@ -296,7 +296,7 @@ overwrite the foreign-pid record the child holds for it — the parent's own sta
 `_FOREIGN` `_mark_inherited` `setdefault`s where the parent recorded nothing — leaving a child
 able to close a sink it never acquired. `Worker` declares no `_FORK_SKIP` today and will need one.
 
-This supersedes the "left open" claim at `architecture.md` §7, `docs/decisions.md`'s SPEC-030
+This supersedes the "left open" claim at `architecture.md` §7, `docs/decisions/`'s SPEC-030
 entry (under *The sink contract: waiting, concurrency and shutdown*, **not** the pipeline area),
 and four `worker.py` docstrings including the public `Health.incomplete_swaps`. It does **not**
 touch SPEC-027's claim about an *expired* `shutdown()` leaving the live sink open, which stays
@@ -407,7 +407,7 @@ src/log_foundry/
 └── decorator.py     # FR-003
 docs/
 ├── architecture.md  # §7 swap paragraph, §9 shutdown
-├── decisions.md     # the sink-contract area (FR-004's reversal) + the rejection above
+├── decisions/     # the sink-contract area (FR-004's reversal) + the rejection above
 └── specs/SPEC-050-lifecycle-residue.md
 tests/
 ├── test_worker.py             # FR-001, FR-002, FR-004, FR-005 + the budget housekeeping
@@ -439,10 +439,10 @@ tests/
 - FR-004: record a sink swapped out on an unconfirmed drain, with `Worker._FORK_SKIP` and the
   prune rule; drain the record from `_close_if_owed` once the drain thread has ended; correct the
   announcement and the four superseded `worker.py` docstrings.
-- Update `architecture.md` §7 and the sink-contract area of `docs/decisions.md`.
+- Update `architecture.md` §7 and the sink-contract area of `docs/decisions/`.
 
 ### Phase 4: Housekeeping and the ritual
 
 - Widen the budget-vs-operation gap at `test_worker.py::test_submit_returns_before_emit_completes`.
-- Record the rejection above in `docs/decisions.md`; delivery doc; INDEX row; CLAUDE.md digest
+- Record the rejection above in `docs/decisions/`; delivery doc; INDEX row; CLAUDE.md digest
   line; name the two owed `README.md` corrections in the delivery doc and the PR body.

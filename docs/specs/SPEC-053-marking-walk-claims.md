@@ -92,7 +92,7 @@ Three things follow, and each is load-bearing:
 
 - **6 to 0 is the discrimination.** All six pre-fix hits are sentences PR #218 corrected — three
   in `_lifecycle.py` (`_FOREIGN`'s docstring, `_MARKING_CEILING`'s summary, `releasable`'s
-  paragraph), one in `docs/decisions.md`, one in `docs/specs/SPEC-050-lifecycle-residue.md`, and
+  paragraph), one in `docs/decisions/`, one in `docs/specs/SPEC-050-lifecycle-residue.md`, and
   one in `tests/test_fork_lifecycle.py`. One of the six is an artifact of its *trigger* rather than
   of the sentence, and that is what *The six the shipped check reports* below is about.
 - **The scoping clause is load-bearing**: dropping it takes `ac938c0` from 0 to 9, and every one of
@@ -160,7 +160,7 @@ about this check; it already happened, in the record, to the instrument this spe
       docstring. A check that cannot redden against the defect it was built for is evidence of
       nothing.
 - [ ] Removing the restriction clause yields a **non-zero** count on both `ac938c0` and the
-      shipping tree, every member correct prose, with `docs/decisions.md`'s register sentence among
+      shipping tree, every member correct prose, with `docs/decisions/`'s register sentence among
       them. The draft's "0 to 9" is the **lexical** instrument's figure and stays recorded as that.
 - [ ] **The restriction is syntactic, not lexical:** a scoping term excuses a universal only inside
       the noun phrase that universal quantifies, and every one of the 9 correct sentences the
@@ -181,7 +181,7 @@ about this check; it already happened, in the record, to the instrument this spe
       without re-running a search by hand.
 - [ ] It runs inside `scripts/docs-lint.sh` and is covered by that script's exit status.
 - [ ] Serves no invariant: a gate over prose, which `docs/invariants.md` says is judged by
-      `process.md` §5's rules rather than by a promise on that page.
+      `docs/process/completion-ritual.md`'s rules rather than by a promise on that page.
 
 ### FR-002: A corpus proving the check fires, and proving it stays silent
 
@@ -193,7 +193,7 @@ the corpus asserts failure text on planted violations and asserts **silence** on
 
 Silence matters more here than failure. On `ac938c0` the named anchor with the scoping clause
 ignored reaches 9 sentences, every one of them correct. The one that matters most is in the decision
-register itself: `docs/decisions.md`'s "A fork handler marks everything inherited that the parent
+register itself: `docs/decisions/`'s "A fork handler marks everything inherited that the parent
 never recorded `_FOREIGN` …" is correct prose that fires on anchor and universal alike, and is
 silenced today **only** by the lexical `setdefault`/`reach` in the same sentence. A syntactic
 scoping clause must keep it silent. A check that reddens on the register's statement of the
@@ -209,7 +209,7 @@ decision is worse than no check.
       a clause cannot be discriminated by any sentence in the record — measured, several cannot —
       the fixture is **invented and labelled as invented**, never a real-prose case that stays
       green under the mutant.
-- [ ] Silence fixtures for: `docs/decisions.md`'s register sentence above; a negated universal and
+- [ ] Silence fixtures for: `docs/decisions/`'s register sentence above; a negated universal and
       an "at all" (defeat 1, both mechanisms, each on a sentence where the *other* clauses do not
       already keep it silent); a universal inside a fenced block; inside a Markdown table row; in a
       heading; a universal that names the walk but does not quantify what the walk acts on; and a

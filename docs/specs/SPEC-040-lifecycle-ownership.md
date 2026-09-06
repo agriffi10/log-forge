@@ -135,7 +135,7 @@ regressions were both green.
       untouched. They are the regression suite for this exact state.
 - [ ] AC-4: An execution harness, not a review: the concurrency cases run under
       `conftest.run_concurrently` and the injected preemption points that already exist, per
-      `docs/process.md` on lifecycle work.
+      `docs/process/reviewer-contract.md` on lifecycle work.
 - [ ] AC-5: Mutation-tested in the direction that matters — each of the four questions is
       swapped for its neighbour, and each swap fails a *behavioural* test, not only the roster.
       A question nothing behavioural distinguishes is recorded (SPEC-035 FR-002 round 7b found

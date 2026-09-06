@@ -524,6 +524,6 @@ docs/spec-delivery/
 - Confirm the run reports no `unpinned-uses` and no `excessive-permissions` findings — Phase 1 is
   what makes this pass, so a finding here means Phase 1 missed a reference.
 - Add `SECURITY.md` and enable private vulnerability reporting (FR-008).
-- Run the completion ritual from `docs/process.md`: set this spec to Completed, update the row in
+- Run the completion ritual from `docs/process/completion-ritual.md`: set this spec to Completed, update the row in
   `docs/specs/INDEX.md`, write `docs/spec-delivery/SPEC-022-security-scanning.md`, and add one
   Key Decisions line to `CLAUDE.md`.

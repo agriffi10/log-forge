@@ -601,10 +601,10 @@ broke and the reason it is recorded here rather than silently re-ordered.
 ## Revision history
 
 Provenance for decisions that were re-opened, superseded or re-scheduled. Kept out of the
-requirements above so the builder meets each criterion once (process.md §4).
+requirements above so the builder meets each criterion once (`docs/process/authoring-a-spec.md`).
 
 - **2026-08-30 — acceptance criteria right-sized, and the spec reconciled with a `main` that moved
-  under it.** Authored 2026-08-09, it carried 51 criteria averaging 48 words, which `process.md` §4
+  under it.** Authored 2026-08-09, it carried 51 criteria averaging 48 words, which `docs/process/authoring-a-spec.md`
   now names as its own cautionary example. The criteria are unchanged in substance; the reasoning
   they carried moved into each FR's Description. Reconciled in the same pass, since SPEC-034, 037,
   038, 039 and 042 have all shipped since: the headline defect was **re-measured on `690d2a5`** and
@@ -636,7 +636,7 @@ requirements above so the builder meets each criterion once (process.md §4).
   FR-002's Description asserted that none of the roster's four categories describes *performing* a
   drain, and that its docstring refuses a fifth. Both are false against the file cited: `LIVENESS`
   is defined in exactly those words, and the refusal is of one specific proposed category. Kept as a
-  record because a wrong claim in a spec has no test to catch it later — the asymmetry `process.md`
+  record because a wrong claim in a spec has no test to catch it later — the asymmetry `docs/process/reviewer-contract.md`
   §3 names when it says to spot-check a negative claim before writing it down.
 - **Sequencing.** ~~Sequenced after SPEC-035 — ordering only… 035 FR-005's fork lock roster must
   pick up the counter lock FR-003 adds~~ — the roster moved to SPEC-039 with the fork FR; it is

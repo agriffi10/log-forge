@@ -482,6 +482,6 @@ CLAUDE.md             # CHANGED: note tag-derived version + plugin install in Co
 - Update `CLAUDE.md` Common Commands and Tech Stack to note the tag-derived version and the
   Poetry plugin install, and add a "Publishing" note pointing at `release.yml`.
 - Add a short "Installation" and release-process note to `README.md`.
-- Run the standard spec-completion ritual from `docs/process.md`: set this spec's status to
+- Run the standard spec-completion ritual from `docs/process/completion-ritual.md`: set this spec's status to
   Completed, update the row in `docs/specs/INDEX.md`, and write the delivery doc under
   `docs/spec-delivery/`.

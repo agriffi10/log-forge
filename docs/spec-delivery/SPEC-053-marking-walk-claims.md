@@ -24,7 +24,7 @@
   "no dependencies": check 11 needs `python3`. Both headers now say so and why.
 - `src/log_foundry/_lifecycle.py` — `_FOREIGN`'s docstring only. No logic changed; `setdefault` is
   correct and `_mark_inherited`'s own docstring is untouched, being what the others now defer to.
-- `docs/decisions.md`'s gate entry is **extended, not appended to** — the area gains "a gate's
+- `docs/decisions/`'s gate entry is **extended, not appended to** — the area gains "a gate's
   scoping test binds to what it scopes". **`CLAUDE.md` is not touched, and the digest line that
   entry is owed is OWED, not written.** The always-loaded file sits at its fence, and paying for
   one line means pruning another area's — which is the damage the budget's own comment says the

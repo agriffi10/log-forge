@@ -1,6 +1,6 @@
 # Completed Spec — SPEC-XXX: [Name]
 
-> **Keep this short — aim for under ~40 lines.** Delivery docs are read on demand by a later
+> **Keep this short — aim well under a page (`docs/process/completion-ritual.md` step 3 owns the rule; `DELIVERY_MAX_LINES` is a ratchet, not a target).** Delivery docs are read on demand by a later
 > spec that depends on this one; they should answer "what shipped and what changed," not re-explain
 > the code (the code + `docs/component-inventory.md` are the source of truth for reuse). Do **not**
 > paste code, full file contents, or config/JSON. Link, don't duplicate.

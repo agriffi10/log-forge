@@ -4,29 +4,38 @@
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
-- **  ** — a bold span that closes but holds nothing is no label at all, so it demands no
-  register entry. Reporting it as a digest line carrying "" sent the reader looking for an
-  entry called nothing.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Alpha rule](#alpha-rule)
 
----
+## Fences
 
-## Area one
+- **Alpha rule**  —  short claim, with padding either side of the dash.
+
+---
 
 ### Alpha rule
 

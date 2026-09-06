@@ -469,7 +469,7 @@ extreme.
       leaves `emit` returning, and one re-raising propagates.
 - [ ] `ruff`, `mypy --strict` and `docs-lint` stay green.
 - [ ] Serves no invariant: the `@staticmethod`, the dedent and the `Raises:` line are prose and
-      layout, which `docs/invariants.md` leaves to `process.md` §5's own rules, and the handler
+      layout, which `docs/invariants.md` leaves to `docs/process/completion-ritual.md`'s own rules, and the handler
       test pins behaviour that already holds rather than changing what a caller observes.
 
 ---

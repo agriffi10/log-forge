@@ -4,36 +4,40 @@
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
-- **Beta rule** — short claim and its fence.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Alpha rule](#alpha-rule)
-- [Beta rule](#beta-rule)
+
+## Fences
+
+- **Alpha rule** — short claim and its fence.
 
 ---
 
-## Area one
-
 ### Alpha rule
 
-Reasoning that opens with prose rather than restating the heading in bold. That is a
-deliberate exemption, not an oversight: the live register has such an entry, and a heading
-with no restatement contradicts nothing.
-
-### Beta rule
-
-Reasoning that mentions **Alpha rule** in bold partway through, which is emphasis and not a
-label. The check anchors on the START of the line for exactly this reason.
+Plain prose opening, with no bold label at all. Deleting the label is the
+deliberate escape from this check: a heading with no restatement contradicts nothing.

@@ -40,7 +40,7 @@ bound is worse than an unpinned expression. Recorded in the test's own docstring
   its detached closer, and FR-004 AC-2's latch-disposition roster over the same derived population.
 - `tests/test_span_sweep.py` (SPEC-036) discarded a worker per trial without shutting it down,
   leaking thirty daemon threads to the end of the session; fixed at source.
-- `docs/process.md` and `CLAUDE.md`: the PR grouping is no longer a blocking reviewer gate.
+- `docs/process/reviewer-contract.md` and `CLAUDE.md`: the PR grouping is no longer a blocking reviewer gate.
 - `architecture.md` §13: races 1–5 struck in place and marked fixed (SPEC-021's rule), the
   double-close paragraph struck likewise, the timeout entry gains the orphan path, and the
   concurrent-`configure` double-close is recorded as measured-and-unfixed.
