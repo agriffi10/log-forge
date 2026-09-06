@@ -1,12 +1,7 @@
 @@@ expect exit=1
-@@@ match docs/architecture.md:3 claims the marking walk acts on EVERYTHING, with no scope.
-@@@ match A fork handler marks everything inherited `_FOREIGN` before the roster is read.
-@@@ file docs/architecture.md
-# Architecture
-
-- A fork handler marks
-    everything
-    inherited `_FOREIGN` before the roster is read.
+@@@ match src/log_foundry/mod.py:1 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ file src/log_foundry/mod.py
+"""A fork handler marks everything inherited `_FOREIGN` before the roster is read."""
 
 @@@ file CLAUDE.md
 # Project

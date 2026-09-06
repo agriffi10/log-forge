@@ -1,12 +1,11 @@
 @@@ expect exit=1
-@@@ match docs/architecture.md:3 claims the marking walk acts on EVERYTHING, with no scope.
-@@@ match A fork handler marks everything inherited `_FOREIGN` before the roster is read.
+@@@ match docs/architecture.md:5 claims the marking walk acts on EVERYTHING, with no scope.
 @@@ file docs/architecture.md
 # Architecture
 
-- A fork handler marks
-    everything
-    inherited `_FOREIGN` before the roster is read.
+A first line of an ordinary paragraph that says nothing at all about the topic.
+A second line, still ordinary, wrapping on without any claim in it whatever.
+A fork handler marks everything inherited `_FOREIGN` before the roster is read.
 
 @@@ file CLAUDE.md
 # Project

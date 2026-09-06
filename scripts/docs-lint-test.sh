@@ -130,7 +130,11 @@ echo "docs-lint-test: $pass passed, $fail failed."
 # here. Removing them does, and that is the point: a case pruned on purpose is a
 # one-line, deliberate lowering in the same change; a case lost by accident reds the run.
 # Not applied to the self-test invocation, which runs a handful of planted cases.
-CASES_MIN=80
+# Raised from 80 with SPEC-053's corpus (86 cases -> 137). The old floor was slack enough that
+# deleting EVERY marking-walk case left 86 cases running, a success line and exit 0 — measured,
+# which is the whole failure this floor is written against. It stays deliberately below the
+# measurement so adding cases needs no edit here; it just is not 36 cases below any more.
+CASES_MIN=125
 if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "docs-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"
   echo "shrunk or gone missing — a run over nothing exits 0 and looks exactly like a healthy"
@@ -264,4 +268,32 @@ if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ]; then
     exit 1
   fi
   echo "docs-lint-test: check 11 reports a broken interpreter rather than skipping."
+
+  # The same rule one level down: a FILE the check could not read is a file it did not examine.
+  # This cannot be a .case — the `@@@ file` splitter writes text through awk and the input needed
+  # here is a byte sequence that is not UTF-8 — so it sits beside the interpreter test, and it is
+  # run BOTH ways for the same reason: a red run has to be attributable to this file.
+  BAD="$WORK.badbytes"
+  rm -rf "$BAD"; mkdir -p "$BAD/tree/scripts" "$BAD/tree/docs"
+  cp "$ROOT/scripts/docs-lint.sh" "$BAD/tree/scripts/docs-lint.sh"
+  printf '# Project\n\n## Key Decisions\n\nOne line each.\n\n### Area one\n\n- **Alpha rule** — short claim.\n' > "$BAD/tree/CLAUDE.md"
+  printf '# Key Decisions — full register\n\n## Contents\n\n- [Alpha rule](#alpha-rule)\n\n---\n\n## Area one\n\n### Alpha rule\n\nReasoning.\n' > "$BAD/tree/docs/decisions.md"
+  control=$(cd "$BAD/tree" && sh scripts/docs-lint.sh 2>&1) && control_rc=0 || control_rc=$?
+  printf '# Notes\n\n\377\376 not utf-8.\n' > "$BAD/tree/docs/notes.md"
+  dirty=$(cd "$BAD/tree" && sh scripts/docs-lint.sh 2>&1) && dirty_rc=0 || dirty_rc=$?
+  rm -rf "$BAD"
+  bad_fail=0
+  [ "$control_rc" -eq 0 ] || { echo "FAIL  self-test: the control tree is not clean before the bad file lands."; bad_fail=1; }
+  [ "$dirty_rc" -ne 0 ] || { echo "FAIL  self-test: a file check 11 cannot read left docs-lint.sh exiting 0."; bad_fail=1; }
+  case "$dirty" in
+    *"docs/notes.md could not be read (UnicodeDecodeError), so this check did NOT examine it"*) ;;
+    *) echo "FAIL  self-test: an unreadable file was skipped instead of reported."; bad_fail=1 ;;
+  esac
+  if [ "$bad_fail" -ne 0 ]; then
+    echo "----"
+    echo "docs-lint-test: check 11 can skip a file without saying so. A file the gate could not"
+    echo "open is a file it did not examine, and silence there reads as a clean result."
+    exit 1
+  fi
+  echo "docs-lint-test: check 11 reports a file it cannot read rather than skipping it."
 fi

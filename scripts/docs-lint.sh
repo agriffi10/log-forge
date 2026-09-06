@@ -22,8 +22,9 @@
 #   with its digest, an entry is unreachable from the Contents, a Contents row names one
 #   decision and links to another, an entry body opens with a bold label its own heading
 #   does not match, a Completed spec has no delivery doc, a delivery doc has become an
-#   essay, a pointer out of CLAUDE.md goes nowhere, or a standing document dates a
-#   measurement without anchoring it to a commit.
+#   essay, a pointer out of CLAUDE.md goes nowhere, a standing document dates a
+#   measurement without anchoring it to a commit, or a sentence claims the marking walk
+#   acts on everything a forked child inherited.
 #
 # There is no WARN tier: `spec-lint.sh` owns the soft per-spec judgements, and every rule
 # here is a shape the layering depends on — a shape is either held or it isn't.
@@ -778,7 +779,7 @@ done
 #             clean-tree count from 0 into the tens or hundreds against zero true positives,
 #             which is the shape process.md 5 warns about, half a gate's regressions being
 #             false positives.
-#   UNIVERSAL every, everything, all. NOT any/always/never, and that is measured rather than
+#   UNIVERSAL every, everything, each, all. NOT any/always/never, and that is measured rather than
 #             assumed: they buy no true positive this rule can discriminate and they are the
 #             mechanism of every false positive on the corrected tree — "before ANY other
 #             handler runs" appears identically in the false register sentence and in its
@@ -786,7 +787,10 @@ done
 #             acquired" is correct in three of the nine sentences that fire without scoping.
 #   SUBJECT   the universal must quantify what the walk ACTS ON — a sink, a record, something
 #             inherited or stamped, a transport, a descriptor, an object — or be governed
-#             directly by a marking verb, as in "refuses everything". Without this the rule
+#             directly by a marking verb, as in "refuses everything". Every alternative in
+#             each of these lists is a STEM with `\w*` after it, and that is a testability
+#             decision, not brevity: a list of inflections is a list of members no fixture
+#             exercises, and the corpus owes one per alternative. Without this the rule
 #             needs only an anchor and a universal to CO-OCCUR, and it then fires on ordinary
 #             prose that happens to mention the walk: "all of the buffer repair happens after
 #             it", "every one of the sixteen files describing the marking walk was corrected".
@@ -844,9 +848,14 @@ done
 #
 # IN:  every *.md at the root; docs/**.md; src/**.py; tests/**.py.
 # OUT: scripts/ — this check's own patterns and the prose describing them live here, so the check
-#      would fail on itself. Note there is no exclusion to mutate: the population is built from
-#      four INCLUSION globs that never reach scripts/, and tests/docs-lint/*.case is likewise out
-#      by extension before its directory is skipped.
+#      would fail on itself. That one needs no exclusion: the population is four INCLUSION globs
+#      and none of them reaches scripts/, so there is nothing there to mutate and a fixture over
+#      it proves only that the harness runs.
+# OUT: any directory named docs-lint, which IS a live exclusion and is the one to mutate. The
+#      .case corpus carries the wrong form on purpose, and while a .case is already outside the
+#      globs by extension, a .py planted beside it is not — which is exactly what that fixture
+#      plants. The skip does not prune the walk, so a subdirectory of one is still descended into;
+#      nothing puts prose there today and this says so rather than implying otherwise.
 #
 # THIS POPULATION DIFFERS FROM CHECK 9's, and check 9 excludes its three trees for three DIFFERENT
 # reasons, none of which is "frozen records" alone (see :650, :654, :658 above): docs/specs and
@@ -866,6 +875,24 @@ done
 # sentence it replaces. This check catches the BARE universal, which is the one spelling that
 # recurred; the contrapositive ("an unmarked sink is claimable") and the possessive ("the
 # `_FOREIGN` stamp `_mark_inherited` set") carry no universal and are out of reach by construction.
+#
+# AND WHAT REDDENS THAT SHOULD NOT — the more important list, because a false negative costs a
+# missed claim while a false positive costs the gate. All four are the price of the positional
+# scope test, and none is fixable without paying a true positive; each was built and measured.
+#
+#   A RESTRICTION WITH NO RELATIVE PRONOUN reddens. "Every sink the walk missed" is restricted in
+#   English and not to this check, which needs `that`, `which`, `whose` or one of the scoping
+#   words. Adding `it|its|the parent|the child` closes it and drops one of the six true positives,
+#   so the pronoun stays required and the FAIL text says to insert it. This is the one authors will
+#   hit.
+#   AN UNBALANCED FENCE silences everything below it to EOF, in any file. Check 9 has the same
+#   hole and names it; this check inherits it rather than closing it, because balancing fences is
+#   a markdown parser's job.
+#   A 4-SPACE INDENTED CODE BLOCK is not a fence and is not skipped, so a false claim quoted that
+#   way reddens. Use a fenced block, which is what the FAIL text already recommends.
+#   TWO ADJACENT LINES WITH NO TERMINATOR are one sentence, so an anchor on one and a universal on
+#   the next pair up. That is the table-row flattening in another costume, and dropping table rows
+#   closes only the instance where it is unavoidable.
 # ONE branch, not two, and that is a testability decision. The obvious spelling guards a
 # `command -v python3` and reports a missing interpreter separately from a failing one — but the
 # absent-interpreter branch cannot be reached from the fixture harness without unbuilding PATH far
@@ -873,8 +900,10 @@ done
 # check exists to argue against. Collapsed to one invocation, a missing python3 exits 127 and a
 # broken one exits non-zero, and both land on the same `note` — which a self-test in
 # docs-lint-test.sh reaches with a python3 shim that fails. The report is a FAIL either way: a
-# check that could not run must never read as a check that found nothing.
-python3 - . >> "$FAILS" 2>/dev/null <<'PYEOF' || note "check 11 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
+# check that could not run must never read as a check that found nothing. stderr is deliberately
+# NOT swallowed — the note says the check did not run, and the traceback or the shell's own
+# "command not found" beside it is the only thing that says why.
+python3 - . >> "$FAILS" <<'PYEOF' || note "check 11 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
 """SPEC-053 FR-001. Reads the tree given as argv[1]; prints FAIL lines; never exits non-zero."""
 import ast
 import os
@@ -882,15 +911,13 @@ import re
 import sys
 
 ANCHOR = re.compile(r"_mark_inherited|`_FOREIGN`|marking walk")
-UNIVERSAL = re.compile(r"\b(every|everything|all)\b", re.IGNORECASE)
+UNIVERSAL = re.compile(r"\b(every|everything|each|all)\b", re.IGNORECASE)
 SUBJECT = re.compile(
-    r"\b(sink|sinks|record|records|recorded|inherit\w*|stamp\w*|transport\w*"
-    r"|descriptor\w*|object|objects)\b",
+    r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*",
     re.IGNORECASE,
 )
 VERB = re.compile(
-    r"\b(mark|marks|marked|record|records|recorded|stamp|stamps|stamped"
-    r"|refuse|refuses|refused|claim|claims|claimed)\s+(\w+\s+){0,1}$",
+    r"\b(mark|record|stamp|refuse|claim)\w*\s+(\w+\s+){0,1}$",
     re.IGNORECASE,
 )
 RESTRICT = re.compile(
@@ -898,11 +925,25 @@ RESTRICT = re.compile(
     re.IGNORECASE,
 )
 NEGATED = re.compile(
-    r"\b(not|no|never|nothing|rather than)\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$",
+    r"\b(not|no|never|nothing|rather than|false|used to|corrected)"
+    r"\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$",
     re.IGNORECASE,
 )
 NP_END = re.compile(r"[,;:.()—–]")
 ESCAPE = "docs-lint: marking-walk"
+REPORT = (
+    "FAIL  %s:%d claims the marking walk acts on EVERYTHING, with no scope.\n"
+    "      %s\n"
+    "      `_mark_inherited` ``setdefault``s: a sink `configure()` already stamped keeps the\n"
+    "      parent's real pid, and ``_FOREIGN`` lands only where nothing was recorded. Say what\n"
+    "      the universal is restricted TO, INSIDE its own noun phrase — \"every inherited sink\n"
+    "      its walk reaches\", \"everything inherited that the parent never recorded\". A scoping\n"
+    "      word elsewhere in the sentence does NOT count and is not meant to, and a restriction\n"
+    "      with no relative pronoun (\"every sink the walk missed\") is not seen as one — insert\n"
+    "      the `that`. Quoting the false claim on purpose? Use a fenced block, or put\n"
+    "      `docs-lint: marking-walk` in the same unit — the paragraph, or the single bullet,\n"
+    "      that carries it, since a bullet is a unit of its own. SPEC-053 FR-001."
+)
 LIST_ITEM = re.compile(r"^[ \t]*([-*+]|[0-9]+[.)])[ \t]")
 SENTENCE = re.compile(r"(?<=[.!?])[*_`\"')\]]*\s+")
 
@@ -957,7 +998,8 @@ def blocks(lines, first, markdown):
             continue
         if fenced:
             continue
-        if not stripped or (markdown and (stripped.startswith("#") or stripped.startswith("|"))):
+        if not stripped or (markdown and (stripped.startswith("#") or stripped.startswith("|")
+                                          or stripped.startswith(">"))):
             if held:
                 yield start, "\n".join(held)
             held, start = [], None
@@ -1006,35 +1048,54 @@ def units(relative, text):
         yield from blocks(text.splitlines(), 1, True)
 
 
+def sentences(block, first):
+    """Every sentence of one unit, each with the source line it starts on."""
+    flat, lines = [], []
+    for offset, line in enumerate(block.splitlines()):
+        stripped = line.strip() if offset else line
+        flat.append(stripped)
+        lines.append(first + offset)
+    joined = " ".join(flat)
+    starts, cursor = [], 0
+    for offset, piece in enumerate(flat):
+        starts.append((cursor, lines[offset]))
+        cursor += len(piece) + 1
+    found, cursor = [], 0
+    for sentence in SENTENCE.split(joined):
+        line = first
+        for at, number in starts:
+            if at <= cursor:
+                line = number
+        found.append((line, sentence.strip()))
+        cursor += len(sentence) + 1
+    return found
+
+
 def main(root):
-    """Print one FAIL block per violating sentence."""
+    """Print one FAIL block per violating sentence, in file and line order."""
+    findings = []
     for relative in population(root):
         try:
             with open(os.path.join(root, relative), encoding="utf-8") as handle:
                 text = handle.read()
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as failure:
+            # NOT a skip. A file this check could not read is a file it did not examine, and the
+            # whole argument for the interpreter guard above applies again one level down: a gate
+            # that goes quiet on what it could not open reads exactly like a gate that found
+            # nothing. Reported by TYPE, per arch 6 and SPEC-029.
+            findings.append((relative, 0,
+                             "FAIL  %s could not be read (%s), so this check did NOT examine it."
+                             % (relative, type(failure).__name__)))
             continue
         for line, block in units(relative, text):
             if ESCAPE in block:
                 continue
-            for sentence in SENTENCE.split(re.sub(r"\n\s*", " ", block).strip()):
-                sentence = sentence.strip()
+            for at, sentence in sentences(block, line):
                 if not sentence or not violates(sentence):
                     continue
-                print(
-                    "FAIL  %s:%d claims the marking walk acts on EVERYTHING, with no scope.\n"
-                    "      %s\n"
-                    "      `_mark_inherited` ``setdefault``s: a sink `configure()` already stamped\n"
-                    "      keeps the parent's real pid, and ``_FOREIGN`` lands only where nothing\n"
-                    "      was recorded. Say what the universal is restricted TO, inside the same\n"
-                    "      noun phrase — \"every inherited sink its walk reaches\", \"everything\n"
-                    "      inherited that the parent never recorded\". A scoping word elsewhere in\n"
-                    "      the sentence does NOT count and is not meant to. Quoting the false claim\n"
-                    "      on purpose? Use a fenced block, or put `docs-lint: marking-walk` in the\n"
-                    "      same unit — the paragraph, or the single bullet, that carries it, since a\n"
-                    "      bullet is a unit of its own. SPEC-053 FR-001."
-                    % (relative, line, sentence[:160])
-                )
+                findings.append((relative, at, REPORT % (relative, at, sentence[:160])))
+    for _, _, report in sorted(findings, key=lambda found: (found[0], found[1])):
+        print(report)
 
 
 main(sys.argv[1])

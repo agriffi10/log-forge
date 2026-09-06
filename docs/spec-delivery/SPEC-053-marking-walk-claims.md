@@ -73,6 +73,35 @@ moves the 6 / 0 / 0 table.
   co-occur fires on "all of the buffer repair happens after it". Adding that clause took the live
   tree from 3 findings to 1.
 
+## What the second review frame changed
+
+That frame walked the future edit rather than reading the diff, and its blocking finding was that
+"every clause is mutation-tested" was true only at the granularity of deleting a whole clause: 16
+of 44 finer mutants — individual members of the four vocabularies — survived the corpus. The fix
+is structural rather than another round of fixtures. **Every alternative is now a stem** (`sink`
++ `\w*`, not `sink|sinks`), because a list of inflections is a list of members no fixture
+exercises; the four vocabularies hold 33 alternatives between them and the corpus discriminates
+each. Synonyms that no fixture reached were deleted rather than fixtured.
+
+Four behaviour changes came out of the same frame, none of which moves the 6 / 0 / 0 table:
+
+- **`each` joins the universal.** It is the word this repo's *corrected* prose reaches for —
+  FR-003's own output sentence uses it — so without it the one docstring this spec rewrote sat
+  outside the gate this spec built, and its likeliest regression (trimming the restrictive tail)
+  was invisible.
+- **The repair vocabulary joins the negators.** "It is false that X marks every inherited sink"
+  and "The docstring used to say ..." are sentences written while *fixing* this defect, and the
+  gate reddened on them — defeat 1 in its most damaging form.
+- **A blockquote is skipped**, because the completion ritual puts a superseded marker restating the
+  old claim at every doc site, and check 3-7 in the same script already skips them for that reason.
+- **A file the check cannot read is reported, not skipped** — the interpreter rule one level down.
+  It cannot be a `.case` (the fixture splitter writes text through `awk`), so it joins the
+  interpreter self-test, which runs one tree both ways so the red is attributable.
+
+Two reporting defects went with them: the line was the unit's, not the violating sentence's, and
+findings printed in `ast.walk` order rather than line order. The corpus floor was raised from 80 to
+125: with 137 cases, deleting every `marking-walk` case left 86 running and exiting 0.
+
 ## Known limits, stated rather than discovered later
 
 - Markdown **table rows are dropped** (a table has no sentence terminator, so one flattens into a
@@ -82,6 +111,18 @@ moves the 6 / 0 / 0 table.
 - An overt relative pronoun excuses a universal, so "marks everything **that** the child inherited"
   would pass while being as false as the sentence it replaces. The check catches the **bare**
   universal, which is the one spelling that recurred.
+- **The converse costs more and is the one authors will hit**: a restriction with *no* relative
+  pronoun — "every sink the walk missed" — is restricted in English and not to this check, so it
+  reddens. Adding `it|its|the parent|the child` to the restriction closes it and drops one of the
+  six true positives; it was built and measured. The pronoun stays required, and the FAIL text says
+  to insert it.
+- An **unbalanced fence** silences everything below it to EOF (check 9 has the same hole and names
+  it); a **4-space indented code block** is not a fence, so a claim quoted that way reddens; and
+  **two adjacent lines with no terminator** are one sentence, which is the table-row flattening in
+  another costume. All three are in the check's own header.
+- **Finding order is presentation, and is the one behaviour with no fixture.** Findings are sorted
+  by file and line; the `.case` harness asserts substrings of the output and cannot express an
+  ordering, so this is stated rather than covered.
 - The escape `docs-lint: marking-walk` is a magic word by design — explicit and greppable, so
   unlike `setdefault` nobody reaches it while paraphrasing — but it is the one clause an author can
   reach for instead of fixing a claim. It covers the unit that carries it and no other, and a

@@ -274,11 +274,12 @@ not be implemented by contorting prose to dodge a check that should not have fir
 # are the spec's own findings and a reader comparing them should see both.
 
 ANCHOR    = r"_mark_inherited|`_FOREIGN`|marking walk"                # named symbols only
-UNIVERSAL = r"\b(every|everything|all)\b"                             # re.IGNORECASE required
-SUBJECT   = r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*\b"
+UNIVERSAL = r"\b(every|everything|each|all)\b"                        # re.IGNORECASE required
+SUBJECT   = r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*"
 VERB      = r"\b(mark|record|stamp|refuse|claim)\w*\s+(\w+\s+){0,1}$"
 RESTRICT  = r"\b(that|which|whose)\b|reach|missed|residual|partial|setdefault|item 7"
-NEGATED   = r"\b(not|no|never|nothing|rather than)\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$"
+NEGATED   = r"\b(not|no|never|nothing|rather than|false|used to|corrected)"
+            r"\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$"
 NP_END    = r"[,;:.()...]"
 
 # A universal violates when its NOUN PHRASE — itself, up to the next NP_END — names what
@@ -287,7 +288,10 @@ NP_END    = r"[,;:.()...]"
 # *The six the shipped check reports* or in the acceptance criteria:
 #
 #   1. `any|always|never` are gone. They buy no true positive the rule can discriminate,
-#      and they are the mechanism of every false positive on the corrected tree.
+#      and they are the mechanism of every false positive on the corrected tree. `each`
+#      is IN, and it is the word this repo's corrected prose actually reaches for —
+#      FR-003's own output sentence uses it, so without it the one docstring this spec
+#      rewrote would sit outside the gate this spec built.
 #   2. SUBJECT/VERB is new. Without it the rule needs only a name and a universal to
 #      CO-OCCUR, and fires on "all of the buffer repair happens after it". Adding it took
 #      the live tree from 3 findings to 1.
@@ -303,6 +307,15 @@ NP_END    = r"[,;:.()...]"
 # separate "at all" guard is NOT here: the idiom occurs only inside a negated clause,
 # which NEGATED already covers, and where "at all" is a preposition plus a real universal
 # ("looks at all inherited sinks") a guard would silence a genuine claim.
+#
+# EVERY ALTERNATIVE IS A STEM, and that is a testability decision rather than brevity. A list of
+# inflections — `sink|sinks|record|records|recorded` — is a list of members no fixture exercises,
+# and FR-002 owes one fixture per alternative. Written as stems with `\w*`, the four vocabularies
+# hold 4 + 7 + 5 + 9 + 8 alternatives and the corpus discriminates each. NEGATED carries the
+# repair vocabulary as well as the negators, because "It is false that X marks every inherited
+# sink" and "The docstring used to say ..." are sentences someone writes while FIXING this defect,
+# and the gate reddening on those is defeat 1 in its most damaging form. Synonyms of those that no
+# fixture exercises were tried and removed, for the reason above.
 
 # ── the draft's version, kept for the comparison ──
 # ANCHOR    = r"_mark_inherited|``_FOREIGN``|`_FOREIGN`|marking walk"
