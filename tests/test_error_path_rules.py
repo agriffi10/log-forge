@@ -1,7 +1,7 @@
 """SPEC-038 FR-002 AC-4 — the error-path rule, enforced rather than swept once.
 
 FR-002 fixes one unguarded `rollback()`. Its AC-4 asks for the same audit across every sink "as a
-*rule*, per `docs/process.md`", because a sweep settles today and a lint settles every day after.
+*rule*, per `docs/process/reviewer-contract.md`", because a sweep settles today and a lint settles every day after.
 
 The rule: **a cleanup call made on an object the sink holds must not be unguarded inside an
 `except` handler.** Cleanup runs while a failure is already being handled, so a cleanup that

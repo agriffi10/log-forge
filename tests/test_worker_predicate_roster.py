@@ -35,7 +35,7 @@ line-oriented seam check over the same derived scope would need no source segmen
 and no shape refusal, collapsing roughly half of it. It is **not** done here: the current reader
 was just measured correct in both directions and pinned by six mutations, and replacing a
 verified implementation with an unverified one during the review that verified it is how scope
-added mid-review earns confidence it has not (`docs/process.md`). It belongs in its own change.
+added mid-review earns confidence it has not (`docs/process/reviewer-contract.md`). It belongs in its own change.
 """
 
 import ast

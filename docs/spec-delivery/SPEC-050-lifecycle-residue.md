@@ -26,7 +26,7 @@ it against `eb80099` before the spec was written and re-run against the fix.
   *wait* below the put is unchanged and a timeout large enough to overflow `time_t` still raises
   out of `Worker.flush`, here as on every earlier tree — and is caught by that same
   `except Exception` before a public caller sees it, so the same distinction applies. The pessimistic-verdict population is correspondingly
-  wider, recorded in `docs/decisions.md`
+  wider, recorded in `docs/decisions/`
   as a narrowing of "`flush()` answers from the drain that carried the events"; the converse is
   untouched, since `delivered` is only ever written by the owning drain. A
   `flush(timeout=None)` parked behind a stuck sink used to wait forever on a drain that call had
@@ -61,7 +61,7 @@ the same reason. Measured: the bystander waited 0.000 s and lost five events, an
 
 **A fifth reviewer was spent, out of budget and said so.** The orphan record was *replaced*
 rather than revised after both diff reviews, so those reviews examined a mechanism that no longer
-existed — which `process.md` prices at one more pass in the frame that catches a replacement's own
+existed — which `docs/process/reviewer-contract.md` prices at one more pass in the frame that catches a replacement's own
 class of defect. It found three: an async `KeyboardInterrupt` landing between taking the in-flight
 count and the `try` leaked it permanently (measured, once every few hundred iterations under a real
 `SIGINT` storm); a `fork()` from *inside* the inline close left the child at `-1`, which
@@ -70,14 +70,14 @@ that leave a close running happen to sit *after* the one that measures the no-wa
 that pair fails it at 4.01 s. The first two share one edit (take inside the `try`, guarded by a flag
 and floored at zero); the third is a `conftest` reset.
 
-**Rejected, with the reasoning in `decisions.md`:** `health().retired` reading `True` for a worker
+**Rejected, with the reasoning in `docs/decisions/`:** `health().retired` reading `True` for a worker
 built after an orphan-only `shutdown()`. The field documents an action the caller took, the
 alert idiom is the *pair*, and the fresh worker's events are not lost silently.
 
 ## What changed from earlier specs?
 
 - **SPEC-030's "the previous sink is left open"** now means *for now*, not forever. Superseded in
-  place at `architecture.md` §7, `docs/decisions.md`, and four `worker.py` docstrings including the
+  place at `architecture.md` §7, `docs/decisions/`, and four `worker.py` docstrings including the
   public `Health.incomplete_swaps`. **Owed elsewhere:** `README.md:253` and `README.md:1009` carry
   the same claim and belong to the release-surface session.
 - **SPEC-031's `_release_waiters`** gains a third caller.

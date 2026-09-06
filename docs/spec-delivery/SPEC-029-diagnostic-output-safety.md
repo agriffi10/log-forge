@@ -74,6 +74,6 @@ sampling does not scale to a mechanical change across 28 sites. And a `monkeypat
 "stderr", …)` applied in a *fixture* is silently undone by pytest's capture-resume between the setup
 and call phases, which would have made every "the secret is absent from stderr" assertion pass
 vacuously; the tests read through `capsys` instead. Two CI-only traps are recorded in
-`process.md` §6: `OSError`'s concrete type is per-platform (`OSError(111, …)` is
+`docs/process/operational-traps.md`: `OSError`'s concrete type is per-platform (`OSError(111, …)` is
 `ConnectionRefusedError` on Linux, plain `OSError` on macOS), and `ruff format` is not a gate here
 and rewrites files a change never touched.

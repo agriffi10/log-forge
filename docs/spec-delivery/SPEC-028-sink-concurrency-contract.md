@@ -167,7 +167,7 @@ behind everything above, and `CLAUDE.md` now states that green CI is not a revie
 > merge*. The gate has since moved earlier still — the diff is reviewed **before the push**, so a
 > branch reaches the remote already reviewed rather than collecting fixes in public. The reason is
 > unchanged and this spec is still the evidence for it; only the point it binds has moved. See
-> `docs/process.md` §3 → *The reviewer contract*.
+> `docs/process/reviewer-contract.md` → *The reviewer contract*.
 
 A third review, run *before* merging the corrections, returned DO NOT MERGE with
 13 findings. The ones that changed code:

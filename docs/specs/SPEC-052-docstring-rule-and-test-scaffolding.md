@@ -32,7 +32,7 @@ removes the dead guards so an import failure is a failure again.
 
 - Re-scoping `CLAUDE.md`'s docstring sentence cap from the whole description to the **summary
   line**, reconciling the same bullet's `Args:`/`Returns:`/`Raises:` clause with the 58 of 59
-  classes that carry none of them, and recording the decision in `docs/decisions.md`.
+  classes that carry none of them, and recording the decision in `docs/decisions/`.
 - A checker at `scripts/docstring-lint.py` enforcing the four parts of the rule that are alive,
   and its registration as a local pre-push gate beside `scripts/docs-lint.sh`.
 - A fixture corpus at `scripts/docstring-lint-test.sh` that proves each of those checks still
@@ -103,7 +103,7 @@ sentence. There are **seven**: those three plus `Sink`'s class docstring, `Sentr
 by the principle and the query that answers it (`grep -rn '__doc__' tests/`), which is shorter,
 true, and cannot rot the way a count does.
 
-The decision gets a full entry in `docs/decisions.md` under the existing working-rules area,
+The decision gets a full entry in `docs/decisions/` under the existing working-rules area,
 with a row in that file's `## Contents`, and **one** line in `CLAUDE.md`'s Key Decisions
 replacing or extending that area's clause.
 
@@ -118,7 +118,7 @@ replacing or extending that area's clause.
 - [ ] `CLAUDE.md` no longer claims three docstrings are asserted by tests. `grep -rn '__doc__'
       tests/` returns assertions against seven, and the bullet points at that query rather than
       carrying a list.
-- [ ] `docs/decisions.md` carries a `###` entry for the decision **and** a matching row in its
+- [ ] `docs/decisions/` carries a `###` entry for the decision **and** a matching row in its
       `## Contents`; `sh scripts/docs-lint.sh` exits 0 (it fails an entry the Contents cannot
       reach, and fails a digest line with no entry behind it).
 - [ ] `CLAUDE.md`'s Key Decisions gains **one** line, under the existing working-rules area,
@@ -130,7 +130,7 @@ replacing or extending that area's clause.
 
 Ship `scripts/docstring-lint.py` — standard library only, so it runs in the no-extras
 environment CI uses. It **parses** with `ast` and `tokenize`; it does not grep the source,
-because a regex over source is the hazard `docs/process.md` §3 names ("parse instead where a
+because a regex over source is the hazard `docs/process/reviewer-contract.md` names ("parse instead where a
 parser exists"). It reads `src/log_foundry/` and exits 1 on any violation, printing one
 `FAIL  <path>:<line>  <message>` line per finding.
 
@@ -187,7 +187,7 @@ The four checks, each with its measured baseline at `451edf9`:
 - [ ] A summary line containing a Sphinx role, a dotted module name, or a section reference
       (`arch §9.2`) is **not** reported — asserted as a silence case in FR-003, since this is
       where the naive implementation produces 39 false positives.
-- [ ] `CLAUDE.md`'s Common Commands and pre-push gate list name it, and `docs/process.md` §3's
+- [ ] `CLAUDE.md`'s Common Commands and pre-push gate list name it, and `docs/process/session-rhythm.md`'s
       gate list names it, so the two do not disagree about what the gates are.
 
 ### FR-003: A fixture corpus that proves each check still fires
@@ -374,7 +374,7 @@ through SPEC-001".
 
 These four sites and two docstrings are edited **by hand**, not by a script. They are six edits,
 and a script would be operating on files FR-004 had just rewritten — which is the one thing
-`docs/process.md` §3 says an automated repair must never do.
+`docs/process/reviewer-contract.md` says an automated repair must never do.
 
 #### Acceptance Criteria:
 
@@ -409,7 +409,7 @@ that a sibling test covers. The correct statement names all three and says which
 that in `tests/integration/`, a skip is a defect.
 
 It also carries a bare runtime measurement ("~35 s"), which the standing rule in
-`docs/process.md` §5 forbids: state the principle or anchor both ends to a commit a reader can
+`docs/process/completion-ritual.md` forbids: state the principle or anchor both ends to a commit a reader can
 re-measure from.
 
 #### Acceptance Criteria:
@@ -489,8 +489,8 @@ tests/
 └── test_decorator_async.py    # skipif mark + `_async_trace_supported`
 src/log_foundry/sinks/__init__.py   # one module docstring — the only src/ edit
 CLAUDE.md                      # Code Conventions, Key Decisions, gate list
-docs/decisions.md              # the new entry + its Contents row
-docs/process.md                # §3's gate list
+docs/decisions/working-rules.md              # the new entry + its Contents row
+docs/process/session-rhythm.md                # the gate list
 ```
 
 ## Implementation Phases
@@ -498,7 +498,7 @@ docs/process.md                # §3's gate list
 ### Phase 1: The rule and its record
 
 - Re-scope the Code Conventions bullet in `CLAUDE.md`: summary line, class clause, `# pragma:`.
-- Write the `docs/decisions.md` entry and its `## Contents` row; add the single Key Decisions
+- Write the `docs/decisions/` entry and its `## Contents` row; add the single Key Decisions
   digest line.
 - Run `sh scripts/docs-lint.sh` — the byte budget and the digest-unit cap both bind here.
 
@@ -506,7 +506,7 @@ docs/process.md                # §3's gate list
 
 - `scripts/docstring-lint.py`, the four checks, stdlib only, resolving its own root.
 - The one-line module docstring for `src/log_foundry/sinks/__init__.py`.
-- Register it in `CLAUDE.md`'s Common Commands and gate list, and in `docs/process.md` §3.
+- Register it in `CLAUDE.md`'s Common Commands and gate list, and in `docs/process/session-rhythm.md`.
 - Confirm it exits 0 against `src/` — and treat that as proof of nothing until Phase 3.
 
 ### Phase 3: The corpus

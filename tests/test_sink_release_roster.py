@@ -645,7 +645,7 @@ _LATCH_DISPOSITIONS = {
 """What each close site does about the closed-sink latch, and why (SPEC-044 FR-004 AC-2).
 
 FR-004's finding was a close site that recorded nothing, so fixing the cited line and moving on
-is how the ninth one recurs — the "re-audit the rule, not the line" discipline `docs/process.md`
+is how the ninth one recurs — the "re-audit the rule, not the line" discipline `docs/process/reviewer-contract.md`
 draws from SPEC-033, where three reviewers each named a different site and a fourth shipped.
 
 The population is derived, not listed: it is the same `_release_call_sites()` the roster above

@@ -3,7 +3,7 @@
 One page, numbered, loaded before a spec is written and before a diff is reviewed. Each entry is a
 promise stated as an **observable** — something a probe can measure and a test can assert — with
 where the exceptions to it are recorded and where it is guarded today. It is not the decisions
-register (`decisions.md` holds the *fences*: what was built, what was rejected and why) and it is
+register (`docs/decisions/` holds the *fences*: what was built, what was rejected and why) and it is
 not the constraints list (`architecture.md` §13 holds what the design accepts it cannot do). A
 fence explains a mechanism; an invariant is what every mechanism, present and future, must keep.
 
@@ -12,11 +12,11 @@ fence explains a mechanism; an invariant is what every mechanism, present and fu
 this page lacks; an FR that keeps no invariant says so with the exact phrase `serves no invariant`,
 and the template gives the spellings.
 The second diff reviewer — the one that starts from the system rather than the change
-(`process.md` §3) — starts from this page: for each invariant the diff touches, it asks whether
+(`docs/process/reviewer-contract.md`) — starts from this page: for each invariant the diff touches, it asks whether
 the change keeps it on **every twin path** (invariant 6), not only the one the spec names. An
 audit's "not covered" list is a list of invariants nobody has measured lately. A *behavioural*
 finding that breaks no invariant here is a candidate for a new one; prose, lint and hygiene
-findings are judged by their own rules (`process.md` §5).
+findings are judged by their own rules (`docs/process/completion-ritual.md`).
 
 **Where an open defect against an invariant lives:** `architecture.md` §12, never here. This page
 states what is true when the library is correct; it does not carry a changelog.

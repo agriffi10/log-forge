@@ -248,7 +248,7 @@ about re-arming, and two mechanisms that contradict it are retired, said out lou
 
 - **The closed-sink latch** (`_orphan_closed_sink`, SPEC-033 FR-001, SPEC-044 FR-004) refused
   re-arming for the *most recently* closed sink only — SPEC-044 FR-004's own text records that
-  "after closing A then B, A is forgettable and re-armable again" — and `decisions.md` describes
+  "after closing A then B, A is forgettable and re-armable again" — and `docs/decisions/` describes
   the same slot as naming "a sink a swap left *open*", which is a different claim. Under one
   record an emit that lands re-arms, always; what the latch protected against — a close performed
   against a sink the drain thread may still be inside — is answered at close time by the moment
@@ -447,7 +447,7 @@ where an abandoned drain must count as still inside so the sink is left open (SP
 Both were measured on the expired-shutdown state: SPEC-033 FR-002 closing under a live writer,
 SPEC-035 FR-001 the fresh event never arriving. `worker_owns` and `worker_owns_now` are deleted. This supersedes the four-question set of SPEC-035 FR-002 and
 SPEC-040 FR-002 and the "ownership, not liveness" slogan, and says so where those are recorded:
-arch §9.2, `decisions.md`'s guard entry, and the roster test's own docstring.
+arch §9.2, `docs/decisions/`'s guard entry, and the roster test's own docstring.
 
 The roster (`tests/test_worker_predicate_roster.py`) loses its 10 ownership rows and 3 ownership
 ∧ moment rows and gains the `in_flight` site. Its per-module floor is **re-derived from the
@@ -466,9 +466,9 @@ lint exists to catch. The three limitations the roster discloses about itself ar
       were measured at.
 - [ ] Deleting any one question's use at any one site fails the roster with that site named.
       Proven by planting three mutants, one per category.
-- [ ] arch §9.2's table has three rows; `decisions.md`'s entry *A worker guard asks one of four
-      questions* carries a superseded marker pointing here and its heading, Contents row and
-      digest label move together (`docs-lint.sh` fails otherwise).
+- [ ] arch §9.2's table has three rows; the entry *A worker guard asks one of four questions* in
+      `docs/decisions/pipeline.md` carries a superseded marker pointing here, and its heading,
+      Contents row and fence label move together (`docs-lint.sh` fails otherwise).
 - [ ] `tests/test_lifecycle_races.py::test_no_close_or_drain_is_performed_under_the_lifecycle_lock`
       passes against the merged closer. Invariant 3.
 
@@ -635,8 +635,9 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
 
 ### Phase 4: The record (FR-004's documentation half, and the ritual)
 
-- arch §9.2 to three questions; superseded markers in `decisions.md` (guard entry) and the
-  digest line, with heading, Contents row and label moved together; `docs/invariants.md` §6's
+- arch §9.2 to three questions; a superseded marker on the guard entry in
+  `docs/decisions/pipeline.md`, with heading, Contents row and fence label moved together;
+  `docs/invariants.md` §6's
   first clause narrowed; §12's two open items updated (one closed, one narrowed).
 - Delivery doc with the re-derived floor counts, the `submit` delta, the widened model-test run,
   and both probes' final output.
@@ -656,7 +657,7 @@ seed — and re-derives the roster floor for the sites it moved. The plan decide
   unchanged, and is the reason a bystander waits on *every* in-flight event rather than one.
 - **A refactor silently shrinks a derived guard.** Three lints are keyed on names this spec
   deletes. Each phase re-keys them and plants a mutant; a green suite after a rename is not
-  evidence (SPEC-040's own history, recorded in `decisions.md`).
+  evidence (SPEC-040's own history, recorded in `docs/decisions/`).
 - **Two closes that used to be one.** FR-002 changes two observable counts from 1 to 2: a late
   worker built during the first pass's close (SPEC-044 FR-001's third race test), and a sink
   written to after a completed close. Both are SPEC-045 FR-002's rule applied to the sites that

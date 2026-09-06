@@ -15,11 +15,13 @@ Closes #<!-- issue number -->
 
 ## Review (before this branch was pushed)
 - [ ] **Two** fresh-context reviews of this diff, in **different frames**, before the push — every
-      diff gets two, including a spec-only or docs-only one (`docs/process.md` §3 names the two
+      diff gets two, including a spec-only or docs-only one (`docs/process/reviewer-contract.md` names the two
       frames for a diff with no code in it). The single review a spec or plan gets is the earlier
       gate on the artifact, not this one.
 - [ ] Every finding **fixed or flagged** out loud; nothing dropped silently
 - [ ] Any acceptance criterion that could not settle pre-push is listed under **Owed** below
+- Implementer model: **Opus | Fable** — if any code here was written or rewritten on Fable, the
+      build frame ran on Fable too (`docs/process/model-routing.md`); edit this line, it is a claim
 
 ### Owed (criteria that can only settle on the green run)
 <!-- One line each, or "none". These block the merge, not the push. Edit this line —
@@ -36,6 +38,7 @@ Closes #<!-- issue number -->
 - [ ] Code follows the project's style and conventions
 - [ ] `ruff`, `mypy`, `pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh` and `poetry run python scripts/docstring-lint.py` pass
 - [ ] The matching `-test.sh` corpus passes (only if you changed that linter)
+- [ ] Any gate this PR adds ships fixtures asserting its failure text, including a silence case
 - [ ] Documentation updated if applicable
 - [ ] No unrelated changes included
 

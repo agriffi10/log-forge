@@ -60,5 +60,5 @@ work introduced (`json.dumps` hoisted out of the `try`: 2 of 5 delivered, 6 dupl
 criterion that could not fail (`DEFAULT_PUBLISH_TIMEOUT` mutable to `0.02`, whole suite green).
 
 **Not done, deliberately:** no `## Specs` paragraph in `CLAUDE.md`. Prior completions added one,
-but that section is the spec-ordered changelog shape `process.md` §5 names as an unpaid obligation,
+but that section is the spec-ordered changelog shape `docs/process/completion-ritual.md` names as an unpaid obligation,
 and its rule is to *extend the clause for its area* instead — which the Key Decisions edit does.

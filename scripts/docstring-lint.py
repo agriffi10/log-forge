@@ -8,7 +8,7 @@ beside it told authors that reasoning which would have been an inline comment be
 the docstring, and the code followed the second sentence. Measured at 451edf9, before
 SPEC-052 re-scoped the cap: 158 of 506 documented defs exceeded it on the narrowest
 reading of "description" and 492 on the widest. A rule practice violates that consistently
-gets reconciled or deleted (process.md section 5), so the cap moved to the summary line —
+gets reconciled or deleted (`docs/process/completion-ritual.md`), so the cap moved to the summary line —
 where the codebase already complied everywhere — and this script is what stops the
 re-scoped rule going the same way.
 

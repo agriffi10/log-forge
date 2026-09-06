@@ -34,7 +34,7 @@ per-event path a hazard rather than a wart.
 - Exporting the names a public signature already uses, and `DEFAULT_SWAP_TIMEOUT`.
 - Typing the keywords the seven HTTP platform sinks forward to `HTTPSink`.
 - Correcting the two public docstrings that describe a `Health` the code no longer has, and
-  recording two decisions in `docs/decisions.md`.
+  recording two decisions in `docs/decisions/`.
 - A typed-consumer probe in the suite: a module type-checked by `mypy --strict` in a subprocess,
   because a test that only exercises the library from inside the library cannot see an invariance
   defect or a keyword-only signature at all.
@@ -235,7 +235,7 @@ recorded so the next audit reads a decision rather than re-finding an omission.
 - [ ] A **derived** test asserts `health()`'s `Returns:` block names every field of `Health`,
       taken from `dataclasses.fields(Health)` rather than a written list, so the next field
       appended fails it until it is documented.
-- [ ] `docs/decisions.md` carries an entry for the API freeze — keyword-only construction, the
+- [ ] `docs/decisions/` carries an entry for the API freeze — keyword-only construction, the
       mapping parameters, the exports, and the worker tunables as an explicit "do NOT build" —
       and one for the sink constructor surface: the parameter names frozen as the vendor spells
       them, and the forwarded keywords typed.
@@ -377,7 +377,7 @@ tests/
     ├── accepts.py             # must type-check clean
     └── rejects.py             # must be rejected, with the planted messages
 docs/
-├── decisions.md               # two entries + two Contents rows
+├── decisions/               # two entries + two Contents rows
 └── specs/INDEX.md             # the row, and the 1.0 cut line naming this spec
 ```
 
@@ -410,5 +410,5 @@ docs/
 
 - `tests/typed_consumer/accepts.py` and `rejects.py`, and the subprocess runner.
 - Defeat each half in turn and confirm it reddens.
-- The two `docs/decisions.md` entries, their Contents rows, and one Key Decisions line each.
+- The two `docs/decisions/` entries, their Contents rows, and one Key Decisions line each.
 - Completion ritual: status, `INDEX.md` row and cut line, delivery doc.

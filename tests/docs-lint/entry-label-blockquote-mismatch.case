@@ -5,30 +5,41 @@
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Alpha rule](#alpha-rule)
+
+## Fences
+
+- **Alpha rule** — short claim and its fence.
 
 ---
 
-## Area one
-
 ### Alpha rule
 
-> Superseded 2026-09-02 by SPEC-999. The marker sits directly under the heading, which is
-> where the completion ritual puts it — and superseding is when a heading gets renamed.
+> Superseded by SPEC-002; the full entry is below.
 
-**Beta rule** — the heading was renamed and this label was left behind.
+**Beta rule** — the marker is skipped, and the stale label under it is not.

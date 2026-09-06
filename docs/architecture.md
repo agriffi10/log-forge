@@ -336,7 +336,7 @@ that a leaked resource in a running process beats a close raced against a write.
 > gets. An expired `shutdown()` still leaves it open, because the thread is still live, and the
 > next call performs the close instead. What changed the decision was measuring the cost: for a
 > sink whose `close()` *is* the delivery, "left open" is nine events lost, not a leaked handle.
-> Full entry in `decisions.md` under *The sink contract: waiting, concurrency and shutdown*.
+> Full entry in `docs/decisions/sink-lifecycle.md`.
 
 Passing the sink already live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
 updated and the retirement signals (§9) continue to apply — but the sink adopted by that call is
@@ -928,7 +928,7 @@ close it.
   exact `str` measured through `str.__str__`, which reaches `function`, `message`, `fields`
   (keys and values), baggage, `defaults` and the `error` sub-document on both paths, and so
   every sink the entry listed. The four prose sites that asserted the pass-through were
-  reworded with the fix. Full reasoning: `decisions.md` ("An event is safe by construction").
+  reworded with the fix. Full reasoning: `docs/decisions/event-assembly.md` ("An event is safe by construction").
 - ~~**`service`, `version` and `env` reach the event without passing through `sanitize`**~~
   (invariant 8) → **half fixed in SPEC-055 FR-001, half recorded**. `configure()` now refuses a
   stamp that is not a `str` (`TypeError`) or does not encode as UTF-8 (`ValueError`), naming the
@@ -1003,8 +1003,8 @@ close it.
 alternative was built and measured worse, or because fixing it would change a published contract.
 It is **not** a backlog: something genuinely unfinished belongs in §12, which names what would
 close it. A closed item is struck in place with the spec that closed it (SPEC-021's rule) and its
-reasoning is *not* repeated here — that lives in `decisions.md` (digested in CLAUDE.md's Key
-Decisions) and the delivery doc,
+reasoning is *not* repeated here — that lives in `docs/decisions/` (its area file opens with the fence, and CLAUDE.md's Key
+Decisions table names the area) and the delivery doc,
 and a third copy is a fork with no merge.
 
 - **`flush()` reports success over events `NATSSink`'s publish deadline absorbed.** Measured with
@@ -1072,7 +1072,7 @@ and a third copy is a fork with no merge.
 
 - ~~**A process that only ever used the orphan path never closes its sink**, and a sink
   adopted after `shutdown()` is closed by nothing.~~ — **fixed by SPEC-031 FR-006 and
-  SPEC-033.** The reasoning is in `decisions.md` ("The close is once-only across
+  SPEC-033.** The reasoning is in `docs/decisions/pipeline.md` ("The close is once-only across
   both delivery paths" and "A sink handoff is owned by whoever is delivering") and in
   [SPEC-031](spec-delivery/SPEC-031-audit-small-corrections.md) and
   [SPEC-033](spec-delivery/SPEC-033-orphan-path-sink-handoff.md); it is not repeated here.
@@ -1304,7 +1304,7 @@ and a third copy is a fork with no merge.
   these: it writes its queue-full line *outside* its own lock for exactly this reason, which is
   the shape to copy if a fourth site ever sits on a hot path. Found as C5 by the 2026-08-07
   audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
-  (`docs/process.md`) found the third.
+  (`docs/process/reviewer-contract.md`) found the third.
 
 - **A fork's repair stops at the library's own objects, and five things sit outside it**
   (SPEC-039 FR-005). The child's walk descends into what this package defines and the plain
@@ -1492,8 +1492,8 @@ and a third copy is a fork with no merge.
   reproduced byte-identically on the pre-SPEC-040 tree, so the refactor caused none of them.
   The sixth is the `shutdown(timeout=…)` limit stated above and is not repeated here. What each
   race was, and the depth counter, close registry and latch that closed them, is in
-  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and `decisions.md` →
-  "A worker guard asks one of four questions". It is not in CLAUDE.md: the digest line for that
+  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and `docs/decisions/pipeline.md` →
+  "A worker guard asks one of four questions". It is not in CLAUDE.md: the fence for that
   entry names none of the three.
 
 - **On macOS a forked child dies of `SIGSEGV` if it finalizes an inherited, unclosed

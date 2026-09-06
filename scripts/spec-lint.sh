@@ -29,7 +29,7 @@ SPEC_DIR="${1:-docs/specs}"
 INVARIANTS="$(dirname "$SPEC_DIR")/invariants.md"
 
 # Above this many FRs, a spec has usually stopped being one buildable slice and
-# wants splitting into two specs recorded as an arc (docs/process.md §4).
+# wants splitting into two specs recorded as an arc (`docs/process/authoring-a-spec.md`).
 FR_CEILING=8
 fail=0
 warn=0
@@ -61,7 +61,7 @@ fi
 # than passing as "a number was written". A MISSING page fails outright, and fails here
 # rather than per spec: the page is this check's input, and a check whose input has
 # vanished must be loud — a run that goes quiet when its evidence disappears is the
-# shape docs/process.md §3 names as a green run over nothing.
+# shape `docs/process/reviewer-contract.md` names as a green run over nothing.
 inv_numbers=""
 if [ -f "$INVARIANTS" ]; then
   inv_numbers=$(awk '
@@ -106,7 +106,7 @@ for f in $specs; do
 
   # --- FAIL: an FR of a live spec names no invariant, or names one the page lacks ---
   #
-  # docs/process.md §4 and the spec template say every FR's Acceptance Criteria name the
+  # `docs/process/authoring-a-spec.md` and the spec template say every FR's Acceptance Criteria name the
   # invariant(s) it serves, by number from docs/invariants.md, so the system-frame diff
   # reviewer knows which promise to check on every twin path. This is that rule where a
   # script can see it — a rule with no gate is a rule that rots (CLAUDE.md, Working rules).

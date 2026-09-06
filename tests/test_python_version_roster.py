@@ -35,7 +35,7 @@ rather than another check. The structural answer is this paragraph: the roster e
 every *restatement* matches the matrix, not that the matrix ran.
 
 The sites are **derived where they can be** rather than hand-kept, for the reason
-`docs/decisions.md` gives for the SPEC-035 and SPEC-040 rosters: "a roster that hand-lists
+`docs/decisions/working-rules.md` gives for the SPEC-035 and SPEC-040 rosters: "a roster that hand-lists
 anything — sites or tokens — rots". The workflow pins are found by globbing
 `.github/workflows/`, so a workflow added tomorrow is covered the day it lands rather than the day
 someone remembers this file. The three prose sites cannot be derived — prose has no schema — so

@@ -14,7 +14,7 @@
   the query that answers it.
 - **`scripts/docstring-lint.py`** — four checks over `src/log_foundry`, standard library only, a
   local pre-push gate like `docs-lint.sh`. Registered in all five places that list gates; two of
-  them (`process.md`'s reviewer list and `.github/PULL_REQUEST_TEMPLATE.md`) had already drifted by
+  them (`docs/process/reviewer-contract.md`'s reviewer list and `.github/PULL_REQUEST_TEMPLATE.md`) had already drifted by
   omitting `docs-lint.sh`.
 - **`scripts/docstring-lint-test.sh` + `tests/docstring-lint/`** — the fixture corpus, with one
   failing case per terminating condition, a silence case per check and per exemption, a
@@ -46,7 +46,7 @@ sitting in the same file as the sentence naming it. All three criteria now deriv
 
 - `CLAUDE.md`'s Code Conventions bullet is rewritten; three of its claims were false.
 - The **Review paragraph** in Session Workflow is cut to its rules, with the measured evidence left
-  in `docs/process.md` §3, which it already pointed at. Every rule was verified present afterwards by
+  in `docs/process/reviewer-contract.md`, which it already pointed at. Every rule was verified present afterwards by
   enumerating the whole population, not by reading. This bought the byte-budget room the rule change
   needed without pruning any area's fences — two other sessions were blocked on the same 34,000-byte
   cap at the time.

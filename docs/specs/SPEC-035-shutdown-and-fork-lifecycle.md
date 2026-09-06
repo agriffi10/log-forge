@@ -85,7 +85,7 @@ That is SPEC-027's global pause, reintroduced by the spec that was supposed to e
 guarantee to this path.
 
 **This is the fourth time this distinction has been got wrong**, and the process change in
-`docs/process.md` ("re-audit the rule, not the line") exists because of it. Three reviewers each
+`docs/process/reviewer-contract.md` ("re-audit the rule, not the line") exists because of it. Three reviewers each
 named a different call site; each was fixed; this one shipped. So the fix is not a fourth
 one-line correction — it is FR-002's enumeration.
 

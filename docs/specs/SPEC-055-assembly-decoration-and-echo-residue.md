@@ -472,7 +472,7 @@ tests/
 └── test_sinks_kinesis.py      # FR-001: one docstring
 docs/
 ├── invariants.md              # the Guarded lines for 8, 11, 13; a Recorded exception on 8 for the stamps
-├── decisions.md               # event-assembly area extended; one trace-model entry; one diag entry
+├── decisions/               # event-assembly area extended; one trace-model entry; one diag entry
 ├── architecture.md            # §12: the two entries 02a8ac5 files, struck in place; §6 auto-capture line
 ├── specs/SPEC-048-*.md        # FR-001: the surrogate claim, struck in place
 ├── spec-delivery/SPEC-048-*.md  # same
@@ -515,7 +515,7 @@ README.md                      # the @trace section: name fallback, refusals; th
 
 - `invariants.md`: Guarded lines for 8, 11 and 13; the stamp exemption on invariant 8's Recorded
   exceptions.
-- `decisions.md` entries and the CLAUDE.md digest.
+- `docs/decisions/` entries and their fences.
 - `architecture.md` §12: if `02a8ac5` has landed, strike its two entries in place with this
   spec; if it has not, its author strikes them on rebase, and the PR body says so.
 - Delivery doc; INDEX row.

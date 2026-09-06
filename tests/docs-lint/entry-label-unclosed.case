@@ -1,32 +1,44 @@
 @@@ expect exit=1
 @@@ match "### Alpha rule" opens its body with a
-@@@ match that never closes.
+@@@ match An unclosed label yields no label at all
 @@@ file CLAUDE.md
 # Project
 
 ## Key Decisions
 
-One line each; the full entry lives in the register.
+Intro prose; every decision is a fence in its area file.
 
-### Area one
-
-- **Alpha rule** — short claim and its fence.
+| Area | Fences |
+|---|---|
+| Area one | `docs/decisions/area-one.md#fences` |
 
 ## Out of Scope
 
 nothing
+@@@ file docs/decisions/INDEX.md
+# Key Decisions — the register
 
-@@@ file docs/decisions.md
-# Key Decisions — full register
+## Areas
+
+| Area | Fences | Governs |
+|---|---|---|
+| Area one | `docs/decisions/area-one.md#fences` | none |
+@@@ file docs/decisions/area-one.md
+# Area one — decisions
+
+intro
 
 ## Contents
 
+- [Fences](#fences)
 - [Alpha rule](#alpha-rule)
+
+## Fences
+
+- **Alpha rule** — short claim and its fence.
 
 ---
 
-## Area one
-
 ### Alpha rule
 
-**Alpha rule — the label opens and is never closed, so it yields no label at all.
+**Alpha rule — the label never closes, so nothing is compared against the heading.

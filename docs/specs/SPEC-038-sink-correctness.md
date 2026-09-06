@@ -232,7 +232,7 @@ exception reaches the worker instead of `SinkDeliveryError`.
       server.
 - [ ] AC-4: The same audit is applied to every other sink's error path, derived from the roster:
       no cleanup call inside an `except` may be unguarded. This is FR-002 as a *rule*, per
-      `docs/process.md`.
+      `docs/process/reviewer-contract.md`.
 
 ### ~~FR-003: `PostgresSink` recovers from a broken connection~~ — moved to SPEC-041
 
