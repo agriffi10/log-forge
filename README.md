@@ -1360,8 +1360,8 @@ failure lands on whoever caused it rather than on a shared branch. Contributors 
 with `scripts/spec-lint.sh`, before pushing.
 
 On a push to `main` the full `ci.yml` matrix still runs, but as the first job of
-[`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it is
-allowed to publish — so on main the checks are listed under the *Release* workflow, named
+[`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it would
+be allowed to publish — so on main the checks are listed under the *Release* workflow, named
 `test / test (py3.12)` and `test / test (py3.13)`. `ci.yml` deliberately carries no `push`
 trigger of its own; it had one, and the result was that every merge ran the identical matrix
 twice. A `v*` tag is gated the same way, by that same reusable call.
@@ -1418,12 +1418,14 @@ sdist and a wheel:
 
 | Trigger | Version built | Published to PyPI as |
 |---|---|---|
-| merge to `main` | `X.Y.Z.devN` | dev pre-release |
+| merge to `main` | `X.Y.Z.devN` | **nothing, for now** — `publish-dev` is disabled |
 | push tag `vX.Y.Z` | `X.Y.Z` | stable release |
 
-Dev pre-releases keep the upload path exercised on every merge, so a real release is never the
-first time it runs. `pip install log-foundry` still resolves to the latest **stable** version —
-pip ignores pre-releases unless you pass `--pre`.
+Dev pre-releases **kept** the upload path exercised on every merge, so a real release was never
+the first time it ran. That property is suspended along with the job: the next `vX.Y.Z` tag is
+the first attempt at the upload path since `publish-dev` was disabled. `pip install log-foundry`
+resolves to the latest **stable** version either way — pip ignores pre-releases unless you pass
+`--pre`.
 
 Cutting a release is one tag:
 

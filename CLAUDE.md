@@ -100,7 +100,8 @@ Uninstalling is not enough: `azure/` and `google/` leave namespace directories b
 still reads as installed. `poetry env remove --all && poetry install --with dev` is the fix.
 
 **Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
-Merges to `main` publish a `X.Y.Z.devN` pre-release. Never add a `version` key to `pyproject.toml`.
+Merges to `main` publish no `.devN` for now (`publish-dev` disabled in `release.yml`, which says
+why). Never add a `version` key to `pyproject.toml`.
 `poetry-dynamic-versioning` rewrites `pyproject.toml` in place whenever it resolves a version —
 `python -m build` **and** `poetry install` with the plugin active — and the round-trip reorders keys
 (it moves `[tool.poetry] version` out from under its comment). Harmless but noisy: `git checkout --
@@ -189,7 +190,7 @@ for an area before working in it. A line here is **never the only home of a fact
 
 ### Release, supply chain and naming
 
-- **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases; merges to `main` publish `.devN` pre-releases. (SPEC-012)
+- **Version comes from Git tags, published to PyPI as `log-foundry`** — tags cut releases; merges to `main` publish **no** `.devN` for now (`publish-dev` off). (SPEC-012)
 - **Every action is pinned to a commit SHA, and the pins are maintained, not frozen** — a mutable tag on a workflow holding `id-token: write` against PyPI is a silent path from a third-party repository into every consumer's install. A lagging pin fails loudly; a compromised action fails forever. The version comment must read exactly `# vX.Y.Z` or Dependabot silently stops rewriting the pin — that comment is what "maintained" rests on. (SPEC-022)
 - **A scanner that exits zero has not said "clean"** — the alert count is the verdict, never the check mark — zizmor and CodeQL pass the job regardless of findings by design, and only `dependency-review` fails a build. (SPEC-022)
 - **An SBOM describes the published artifact, and is generated from it** — `make-sbom.py` describes the built wheel installed with every extra, and runs from a *second* venv or it lists its own ~30 dependencies as the library's. (SPEC-023)

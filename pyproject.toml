@@ -30,9 +30,11 @@ dependencies = [
 classifiers = [
     # Asserts what the NEXT STABLE TAG will be, not what the current version is. Safe only
     # because PyPI's default project page renders the latest stable release, which is still
-    # `v0.10.1` and carries none of this; the artifacts carrying it in the meantime are the
-    # `.devN` pre-releases that SECURITY.md declares unsupported and that `pip install` does
-    # not select. Their own per-version pages DO show it, so this is narrow, not free.
+    # `v0.10.1` and carries none of this. The artifacts that carried it in the meantime were the
+    # `.devN` pre-releases SECURITY.md declares unsupported and `pip install` does not select;
+    # their own per-version pages DO show it, so this was narrow rather than free. With
+    # `publish-dev` disabled no new artifact carries it at all, which narrows the exposure
+    # further — the claim is not more true, it just reaches nobody until the next tag.
     # Revisit if the next stable tag is not `v1.0.0`: README still says three public shapes
     # change once, before the API is frozen, and Production/Stable on the default page would
     # then contradict it.
