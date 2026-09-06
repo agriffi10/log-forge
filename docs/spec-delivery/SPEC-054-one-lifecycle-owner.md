@@ -52,7 +52,8 @@ are unchanged):
   sink (SPEC-044 FR-002); those now stay owed until the `configure()` that supersedes them, or exit.
 - **A worker-path `shutdown()` no longer pays the grace for an orphan close** it never touched
   (SPEC-050 FR-002's process-wide gate, measured at 2.007 s wall for an unrelated sink).
-- `Worker.shutdown` → `stop`, `Worker.swap_sink` → `retarget`. Internal; 169 call sites in tests.
+- `Worker.shutdown` → `stop`, `Worker.swap_sink` → `retarget`. Internal; 169 worker-receiver
+  `.shutdown(` call sites in `tests/` at `3a4d337`, counted over that tree.
 
 ## What the build found that the spec and the plan did not
 
@@ -95,15 +96,20 @@ change that is +3 ns, which was a deque growing to a million entries inside the 
 
 **The roster floor is re-derived, not lowered.** `log_foundry._lifecycle` 46 → 42, accounted for
 per scope in `_SITE_FLOOR`'s docstring by deriving the site list from both trees and diffing it.
-Categories: 25 existence, 14 liveness, 7 moment.
+Categories: 22 existence, 14 liveness, 8 moment.
 
 **Ten mutants planted and killed**, one at a time, in place: three roster categories (FR-004 AC-3),
 a record rebind and an out-of-transition clear (FR-002 AC-6), the fork opt-out (FR-006 AC-1), a
 ninth direct close (FR-003 AC-7), plus the three guards this build added — the bystander wait, the
 swap's `held` term, and the registration discharge.
 
-**Test names diffed from `--collect-only` on both refs, never pass counts**: 2563 → 2572, every
-difference either a rename that restates a superseded claim or one of the nine tests the criteria
-name and `tests/` did not have — `threading.get_ident()` inside `close()` on both paths, the
-four-sink fan-out on the worker path, the no-close-in-flight CPU bound, the `KeyboardInterrupt`
-during the fan-out, the stranded close past the grace, and FR-002 AC-5's two racing shutdowns.
+**Test names diffed from `--collect-only` on both refs, never pass counts**: 2563 → 2572, over the
+whole change — 22 names added, 13 removed, **net 9**, and each of the 13 removals pairs with an
+addition that restates the claim its old name made. The nine net-new tests are the ones the
+criteria name and `tests/` did not have: `threading.get_ident()` inside `close()` on each path
+(2), the four-sink fan-out on the worker path, the no-close-in-flight wall-and-CPU bound, the
+`KeyboardInterrupt` during the fan-out, the stranded close past the grace, FR-002 AC-5's two
+racing shutdowns, and FR-001 AC-2's second shutdown stranding the late worker's next submission.
+FR-005 AC-3's worker-path `inherited_sink` test is the tenth addition; it nets out against
+`test_the_worker_waits_for_the_swapped_out_close_it_started`, which became
+`test_the_swap_waits_...` when the close moved to the owner.
