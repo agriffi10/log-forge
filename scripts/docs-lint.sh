@@ -848,10 +848,15 @@ done
 # sentence it replaces. This check catches the BARE universal, which is the one spelling that
 # recurred; the contrapositive ("an unmarked sink is claimable") and the possessive ("the
 # `_FOREIGN` stamp `_mark_inherited` set") carry no universal and are out of reach by construction.
-if ! command -v python3 >/dev/null 2>&1; then
-  note "check 11 (the marking walk) needs python3 and it is not on PATH — the check did NOT run."
-else
-  python3 - . >> "$FAILS" 2>/dev/null <<'PYEOF' || note "check 11 (the marking walk) failed to run; its findings, if any, are NOT in this report."
+# ONE branch, not two, and that is a testability decision. The obvious spelling guards a
+# `command -v python3` and reports a missing interpreter separately from a failing one — but the
+# absent-interpreter branch cannot be reached from the fixture harness without unbuilding PATH far
+# enough to take `grep` and `awk` with it, so it would ship untested, which is the state this
+# check exists to argue against. Collapsed to one invocation, a missing python3 exits 127 and a
+# broken one exits non-zero, and both land on the same `note` — which a self-test in
+# docs-lint-test.sh reaches with a python3 shim that fails. The report is a FAIL either way: a
+# check that could not run must never read as a check that found nothing.
+python3 - . >> "$FAILS" 2>/dev/null <<'PYEOF' || note "check 11 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
 """SPEC-053 FR-001. Reads the tree given as argv[1]; prints FAIL lines; never exits non-zero."""
 import ast
 import os
@@ -1015,7 +1020,6 @@ def main(root):
 
 main(sys.argv[1])
 PYEOF
-fi
 
 
 report

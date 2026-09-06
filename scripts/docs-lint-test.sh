@@ -225,3 +225,43 @@ Reasoning.'
   fi
   echo "docs-lint-test: fixture guards verified — 3 guards, $planted vacuous cases refused."
 fi
+
+# ── self-test: a check that could not RUN must not read as a check that found nothing ──
+#
+# Check 11 is the one check here that shells to another interpreter, so it is the one that can
+# stop working without any of its logic changing. It has no `command -v` guard on purpose (the
+# comment beside it says why): a missing python3 and a broken one both exit non-zero and land on
+# the same `note`. This is the only way to reach that line, and it cannot be a .case — the harness
+# runs docs-lint.sh with the ambient PATH and a fixture cannot change it.
+#
+# The positive control is the point. Asserting only that the shimmed run reddens would pass on a
+# fixture tree that was dirty for some unrelated reason, so the same tree is run BOTH ways: clean
+# with a working python3, red with a broken one, and red for THIS reason.
+if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ]; then
+  PYT="$WORK.py3"
+  rm -rf "$PYT"; mkdir -p "$PYT/bin" "$PYT/tree/scripts"
+  cp "$ROOT/scripts/docs-lint.sh" "$PYT/tree/scripts/docs-lint.sh"
+  printf '# Project\n\n## Key Decisions\n\nOne line each.\n\n### Area one\n\n- **Alpha rule** — short claim.\n' > "$PYT/tree/CLAUDE.md"
+  mkdir -p "$PYT/tree/docs"
+  printf '# Key Decisions — full register\n\n## Contents\n\n- [Alpha rule](#alpha-rule)\n\n---\n\n## Area one\n\n### Alpha rule\n\nReasoning.\n' > "$PYT/tree/docs/decisions.md"
+  printf '#!/bin/sh\nexit 127\n' > "$PYT/bin/python3"
+  chmod +x "$PYT/bin/python3"
+
+  control=$(cd "$PYT/tree" && sh scripts/docs-lint.sh 2>&1) && control_rc=0 || control_rc=$?
+  shimmed=$(cd "$PYT/tree" && PATH="$PYT/bin:$PATH" sh scripts/docs-lint.sh 2>&1) && shim_rc=0 || shim_rc=$?
+  rm -rf "$PYT"
+  py_fail=0
+  [ "$control_rc" -eq 0 ] || { echo "FAIL  self-test: the control tree is not clean with a working python3."; py_fail=1; }
+  [ "$shim_rc" -ne 0 ] || { echo "FAIL  self-test: a python3 that cannot run left docs-lint.sh exiting 0."; py_fail=1; }
+  case "$shimmed" in
+    *"did not run — python3 is missing or the check failed"*) ;;
+    *) echo "FAIL  self-test: a broken python3 did not produce check 11's did-not-run report."; py_fail=1 ;;
+  esac
+  if [ "$py_fail" -ne 0 ]; then
+    echo "----"
+    echo "docs-lint-test: check 11 can stop running without saying so. A gate that goes quiet when"
+    echo "its interpreter is absent is indistinguishable from a gate that found nothing."
+    exit 1
+  fi
+  echo "docs-lint-test: check 11 reports a broken interpreter rather than skipping."
+fi
