@@ -39,6 +39,20 @@ def _span(msg) -> list[dict]:
     return [{"message": msg}]
 
 
+def _retire(worker, timeout: float | None = 30.0) -> None:
+    """Retires the process through the lifecycle owner, which is where the latch now lives.
+
+    SPEC-054 FR-001 moved retirement off ``Worker``: a worker's own stop ends its thread and
+    nothing more, and what makes a later submission *undeliverable* is the **process** having
+    retired. So a test about post-shutdown submissions installs the worker it built as the
+    process worker and drives the real ``_lifecycle._shutdown_worker``, rather than moving the
+    count by hand — a helper that reproduced the production expression would pass against a
+    broken one, which is the whole hazard here. ``conftest``'s reset clears both again.
+    """
+    _lifecycle._state._worker = worker
+    _lifecycle._shutdown_worker(timeout)
+
+
 class RecordingSink:
     def __init__(self) -> None:
         self.batches: list[list[dict]] = []
@@ -902,8 +916,8 @@ def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
     """
     w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
-    h = w.health()
+    _retire(w)
+    h = log_foundry_mod.health()
 
     # Values, not types: `X == X` and `isinstance(x, int)` are true of anything the annotation
     # already promises, and the first version of this test asserted exactly that -- residue of
@@ -911,7 +925,7 @@ def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
     assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
     assert h.stopped_reason is None, "a clean shutdown is not a failure (SPEC-019)"
     assert h.sink is None, "RecordingSink reports no losses"
-    assert h.retired is True, "shutdown() was called two lines above"
+    assert h.retired is True, "shutdown() was called three lines above"
     assert (h.submitted_after_shutdown, h.incomplete_swaps, h.closing_sinks) == (0, 0, 0)
 
     with pytest.raises(TypeError):
@@ -1611,9 +1625,9 @@ def test_a_clean_shutdown_reports_retired_with_a_zero_count() -> None:
     """Correct usage: shut down, then stop logging. Retired is a state, not yet a fault."""
     w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
+    _retire(w)
 
-    h = w.health()
+    h = log_foundry_mod.health()
     assert h.retired is True
     assert h.submitted_after_shutdown == 0
 
@@ -1622,12 +1636,12 @@ def test_submissions_after_shutdown_are_counted() -> None:
     """The measured defect: three submissions delivered nothing and every counter read zero."""
     sink = RecordingSink()
     w = Worker(sink, batch_size=1)
-    w.shutdown()
+    _retire(w)
 
     for i in range(3):
         w.submit(_span(i))
 
-    h = w.health()
+    h = log_foundry_mod.health()
     assert h.submitted_after_shutdown == 3
     assert h.retired is True
     assert sink.events == [], "the worker is retired; nothing drains these"
@@ -1701,7 +1715,7 @@ def test_decorated_calls_after_a_module_shutdown_are_counted() -> None:
 
 def test_the_first_post_shutdown_submission_warns_once(capsys) -> None:
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     capsys.readouterr()  # discard anything shutdown itself wrote
 
     w.submit(_span("a"))
@@ -1717,7 +1731,7 @@ def test_the_first_post_shutdown_submission_warns_once(capsys) -> None:
 def test_the_post_shutdown_warning_is_throttled(capsys) -> None:
     """2,500 submissions must produce exactly 3 lines (1, 1000, 2000), as overflow does."""
     w = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
-    w.shutdown()
+    _retire(w)
     capsys.readouterr()
 
     for i in range(2500):
@@ -1745,7 +1759,7 @@ def test_the_post_shutdown_warning_never_reaches_the_caller(monkeypatch) -> None
             raise ValueError("I/O operation on closed file")
 
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     monkeypatch.setattr("sys.stderr", BrokenStderr())
 
     w.submit(_span("a"))  # warns -> stderr raises internally -> must not escape
@@ -1762,7 +1776,7 @@ def test_the_post_shutdown_counter_survives_an_announcement_that_detonates(monke
     and here the exception reaches the application's own thread on its way out.
     """
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     monkeypatch.setattr(sys, "stderr", _DetonatingStderr())
 
     with pytest.raises(_Detonation):
@@ -2091,7 +2105,7 @@ def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
     """SPEC-030's evidence must survive everything shutdown does on the way out."""
     sink = RecordingSink()
     worker = Worker(sink, batch_size=10, flush_interval=0.01)
-    worker.shutdown()
+    _retire(worker)
 
     worker.submit(_span("late"))
     worker.submit(_span("later"))
@@ -3437,7 +3451,7 @@ def test_a_submission_racing_the_final_drain_is_counted(capsys) -> None:
     submitter.start()
     assert at_put.wait(5.0), "the premise: the submitter is parked at its put"
 
-    worker.shutdown(timeout=5.0)
+    _retire(worker, timeout=5.0)
     release.set()
     submitter.join(timeout=5)
     err = capsys.readouterr().err
@@ -3455,7 +3469,7 @@ def test_a_submission_after_a_latched_shutdown_is_counted_exactly_once(capsys) -
     submission counted twice — a doubling no other assertion here would notice.
     """
     worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
-    worker.shutdown(timeout=5.0)
+    _retire(worker, timeout=5.0)
 
     worker.submit(_span("a"))
     worker.submit(_span("b"))
@@ -3549,7 +3563,7 @@ def test_the_throttle_period_is_read_from_diag(capsys, monkeypatch) -> None:
         w.shutdown()
 
     w2 = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
-    w2.shutdown()
+    _retire(w2)
     capsys.readouterr()
     for i in range(12):
         w2.submit(_span(i))

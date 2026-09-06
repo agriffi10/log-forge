@@ -104,7 +104,7 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
     try:
         assert sink.in_emit.wait(5.0), "the drain thread never reached emit"
         shutting_down.start()
-        while not worker.retired:  # the latch is entry to shutdown, not its completion
+        while not log_foundry.health().retired:  # entry to shutdown, not its completion
             time.sleep(0.001)
 
         log_foundry.info("an orphan log while the drain is in flight")
@@ -136,7 +136,7 @@ def test_an_orphan_log_during_the_drain_does_not_strand_the_backoff() -> None:
     try:
         assert sink.in_emit.wait(5.0)
         shutting_down.start()
-        while not worker.retired:
+        while not log_foundry.health().retired:
             time.sleep(0.001)
         log_foundry.info("an orphan log while the drain is in flight")
     finally:
@@ -330,7 +330,10 @@ def _shutdown_inside_the_first_flush(worker) -> threading.Thread:
     rather than raced for. A **real** ``shutdown()`` runs in it rather than the latch alone:
     latching ``_shutdown_done`` by hand declines the swap identically, but leaves the drain
     thread alive, so ``_close_if_owed`` declines and the old sink is never closed by anyone —
-    which would make AC-2 unobservable and read as a defect it is not.
+    which would make AC-2 unobservable and read as a defect it is not. The wait reads
+    ``health().retired``, the public observable, rather than a worker attribute: SPEC-054 FR-001
+    moved the latch onto the lifecycle owner as a count, and entry to ``shutdown()`` is still
+    what moves it.
     """
     real_flush = worker.flush
     shutting_down = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
@@ -339,7 +342,7 @@ def _shutdown_inside_the_first_flush(worker) -> threading.Thread:
         result = real_flush(timeout)
         worker.flush = real_flush
         shutting_down.start()
-        while not worker.retired:
+        while not log_foundry.health().retired:
             time.sleep(0.001)
         return result
 
@@ -512,7 +515,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
             worker.flush = real
             t = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
             t.start()
-            while not worker.retired:
+            while not log_foundry.health().retired:
                 pass
             t.join(30.0)
             return r

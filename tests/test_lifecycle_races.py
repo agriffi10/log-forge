@@ -490,6 +490,56 @@ def test_a_worker_built_after_shutdown_returned_still_delivers() -> None:
         "and its submissions are not the pair SPEC-030 defines, which needs a retired worker"
     )
 
+    late = _lifecycle._state.worker_exists()
+    assert late is not None and _lifecycle._state.live_worker() is late, (
+        "the premise for the second half: the worker built afterwards reads as live"
+    )
+    log_foundry.shutdown(timeout=5.0)
+    assert not late.draining, "SPEC-054 FR-001 AC-4: the second shutdown's drain finished"
+    assert _lifecycle._state.live_worker() is None, "and it stopped reading as live"
+
+    delivered = sink.events
+    log_foundry.info("after the second shutdown")
+    assert log_foundry.health().submitted_after_shutdown == 0, (
+        "an orphan log outside a span is delivered, not stranded (SPEC-030's fence, kept)"
+    )
+    assert sink.events > delivered, "and it really did land"
+
+
+def test_a_second_shutdown_strands_and_counts_the_late_workers_next_submission() -> None:
+    """FR-001 AC-2. The count, not a latch, is what makes both halves of this true.
+
+    A worker built after a `shutdown()` returned records the already-incremented count as its
+    epoch, so its own submissions are **not** stranded — that is the half above. This is the
+    other: the *next* `shutdown()` moves the count past that epoch, and from that instant the
+    same worker's submissions are queued where nothing will drain them, which is exactly what
+    `submitted_after_shutdown` counts (SPEC-030 FR-001).
+
+    Against a latched boolean the two halves cannot both hold: a worker whose flag is set at
+    build counts everything it ever delivered, and one whose flag is clear never starts counting.
+    """
+    sink = CountingSink("A")
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("an orphan log, so the first shutdown has something to retire")
+    log_foundry.shutdown(timeout=5.0)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()
+    log_foundry.flush(timeout=5.0)
+    assert log_foundry.health().submitted_after_shutdown == 0, (
+        "the premise: the late worker's own submissions are not stranded"
+    )
+
+    log_foundry.shutdown(timeout=5.0)
+    work()
+
+    assert log_foundry.health().submitted_after_shutdown == 1, (
+        "the submission after the second shutdown is stranded and counted"
+    )
+
 
 _UNDER_LOCK_OFFENDERS = frozenset({"_close_orphan_sink", "join_closers", "_close_owed"})
 """Calls that must never appear inside a `with _state._lock` body.

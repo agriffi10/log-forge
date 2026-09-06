@@ -259,10 +259,13 @@ def test_the_swap_drains_the_old_sink_then_fences_before_closing_it() -> None:
 def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
     """The retirement check must be re-taken after the drain, not only before it.
 
-    ``shutdown()`` closes whatever ``self.sink`` is at that moment and latches its once-only
-    flag. A swap that reassigns afterwards installs a sink **nothing will ever close** — a second
-    ``shutdown()`` returns early — and then reports an ``incomplete_swaps`` whose stderr line
-    says the old sink was left open, when it was in fact closed. The race is injected rather
+    ``shutdown()`` closes whatever ``self.sink`` is at that moment and moves the retirement
+    count past this worker's epoch. A swap that reassigns afterwards installs a sink **nothing
+    will ever close** — a second ``shutdown()`` returns early — and then reports an
+    ``incomplete_swaps`` whose stderr line says the old sink was left open, when it was in fact
+    closed. It is the **owner's** shutdown that is injected, not the worker's own stop: SPEC-054
+    FR-001 made retirement a process fact, so stopping the thread alone would leave the re-check
+    with nothing to see and the test would prove the opposite of its name. The race is injected rather
     than run, on the same principle as the fence test above.
     """
     old, new = SwapSink(), SwapSink()
@@ -271,7 +274,7 @@ def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
 
     def flush_then_retire(timeout=None):
         result = real_flush(timeout)
-        worker.shutdown()  # atexit, or another thread, lands here
+        _lifecycle._shutdown_worker()  # atexit, or another thread, lands here
         return result
 
     worker.flush = flush_then_retire

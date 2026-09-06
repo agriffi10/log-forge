@@ -60,11 +60,31 @@ from log_foundry import _lifecycle, decorator
 # `continue_trace`'s trace-context variable, which is not a worker question at all: a heuristic
 # broad enough to catch every phrasing also catches things that are not the subject.
 #
-# These four are the *base*. The set actually used is derived per-tree by
+# SPEC-054 added the last five, and the first of them is the reason the list needed revisiting
+# at all: `"retired"` is **not** a substring of `"retirements"`, so moving the retirement latch
+# from a per-worker boolean to the owner's count would have dropped `_worker_health`'s guard out
+# of the roster with the suite green and the re-derived floor blessing the shrink — the exact
+# "a refactor silently shrinks a derived guard" shape this file exists to catch. `_epoch`,
+# `in_flight`, `held` and `may_be_inside` name the questions that replaced `worker_owns` and
+# `worker_owns_now`. Measured when they were added: the walked counts did not move
+# (`_lifecycle` 46, `decorator` 2), so they over-match nothing here — and over-matching is the
+# safe direction anyway, since it demands a classification rather than skipping one.
+#
+# These are the *base*. The set actually used is derived per-tree by
 # :func:`_accessor_names`, which adds any function that hands the worker back, because a
 # hand-written token list is the one hand-list left in a file whose whole argument is that
 # hand-lists rot.
-_BASE_SENTINELS = ("_worker", "worker", "draining", "retired")
+_BASE_SENTINELS = (
+    "_worker",
+    "worker",
+    "draining",
+    "retired",
+    "retirements",
+    "_epoch",
+    "in_flight",
+    "held",
+    "may_be_inside",
+)
 
 EXISTENCE = "existence — is there a worker at all, and therefore anything to do"
 LIVENESS = (
@@ -178,14 +198,17 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "order to prove there is nothing to drain."
         ),
     ),
-    ("_rebuild_worker_after_fork", "not worker.retired", 0): (
+    ("_rebuild_worker_after_fork", "_state.live_worker() is not None", 0): (
         LIVENESS,
         (
             "who performs: a retired worker performs no delivery, so the child gets no drain "
             "thread and a fork does not undo a shutdown() (SPEC-039 FR-002 AC-4). Hoisted into "
             "a named binding rather than left inline in the call, because a keyword argument is "
             "not a position this roster files - the decision would have been invisible. It is "
-            "deliberately not ownership: nothing here is deciding who closes a sink."
+            "deliberately not ownership: nothing here is deciding who closes a sink. "
+            "Was `not worker.retired` until SPEC-054 FR-001 moved the latch off the worker; the "
+            "question and its category are unchanged, and it now asks the one helper rather "
+            "than a per-worker flag that agreed with the process's by convention."
         ),
     ),
     ("_Lifecycle.live_worker", "self._worker", 0): (
@@ -196,9 +219,16 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "because rebinding is how a guard changes category without its text changing."
         ),
     ),
-    ("_Lifecycle.live_worker", "worker is None or worker.retired", 0): (
+    ("_Lifecycle.live_worker", "worker is None or worker._epoch != self.retirements", 0): (
         LIVENESS,
-        "the definition of the liveness helper itself, rather than a consumer of it.",
+        (
+            "the definition of the liveness helper itself, rather than a consumer of it. "
+            "SPEC-054 FR-001 replaced the per-worker latch it read with the owner's count: a "
+            "worker is live while the count is still the one it recorded at its build. A count "
+            "rather than a boolean because a worker built after a shutdown() returned still "
+            "delivers, and against a latch every event it delivered would be counted as "
+            "stranded."
+        ),
     ),
     ("_Lifecycle.worker_owns_now", "self._worker", 0): (
         OWNERSHIP_AND_MOMENT,
@@ -619,20 +649,24 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "chooses between `worker.sink` and nothing."
         ),
     ),
-    ("_worker_health", "_state._orphan_retired or health.retired", 0): (
+    ("_worker_health", "_state.retirements > 0", 0): (
         LIVENESS,
         (
             "reporting rather than deciding: this synthesizes `retired` for a process that shut "
             "down without ever building a worker (SPEC-031 FR-006). It is a liveness question "
-            "even though one operand is a module flag, because `health.retired` is the worker's "
-            "own retirement read off its snapshot. A draft filed it under a fifth category, "
+            "even though the operand is the owner's counter, because that counter is the "
+            "own retirement read off the one latch. A draft filed it under a fifth category, "
             "not-a-worker-question, which was an unbounded escape hatch: a site nobody wanted "
             "to think about could be filed there and pass both tests. "
             "Was `_orphan_retired and (not health.retired)`, guarding an early `replace()`; "
             "SPEC-036 FR-003 made the field set unconditional (two loss counters are merged on "
             "this branch whether or not `retired` needs correcting), so the same question is now "
             "asked as a value rather than as a branch. The category is unchanged, which is the "
-            "point of filing a binding by the question it feeds rather than by its shape."
+            "point of filing a binding by the question it feeds rather than by its shape. "
+            "SPEC-054 FR-001 made it one term instead of an `or` over two records, and the "
+            "binding is load-bearing: `_boolean_positions` does not file a keyword argument, so "
+            "writing it inline in the single `Health(...)` FR-005 requires would drop this row "
+            "and take the module's count from 46 to 45 with nothing red."
         ),
     ),
 }

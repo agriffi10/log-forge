@@ -18,6 +18,33 @@ __all__ = ["Health", "Worker"]
 
 _SHUTDOWN = object()
 
+
+_lifecycle_state = _lifecycle._state
+"""The lifecycle owner, bound once at import rather than reached through the module per read.
+
+SPEC-054 FR-001 moved the retirement latch onto the owner, so :meth:`Worker.submit` asks
+``retirements > self._epoch`` twice per call where it read one ``self`` attribute before.
+Measured on this machine over 5M iterations in one process, best of 7: the ``self`` attribute
+was 3.80 ns, and ``_lifecycle._state.retirements > self._epoch`` — a global load, two attribute
+hops and a compare — is 14.86 ns, which is +22 ns across ``submit``'s two reads and outside
+FR-001 AC-5's 10 ns budget. Bound here it is 7.55 ns per read, +7.5 ns per ``submit``, inside
+it. The spec predicted under 2 ns per read from a 4.1 / 5.9 ns pair; that pair measured
+``state.retirements`` with ``state`` already a local, which is not the expression it went on to
+prescribe.
+
+**The isolated read is the measurement that decides, because the whole-``submit`` one cannot see
+this.** A 1M-call harness over ``submit`` spreads ~20 ns across repeated runs of the *same* tree
+— more than the effect — so it resolves neither this choice nor the change itself; six
+alternating rounds put the two spellings inside each other's range. An earlier version of that
+harness also let one queue grow to a million entries inside the timer and reported +14 ns for a
+change that is +3 ns, which was allocator behaviour rather than the read.
+
+Binding the **object** is safe: ``_lifecycle._state`` is assigned once at that module's import
+and never rebound — the suite mutates its fields rather than replacing it — and a fork copies the
+object, so this names the same owner in the child. It is a second *name* for one object and not
+a second copy of any state, which is what would make it the twin this spec exists to delete.
+"""
+
 DEFAULT_SHUTDOWN_TIMEOUT = _lifecycle.DEFAULT_SHUTDOWN_TIMEOUT
 """Re-exported from ``_lifecycle``, which owns it (SPEC-040 FR-001).
 
@@ -352,16 +379,17 @@ class Worker:
         self.incomplete_swaps = 0
         self._max_queue = max_queue
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
-        self._stop = threading.Event()
+        self._stop = _lifecycle._state.refresh_stop_signal()
+        self._epoch = _lifecycle._state.retirements
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
-        self._shutdown_done = False
+        self._stopped = False
         self._sink_closed = sink_released
         self._closing: threading.Event | None = None
         self._taken_markers: list[_FlushMarker] = []
         self._unclosed_swaps: list[Sink] = []
         self._lock = threading.Lock()
-        self._offer_stop_signal()
+        _lifecycle.offer_stop_signal(sink, self._stop)
         self._thread = threading.Thread(
             target=self._run, name="log-foundry-worker", daemon=True
         )
@@ -472,7 +500,7 @@ class Worker:
             return
         self._drain_finished.clear()
         self._drain_settled.clear()
-        self._offer_stop_signal()
+        _lifecycle.offer_stop_signal(self.sink, self._stop)
         thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         try:
             thread.start()
@@ -483,27 +511,6 @@ class Worker:
             _diag.absorbed("starting this child's drain thread", exc, "it will deliver nothing")
             return
         self._thread = thread
-
-    def _offer_stop_signal(self) -> None:
-        """Gives the sink this worker's shutdown event, if it advertises somewhere to put it.
-
-        The dependency stays one-way (SPEC-027 FR-002): ``sinks`` must not import ``worker``,
-        so the worker pushes rather than the sink pulling. It is probed with ``hasattr``, the
-        same optional-protocol shape SPEC-026 uses for ``losses()`` — a sink without the
-        attribute simply never gets one and backs off uninterruptibly, exactly as before.
-
-        Args:
-          None.
-
-        Returns:
-          None.
-
-        Raises:
-          None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose
-            ``__setattr__`` objects, loses interruptibility rather than preventing the worker
-            from starting.
-        """
-        _lifecycle.offer_stop_signal(self.sink, self._stop)
 
     def submit(self, events: list[dict[str, object]]) -> None:
         """Hands a finished span's events to the worker, without blocking.
@@ -538,7 +545,7 @@ class Worker:
         queues its item after the final drain has already run, where nothing will read it — and
         the counter built for exactly that case stayed at zero, so the documented
         ``retired`` + ``submitted_after_shutdown`` pair could not fire. It **closes** the window
-        rather than narrowing it: ``_shutdown_done`` latches under the lock at the top of
+        rather than narrowing it: the retirement count moves under the owner's lock at the top of
         :meth:`shutdown`, strictly before the sentinel and before ``_stop`` is set, therefore
         strictly before :meth:`_final_drain`. Any submission that can be stranded has the flag
         already latched by the time this read runs, and a read that still sees ``False`` proves
@@ -557,7 +564,7 @@ class Worker:
         Raises:
           None.
         """
-        retired = self._shutdown_done
+        retired = _lifecycle_state.retirements > self._epoch
         if retired:
             self._count_undeliverable()
         try:
@@ -569,7 +576,7 @@ class Worker:
             if total == 1 or total % _diag.WARN_EVERY == 0:
                 _diag.lost("submission", total, "log queue full; count is cumulative")
             return
-        if not retired and self._shutdown_done:
+        if not retired and _lifecycle_state.retirements > self._epoch:
             self._count_undeliverable()
 
     def _count_undeliverable(self) -> None:
@@ -600,30 +607,6 @@ class Worker:
                 "logged after shutdown(), which is terminal; nothing will drain these. Use "
                 "flush() in a process that logs again. Count is cumulative",
             )
-
-    @property
-    def retired(self) -> bool:
-        """Whether :meth:`shutdown` has begun, so this worker will deliver nothing further.
-
-        A retired worker still *holds* its sink — ``self.sink`` never changes again, because
-        :meth:`swap_sink` returns early once shut down — so "a worker exists" and "a worker is
-        still delivering" stop being the same question, and callers deciding who owns a sink's
-        close need the second one (SPEC-033 FR-002). Read without the lock, as ``submit``'s check
-        is: the flag is written once and never cleared, so a racing reader sees one of two
-        answers and both are momentarily true.
-
-        Args:
-          None.
-
-        Returns:
-          Whether shutdown has begun. ``True`` for an expired shutdown too, which is why
-          ``_close_orphan_sink`` deliberately does *not* use this — there the drain thread may
-          still be inside the sink's ``emit``.
-
-        Raises:
-          None.
-        """
-        return self._shutdown_done
 
     @property
     def draining(self) -> bool:
@@ -659,7 +642,7 @@ class Worker:
         abandoned is ``_drain_settled`` set with ``_drain_finished`` unset, and the operator-facing
         form of the same fact is ``stopped_reason == "ShutdownTimeout"``.
 
-        Read without the lock, as ``retired`` is: the event is set once and never cleared, so a
+        Read without the lock, as the retirement count is: the event is set once and never cleared, so a
         racing reader sees one of two answers and both are momentarily true.
 
         Args:
@@ -695,10 +678,10 @@ class Worker:
         Raises:
           None.
         """
+        retired = _lifecycle_state.retirements > self._epoch
         with self._lock:
             dropped, failed_batches = self.dropped, self.failed_batches
             stopped_reason = self.stopped_reason
-            retired = self._shutdown_done
             submitted_after_shutdown = self.submitted_after_shutdown
             incomplete_swaps = self.incomplete_swaps
         return Health(
@@ -816,9 +799,8 @@ class Worker:
         Raises:
           None.
         """
-        with self._lock:
-            if self._shutdown_done:
-                return FlushResult(ok=False, reason="retired")
+        if _lifecycle_state.retirements > self._epoch:
+            return FlushResult(ok=False, reason="retired")
         if not self._thread.is_alive():
             return FlushResult(ok=False, reason="thread-died")
         with self._lock:
@@ -979,7 +961,7 @@ class Worker:
 
         Returns:
           Whether this worker now holds ``new_sink``, and therefore owns its close. ``False``
-          means **declined**, which happens only when ``_shutdown_done`` latched — and the
+          means **declined**, which happens only when the count moved past this worker's epoch — and the
           caller must then own the handoff itself, because a declined swap leaves the new sink
           installed nowhere (SPEC-035 FR-003). ``True`` covers the sink already being this
           worker's, which owes nothing further. The *quality* of the swap is still reported
@@ -992,14 +974,14 @@ class Worker:
           (SPEC-025 FR-004).
         """
         with self._lock:
-            if self._shutdown_done:
+            if _lifecycle_state.retirements > self._epoch:
                 return False
             if self.sink is new_sink:
                 return True
         deadline = None if timeout is None else time.monotonic() + timeout
         drained = self.flush(timeout)
         with self._lock:
-            if self._shutdown_done:
+            if _lifecycle_state.retirements > self._epoch:
                 return False
             old = self.sink
             if old is new_sink:
@@ -1007,7 +989,7 @@ class Worker:
             self.sink = new_sink
             self._sink_closed = False
             self._discard_owed_swap(new_sink)
-        self._offer_stop_signal()
+        _lifecycle.offer_stop_signal(new_sink, self._stop)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not (drained and self.flush(remaining)):
             self._record_incomplete_swap(timeout, old)
@@ -1192,7 +1174,7 @@ class Worker:
         that call, so this one does not.
 
         **The idempotent path waits for the drain it found running** (SPEC-035 FR-004).
-        ``_shutdown_done`` latches on *entry*, so a second caller used to take that branch and
+        ``_stopped`` latches on *entry*, so a second caller used to take that branch and
         return in under a millisecond over a drain that had barely started. The shape is rarely
         two user calls: it is a ``shutdown()`` on one thread and ``atexit`` on the main thread,
         and measured with a 2 s-emit sink and three traced calls it delivered **nothing**, never
@@ -1229,8 +1211,8 @@ class Worker:
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._lock:
-            first = not self._shutdown_done
-            self._shutdown_done = True
+            first = not self._stopped
+            self._stopped = True
         if not first:
             if self.draining:
                 self._drain_settled.wait(

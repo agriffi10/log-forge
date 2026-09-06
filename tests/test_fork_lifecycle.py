@@ -631,14 +631,14 @@ def test_two_holders_of_one_event_still_share_it_in_the_child() -> None:
 def test_a_set_event_is_still_set_in_the_child() -> None:
     """FR-003 AC-5. An ``Event`` carries its set state across, or the child un-does a shutdown.
 
-    ``_lifecycle._state._orphan_stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
+    ``_lifecycle._state._stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
     replacement that started unset would tell a child's sink to go on backing off for delivery
     that has already been retired, which is SPEC-033 FR-004's reasoning inherited by a fork.
     """
-    _lifecycle._state._orphan_stop.set()
-    before = id(_lifecycle._state._orphan_stop)
+    _lifecycle._state._stop.set()
+    before = id(_lifecycle._state._stop)
     child = run_in_child(
-        lambda: f"{_lifecycle._state._orphan_stop.is_set()},{id(_lifecycle._state._orphan_stop) != before}"
+        lambda: f"{_lifecycle._state._stop.is_set()},{id(_lifecycle._state._stop) != before}"
     )
     assert child.output == "True,True", child.output
 
@@ -933,7 +933,7 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "retired.ndjson"
     sink = FileSink(str(path))
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
-    worker = _idle_worker(sink)
+    _idle_worker(sink)
     log_foundry.shutdown()
 
     started = threading.Event()
@@ -958,7 +958,7 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
         Worker._run = original_run  # type: ignore[method-assign]
 
     assert child.output == "True,1,False", child.output
-    assert worker.retired
+    assert log_foundry.health().retired
     assert path.read_text(encoding="utf-8") == "", "the retired child delivered"
 
 
@@ -990,9 +990,9 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
     shutting_down.start()
     deadline = time.monotonic() + 5.0
-    while not worker.retired and time.monotonic() < deadline:
+    while not worker._stopped and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
+    assert worker._stopped and worker.draining, "the fork must land while the shutdown is joining"
 
     def report() -> str:
         live = _lifecycle._state._worker
@@ -1060,10 +1060,10 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     shutting_down.start()
 
     def parent_ready() -> bool:
-        # `retired` latches before `_stop` is set, so polling on `retired` alone and asserting
+        # `_stopped` latches before `_stop` is set, so polling on it alone and asserting
         # the signal afterwards has a window between the two where the precondition is false.
         signal = sink.log_foundry_stop_signal
-        return worker.retired and signal is not None and signal.is_set()
+        return worker._stopped and signal is not None and signal.is_set()
 
     deadline = time.monotonic() + 5.0
     while not parent_ready() and time.monotonic() < deadline:
@@ -1230,7 +1230,7 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
     """FR-002. A process that only ever logged outside a span has nothing to rebuild.
 
     The existence guard is what keeps that quiet. Without it the rebuild takes an
-    ``AttributeError`` on ``None.retired``, which ``_fork`` absorbs into a stderr line on
+    ``AttributeError`` on ``None._epoch``, which ``_fork`` absorbs into a stderr line on
     **every fork** — a library announcing a fault of its own invention, on a path where nothing
     was wrong (SPEC-025).
     """
@@ -1479,7 +1479,7 @@ def _namespace_stores(tree: ast.AST) -> set[int]:
     threading.Lock()`` inside a function, and treating every ``Name`` as reachable made the rule
     accept a lock no walk could ever find. So the scope is carried down — module and class
     bodies write to a namespace, a function body does not unless the name is declared ``global``,
-    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_orphan_stop``.
+    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_stop``.
 
     Args:
       tree: The parsed module.
@@ -1706,7 +1706,7 @@ def test_the_shape_lint_rejects_the_shapes_it_claims_to() -> None:
 
 
 def test_a_module_global_reassigned_inside_a_function_still_counts() -> None:
-    """``_orphan_stop`` is rebuilt as ``self._orphan_stop`` inside ``_Lifecycle.refresh_stop_signal``.
+    """``_stop`` is rebuilt as ``self._stop`` inside ``_Lifecycle.refresh_stop_signal``.
 
     It was a ``global`` rebinding inside ``_offer_orphan_signal`` until SPEC-040 moved the state
     onto one owner, so **no live site in ``src/`` takes the ``global`` branch any more**. The
@@ -2167,7 +2167,7 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     assert worker._queue is queue_before
     assert sink._lock is lock_before
     assert worker.dropped == dropped_before
-    assert not worker.retired
+    assert _lifecycle._state.live_worker() is worker
 
     @log_foundry.trace
     def work() -> None:

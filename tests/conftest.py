@@ -101,16 +101,19 @@ def _reset_worker() -> None:
     naming itself.
 
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
-    ``_orphan_retired`` is what ``health()`` synthesizes when there is no worker, so a test
+    ``retirements`` is what ``health()`` reads for ``retired``, so a test
     that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
     ``_orphan_owed`` would make "nothing was ever logged, so nothing is closed"
     untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
     handler really is registered for the life of the interpreter, and re-arming the flag would
     have the next worker register a second one.
 
-    SPEC-033 adds three more. ``_orphan_stop`` is replaced rather than cleared, since an
+    SPEC-033 adds three more. ``_stop`` is replaced rather than cleared, since an
     ``Event`` cannot be un-set and a test that called ``shutdown()`` would otherwise leave every
-    later test's sink backing off not at all. ``_lifecycle._closers`` is now process-global, so a
+    later test's sink backing off not at all. SPEC-054 made it and ``retirements`` the process's
+    only pair, so resetting the count to zero is what makes ``retired`` false again and what puts
+    a worker built by the next test back in step with it — a count left raised makes every later
+    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._closers`` is now process-global, so a
     hung closer from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
 
@@ -145,8 +148,8 @@ def _reset_worker() -> None:
         _lifecycle._state._worker = None
     _lifecycle._state._orphan_owed.clear()
     _lifecycle._state._orphan_closed_sink = None
-    _lifecycle._state._orphan_retired = False
-    _lifecycle._state._orphan_stop = threading.Event()
+    _lifecycle._state.retirements = 0
+    _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
     _lifecycle._state._late_worker = None
     decorator._orphan_lost = 0
