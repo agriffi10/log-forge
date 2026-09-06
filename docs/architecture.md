@@ -636,9 +636,16 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
   sink own the limits only it knows about.
 
 
-### 9.2 Four questions a guard can ask about the worker
+### 9.2 Three questions a guard can ask about the worker
 
-Every guard that mentions the worker is classified as exactly one of four categories, and
+> **Superseded by SPEC-054 FR-004.** This section read *four questions* until the owed-close
+> record was merged. With one record, "who owns this sink's close" has one answer and is no
+> longer a question a call site can get wrong, so **ownership** and **ownership ∧ moment** are
+> gone and what remains of the conjunction is the moment on its own — carrying **two**
+> predicates, because an abandoned drain answers them oppositely. The full entry is
+> `docs/decisions/pipeline.md` → *A worker guard asks one of three questions*.
+
+Every guard that mentions the worker is classified as exactly one of three categories, and
 answering with the wrong one is this codebase's most repeated defect: three reviewers told
 SPEC-033 "ownership, not liveness", each naming a different call site, each was fixed, and a
 fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribed a predicate that
@@ -652,31 +659,32 @@ one rather than composing a predicate. The state and the guards live in `_lifecy
 | Category | Method | What it decides |
 |---|---|---|
 | **Existence** | `_state.worker_exists()` | is there anything to do, or a worker to build |
-| **Liveness** | `_state.live_worker()` — not `None`, not `retired` | who **performs** an action; a retired worker performs nothing. Reading `retired` to *report* it is the same question, not a fifth |
-| **Ownership** | `_state.worker_owns(sink)` | who **owns** a close; a retired worker still owns its sink's |
-| **Ownership ∧ moment** | `_state.worker_owns_now(sink)` | whose stop event the sink should be holding **now** |
+| **Liveness** | `_state.live_worker()` — the worker while its `_epoch` is the current retirement count | who **performs** an action; a retired worker performs nothing. Reading the count to *report* it is the same question, not a fourth |
+| **Moment** | `_state.in_flight(sink)` for the signal refresh, `_state.held(sink)` for the close | is anything using this sink **now**. Two predicates in one category, because an abandoned drain answers them oppositely |
 
-**None of the four takes the lifecycle lock.** Four guards ask a question with it already held
-(`_get_worker`'s inner check, `_close_orphan_sink`, `_swap_sink`, and `_offer_orphan_signal`
-through all three of its callers), so a non-reentrant acquire inside a question would deadlock
+**None of the three takes the lifecycle lock.** Several guards ask a question with it already
+held (`_get_worker`'s inner check, `_close_owed`, `_swap_sink`, and `_offer_orphan_signal`
+through all of its callers), so a non-reentrant acquire inside a question would deadlock
 them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
 read is a single atomic reference load, and a caller needing consistency across two reads takes
-the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span.
+the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The two
+moment predicates do take the leaf `_closing_now_lock`, which is the order the shipped code
+already established — `_offer_orphan_signal` reached that lock under the lifecycle lock before
+SPEC-054 folded the read into the question — and nothing acquires the lifecycle lock beneath it.
 
-The fourth is a **conjunction**, not a new question, which is why it is named for both terms
-rather than for `Worker.draining` alone. A category named for the moment by itself would have no
-site — the moment never decides anything on its own here — and a contributor reaching for one
-would be reaching for something the roster does not accept.
+**The moment is one category with two predicates**, and that is stated here rather than left to
+be rediscovered at a site. `in_flight(sink)` asks whether the worker is *draining* into it, so
+an abandoned drain counts as **over** and the sink gets a fresh stop event rather than SPEC-033
+FR-004's tight retry loop. `held(sink)` asks whether the worker's thread is *alive* and may be
+inside it, so the same state counts as **still inside** and the sink is left open (SPEC-027
+FR-004). Both were measured on the expired-shutdown state — SPEC-033 FR-002 closing under a live
+writer, SPEC-035 FR-001 the fresh event never arriving — and a single predicate is wrong for one
+of the two sites whichever way it is written.
 
-Liveness and ownership diverge the instant `retired` latches — which is **entry** to
-`shutdown()`, not its completion. The moment is independent of both rather than a refinement of
-either:
-`_offer_orphan_signal` needs ownership **and** the moment, because ownership alone hands a set
-event to a sink still being written to (every later backoff collapses to zero) while liveness
-alone strips the drain thread of the event it is about to wait on. One ownership question is
-answered by a **return value** rather than a predicate — `Worker.swap_sink` reports whether it
-adopted the sink, because the decline is taken between its two lock acquisitions and nothing
-outside observes it.
+Liveness and the moment diverge the instant the retirement count moves — which is **entry** to
+`shutdown()`, not its completion. One question is answered by a **return value** rather than a
+predicate: `Worker.retarget` reports what it did, because the decline is taken between its two
+lock acquisitions and nothing outside observes it.
 
 The rule is enforced, not just written down: `tests/test_worker_predicate_roster.py` derives
 every expression **in boolean position** naming the worker from the ASTs of `_lifecycle.py`
@@ -799,20 +807,17 @@ close it.
   walk has, so a cap degrades to a leaked handle rather than a hung child; it is SPEC-039's to
   change. It sits here rather than in §13 because it has a named remedy nobody has scheduled,
   which is this section's criterion.
-- **`health().inherited_sink` reads the owed record's last entry**, which arming order does not
-  make the installed sink: `_swap_sink` seeds the record with the new sink and a preempted emit
-  then appends the superseded one, so the order can be `[live, superseded]` and the field can
-  name a sink this process has stopped delivering to. The answer is unchanged from before
-  SPEC-045, which is why that spec did not treat it as a regression. **Closed by** answering
-  from the config, which is the authority for "installed" — a small change to one reader, left
-  out of SPEC-045 because it touches a published `Health` field on a path that spec did not
-  otherwise change.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
-  `tests/test_worker_predicate_roster.py` is ~1,500 lines policing what is now four methods, and
-  roughly half of it is the seam lint guarding the prose in its own data table rather than the
-  rule. The case for retiring it got *weaker* during SPEC-040: widening its scope immediately
-  filed two sites that had gone unfiled for two specs. **Closed by** evidence a year of
-  maintenance provides — whether any post-SPEC-040 defect was caught by it, or by nothing.
+  `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
+  of it is the seam lint guarding the prose in its own data table rather than the rule. The case
+  for retiring it got *weaker* during SPEC-040: widening its scope immediately filed two sites
+  that had gone unfiled for two specs. It got weaker again in SPEC-054, which is what narrows this
+  item rather than closing it: the merge would have dropped `_worker_health`'s only retirement
+  guard out of the roster silently — `"retired"` is not a substring of `"retirements"`, and a
+  keyword argument is not a position the walker files — leaving the re-derived floor to bless the
+  shrink. So it caught, in one refactor, exactly the class of defect it exists for. What is still
+  open is the *cost*, not the value. **Closed by** evidence a year of maintenance provides —
+  whether any further defect is caught by it, or by nothing.
 - **`worker.py` and `_lifecycle.py` are unsplit and unscheduled** (SPEC-040 FR-005 AC-2).
   They are the two largest modules in `src/log_foundry/`, and both still grow with the specs
   that settle lifecycle questions. This entry deliberately carries no line counts:
@@ -902,6 +907,17 @@ close it.
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
 
 ### Resolved
+
+- ~~**`health().inherited_sink` reads the owed record's last entry**~~ (SPEC-045; invariant 12) →
+  **closed by SPEC-054 FR-005**. Arming order does not make a sink the installed one: `_swap_sink`
+  seeds the record with the new sink and a preempted emit then appends the superseded one, so the
+  order could be `[live, superseded]` and the field could name a sink this process had stopped
+  delivering to. It answers from the **config** now, which is what this section already named as
+  the authority for "installed", and `_worker_health`'s `sink` field takes the same authority in
+  the same edit — answering the two from different places is what let them disagree. Pinned on
+  both delivery paths and in a forked child, by
+  `tests/test_sink_ownership.py::test_health_reports_an_inherited_sink_on_the_worker_path_too` and
+  its orphan-path sibling.
 
 - ~~**`NATSSink(max_reconnect_attempts=0)` makes the connect loop unbounded**~~ (SPEC-047 FR-002;
   invariant 13) → **closed by SPEC-049 FR-004**. `nats-py` retires a server from its pool only

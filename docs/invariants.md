@@ -105,12 +105,21 @@ owed a second close, which is correct rather than a double (SPEC-045).
 ## 6. Twin paths keep the same promises
 
 The library has pairs of code paths that must behave identically under invariants 1–5, 7–8 and
-13: the **worker** path and the **orphan** path; the **sync** and **async** decorator bodies; a
-sink's `emit` and its `flush`; the `_drain` loop and `_final_drain`; `flush()` and `shutdown()`
-as the two answerers of a flush marker. A fix applied to one twin is a recurring shape in this
-repo's history — SPEC-033's two same-day regressions, the SPEC-035 guard sites, SPEC-050's
-daemon-thread close on both paths. This invariant is a review obligation rather than a mechanism:
-a spec names the twins its FRs touch, and the system-frame reviewer checks each.
+13: the **worker** path and the **orphan** path, ~~and the bookkeeping around them~~; the **sync**
+and **async** decorator bodies; a sink's `emit` and its `flush`; the `_drain` loop and
+`_final_drain`; `flush()` and `shutdown()` as the two answerers of a flush marker. A fix applied to
+one twin is a recurring shape in this repo's history — SPEC-033's two same-day regressions, the
+SPEC-035 guard sites, SPEC-050's daemon-thread close on both paths. This invariant is a review
+obligation rather than a mechanism: a spec names the twins its FRs touch, and the system-frame
+reviewer checks each.
+
+**The two delivery paths are still twins for the *emit*; their bookkeeping is not** (SPEC-054).
+Thirteen twin pairs — the retirement latch, the stop event, the owed-close record, the closer, the
+in-flight gate, the grace arithmetic, the swap, the `Health` assembly and the rest — were one
+mechanism implemented once per path, and they are one mechanism now. That is the strongest form
+this invariant takes: not a review obligation but a shape in which the fix cannot land on one side.
+What remains a twin is what the two paths genuinely do differently, which is where the event goes
+and on whose thread.
 
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
