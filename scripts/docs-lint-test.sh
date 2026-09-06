@@ -20,7 +20,8 @@
 # and every register fixture uses one.
 #
 # Usage: sh scripts/docs-lint-test.sh [case-name-substring]
-# POSIX sh — no dependencies.
+# POSIX sh. It inherits docs-lint.sh's one dependency — `python3`, for check 11 — because it
+# runs that script; see the note in its header.
 
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -129,7 +130,11 @@ echo "docs-lint-test: $pass passed, $fail failed."
 # here. Removing them does, and that is the point: a case pruned on purpose is a
 # one-line, deliberate lowering in the same change; a case lost by accident reds the run.
 # Not applied to the self-test invocation, which runs a handful of planted cases.
-CASES_MIN=80
+# Raised from 80 with SPEC-053's corpus (86 cases -> 137). The old floor was slack enough that
+# deleting EVERY marking-walk case left 86 cases running, a success line and exit 0 — measured,
+# which is the whole failure this floor is written against. It stays deliberately below the
+# measurement so adding cases needs no edit here; it just is not 36 cases below any more.
+CASES_MIN=125
 if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "docs-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"
   echo "shrunk or gone missing — a run over nothing exits 0 and looks exactly like a healthy"
@@ -223,4 +228,72 @@ Reasoning.'
     exit 1
   fi
   echo "docs-lint-test: fixture guards verified — 3 guards, $planted vacuous cases refused."
+fi
+
+# ── self-test: a check that could not RUN must not read as a check that found nothing ──
+#
+# Check 11 is the one check here that shells to another interpreter, so it is the one that can
+# stop working without any of its logic changing. It has no `command -v` guard on purpose (the
+# comment beside it says why): a missing python3 and a broken one both exit non-zero and land on
+# the same `note`. This is the only way to reach that line, and it cannot be a .case — the harness
+# runs docs-lint.sh with the ambient PATH and a fixture cannot change it.
+#
+# The positive control is the point. Asserting only that the shimmed run reddens would pass on a
+# fixture tree that was dirty for some unrelated reason, so the same tree is run BOTH ways: clean
+# with a working python3, red with a broken one, and red for THIS reason.
+if [ -z "${DOCS_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ]; then
+  PYT="$WORK.py3"
+  rm -rf "$PYT"; mkdir -p "$PYT/bin" "$PYT/tree/scripts"
+  cp "$ROOT/scripts/docs-lint.sh" "$PYT/tree/scripts/docs-lint.sh"
+  printf '# Project\n\n## Key Decisions\n\nOne line each.\n\n### Area one\n\n- **Alpha rule** — short claim.\n' > "$PYT/tree/CLAUDE.md"
+  mkdir -p "$PYT/tree/docs"
+  printf '# Key Decisions — full register\n\n## Contents\n\n- [Alpha rule](#alpha-rule)\n\n---\n\n## Area one\n\n### Alpha rule\n\nReasoning.\n' > "$PYT/tree/docs/decisions.md"
+  printf '#!/bin/sh\nexit 127\n' > "$PYT/bin/python3"
+  chmod +x "$PYT/bin/python3"
+
+  control=$(cd "$PYT/tree" && sh scripts/docs-lint.sh 2>&1) && control_rc=0 || control_rc=$?
+  shimmed=$(cd "$PYT/tree" && PATH="$PYT/bin:$PATH" sh scripts/docs-lint.sh 2>&1) && shim_rc=0 || shim_rc=$?
+  rm -rf "$PYT"
+  py_fail=0
+  [ "$control_rc" -eq 0 ] || { echo "FAIL  self-test: the control tree is not clean with a working python3."; py_fail=1; }
+  [ "$shim_rc" -ne 0 ] || { echo "FAIL  self-test: a python3 that cannot run left docs-lint.sh exiting 0."; py_fail=1; }
+  case "$shimmed" in
+    *"did not run — python3 is missing or the check failed"*) ;;
+    *) echo "FAIL  self-test: a broken python3 did not produce check 11's did-not-run report."; py_fail=1 ;;
+  esac
+  if [ "$py_fail" -ne 0 ]; then
+    echo "----"
+    echo "docs-lint-test: check 11 can stop running without saying so. A gate that goes quiet when"
+    echo "its interpreter is absent is indistinguishable from a gate that found nothing."
+    exit 1
+  fi
+  echo "docs-lint-test: check 11 reports a broken interpreter rather than skipping."
+
+  # The same rule one level down: a FILE the check could not read is a file it did not examine.
+  # This cannot be a .case — the `@@@ file` splitter writes text through awk and the input needed
+  # here is a byte sequence that is not UTF-8 — so it sits beside the interpreter test, and it is
+  # run BOTH ways for the same reason: a red run has to be attributable to this file.
+  BAD="$WORK.badbytes"
+  rm -rf "$BAD"; mkdir -p "$BAD/tree/scripts" "$BAD/tree/docs"
+  cp "$ROOT/scripts/docs-lint.sh" "$BAD/tree/scripts/docs-lint.sh"
+  printf '# Project\n\n## Key Decisions\n\nOne line each.\n\n### Area one\n\n- **Alpha rule** — short claim.\n' > "$BAD/tree/CLAUDE.md"
+  printf '# Key Decisions — full register\n\n## Contents\n\n- [Alpha rule](#alpha-rule)\n\n---\n\n## Area one\n\n### Alpha rule\n\nReasoning.\n' > "$BAD/tree/docs/decisions.md"
+  control=$(cd "$BAD/tree" && sh scripts/docs-lint.sh 2>&1) && control_rc=0 || control_rc=$?
+  printf '# Notes\n\n\377\376 not utf-8.\n' > "$BAD/tree/docs/notes.md"
+  dirty=$(cd "$BAD/tree" && sh scripts/docs-lint.sh 2>&1) && dirty_rc=0 || dirty_rc=$?
+  rm -rf "$BAD"
+  bad_fail=0
+  [ "$control_rc" -eq 0 ] || { echo "FAIL  self-test: the control tree is not clean before the bad file lands."; bad_fail=1; }
+  [ "$dirty_rc" -ne 0 ] || { echo "FAIL  self-test: a file check 11 cannot read left docs-lint.sh exiting 0."; bad_fail=1; }
+  case "$dirty" in
+    *"docs/notes.md could not be read (UnicodeDecodeError), so this check did NOT examine it"*) ;;
+    *) echo "FAIL  self-test: an unreadable file was skipped instead of reported."; bad_fail=1 ;;
+  esac
+  if [ "$bad_fail" -ne 0 ]; then
+    echo "----"
+    echo "docs-lint-test: check 11 can skip a file without saying so. A file the gate could not"
+    echo "open is a file it did not examine, and silence there reads as a clean result."
+    exit 1
+  fi
+  echo "docs-lint-test: check 11 reports a file it cannot read rather than skipping it."
 fi

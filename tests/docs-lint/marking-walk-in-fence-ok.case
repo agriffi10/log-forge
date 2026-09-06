@@ -1,0 +1,41 @@
+@@@ expect exit=0
+@@@ file docs/architecture.md
+# Architecture
+
+Do not write this:
+
+```
+A fork handler marks everything inherited `_FOREIGN` before the roster is read.
+```
+
+Write what it is restricted to instead.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

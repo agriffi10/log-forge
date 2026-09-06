@@ -1,0 +1,42 @@
+@@@ expect exit=0
+@@@ file src/log_foundry/_lifecycle.py
+"""Lifecycle."""
+
+
+def releasable(sink):
+    """Whether this process may close a sink.
+
+    Not every one of them names the parent: it is the parent's own stamp where ``configure()``
+    left one, and ``_FOREIGN`` where :func:`_mark_inherited` wrote it, which is never a real pid
+    at all.
+    """
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

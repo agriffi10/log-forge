@@ -1,0 +1,41 @@
+@@@ expect exit=1
+@@@ match src/log_foundry/_lifecycle.py:4 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match refuses everything
+@@@ file src/log_foundry/_lifecycle.py
+"""Lifecycle."""
+
+_MARKING_CEILING = 100_000
+"""Objects the child's marking walk may visit before it gives up and refuses everything.
+
+Set far above any real graph.
+"""
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

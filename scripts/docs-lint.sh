@@ -22,8 +22,9 @@
 #   with its digest, an entry is unreachable from the Contents, a Contents row names one
 #   decision and links to another, an entry body opens with a bold label its own heading
 #   does not match, a Completed spec has no delivery doc, a delivery doc has become an
-#   essay, a pointer out of CLAUDE.md goes nowhere, or a standing document dates a
-#   measurement without anchoring it to a commit.
+#   essay, a pointer out of CLAUDE.md goes nowhere, a standing document dates a
+#   measurement without anchoring it to a commit, or a sentence claims the marking walk
+#   acts on everything a forked child inherited.
 #
 # There is no WARN tier: `spec-lint.sh` owns the soft per-spec judgements, and every rule
 # here is a shape the layering depends on — a shape is either held or it isn't.
@@ -32,7 +33,13 @@
 # qualified in one of them and read from the other.
 #
 # Usage: sh scripts/docs-lint.sh          (run from anywhere; resolves its own root)
-# POSIX sh — no bashisms, no dependencies; runs anywhere /bin/sh exists.
+# POSIX sh — no bashisms. One dependency, and only for check 11: `python3`, because that
+# check reads .py DOCSTRINGS and nothing but docstrings, which needs `ast`. The line
+# heuristic that would have let awk do it was measured and rejected — it wrongly keeps
+# 58.6% of code lines and wrongly drops 0.5% of docstring lines, splitting wrapped prose at
+# exactly the sentences that check is about. Every other check here is awk, and a missing
+# python3 is reported as a FAIL rather than skipped: a gate that goes quiet when its
+# interpreter is absent is indistinguishable from a gate that found nothing.
 #
 # NOTE for maintainers: the awk programs below are single-quoted. An apostrophe anywhere
 # inside one — including in a comment — closes the quote, and the shell then parses awk
@@ -749,6 +756,350 @@ done
       END { flush() }
     ' "$f" >> "$FAILS"
   done
+
+
+# ── 11. A universal claim about the marking walk carries its scope ─────────────
+#
+# `_lifecycle._mark_inherited()` is described in prose across sixteen files in src/, docs/ and
+# tests/, and a large share of those descriptions said the same false thing: that it stamps
+# EVERYTHING a forked child inherited `_FOREIGN`. It `setdefault`s, so a sink `configure()`
+# already stamped keeps the parent's real pid. PR #218 corrected it across twelve files over four
+# rounds and three fresh-context review frames, every round finding defects in the previous
+# round's fixes — including two in src/ that all three frames read past. Nothing mechanical
+# noticed that sixteen descriptions of one mechanism disagreed with the code and with each other.
+# This is the one spelling that recurred, where a script can see it (SPEC-053 FR-001).
+#
+# WHAT IT CATCHES, exactly: a sentence that NAMES the mechanism, quantifies what the walk acts on
+# with a bare universal, and attaches no restriction to it. All four parts are load-bearing and
+# each was measured; the numbers below are reproducible with `git archive <sha> | tar -x`.
+#
+#   ANCHOR    _mark_inherited, `_FOREIGN`, ``_FOREIGN``, or the phrase "marking walk". NAMED
+#             symbols only. A descriptive anchor — one that also matches "a forked child",
+#             "it inherited", "inherited sink" — is rejected: every widening tried took the
+#             clean-tree count from 0 into the tens or hundreds against zero true positives,
+#             which is the shape process.md 5 warns about, half a gate's regressions being
+#             false positives.
+#   UNIVERSAL every, everything, each, all. NOT any/always/never, and that is measured rather than
+#             assumed: they buy no true positive this rule can discriminate and they are the
+#             mechanism of every false positive on the corrected tree — "before ANY other
+#             handler runs" appears identically in the false register sentence and in its
+#             correction, "far above ANY real graph" is correct prose, and "a sink it NEVER
+#             acquired" is correct in three of the nine sentences that fire without scoping.
+#   SUBJECT   the universal must quantify what the walk ACTS ON — a sink, a record, something
+#             inherited or stamped, a transport, a descriptor, an object — or be governed
+#             directly by a marking verb, as in "refuses everything". Every alternative in
+#             each of these lists is a STEM with `\w*` after it, and that is a testability
+#             decision, not brevity: a list of inflections is a list of members no fixture
+#             exercises, and the corpus owes one per alternative. Without this the rule
+#             needs only an anchor and a universal to CO-OCCUR, and it then fires on ordinary
+#             prose that happens to mention the walk: "all of the buffer repair happens after
+#             it", "every one of the sixteen files describing the marking walk was corrected".
+#             Measured: adding this clause took the shipping tree from 3 hits to 1.
+#   SCOPE     a restriction inside the QUANTIFIED NOUN PHRASE excuses the universal — a relative
+#             (that/which/whose/it/its) or one of the scoping words this repo actually writes
+#             (reach, missed, residual, partial, setdefault, item 7).
+#
+# THE SCOPE TEST IS POSITIONAL, AND THAT IS THE WHOLE DIFFERENCE BETWEEN A GATE AND A NUISANCE.
+# Tested against the whole sentence — the obvious spelling — a scoping word ANYWHERE excuses a
+# universal ANYWHERE, so the word an author reaches for while fixing this very defect is the word
+# that silences the check. Measured twice over: inserting a scoping clause into the six known-bad
+# sentences, WITHOUT touching their claims, silences the sentence-wide form on 6 of 6, while the
+# positional form survives every insertion a null edit can make. And it already happened for
+# real: `reclaim`'s docstring
+# said "_mark_inherited has already stamped everything inherited ``_FOREIGN``" and the
+# sentence-wide form MISSED it, silenced by the word `setdefault` fourteen words later in its own
+# sentence. The positional form catches it.
+#
+# The positional form's own bound is stated as a property rather than a score, because a score
+# here names no instrument: an insertion anywhere OUTSIDE the quantified noun phrase leaves the
+# sentence firing, and one inside it silences the check by construction. That is what "bound to
+# the noun phrase" means; it is not a leak in it. Anyone can re-derive it from the rule.
+#
+# A NEGATED UNIVERSAL IS NOT A CLAIM, and it is the CORRECTING sentence that needs this. "does not
+# stamp every inherited sink" reads to a regex exactly like the false claim it replaces, so without
+# this the gate reddens on the repair — measured on the real one: `releasable`'s docstring fired
+# first on a negated "every" and, once rewritten, again on "at all". A gate that reddens on two
+# successive repairs of the defect it exists to catch trains authors away from repairing it.
+#
+# The negator's reach is ITS OWN CLAUSE — up to 40 characters, no sentence punctuation, and no
+# coordinating conjunction. Both bounds were measured. A negator plus at most one word (the first
+# spelling) leaves five of eight ordinary corrections reddening, including "does not, as the old
+# docstring said, mark every inherited sink"; letting it cross an `and` makes "the next one is not,
+# and it says X stamps everything inherited" read as a correction of itself.
+#
+# "AT ALL" NEEDS NO GUARD OF ITS OWN, and the one written here was deleted rather than kept. The
+# idiom means "whatsoever" and only ever appears inside a negated clause, which the rule above
+# already covers — measured, its own fixture went on passing with the guard gone, which is the
+# definition of a check that cannot fire. Where "at all" is NOT idiomatic it is a preposition
+# followed by a real universal ("looks at all inherited sinks"), and a guard there would silence a
+# genuine claim. A clause that is dead where it is right and wrong where it is live is not a fence.
+#
+# NO LENGTH CAP. An earlier draft dropped sentences over 700 characters, which is an unconditional
+# escape: padding a false sentence past the cap silences it with its claim untouched. Removing it
+# was measured to move no count on any of the three trees, so it is gone rather than justified.
+#
+# QUOTING THE FALSE CLAIM ON PURPOSE stays possible two ways: a fenced block, which the population
+# below skips, and the literal escape `docs-lint: marking-walk` anywhere in the unit. The escape
+# is a magic word and that is deliberate — it is EXPLICIT and greppable, so nobody reaches it while
+# paraphrasing, which is exactly how the scoping words above defeat a sentence-wide test. It
+# covers the unit it appears in and never a file.
+#
+# ── the population ──
+#
+# IN:  every *.md at the root; docs/**.md; src/**.py; tests/**.py.
+# OUT: scripts/ — this check's own patterns and the prose describing them live here, so the check
+#      would fail on itself. That one needs no exclusion: the population is four INCLUSION globs
+#      and none of them reaches scripts/, so there is nothing there to mutate and a fixture over
+#      it proves only that the harness runs.
+# OUT: any directory named docs-lint, which IS a live exclusion and is the one to mutate. The
+#      .case corpus carries the wrong form on purpose, and while a .case is already outside the
+#      globs by extension, a .py planted beside it is not — which is exactly what that fixture
+#      plants. The skip does not prune the walk, so a subdirectory of one is still descended into;
+#      nothing puts prose there today and this says so rather than implying otherwise.
+#
+# THIS POPULATION DIFFERS FROM CHECK 9's, and check 9 excludes its three trees for three DIFFERENT
+# reasons, none of which is "frozen records" alone (see :650, :654, :658 above): docs/specs and
+# four sibling docs trees are frozen records; src/ is out because its docstrings anchor to SPEC
+# numbers rather than commits and whether that counts is a decision nobody has taken; tests/ is
+# out because the .case corpus carries the wrong form on purpose. This check INCLUDES all three —
+# docs/specs and tests/ are exactly where the false claim was restated, and a frozen record that
+# states a false universal is still read as a description of today's code — and EXCLUDES
+# scripts/, pyproject.toml and .github/*.yml, which check 9 includes. One reason standing in for
+# three is how the wrong one gets cited later, so all three are written out here.
+#
+# KNOWN AND STATED, not discovered later: a markdown TABLE ROW is dropped (a table has no sentence
+# terminator, so a whole table flattens into one "sentence" pairing any row's anchor with any
+# other row's universal), which means docs/component-inventory.md's row — one of the three places
+# that restate this mechanism — cannot be policed here. An overt relative pronoun excuses a
+# universal, so "marks everything THAT the child inherited" would pass while being as false as the
+# sentence it replaces. This check catches the BARE universal, which is the one spelling that
+# recurred; the contrapositive ("an unmarked sink is claimable") and the possessive ("the
+# `_FOREIGN` stamp `_mark_inherited` set") carry no universal and are out of reach by construction.
+#
+# AND WHAT REDDENS THAT SHOULD NOT — the more important list, because a false negative costs a
+# missed claim while a false positive costs the gate. All four are the price of the positional
+# scope test, and none is fixable without paying a true positive; each was built and measured.
+#
+#   A RESTRICTION WITH NO RELATIVE PRONOUN reddens. "Every sink the walk missed" is restricted in
+#   English and not to this check, which needs `that`, `which`, `whose` or one of the scoping
+#   words. Adding `it|its|the parent|the child` closes it and drops one of the six true positives,
+#   so the pronoun stays required and the FAIL text says to insert it. This is the one authors will
+#   hit.
+#   AN UNBALANCED FENCE silences everything below it to EOF, in any file. Check 9 has the same
+#   hole and names it; this check inherits it rather than closing it, because balancing fences is
+#   a markdown parser's job.
+#   A 4-SPACE INDENTED CODE BLOCK is not a fence and is not skipped, so a false claim quoted that
+#   way reddens. Use a fenced block, which is what the FAIL text already recommends.
+#   TWO ADJACENT LINES WITH NO TERMINATOR are one sentence, so an anchor on one and a universal on
+#   the next pair up. That is the table-row flattening in another costume, and dropping table rows
+#   closes only the instance where it is unavoidable.
+# ONE branch, not two, and that is a testability decision. The obvious spelling guards a
+# `command -v python3` and reports a missing interpreter separately from a failing one — but the
+# absent-interpreter branch cannot be reached from the fixture harness without unbuilding PATH far
+# enough to take `grep` and `awk` with it, so it would ship untested, which is the state this
+# check exists to argue against. Collapsed to one invocation, a missing python3 exits 127 and a
+# broken one exits non-zero, and both land on the same `note` — which a self-test in
+# docs-lint-test.sh reaches with a python3 shim that fails. The report is a FAIL either way: a
+# check that could not run must never read as a check that found nothing. stderr is deliberately
+# NOT swallowed — the note says the check did not run, and the traceback or the shell's own
+# "command not found" beside it is the only thing that says why.
+python3 - . >> "$FAILS" <<'PYEOF' || note "check 11 (the marking walk) did not run — python3 is missing or the check failed. Its findings, if any, are NOT in this report."
+"""SPEC-053 FR-001. Reads the tree given as argv[1]; prints FAIL lines; never exits non-zero."""
+import ast
+import os
+import re
+import sys
+
+ANCHOR = re.compile(r"_mark_inherited|`_FOREIGN`|marking walk")
+UNIVERSAL = re.compile(r"\b(every|everything|each|all)\b", re.IGNORECASE)
+SUBJECT = re.compile(
+    r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*",
+    re.IGNORECASE,
+)
+VERB = re.compile(
+    r"\b(mark|record|stamp|refuse|claim)\w*\s+(\w+\s+){0,1}$",
+    re.IGNORECASE,
+)
+RESTRICT = re.compile(
+    r"\b(that|which|whose)\b|reach|missed|residual|partial|setdefault|item 7",
+    re.IGNORECASE,
+)
+NEGATED = re.compile(
+    r"\b(not|no|never|nothing|rather than|false|used to|corrected)"
+    r"\b(?:(?!\b(?:and|but|or|so)\b)[^.;:]){0,40}$",
+    re.IGNORECASE,
+)
+NP_END = re.compile(r"[,;:.()—–]")
+ESCAPE = "docs-lint: marking-walk"
+REPORT = (
+    "FAIL  %s:%d claims the marking walk acts on EVERYTHING, with no scope.\n"
+    "      %s\n"
+    "      `_mark_inherited` ``setdefault``s: a sink `configure()` already stamped keeps the\n"
+    "      parent's real pid, and ``_FOREIGN`` lands only where nothing was recorded. Say what\n"
+    "      the universal is restricted TO, INSIDE its own noun phrase — \"every inherited sink\n"
+    "      its walk reaches\", \"everything inherited that the parent never recorded\". A scoping\n"
+    "      word elsewhere in the sentence does NOT count and is not meant to, and a restriction\n"
+    "      with no relative pronoun (\"every sink the walk missed\") is not seen as one — insert\n"
+    "      the `that`. Quoting the false claim on purpose? Use a fenced block, or put\n"
+    "      `docs-lint: marking-walk` in the same unit — the paragraph, or the single bullet,\n"
+    "      that carries it, since a bullet is a unit of its own. SPEC-053 FR-001."
+)
+LIST_ITEM = re.compile(r"^[ \t]*([-*+]|[0-9]+[.)])[ \t]")
+SENTENCE = re.compile(r"(?<=[.!?])[*_`\"')\]]*\s+")
+
+
+def violates(sentence):
+    """Whether one sentence makes an unrestricted universal claim about the marking walk.
+
+    The escape is not consulted here. It covers the whole UNIT — a paragraph, a bullet, one
+    docstring paragraph — because a marker written as its own sentence would otherwise excuse
+    only itself, which is the one sentence that never violates.
+    """
+    if not ANCHOR.search(sentence):
+        return False
+    for found in UNIVERSAL.finditer(sentence):
+        before = sentence[max(0, found.start() - 60):found.start()]
+        if NEGATED.search(before):
+            continue
+        end = NP_END.search(sentence, found.end())
+        phrase = sentence[found.start():end.start()] if end else sentence[found.start():]
+        if not (SUBJECT.search(phrase) or VERB.search(before)):
+            continue
+        if RESTRICT.search(phrase[found.end() - found.start():]):
+            continue
+        return True
+    return False
+
+
+def population(root):
+    """Every file this check reads, as paths relative to root."""
+    for name in sorted(os.listdir(root)):
+        if name.endswith(".md") and os.path.isfile(os.path.join(root, name)):
+            yield name
+    for sub, suffix in (("docs", ".md"), ("src", ".py"), ("tests", ".py")):
+        for dirpath, dirnames, filenames in os.walk(os.path.join(root, sub)):
+            dirnames.sort()
+            if os.path.basename(dirpath) == "docs-lint":
+                continue
+            for name in sorted(filenames):
+                if name.endswith(suffix):
+                    yield os.path.relpath(os.path.join(dirpath, name), root)
+
+
+def blocks(lines, first, markdown):
+    """Split lines into units at blank lines, list markers, and (in markdown) headings/rows."""
+    held, start, fenced = [], None, False
+    for number, line in enumerate(lines, first):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if held:
+                yield start, "\n".join(held)
+            held, start, fenced = [], None, not fenced
+            continue
+        if fenced:
+            continue
+        if not stripped or (markdown and (stripped.startswith("#") or stripped.startswith("|")
+                                          or stripped.startswith(">"))):
+            if held:
+                yield start, "\n".join(held)
+            held, start = [], None
+            continue
+        if LIST_ITEM.match(line):
+            if held:
+                yield start, "\n".join(held)
+            held, start = [line], number
+            continue
+        if not held:
+            start = number
+        held.append(line)
+    if held:
+        yield start, "\n".join(held)
+
+
+def docstrings(text):
+    """Every docstring in a module: def, class and module bodies, plus attribute docstrings."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            found = ast.get_docstring(node, clean=False)
+            if found:
+                yield node.body[0].lineno, found
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for index, statement in enumerate(body):
+            if not index or not isinstance(statement, ast.Expr):
+                continue
+            value = statement.value
+            if (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                    and isinstance(body[index - 1], (ast.Assign, ast.AnnAssign))):
+                yield statement.lineno, value.value
+
+
+def units(relative, text):
+    """The prose units of one file, as (starting line, text) pairs."""
+    if relative.endswith(".py"):
+        for line, found in docstrings(text):
+            yield from blocks(found.splitlines(), line, False)
+    else:
+        yield from blocks(text.splitlines(), 1, True)
+
+
+def sentences(block, first):
+    """Every sentence of one unit, each with the source line it starts on."""
+    flat, lines = [], []
+    for offset, line in enumerate(block.splitlines()):
+        stripped = line.strip() if offset else line
+        flat.append(stripped)
+        lines.append(first + offset)
+    joined = " ".join(flat)
+    starts, cursor = [], 0
+    for offset, piece in enumerate(flat):
+        starts.append((cursor, lines[offset]))
+        cursor += len(piece) + 1
+    found, cursor = [], 0
+    for sentence in SENTENCE.split(joined):
+        line = first
+        for at, number in starts:
+            if at <= cursor:
+                line = number
+        found.append((line, sentence.strip()))
+        cursor += len(sentence) + 1
+    return found
+
+
+def main(root):
+    """Print one FAIL block per violating sentence, in file and line order."""
+    findings = []
+    for relative in population(root):
+        try:
+            with open(os.path.join(root, relative), encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as failure:
+            # NOT a skip. A file this check could not read is a file it did not examine, and the
+            # whole argument for the interpreter guard above applies again one level down: a gate
+            # that goes quiet on what it could not open reads exactly like a gate that found
+            # nothing. Reported by TYPE, per arch 6 and SPEC-029.
+            findings.append((relative, 0,
+                             "FAIL  %s could not be read (%s), so this check did NOT examine it."
+                             % (relative, type(failure).__name__)))
+            continue
+        for line, block in units(relative, text):
+            if ESCAPE in block:
+                continue
+            for at, sentence in sentences(block, line):
+                if not sentence or not violates(sentence):
+                    continue
+                findings.append((relative, at, REPORT % (relative, at, sentence[:160])))
+    for _, _, report in sorted(findings, key=lambda found: (found[0], found[1])):
+        print(report)
+
+
+main(sys.argv[1])
+PYEOF
 
 
 report

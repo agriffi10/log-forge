@@ -1,0 +1,43 @@
+@@@ expect exit=1
+@@@ match src/log_foundry/_lifecycle.py:6 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match over everything the child inherited
+@@@ file src/log_foundry/_lifecycle.py
+"""Lifecycle."""
+
+_FOREIGN = -1
+"""The pid a record carries when the sink belongs to some earlier process.
+
+Never a real pid, so it can never match os.getpid. Laid down by
+:func:`_mark_inherited` in a forked child over everything the child inherited, which is what
+gives "this process did not acquire it" a **terminal** state.
+"""
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

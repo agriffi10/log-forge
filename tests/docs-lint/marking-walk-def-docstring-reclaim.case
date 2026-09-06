@@ -1,0 +1,45 @@
+@@@ expect exit=1
+@@@ match src/log_foundry/_lifecycle.py:7 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ match has already stamped everything inherited
+@@@ file src/log_foundry/_lifecycle.py
+"""Lifecycle."""
+
+
+def reclaim(sink):
+    """Records that a sink re-acquired its transport in this process.
+
+    The one write that **overrides** an existing record, and it has to be: :func:`_mark_inherited`
+    has already stamped everything inherited ``_FOREIGN`` by the time the hook roster is read, so
+    a ``setdefault`` here would leave a sink that provably holds its own descriptor refused
+    forever.
+    """
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

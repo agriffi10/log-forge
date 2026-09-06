@@ -1,0 +1,37 @@
+@@@ expect exit=0
+@@@ file docs/architecture.md
+# Architecture
+
+The marking walk runs first, and all of the buffer repair happens after it.
+
+Every one of the sixteen files describing the marking walk was corrected.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

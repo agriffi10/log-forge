@@ -1,0 +1,36 @@
+@@@ expect exit=1
+@@@ match docs/architecture.md:3 claims the marking walk acts on EVERYTHING, with no scope.
+@@@ file docs/architecture.md
+# Architecture
+
+The marking walk stamps them all.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.

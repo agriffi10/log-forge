@@ -1,0 +1,37 @@
+@@@ expect exit=0
+@@@ file docs/architecture.md
+# Architecture
+
+A fork handler marks everything inherited that the parent never recorded `_FOREIGN` — it
+`setdefault`s, so a sink the parent stamped keeps that pid and is refused by it — **before any
+other handler runs**, which is what gives "no record" a terminal state.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+One line each; the full entry lives in the register.
+
+### Area one
+
+- **Alpha rule** — short claim and its fence.
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions.md
+# Key Decisions — full register
+
+## Contents
+
+- [Alpha rule](#alpha-rule)
+
+---
+
+## Area one
+
+### Alpha rule
+
+Reasoning.
