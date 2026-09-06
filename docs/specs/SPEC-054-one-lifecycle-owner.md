@@ -1,7 +1,7 @@
 # Spec: One Lifecycle Owner for Both Delivery Paths
 
 **ID:** SPEC-054
-**Status:** Draft
+**Status:** Completed
 **Last Updated:** 2026-09-04
 **Depends On:** SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050
 
@@ -285,7 +285,14 @@ disappears, said so rather than left to be discovered.
 does not rely on it (SPEC-044): every close performed here is either the first close of a sink
 armed by a build, a swap or a landed emit — a live target is closed at exit whether or not
 anything was written since it was installed, the worker path's rule today — or a close that
-follows a write since the previous one. Never two for one write-epoch.
+follows a write since the previous one. Never two for one write-epoch, ~~without exception~~ —
+corrected during the build: a swap the worker **declines** arms the new sink anyway (FR-003), so
+a `shutdown()` that lands inside a declining swap can close that sink and the exit close it again
+with nothing written between. The alternative is not arming it, which costs SPEC-035 FR-003's
+guarantee that a declined sink is owned by somebody; three shipped tests hold that guarantee and
+all three fail without the arming. The redundant close is therefore the accepted trade, and it is
+the first clause of this sentence rather than a violation of the last: a live target the config
+installed, closed at exit.
 
 The record is declared in the owner's `_FORK_SKIP`, for the reason `_owned` and
 `Worker._unclosed_swaps` are: it pins superseded sinks, and the repair walk would run their fork

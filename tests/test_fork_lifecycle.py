@@ -631,14 +631,14 @@ def test_two_holders_of_one_event_still_share_it_in_the_child() -> None:
 def test_a_set_event_is_still_set_in_the_child() -> None:
     """FR-003 AC-5. An ``Event`` carries its set state across, or the child un-does a shutdown.
 
-    ``_lifecycle._state._orphan_stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
+    ``_lifecycle._state._stop`` is set by ``shutdown()`` and an ``Event`` never clears. A
     replacement that started unset would tell a child's sink to go on backing off for delivery
     that has already been retired, which is SPEC-033 FR-004's reasoning inherited by a fork.
     """
-    _lifecycle._state._orphan_stop.set()
-    before = id(_lifecycle._state._orphan_stop)
+    _lifecycle._state._stop.set()
+    before = id(_lifecycle._state._stop)
     child = run_in_child(
-        lambda: f"{_lifecycle._state._orphan_stop.is_set()},{id(_lifecycle._state._orphan_stop) != before}"
+        lambda: f"{_lifecycle._state._stop.is_set()},{id(_lifecycle._state._stop) != before}"
     )
     assert child.output == "True,True", child.output
 
@@ -933,7 +933,7 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "retired.ndjson"
     sink = FileSink(str(path))
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
-    worker = _idle_worker(sink)
+    _idle_worker(sink)
     log_foundry.shutdown()
 
     started = threading.Event()
@@ -958,8 +958,35 @@ def test_a_retired_parent_forks_a_retired_child(tmp_path: pathlib.Path) -> None:
         Worker._run = original_run  # type: ignore[method-assign]
 
     assert child.output == "True,1,False", child.output
-    assert worker.retired
+    assert log_foundry.health().retired
     assert path.read_text(encoding="utf-8") == "", "the retired child delivered"
+
+
+def test_a_retired_parent_forks_a_retired_child_with_no_worker_built() -> None:
+    """SPEC-054 FR-006 AC-3's other half: the same answer on the orphan path, from the one latch.
+
+    The worker-path test above reads retirement through `_state._worker`, so it cannot say where
+    the answer comes from. This one shuts down a process that only ever logged **outside a span**,
+    so there is no worker in the parent and none is built in the child — the child's `retired` can
+    only be the owner's count, which the fork copies like any other attribute.
+
+    That is what having one latch buys. Before SPEC-054 the answer was `_orphan_retired or
+    worker.retired`, and a child on this path was answered by the first term alone; a fix to
+    either term left the other untouched, which is `docs/invariants.md` invariant 6's shape.
+    """
+    log_foundry.configure(service="fork", version="0", env="test", sink=MemorySink())
+    log_foundry.info("an orphan log, so the shutdown has something to retire")
+    log_foundry.shutdown()
+    assert _lifecycle._state._worker is None, "the premise: no worker was ever built"
+    assert log_foundry.health().retired is True, "and the parent is retired"
+
+    def report() -> str:
+        """Reports the child's retirement and that answering it built no worker."""
+        health = log_foundry.health()
+        return f"{health.retired},{_lifecycle._state._worker is None}"
+
+    child = run_in_child(report)
+    assert child.output == "True,True", child.output
 
 
 def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: pathlib.Path) -> None:
@@ -987,12 +1014,12 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     _lifecycle._state._worker = worker
     gate = _park_the_drain_thread(stream, worker, 0)
 
-    shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
+    shutting_down = threading.Thread(target=lambda: worker.stop(30.0), daemon=True)
     shutting_down.start()
     deadline = time.monotonic() + 5.0
-    while not worker.retired and time.monotonic() < deadline:
+    while not worker._stopped and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert worker.retired and worker.draining, "the fork must land while the shutdown is joining"
+    assert worker._stopped and worker.draining, "the fork must land while the shutdown is joining"
 
     def report() -> str:
         live = _lifecycle._state._worker
@@ -1056,14 +1083,14 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     worker.submit([{"msg": "parks the drain thread"}])
     assert gate.entered.wait(5.0), "the drain thread never parked, so the fork misses the window"
 
-    shutting_down = threading.Thread(target=lambda: worker.shutdown(30.0), daemon=True)
+    shutting_down = threading.Thread(target=lambda: worker.stop(30.0), daemon=True)
     shutting_down.start()
 
     def parent_ready() -> bool:
-        # `retired` latches before `_stop` is set, so polling on `retired` alone and asserting
+        # `_stopped` latches before `_stop` is set, so polling on it alone and asserting
         # the signal afterwards has a window between the two where the precondition is false.
         signal = sink.log_foundry_stop_signal
-        return worker.retired and signal is not None and signal.is_set()
+        return worker._stopped and signal is not None and signal.is_set()
 
     deadline = time.monotonic() + 5.0
     while not parent_ready() and time.monotonic() < deadline:
@@ -1230,7 +1257,7 @@ def test_a_child_of_a_process_that_built_no_worker_is_silent(tmp_path: pathlib.P
     """FR-002. A process that only ever logged outside a span has nothing to rebuild.
 
     The existence guard is what keeps that quiet. Without it the rebuild takes an
-    ``AttributeError`` on ``None.retired``, which ``_fork`` absorbs into a stderr line on
+    ``AttributeError`` on ``None._epoch``, which ``_fork`` absorbs into a stderr line on
     **every fork** — a library announcing a fault of its own invention, on a path where nothing
     was wrong (SPEC-025).
     """
@@ -1479,7 +1506,7 @@ def _namespace_stores(tree: ast.AST) -> set[int]:
     threading.Lock()`` inside a function, and treating every ``Name`` as reachable made the rule
     accept a lock no walk could ever find. So the scope is carried down — module and class
     bodies write to a namespace, a function body does not unless the name is declared ``global``,
-    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_orphan_stop``.
+    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_stop``.
 
     Args:
       tree: The parsed module.
@@ -1706,7 +1733,7 @@ def test_the_shape_lint_rejects_the_shapes_it_claims_to() -> None:
 
 
 def test_a_module_global_reassigned_inside_a_function_still_counts() -> None:
-    """``_orphan_stop`` is rebuilt as ``self._orphan_stop`` inside ``_Lifecycle.refresh_stop_signal``.
+    """``_stop`` is rebuilt as ``self._stop`` inside ``_Lifecycle.refresh_stop_signal``.
 
     It was a ``global`` rebinding inside ``_offer_orphan_signal`` until SPEC-040 moved the state
     onto one owner, so **no live site in ``src/`` takes the ``global`` branch any more**. The
@@ -2167,7 +2194,7 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     assert worker._queue is queue_before
     assert sink._lock is lock_before
     assert worker.dropped == dropped_before
-    assert not worker.retired
+    assert _lifecycle._state.live_worker() is worker
 
     @log_foundry.trace
     def work() -> None:
@@ -2937,7 +2964,7 @@ def test_the_buffer_lint_reads_the_shapes_it_claims_to() -> None:
 
 
 def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
-    """FR-004. `Worker._unclosed_swaps` pins superseded sinks, so the walk must not enter it.
+    """FR-004. `Worker._held` pins superseded sinks, so the walk must not enter it.
 
     The hazard `_fork._SKIP_ATTRIBUTE` documents, at a new container: reaching a sink the process
     abandoned replaces its locks — merely wasteful — and runs its fork hooks, which is not, since
@@ -2966,7 +2993,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
     worker = Worker(_Hooked())
     stranded = _Hooked()
     try:
-        worker._unclosed_swaps = [stranded]
+        worker._held = [worker.sink, stranded]
         _lifecycle._state._worker = worker
         reached = _fork._reinit_primitives()
         assert not any(obj is stranded for obj in reached), (
@@ -2974,7 +3001,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         )
 
         # Control: the same walk, with the attribute renamed out from under the opt-out.
-        worker._unclosed_swaps = []
+        worker._held = [worker.sink]
         worker._not_skipped = [stranded]  # type: ignore[attr-defined]
         reached_control = _fork._reinit_primitives()
         assert any(obj is stranded for obj in reached_control), (
@@ -2986,7 +3013,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         # a called hook reaches — the one write that overrides an inherited record.
         # So "the hook did not run in the child" is the step between the walk and `releasable`.
         worker._not_skipped = []  # type: ignore[attr-defined]
-        worker._unclosed_swaps = [stranded]
+        worker._held = [worker.sink, stranded]
         reclaimed: list[object] = []
         real_reclaim = _lifecycle.reclaim
         _lifecycle.reclaim = reclaimed.append  # type: ignore[assignment]
@@ -2994,7 +3021,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
             assert run_in_child(lambda: str(stranded in reclaimed)).output == "False", (
                 "a child re-stamped a sink the record only pins, so it could then release it"
             )
-            worker._unclosed_swaps = []
+            worker._held = [worker.sink]
             worker._not_skipped = [stranded]  # type: ignore[attr-defined]
             assert run_in_child(lambda: str(stranded in reclaimed)).output == "True", (
                 "the control did not re-stamp it either, so the assertion above proves nothing"
@@ -3003,7 +3030,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
             _lifecycle.reclaim = real_reclaim  # type: ignore[assignment]
     finally:
         _lifecycle._state._worker = None
-        worker.shutdown(timeout=2.0)
+        worker.stop(timeout=2.0)
 
 
 def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
@@ -3045,16 +3072,18 @@ def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
         )
     finally:
         _lifecycle._state._worker = None
-        worker.shutdown(timeout=2.0)
+        worker.stop(timeout=2.0)
 
 
 def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
-    """FR-002. Both slots naming an in-flight close are emptied for the child.
+    """SPEC-050 FR-002's rule at SPEC-054 FR-003's one registry: no inherited close promise.
 
-    `_fork._fresh_primitive` carries an `Event`'s set state across, and the thread that would
-    have cleared these did not survive the fork — so a child inheriting either would answer its
-    *own* later close instantly and exit through a close still running, which is the defect
-    FR-002 closes, made permanent.
+    ~~Both slots naming an in-flight close are emptied for the child.~~ — struck (SPEC-021):
+    the worker's slot and the process-wide orphan count are both gone, and one per-sink registry
+    holds every close in flight. `_fork._fresh_primitive` carries an `Event`'s set state across,
+    and the thread that would have discharged a registration did not survive the fork — so a
+    child inheriting one would answer its *own* later close instantly and exit through a close
+    still running, and would leave that sink skipped by the signal refresh forever.
     """
     from log_foundry.worker import Worker
 
@@ -3068,23 +3097,21 @@ def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
     worker = Worker(_Quiet())
     try:
         _lifecycle._state._worker = worker  # only the *registered* worker is rebuilt
-        worker._closing = threading.Event()
-        worker._closing.set()
-        _lifecycle._orphan_closing = 1
-        _lifecycle._orphan_idle.clear()
+        inherited = _lifecycle._register_closing(worker.sink)
+        inherited.event.set()  # as an already-answered close would arrive
 
         def in_child() -> str:
-            """Reports both records as the child sees them, after the handlers have run."""
-            return f"{worker._closing is None},{not _lifecycle._orphan_closing}"
+            """Reports the registry as the child sees it, after the handlers have run."""
+            return f"{not _lifecycle._closing_now},{_lifecycle.closing_count()}"
 
         child = run_in_child(in_child)
     finally:
-        _lifecycle._orphan_closing = 0
-        _lifecycle._orphan_idle.set()
+        with _lifecycle._closing_now_lock:
+            _lifecycle._closing_now.clear()
         _lifecycle._state._worker = None
-        worker.shutdown(timeout=2.0)
+        worker.stop(timeout=2.0)
 
-    assert child.output == "True,True", child.output
+    assert child.output == "True,0", child.output
 
 
 _TESTS_DIR = pathlib.Path(__file__).parent

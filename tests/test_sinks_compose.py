@@ -330,7 +330,7 @@ def test_worker_records_a_failed_batch_when_every_child_is_down() -> None:
         worker.submit([ev()])
         worker.flush(timeout=5.0)
     finally:
-        worker.shutdown()
+        worker.stop()
 
     assert worker.failed_batches == 1
 

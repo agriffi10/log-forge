@@ -36,7 +36,7 @@ class ConsoleWriter:
     module so a ``ConsoleWriter(stream=…)`` built for a test starts clean, and the counter is
     taken under a lock on the failure path only, since ``_log`` reaches the process-global
     writer from arbitrary application threads; the disable flag is a set-only latch read
-    unlocked, as ``Worker.submit`` reads ``_shutdown_done``.
+    unlocked, as ``Worker.submit`` reads the lifecycle owner's retirement count.
     """
 
     def __init__(self, stream: TextIO | None = None) -> None:

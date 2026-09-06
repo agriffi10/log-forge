@@ -12,7 +12,9 @@ import json
 
 import pytest
 
+import log_foundry
 import log_foundry.sinks._socket as socket_mod
+from conftest import install_worker
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.multi import MultiSink
@@ -124,46 +126,115 @@ def test_a_non_callable_losses_attribute_is_refused() -> None:
 
 
 def test_health_reports_the_configured_sinks_losses() -> None:
-    worker = Worker(CountingSink(dropped=4, failed=5), batch_size=1)
+    """SPEC-054 FR-005: the field reads the **configured** sink, on either delivery path.
+
+    It was `worker.health().sink`, filled from `worker.sink`. The two differ after a declined
+    swap and after any `configure()` on a retired worker, and the config is what
+    `architecture.md` §12 names the authority for "installed" — so the sink is configured here
+    rather than only handed to a worker.
+    """
+    sink = CountingSink(dropped=4, failed=5)
+    log_foundry.configure(service="t", sink=sink)
+    worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink == SinkLosses(dropped=4, failed=5)
+        assert log_foundry.health().sink == SinkLosses(dropped=4, failed=5)
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_health_sink_is_none_when_the_sink_reports_nothing() -> None:
     worker = Worker(QuietSink(), batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink is None
+        assert log_foundry.health().sink is None
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_health_never_raises_on_a_broken_accessor() -> None:
     worker = Worker(BrokenLossesSink(), batch_size=1)
+    install_worker(worker)
     try:
-        health = worker.health()
+        health = log_foundry.health()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert health.sink is None
     assert health.failed_batches == 0, "the rest of the snapshot is intact"
 
 
 def test_health_sink_tracks_the_counters_live() -> None:
     sink = CountingSink()
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
-        assert worker.health().sink == SinkLosses(dropped=0, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=0, failed=0)
         sink._losses = SinkLosses(dropped=7, failed=0)
-        assert worker.health().sink == SinkLosses(dropped=7, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=7, failed=0)
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
-def test_no_worker_reports_no_sink_losses() -> None:
+def test_no_sink_configured_reports_no_sink_losses() -> None:
+    """The field is `None` because nothing is configured, not because no worker exists.
+
+    Named for the causation since SPEC-054 FR-005: `health().sink` is filled from the
+    **configured** sink on both delivery paths, so "no worker" stopped being the reason for a
+    `None` here. The test below is the one that pins the path this used to describe.
+    """
     import log_foundry
 
     assert log_foundry.health().sink is None
+
+
+def test_health_reports_a_sinks_losses_with_no_worker_at_all() -> None:
+    """SPEC-054 FR-005 AC-1 — probe 1, as a regression guard rather than as prose.
+
+    The divergence that motivated the whole FR: against a `MultiSink` whose first child raises,
+    one `info()` **inside** a span reported `SinkLosses(dropped=0, failed=N)` while the same call
+    **outside** one reported `None`, with the sink's own `losses()` reading `failed=1`. That
+    contradicts `docs/invariants.md` §2's observable — loss a sink absorbed is in `health().sink`
+    — and it was the two-owner shape describing itself as the contract: `_worker_health`'s
+    no-worker branch synthesized eight fields and not that one.
+
+    Every other `health().sink` assertion in this file installs a worker, so **none of them
+    discriminates**: reverting `_worker_health` to `sink=None` where no worker exists left the
+    full suite green, measured. This one is on the orphan path with no worker built, and it
+    asserts the sink's own `losses()` alongside, so the two cannot disagree silently again.
+    """
+    import log_foundry
+    from log_foundry import _lifecycle
+    from log_foundry.sinks.memory import MemorySink
+    from log_foundry.sinks.multi import MultiSink
+
+    class Raising(Sink):
+        """A child that fails every batch, so the wrapper absorbs and counts one loss."""
+
+        def emit(self, events: list[dict[str, object]]) -> None:
+            """Fails, which `MultiSink` isolates and counts."""
+            raise RuntimeError("this child is down")
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    sink = MultiSink(Raising(), MemorySink())
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("outside a span, so no worker is ever built")
+
+    assert _lifecycle._state.worker_exists() is None, (
+        "the premise: this is the orphan path, where the field used to read None"
+    )
+    health = log_foundry.health()
+    assert health.sink == SinkLosses(dropped=0, failed=1), (
+        f"loss a sink absorbed is in health().sink on this path too — got {health.sink}"
+    )
+    assert health.sink == read_losses(sink), (
+        "and it is the sink's own answer, not a second opinion"
+    )
+    assert health.orphan_lost == 0, (
+        "the wrapper absorbed the child's failure, so nothing was lost to the caller"
+    )
 
 
 def test_health_sink_defaults_to_none_for_third_party_construction() -> None:
@@ -187,7 +258,7 @@ def test_a_total_failure_reaches_failed_batches_and_flush() -> None:
         assert worker.health().failed_batches == 1
         assert worker.health().stopped_reason is None, "the drain thread survived"
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_the_worker_keeps_draining_after_a_total_failure() -> None:
@@ -210,7 +281,7 @@ def test_the_worker_keeps_draining_after_a_total_failure() -> None:
         worker.submit(_span("b"))
         assert worker.flush(timeout=2.0)
     finally:
-        worker.shutdown()
+        worker.stop()
     assert [e["event"] for batch in sink.batches for e in batch] == ["b"]
 
 
@@ -496,13 +567,15 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     sink = SyslogSink("loghost", transport="udp", max_retries=0)
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1, max_retries=0)
+    install_worker(worker)
     try:
         worker.submit(_span("a"))
         assert not worker.flush(timeout=2.0)
-        health = worker.health()
+        health = log_foundry.health()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert health.failed_batches == 1
     assert health.sink == SinkLosses(dropped=0, failed=1)
 
@@ -658,15 +731,17 @@ def test_losses_is_safe_to_call_concurrently_with_emit() -> None:
             return SinkLosses(dropped=0, failed=self.failed)
 
     sink = SlowSink()
+    log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1)
+    install_worker(worker)
     try:
         worker.submit(_span("a"))
         assert started.wait(2.0), "the emit is in flight"
-        assert worker.health().sink == SinkLosses(dropped=0, failed=0)
+        assert log_foundry.health().sink == SinkLosses(dropped=0, failed=0)
         release.set()
     finally:
-        worker.shutdown()
-    assert worker.health().sink == SinkLosses(dropped=0, failed=1)
+        worker.stop()
+    assert log_foundry.health().sink == SinkLosses(dropped=0, failed=1)
 
 
 # --- review follow-ups: wrappers, the SDK path, an all-rejected bulk ----------------------
@@ -916,7 +991,7 @@ def _worker_sees(sink) -> tuple[int, bool]:
         verdict = worker.flush(timeout=2.0)
         return worker.health().failed_batches, verdict
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> None:

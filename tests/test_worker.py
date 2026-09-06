@@ -16,6 +16,7 @@ import time
 import pytest
 
 import log_foundry as log_foundry_mod
+from conftest import install_worker, retire_process
 from log_foundry import _lifecycle
 from log_foundry import worker as worker_mod
 
@@ -37,6 +38,20 @@ def _wait_until(predicate, timeout: float = 2.0) -> bool:
 def _span(msg) -> list[dict]:
     """One span's worth of events (a single-event list, as submit() receives)."""
     return [{"message": msg}]
+
+
+def _retire(worker, timeout: float | None = 30.0) -> None:
+    """Retires the process through the lifecycle owner, which is where the latch now lives.
+
+    SPEC-054 FR-001 moved retirement off ``Worker``: a worker's own stop ends its thread and
+    nothing more, and what makes a later submission *undeliverable* is the **process** having
+    retired. So a test about post-shutdown submissions installs the worker it built as the
+    process worker and drives the real ``_lifecycle._shutdown_worker``, rather than moving the
+    count by hand — a helper that reproduced the production expression would pass against a
+    broken one, which is the whole hazard here. ``conftest``'s reset clears both again.
+    """
+    _lifecycle._state._worker = worker
+    _lifecycle._shutdown_worker(timeout)
 
 
 class RecordingSink:
@@ -144,7 +159,7 @@ def test_submit_returns_before_emit_completes() -> None:
     sink.release.set()
     assert elapsed < 1.0, f"submit blocked for {elapsed:.2f}s on a sink that waits 30s"
 
-    w.shutdown()
+    w.stop()
     assert any(e["message"] == "x" for e in sink.events)
 
 
@@ -156,7 +171,7 @@ def test_batching_no_loss_in_order() -> None:
     w = Worker(sink, batch_size=5, flush_interval=0.05)
     for i in range(23):
         w.submit(_span(i))
-    w.shutdown()
+    w.stop()
 
     assert [e["message"] for e in sink.events] == list(range(23))
 
@@ -166,7 +181,7 @@ def test_emit_receives_a_flat_list_of_dicts() -> None:
     w = Worker(sink, batch_size=3, flush_interval=0.05)
     for i in range(6):
         w.submit(_span(i))
-    w.shutdown()
+    w.stop()
 
     assert sink.batches, "at least one batch emitted"
     for batch in sink.batches:
@@ -182,7 +197,7 @@ def test_batch_size_triggers_emit_before_shutdown() -> None:
             w.submit(_span(i))
         assert _wait_until(lambda: len(sink.events) >= 3), "batch_size should trigger a flush"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_interval_triggers_emit_before_shutdown() -> None:
@@ -192,7 +207,7 @@ def test_flush_interval_triggers_emit_before_shutdown() -> None:
         w.submit(_span("t"))
         assert _wait_until(lambda: len(sink.events) >= 1), "flush_interval should trigger a flush"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 # -- FR-003: retry with backoff ---------------------------------------------------------
@@ -202,7 +217,7 @@ def test_retry_survives_transient_failure() -> None:
     sink = FlakySink(fail_times=2)
     w = Worker(sink, batch_size=1, flush_interval=0.02, max_retries=3)
     w.submit(_span("r"))
-    w.shutdown()
+    w.stop()
 
     assert any(e["message"] == "r" for e in sink.events), "batch delivered after retries"
     assert sink.attempts >= 3, "the failing attempts were retried"
@@ -215,7 +230,7 @@ def test_worker_survives_emit_exception_and_keeps_processing() -> None:
     w.submit(_span("a"))
     assert _wait_until(lambda: any(e["message"] == "a" for e in sink.events))
     w.submit(_span("b"))
-    w.shutdown()
+    w.stop()
 
     assert {"a", "b"} <= {e["message"] for e in sink.events}
 
@@ -224,7 +239,7 @@ def test_batch_abandoned_after_retry_bound_is_counted(capsys) -> None:
     sink = AlwaysFailSink()
     w = Worker(sink, batch_size=1, flush_interval=0.02, max_retries=2)
     w.submit(_span("x"))
-    w.shutdown()
+    w.stop()
 
     assert w.failed_batches >= 1, "an unrecoverable batch is counted, not silently dropped"
     assert "lost 1 event(s)" in capsys.readouterr().err, "the line carries the count"
@@ -248,7 +263,7 @@ def test_full_queue_drops_newest_and_counts() -> None:
         assert w.dropped == 2
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
     delivered = {e["message"] for e in sink.events}
     assert delivered == {0, 1}, "dropped submissions never reached the sink"
@@ -265,7 +280,7 @@ def test_dropped_counter_is_observable() -> None:
         assert isinstance(w.dropped, int) and w.dropped >= 1
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 # -- regression: idle worker must block, not busy-spin ----------------------------------
@@ -291,7 +306,7 @@ def test_idle_worker_does_not_busy_spin(monkeypatch) -> None:
         # busy-spin (last_flush never advancing) would be tens of thousands to millions.
         assert counts["get"] < 100, f"idle worker appears to busy-spin: {counts['get']} get() calls"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 # -- FR-005: graceful shutdown ----------------------------------------------------------
@@ -304,7 +319,7 @@ def test_shutdown_drains_buffered_events_and_closes_sink() -> None:
         w.submit(_span(i))
     assert sink.events == [], "still buffered before shutdown"
 
-    w.shutdown()
+    retire_process(w)
     assert [e["message"] for e in sink.events] == list(range(5)), "drain emits the tail"
     assert sink.closed == 1
 
@@ -313,8 +328,8 @@ def test_shutdown_is_idempotent() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=100, flush_interval=100.0)
     w.submit(_span("x"))
-    w.shutdown()
-    w.shutdown()  # must not raise or double-close
+    retire_process(w)
+    retire_process(w)  # must not raise or double-close
 
     assert sink.closed == 1
 
@@ -334,7 +349,7 @@ def test_decorator_worker_is_lazy_and_single() -> None:
         assert w1 is w2, "one worker per process, reused"
         assert w1.sink is log_foundry.get_config().sink, "worker built from the configured sink"
     finally:
-        w1.shutdown()
+        w1.stop()
         _lifecycle._state._worker = None
 
 
@@ -367,7 +382,7 @@ def test_flush_drains_and_leaves_the_worker_running() -> None:
         assert w.flush(timeout=5.0)
         assert sink.events[-1]["message"] == "after", "the worker still works after a flush"
     finally:
-        w.shutdown()
+        retire_process(w)
 
 
 def test_flush_does_not_merely_wait_out_the_flush_interval() -> None:
@@ -386,7 +401,7 @@ def test_flush_does_not_merely_wait_out_the_flush_interval() -> None:
         # could not have delivered these inside a 100s interval.
         assert elapsed < 1.0, f"flush should return promptly, took {elapsed:.3f}s"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_marker_never_reaches_the_sink() -> None:
@@ -403,7 +418,7 @@ def test_flush_marker_never_reaches_the_sink() -> None:
                 assert isinstance(event, dict), f"a non-event reached the sink: {event!r}"
         assert [e["message"] for e in sink.events] == ["a", "b"], "exactly the submitted events"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_shutdown_answers_a_marker_left_in_the_queue() -> None:
@@ -418,7 +433,7 @@ def test_shutdown_answers_a_marker_left_in_the_queue() -> None:
 
     flusher = threading.Thread(target=lambda: flushed.append(w.flush(timeout=5.0)))
     flusher.start()
-    stopper = threading.Thread(target=w.shutdown)
+    stopper = threading.Thread(target=w.stop)
     try:
         assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
         stopper.start()
@@ -466,7 +481,7 @@ def test_flush_is_repeatable_and_concurrent() -> None:
         assert [bool(r) for r in results] == [True] * 4, "every concurrent flush is answered"
         assert sink.events[-1]["message"] == "third"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_does_not_consume_the_shutdown_flag() -> None:
@@ -477,7 +492,7 @@ def test_flush_does_not_consume_the_shutdown_flag() -> None:
     assert w.flush(timeout=5.0)
 
     w.submit(_span("tail"))
-    w.shutdown()  # must still be a full, working shutdown
+    retire_process(w)  # must still be a full, working shutdown
 
     assert any(e["message"] == "tail" for e in sink.events), "shutdown still drains"
     assert sink.closed == 1, "shutdown still closes the sink"
@@ -489,7 +504,7 @@ def test_flush_does_not_consume_the_shutdown_flag() -> None:
 def test_flush_after_shutdown_returns_false_promptly() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
-    w.shutdown()
+    w.stop()
 
     start = time.monotonic()
     assert not w.flush(timeout=5.0), "nothing will ever consume the marker now"
@@ -518,7 +533,7 @@ def test_flush_honours_its_timeout_on_a_wedged_sink() -> None:
         assert elapsed < 1.0, f"timeout not honoured, took {elapsed:.3f}s"
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
@@ -535,7 +550,7 @@ def test_flush_does_not_raise_when_the_sink_always_fails() -> None:
         assert sink.events == [], "nothing was ever successfully emitted"
         assert w.failed_batches >= 1, "the failure is counted, not swallowed silently"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_with_timeout_none_returns_true_on_a_healthy_worker() -> None:
@@ -546,7 +561,7 @@ def test_flush_with_timeout_none_returns_true_on_a_healthy_worker() -> None:
         assert w.flush(timeout=None)
         assert [e["message"] for e in sink.events] == ["n"]
     finally:
-        w.shutdown()
+        w.stop()
 
 
 # -- SPEC-013 FR-003/FR-005: the public `lf.flush()` entry point -------------------------
@@ -601,7 +616,7 @@ def test_module_flush_delivers_a_traced_call_and_logging_continues() -> None:
         assert log_foundry.flush(timeout=5.0)
         assert [e["message"] for e in sink.events].count("invoked") == 2
     finally:
-        _lifecycle._state._worker.shutdown()
+        retire_process()
         _lifecycle._state._worker = None
 
 
@@ -630,7 +645,7 @@ def test_health_reflects_live_counters() -> None:
         assert isinstance(h.queued, int)
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_health_counts_failed_batches() -> None:
@@ -644,14 +659,14 @@ def test_health_counts_failed_batches() -> None:
         w.flush(timeout=5.0)
         assert w.health().failed_batches == 1
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_health_is_readable_after_shutdown() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
+    w.stop()
 
     h = w.health()  # must not raise
     assert h.queued == 0, "the final drain consumed the queue, markers included"
@@ -700,7 +715,7 @@ def test_first_overflow_drop_warns_once(capsys) -> None:
         assert "lost 1 submission(s)" in err
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_overflow_warning_is_throttled(capsys) -> None:
@@ -719,7 +734,7 @@ def test_overflow_warning_is_throttled(capsys) -> None:
         assert err.count("log queue full") == 3
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_overflow_warning_never_raises_into_the_caller(monkeypatch) -> None:
@@ -747,7 +762,7 @@ def test_overflow_warning_never_raises_into_the_caller(monkeypatch) -> None:
         assert w.dropped == 1, "the drop is still counted even when the warning cannot be written"
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 # -- SPEC-019: the drain thread's terminal-failure path ---------------------------------
@@ -825,7 +840,7 @@ def test_an_ordinary_exception_does_not_set_stopped_reason() -> None:
     assert w._thread.is_alive(), "an Exception is absorbed by _emit; the worker survives it"
     w.submit(_span("b"))
     assert _wait_until(lambda: sink.attempts >= 4), "still draining after the abandoned batch"
-    w.shutdown()
+    w.stop()
 
 
 def test_callers_are_unaffected_after_the_worker_dies() -> None:
@@ -835,8 +850,8 @@ def test_callers_are_unaffected_after_the_worker_dies() -> None:
     assert _wait_until(lambda: _dead(w))
     w.submit(_span("b"))  # queued, never drained — must not raise
     assert not w.flush(timeout=0.2), "flush reports failure rather than burning its timeout"
-    w.shutdown()  # joins an already-dead thread and closes the sink
-    w.shutdown()  # still idempotent
+    w.stop()  # joins an already-dead thread and closes the sink
+    w.stop()  # still idempotent
 
 
 def test_a_decorated_function_is_unaffected_after_the_worker_dies() -> None:
@@ -863,7 +878,7 @@ def test_stopped_reason_survives_shutdown() -> None:
     w = Worker(TerminalSink(SystemExit(1)), batch_size=1)
     w.submit(_span("a"))
     assert _wait_until(lambda: _dead(w))
-    w.shutdown()
+    w.stop()
     assert w.health().stopped_reason == "SystemExit", "shutdown must not clear the diagnosis"
 
 
@@ -871,7 +886,7 @@ def test_a_clean_run_reports_no_terminal_failure(capsys) -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
+    w.stop()
     h = w.health()
     assert h.stopped_reason is None
     assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
@@ -902,8 +917,8 @@ def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
     """
     w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
-    h = w.health()
+    _retire(w)
+    h = log_foundry_mod.health()
 
     # Values, not types: `X == X` and `isinstance(x, int)` are true of anything the annotation
     # already promises, and the first version of this test asserted exactly that -- residue of
@@ -911,7 +926,7 @@ def test_health_is_read_by_attribute_and_no_longer_by_position() -> None:
     assert (h.queued, h.dropped, h.failed_batches) == (0, 0, 0)
     assert h.stopped_reason is None, "a clean shutdown is not a failure (SPEC-019)"
     assert h.sink is None, "RecordingSink reports no losses"
-    assert h.retired is True, "shutdown() was called two lines above"
+    assert h.retired is True, "shutdown() was called three lines above"
     assert (h.submitted_after_shutdown, h.incomplete_swaps, h.closing_sinks) == (0, 0, 0)
 
     with pytest.raises(TypeError):
@@ -952,7 +967,7 @@ def test_flush_reports_true_when_the_events_reach_the_sink() -> None:
         assert [e["message"] for e in sink.events] == ["landed"], "True means these landed"
         assert w.failed_batches == 0
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
@@ -967,7 +982,7 @@ def test_flush_reports_false_when_the_batch_is_abandoned() -> None:
         assert w.failed_batches == 1, "and the failure it reports is the abandoned batch"
         assert sink.events == []
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_a_failing_flush_returns_promptly_rather_than_at_the_timeout() -> None:
@@ -984,7 +999,7 @@ def test_a_failing_flush_returns_promptly_rather_than_at_the_timeout() -> None:
         assert sink.attempts == 3, "the retry budget really was spent inside the flush"
         assert elapsed < 5.0, f"the waiter was stranded, took {elapsed:.3f}s"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_reports_true_when_there_was_nothing_pending() -> None:
@@ -999,7 +1014,7 @@ def test_flush_reports_true_when_there_was_nothing_pending() -> None:
         assert w.flush(timeout=5.0)
         assert w.flush(timeout=5.0), "the second flush has nothing left to do"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_reports_true_when_the_sink_recovers_mid_retry() -> None:
@@ -1013,7 +1028,7 @@ def test_flush_reports_true_when_the_sink_recovers_mid_retry() -> None:
         assert sink.attempts == 3, "two failures then the delivery"
         assert w.failed_batches == 0, "a recovered batch is not an abandoned one"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_reports_false_on_a_dead_worker() -> None:
@@ -1026,7 +1041,7 @@ def test_flush_reports_false_on_a_dead_worker() -> None:
         assert not dead
         assert dead.reason == "thread-died"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
@@ -1052,7 +1067,7 @@ def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
 
     flusher = threading.Thread(target=lambda: flushed.append(w.flush(timeout=5.0)))
     flusher.start()
-    stopper = threading.Thread(target=w.shutdown)
+    stopper = threading.Thread(target=w.stop)
     try:
         assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
         stopper.start()
@@ -1072,7 +1087,7 @@ def test_shutdown_still_returns_nothing_and_still_drains() -> None:
     sink = RecordingSink()
     w = Worker(sink, batch_size=1000, flush_interval=100.0)
     w.submit(_span("tail"))
-    assert w.shutdown() is None, "shutdown must not grow a return value"
+    assert retire_process(w) is None, "shutdown must not grow a return value"
     assert [e["message"] for e in sink.events] == ["tail"], "and it still drains"
     assert sink.closed == 1, "and still closes the sink"
 
@@ -1124,7 +1139,7 @@ def test_every_flush_outstanding_over_a_lost_batch_reports_the_loss() -> None:
         assert sink.events == []
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_a_flush_called_after_the_abandonment_reports_success() -> None:
@@ -1147,7 +1162,7 @@ def test_a_flush_called_after_the_abandonment_reports_success() -> None:
         assert w.flush(timeout=5.0), "nothing pending, and nothing lost since the call"
         assert w.health().failed_batches == 1, "the loss is reported by health(), not by flush()"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes() -> None:
@@ -1169,7 +1184,7 @@ def test_a_loss_that_predates_the_call_does_not_stick_to_later_flushes() -> None
         assert [e["message"] for e in sink.events] == ["kept"]
         assert w.flush(timeout=5.0), "and it does not come back on the next empty flush"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_flush_reports_false_when_the_queue_is_too_full_for_the_marker() -> None:
@@ -1188,7 +1203,7 @@ def test_flush_reports_false_when_the_queue_is_too_full_for_the_marker() -> None
         assert time.monotonic() - start < 1.0, "and the put timeout bounds the wait"
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 def test_a_flush_answered_by_a_dying_final_drain_is_not_stranded() -> None:
@@ -1219,7 +1234,7 @@ def test_a_flush_answered_by_a_dying_final_drain_is_not_stranded() -> None:
     w.submit(_span("b"))
     flusher = threading.Thread(target=_flush)
     flusher.start()
-    stopper = threading.Thread(target=w.shutdown)
+    stopper = threading.Thread(target=w.stop)
     try:
         assert _wait_until(lambda: w._queue.qsize() >= 2), "marker should be queued behind 'b'"
         stopper.start()
@@ -1326,7 +1341,7 @@ def test_shutdown_returns_normally_when_the_sink_cannot_close(capsys) -> None:
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     worker.submit(_span("a"))
 
-    worker.shutdown()  # must not raise
+    retire_process(worker)  # must not raise
 
     err = capsys.readouterr().err
     assert "absorbed a failure while closing the sink (OSError)" in err
@@ -1346,7 +1361,7 @@ def test_shutdown_drains_and_emits_before_attempting_the_close() -> None:
     worker.submit(_span("a"))
     worker.submit(_span("b"))
 
-    worker.shutdown()
+    retire_process(worker)
 
     assert [e["message"] for batch in sink.batches for e in batch] == ["a", "b"]
     assert sink.emitted_at_close == 2, "the drain had completed before the close was attempted"
@@ -1360,8 +1375,8 @@ def test_a_second_shutdown_is_still_a_no_op_and_still_does_not_raise() -> None:
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     worker.submit(_span("a"))
 
-    worker.shutdown()
-    worker.shutdown()  # must not raise, and must not retry the close
+    retire_process(worker)
+    retire_process(worker)  # must not raise, and must not retry the close
 
     assert sink.close_calls == 1
 
@@ -1370,7 +1385,7 @@ def test_health_stays_readable_after_a_failed_close() -> None:
     sink = _CloseFailsSink()
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     worker.submit(_span("a"))
-    worker.shutdown()
+    worker.stop()
 
     health = worker.health()
     assert health.queued == 0
@@ -1391,10 +1406,10 @@ def test_a_keyboardinterrupt_from_close_still_propagates() -> None:
     worker.submit(_span("a"))
 
     with pytest.raises(KeyboardInterrupt):
-        worker.shutdown()
+        retire_process(worker)
 
     try:
-        worker.shutdown()  # spent, not retryable — and still silent
+        retire_process(worker)  # spent, not retryable — and still silent
     except KeyboardInterrupt:
         # Caught rather than allowed to propagate: an escaping KeyboardInterrupt aborts the
         # whole pytest session instead of failing this test, which reads in CI as an
@@ -1522,7 +1537,7 @@ def test_a_broken_stderr_does_not_kill_the_drain_thread(monkeypatch) -> None:
         w.submit(_span("b"))
         assert _wait_until(lambda: w.health().failed_batches == 2), "still draining"
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_a_broken_stderr_still_records_the_terminal_failure(monkeypatch) -> None:
@@ -1549,7 +1564,7 @@ def test_a_broken_stderr_does_not_reach_the_caller_on_overflow(monkeypatch) -> N
         assert w.health().dropped == 1
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
 
 class _Detonation(BaseException):
@@ -1586,7 +1601,7 @@ def test_the_batch_counter_survives_an_announcement_that_detonates(monkeypatch) 
         w.submit(_span("a"))
         assert _wait_until(lambda: w.health().failed_batches == 1)
     finally:
-        w.shutdown()
+        w.stop()
 
 
 # The detonation escapes the worker thread by design — that is the fault being modelled — and
@@ -1611,9 +1626,9 @@ def test_a_clean_shutdown_reports_retired_with_a_zero_count() -> None:
     """Correct usage: shut down, then stop logging. Retired is a state, not yet a fault."""
     w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
+    _retire(w)
 
-    h = w.health()
+    h = log_foundry_mod.health()
     assert h.retired is True
     assert h.submitted_after_shutdown == 0
 
@@ -1622,12 +1637,12 @@ def test_submissions_after_shutdown_are_counted() -> None:
     """The measured defect: three submissions delivered nothing and every counter read zero."""
     sink = RecordingSink()
     w = Worker(sink, batch_size=1)
-    w.shutdown()
+    _retire(w)
 
     for i in range(3):
         w.submit(_span(i))
 
-    h = w.health()
+    h = log_foundry_mod.health()
     assert h.submitted_after_shutdown == 3
     assert h.retired is True
     assert sink.events == [], "the worker is retired; nothing drains these"
@@ -1636,7 +1651,7 @@ def test_submissions_after_shutdown_are_counted() -> None:
 def test_stopped_reason_stays_none_through_post_shutdown_submissions() -> None:
     """SPEC-019 FR-003 unchanged: a clean shutdown is not a terminal failure, ever."""
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    w.stop()
     w.submit(_span("a"))
 
     assert w.health().stopped_reason is None
@@ -1652,7 +1667,7 @@ def test_a_worker_that_was_never_shut_down_reports_false_and_zero() -> None:
         assert h.retired is False
         assert h.submitted_after_shutdown == 0
     finally:
-        w.shutdown()
+        w.stop()
 
 
 def test_a_process_that_never_logged_reports_the_zeroed_lifecycle_snapshot() -> None:
@@ -1701,7 +1716,7 @@ def test_decorated_calls_after_a_module_shutdown_are_counted() -> None:
 
 def test_the_first_post_shutdown_submission_warns_once(capsys) -> None:
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     capsys.readouterr()  # discard anything shutdown itself wrote
 
     w.submit(_span("a"))
@@ -1717,7 +1732,7 @@ def test_the_first_post_shutdown_submission_warns_once(capsys) -> None:
 def test_the_post_shutdown_warning_is_throttled(capsys) -> None:
     """2,500 submissions must produce exactly 3 lines (1, 1000, 2000), as overflow does."""
     w = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
-    w.shutdown()
+    _retire(w)
     capsys.readouterr()
 
     for i in range(2500):
@@ -1731,7 +1746,7 @@ def test_the_post_shutdown_warning_is_throttled(capsys) -> None:
 def test_a_shutdown_with_no_later_logging_writes_nothing(capsys) -> None:
     w = Worker(RecordingSink(), batch_size=1)
     w.submit(_span("a"))
-    w.shutdown()
+    w.stop()
 
     assert capsys.readouterr().err == "", "correct usage must stay silent"
 
@@ -1745,7 +1760,7 @@ def test_the_post_shutdown_warning_never_reaches_the_caller(monkeypatch) -> None
             raise ValueError("I/O operation on closed file")
 
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     monkeypatch.setattr("sys.stderr", BrokenStderr())
 
     w.submit(_span("a"))  # warns -> stderr raises internally -> must not escape
@@ -1762,7 +1777,7 @@ def test_the_post_shutdown_counter_survives_an_announcement_that_detonates(monke
     and here the exception reaches the application's own thread on its way out.
     """
     w = Worker(RecordingSink(), batch_size=1)
-    w.shutdown()
+    _retire(w)
     monkeypatch.setattr(sys, "stderr", _DetonatingStderr())
 
     with pytest.raises(_Detonation):
@@ -1783,7 +1798,7 @@ def test_a_live_worker_pays_nothing_for_the_check(capsys) -> None:
         assert w.health().submitted_after_shutdown == 0
         assert capsys.readouterr().err == ""
     finally:
-        w.shutdown()
+        w.stop()
 
 
 # -- SPEC-030 follow-up: a hung swapped-out close must not hijack interpreter shutdown ------
@@ -1887,7 +1902,7 @@ def test_release_waiters_answers_markers_among_queued_event_lists() -> None:
     """
     sink = RecordingSink()
     worker = Worker(sink, batch_size=1000, flush_interval=60.0)
-    worker.shutdown()
+    worker.stop()
     assert not worker._thread.is_alive(), "nothing may consume what this test puts on the queue"
 
     first = worker_mod._FlushMarker(seen_failures=0)
@@ -1922,7 +1937,7 @@ def test_release_waiters_is_a_no_op_with_no_markers_queued() -> None:
     """
     sink = RecordingSink()
     worker = Worker(sink)
-    worker.shutdown()
+    worker.stop()
 
     worker._release_waiters()  # must not raise
 
@@ -1957,7 +1972,7 @@ def test_the_sentinel_is_queued_before_stop_is_set() -> None:
     worker._queue.put_nowait = recording_put  # type: ignore[method-assign]
     worker._stop.set = recording_set  # type: ignore[method-assign]
 
-    worker.shutdown()
+    worker.stop()
 
     assert order == ["put", "set"], "the sentinel must be queued before _stop is set"
 
@@ -1974,7 +1989,7 @@ def test_no_sentinel_is_queued_for_a_thread_that_is_already_gone() -> None:
     worker._thread.join(timeout=5)
     assert not worker._thread.is_alive()
 
-    worker.shutdown()
+    worker.stop()
 
     assert _SHUTDOWN_SENTINEL not in list(worker._queue.queue)
     assert worker.health().queued == 0
@@ -2004,7 +2019,7 @@ def test_no_sentinel_survives_a_completed_shutdown_under_load() -> None:
         for _ in range(300):
             worker = Worker(RecordingSink(), batch_size=10, flush_interval=60.0)
             worker.submit(_span("a"))
-            worker.shutdown(timeout=2.0)
+            worker.stop(timeout=2.0)
             if _SHUTDOWN_SENTINEL in list(worker._queue.queue):
                 stranded += 1
             if worker.health().stopped_reason is not None:
@@ -2039,7 +2054,7 @@ def test_a_flush_marker_queued_after_the_final_drain_is_still_answered() -> None
     marker = worker_mod._FlushMarker(seen_failures=0)
     worker._queue.put_nowait(marker)
 
-    worker.shutdown()
+    worker.stop()
 
     assert marker.event.is_set(), "a caller with timeout=None would otherwise wait forever"
     assert marker.delivered is False, "the drain that would have carried it is gone"
@@ -2070,7 +2085,7 @@ def test_an_expired_shutdown_leaves_the_sentinel_but_answers_the_waiters() -> No
     marker = worker_mod._FlushMarker(seen_failures=0)
     worker._queue.put_nowait(marker)
 
-    worker.shutdown(timeout=0.2)  # expires; the thread is still in emit
+    worker.stop(timeout=0.2)  # expires; the thread is still in emit
 
     assert worker._thread.is_alive(), "the premise: the drain thread outlived the join"
     assert worker.health().stopped_reason == "ShutdownTimeout"
@@ -2091,7 +2106,7 @@ def test_post_shutdown_submissions_are_still_counted_and_queued() -> None:
     """SPEC-030's evidence must survive everything shutdown does on the way out."""
     sink = RecordingSink()
     worker = Worker(sink, batch_size=10, flush_interval=0.01)
-    worker.shutdown()
+    _retire(worker)
 
     worker.submit(_span("late"))
     worker.submit(_span("later"))
@@ -2191,7 +2206,7 @@ def test_the_drain_finished_flag_is_set_before_the_threads_own_sweep() -> None:
 
     worker._release_waiters = recording_sweep  # type: ignore[method-assign]
 
-    worker.shutdown()
+    worker.stop()
 
     assert observations, "the drain thread must sweep on its way out, not only shutdown()"
     assert observations[0] is True, "the flag must already be set when the thread's sweep runs"
@@ -2241,7 +2256,7 @@ def test_no_sentinel_is_queued_while_the_terminal_line_is_being_written(capsys) 
     assert entered.wait(timeout=5), "the drain must be inside the terminal line"
     assert worker._thread.is_alive(), "the premise: is_alive() still reads True here"
 
-    closing = threading.Thread(target=lambda: worker.shutdown(timeout=1.0), daemon=True)
+    closing = threading.Thread(target=lambda: worker.stop(timeout=1.0), daemon=True)
     closing.start()
     assert _wait_until(lambda: worker._stop.is_set(), timeout=5.0), "shutdown got past its put"
 
@@ -2343,7 +2358,7 @@ def test_a_parked_unbounded_flush_is_released_when_shutdown_expires(capsys) -> N
     assert _wait_until(lambda: any(isinstance(i, worker_mod._FlushMarker)
                                    for i in list(worker._queue.queue))), "marker never queued"
 
-    worker.shutdown(timeout=0.3)
+    worker.stop(timeout=0.3)
     flusher.join(timeout=2.0)
     still_waiting = flusher.is_alive()
     # Released unconditionally: a regression strands this thread on an unbounded wait, and a
@@ -2391,7 +2406,7 @@ def test_a_marker_the_drain_already_took_is_released_too(capsys) -> None:
         "the premise: the drain took the marker before blocking, so a queue sweep cannot see it"
     )
 
-    worker.shutdown(timeout=0.3)
+    worker.stop(timeout=0.3)
     flusher.join(timeout=2.0)
     still_waiting = flusher.is_alive()
     sink.release.set()
@@ -2417,7 +2432,7 @@ def test_a_marker_taken_by_the_final_drain_is_released_too(capsys) -> None:
     marker = worker_mod._FlushMarker(seen_failures=0)
     worker._queue.put_nowait(marker)
 
-    worker.shutdown(timeout=0.5)
+    worker.stop(timeout=0.5)
 
     assert worker._thread.is_alive(), "the premise: the final drain is wedged in emit"
     assert sink.in_emit.is_set(), "the premise: it got as far as the sink"
@@ -2457,7 +2472,7 @@ def test_the_taken_marker_record_does_not_grow(capsys) -> None:
         f"{len(worker._taken_markers)} markers retained after 200 flushes — one per flush is a "
         f"leak of an Event apiece for the life of the process"
     )
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
     assert worker._taken_markers == [], "and the final drain releases the ones it took"
 
@@ -2499,7 +2514,7 @@ def test_a_flush_that_arrives_after_the_sweep_is_not_left_waiting(capsys) -> Non
     flusher.start()
     assert at_put.wait(5.0), "the premise: the flusher is past its guards and about to put"
 
-    worker.shutdown(timeout=0.3)
+    worker.stop(timeout=0.3)
     assert worker._thread.is_alive() and not worker._drain_finished.is_set(), (
         "the premise: the expiry branch, where only _drain_settled is set"
     )
@@ -2542,7 +2557,7 @@ def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_is_given_up(caps
     flusher.start()
     assert _wait_until(lambda: flusher.is_alive()), "the premise: the flusher is parked in put"
 
-    worker.shutdown(timeout=0.2)
+    worker.stop(timeout=0.2)
     flusher.join(timeout=5.0)
     still_parked = flusher.is_alive()
     sink.release.set()
@@ -2576,7 +2591,7 @@ def test_flush_with_a_zero_timeout_still_enqueues_its_marker(capsys) -> None:
     assert result.reason == "timed-out", f"a queue with room is not queue-full — got {result}"
 
     sink.release.set()
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2634,7 +2649,7 @@ def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_dies(capsys) -> 
     assert verdict and verdict[0].reason == "thread-died", (
         f"the drain died rather than being given up on — got {verdict[0]}"
     )
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2679,7 +2694,7 @@ def test_the_full_queue_wait_polls_rather_than_spins(capsys) -> None:
     assert attempts > 1, "and it must actually re-attempt, or the slicing does nothing"
 
     sink.release.set()
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2717,7 +2732,7 @@ def test_flush_with_a_negative_timeout_reports_a_timeout_rather_than_raising(cap
         f"a negative budget is an expired one, not a dead thread — got {result}"
     )
     sink.release.set()
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2774,7 +2789,7 @@ def test_a_bounded_flush_on_a_full_queue_still_reports_queue_full(capsys) -> Non
         "a live-but-slow drain is a full queue, not an abandoned one"
     )
     sink.release.set()
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2827,7 +2842,7 @@ def test_a_marker_the_drain_delivered_beats_the_given_up_branch(capsys) -> None:
 
     worker._release_marker = slow_release  # type: ignore[method-assign]
 
-    shutdown = threading.Thread(target=lambda: worker.shutdown(timeout=0.2), daemon=True)
+    shutdown = threading.Thread(target=lambda: worker.stop(timeout=0.2), daemon=True)
     shutdown.start()
     shutdown.join(timeout=5)
     assert worker._drain_settled.is_set(), "the premise: the shutdown gave up and set the flag"
@@ -2895,7 +2910,7 @@ def test_a_flush_arriving_after_a_dead_drain_still_reports_thread_died(capsys) -
     assert verdict and verdict[0].reason == "thread-died", (
         "a drain that died is not a drain that was given up on"
     )
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
 
@@ -2950,7 +2965,7 @@ def test_a_marker_taken_after_the_drain_settled_answers_itself(capsys) -> None:
     assert not sink.in_emit.is_set(), "the premise: it has not started emitting yet"
     assert worker._taken_markers == [], "the premise: it is in neither the queue nor the record"
 
-    worker.shutdown(timeout=0)  # its sweep finds both populations empty
+    worker.stop(timeout=0)  # its sweep finds both populations empty
     may_return.set()  # the drain records the marker, then wedges in the sink for good
     flusher.join(timeout=5.0)
     still_waiting = flusher.is_alive()
@@ -2981,7 +2996,7 @@ def test_a_released_marker_answered_again_still_delivers_once(capsys) -> None:
     marker = worker_mod._FlushMarker(seen_failures=0)
     worker._queue.put_nowait(marker)
 
-    worker.shutdown(timeout=0.3)
+    worker.stop(timeout=0.3)
     assert marker.event.is_set(), "the premise: the sweep answered it"
 
     sink.release.set()
@@ -3001,7 +3016,7 @@ def test_a_clean_shutdown_still_answers_each_marker_with_the_real_outcome(capsys
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
     worker.submit(_span("a"))
     result = worker.flush(timeout=2.0)
-    worker.shutdown(timeout=2.0)
+    worker.stop(timeout=2.0)
     capsys.readouterr()
 
     assert bool(result) is True, "a confirmed drain still reports delivery"
@@ -3015,7 +3030,7 @@ def test_the_expiry_branch_still_reports_shutdown_timeout(capsys) -> None:
     worker.submit(_span("a"))
     assert _wait_until(lambda: sink.in_emit.is_set())
 
-    worker.shutdown(timeout=0.2)
+    worker.stop(timeout=0.2)
     err = capsys.readouterr().err
 
     assert worker.health().stopped_reason == "ShutdownTimeout"
@@ -3062,11 +3077,11 @@ def test_a_second_shutdown_waits_for_an_inline_close_it_did_not_claim(capsys) ->
     worker.submit(_span("a"))
     assert _wait_until(lambda: bool(sink.events)), "the premise: the batch reached the sink"
 
-    first = threading.Thread(target=lambda: worker.shutdown(timeout=5.0))
+    first = threading.Thread(target=lambda: retire_process(worker, timeout=5.0))
     first.start()
     assert sink.in_close.wait(5.0), "the premise: the first caller is inside close()"
 
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     capsys.readouterr()
 
     assert sink.closed == 1, "the second caller waited; it did not close a second time"
@@ -3082,12 +3097,12 @@ def test_the_waiting_caller_does_not_close_a_second_time(capsys) -> None:
     """
     sink = _CloseIsDeliverySink(close_seconds=0.4)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    first = threading.Thread(target=lambda: worker.shutdown(timeout=5.0))
+    first = threading.Thread(target=lambda: retire_process(worker, timeout=5.0))
     first.start()
     assert sink.in_close.wait(5.0)
 
     start = time.monotonic()
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     elapsed = time.monotonic() - start
     capsys.readouterr()
 
@@ -3106,12 +3121,13 @@ def test_a_stuck_close_costs_the_second_caller_only_the_closer_grace(capsys) -> 
     """
     sink = _CloseIsDeliverySink()  # never finishes: may_finish is never set
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    first = threading.Thread(target=lambda: worker.shutdown(timeout=None), daemon=True)
+    install_worker(worker)
+    first = threading.Thread(target=lambda: retire_process(worker, timeout=None), daemon=True)
     first.start()
     assert sink.in_close.wait(5.0)
 
     start = time.monotonic()
-    worker.shutdown(timeout=30.0)
+    retire_process(worker, timeout=30.0)
     elapsed = time.monotonic() - start
     capsys.readouterr()
 
@@ -3128,12 +3144,13 @@ def test_a_zero_timeout_second_shutdown_does_not_inherit_the_other_deadline(caps
     """
     sink = _CloseIsDeliverySink()
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    first = threading.Thread(target=lambda: worker.shutdown(timeout=None), daemon=True)
+    install_worker(worker)
+    first = threading.Thread(target=lambda: retire_process(worker, timeout=None), daemon=True)
     first.start()
     assert sink.in_close.wait(5.0)
 
     start = time.monotonic()
-    worker.shutdown(timeout=0)
+    retire_process(worker, timeout=0)
     elapsed = time.monotonic() - start
     capsys.readouterr()
 
@@ -3146,10 +3163,10 @@ def test_a_second_shutdown_with_no_close_in_flight_returns_at_once(capsys) -> No
     sink = RecordingSink()
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
     worker.submit(_span("a"))
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
 
     start = time.monotonic()
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     elapsed = time.monotonic() - start
     capsys.readouterr()
 
@@ -3170,22 +3187,20 @@ def test_the_closing_slot_is_emptied_for_a_forked_child() -> None:
     """
     for resume in (True, False):
         worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
-        worker._closing = threading.Event()
-        worker._closing.set()  # as an inherited, already-answered close would arrive
-        worker._unclosed_swaps = [RecordingSink()]  # and a sink the child never stranded
+        stranded = RecordingSink()
+        worker._held = [worker.sink, stranded]  # a sink the child never stranded
         worker._taken_markers = [worker_mod._FlushMarker(seen_failures=0)]  # and a caller it
         # cannot answer: the flush() waiting on it is on a thread that did not survive the fork
 
         worker._reinit_after_fork(resume=resume)
 
-        assert worker._closing is None, f"the slot survived the fork with resume={resume}"
-        assert worker._unclosed_swaps == [], (
+        assert worker._held == [worker.sink], (
             f"the child inherited the parent's stranded sinks with resume={resume}"
         )
         assert worker._taken_markers == [], (
             f"the child inherited the parent's in-flight flush markers with resume={resume}"
         )
-        worker.shutdown(timeout=2.0)
+        worker.stop(timeout=2.0)
 
 
 # -- SPEC-050 FR-004: a sink stranded by an unconfirmed swap is closed at shutdown -------
@@ -3212,10 +3227,19 @@ class _ClientBufferingSink(RecordingSink):
 
 
 def _strand(worker: Worker, old: _ClientBufferingSink, new: object) -> None:
-    """Performs a swap whose drain cannot be confirmed, leaving `old` recorded and open."""
-    assert worker.swap_sink(new, timeout=0.05) is True  # type: ignore[arg-type]
+    """Performs a swap whose drain cannot be confirmed, leaving `old` owed and open.
+
+    Driven through `_lifecycle._swap_sink`, which is what `configure(sink=...)` calls, rather
+    than through the worker alone: SPEC-054 FR-003 made the **owner** responsible for every
+    close, so a swap taken at the worker leaves the owed record untouched and a later shutdown
+    with nothing to close.
+    """
+    if _lifecycle._state.worker_exists() is not worker:
+        install_worker(worker)
+    _lifecycle._swap_sink(new, timeout=0.05)
     assert worker.incomplete_swaps >= 1, "the premise: the drain was not confirmed"
-    assert any(s is old for s in worker._unclosed_swaps), "the premise: it was recorded"
+    assert worker.holds_unfenced(old), "the premise: the worker still holds it unfenced"
+    assert id(old) in _lifecycle._state._owed, "and it is still owed a close"
 
 
 def test_a_sink_stranded_by_an_unconfirmed_swap_is_closed_at_shutdown(capsys) -> None:
@@ -3233,12 +3257,12 @@ def test_a_sink_stranded_by_an_unconfirmed_swap_is_closed_at_shutdown(capsys) ->
     new = RecordingSink()
     _strand(worker, old, new)
 
-    worker.shutdown(timeout=10.0)
+    retire_process(worker, timeout=10.0)
     capsys.readouterr()
 
     assert old.closed == 1, "the stranded sink is closed exactly once"
     assert old.wire == old.events, "and its buffer reached the wire"
-    assert worker._unclosed_swaps == [], "the record is discharged"
+    assert id(old) not in _lifecycle._state._owed, "the record is discharged"
 
 
 def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) -> None:
@@ -3256,23 +3280,23 @@ def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) ->
     worker.submit(_span("b"))
     assert _wait_until(lambda: blocking.in_emit.is_set()), "the premise: the drain is wedged"
 
-    worker.shutdown(timeout=0.3)
+    retire_process(worker, timeout=0.3)
     assert worker._thread.is_alive(), "the premise: the join expired"
     assert old.closed == 0, "a live drain thread means no close is decided yet"
-    assert any(s is old for s in worker._unclosed_swaps), "and the record survives the attempt"
+    assert id(old) in _lifecycle._state._owed, "and the record survives the attempt"
 
     # The idempotent path is where `_close_if_owed` is actually reached with the thread still
     # alive — the expiry branch returns before it — so this is what pins the liveness guard.
-    worker.shutdown(timeout=0.3)
+    retire_process(worker, timeout=0.3)
     assert worker._thread.is_alive(), "the premise: still wedged"
     assert old.closed == 0, (
         "the drain thread may still be inside the stranded sink's emit; it must not be closed"
     )
-    assert any(s is old for s in worker._unclosed_swaps), "and the record still survives"
+    assert id(old) in _lifecycle._state._owed, "and the record still survives"
 
     blocking.release.set()
     worker._thread.join(timeout=5)
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     capsys.readouterr()
 
     assert old.closed == 1, "the next call finds the thread finished and closes it then"
@@ -3289,10 +3313,11 @@ def test_a_stranded_sink_readopted_as_the_live_sink_is_closed_once(capsys) -> No
     worker.submit(_span("a"))
     _strand(worker, old, RecordingSink())
 
-    assert worker.swap_sink(old, timeout=5.0) is True, "re-adopt it as the live sink"
-    assert worker._unclosed_swaps == [], "re-adoption must drop it from the owed record"
+    _lifecycle._swap_sink(old, timeout=5.0)
+    assert worker.sink is old, "re-adopt it as the live sink"
+    assert not worker.holds_unfenced(old), "re-adoption must drop it from the unfenced set"
 
-    worker.shutdown(timeout=10.0)
+    retire_process(worker, timeout=10.0)
     capsys.readouterr()
 
     assert old.closed == 1, f"closed {old.closed} times"
@@ -3308,11 +3333,12 @@ def test_a_stranded_sink_swapped_out_again_confirmed_is_closed_once(capsys) -> N
     worker = Worker(old, batch_size=1, flush_interval=0.01)
     worker.submit(_span("a"))
     _strand(worker, old, RecordingSink())
-    assert worker.swap_sink(old, timeout=5.0) is True
+    _lifecycle._swap_sink(old, timeout=5.0)
     old._emit_seconds = 0.0
 
-    assert worker.swap_sink(RecordingSink(), timeout=5.0) is True, "confirmed this time"
-    worker.shutdown(timeout=10.0)
+    _lifecycle._swap_sink(RecordingSink(), timeout=5.0)
+    assert worker.incomplete_swaps == 1, "confirmed this time, so the count did not rise"
+    retire_process(worker, timeout=10.0)
     capsys.readouterr()
 
     assert old.closed == 1, f"closed {old.closed} times"
@@ -3329,7 +3355,7 @@ def test_two_unconfirmed_swaps_close_both_stranded_sinks_once(capsys) -> None:
     third = RecordingSink()
     _strand(worker, second, third)
 
-    worker.shutdown(timeout=10.0)
+    retire_process(worker, timeout=10.0)
     capsys.readouterr()
 
     assert (first.closed, second.closed) == (1, 1), "both stranded sinks closed exactly once"
@@ -3347,11 +3373,13 @@ def test_a_confirmed_swap_records_nothing(capsys) -> None:
     worker.submit(_span("a"))
     new = RecordingSink()
 
-    assert worker.swap_sink(new, timeout=5.0) is True
+    install_worker(worker)
+    _lifecycle._swap_sink(new, timeout=5.0)
     assert worker.incomplete_swaps == 0, "the premise: this drain was confirmed"
-    assert worker._unclosed_swaps == [], "a confirmed swap owes nothing"
+    assert not worker.holds_unfenced(old), "a confirmed swap leaves nothing unfenced"
+    assert id(old) not in _lifecycle._state._owed, "and nothing owed for the old sink"
 
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     capsys.readouterr()
     assert old.closed == 1, f"closed {old.closed} times"
 
@@ -3374,7 +3402,7 @@ def test_a_stuck_stranded_close_does_not_extend_the_shutdown_budget(capsys) -> N
     _strand(worker, old, RecordingSink())
 
     start = time.monotonic()
-    worker.shutdown(timeout=5.0)
+    retire_process(worker, timeout=5.0)
     elapsed = time.monotonic() - start
     capsys.readouterr()
 
@@ -3400,7 +3428,7 @@ def test_the_incomplete_swap_line_no_longer_says_the_sink_stays_open(capsys) -> 
     assert "shutdown() that finds the drain thread ended closes it" in err
     assert worker.incomplete_swaps == 1
 
-    worker.shutdown(timeout=10.0)
+    worker.stop(timeout=10.0)
     capsys.readouterr()
 
 
@@ -3437,7 +3465,7 @@ def test_a_submission_racing_the_final_drain_is_counted(capsys) -> None:
     submitter.start()
     assert at_put.wait(5.0), "the premise: the submitter is parked at its put"
 
-    worker.shutdown(timeout=5.0)
+    _retire(worker, timeout=5.0)
     release.set()
     submitter.join(timeout=5)
     err = capsys.readouterr().err
@@ -3455,7 +3483,7 @@ def test_a_submission_after_a_latched_shutdown_is_counted_exactly_once(capsys) -
     submission counted twice — a doubling no other assertion here would notice.
     """
     worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
-    worker.shutdown(timeout=5.0)
+    _retire(worker, timeout=5.0)
 
     worker.submit(_span("a"))
     worker.submit(_span("b"))
@@ -3468,7 +3496,7 @@ def test_a_submission_before_shutdown_is_not_counted(capsys) -> None:
     """FR-005 AC-3. The ordinary path is untouched by the second read."""
     worker = Worker(RecordingSink(), batch_size=1, flush_interval=0.01)
     worker.submit(_span("a"))
-    worker.shutdown(timeout=5.0)
+    worker.stop(timeout=5.0)
     capsys.readouterr()
 
     assert worker.health().submitted_after_shutdown == 0
@@ -3507,7 +3535,7 @@ def test_a_submission_dropped_while_racing_shutdown_is_not_counted_as_stranded(c
     submitter.start()
     assert at_put.wait(5.0), "the premise: the submitter is parked with the flag still clear"
 
-    worker.shutdown(timeout=0.3)
+    worker.stop(timeout=0.3)
     assert worker._thread.is_alive(), "the premise: the join expired, so the queue is still full"
     release.set()
     submitter.join(timeout=5)
@@ -3546,10 +3574,10 @@ def test_the_throttle_period_is_read_from_diag(capsys, monkeypatch) -> None:
         assert err.count("log queue full") == 3
     finally:
         sink.release.set()
-        w.shutdown()
+        w.stop()
 
     w2 = Worker(RecordingSink(), batch_size=1, max_queue=10_000)
-    w2.shutdown()
+    _retire(w2)
     capsys.readouterr()
     for i in range(12):
         w2.submit(_span(i))

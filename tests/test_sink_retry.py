@@ -14,6 +14,7 @@ import time
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
+from conftest import retire_process
 from log_foundry import _lifecycle
 from log_foundry.sinks._retry import clamp_server_delay, usable_timeout, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
@@ -174,7 +175,7 @@ def test_the_worker_hands_the_sink_its_stop_signal() -> None:
     try:
         assert sink.log_foundry_stop_signal is worker._stop
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_a_sink_with_no_stop_signal_attribute_is_left_alone() -> None:
@@ -187,7 +188,7 @@ def test_a_sink_with_no_stop_signal_attribute_is_left_alone() -> None:
     try:
         assert not hasattr(sink, "log_foundry_stop_signal")
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_a_sink_that_refuses_the_signal_does_not_stop_the_worker(capsys) -> None:
@@ -206,7 +207,7 @@ def test_a_sink_that_refuses_the_signal_does_not_stop_the_worker(capsys) -> None
     try:
         assert worker._thread.is_alive()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert "handing the sink its stop signal" in capsys.readouterr().err
 
 
@@ -243,7 +244,7 @@ def test_shutdown_is_not_held_by_a_sink_mid_backoff() -> None:
     worker.submit([{"a": 1}])
     time.sleep(0.2)  # let the drain thread reach the backoff
 
-    assert _run_bounded(worker.shutdown, bound=5.0), "held by the sink's backoff"
+    assert _run_bounded(worker.stop, bound=5.0), "held by the sink's backoff"
 
 
 # --- FR-002 (Phase 2): every retrying sink waits through the shared helper ------------------
@@ -410,7 +411,7 @@ def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
         try:
             assert sink.log_foundry_stop_signal is worker._stop, type(sink).__name__
         finally:
-            worker.shutdown()
+            worker.stop()
 
 
 def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch) -> None:
@@ -431,7 +432,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
         try:
             assert backend(sink).log_foundry_stop_signal is worker._stop, type(sink).__name__
         finally:
-            worker.shutdown()
+            worker.stop()
 
 
 def test_sentry_forwards_to_its_http_fallback() -> None:
@@ -442,7 +443,7 @@ def test_sentry_forwards_to_its_http_fallback() -> None:
     try:
         assert sink._http is not None and sink._http.log_foundry_stop_signal is worker._stop
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def _drain_one(sink) -> float:
@@ -451,7 +452,7 @@ def _drain_one(sink) -> float:
     worker.submit([{"a": 1}])
     time.sleep(0.2)  # let the drain thread reach the sink's backoff
     started = time.monotonic()
-    finished = _run_bounded(worker.shutdown, bound=6.0)
+    finished = _run_bounded(worker.stop, bound=6.0)
     return time.monotonic() - started if finished else float("inf")
 
 
@@ -569,7 +570,7 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
                     "and on through SyslogSink to the transport that actually waits"
                 )
         finally:
-            worker.shutdown()
+            worker.stop()
 
 
 def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> None:
@@ -589,7 +590,7 @@ def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> N
     try:
         assert willing.log_foundry_stop_signal is worker._stop, "the sibling still got it"
     finally:
-        worker.shutdown()
+        worker.stop()
     assert "handing a MultiSink child its stop signal" in capsys.readouterr().err
 
 
@@ -619,7 +620,7 @@ def test_shutdown_returns_within_its_bound_on_a_blocked_drain() -> None:
     assert sink.entered.wait(2.0), "the drain thread is inside emit"
     try:
         started = time.monotonic()
-        assert _run_bounded(lambda: worker.shutdown(timeout=0.5), bound=5.0)
+        assert _run_bounded(lambda: worker.stop(timeout=0.5), bound=5.0)
         assert time.monotonic() - started < 5.0
     finally:
         sink.release.set()
@@ -631,7 +632,7 @@ def test_an_expired_shutdown_is_recorded_and_announced(capsys) -> None:
     worker.submit([{"a": 1}])
     assert sink.entered.wait(2.0)
     try:
-        worker.shutdown(timeout=0.2)
+        worker.stop(timeout=0.2)
         health = worker.health()
         err = capsys.readouterr().err
     finally:
@@ -649,7 +650,7 @@ def test_an_expired_shutdown_leaves_the_sink_open() -> None:
     worker.submit([{"a": 1}])
     assert sink.entered.wait(2.0)
     try:
-        worker.shutdown(timeout=0.2)
+        retire_process(worker, timeout=0.2)
         assert sink.closed == 0
     finally:
         sink.release.set()
@@ -664,7 +665,7 @@ def test_an_expired_shutdown_does_not_overwrite_a_terminal_reason() -> None:
     with worker._lock:
         worker.stopped_reason = "SystemExit"
     try:
-        worker.shutdown(timeout=0.2)
+        worker.stop(timeout=0.2)
         assert worker.health().stopped_reason == "SystemExit"
     finally:
         sink.release.set()
@@ -676,12 +677,12 @@ def test_a_normal_shutdown_is_unaffected() -> None:
     sink = FakeSink()
     worker = Worker(sink, batch_size=1)
     worker.submit([{"a": 1}])
-    worker.shutdown()
+    worker.stop()
     health = worker.health()
 
     assert health.stopped_reason is None
     assert [e["a"] for e in sink.events] == [1]
-    worker.shutdown()  # still idempotent
+    worker.stop()  # still idempotent
 
 
 def test_the_public_shutdown_takes_a_timeout() -> None:
@@ -702,7 +703,7 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
     seen: list[float | None] = []
 
     class SpyWorker:
-        def shutdown(self, timeout: float | None = None) -> None:
+        def stop(self, timeout: float | None = None) -> None:
             seen.append(timeout)
 
     monkeypatch.setattr(_lifecycle._state, "_worker", SpyWorker())
@@ -777,15 +778,15 @@ def test_a_later_shutdown_closes_a_sink_an_expired_one_left_open() -> None:
     worker.submit([{"a": 1}])
     assert sink.entered.wait(2.0)
 
-    worker.shutdown(timeout=0.2)
+    retire_process(worker, timeout=0.2)
     assert sink.closed == 0, "not while the thread is still inside emit"
 
     sink.release.set()
     worker._thread.join(5.0)
-    worker.shutdown(timeout=1.0)
+    retire_process(worker, timeout=1.0)
     assert sink.closed == 1, "the close was deferred, not abandoned"
 
-    worker.shutdown(timeout=1.0)
+    retire_process(worker, timeout=1.0)
     assert sink.closed == 1, "and still idempotent"
 
 
@@ -795,13 +796,13 @@ def test_a_deferred_close_does_not_re_drain() -> None:
     worker = Worker(sink, batch_size=1)
     worker.submit([{"a": 1}])
     assert sink.entered.wait(2.0)
-    worker.shutdown(timeout=0.2)
+    retire_process(worker, timeout=0.2)
     sink.release.set()
     worker._thread.join(5.0)
 
     calls_before = sink.entered.is_set()
     worker.submit([{"b": 2}])  # nothing consumes this now
-    worker.shutdown(timeout=1.0)
+    retire_process(worker, timeout=1.0)
 
     assert calls_before and sink.closed == 1
 
@@ -815,7 +816,7 @@ def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
     worker.submit([{"b": 1}])
     worker.submit([{"c": 1}])
     try:
-        worker.shutdown(timeout=0.2)
+        worker.stop(timeout=0.2)
         err = capsys.readouterr().err
     finally:
         sink.release.set()
@@ -943,7 +944,7 @@ def test_concurrent_shutdowns_close_the_sink_exactly_once() -> None:
 
     def shut() -> None:
         ready.wait(5.0)
-        worker.shutdown(timeout=5.0)
+        retire_process(worker, timeout=5.0)
 
     threads = [threading.Thread(target=shut, daemon=True) for _ in range(3)]
     for thread in threads:

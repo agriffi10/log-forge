@@ -80,7 +80,7 @@ def test_stdout_emits_a_previously_poisonous_batch_in_full(capsys) -> None:
         worker.submit(events)
         assert worker.flush(timeout=5.0)
     finally:
-        worker.shutdown()
+        worker.stop()
 
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert [e["message"] for e in lines] == ["clean", "poison", "also-clean"]

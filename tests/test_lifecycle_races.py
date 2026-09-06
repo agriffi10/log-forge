@@ -39,7 +39,11 @@ _DRAIN_NAME = "log-foundry-worker"
 
 
 class CountingSink:
-    """Counts closes and emits, and can hold its close open so a race has somewhere to land.
+    """Counts closes and emits, records the event count at each close, and can park inside one.
+
+    `events_at_close` is what distinguishes a second close that **follows** the delivery it
+    discharges — SPEC-045 FR-002's one close per write-epoch — from the double it would otherwise
+    be indistinguishable from, since both read `closes == 2` (SPEC-054 FR-002).
 
     It declares `log_foundry_stop_signal` because `offer_stop_signal` probes for it with
     `hasattr` (SPEC-027 FR-002) — a sink without the attribute simply never receives one, so a
@@ -52,6 +56,7 @@ class CountingSink:
         self.name = name
         self.closes = 0
         self.events = 0
+        self.events_at_close: list[int] = []
         self.close_seconds = close_seconds
         self.in_close = threading.Event()
         self.may_finish: threading.Event | None = None
@@ -71,6 +76,7 @@ class CountingSink:
         """
         with self._lock:
             self.closes += 1
+            self.events_at_close.append(self.events)
             first = self.closes == 1
         self.in_close.set()
         if self.may_finish is not None and first:
@@ -221,14 +227,23 @@ def test_the_racing_shutdown_closes_the_sink_once_when_the_worker_registers_firs
     assert sink.closes == 1, f"closed {sink.closes} times, not once: {sink}"
 
 
-def test_the_racing_shutdown_closes_the_sink_once_when_the_orphan_branch_closes_first() -> None:
-    """FR-001 AC-3, the ordering `sink_released` exists for — and the one that bites.
+def test_the_racing_shutdown_closes_the_sink_twice_when_the_orphan_branch_closes_first() -> None:
+    """SPEC-054 FR-002 AC-4 re-states this from one close to two, and says why.
 
-    Here the shutdown wins the first critical section, finds no worker, raises the counter and
-    goes on to close the orphan sink; the `@trace` builds its worker only once that close is
-    already underway, over the very sink just released. Without `sink_released` the late worker
-    owns a close of its own and performs a **second** `close()`, which `sinks/base.py` does not
-    promise to tolerate.
+    ~~Without `sink_released` the late worker owns a close of its own and performs a **second**
+    `close()`~~ — struck (SPEC-021). The ordering is unchanged: the shutdown wins the first
+    critical section, finds no worker, raises the counter and closes the sink; the `@trace`
+    builds its worker only once that close is already underway, over the very sink just
+    released. What changed is the verdict on the second close. `Worker(sink_released=)` made the
+    late worker inherit a discharged close so there would be exactly one; under one owed-close
+    record that flag has no work to do, because the late worker's **build arms its sink** and the
+    closer's second pass closes it *after* that worker's drain.
+
+    Two closes, and the second is not a double: it follows a delivery the first close could not
+    have carried, which is SPEC-045 FR-002's one-close-per-write-epoch rule applied to the site
+    that still contradicted it. The event count at each close is what says so, and it is asserted
+    rather than the bare count — a second close that landed *before* the late worker's events
+    would be the defect this replaced, wearing the same number.
 
     The preemption point is the sink's own `close()`, which is where the shutdown provably is
     after its first critical section — no patching required, and it cannot drift out of the
@@ -242,35 +257,44 @@ def test_the_racing_shutdown_closes_the_sink_once_when_the_orphan_branch_closes_
     shutdown = threading.Thread(target=lambda: log_foundry.shutdown(timeout=5.0))
     shutdown.start()
     assert sink.in_close.wait(5.0), "the shutdown reached the orphan close having found no worker"
-    assert _lifecycle._state._orphan_closed_sink is sink, "and latched it before closing"
+    assert id(sink) not in _lifecycle._state._owed, "and discharged it before closing"
 
     @log_foundry.trace
     def work() -> int:
-        return 1
+        log_foundry.info("delivered by the late worker")
 
     work()  # builds a worker over the sink that is being closed right now
     worker = _lifecycle._state.worker_exists()
     assert worker is not None, "the late worker was built inside the shutdown's window"
     assert _lifecycle._state._late_worker is worker, "and registered for the running shutdown"
+    assert id(sink) in _lifecycle._state._owed, "and its build re-armed the sink"
 
     sink.may_finish.set()
     shutdown.join(20.0)
 
     assert not _drain_threads(), "the shutdown drained the worker it did not know it would build"
-    log_foundry.shutdown(timeout=5.0)  # the exit path
-    assert sink.closes == 1, (
-        f"the sink was closed {sink.closes} times: the orphan branch released it and the late "
-        "worker performed a second close"
+    assert sink.closes == 2, (
+        f"the first shutdown's second pass closes it again after the late worker's drain: {sink}"
     )
+    assert sink.events_at_close[1] > sink.events_at_close[0], (
+        "and the second close follows the delivery it discharges, which is what makes it one "
+        f"close per write-epoch rather than a double: {sink.events_at_close}"
+    )
+
+    log_foundry.shutdown(timeout=5.0)  # the exit path
+    assert sink.closes == 2, f"and nothing runs a third: {sink}"
 
 
 def test_a_late_worker_that_swaps_still_closes_the_sink_it_adopted() -> None:
-    """FR-001 AC-3's other half: `sink_released` describes **one** sink, not the worker.
+    """SPEC-044 FR-001 AC-3's other half, kept after SPEC-054 FR-002 removed its mechanism.
 
-    `Worker._sink_closed` is a worker-lifetime flag, so a worker born with a discharged close
-    keeps that claim across every later `swap_sink` unless it is reset — and the sink it adopts
-    next is then closed by nobody. For a sink whose `close()` *is* its delivery, a `KafkaSink`
-    flushing its producer, that is a silently lost buffer with `health()` reading clean.
+    ~~`Worker._sink_closed` is a worker-lifetime flag, so a worker born with a discharged close
+    keeps that claim across every later swap unless it is reset~~ — struck (SPEC-021): the flag
+    is retired, because under one owed-close record a worker's build arms its sink and a swap
+    arms the next one, so there is no claim to carry or reset. The **observable** is what this
+    keeps: the sink a late worker adopts mid-shutdown is closed by somebody. For a sink whose
+    `close()` *is* its delivery, a `KafkaSink` flushing its producer, the alternative is a
+    silently lost buffer with `health()` reading clean.
 
     Reaching it needs all three of a shutdown in flight, a worker born inside that window, and a
     swap while that worker is still live — which is why the shutdown is parked inside the orphan
@@ -292,14 +316,14 @@ def test_a_late_worker_that_swaps_still_closes_the_sink_it_adopted() -> None:
 
     work()  # the late worker, born over a sink already released
     worker = _lifecycle._state.worker_exists()
-    assert worker is not None and worker._sink_closed, "born with the close discharged"
+    assert worker is not None, "the late worker was built inside the shutdown's window"
 
     log_foundry.configure(sink=b)  # it is still live, so this is a real swap
     assert worker.sink is b, "the live late worker adopted B"
 
     a.may_finish.set()
     shutdown.join(20.0)
-    _lifecycle.join_closers(5.0)
+    _lifecycle.join_closers(time.monotonic() + 5.0)
 
     assert b.closes == 1, (
         f"the sink adopted after the discharged-close claim must still be closed: {b}"
@@ -307,38 +331,39 @@ def test_a_late_worker_that_swaps_still_closes_the_sink_it_adopted() -> None:
 
 
 def test_a_worker_built_after_the_shutdown_returned_owns_its_sinks_close() -> None:
-    """FR-001 AC-5's mechanism: the discharged-close claim is gated on the shutdown window.
+    """SPEC-044 FR-001 AC-5's rule, asserted on the record now that the flag is gone.
 
-    Ungated, `_orphan_closed_sink is sink` is also true in the plain sequential
-    `configure(A)` → `info()` → `shutdown()` → `@trace`, because the orphan branch latched A and
-    `_ensure_sink()` still returns it — so every worker built after any shutdown would inherit a
-    claim it has no right to. The spec's Out of Scope forbids reaching that path at all.
+    ~~The discharged-close claim is gated on the shutdown window~~ — struck (SPEC-021):
+    SPEC-054 FR-002 retired the claim, so there is no gate left to test. The rule it protected
+    stands and is what is asserted here: a worker built **after** a shutdown returned owns its
+    sink's close, so its build arms that sink and a later `shutdown()` performs it.
 
-    Asserted on the flag rather than on a close count deliberately: the *observable* difference
-    in the sequential case is that A is closed twice today, which is the pre-existing behaviour
-    `architecture.md` §13 records for a sink handed back after being swapped out. SPEC-045 later
-    established that both closes are legitimate — one per period the sink took events — and
-    struck §13's reading of them as a defect, which is the stronger form of this docstring's own
-    point: pinning that count would have been worse than pinning the mechanism, and pinning it
-    as a *defect* would have been wrong outright.
+    That is now the same statement on both paths, which is the point of one record — the
+    sequential case and the racing one differ in *when* the arming happens and in nothing else.
     """
     sink = CountingSink("A")
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("before the shutdown")
     log_foundry.shutdown()
-    assert _lifecycle._state._orphan_closed_sink is sink, "the orphan branch latched it"
+    assert sink.closes == 1, "the orphan branch closed it"
+    assert id(sink) not in _lifecycle._state._owed, "and discharged it"
     assert _lifecycle._state._shutdown_running == 0, "and the shutdown has returned"
 
     @log_foundry.trace
     def work() -> int:
-        return 1
+        log_foundry.info("delivered after the shutdown returned")
 
     work()
     worker = _lifecycle._state.worker_exists()
     assert worker is not None, "the sequential case still builds a live worker"
-    assert not worker._sink_closed, (
-        "a worker built outside a running shutdown owns its sink's close — the discharged-close "
-        "claim belongs to the race, and must not reach the sequential path"
+    assert id(worker.sink) in _lifecycle._state._owed, (
+        "a worker built outside a running shutdown owns its sink's close, so its build arms it"
+    )
+
+    log_foundry.shutdown(timeout=5.0)
+    assert sink.closes == 2, f"and the next shutdown performs that close: {sink}"
+    assert sink.events_at_close[1] > sink.events_at_close[0], (
+        "one close per write-epoch: the second follows the events the late worker delivered"
     )
 
 
@@ -490,12 +515,75 @@ def test_a_worker_built_after_shutdown_returned_still_delivers() -> None:
         "and its submissions are not the pair SPEC-030 defines, which needs a retired worker"
     )
 
+    late = _lifecycle._state.worker_exists()
+    assert late is not None and _lifecycle._state.live_worker() is late, (
+        "the premise for the second half: the worker built afterwards reads as live"
+    )
+    log_foundry.shutdown(timeout=5.0)
+    assert not late.draining, "SPEC-054 FR-001 AC-4: the second shutdown's drain finished"
+    assert _lifecycle._state.live_worker() is None, "and it stopped reading as live"
 
-_UNDER_LOCK_OFFENDERS = frozenset({"_close_orphan_sink", "join_closers", "_close_owed"})
+    delivered = sink.events
+    log_foundry.info("after the second shutdown")
+    assert log_foundry.health().submitted_after_shutdown == 0, (
+        "an orphan log outside a span is delivered, not stranded (SPEC-030's fence, kept)"
+    )
+    assert sink.events > delivered, "and it really did land"
+
+
+def test_a_second_shutdown_strands_and_counts_the_late_workers_next_submission() -> None:
+    """FR-001 AC-2. The count, not a latch, is what makes both halves of this true.
+
+    A worker built after a `shutdown()` returned records the already-incremented count as its
+    epoch, so its own submissions are **not** stranded — that is the half above. This is the
+    other: the *next* `shutdown()` moves the count past that epoch, and from that instant the
+    same worker's submissions are queued where nothing will drain them, which is exactly what
+    `submitted_after_shutdown` counts (SPEC-030 FR-001).
+
+    Against a latched boolean the two halves cannot both hold: a worker whose flag is set at
+    build counts everything it ever delivered, and one whose flag is clear never starts counting.
+    """
+    sink = CountingSink("A")
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("an orphan log, so the first shutdown has something to retire")
+    log_foundry.shutdown(timeout=5.0)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()
+    log_foundry.flush(timeout=5.0)
+    assert log_foundry.health().submitted_after_shutdown == 0, (
+        "the premise: the late worker's own submissions are not stranded"
+    )
+
+    log_foundry.shutdown(timeout=5.0)
+    work()
+
+    assert log_foundry.health().submitted_after_shutdown == 1, (
+        "the submission after the second shutdown is stranded and counted"
+    )
+
+
+_UNDER_LOCK_OFFENDERS = frozenset({"join_closers", "_close_owed"})
 """Calls that must never appear inside a `with _state._lock` body.
 
-Every one performs or waits on a sink `close()`. A name is added here whenever a helper starts
-wrapping one, because this lint matches on the name and cannot see through a rename.
+Every one performs or waits on a sink `close()` or on a drain. A name is added here whenever a
+helper starts wrapping one, because this lint matches on the **name** and cannot see through a
+rename — which is not hypothetical: SPEC-054 renamed `Worker.shutdown` to `Worker.stop`, and the
+suffix rule below went silent until this list was updated with it. Planting
+`worker.stop(timeout)` inside `_shutdown_worker`'s critical section passed the lint, with
+`join_closers(deadline)` in the same place still failing it — so the gate discriminated and the
+escape was real. `_close_orphan_sink` is dropped because the function is gone and a
+forbidden-name list carries no dead names; `retarget` is added because it waits on two drains.
+"""
+
+_UNDER_LOCK_METHOD_SUFFIXES = (".stop", ".retarget", ".shutdown", ".join")
+"""Method calls forbidden under the lock, matched by suffix so any receiver is caught.
+
+`.shutdown` stays although no library method is called that today: a third-party sink may carry
+one, and a suffix that costs nothing is cheaper than rediscovering why it was removed.
 """
 
 
@@ -510,9 +598,12 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
 
     The offender set is a **name** list, so a helper that wraps an inline release is invisible to
     it until it is named — which is how a refactor shrinks a derived guard as silently as a
-    deletion. `_close_owed` is the case: SPEC-046 moved `_close_orphan_sink`'s inline
-    `release()` into it, and without the entry below this lint would pass against that call
-    reappearing under the lock.
+    deletion. Two cases on record. `_close_owed`: SPEC-046 moved the orphan closer's inline
+    `release()` into it, and without the entry this lint would pass against that call reappearing
+    under the lock. `Worker.stop`: SPEC-054 renamed `shutdown` to `stop`, and the suffix rule
+    kept matching `.shutdown` — mutation-tested, `worker.stop(timeout)` planted inside
+    `_shutdown_worker`'s critical section **passed**, while `join_closers(deadline)` in the same
+    place failed. A rename is a deletion as far as this lint is concerned.
     """
     tree = ast.parse(_LIFECYCLE_SRC.read_text())
     offenders: list[str] = []
@@ -528,7 +619,7 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
             if not isinstance(inner, ast.Call):
                 continue
             name = ast.unparse(inner.func)
-            if name in _UNDER_LOCK_OFFENDERS or name.endswith(".shutdown"):
+            if name in _UNDER_LOCK_OFFENDERS or name.endswith(_UNDER_LOCK_METHOD_SUFFIXES):
                 offenders.append(name)
             if name == "release" and not any(kw.arg == "detached" for kw in inner.keywords):
                 offenders.append("inline release()")
@@ -551,7 +642,7 @@ def test_a_worker_that_did_not_adopt_the_recorded_sink_does_not_discard_its_clos
     a, b = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=a)
     log_foundry.info("to A")
-    assert _lifecycle._state._orphan_owed.get(id(a)) is a, (
+    assert _lifecycle._state._owed.get(id(a)) is a, (
         "the record is armed by the emit that landed"
     )
 
@@ -577,7 +668,7 @@ def test_a_worker_that_did_not_adopt_the_recorded_sink_does_not_discard_its_clos
     worker = _lifecycle._state.worker_exists()
     assert worker is not None and worker.sink is b, "the worker captured the newly configured B"
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(5.0)
+    _lifecycle.join_closers(time.monotonic() + 5.0)
     assert a.events and a.closes == 1, f"A had events and must be closed exactly once: {a}"
 
 
@@ -597,7 +688,7 @@ def test_a_worker_that_did_adopt_the_recorded_sink_leaves_one_close() -> None:
 
     work()
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(5.0)
+    _lifecycle.join_closers(time.monotonic() + 5.0)
     assert sink.closes == 1, f"a mixed process closes once, in either order: {sink}"
 
 
@@ -630,7 +721,7 @@ def _orphan_record_sites() -> dict[tuple[str, str], ast.FunctionDef]:
             else:
                 continue
             for write in writes:
-                if "_orphan_owed" in write:
+                if "_owed" in write:
                     value = (
                         ast.unparse(node.value)
                         if isinstance(node, ast.Assign)
@@ -648,30 +739,45 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
     a decision somebody takes rather than a default.
 
     SPEC-045 made the record a `dict` rather than a single slot, which collapsed three separate
-    clears into `take_orphan_owed`. What remains is the armings and the per-sink removals that
-    pair with a close — one for each thing that can perform one.
+    clears into one transition. SPEC-054 FR-002 then merged four records into it and FR-003 gave
+    it one closer, so what remains is the armings and the per-sink removals that pair with a
+    close — one for each thing that can perform one, and **no wholesale clear at all**.
 
     The set equality **is** the floor: an exact comparison against a hand-written table cannot
     shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
     while being strictly implied. Stated rather than asserted twice, as the sibling roster does.
     """
     dispositions = {
-        ("take_orphan_owed", "self._orphan_owed.clear"): (
-            "cleared — the one transition that empties the record, so a caller reads and clears "
-            "in a single step and two of them cannot both decide the same sink is theirs"
+        ("_close_owed", "_state._owed[id(sink)]"): (
+            "removed per sink — the one closer performs that sink's close, and it removes and "
+            "registers the close in the **same** critical section, so there is no instant at "
+            "which the sink is neither owed nor in flight (SPEC-054 FR-003)"
         ),
-        ("_close_orphan_sink", "_state._orphan_owed[id(sink)]"): (
-            "removed per sink — this function performs that sink's close itself"
+        ("_close_owed", "_state._owed.setdefault"): (
+            "re-armed — a sink this call took but never handed to a closer is put back, so an "
+            "interrupt between the take and the close leaves it owed rather than owed by nobody. "
+            "`setdefault`, so a re-arm that landed meanwhile keeps its own entry. Measured "
+            "before it: three sinks, `closes=[0, 0, 0]`, and an empty record"
         ),
-        ("discharge_owed", "_state._orphan_owed.pop"): (
-            "removed per sink — a worker taking its own owed-swap record performs that close, "
-            "and the two records can name the same sink (SPEC-050 FR-004). Removed under "
-            "_state._lock in the caller's critical section, so this and _close_orphan_sink "
-            "cannot both decide the sink is theirs — measured A.closes == 2 without it"
+        ("_swap_sink", "_state._owed[id(stale)]"): (
+            "removed per sink — the swap releases a superseded sink itself, detached, and "
+            "registers that close beside the removal under _state._lock for the same reason"
+        ),
+        ("_swap_sink", "_state._owed.pop"): (
+            "removed per sink — the previous sink, once the worker confirmed its fence, so "
+            "nothing can still be inside it; released detached and joined to the swap's budget"
         ),
         ("_swap_sink", "new_sink"): "armed — the sink configure() just installed is owed a close",
         ("_note_orphan_emit", "sink"): "armed — the emit that landed owns the close",
-        ("_adopt_declined_swap", "new_sink"): "armed — the worker refused it mid-swap",
+        ("_get_worker", "sink"): (
+            "armed — a worker built on a sink owes it a close whether or not anything is emitted "
+            "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
+        ),
+        ("_shutdown_worker", "_close_owed"): (
+            "neither — it is the call to the closer, which the walker sees because the callee's "
+            "name carries the record's. Listed rather than filtered out, because a filter narrow "
+            "enough to drop it would drop a real site under a similar name"
+        ),
     }
     found = set(_orphan_record_sites())
     assert found == set(dispositions), (
@@ -687,11 +793,13 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
     The record was one slot, so arming a second sink discarded the first and its close went to
     nobody — measured, the live sink closed zero times while a stale one was closed twice.
     Making it a `dict` fixes that only while every site mutates it **in place**: any
-    `_orphan_owed = {...}` silently drops whatever another thread armed between the read and the
+    `_owed = {...}` silently drops whatever another thread armed between the read and the
     write, which is the same defect with a wider window.
 
-    `take_orphan_owed` is the one sanctioned emptying, and it reads and clears under the lock in
-    one step so two callers cannot both take the same sink.
+    There is no sanctioned wholesale emptying any more (SPEC-054 FR-003): every removal is per
+    sink, under the lock, in the same critical section that registers that sink's close. The
+    assertion below is therefore that **nothing** clears the record — a `clear()` reappearing
+    would be a caller taking sinks whose closes it has not decided.
 
     The collector gathers `ast.Assign` only, so `__init__`'s annotated declaration is not a
     rebind it can see — an earlier draft carried a disjunct exempting that line, which read as
@@ -703,7 +811,7 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Assign)
         for target in node.targets
-        if isinstance(target, ast.Attribute) and target.attr == "_orphan_owed"
+        if isinstance(target, ast.Attribute) and target.attr == "_owed"
     ]
     assert not rebinds, (
         "the owed-close record is rebound rather than mutated, which drops whatever another "
@@ -714,11 +822,11 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
         for scope in ast.walk(tree)
         if isinstance(scope, ast.FunctionDef)
         for node in ast.walk(scope)
-        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("_orphan_owed.clear")
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("_owed.clear")
     }
-    assert clears == {"take_orphan_owed"}, (
-        "emptying the record wholesale is one transition's job, so a caller cannot take sinks "
-        f"it has not decided the close for: {sorted(clears)}"
+    assert clears == set(), (
+        "the record is emptied per sink, in the critical section that decides each close, so a "
+        f"wholesale clear is a caller taking sinks it has not decided: {sorted(clears)}"
     )
 
 
@@ -853,7 +961,7 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
     not at all. Measured before `_clear_closing_after_fork` existed.
     """
     with _lifecycle._closing_now_lock:
-        _lifecycle._closing_now.add(0xDEADBEEF)
+        _lifecycle._closing_now[0xDEADBEEF] = threading.Event()
     try:
         read_fd, write_fd = os.pipe()
         # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
@@ -874,20 +982,32 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         os.close(read_fd)
     finally:
         with _lifecycle._closing_now_lock:
-            _lifecycle._closing_now.discard(0xDEADBEEF)
+            _lifecycle._closing_now.pop(0xDEADBEEF, None)
 
 
 # --------------------------------------------------------------------------- FR-004
 
 
-def test_a_swap_that_hands_a_sink_to_the_worker_latches_it(
+def test_a_swap_that_hands_a_sink_to_the_worker_owes_a_second_close_for_the_late_emit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-004 AC-1. `h1`: 0/120 without an injected preemption point, hence the injection.
+    """SPEC-054 FR-002 AC-3 re-states SPEC-044 FR-004 AC-1 from one close to two.
 
-    An orphan emit that resolved sink A before the swap and resumes after it re-armed a sink
-    `Worker.swap_sink` had already closed, and the exit close then performed a second `close()`.
-    Measured on the pre-fix tree: `A.closes == 2`, and `Sink.close` promises no idempotency.
+    `h1`: 0/120 without an injected preemption point, hence the injection. An orphan emit
+    resolves sink A before the swap and resumes after it, so the emit lands on a sink the swap
+    has already closed.
+
+    ~~and the exit close then performed a second `close()`~~ — struck (SPEC-021). The **route**
+    is unchanged and the verdict on its second close is not. SPEC-044 FR-004 answered it with a
+    closed-sink latch that refused the re-arm, and SPEC-054 FR-002 retires that latch: an emit
+    that lands re-arms, always, and a sink written to after its close is owed another
+    (SPEC-045 FR-002). What the latch protected against — a close performed against a sink the
+    drain thread may still be inside — is answered at close time by `held`, not by refusing the
+    arming.
+
+    So A is closed **twice**, and the second close follows the event that earned it. The event
+    count at each close is what says so: a second close landing *before* the late event would be
+    the double the latch existed to prevent, wearing the same number.
     """
     a, b = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=a)
@@ -897,7 +1017,9 @@ def test_a_swap_that_hands_a_sink_to_the_worker_latches_it(
         return 1
 
     work()  # builds the worker on A
-    assert not _lifecycle._state._orphan_owed, "the build cleared the record"
+    assert id(a) in _lifecycle._state._owed, (
+        "the build arms its sink rather than clearing the record (SPEC-054 FR-002)"
+    )
 
     resolved = threading.Event()
     release_it = threading.Event()
@@ -920,8 +1042,14 @@ def test_a_swap_that_hands_a_sink_to_the_worker_latches_it(
     emitter.join(10.0)
 
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(5.0)
-    assert a.closes == 1, f"the swapped-out sink was closed {a.closes} times: {a}"
+    _lifecycle.join_closers(time.monotonic() + 5.0)
+    assert a.closes == 2, (
+        f"the emit that landed after the swap's close re-armed A, so it is owed another: {a}"
+    )
+    assert a.events_at_close[1] > a.events_at_close[0], (
+        "and that second close follows the event it discharges, which is one close per "
+        f"write-epoch rather than a double: {a.events_at_close}"
+    )
 
 
 def test_a_swap_releases_a_third_sink_the_record_named(
@@ -955,20 +1083,19 @@ def test_a_swap_releases_a_third_sink_the_record_named(
 
     # Re-arm the record on a sink the worker does not hold, the way a preempted emit would.
     with _lifecycle._state._lock:
-        _lifecycle._state._orphan_owed[id(third)] = third
+        _lifecycle._state._owed[id(third)] = third
     _lifecycle.stamp(third)
 
     started = time.monotonic()
     log_foundry.configure(sink=second)
     swap_seconds = time.monotonic() - started
-    _lifecycle.join_closers(5.0)
+    _lifecycle.join_closers(time.monotonic() + 5.0)
 
     assert worker.sink is second, "the worker adopted the newly configured sink"
     assert third.closes == 1, (
         f"the sink the record named is neither the worker's nor the new one, so this swap owns "
         f"its close and nothing else would perform it: {third}"
     )
-    assert _lifecycle._state._orphan_closed_sink is not None, "and it is latched against a re-arm"
     assert swap_seconds < _lifecycle.DEFAULT_SWAP_TIMEOUT, (
         "a swap that starts a detached close still returns inside its own budget"
     )
@@ -1003,7 +1130,7 @@ _HOOKED: list[str] = []
 def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     """FR-005 AC-1. `h11`: the exact hazard `_fork._SKIP_ATTRIBUTE`'s own docstring describes.
 
-    `_orphan_closed_sink` pins the sink a swap already released, and the repair walk reached it,
+    The owed-close record pins a sink a swap already released, and the repair walk reached it,
     so a child called `reacquire_after_fork()` on a closed sink — a `FileSink` there would have
     its file re-opened on every fork for the life of the process. The module-level `_FORK_SKIP`
     could not reach it: `_owned` is a module global while this slot is an attribute of `_state`,
@@ -1015,8 +1142,11 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     log_foundry.info("to the sink that is about to be superseded")
     log_foundry.configure(sink=live)
     log_foundry.info("to the live sink")
-    _lifecycle.join_closers(5.0)
-    assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
+    _lifecycle.join_closers(time.monotonic() + 5.0)
+    assert superseded.closes == 1 and id(superseded) not in _lifecycle._state._owed, (
+        "the premise: the swap released it and it left the record, so what could still reach it "
+        "is a walk that descends into a record it should not"
+    )
 
     read_fd, write_fd = os.pipe()
     # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
@@ -1066,8 +1196,8 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     log_foundry.configure(service="t", sink=superseded)
     log_foundry.info("to the sink that is about to be superseded")
     log_foundry.configure(sink=live)
-    _lifecycle.join_closers(5.0)
-    assert _lifecycle._state._orphan_closed_sink is superseded, "the slot pins it"
+    _lifecycle.join_closers(time.monotonic() + 5.0)
+    assert superseded.closes == 1, "the premise: the swap released it before the fork"
 
     parent_pid = os.getpid()
     read_fd, write_fd = os.pipe()
@@ -1111,8 +1241,8 @@ def test_the_fork_opt_out_is_declared_where_the_walk_reads_it() -> None:
     declaration that stops being found is exactly the failure the behavioural test above would
     also catch, and exactly the one a `getattr` on the class would not.
     """
-    assert "_orphan_closed_sink" in _fork._skipped_names(_lifecycle._state), (
-        "the slot pinning a superseded sink must be opted out on the object that holds it"
+    assert "_owed" in _fork._skipped_names(_lifecycle._state), (
+        "the record pinning superseded sinks must be opted out on the object that holds it"
     )
     assert "_owned" in _fork._skipped_names(_lifecycle), (
         "and the module-level declaration stays — the two together are the rule"

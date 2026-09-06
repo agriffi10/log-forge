@@ -368,7 +368,7 @@ def test_a_sweep_racing_a_span_close_delivers_each_event_once() -> None:
         """
         previous = _lifecycle._state.worker_exists()
         if previous is not None:
-            previous.shutdown(5.0)
+            previous.stop(5.0)
         _lifecycle._state._worker = None
         sink = Recorder()
         log_foundry.configure(service="t", sink=sink)

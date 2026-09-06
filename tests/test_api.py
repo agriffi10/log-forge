@@ -216,7 +216,7 @@ def test_an_over_long_int_inside_a_span_does_not_destroy_its_batch(lf, fake_sink
     worker = Worker(sink, batch_size=2, flush_interval=60.0)
     worker.submit(poisoned_events)
     worker.submit(innocent_events)
-    worker.shutdown()
+    worker.stop()
 
     assert len(sink.batches) == 1, "both spans must land in one flattened batch"
     messages = [event["message"] for event in sink.batches[0]]
@@ -878,7 +878,7 @@ def test_the_orphan_close_defers_to_a_live_worker_even_when_called_directly() ->
     traced()
     assert _lifecycle._state._worker is not None
 
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
 
     assert sink.closes == 0, "the worker owns this sink; the orphan close must stand down"
 
@@ -917,7 +917,7 @@ def test_the_worker_check_is_read_under_the_lock_that_publishes_the_worker() -> 
 
     _lifecycle._state._lock = _PreemptingLock()  # type: ignore[assignment]
     try:
-        _lifecycle._close_orphan_sink()
+        _lifecycle._close_owed()
     finally:
         _lifecycle._state._lock = real_lock
 
@@ -972,7 +972,7 @@ def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     finally:
         api._ensure_sink = original  # type: ignore[assignment]
 
-    assert not _lifecycle._state._orphan_owed
+    assert not _lifecycle._state._owed
 
 
 def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:

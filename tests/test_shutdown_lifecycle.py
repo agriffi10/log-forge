@@ -104,7 +104,7 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
     try:
         assert sink.in_emit.wait(5.0), "the drain thread never reached emit"
         shutting_down.start()
-        while not worker.retired:  # the latch is entry to shutdown, not its completion
+        while not log_foundry.health().retired:  # entry to shutdown, not its completion
             time.sleep(0.001)
 
         log_foundry.info("an orphan log while the drain is in flight")
@@ -136,7 +136,7 @@ def test_an_orphan_log_during_the_drain_does_not_strand_the_backoff() -> None:
     try:
         assert sink.in_emit.wait(5.0)
         shutting_down.start()
-        while not worker.retired:
+        while not log_foundry.health().retired:
             time.sleep(0.001)
         log_foundry.info("an orphan log while the drain is in flight")
     finally:
@@ -330,7 +330,10 @@ def _shutdown_inside_the_first_flush(worker) -> threading.Thread:
     rather than raced for. A **real** ``shutdown()`` runs in it rather than the latch alone:
     latching ``_shutdown_done`` by hand declines the swap identically, but leaves the drain
     thread alive, so ``_close_if_owed`` declines and the old sink is never closed by anyone —
-    which would make AC-2 unobservable and read as a defect it is not.
+    which would make AC-2 unobservable and read as a defect it is not. The wait reads
+    ``health().retired``, the public observable, rather than a worker attribute: SPEC-054 FR-001
+    moved the latch onto the lifecycle owner as a count, and entry to ``shutdown()`` is still
+    what moves it.
     """
     real_flush = worker.flush
     shutting_down = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
@@ -339,7 +342,7 @@ def _shutdown_inside_the_first_flush(worker) -> threading.Thread:
         result = real_flush(timeout)
         worker.flush = real_flush
         shutting_down.start()
-        while not worker.retired:
+        while not log_foundry.health().retired:
             time.sleep(0.001)
         return result
 
@@ -365,7 +368,7 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     shutting_down.join(60.0)
 
     assert worker.sink is old, "the swap really was declined, or this test proves nothing"
-    assert _lifecycle._state._orphan_owed.get(id(new)) is new or new.closed == 1, (
+    assert _lifecycle._state._owed.get(id(new)) is new or new.closed == 1, (
         "the declined sink is neither closed nor armed for the exit handler — owned by nobody"
     )
 
@@ -383,7 +386,7 @@ def test_the_old_sink_is_not_closed_by_both_paths() -> None:
     log_foundry.configure(service="t", sink=new)
     shutting_down.join(60.0)
 
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
     assert old.closed == 1, f"A was closed {old.closed} times, not once"
     assert new.closed == 1, f"B was closed {new.closed} times, not once"
 
@@ -404,7 +407,9 @@ def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> N
 
     worker.flush = lambda timeout=None: False  # the drain cannot be confirmed
     new = CountingSink("B")
-    assert worker.swap_sink(new, 1.0) is True, "an unconfirmed drain is still an adopted swap"
+    assert worker.retarget(new, time.monotonic() + 1.0).verdict == "unfenced", (
+        "an unconfirmed drain is still an adopted swap"
+    )
     assert worker.sink is new
     assert worker.health().incomplete_swaps == 1
 
@@ -412,13 +417,23 @@ def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> N
 # --- found by independent review of this PR --------------------------------------------------
 
 
-def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
-    """The re-arm guard `_note_orphan_emit` carries, which `_adopt_declined_swap` first omitted.
+def test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade() -> None:
+    """SPEC-054 FR-002 retires the closed-sink latch, and this is the one place it cost a close.
 
-    All three actors are ordinary and the window is a whole drain, not the few instructions
-    FR-003 AC-3 needs a preemption point for: an orphan log arms the sink while a `configure()`
-    is inside `swap_sink`'s first `flush()`, a `shutdown()` closes it, and the declining swap
-    then re-arms a closed sink for a second `close()` at exit.
+    ~~The re-arm guard `_note_orphan_emit` carries, which `_adopt_declined_swap` first
+    omitted.~~ — struck (SPEC-021). The scenario is unchanged and all three actors are ordinary:
+    an orphan log arms the sink while a `configure()` is inside the swap's first `flush()`, a
+    `shutdown()` closes it, and the declining swap then arms it again.
+
+    The latch refused that second arming. It is gone, so B is closed twice — and unlike the other
+    two counts SPEC-054 raised, **nothing was written between the two closes**. It is the case
+    FR-002 enumerates rather than a write-epoch double: *a live target is closed at exit whether
+    or not anything was written since it was installed*, which is the worker path's rule.
+
+    Not arming on a decline was tried, and it costs SPEC-035 FR-003's guarantee that a declined
+    sink is owned by somebody — three tests in this file hold it. So the redundant close is the
+    accepted trade, and `sinks/base.py` asks an implementation for an idempotent `close()` for
+    exactly this.
     """
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
@@ -433,7 +448,7 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
         result = real_flush(timeout)
         worker.flush = real_flush
         log_foundry.info("an orphan log that arms B while the swap is in flight")
-        assert _lifecycle._state._orphan_owed.get(id(new)) is new, (
+        assert _lifecycle._state._owed.get(id(new)) is new, (
             "the orphan log must have armed B"
         )
         log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
@@ -442,8 +457,11 @@ def test_a_declined_swap_does_not_re_arm_a_sink_already_closed() -> None:
     worker.flush = flush_then_arm_and_shut_down
     log_foundry.configure(service="t", sink=new)  # declines, then must not re-arm B
 
-    _lifecycle._close_orphan_sink()
-    assert new.closed == 1, f"B was closed {new.closed} times, not once"
+    _lifecycle._close_owed()
+    assert new.closed == 2, (
+        f"B was closed {new.closed} times: once by the racing shutdown, once as the live target "
+        "the swap installed — the trade this test's docstring records"
+    )
 
 
 def test_an_abandoning_first_shutdown_releases_the_second_callers_wait() -> None:
@@ -512,7 +530,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
             worker.flush = real
             t = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
             t.start()
-            while not worker.retired:
+            while not log_foundry.health().retired:
                 pass
             t.join(30.0)
             return r
@@ -537,9 +555,9 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
 
 
 def test_an_orphan_only_second_shutdown_waits_for_the_close_in_flight() -> None:
-    """FR-002 AC-3. `_close_orphan_sink` had `_close_if_owed`'s shape, and the same residue.
+    """FR-002 AC-3. The orphan closer had the worker's shape, and the same residue.
 
-    It empties `_orphan_owed` under `_state._lock` and *then* closes, so a second caller took the
+    It empties `_owed` under `_state._lock` and *then* closes, so a second caller took the
     early return while the first was still inside an unbounded `close()`. In a process that only
     ever logged outside a span there is no worker, so this function is the *only* thing that
     closes the sink — which makes an `atexit` call returning through a running close total loss
@@ -621,17 +639,21 @@ def test_an_orphan_only_shutdown_with_no_close_in_flight_does_not_wait() -> None
     )
 
 
-def test_a_completed_orphan_close_does_not_defeat_a_later_bystanders_wait() -> None:
-    """FR-002. The orphan record is a count and a gate, because it is not once-only.
+def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_work() -> None:
+    """SPEC-050 FR-002's property, strengthened by SPEC-054 FR-003's per-sink registrations.
 
-    A single slot held one close's event, so a second orphan close overwrote it and its own
-    completion then cleared it — a bystander arriving afterwards read nothing, waited for nothing,
-    and the process exited through the *first* close, still running. Measured on that shape: the
-    bystander waited 1.005 s with one close and 0.000 s with a second completing in between,
-    losing the first sink's whole buffer.
+    ~~The orphan record is a count and a gate, because it is not once-only. A single slot held
+    one close's event, so a second orphan close overwrote it and its own completion then cleared
+    it — a bystander arriving afterwards read nothing and waited for nothing.~~ — struck
+    (SPEC-021). Measured on that shape: the bystander waited 1.005 s with one close and 0.000 s
+    with a second completing in between, losing the first sink's whole buffer.
 
-    The second close is driven to **completion** here rather than left running, which is the whole
-    point: a test where both closes overlap passes against the slot as well.
+    That scenario can no longer be built, and that is the point: a close is registered against the
+    **sink** it is closing, so a second caller cannot overwrite a first caller's record. What is
+    asserted instead is the stronger property that makes it unbuildable — a caller waits on every
+    registration that is not its own, **including one that also took work of its own**. So the
+    caller closing the second sink does not return until the first sink's close has finished, and
+    the first sink's buffer reaches the wire.
     """
     class _Slow:
         def __init__(self, seconds: float) -> None:
@@ -658,20 +680,20 @@ def test_a_completed_orphan_close_does_not_defeat_a_later_bystanders_wait() -> N
     for _ in range(5):
         log_foundry.info("x")
 
-    closer = threading.Thread(target=_lifecycle._close_orphan_sink, daemon=True)
+    closer = threading.Thread(target=_lifecycle._close_owed, daemon=True)
     closer.start()
     assert first.in_close.wait(5.0), "the premise: the first close is running"
 
     log_foundry.configure(service="test", sink=second)
     log_foundry.info("y")
-    _lifecycle._close_orphan_sink()
-    assert second.closed == 1, "the premise: a second orphan close ran to completion in between"
-
     start = time.monotonic()
-    _lifecycle._close_orphan_sink()  # a bystander: nothing owed
+    _lifecycle._close_owed()  # closes the second sink, and waits on the first
     waited = time.monotonic() - start
 
-    assert waited > 0.3, f"the bystander returned in {waited:.3f}s with a close still running"
+    assert second.closed == 1, "the premise: this caller had work of its own to do"
+    assert waited > 0.3, (
+        f"it returned in {waited:.3f}s, so it returned through a close it did not start"
+    )
     assert first.wire == 5 and first.closed == 1, f"the first sink lost its buffer: {first.wire}"
     closer.join(5)
 
@@ -710,13 +732,13 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
     log_foundry.configure(service="test", sink=sink)
     log_foundry.info("orphan")
 
-    closer = threading.Thread(target=_lifecycle._close_orphan_sink, daemon=True)
+    closer = threading.Thread(target=_lifecycle._close_owed, daemon=True)
     closer.start()
     assert sink.in_close.wait(5.0), "the premise: the close is running"
 
-    _lifecycle._close_orphan_sink()  # first bystander
+    _lifecycle._close_owed()  # first bystander
     start = time.monotonic()
-    _lifecycle._close_orphan_sink()  # second: must still find the close in flight
+    _lifecycle._close_owed()  # second: must still find the close in flight
     waited = time.monotonic() - start
 
     assert waited > 0.1, (
@@ -726,7 +748,7 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
     closer.join(5)
 
 
-def test_an_interrupt_between_taking_the_count_and_the_close_does_not_leak_it() -> None:
+def test_an_interrupt_after_the_take_does_not_leak_a_close_registration() -> None:
     """FR-002. A leaked in-flight count is permanent, so the take is inside the `try`.
 
     `KeyboardInterrupt` is delivered asynchronously at a bytecode boundary, so one landing between
@@ -763,21 +785,20 @@ def test_an_interrupt_between_taking_the_count_and_the_close_does_not_leak_it() 
 
     real_choice = _lifecycle._inline_close_choice
 
-    def interrupted(owed: list[object]) -> object:
-        """Stands in for an async interrupt landing after the count was taken."""
+    def interrupted(owed: list[object], worker: object) -> object:
+        """Stands in for an async interrupt landing after the take, before any close."""
         raise KeyboardInterrupt
 
     _lifecycle._inline_close_choice = interrupted  # type: ignore[assignment]
     try:
         with pytest.raises(KeyboardInterrupt):
-            _lifecycle._close_orphan_sink()
+            _lifecycle._close_owed()
     finally:
         _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
 
-    assert _lifecycle._orphan_closing == 0, (
-        f"the in-flight count leaked to {_lifecycle._orphan_closing} and never returns"
+    assert not _lifecycle._closing_now, (
+        f"a close registration leaked and never discharges: {_lifecycle._closing_now}"
     )
-    assert _lifecycle._orphan_idle.is_set(), "the gate stayed clear, so every later caller waits"
 
     start = time.monotonic()
     log_foundry.shutdown(timeout=30.0)
@@ -786,16 +807,60 @@ def test_an_interrupt_between_taking_the_count_and_the_close_does_not_leak_it() 
     )
 
 
-def test_a_double_release_of_the_count_cannot_drive_it_negative() -> None:
-    """FR-002. A negative count never satisfies `not _orphan_closing`, so the gate never sets.
+def test_an_interrupt_after_the_take_leaves_the_sinks_owed_for_a_later_shutdown() -> None:
+    """The other half of the discharge guarantee, found by SPEC-054's second diff review.
 
-    Reproduced by forking from *inside* the inline close: the child's fork handler zeroes the
-    count, and the forking thread's own `finally` then takes it to -1. The floor is what makes
-    that recoverable, and it is asserted directly because the fork shape needs a subprocess to
-    observe and this is the invariant that shape depends on.
+    Discharging the registration is not enough on its own. The take has already removed each sink
+    from the owed record, so an interrupt between the take and the close left them **owed by
+    nobody**: closed by nobody, and unreachable by a later `shutdown()` because nothing names
+    them any more. Measured before the fix at three sinks, `closes=[0, 0, 0]`, record empty.
+
+    The registry half is asserted by the sibling test above; this one asserts the record half and
+    then drives the recovery, which is the point — a sink put back is only useful if the next
+    call closes it.
     """
-    _lifecycle._orphan_closing = 0
-    _lifecycle._orphan_idle.set()
+    first, second = CountingSink("A"), CountingSink("B")
+    log_foundry.configure(service="t", sink=first)
+    log_foundry.info("arms A")
+    _lifecycle._note_orphan_emit(second)
+    assert len(_lifecycle._state._owed) == 2, "the premise: two sinks are owed"
+
+    real_choice = _lifecycle._inline_close_choice
+
+    def interrupted(owed: list[object], worker: object) -> object:
+        """Stands in for an async interrupt landing after the take, before any close."""
+        raise KeyboardInterrupt
+
+    _lifecycle._inline_close_choice = interrupted  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _lifecycle._close_owed()
+    finally:
+        _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
+
+    assert (first.closed, second.closed) == (0, 0), "the premise: neither close ran"
+    assert not _lifecycle._closing_now, "the registrations were discharged"
+    assert {id(first), id(second)} <= set(_lifecycle._state._owed), (
+        "and both sinks are owed again, so a later shutdown can still close them"
+    )
+
+    log_foundry.shutdown(timeout=5.0)
+    assert (first.closed, second.closed) == (1, 1), (
+        f"which it does — got A={first.closed} B={second.closed}"
+    )
+
+
+def test_a_forks_clear_inside_a_close_leaves_the_registry_consistent() -> None:
+    """SPEC-050 FR-002's shape at SPEC-054 FR-003's registry, where the count could go negative.
+
+    ~~A negative count never satisfies `not _orphan_closing`, so the gate never sets~~ — struck
+    (SPEC-021): there is no count to drive negative. The reproduction it came from survives and
+    still matters: forking from *inside* the inline close runs the child's handler, which clears
+    the whole registry, and the forking thread's own discharge then arrives at an entry that is
+    already gone. A count went to -1 there and never recovered; `_finish_closing` removes an
+    entry only when it is still **the one it was handed**, so the late discharge finds nothing,
+    removes nothing, and leaves the registry exactly as the clear left it.
+    """
 
     class _Quiet:
         def __init__(self) -> None:
@@ -805,17 +870,17 @@ def test_a_double_release_of_the_count_cannot_drive_it_negative() -> None:
             """Accepts a batch."""
 
         def close(self) -> None:
-            """Releases nothing, but zeroes the count as a forked child's handler would."""
-            _lifecycle._clear_closing_after_fork()
+            """Releases nothing, but empties the registry as a forked child's handler would."""
+            _lifecycle._clear_after_fork()
 
     log_foundry.configure(service="test", sink=_Quiet())
     log_foundry.info("orphan")
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
 
-    assert _lifecycle._orphan_closing == 0, (
-        f"the count went to {_lifecycle._orphan_closing}, which the gate's test never satisfies"
+    assert not _lifecycle._closing_now, (
+        f"the clear and the late discharge left the registry inconsistent: "
+        f"{_lifecycle._closing_now}"
     )
-    assert _lifecycle._orphan_idle.is_set(), "and the gate never sets again"
 
 
 def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() -> None:
@@ -922,7 +987,7 @@ def test_an_orphan_only_daemon_shutdown_finishes_its_close_before_the_process_ex
     what the criterion actually asks: a process that only ever logged outside a span, whose
     `shutdown()` began on a daemon thread, still delivers its close-is-delivery sink's buffer
     when the interpreter exits through `atexit`. There is no worker on this path, so
-    `_close_orphan_sink` is the only thing that closes the sink at all.
+    `_close_owed` is the only thing that closes the sink at all.
     """
     import subprocess
     import sys
