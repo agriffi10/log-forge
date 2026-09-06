@@ -17,11 +17,13 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 import log_foundry
 from log_foundry import _lifecycle
 
 if TYPE_CHECKING:
-    import pytest
+    from log_foundry.worker import Worker
 
 CLOSE_SECONDS = 2.0
 """Long enough to separate `max` from `sum` at four sinks, short enough to keep the suite quick.
@@ -34,6 +36,10 @@ measurement this file exists to move.
 
 class SlowCloseSink:
     """Records which thread closed it, when, and how long its buffer went undelivered.
+
+    Both the thread's **name** and its **id**: a name is not an identity, since two threads may
+    carry one and a pool reuses them, and `threading.get_ident()` is what SPEC-054 FR-003 AC-2
+    asserts against (the SPEC-028 objection is about which thread the interpreter kills).
 
     `close()` is its delivery and it keeps accepting afterwards, which `sinks/base.py` permits and
     nineteen shipped sink modules do. That is the shape for which an abandoned close is lost data,
@@ -52,6 +58,7 @@ class SlowCloseSink:
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.closed_on: str | None = None
+        self.closed_by: int | None = None
         self._lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -63,6 +70,7 @@ class SlowCloseSink:
         """Takes its time, then delivers — so a close that never completes is a loss."""
         self.started_at = time.monotonic()
         self.closed_on = threading.current_thread().name
+        self.closed_by = threading.get_ident()
         time.sleep(self.seconds)
         with self._lock:
             self.closes += 1
@@ -113,7 +121,7 @@ def test_four_owed_closes_cost_the_slowest_not_their_sum() -> None:
         SlowCloseSink(f"s{i}") for i in range(3)
     ]
     _arm(*sinks)
-    assert len(_lifecycle._state._orphan_owed) == 4, "four are owed, or this measures nothing"
+    assert len(_lifecycle._state._owed) == 4, "four are owed, or this measures nothing"
     assert _lifecycle._live_config_sink() is sinks[0], (
         "the short close is the inline one, or a dropped join is hidden behind a 2 s wait"
     )
@@ -154,7 +162,7 @@ def test_the_configured_sink_closes_on_the_calling_thread() -> None:
     """
     live, other = SlowCloseSink("live"), SlowCloseSink("other")
     _arm(live, other)
-    owed = _lifecycle._state._orphan_owed
+    owed = _lifecycle._state._owed
     assert list(owed.values()) == [live, other], "the config's sink is armed first, not last"
     assert _lifecycle._live_config_sink() is live, "and the config still names it"
 
@@ -182,7 +190,7 @@ def test_the_last_armed_sink_closes_inline_when_the_config_is_not_owed() -> None
     from log_foundry import config as config_module
 
     config_module._rebind(sink=elsewhere)
-    owed = _lifecycle._state._orphan_owed
+    owed = _lifecycle._state._owed
     assert id(elsewhere) not in owed, "the configured sink is not among those owed"
     assert list(owed.values())[-1] is last, "and `last` is the most recently armed"
 
@@ -380,7 +388,7 @@ def test_one_owed_sink_creates_no_thread() -> None:
     """
     only = SlowCloseSink("only", seconds=0.1)
     _arm(only)
-    assert len(_lifecycle._state._orphan_owed) == 1, "exactly one is owed"
+    assert len(_lifecycle._state._owed) == 1, "exactly one is owed"
 
     caller = threading.current_thread().name
     log_foundry.shutdown(timeout=1.0)
@@ -396,3 +404,263 @@ def test_one_owed_sink_creates_no_thread() -> None:
     # `closing_sinks` counts `_closers`, which this path never registers in — so the assertion
     # above is structural rather than a live check, and it is here to fail if a later change
     # routes these closes through `_start_closer` after all.
+
+
+# --------------------------------------------------------------------------- SPEC-054 FR-003
+
+
+def _reset() -> None:
+    """Puts the process back in the cold state between the two paths of one test.
+
+    The autouse fixture in `conftest.py` runs per test, not per loop iteration, and a test that
+    drives both delivery paths needs the second to start where the first did.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from conftest import _reset_worker
+
+    _reset_worker()
+
+
+def _wait_for_the_drain_to_end(worker: Worker, timeout: float = 10.0) -> None:
+    """Waits until the worker's drain thread has ended, so a stranded sink becomes takeable.
+
+    `_Lifecycle.held` answers on thread **liveness**, so a stranded sink is left open while the
+    thread that may be inside it is alive (SPEC-027 FR-004). A test about what the closer does
+    with such a sink has to get past that, and waiting is what the shipped `shutdown()` does.
+
+    Args:
+      worker: The worker whose thread to wait for.
+      timeout: Seconds to wait before giving up.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    worker.stop(timeout=timeout)
+
+
+def _arm_on_the_worker_path(*sinks: SlowCloseSink) -> Worker:
+    """Builds a process worker on the first sink and arms the rest, then returns the worker.
+
+    The worker path's counterpart to :func:`_arm`. SPEC-054 FR-003 gave both paths one closer,
+    and every criterion this section holds was measured on the orphan path alone before it —
+    ``tests/test_concurrent_owed_closes.py`` had no worker in it at all.
+
+    Args:
+      *sinks: The sinks to arm, the first of which the worker is built on.
+
+    Returns:
+      The process worker, already installed.
+
+    Raises:
+      None.
+    """
+    log_foundry.configure(service="t", sink=sinks[0])
+
+    @log_foundry.trace
+    def work() -> None:
+        """Builds the worker, which arms the sink it is built on."""
+
+    work()
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None, "the premise: a @trace built the process worker"
+    log_foundry.flush(timeout=5.0)
+    for sink in sinks[1:]:
+        _lifecycle._note_orphan_emit(sink)
+        sink.emit([{"message": f"to {sink.name}"}])
+    return worker
+
+
+def test_four_owed_closes_on_the_worker_path_cost_the_slowest_not_their_sum() -> None:
+    """FR-003 AC-3. SPEC-046 FR-001's two criteria, on the path that never had them.
+
+    `test_four_owed_closes_cost_the_slowest_not_their_sum` above measures the same thing with no
+    worker in the process. Before SPEC-054 the worker path reached a different closer entirely —
+    `Worker._close_if_owed`, which closed one sink — so the fan-out and its join were untested
+    wherever a worker existed, which is every process that ever ran a `@trace`.
+
+    Elapsed time alone is not the observable, for the reason the orphan test gives: a fan-out
+    that never joins is faster still and abandons three closes. The live sink's close is short so
+    that a dropped join is not hidden behind an inline wait.
+    """
+    live = SlowCloseSink("live", seconds=0.2)
+    others = [SlowCloseSink(f"s{i}") for i in range(3)]
+    _arm_on_the_worker_path(live, *others)
+    sinks = [live, *others]
+    assert len(_lifecycle._state._owed) == 4, "four are owed, or this measures nothing"
+
+    started = time.monotonic()
+    log_foundry.shutdown(timeout=1.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 4.0, (
+        f"the exit close costs the slowest owed close, not their sum — took {elapsed:.2f}s "
+        f"against {0.2 + 3 * CLOSE_SECONDS:.1f}s in sequence"
+    )
+    assert all(sink.closes == 1 for sink in sinks), (
+        f"and every owed sink completed its close — got {sinks}"
+    )
+    assert all(sink.buffered == 0 for sink in sinks), (
+        f"so nothing any of them held is stranded — got {sinks}"
+    )
+
+
+def test_the_live_sink_closes_on_the_calling_thread_on_the_worker_path() -> None:
+    """FR-003 AC-2, the half no test in `tests/` asserted on either path before this spec.
+
+    `grep -rn 'get_ident' tests/` was empty; the orphan path had a thread-**name** assertion and
+    the worker path had none at all. It matters because of the SPEC-028 objection: interpreter
+    exit kills a daemon wherever it has reached, and for a `SQLiteSink` that can be inside
+    `commit()`. A merged closer that put the live sink's close on a fan-out thread would leave it
+    exposed to a bystander returning after the grace.
+
+    The **worker's** sink is asserted rather than the configured one, because FR-003 orders the
+    inline choice worker-first and the two differ after a declined swap (SPEC-035 FR-003).
+    """
+    live, other = SlowCloseSink("live", seconds=0.2), SlowCloseSink("other", seconds=0.2)
+    worker = _arm_on_the_worker_path(live, other)
+    assert worker.sink is live, "the premise: the worker holds the sink asserted below"
+
+    caller = threading.get_ident()
+    log_foundry.shutdown(timeout=5.0)
+
+    assert live.closed_by == caller, (
+        f"the worker's live sink closed on thread {live.closed_by}, not the caller's {caller}"
+    )
+    assert other.closed_by is not None and other.closed_by != caller, (
+        f"and the superseded one did not, got {other.closed_by}"
+    )
+
+
+def test_the_live_sink_closes_on_the_calling_thread_on_the_orphan_path() -> None:
+    """FR-003 AC-2's other path, asserted on the thread **id** rather than its name.
+
+    A name is not an identity: two threads may share one, and a pool reuses them. The id is what
+    `threading.get_ident()` compares, and it is what the SPEC-028 objection is about.
+    """
+    live, other = SlowCloseSink("live", seconds=0.2), SlowCloseSink("other", seconds=0.2)
+    _arm(live, other)
+    assert _lifecycle._live_config_sink() is live, "the premise: the config names the first"
+
+    caller = threading.get_ident()
+    log_foundry.shutdown(timeout=5.0)
+
+    assert live.closed_by == caller, (
+        f"the configured sink closed on thread {live.closed_by}, not the caller's {caller}"
+    )
+    assert other.closed_by is not None and other.closed_by != caller, (
+        f"and the superseded one did not, got {other.closed_by}"
+    )
+
+
+def test_a_worker_path_shutdown_with_no_close_in_flight_pays_no_grace() -> None:
+    """FR-003 AC-4. The ordinary exit must not pay for a wait nobody is waiting on.
+
+    The process-wide gate SPEC-050 FR-002 shipped made a worker-path `shutdown()` wait out the
+    whole grace for an *orphan* close of a sink it never touched — measured at 2.007 s wall,
+    0.000 s CPU. Per-sink registrations end that: a caller waits only on closes actually in
+    flight, and here there are none.
+
+    **CPU as well as wall**, per invariant 3: a busy-spin would satisfy a wall-clock bound alone,
+    and this is the file where a wait is measured.
+    """
+    sink = SlowCloseSink("live", seconds=0.0)
+    _arm_on_the_worker_path(sink)
+
+    wall = time.monotonic()
+    cpu = time.process_time()
+    log_foundry.shutdown(timeout=30.0)
+    elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+
+    assert sink.closes == 1, "the premise: it did the work, it just did not wait"
+    assert elapsed < 0.2, (
+        f"a shutdown with no close in flight waited {elapsed:.3f}s against a "
+        f"{_lifecycle.DEFAULT_CLOSER_GRACE}s grace it had no reason to pay"
+    )
+    assert spent < 0.1, f"and it idled rather than spun — {spent:.3f}s of CPU"
+
+
+def test_a_keyboardinterrupt_during_the_fan_out_joins_every_close_it_started() -> None:
+    """FR-003 AC-6. SPEC-046 put the join in a `finally`; nothing in `tests/` pinned it.
+
+    Measured on the unjoined shape when SPEC-046 was written: four closes abandoned mid-write.
+    The interrupt is raised from the **inline** close, which is the last thing the closer does
+    and the one place a `BaseException` can escape while fan-out threads are still running.
+
+    Both paths, because the closer is one function now and the claim is about that function.
+    `KeyboardInterrupt` is caught here rather than allowed to propagate: an escaping one aborts
+    the whole pytest session instead of failing this test.
+    """
+    for on_the_worker_path in (False, True):
+        live = SlowCloseSink("live", seconds=0.0)
+        others = [SlowCloseSink(f"s{i}", seconds=0.4) for i in range(3)]
+
+        def interrupting_close(sink: SlowCloseSink = live) -> None:
+            """Stands in for an interrupt landing inside the inline close."""
+            sink.closes += 1
+            raise KeyboardInterrupt
+
+        live.close = interrupting_close  # type: ignore[method-assign]
+        if on_the_worker_path:
+            _arm_on_the_worker_path(live, *others)
+        else:
+            _arm(live, *others)
+
+        with pytest.raises(KeyboardInterrupt):
+            log_foundry.shutdown(timeout=5.0)
+
+        assert all(sink.closes == 1 for sink in others), (
+            f"every started close was joined before the interrupt reached the caller "
+            f"(worker path: {on_the_worker_path}) — got {others}"
+        )
+        assert all(sink.finished_at is not None for sink in others), (
+            f"and each ran to completion rather than being abandoned mid-write — got {others}"
+        )
+        _reset()
+
+
+def test_a_stranded_close_that_outlasts_the_grace_does_not_hold_the_shutdown() -> None:
+    """FR-003 AC-5. The detached case: a stuck swapped-out sink costs the grace, not the budget.
+
+    SPEC-050 FR-004's judgement, kept: a sink the worker swapped out without confirming a fence
+    already had the swap's whole budget, so one still closing at exit is far more likely stuck
+    than slow. It is released detached and granted only `join_closers`' grace, where joining it
+    would let one stuck sink hold the exit for the shutdown's whole budget.
+    """
+    class _SlowEmit(SlowCloseSink):
+        """Emits slowly, so a swap's drain cannot be confirmed inside its budget."""
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Buffers, after a delay that outlasts the swap budget."""
+            time.sleep(0.4)
+            super().emit(batch)
+
+    stuck = _SlowEmit("stranded", seconds=30.0)
+    live = SlowCloseSink("live", seconds=0.0)
+    worker = _arm_on_the_worker_path(stuck)
+    worker.submit([{"message": "so the drain is inside the stranded sink"}])
+    _lifecycle._swap_sink(live, timeout=0.05)
+    assert worker.holds_unfenced(stuck), "the premise: the swap could not confirm its fence"
+    _wait_for_the_drain_to_end(worker)
+
+    started = time.monotonic()
+    log_foundry.shutdown(timeout=30.0)
+    elapsed = time.monotonic() - started
+
+    assert stuck.started_at is not None, "the stranded close was started"
+    assert stuck.closes == 0, "and is still running, which is what makes the bound meaningful"
+    assert elapsed < _lifecycle.DEFAULT_CLOSER_GRACE + 1.0, (
+        f"a stuck stranded close held the shutdown for {elapsed:.2f}s against a "
+        f"{_lifecycle.DEFAULT_CLOSER_GRACE}s grace on a 30s budget"
+    )
+    assert live.closes == 1, "and the live sink was still closed"

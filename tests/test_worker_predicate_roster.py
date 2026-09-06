@@ -92,8 +92,12 @@ LIVENESS = (
     "same retirement in order to *report* it is this question asked for a different purpose, "
     "not a fifth category"
 )
-OWNERSHIP = "ownership — who *owns* a close, which a retired worker still does"
-OWNERSHIP_AND_MOMENT = "ownership ∧ moment — whose stop event the sink should be holding *now*"
+MOMENT = (
+    "moment — is anything using this sink right now. **Two predicates**, because an abandoned "
+    "drain answers them oppositely: `in_flight` reads `draining`, for the signal refresh, where "
+    "an abandoned drain counts as over; `held` reads thread liveness, for the close, where it "
+    "counts as still inside"
+)
 
 # One row per site: (enclosing function, the expression as `ast.unparse` renders it) -> why.
 # Adding a call site without adding a row fails `test_every_worker_predicate_is_classified`,
@@ -159,20 +163,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "keeps naming the publication and this one is index 1."
         ),
     ),
-    ("_get_worker", "stale is not worker.sink", 0): (
-        OWNERSHIP,
-        (
-            "who owns the close the orphan record was holding, at the moment the record is "
-            "cleared (SPEC-044 FR-002). Ownership, not existence: a worker exists by "
-            "construction three lines up, and what is undecided is whether it *adopted* the "
-            "recorded sink - `configure()` writes `_config.sink` before taking this lock, so a "
-            "`configure(sink=B)` blocked here leaves `_ensure_sink()` returning B while the "
-            "record still names A, which is the close that used to be discarded. Not liveness: "
-            "the worker was built moments ago and cannot be retired, so liveness answers the "
-            "same thing today and stops doing so the day a worker is built retired."
-        ),
-    ),
-    ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
+        ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the two questions below read, taken once. The existence question "
@@ -230,71 +221,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "stranded."
         ),
     ),
-    ("_Lifecycle.worker_owns_now", "self._worker", 0): (
-        OWNERSHIP_AND_MOMENT,
-        (
-            "the snapshot the conjunction below reads, now inside the question rather than at "
-            "its caller (SPEC-040 FR-002). Rebinding it to _live_worker() is precisely the "
-            "revert SPEC-035 FR-001 exists to stop, and it is still caught here rather than "
-            "below: the conjunction's text does not change at all, so this row goes stale and "
-            "a new unclassified site appears, both about this line. What moving it bought is "
-            "that there is now one such line in the module instead of one per caller."
-        ),
-    ),
-    ("_Lifecycle.worker_owns_now", "worker is not None and worker.sink is sink and worker.draining", 0): (
-        OWNERSHIP_AND_MOMENT,
-        (
-            "SPEC-035 FR-001, stated once. Ownership alone skips for a worker whose shutdown has "
-            "finished, leaving a sink still being written to holding a set event - SPEC-033 "
-            "FR-004's tight retry loop. Liveness alone un-skips for the whole drain, handing the "
-            "drain thread a fresh event nobody will set. Both were measured; only the "
-            "conjunction is right. It is a conjunction and not a fifth subject, which is why "
-            "the category names both terms."
-        ),
-    ),
-    ("_Lifecycle.worker_owns", "self._worker", 0): (
-        OWNERSHIP,
-        (
-            "the snapshot the ownership test below reads. Filed for the reason every binding "
-            "here is: rebinding it to _live_worker() changes the category of the predicate "
-            "below without changing that predicate's text, which is SPEC-033's defect exactly "
-            "- and now it can only be made once, in this function, rather than at each of the "
-            "two call sites that used to compose it."
-        ),
-    ),
-    ("_Lifecycle.worker_owns", "worker is not None and worker.sink is sink", 0): (
-        OWNERSHIP,
-        (
-            "the definition of the ownership question itself. A retired worker still owns its "
-            "sink's close - Worker.swap_sink returns early once _shutdown_done, so it keeps "
-            "that sink forever - which is why this deliberately does not consult retired. "
-            "Answering it with liveness closes the sink twice on a clean shutdown and under a "
-            "live writer on an expired one, both measured (SPEC-033 FR-002)."
-        ),
-    ),
-    ("_offer_orphan_signal", "_state.worker_owns_now(sink)", 0): (
-        OWNERSHIP_AND_MOMENT,
-        (
-            "SPEC-035 FR-001. Ownership alone skips for a worker whose shutdown has finished, "
-            "leaving "
-            "a sink still being written to holding a set event - SPEC-033 FR-004's tight retry "
-            "loop. "
-            "Liveness alone un-skips for the whole drain, handing the drain thread a fresh event "
-            "nobody will set. Both were measured; only the conjunction is right."
-        ),
-    ),
-    (
-        "_close_orphan_sink",
-        "[sink for sink in _state._orphan_owed.values() if not _state.worker_owns(sink)]",
-        0,
-    ): (
-        OWNERSHIP,
-        (
-            "a retired worker still owns its sink's close, and deliberately declines it when its "
-            "shutdown expired, because the drain thread may still be inside emit (SPEC-027 FR-004)."
-        ),
-    ),
-    ("_shutdown_worker", "_state.worker_exists()", 0): (
+                            ("_shutdown_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "which exit path to take. A worker that exists drains first, and only then is the "
@@ -396,88 +323,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "worker closed by nobody."
         ),
     ),
-    ("_swap_sink", "worker is not None", 1): (
-        LIVENESS,
-        (
-            "the out-of-lock branch: whether to delegate at all. It consumes the verdict the "
-            "row above produced rather than re-reading _worker, and that is deliberate - "
-            "_get_worker can assign the global between the two reads, so a re-read would let "
-            "the two branches act on different answers. Textually identical to the row above "
-            "and a separate read, which is why the key carries an occurrence index rather than "
-            "only the text. Disclosed rather than claimed: no shipped test distinguishes this "
-            "from the existence form, because the in-lock branch has already performed the "
-            "orphan handoff and _adopt_declined_swap absorbs the delegation a retired worker "
-            "then declines. A first version of this row said a retired worker here loses the "
-            "handoff entirely - a sentence lifted from SPEC-033's delivery doc, where it "
-            "described _live_worker() as a whole; measurement puts that loss at the row above, "
-            "and a reason copied rather than thought about is the failure AC-2 exists to stop."
-        ),
-    ),
-    ("_swap_sink", "not _state.worker_owns(stale)", 0): (
-        OWNERSHIP,
-        (
-            "who owns the *old* sink's close. Answering this one with liveness closes it twice on "
-            "a "
-            "clean shutdown and under a live writer on an expired one - both measured."
-        ),
-    ),
-    ("_swap_sink", "worker.swap_sink(new_sink, timeout)", 0): (
-        OWNERSHIP,
-        (
-            "the call that produces the ownership verdict the row below reads. Filed because "
-            "the roster files bindings positionally: a delegation retargeted at _worker rather "
-            "than the live snapshot is the round-9 attack wearing a different value shape."
-        ),
-    ),
-    ("_swap_sink", "stale is not new_sink and stale is not worker.sink", 0): (
-        OWNERSHIP,
-        (
-            "whether the orphan record names a **third** sink - neither the one the worker holds "
-            "nor the one being installed - which nothing else would then close (SPEC-044 "
-            "FR-002). Ownership: it asks what the worker holds, not whether it is alive or "
-            "exists, and it is the same question `_get_worker` asks at the sibling site. Only a "
-            "preempted orphan emit re-arming across an earlier swap can make it true, which is "
-            "why it is a guard rather than the common path."
-        ),
-    ),
-    ("_swap_sink", "worker.sink is not new_sink", 0): (
-        OWNERSHIP,
-        (
-            "whether this swap actually hands a sink over, and therefore whether there is a "
-            "close for the latch to record (SPEC-044 FR-004). Ownership: `worker.sink` is the "
-            "sink `Worker.swap_sink` is about to close, and it is the **right** subject where "
-            "the orphan record is the wrong one - the record is `None` in the reproduced case, "
-            "because `_get_worker` cleared it when the worker was built, so a latch keyed on it "
-            "recorded nothing and left the double close exactly where it was."
-        ),
-    ),
-    ("_swap_sink", "worker.sink", 0): (
-        OWNERSHIP,
-        (
-            "the sink written into the latch - the right-hand side of "
-            "`_orphan_closed_sink = worker.sink`, filed for the reason `_get_worker`'s "
-            "publication row is: a write rather than a question, on the roster as a "
-            "stale-detector over the one line that decides which sink a later re-arm is refused "
-            "for. It is set even where the drain could not be confirmed and the swap therefore "
-            "leaves that sink **open**, because the reason is not `it was closed` but that a "
-            "racing emit must not re-arm a sink whose drain thread may still be inside `emit`."
-        ),
-    ),
-    ("_swap_sink", "not worker_holds_sink", 0): (
-        OWNERSHIP,
-        (
-            "who owns the *new* sink when the worker declined mid-swap (SPEC-035 FR-003). "
-            "Carried by a return value because a decline is a decision taken inside "
-            "Worker.swap_sink, between its two lock acquisitions, and nothing outside observes "
-            "it. What is *not* claimed: that no other predicate would do. swap_sink returns "
-            "False only where _shutdown_done latched, which is exactly what _live_worker() "
-            "reads, so a liveness re-read agrees with it at this site by construction and "
-            "measurement cannot separate the two - replacing it leaves the behavioural suite "
-            "green. The return value is the form that stays correct if swap_sink ever gains a "
-            "second reason to decline; today that is a design argument, not a measured one."
-        ),
-    ),
-    ("_flush_worker", "_state.worker_exists()", 0): (
+                                ("_flush_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the existence test below reads. Deliberately the existence question "
@@ -544,48 +390,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "drain, which is false against LIVENESS's own definition."
         ),
     ),
-    ("_flush_live_sink", "_state.live_worker()", 0): (
-        LIVENESS,
-        (
-            "who is *being delivered to*, asked once here rather than composed in the "
-            "conditional below (SPEC-040 FR-002). It was the raw global with `not "
-            "worker.retired` spelled out at the call site, and the two forms are equivalent by "
-            "construction - _live_worker returns None exactly when the worker is absent or "
-            "retired - so the branches this function exists to distinguish are unchanged. The "
-            "row's category moves with the binding: it is the liveness question now, where it "
-            "used to be an existence binding feeding a liveness test.\n"
-            "**Nothing behavioural distinguishes the two categories at this site** (SPEC-040 "
-            "FR-003 AC-5), and it is recorded rather than accepted, as the "
-            "`not worker_holds_sink` row above records the same thing: replacing this call with "
-            "_worker_exists() leaves the whole behavioural suite green - measured twice, 1802 "
-            "passed with the roster excluded, and only the roster caught it. What would separate "
-            "them is a flush against a *retired* worker whose sink is not the orphan record, "
-            "which no test arranges. The liveness form is kept because it is the one that stays "
-            "correct: a retired worker delivers nothing, so its sink is not the live target."
-        ),
-    ),
-    ("_flush_live_sink", "worker is not None", 0): (
-        LIVENESS,
-        (
-            "which sink is *being delivered to*, which is the sink whose own client buffer a "
-            "flush must drain. A retired worker performs no further delivery, so its sink is not "
-            "the live target and the orphan record is — the definition of this category, applied "
-            "to a target rather than to an action. Deliberately not ownership: nothing here "
-            "decides who *closes* a sink, and answering that question instead would flush the "
-            "sink a retired worker still owns while events were going somewhere else."
-        ),
-    ),
-    ("_flush_live_sink", "[worker.sink]", 0): (
-        LIVENESS,
-        (
-            "which sinks hold a client buffer to drain. A live worker owns exactly one, so the "
-            "list is a singleton; with no worker every sink the orphan path still owes a close "
-            "for may hold one, since SPEC-045 made that record a set rather than a slot. "
-            "Liveness rather than existence: a retired worker delivers nothing, so flushing its "
-            "sink would drain a client nothing is filling while the live target went unflushed."
-        ),
-    ),
-    ("_flush", "_lifecycle._get_worker()", 0): (
+                ("_flush", "_lifecycle._get_worker()", 0): (
         LIVENESS,
         (
             "who *performs* the submit of a finished span's buffer — `_sweep_open_spans`'s "
@@ -633,23 +438,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "specs. That is the gap SPEC-040 FR-004 widens the scope to close."
         ),
     ),
-    (
-        "_inheritance_roots",
-        (
-            "(config._live_config().sink, None if worker is None else worker.sink, "
-            "*_state._orphan_owed.values(), _state._orphan_closed_sink)"
-        ),
-        0,
-    ): (
-        EXISTENCE,
-        (
-            "the three delivery targets plus the superseded one, filed by the question the "
-            "conditional inside it asks. It is one site and not four: the tuple is a single "
-            "filed expression, and the only worker question in it is the existence test that "
-            "chooses between `worker.sink` and nothing."
-        ),
-    ),
-    ("_worker_health", "_state.retirements > 0", 0): (
+        ("_worker_health", "_state.retirements > 0", 0): (
         LIVENESS,
         (
             "reporting rather than deciding: this synthesizes `retired` for a process that shut "
@@ -667,6 +456,167 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "binding is load-bearing: `_boolean_positions` does not file a keyword argument, so "
             "writing it inline in the single `Health(...)` FR-005 requires would drop this row "
             "and take the module's count from 46 to 45 with nothing red."
+        ),
+    ),
+    ("_Lifecycle.in_flight", "self._worker", 0): (
+        MOMENT,
+        (
+            "the snapshot the question below reads, inside the question rather than at its "
+            "caller (SPEC-040 FR-002). It is on the roster because rebinding is how a guard "
+            "changes category without its text changing - swapping this for live_worker() would "
+            "strip the drain thread of the event it is about to wait on, which is the SPEC-035 "
+            "FR-001 revert."
+        ),
+    ),
+    ("_Lifecycle.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
+        MOMENT,
+        (
+            "the moment, for the signal refresh. It reads `draining`, so an abandoned drain "
+            "counts as **over** and the sink gets a fresh event rather than SPEC-033 FR-004's "
+            "tight retry loop - the opposite answer from `held` in the same state, which is why "
+            "the category carries two predicates. The identity term is what stops an orphan log "
+            "to sink Y being skipped because a live worker is draining into sink X. Was "
+            "`worker_owns_now`, an ownership-and-moment conjunction; with one owed-close record "
+            "there is no ownership question left for a site to get wrong (SPEC-054 FR-002/FR-004)."
+        ),
+    ),
+    ("_Lifecycle.held", "self._worker", 0): (
+        MOMENT,
+        "the snapshot the question below reads, for `in_flight`'s reason.",
+    ),
+    ("_Lifecycle.held", "worker is not None and worker.may_be_inside(sink)", 0): (
+        MOMENT,
+        (
+            "the moment, for the close. It reads thread **liveness** through the worker's own "
+            "answer, so an abandoned drain counts as **still inside** and the sink is left open "
+            "(SPEC-027 FR-004). Both halves of the pair were measured on the expired-shutdown "
+            "state: SPEC-033 FR-002 closing under a live writer, SPEC-035 FR-001 the fresh event "
+            "never arriving. It is not liveness in this file's sense - a *retired* worker whose "
+            "thread has ended answers False here and must, because then nothing is inside it."
+        ),
+    ),
+    ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
+        MOMENT,
+        (
+            "the one site the refresh predicate exists for. Bare liveness un-skips for the whole "
+            "drain and hands the drain thread a fresh event nobody will set; a bare identity "
+            "check skips for a worker whose shutdown has finished, leaving a live sink on a set "
+            "event that never clears. Both measured (SPEC-035 FR-001)."
+        ),
+    ),
+    ("_close_owed", "_state.worker_exists()", 0): (
+        EXISTENCE,
+        (
+            "is there a worker whose answers the take must consult at all. Not liveness: a "
+            "**retired** worker's thread may still be inside a sink after an expired shutdown, "
+            "which is exactly what must stop the closer taking it (SPEC-027 FR-004)."
+        ),
+    ),
+    ("_close_owed", "[sink for sink in _state._owed.values() if not _state.held(sink)]", 0): (
+        MOMENT,
+        (
+            "the take: every owed sink nothing may be inside, decided in the same critical "
+            "section that registers each one's close (SPEC-054 FR-003). What is left behind is "
+            "either inside a live drain thread or already being closed by somebody else, and the "
+            "two are answered differently below - a registration is waited on, a drain thread "
+            "costs no grace."
+        ),
+    ),
+    (
+        "_close_owed",
+        "{id(sink) for sink in taken if worker is not None and worker.holds_unfenced(sink)}",
+        0,
+    ): (
+        MOMENT,
+        (
+            "asked about a sink the take already let through, so the thread has ended - what it "
+            "decides is **how** the close runs, not whether. A sink swapped out without a "
+            "confirmed fence is released detached and granted only the closer grace, because it "
+            "already had the swap's whole budget and is far more likely stuck than slow "
+            "(SPEC-050 FR-004)."
+        ),
+    ),
+    ("_close_owed", "_inline_close_choice(taken, worker) if taken else None", 0): (
+        EXISTENCE,
+        (
+            "hands the worker over so the choice can ask whether one holds any of these sinks. "
+            "Existence rather than liveness on purpose: a retired worker's sink is still the one "
+            "whose close must stay on the calling thread (SPEC-030, and the SPEC-028 objection)."
+        ),
+    ),
+    ("_inline_close_choice", "None if worker is None else worker.sink", 0): (
+        EXISTENCE,
+        (
+            "the worker's sink is the first preference for the inline close, ahead of the "
+            "configured one, because the two differ after a declined swap - the config names B "
+            "while the worker still delivers to A (SPEC-035 FR-003) - and putting A's close on a "
+            "fan-out thread exposes it to the SPEC-028 objection."
+        ),
+    ),
+    ("_swap_sink", "worker is None and (not _state._owed)", 0): (
+        LIVENESS,
+        (
+            "the no-worker branch's early return: a `configure(A)` then `configure(B)` with "
+            "nothing ever written must arm nothing, which is FR-002's arming rule. Liveness "
+            "because the binding above it is `live_worker()` - a retired worker keeps its sink "
+            "and has no drain to fence, so this branch is where it belongs."
+        ),
+    ),
+    ("_swap_sink", "None if worker is None else worker.sink", 0): (
+        LIVENESS,
+        (
+            "the sink the swap must not release out from under a worker that is still draining "
+            "into it. It is the same binding as the branch above, read for a different purpose."
+        ),
+    ),
+    ("_swap_sink", "worker is None", 0): (
+        LIVENESS,
+        "arming the new sink is the no-worker branch's job; on the other branch an adoption does it.",
+    ),
+    ("_swap_sink", "stale is new_sink or stale is old or _state.held(stale)", 0): (
+        MOMENT,
+        (
+            "the swap must not release a sink something may still be inside. Under one record a "
+            "sink swapped out **without a confirmed fence** is still owed and still among the "
+            "sinks the drain thread may be inside, so without the `held` term a later "
+            "`configure()` finds it neither the old nor the new one and closes it under a live "
+            "writer — SPEC-033 FR-002's measured defect at a new site, which two records hid "
+            "because the stranded sink lived on the worker and this loop only saw the orphan "
+            "one. Reproduced at `A.closes == 2`."
+        ),
+    ),
+    ("_swap_sink", "worker.retarget(new_sink, deadline)", 0): (
+        LIVENESS,
+        (
+            "who **performs** the drain-reassign-fence. The verdict comes back as a **value** "
+            "rather than a predicate (SPEC-035 FR-003): the decline is taken between two lock "
+            "acquisitions and nothing outside the worker can observe it. A roster keyed on "
+            "worker-naming tokens sees this because the call names the worker."
+        ),
+    ),
+    ("_shutdown_worker", "waited or late_worker is not None", 0): (
+        EXISTENCE,
+        (
+            "whether the second pass has anything to do - a close somebody else held, or a "
+            "worker built during this call. Run unconditionally it defeats FR-002's two-caller "
+            "criterion: the first caller, just out of its own inline close, re-takes the "
+            "re-armed sink before the bystander returns from its wait."
+        ),
+    ),
+    (
+        "_inheritance_roots",
+        (
+            "(config._live_config().sink, None if worker is None else worker.sink, "
+            "*_state._owed.values())"
+        ),
+        0,
+    ): (
+        EXISTENCE,
+        (
+            "every sink this process could still be holding, so the child can refuse to close "
+            "what it inherited (SPEC-042 FR-001). Existence, not liveness: a retired worker's "
+            "sink is exactly the one a child must not close. The record term reaches superseded "
+            "sinks, which is why `_FORK_SKIP` narrows the *repair* walk and not this one."
         ),
     ),
 }
@@ -1021,8 +971,26 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 46, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 45, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 45 and the
+whole of the difference is accounted for below, measured by deriving the site list from both
+trees with this file's own `_sites` and diffing it per scope:
+
+    +2  _Lifecycle.in_flight        -2  _Lifecycle.worker_owns
+    +2  _Lifecycle.held             -2  _Lifecycle.worker_owns_now
+    +4  _close_owed                 -1  _close_orphan_sink
+    +1  _inline_close_choice        -3  _flush_live_sink
+    +1  _shutdown_worker            -1  _get_worker
+    +1  _swap_sink (the `held` guard)   -3  _swap_sink
+
+The four questions became three (FR-004), which is a wash: two predicates replace two. The
+**net** loss is three functions that stopped asking anything. `_flush_live_sink` no longer
+branches on which path armed a sink — it drains the one record (FR-005) — `_get_worker` no
+longer releases a sink its build did not adopt (FR-002), and `_swap_sink` is one function over
+one record where it was two branches keeping two in step (FR-003). Each is a guard that is gone
+because the thing it guarded is gone, which is the only reason a derived floor may fall.
 
 A refactor that relocates guards can shrink a derived roster silently, which is the one failure
 a roster cannot catch about itself. **Per module, and keyed by name, because a single total is
@@ -1031,7 +999,7 @@ of 36 and passed — the exact scenario the test below is named for, measured. A
 mapping fails instead, because the dropped module's entry has nothing to satisfy it.
 
 The counts are measured and may rise; either may fall only in a change that deliberately removes
-guards and says so here. `decorator`'s 2 are `_sweep_open_spans`'s and `_flush`'s
+guards and says so here, with the per-scope accounting above rather than a new number alone. `decorator`'s 2 are `_sweep_open_spans`'s and `_flush`'s
 `worker = _lifecycle._get_worker()` — small, and that is the point: they are the sites that make
 walking both modules necessary. It rose from 1 in SPEC-050 FR-003, which bound `_flush`'s call to
 a name so the span's buffer survives a worker that cannot be built; a floor left at 1 would have
@@ -1143,30 +1111,41 @@ def test_every_worker_predicate_is_classified() -> None:
 def test_every_row_states_a_category_and_a_reason() -> None:
     """AC-2. A category with no reason is a row that will be copied rather than thought about.
 
-    The distinctness check is not pedantry. The valid set below is built from the same four
+    The distinctness check is not pedantry. The valid set below is built from the same three
     constants the rows are written with, so a constant edited to another's text validates
-    itself: setting `OWNERSHIP` to `EXISTENCE`'s string left the whole file green with all six
-    ownership rows silently reading as existence.
+    itself: setting `MOMENT` to `EXISTENCE`'s string left the whole file green with all the
+    moment rows silently reading as existence.
+
+    Three since SPEC-054 FR-004, where it was four. With one owed-close record, "who owns this
+    sink's close" has one answer and is no longer a question a call site can get wrong, so
+    `OWNERSHIP` and `OWNERSHIP_AND_MOMENT` are gone and what remains of the conjunction is the
+    moment on its own — carrying **two predicates**, because an abandoned drain answers them
+    oppositely and that has to be said at the category rather than rediscovered at a site.
     """
-    categories = {EXISTENCE, LIVENESS, OWNERSHIP, OWNERSHIP_AND_MOMENT}
-    assert len(categories) == 4, "two categories carry the same text, so the rows using them agree"
+    categories = {EXISTENCE, LIVENESS, MOMENT}
+    assert len(categories) == 3, "two categories carry the same text, so the rows using them agree"
 
     for site, (category, reason) in ROSTER.items():
         assert category in categories, f"{site} has an unknown category"
         assert len(reason) > 40, f"{site}'s reason is too short to be one"
 
 
-def test_the_two_identical_swap_guards_keep_their_own_reasons() -> None:
+def test_the_two_identical_build_guards_keep_their_own_reasons() -> None:
     """A reason swap between two rows sharing one expression is otherwise undetectable.
 
-    Prose cannot be checked in general, but these two name the branch they describe, so the
-    pairing is assertable — and this is the pair the occurrence index exists for, where getting
-    it wrong is exactly round 3's defect re-introduced by hand.
+    Prose cannot be checked in general, but these two name the half of the double-checked build
+    they describe, so the pairing is assertable — and this is the pair the occurrence index
+    exists for, where getting it wrong is exactly round 3's defect re-introduced by hand.
+
+    It was `_swap_sink`'s two `worker is not None` guards until SPEC-054 FR-003 made that one
+    function with one branch. `_get_worker`'s double-checked build is the pair that remains, and
+    it is the better subject: the two halves differ in whether the lock is held, which is what
+    made the original pair worth distinguishing.
     """
-    in_lock = ROSTER[("_swap_sink", "worker is not None", 0)][1]
-    out_of_lock = ROSTER[("_swap_sink", "worker is not None", 1)][1]
-    assert "the in-lock branch" in in_lock and "out-of-lock" not in in_lock
-    assert "the out-of-lock branch" in out_of_lock
+    unlocked = ROSTER[("_get_worker", "worker is None", 0)][1]
+    locked = ROSTER[("_get_worker", "worker is None", 1)][1]
+    assert "unlocked" in unlocked and "locked half" not in unlocked
+    assert "locked half" in locked
 
 
 def test_the_roster_finds_the_bare_form_that_shipped_unseen() -> None:
@@ -1183,9 +1162,24 @@ def test_the_roster_finds_the_bare_form_that_shipped_unseen() -> None:
 
 
 def test_the_roster_finds_a_verdict_carried_by_a_return_value() -> None:
-    """AC-1. SPEC-035 FR-003 answers an ownership question with a bool, not a predicate — the
-    form a roster built only from worker-name comparisons would miss."""
-    assert ("_swap_sink", "not worker_holds_sink", 0) in _numbered()
+    """AC-1. SPEC-035 FR-003 answers with a value, not a predicate — the form a roster built
+    only from worker-name comparisons would miss.
+
+    The subject moved with SPEC-054 FR-003: the verdict used to be a bool bound to
+    `worker_holds_sink`, caught because the **name** carried a sentinel, and it is now a
+    `SwapOutcome` bound to `outcome`, caught because the **value** does. The value-side match is
+    the stronger of the two, since it does not depend on what the author called the variable.
+
+    The negative below is limitation 3 of `_sites`, pinned rather than left to be discovered: the
+    *use* of a filed binding is not followed, so `outcome.verdict == "fenced"` carries no
+    sentinel and is not a row. Filing the binding is what makes the category reviewable; it does
+    not make every later reference so.
+    """
+    found = _numbered()
+    assert ("_swap_sink", "worker.retarget(new_sink, deadline)", 0) in found
+    assert not any(
+        "outcome.verdict" in expression for _scope, expression, _n in found
+    ), "limitation 3: the use of a filed binding is not followed, and this states so"
 
 
 def _walk_source(source: str) -> set[str]:
@@ -1279,7 +1273,7 @@ def test_the_walker_ignores_uses_that_are_not_questions() -> None:
         """
         def f():
             _worker = Worker(_ensure_sink())
-            worker.shutdown(timeout)
+            worker.stop(timeout)
             worker.flush(timeout)
             _worker.sink = new_sink
             return worker
@@ -1652,8 +1646,7 @@ def test_the_lint_covers_the_categories_and_not_the_whole_module() -> None:
         "ROSTER",
         "EXISTENCE",
         "LIVENESS",
-        "OWNERSHIP",
-        "OWNERSHIP_AND_MOMENT",
+        "MOMENT",
     }
 
     unreferenced = 'UNUSED = "x"\nUSED = "y"\nROSTER: dict = {("f", "e", 0): (USED, "a")}\n'

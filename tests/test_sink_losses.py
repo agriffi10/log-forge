@@ -128,7 +128,7 @@ def test_health_reports_the_configured_sinks_losses() -> None:
     try:
         assert worker.health().sink == SinkLosses(dropped=4, failed=5)
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_health_sink_is_none_when_the_sink_reports_nothing() -> None:
@@ -136,7 +136,7 @@ def test_health_sink_is_none_when_the_sink_reports_nothing() -> None:
     try:
         assert worker.health().sink is None
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_health_never_raises_on_a_broken_accessor() -> None:
@@ -144,7 +144,7 @@ def test_health_never_raises_on_a_broken_accessor() -> None:
     try:
         health = worker.health()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert health.sink is None
     assert health.failed_batches == 0, "the rest of the snapshot is intact"
 
@@ -157,7 +157,7 @@ def test_health_sink_tracks_the_counters_live() -> None:
         sink._losses = SinkLosses(dropped=7, failed=0)
         assert worker.health().sink == SinkLosses(dropped=7, failed=0)
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_no_worker_reports_no_sink_losses() -> None:
@@ -187,7 +187,7 @@ def test_a_total_failure_reaches_failed_batches_and_flush() -> None:
         assert worker.health().failed_batches == 1
         assert worker.health().stopped_reason is None, "the drain thread survived"
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_the_worker_keeps_draining_after_a_total_failure() -> None:
@@ -210,7 +210,7 @@ def test_the_worker_keeps_draining_after_a_total_failure() -> None:
         worker.submit(_span("b"))
         assert worker.flush(timeout=2.0)
     finally:
-        worker.shutdown()
+        worker.stop()
     assert [e["event"] for batch in sink.batches for e in batch] == ["b"]
 
 
@@ -502,7 +502,7 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
         assert not worker.flush(timeout=2.0)
         health = worker.health()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert health.failed_batches == 1
     assert health.sink == SinkLosses(dropped=0, failed=1)
 
@@ -665,7 +665,7 @@ def test_losses_is_safe_to_call_concurrently_with_emit() -> None:
         assert worker.health().sink == SinkLosses(dropped=0, failed=0)
         release.set()
     finally:
-        worker.shutdown()
+        worker.stop()
     assert worker.health().sink == SinkLosses(dropped=0, failed=1)
 
 
@@ -916,7 +916,7 @@ def _worker_sees(sink) -> tuple[int, bool]:
         verdict = worker.flush(timeout=2.0)
         return worker.health().failed_batches, verdict
     finally:
-        worker.shutdown()
+        worker.stop()
 
 
 def test_every_phase_3_sink_reaches_failed_batches_and_flush(monkeypatch) -> None:

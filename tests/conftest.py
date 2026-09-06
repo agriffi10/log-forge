@@ -60,6 +60,72 @@ def run_concurrently(work, threads: int, *, per_thread: int = 1) -> list[BaseExc
     return errors
 
 
+def install_worker(worker) -> None:
+    """Installs ``worker`` as the process worker **and arms its sink**, as ``_get_worker`` does.
+
+    A test that assigns ``_lifecycle._state._worker`` directly — which is how it gets a worker
+    with batching settings the library would never choose — used to be a complete install. Since
+    SPEC-054 FR-002 a worker's build also **arms** its sink in the owed-close record, in the same
+    critical section, and that is what `shutdown()` and `flush()` both read. Assigning the slot
+    alone leaves a worker whose sink nothing owes a close and nothing will flush.
+
+    The two lines below are `_get_worker`'s, which is a fixture reproducing production setup
+    rather than a production expectation: what a test then asserts still comes from the library.
+    A test that wants the *unarmed* state asserts on the record itself and does not use this.
+
+    Args:
+      worker: The worker to install.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _lifecycle
+
+    with _lifecycle._state._lock:
+        _lifecycle._state._worker = worker
+        _lifecycle._state._owed[id(worker.sink)] = worker.sink
+
+
+def retire_process(worker=None, timeout: float | None = 30.0) -> None:
+    """Runs the library's real shutdown, optionally installing ``worker`` as the process worker.
+
+    SPEC-054 FR-001/FR-003 moved retirement and every close off ``Worker``: its ``stop()`` ends
+    the drain thread and nothing more, while the retirement count and the owed-close record are
+    the lifecycle owner's. So a test about anything a *process* shutdown does — a sink being
+    closed, ``submitted_after_shutdown`` moving, the closer grace — drives
+    ``_lifecycle._shutdown_worker``, which is the function ``log_foundry.shutdown()`` and the
+    ``atexit`` handler both bind.
+
+    Installing the worker through :func:`install_worker` is what makes a hand-built one visible
+    to that call, sink included — a shutdown closes what is **owed**, and a worker assigned into
+    the slot without arming owes nothing. It installs **once**: a worker already in the slot is
+    left alone, because arming is what a worker's *build* does and re-arming on every call would
+    hand a second close to a sink the previous call already closed, making every idempotence
+    assertion here read 2 where it should read 1. A helper that moved the count and closed the sinks
+    itself would reproduce the production expression and pass against a broken one, which is the
+    whole hazard; this runs the shipped path instead.
+
+    Args:
+      worker: A worker to install as the process worker first, or ``None`` to shut down whatever
+        the process already has.
+      timeout: Seconds for the drain and the closer grace, or ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _lifecycle
+
+    if worker is not None and _lifecycle._state.worker_exists() is not worker:
+        install_worker(worker)
+    _lifecycle._shutdown_worker(timeout)
+
+
 @pytest.fixture(autouse=True)
 def _reset_config():
     """Restore a fresh global ``Config`` before each test.
@@ -103,7 +169,7 @@ def _reset_worker() -> None:
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
     ``retirements`` is what ``health()`` reads for ``retired``, so a test
     that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
-    ``_orphan_owed`` would make "nothing was ever logged, so nothing is closed"
+    ``_owed`` would make "nothing was ever logged, so nothing is closed"
     untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
     handler really is registered for the life of the interpreter, and re-arming the flag would
     have the next worker register a second one.
@@ -131,12 +197,21 @@ def _reset_worker() -> None:
     failure this fixture's first paragraph describes, on a field whose whole purpose is to be
     believed.
 
-    SPEC-050 FR-002 adds the orphan close's in-flight count and its idle gate, and this pair leaks
-    the most quietly of any here: three tests leave a daemon thread mid-``close()``, so the count
-    stays raised and the gate stays clear, and every later caller that finds nothing owed pays the
-    whole closer grace. Nothing errors — the suite was green only because those three happen to sit
-    *after* the test that measures the no-wait path. Reversing that pair fails it deterministically
-    at 4.01 s for three shutdowns that should cost nothing.
+    SPEC-050 FR-002 added the orphan close's in-flight count and its idle gate, and that pair
+    leaked the most quietly of any here: three tests leave a daemon thread mid-``close()``, so the
+    count stayed raised and the gate stayed clear, and every later caller that found nothing owed
+    paid the whole closer grace. Nothing errored — the suite was green only because those three
+    happen to sit *after* the test that measures the no-wait path. SPEC-054 FR-003 replaced both
+    with a per-sink registration in ``_closing_now``, which was already cleared here, so the pair
+    is gone rather than merely reset: a caller now waits only on closes actually in flight against
+    a sink, and a leaked entry shows up as that sink never being closed rather than as a
+    process-wide charge.
+
+    SPEC-054 also merged four records into ``_state._owed``, so one ``clear()`` replaces the four
+    lines that reset them, and ``retirements`` replaces the retirement flag: it is a **count**, so
+    resetting it to zero is what puts a worker built by the next test back in step with it — one
+    left raised makes every later worker read as retired at its own build, which is a suite that
+    delivers nothing.
     """
     try:
         from log_foundry import _lifecycle, decorator
@@ -144,10 +219,9 @@ def _reset_worker() -> None:
         return
     worker = _lifecycle._state.worker_exists()
     if worker is not None:
-        worker.shutdown()
+        worker.stop()
         _lifecycle._state._worker = None
-    _lifecycle._state._orphan_owed.clear()
-    _lifecycle._state._orphan_closed_sink = None
+    _lifecycle._state._owed.clear()
     _lifecycle._state.retirements = 0
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
@@ -158,9 +232,6 @@ def _reset_worker() -> None:
         _lifecycle._closers.clear()
     with _lifecycle._closing_now_lock:
         _lifecycle._closing_now.clear()
-    with _lifecycle._state._lock:
-        _lifecycle._orphan_closing = 0
-        _lifecycle._orphan_idle.set()
 
 
 class FakeSink:

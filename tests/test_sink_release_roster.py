@@ -53,6 +53,7 @@ import time
 from typing import TYPE_CHECKING
 
 import log_foundry
+from conftest import install_worker, retire_process
 from log_foundry import _lifecycle
 from log_foundry.worker import Worker
 from test_sink_concurrency import _base_names, _sink_classes_with_an_emit
@@ -64,53 +65,55 @@ _SRC = pathlib.Path(log_foundry.__file__).parent
 
 _EXPECTED_CLOSERS = {
     ("_lifecycle", "_close_guarded"),
-    ("_lifecycle", "_close_owed"),
-    ("worker", "Worker._close_sink"),
+    ("_lifecycle", "_close_taken"),
     ("sinks/multi", "MultiSink.close"),
     ("sinks/filtering", "FilteringSink.close"),
     ("sinks/transform", "TransformSink.close"),
     ("sinks/logstash", "LogstashSink.close"),
     ("sinks/sentry", "SentrySink.close"),
 }
-"""The eight sites that close a sink, named so a ninth is a decision somebody takes.
+"""The seven sites that close a sink, named so an eighth is a decision somebody takes.
 
-The first is the *thread body* of a detached close rather than the two callers that start one:
-`_lifecycle._swap_sink` and `Worker._close_swapped_out` request a close and hand the thread on to
-a bounded join, and `_close_guarded` is where it is actually performed. Those two are
+The first is the *thread body* of a detached close rather than the caller that starts one:
+`_lifecycle._swap_sink` and `_lifecycle._close_owed` request a close and hand the thread on to a
+bounded join, and `_close_guarded` is where it is actually performed. Those are
 `_EXPECTED_REQUESTERS` -- listed separately because a requester is not a place a guard has to
-sit, and folding them in here would make the roster read as ten closers when SPEC-042 counted
-eight.
+sit, and folding them in here would make the roster read as more closers than there are.
+
+Eight before SPEC-054 FR-003, which merged four lifecycle closers into one. `Worker._close_sink`
+and `Worker._close_if_owed` are gone with the closes that left `Worker` entirely, and
+`Worker._close_swapped_out` with them: the owner releases a swapped-out sink now, from the one
+record.
 """
 
 _EXPECTED_REQUESTERS = {
     ("_lifecycle", "_swap_sink"),
-    ("worker", "Worker._close_swapped_out"),
 }
-"""The two sites that ask for a detached close and join the thread it returns.
+"""The one site that asks for a detached close and joins the thread it returns.
 
-They are held to the same roster because the helper's return value is theirs: SPEC-030 FR-003
-gave each a bounded wait, and a helper that stopped returning the thread would take it away
-silently (FR-002 AC-8).
+It is held to the same roster because the helper's return value is its own: SPEC-030 FR-003 gave
+it a bounded wait, and a helper that stopped returning the thread would take it away silently
+(FR-002 AC-8). `Worker._close_swapped_out` was the second until SPEC-054 FR-003 moved every
+close to the owner.
 """
 
 _EXPECTED_UNJOINED_REQUESTERS = {
-    ("_lifecycle", "_get_worker"),
-    ("worker", "Worker._close_if_owed"),
+    ("_lifecycle", "_close_owed"),
 }
-"""The two sites that ask for a detached close and deliberately do **not** join it.
+"""The one site that asks for a detached close and deliberately does **not** join it.
 
-A written decision rather than a table edit (SPEC-044 FR-002). `_get_worker` closes a sink the
-worker it just built did not adopt, and it is the only requester with no deadline of its own to
-spend: `_swap_sink` and `Worker._close_swapped_out` are both given one by their caller, while
-this runs inside the double-checked build on the first traced call in the process. Joining there
-would put a whole sink `close()` -- with SPEC-028's emit lock and SPEC-027's backoff behind it --
-on that one call, for a close nobody is waiting on.
+A written decision rather than a table edit (SPEC-044 FR-002). `_close_owed` releases, detached,
+a sink the worker swapped out **without a confirmed fence** whose drain thread has since ended
+(SPEC-050 FR-004). It declines the join because that sink already had the swap's whole budget and
+is far more likely stuck than slow, so joining it would let one stuck swapped-out sink hold the
+exit; and because this runs immediately before the live sink's own inline close, where joining
+would serialise the two and spend the budget `join_closers` is about to spend anyway. The grace
+that follows is the join, one call later, at the end of `_shutdown_worker`.
 
-`Worker._close_if_owed` closes the sinks an unconfirmed `configure(sink=...)` stranded (SPEC-050
-FR-004), once the drain thread that might have been inside their `emit` has ended. It declines
-the join for a different reason: it runs *inside* `shutdown`, immediately before the live sink's
-own inline close, and joining here would serialise the two and spend the budget `_join_closers`
-is about to spend anyway. The grace that follows is the join, one method later.
+Two sites stood here before SPEC-054 FR-002/FR-003 and both are gone with what they did.
+`_get_worker` released a sink the worker it built did not adopt; under one owed-close record that
+sink simply stays owed, so the build releases nothing. `Worker._close_if_owed` is the closer this
+one replaced.
 
 What replaces the join is what SPEC-030 FR-003 built for exactly this: the thread is registered
 in `_closers`, `join_closers` grants it the capped grace at shutdown and at exit, and
@@ -608,33 +611,24 @@ _LATCH_DISPOSITIONS = {
         "records nothing — it is the thread body of a close some requester already latched, "
         "and latching here would overwrite that requester's more recent record"
     ),
-    ("_lifecycle", "_close_owed"): (
-        "records nothing, and does not need to: `_close_orphan_sink` empties the owed record "
-        "under _state._lock before any close starts, so two callers cannot perform the same "
-        "close. The latch itself is a single slot holding only the last of them, unchanged by "
-        "SPEC-046 -- which moved the close out of that function into this helper"
-    ),
-    ("_lifecycle", "_get_worker"): (
-        "latches: the transition owns this close because the worker it just built did not adopt "
-        "the sink, so nothing else would record it (SPEC-044 FR-002)"
+    ("_lifecycle", "_close_taken"): (
+        "records nothing, and does not need to: `_close_owed` takes the sink out of the owed "
+        "record and registers its close in **one** critical section under _state._lock before "
+        "any close starts, so two callers cannot perform the same close and there is no instant "
+        "at which the sink is neither owed nor in flight (SPEC-054 FR-002, FR-003). The "
+        "closed-sink latch this column was named for is retired: an emit that lands re-arms, "
+        "always, and what it protected against is answered at close time by `held`"
     ),
     ("_lifecycle", "_swap_sink"): (
-        "latches both sinks it hands over — the worker's, which Worker.swap_sink closes, and a "
-        "third sink the record named that this branch releases itself (SPEC-044 FR-004)"
+        "discharges each sink it releases from the owed record and registers its close in the "
+        "same critical section, which is what the latch used to approximate — the sink it hands "
+        "to the worker, and every superseded sink the record named that nothing may still be "
+        "inside (SPEC-054 FR-003)"
     ),
-    ("worker", "Worker._close_sink"): (
-        "records nothing, and does not need to: _orphan_sink still names this sink where "
-        "anything named it and worker_owns() answers True, so _close_orphan_sink declines"
-    ),
-    ("worker", "Worker._close_if_owed"): (
-        "records nothing, and does not need to: it takes each stranded sink out of "
-        "Worker._unclosed_swaps under Worker._lock before releasing it, so the list itself is "
-        "the once-only record, and _swap_sink already latched the same sink when it handed it "
-        "over (SPEC-050 FR-004)"
-    ),
-    ("worker", "Worker._close_swapped_out"): (
-        "records nothing — its caller is reached through _lifecycle._swap_sink, which latches "
-        "the same sink before the swap begins"
+    ("_lifecycle", "_close_owed"): (
+        "discharges and registers in one critical section, for every sink it takes: that pair "
+        "**is** the record a later re-arm consults, since a sink not in `_owed` and not in "
+        "`_closing_now` is one nothing owes anything to"
     ),
     ("sinks/multi", "MultiSink.close"): "not a lifecycle close — a wrapper forwarding to a child",
     ("sinks/filtering", "FilteringSink.close"): "not a lifecycle close — a wrapper forwarding",
@@ -758,12 +752,13 @@ def test_a_detached_release_hands_back_the_thread_running_the_close() -> None:
     assert sink.closed == 1, "and joining the returned thread is what waits for it"
 
 
-def test_the_worker_waits_for_the_swapped_out_close_it_started() -> None:
-    """`Worker._close_swapped_out`'s bounded wait, which no test covered (FR-002 AC-8).
+def test_the_swap_waits_for_the_swapped_out_close_it_started() -> None:
+    """The joining requester's bounded wait (FR-002 AC-8).
 
-    The AST lint above cannot see a helper that stops returning the thread, and when that
-    mutation was run the only test in the whole suite that died covered
-    `_lifecycle._swap_sink` -- this caller's wait had nothing asserting it at all.
+    The AST lint above cannot see a helper that stops returning the thread, so the wait needs a
+    behavioural assertion of its own. It was `Worker._close_swapped_out` until SPEC-054 FR-003
+    moved every close to the owner; `_lifecycle._swap_sink` is the one joining requester now, and
+    it is the caller this was always really about — the worker's method was reached through it.
 
     The close takes measurable time on purpose: an instant one completes before the assertion
     whether or not anything joined it, so the elapsed floor is what distinguishes waiting from
@@ -773,28 +768,34 @@ def test_the_worker_waits_for_the_swapped_out_close_it_started() -> None:
     old = _CountingSink(close_seconds=close_seconds)
     new = _CountingSink()
     worker = Worker(old, batch_size=1000, flush_interval=100.0)
+    install_worker(worker)
     try:
         start = time.monotonic()
-        assert worker.swap_sink(new, timeout=5.0) is True
+        _lifecycle._swap_sink(new, timeout=5.0)
         elapsed = time.monotonic() - start
-
+        assert worker.sink is new, "the premise: the swap was adopted"
         assert old.closed == 1, "a close that fits the budget has completed when the swap returns"
-        assert elapsed >= close_seconds, "so the worker waited rather than firing and forgetting"
+        assert elapsed >= close_seconds, "so the swap waited rather than firing and forgetting"
     finally:
-        worker.shutdown(2.0)
+        retire_process(worker, 2.0)
 
 
 def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
     """The discriminator earns its complexity: three of the eight resolve only indirectly.
 
     A resolver that answered only where the call site is annotated would be a simpler rule and a
-    vacuous one -- it would miss `MultiSink`'s iterated child, `decorator`'s aliased global and
-    `Worker`'s `__init__`-assigned attribute, which is three of the eight closers. Each is
-    asserted to resolve, and asserted to resolve to `Sink` rather than to merely something.
+    vacuous one -- it would miss `MultiSink`'s iterated child, a lifecycle closer's plain
+    parameter and a wrapper's `__init__`-assigned attribute. Each is asserted to resolve, and
+    asserted to resolve to `Sink` rather than to merely something.
+
+    The `ast.Attribute` case was `Worker._close_sink`'s `self.sink` until SPEC-054 FR-003 took
+    every close off `Worker`; `FilteringSink.close` carries the same shape and is named here
+    instead, so the assertion still covers both receiver kinds rather than quietly narrowing to
+    one.
     """
     indirect = {
-        ("_lifecycle", "_close_owed", ast.Name),
-        ("worker", "Worker._close_sink", ast.Attribute),
+        ("_lifecycle", "_close_taken", ast.Name),
+        ("sinks/filtering", "FilteringSink.close", ast.Attribute),
         ("sinks/multi", "MultiSink.close", ast.Name),
     }
     resolved: set[tuple[str, str, type]] = set()

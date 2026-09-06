@@ -588,7 +588,7 @@ def test_the_record_holds_a_strong_reference() -> None:
     def in_child() -> str:
         config._config = config.Config()
         _lifecycle._state._worker = None
-        _lifecycle._state._orphan_owed.clear()
+        _lifecycle._state._owed.clear()
         _lifecycle._state._orphan_closed_sink = None
         gc.collect()
         with _lifecycle._owned_lock:
@@ -777,7 +777,7 @@ def test_the_refusal_holds_at_the_orphan_exit_close() -> None:
 
     def in_child() -> str:
         log_foundry.info("orphan")
-        _lifecycle._close_orphan_sink()
+        _lifecycle._close_owed()
         return f"{sink.closed},{len(sink.events)}"
 
     child = run_in_child(in_child)

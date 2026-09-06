@@ -9,6 +9,7 @@ that shape: ``flush() -> True``, on the wire 0, in the client buffer 3, ``health
 from __future__ import annotations
 
 import log_foundry
+from conftest import install_worker
 from log_foundry import _lifecycle, decorator
 from log_foundry.sinks.base import Sink, flush_sink
 from log_foundry.worker import Worker
@@ -60,7 +61,7 @@ def test_flush_reaches_the_client_buffer_after_draining_the_queue() -> None:
     """
     sink = Buffering()
     log_foundry.configure(service="t", sink=sink)
-    _lifecycle._state._worker = Worker(sink, batch_size=1000, flush_interval=100.0)
+    install_worker(Worker(sink, batch_size=1000, flush_interval=100.0))
 
     @log_foundry.trace
     def work() -> None:

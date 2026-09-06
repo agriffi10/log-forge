@@ -84,7 +84,7 @@ def test_the_recorded_sink_is_the_one_emitted_to_not_the_one_configured() -> Non
 
     config._rebind(sink=later)  # the config now names a sink nothing was written to
 
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
 
     assert written.closed == 1, "the sink the event reached is the one closed"
     assert later.closed == 0, "not whatever the config happens to name now"
@@ -95,10 +95,10 @@ def test_a_configured_but_never_written_sink_is_not_closed() -> None:
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
 
     assert sink.closed == 0
-    assert not _lifecycle._state._orphan_owed
+    assert not _lifecycle._state._owed
 
 
 def test_a_sink_whose_emit_raised_is_still_closed() -> None:
@@ -108,25 +108,42 @@ def test_a_sink_whose_emit_raised_is_still_closed() -> None:
 
     log_foundry.info("this will raise inside the sink")  # absorbed by SPEC-025
 
-    assert _lifecycle._state._orphan_owed.get(id(sink)) is sink, (
+    assert _lifecycle._state._owed.get(id(sink)) is sink, (
         "armed before the emit, not after it"
     )
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
     assert sink.closed == 1
 
 
-def test_a_latched_sink_is_not_rearmed_and_so_is_not_closed_twice() -> None:
-    """AC-5. A post-`shutdown()` emit is refused at the closed sink; it must not re-arm it."""
+def test_a_sink_written_to_after_its_close_is_re_armed_and_closed_again() -> None:
+    """SPEC-054 FR-002 retires the closed-sink latch, and this is the observable it names.
+
+    ~~AC-5. A post-`shutdown()` emit is refused at the closed sink; it must not re-arm it.~~ —
+    struck (SPEC-021). The latch refused the re-arm, so this sink's **post-close batch was never
+    flushed**: an explicit `shutdown()`, an `info()` outside a span to a sink that still accepts
+    (SPEC-030 keeps that accepted), and then nothing at exit.
+
+    A sink written to after its close is owed another (SPEC-045 FR-002), and that is now the only
+    rule about re-arming. So the second close happens and it carries the event the first could
+    not have — which is what `delivered` reads, and what makes this one close per write-epoch
+    rather than a double.
+    """
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("before")
     log_foundry.shutdown()
-    assert sink.closed == 1
+    assert sink.closed == 1 and len(sink.delivered) == 1, (
+        f"the premise: one close, carrying the one event before it — {sink.delivered}"
+    )
 
     log_foundry.info("after shutdown, against the closed sink")
-    _lifecycle._close_orphan_sink()
+    _lifecycle._close_owed()
 
-    assert sink.closed == 1, "a second close on a partially released sink is worse than none"
+    assert sink.closed == 2, "the landed emit re-armed it, so it is owed another close"
+    assert len(sink.delivered) == 2, (
+        f"and that close carried the post-close batch, which the latch used to strand: "
+        f"{sink.delivered}"
+    )
 
 
 # -- FR-002: a late configure(sink=...) with no worker closes the old sink -------------------
@@ -193,7 +210,7 @@ def test_reconfiguring_the_same_sink_is_a_no_op() -> None:
     log_foundry.configure(sink=sink)
 
     assert sink.closed == 0, "no close"
-    assert _lifecycle._state._orphan_owed.get(id(sink)) is sink, (
+    assert _lifecycle._state._owed.get(id(sink)) is sink, (
         "and still armed for one at exit"
     )
 
@@ -242,7 +259,7 @@ def test_a_close_that_raises_is_absorbed_and_the_swap_stands(capsys) -> None:
 
     assert _eventually(lambda: old.closed == 1), "the close was attempted"
     assert config.get_config().sink is new, "and the swap still stands"
-    assert _lifecycle._state._orphan_owed == {id(new): new}
+    assert _lifecycle._state._owed == {id(new): new}
     assert "absorbed a failure while closing a swapped-out sink" in capsys.readouterr().err
 
 
@@ -568,7 +585,7 @@ def test_a_closer_that_cannot_start_leaves_the_sink_open_and_says_so(capsys, mon
     log_foundry.configure(sink=new)
 
     assert old.closed == 0, "left open rather than closed inline"
-    assert _lifecycle._state._orphan_owed == {id(new): new}, (
+    assert _lifecycle._state._owed == {id(new): new}, (
         "and the record still re-points (AC-8)"
     )
     err = capsys.readouterr().err
@@ -997,12 +1014,17 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
 
 
 def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
-    """The record survives a shutdown that declined to close, so the swap must decline too.
+    """A shutdown discharges what it closed, so a later swap finds nothing of its to close.
 
-    `_close_orphan_sink` leaves `_orphan_sink` set when a worker owned it, so after any shutdown
-    the record still names the worker's sink. Deciding the *close* by liveness rather than
-    ownership then closes it a second time — measured `A.closed == 2`, which this spec's own
-    docstrings call worse than an unclosed sink.
+    ~~The record survives a shutdown that declined to close, so the swap must decline too.~~ —
+    struck (SPEC-021). SPEC-054 FR-003 discharges a sink from the record in the same critical
+    section that decides its close, so after a `shutdown()` the record is empty rather than still
+    naming the worker's sink — and the swap has nothing to get wrong. The observable the old
+    shape needed a predicate for holds by construction: `A.closed == 2` is unreachable here.
+
+    The other half is FR-002's arming rule: `configure(b)` with nothing owed arms nothing,
+    because a configured sink nothing wrote to is never owed a close. `b` is armed by the first
+    thing that delivers to it.
     """
     a, b = CountingSink("a"), CountingSink("b")
     log_foundry.configure(service="t", sink=a)
@@ -1015,16 +1037,17 @@ def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
     log_foundry.info("orphan, arming the record at a")
     log_foundry.shutdown()
     assert a.closed == 1
-    assert _lifecycle._state._orphan_owed.get(id(a)) is a, (
-        "the record still names the worker's sink"
-    )
+    assert not _lifecycle._state._owed, "the shutdown discharged what it closed"
 
     log_foundry.configure(sink=b)
 
     assert a.closed == 1, "the worker already closed it; the swap must not close it again"
-    assert _lifecycle._state._orphan_owed == {id(b): b}, (
-        "but the record is still re-pointed"
+    assert not _lifecycle._state._owed, (
+        "and nothing is armed: a configured sink nothing wrote to is never owed a close"
     )
+
+    log_foundry.info("the first thing that delivers to b")
+    assert _lifecycle._state._owed.get(id(b)) is b, "which is what arms it"
 
 
 def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
@@ -1070,13 +1093,19 @@ def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
         wedged.release.set()
 
 
-def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypatch) -> None:
-    """What `_orphan_closed_sink = old` defends, which needs an injected preemption point.
+def test_an_emit_preempted_across_a_swap_re_arms_the_closed_sink_and_owes_it_a_close(
+    monkeypatch,
+) -> None:
+    """SPEC-054 FR-002 retires the latch this defended, and the second close becomes correct.
 
-    An orphan emit resolves its sink and *then* records it. One that resolved the old sink and
-    resumes after the swap has closed it must find it latched and decline, or it re-arms a closed
-    sink and the exit close makes that two. The window is a few instructions wide, so it is
-    injected — the technique SPEC-028 uses for races that need one.
+    ~~One that resolved the old sink and resumes after the swap has closed it must find it
+    latched and decline, or it re-arms a closed sink and the exit close makes that two.~~ —
+    struck (SPEC-021). An orphan emit resolves its sink and *then* records it, so one that
+    resolved the old sink and resumes after the swap closed it **lands on that sink**. The event
+    is delivered, so the sink is owed a close for it (SPEC-045 FR-002), and the exit performs it.
+
+    The window is a few instructions wide, so it is injected — the technique SPEC-028 uses for
+    races that need one.
     """
     from log_foundry import api
     old, new = CountingSink("old"), CountingSink("new")
@@ -1102,9 +1131,145 @@ def test_an_emit_preempted_across_a_swap_does_not_rearm_the_closed_sink(monkeypa
         resume.set()
         emitter.join(15.0)
 
-    assert _lifecycle._state._orphan_owed == {id(new): new}, (
-        "the stale emit must not re-arm the closed sink"
+    assert _lifecycle._state._owed.get(id(old)) is old, (
+        "the stale emit landed on the old sink, so it is owed a close for it"
     )
     log_foundry.shutdown()
-    assert old.closed == 1, "or the exit close makes it two"
+    assert old.closed == 2, "and the exit performs it"
+    assert len(old.delivered) == 2, (
+        f"one close per write-epoch: the second carried the stale emit — {old.delivered}"
+    )
     assert new.closed == 1
+
+
+# --------------------------------------------------------------------------- SPEC-054 FR-002
+
+
+class _ReleasableCloseSink(CountingSink):
+    """Blocks inside `close()` until released, and counts concurrent entries.
+
+    The concurrency counter is the assertion FR-002 AC-5 asks for: two callers racing a re-armed
+    sink must not both be inside `close()`, which a count of closes alone cannot distinguish from
+    two closes that happened to be sequential.
+    """
+
+    def __init__(self, name: str = "releasable") -> None:
+        super().__init__(name)
+        self.in_close = threading.Event()
+        self.may_finish = threading.Event()
+        self.inside = 0
+        self.most_inside = 0
+        self._entry_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Parks until released, recording how many callers were inside at once."""
+        with self._entry_lock:
+            self.inside += 1
+            self.most_inside = max(self.most_inside, self.inside)
+        self.in_close.set()
+        self.may_finish.wait(30.0)
+        with self._entry_lock:
+            self.inside -= 1
+        super().close()
+
+
+def _race_two_shutdowns_over_a_re_armed_sink(
+    sink: _ReleasableCloseSink,
+) -> tuple[threading.Thread, threading.Thread]:
+    """Starts a shutdown that parks inside the close, re-arms the sink, and races a second one.
+
+    The shape FR-002 AC-5 names: the first caller is inside `close()`, an `info()` outside a span
+    lands on the sink and re-arms it, and a second `shutdown()` finds it held by the first
+    caller's registration.
+
+    Args:
+      sink: The sink both callers race over.
+
+    Returns:
+      The first caller's thread and the second's, both started.
+
+    Raises:
+      None.
+    """
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("arms the record")
+
+    first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0), daemon=True)
+    first.start()
+    assert sink.in_close.wait(5.0), "the premise: the first caller is inside close()"
+
+    log_foundry.info("lands on the sink the first caller is closing")
+    assert _lifecycle._state._owed.get(id(sink)) is sink, "the premise: the emit re-armed it"
+
+    second = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0), daemon=True)
+    second.start()
+    return first, second
+
+
+def test_a_close_released_inside_the_grace_is_performed_by_the_second_caller() -> None:
+    """FR-002 AC-5, first branch. The bystander waits, then takes what its wait released.
+
+    Two `shutdown()` calls race while an `info()` outside a span lands on the sink the first is
+    closing. The second finds it `held` — a close is registered against it — so it takes nothing,
+    waits `closer_grace`, and its **second pass** closes the re-armed sink once the first caller
+    has let go. `close()` is never entered on two threads at once, which the sink counts.
+    """
+    sink = _ReleasableCloseSink()
+    first, second = _race_two_shutdowns_over_a_re_armed_sink(sink)
+
+    time.sleep(0.2)  # inside the grace, so the second caller is still waiting
+    sink.may_finish.set()
+    first.join(30.0)
+    second.join(30.0)
+
+    assert not first.is_alive() and not second.is_alive(), "both callers returned"
+    assert sink.most_inside == 1, (
+        f"close() was entered on {sink.most_inside} threads at once, which SPEC-045's rule "
+        "forbids however many closes are owed"
+    )
+    assert sink.closed == 2, (
+        f"the second caller performed the re-armed sink's next close after its wait — got "
+        f"{sink.closed}"
+    )
+    assert len(sink.delivered) == 2, (
+        f"and it carried the event that re-armed it, which is one close per write-epoch: "
+        f"{sink.delivered}"
+    )
+
+
+def test_a_close_held_past_the_grace_leaves_the_sink_for_a_later_shutdown() -> None:
+    """FR-002 AC-5, second branch. The bystander gives up, and the record keeps the sink.
+
+    Same race, with the first caller's close held past `closer_grace`. The second caller's wait
+    expires, its second pass finds the sink still held, and it returns leaving the sink **in the
+    record** — so a later `shutdown()` closes it rather than nobody doing so. That is the tail
+    SPEC-050 FR-002's bystander already accepts at `atexit`.
+
+    The grace is shortened rather than the close lengthened, so this costs a fraction of a second
+    instead of the full 2 s cap.
+    """
+    grace = 0.3
+    original = _lifecycle.DEFAULT_CLOSER_GRACE
+    _lifecycle.DEFAULT_CLOSER_GRACE = grace
+    try:
+        sink = _ReleasableCloseSink()
+        first, second = _race_two_shutdowns_over_a_re_armed_sink(sink)
+
+        second.join(10.0)
+        assert not second.is_alive(), (
+            "the second caller returned rather than waiting out the first caller's close"
+        )
+        assert sink.closed == 0, "the premise: the first caller's close has not finished"
+        assert _lifecycle._state._owed.get(id(sink)) is sink, (
+            "so the sink is still in the record, for a later shutdown to close"
+        )
+
+        sink.may_finish.set()
+        first.join(30.0)
+        assert sink.closed == 1, "the first caller's close completed"
+
+        log_foundry.shutdown(timeout=5.0)
+        assert sink.closed == 2, "and a later shutdown performs the close the record was holding"
+        assert sink.most_inside == 1, "never two callers inside close() at once"
+    finally:
+        _lifecycle.DEFAULT_CLOSER_GRACE = original
