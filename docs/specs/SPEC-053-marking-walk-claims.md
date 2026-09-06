@@ -1,7 +1,7 @@
 # Spec: The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them
 
 **ID:** SPEC-053
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-09-04
 **Depends On:** SPEC-042, SPEC-052
 
