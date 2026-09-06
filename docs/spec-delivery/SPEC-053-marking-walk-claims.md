@@ -24,8 +24,13 @@
   "no dependencies": check 11 needs `python3`. Both headers now say so and why.
 - `src/log_foundry/_lifecycle.py` — `_FOREIGN`'s docstring only. No logic changed; `setdefault` is
   correct and `_mark_inherited`'s own docstring is untouched, being what the others now defer to.
-- `CLAUDE.md`'s Key Decisions line for the gate area and its `docs/decisions.md` entry are
-  **extended, not appended to** — the area gains "a gate's scoping test binds to what it scopes".
+- `docs/decisions.md`'s gate entry is **extended, not appended to** — the area gains "a gate's
+  scoping test binds to what it scopes". **`CLAUDE.md` is not touched, and the digest line that
+  entry is owed is OWED, not written.** The always-loaded file sits at its fence, and paying for
+  one line means pruning another area's — which is the damage the budget's own comment says the
+  gate exists to prevent, not a licence to raise it. The entry is reachable from the register's
+  Contents under its existing heading, so the layering still holds; what is missing is the
+  one-line digest, and it is missing on purpose.
 
 ## What the build measured that the spec had wrong
 
@@ -144,7 +149,11 @@ survived along the way and all three were fixtures that could not fail — a sil
 a clause beside it, a wrapped case asserting only a FAIL line and never the collapsed sentence, and
 the "at all" guard, whose survival was the evidence that deleted it.
 
-`CLAUDE.md` closes at 35,970 of its 36,000-byte budget. That is 30 bytes, which is the state the
-budget's own comment calls the mistake — the next spec to settle a decision cannot close without
-pruning another area's fences. The wave the fence was sized for has landed, so the rule says
-re-derive rather than re-check; that is a cut, and it is not this spec's.
+**`CLAUDE.md` is unchanged by this spec, and that is a finding rather than a tidy outcome.** It
+sits at 35,804 of a 36,000-byte budget derived for a wave — SPEC-050 and SPEC-051 measured, two
+more estimated — that has since been exceeded by four further specs settling decisions. Two
+changes wanted room in it on the same day and together they did not fit, so the digest line above
+is owed and the release note beside it was cut to the fact and a pointer. The budget's rule for
+this is to **re-derive after the wave, not re-check** — which is a cut to the always-loaded file,
+an editorial act on the one file every session reads, and not something to fold quietly into a
+spec about prose gates. It is the next thing this repo owes itself.
