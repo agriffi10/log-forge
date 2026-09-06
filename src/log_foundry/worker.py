@@ -115,7 +115,7 @@ class Health:
         it never died — which is also what a live worker and a process that never logged
         report. Non-``None`` is categorically worse than the two counters above: they measure
         loss the worker absorbed and kept running through, this one means the worker is gone
-        (SPEC-019 FR-003). Also ``"ShutdownTimeout"`` when a bounded :meth:`Worker.shutdown`
+        (SPEC-019 FR-003). Also ``"ShutdownTimeout"`` when a bounded :meth:`Worker.stop`
         expired before the drain finished (SPEC-027 FR-004), and the type name of whatever
         stopped a forked child's rebuild from starting a thread at all (SPEC-039 FR-002) — a
         case where the drain thread never ran rather than died. All three are the same thing to
@@ -1172,7 +1172,7 @@ class Worker:
         before :meth:`_release_waiters`, so a marker either lands ahead of that sweep's snapshot
         and is answered by it, or lands behind it and finds the flag set; both take the queue's
         own mutex, which is what leaves no gap between the two. Sweeping here rather than only
-        in :meth:`Worker.shutdown` is what covers the paths ``shutdown`` never reaches — a
+        in :meth:`Worker.stop` is what covers the paths ``stop`` never reaches — a
         terminal failure, and a bounded shutdown that expired while this thread was still
         inside an emit.
 

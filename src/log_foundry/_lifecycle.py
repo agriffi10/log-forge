@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from log_foundry.worker import Health, Worker
 
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
-"""Seconds :meth:`Worker.shutdown` will wait for the drain thread (SPEC-027 FR-004).
+"""Seconds :meth:`Worker.stop` will wait for the drain thread (SPEC-027 FR-004).
 
 Generous, because the ordinary case is a fast drain and expiring early would abandon events
 that were about to be delivered. Bounded at all, because ``shutdown()`` runs from ``atexit``
@@ -205,7 +205,7 @@ class _Lifecycle:
         the count, that worker's epoch equals the count until the *next* ``shutdown()`` moves it,
         which is exactly when its submissions start being stranded.
 
-        A retired worker holds its sink forever — :meth:`Worker.swap_sink` returns early once
+        A retired worker holds its sink forever — :meth:`Worker.retarget` declines once
         shut down — so keying on a worker merely existing hands the swap to something that will
         do nothing with it, and the sink adopted afterwards is closed by no one: measured,
         ``configure(A)`` → ``@trace`` → ``shutdown()`` → ``configure(B)`` → ``info()`` →
@@ -1482,9 +1482,9 @@ def _rebuild_worker_after_fork() -> None:
 def _offer_orphan_signal(sink: Sink) -> None:
     """Gives a sink no live worker owns an unset stop signal (SPEC-033 FR-004).
 
-    An orphan-only process never receives one otherwise — ``Worker._offer_stop_signal`` is the
-    only caller and there is no worker — so SPEC-027's guarantee that a shutdown cuts a backoff
-    short is false on this path, and the inline close at exit can sit behind an uninterruptible
+    An orphan-only process never received one before SPEC-033 FR-004 — the worker offered the
+    signal to its own sink and there is no worker here — so SPEC-027's guarantee that a shutdown
+    cuts a backoff short was false on this path, and the inline close at exit can sit behind an uninterruptible
     wait held by another orphan writer.
 
     The skip is keyed on the **moment**, not on a worker merely existing. A retired worker keeps
