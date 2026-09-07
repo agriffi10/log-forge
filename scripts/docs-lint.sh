@@ -1008,8 +1008,9 @@ fi
 # AT WHAT, and a reader who does not check it against a calendar reads it as current.
 #
 # WHAT IT CATCHES, exactly: a bullet, paragraph or comment block in which "measured" or
-# "as of" is followed immediately by an ISO date, with no short SHA or version tag
-# anywhere in that same unit.
+# "as of" is followed by an ISO date — immediately, or across one adverb of time from a
+# closed set (today, now, recently, here, again, … — the list is beside the check, and
+# `once` is deliberately not in it) — with no short SHA or version tag in that same unit.
 #
 # THAT IS ONE SHAPE, NOT THE POPULATION, and the difference is worth stating plainly
 # because the next person to widen this will read it. Of the eight sites the commit that
@@ -1158,8 +1159,35 @@ fi
       # The separators are the ones this repo actually writes: "Measured 2026-09-01",
       # "Measured, on `f17edd4`", "measured at e565e22". Leaving `at` and the comma out
       # made the two likeliest honest spellings escape while the rule was being followed.
+      # ONE ADVERB OF TIME may sit between the verb and the date, from a closed set. The gap
+      # was found while the queue paragraphs in docs/process/ were being drafted: both were
+      # first written as "Measured here on <date>" with no SHA, this check stayed silent on
+      # them, and a read of the draft caught what the gate had not. Those sentences were
+      # anchored before they committed, so the evidence a reader can re-run is the FIXTURE
+      # SET, not the history.
+      #
+      # A CLOSED SET, not a bounded run of letters, and the difference is the whole design.
+      # The bounded version was built first and rejected on a real false positive: "as of the
+      # 2026-08-04 correction below" — a date that NAMES A THING rather than recording when
+      # someone looked — fired under it and is silent here. (An earlier draft of this comment
+      # claimed "measured against the 2026-08-01 baseline" fired under the bound too; measured,
+      # it does not — "the" sits between the adverb slot and the date. The unhedged form,
+      # "measured against 2026-08-01 baseline", is the one that fires. Corrected here rather
+      # than left standing, since the comment says the next person to widen this will read it.)
+      # The FAIL text has no remedy to offer such a sentence — no number to drop, no tree to
+      # anchor — so the moves left are a decorative SHA or learning to skip a local gate, which
+      # is the damage this check exists to avoid.
+      #
+      # THE SET IS THE ORDINARY ADVERBS OF TIME, and it has to be: a first cut carried only
+      # five and lost everything the bound had caught, so "Measured today on <date>" shipped
+      # green — likelier prose than the "here" that prompted the widening. What is deliberately
+      # OUT is `once`, which doubles as a conjunction ("Measured once 2026-08-01 landed" names
+      # an event, not a measurement), and every determiner and preposition, which is what keeps
+      # `as of the <date> <noun>` and `measured against the <date> baseline` silent. A trailing
+      # comma is taken after the adverb as well as before it, because "Measured here, on <date>"
+      # is the same claim with a pause in it.
       function dated(s) {
-        return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+        return tolower(s) ~ /(measured|as of)[ \t]*[,:]?[ \t]*((here|again|twice|already|today|now|yesterday|recently|just|lately|then|still|finally|first|initially|currently|originally)[ \t]*[,:]?[ \t]*)?((on|at|in)[ \t]+)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
       }
       function flush(   where, what) {
         if (unit != "" && dated(unit) && !has_anchor(unit)) {

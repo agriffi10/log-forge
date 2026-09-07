@@ -68,8 +68,9 @@ this way).
   templates, the allowed glob forms, the allowed models, the routing table; requires every Completed
   spec to have a delivery doc; checks that the pointers out of the always-loaded files resolve; and
   refuses one
-  shape of unanchored evidence — "measured" or "as of" immediately followed by an ISO date, with
-  no commit SHA in the same bullet, paragraph or comment block. That is a
+  shape of unanchored evidence — "measured" or "as of" followed by an ISO date, immediately or
+  across one adverb of time from a closed set, with no commit SHA in the same bullet, paragraph or
+  comment block. That is a
   sub-shape, not the rule: an undated volatile number is invisible to it and stays this file's
   to catch by reading. It reads source files as well as markdown, because the rule three bullets
   down says a markdown-only sweep reports the tree clean — and two of the eight sites that
