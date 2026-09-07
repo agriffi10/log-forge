@@ -88,7 +88,7 @@ elif [ ! -s "$Q/enforce-branches" ]; then
   # neither `spec/…` nor `docs/…`: in a repo using those it installed cleanly, printed its pattern,
   # and enforced nothing on any branch anyone would push — the silent half of the failure the
   # empty-pattern warning in PROTOCOL.md already covers.
-  printf '%s\n' '^(spec|docs)[-/]' > "$Q/enforce-branches"
+  printf '%s\n' '^(spec|docs|ci|test|fix|feat|chore|perf|refactor)[-/]' > "$Q/enforce-branches"
 fi
 
 # --- the hook wrapper -------------------------------------------------------------------------
@@ -117,7 +117,6 @@ fi
 echo "PR queue installed."
 echo "  queue:     $Q"
 echo "  checkout:  $REPO"
-echo "  hook:      $HOOK -> $Q/pre-push"
 echo "  main:      $MAIN"
 # A pattern is only enforcement if it matches the branches this repo actually uses, so say so
 # here rather than leaving it to be discovered by a push that should have been refused and was
@@ -126,12 +125,34 @@ echo "  main:      $MAIN"
 pat="$(cat "$Q/enforce-branches")"
 branches="$(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads | grep -vxF "$MAIN" || true)"
 total=$(printf '%s' "$branches" | grep -c . || true)
-matched=$(printf '%s' "$branches" | grep -cE "$pat" || true)
-echo "  enforcing: $pat  ($matched of $total local branches besides $MAIN)"
-if [ "$total" -gt 0 ] && [ "$matched" -eq 0 ]; then
-  echo "  WARNING: that pattern matches none of them, so the hook will refuse nothing. Re-run with
+# Three states, and only one of them is a count. An EMPTY pattern is what pre-push tests for
+# first and exits on, so it enforces nothing — but an empty ERE matches every line, so counting
+# it would report total coverage for the one setting that has none. An INVALID ERE makes grep
+# exit 2 with empty output, which would print "( of 12)" and then compare an empty string as an
+# integer. Both were live escapes in the first version of this summary.
+# grep exits 2 on an invalid ERE and 1 on a valid one that simply did not match; `|| pat_rc=$?`
+# is what keeps `set -e` from aborting on the ordinary no-match case.
+pat_rc=0
+printf 'x\n' | grep -qE "$pat" >/dev/null 2>&1 || pat_rc=$?
+if [ -z "$pat" ]; then
+  echo "  enforcing: (empty) — the hook exits before testing any ref, so NOTHING is enforced."
+  echo "  WARNING: set a pattern: sh scripts/pr-queue/install.sh '^(spec|docs)[-/]'"
+elif [ "$pat_rc" -gt 1 ]; then
+  echo "  enforcing: $pat — NOT A VALID ERE, so the hook matches nothing and refuses nothing."
+  echo "  WARNING: fix the expression and re-run install.sh."
+else
+  matched=$(printf '%s' "$branches" | grep -cE "$pat" || true)
+  echo "  enforcing: $pat  ($matched of $total local branches besides $MAIN)"
+  if [ "$total" -gt 0 ] && [ "$matched" -eq 0 ]; then
+    echo "  WARNING: that pattern matches none of them, so the hook will refuse nothing. Re-run with
            the ERE your branches use, e.g. sh scripts/pr-queue/install.sh '^(spec|docs)[-/]'"
+  fi
 fi
+case "$hook_status" in
+  installed) echo "  hook:      $HOOK -> $Q/pre-push" ;;
+  blocked)   echo "  hook:      $HOOK — LEFT ALONE, it is not ours; nothing is enforced until the
+             line below is added to it by hand" ;;
+esac
 command -v gh >/dev/null 2>&1 || echo "  WARNING: 'gh' not found — the built-in remote checks need it, or install
            your own 'open-prs', 'all-prs' and 'main-green' executables in $Q (see PROTOCOL.md)."
 [ -x "$Q/open-prs" ] && echo "  NOTE: an existing 'open-prs' override is in place. It must now exclude DRAFT

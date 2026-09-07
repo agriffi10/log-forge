@@ -96,7 +96,8 @@ lifecycle:
   pushed branch against the holder's. A red CI needing a fix push is that case; `PR_QUEUE_BYPASS=1`
   is the way through, and the section below asks you to say you used it. What counts as a
   participating branch is `enforce-branches` and nothing else. The default covers both branch
-  conventions (`^(spec|docs)[-/]`), and `install.sh` prints how many of the repo's branches it
+  conventions and the other prefixes that open PRs here, and `install.sh` prints how many of the
+  repo's branches it
   actually matches — an earlier default matched neither `spec/…` nor `docs/…` and enforced nothing
   in silence, which is why the count is printed rather than assumed.
 - **A draft PR breaks the safety of releasing at all.** Drafts are filtered out of the open-PR check,
@@ -149,7 +150,13 @@ Single-value files in the queue directory, all written by `install.sh`:
 |---|---|
 | `repo` | The checkout the remote checks run from. |
 | `main-branch` | The trunk branch name (default `main`). |
-| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^(spec|docs)[-/]` unless you pass your own, and reports how many local branches it matches. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
+| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^(spec\|docs\|ci\|test\|fix\|feat\|chore\|perf\|refactor)[-/]` unless you pass your own, and reports how many local branches it matches. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
+
+`install-test.sh` beside `install.sh` is the corpus for that summary — the four pattern states
+(default, non-matching, empty, invalid), the fresh-clone silence case, and the foreign-hook case,
+each asserting the text rather than the exit code, since three of them exit 0. **A change to
+`install.sh` runs it**; it builds throwaway repos under `$TMPDIR` and never touches the checkout it
+is run from, which `install.sh` itself cannot claim.
 
 Two environment variables override the files, for a one-off: `PR_QUEUE_DIR` tells `install.sh` where
 to put the queue, and `PR_QUEUE_REPO` overrides `repo` for a single `queue.sh` invocation.
