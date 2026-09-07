@@ -29,15 +29,19 @@ order agents asked, with `main` settled and green before the next**.
 - **Merging needs no lock; pushing does.** A session whose CI is green can watch, merge and drop the
   ticket without the lock. Any push of an enforced branch is refused while you do not hold it, which
   is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through. Which
-  branches are enforced is a per-install setting that the installer's default does not get right for
-  this repo's `spec/` and `docs/` naming, so read `enforce-branches` rather than assuming.
-- **A DRAFT PR breaks that reasoning.** Drafts are invisible to the queue, so releasing with one open
-  lets a peer take the lock and open a second PR; un-drafting and merging then moves `main` under
-  their green branch — the race the queue exists to prevent. Keep the lock, or close the draft.
-
-The behaviour above is defined by `scripts/pr-queue/queue.sh` and `pre-push`, not by this page: the
-exact refusals, exit codes and which check answers first are theirs, and a copy here is a copy that
-goes stale. `scripts/pr-queue/PROTOCOL.md` carries the rest.
+  branches are enforced is a per-install setting — the installer defaults to `^(spec|docs)[-/]` and
+  reports how many of this repo's branches that matches, so read its summary rather than assuming.
+- **A DRAFT PR breaks that reasoning, in both directions.** Drafts are invisible to the open-PR check
+  `turn` and `acquire` use, so releasing with one open lets a peer take the lock and open a second PR;
+  un-drafting and merging then moves `main` under their green branch — the race the queue exists to
+  prevent. They are *not* invisible to the stale-lock reaper, which counts them on purpose as evidence
+  the holder is still alive, so a lock abandoned behind a draft is never reaped and a peer waiting on
+  the timer waits forever — escalate instead of polling. Keep the lock, or close the draft; and if you
+  have already released with only a draft open, re-ticket and acquire immediately, because until a
+  peer beats you to it the queue will hand the lock straight back.
+- **The behaviour above is defined by `scripts/pr-queue/queue.sh` and `pre-push`, not by this page.**
+  The exact refusals, exit codes and which check answers first are theirs, and a copy here is a copy
+  that goes stale; `scripts/pr-queue/PROTOCOL.md` carries the rest.
 - **The queue is not a review.** It is the last thing between an already-reviewed branch and the
   remote. This repo's gates and both diff reviews still come first, in that order.
 - **Every remote check fails closed; enforcement fails open.** The lock only orders the agents that

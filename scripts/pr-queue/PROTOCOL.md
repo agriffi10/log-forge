@@ -95,8 +95,10 @@ lifecycle:
 - **Every push does**, `git push origin --delete <branch>` included, because the hook compares the
   pushed branch against the holder's. A red CI needing a fix push is that case; `PR_QUEUE_BYPASS=1`
   is the way through, and the section below asks you to say you used it. What counts as a
-  participating branch is `enforce-branches` and nothing else — the installer default is `^spec-`,
-  which matches neither `spec/…` nor `docs/…`, so an install that took it enforces nothing on those.
+  participating branch is `enforce-branches` and nothing else. The default covers both branch
+  conventions (`^(spec|docs)[-/]`), and `install.sh` prints how many of the repo's branches it
+  actually matches — an earlier default matched neither `spec/…` nor `docs/…` and enforced nothing
+  in silence, which is why the count is printed rather than assumed.
 - **A draft PR breaks the safety of releasing at all.** Drafts are filtered out of the open-PR check,
   so a peer can acquire behind your draft and open a second PR. They are counted by the stale-lock
   reaper, though — deliberately, as evidence the holder lives — so a lock abandoned behind a draft is
@@ -147,7 +149,7 @@ Single-value files in the queue directory, all written by `install.sh`:
 |---|---|
 | `repo` | The checkout the remote checks run from. |
 | `main-branch` | The trunk branch name (default `main`). |
-| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^spec-` unless you pass your own. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
+| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^(spec|docs)[-/]` unless you pass your own, and reports how many local branches it matches. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
 
 Two environment variables override the files, for a one-off: `PR_QUEUE_DIR` tells `install.sh` where
 to put the queue, and `PR_QUEUE_REPO` overrides `repo` for a single `queue.sh` invocation.

@@ -13,9 +13,17 @@
 # is about the remote: two checkouts of the same repo must share one queue, and two different
 # repos that happen to share a directory name must not. Override with PR_QUEUE_DIR.
 #
-# [branch-regex] is the ERE for branches the hook enforces against (default '^spec-'). Branches
-# outside it push freely — see the fail-open note in pre-push. An existing setting is kept when
-# no argument is given.
+# THERE IS NO DRY RUN. PR_QUEUE_DIR relocates the queue but not the hook: this still writes
+# .git/hooks/pre-push in the checkout it is run from, pointed at whichever queue it just built. A
+# scratch run therefore takes the live hook with it — measured by doing exactly that to this
+# repo — so try it in a throwaway clone, and read the `hook:` line below to see what was touched.
+#
+# [branch-regex] is the ERE for branches the hook enforces against (default '^(spec|docs)[-/]',
+# which covers both the `spec-207` and `spec/207-name` conventions and the docs branches beside
+# them). Branches outside it push freely — see the fail-open note in pre-push. An existing setting
+# is kept when no argument is given, and the summary at the end reports how many of this repo's
+# branches the pattern actually matches, because a default that matches none of them installs
+# cleanly and enforces nothing.
 #
 # EXIT: 0 installed · 1 could not install · 3 queue installed but the hook was NOT (something
 #       else already occupies .git/hooks/pre-push — the message says what to add by hand).
@@ -76,7 +84,11 @@ printf '%s\n' "$MAIN" > "$Q/main-branch"
 if [ "$#" -ge 1 ]; then
   printf '%s\n' "$1" > "$Q/enforce-branches"
 elif [ ! -s "$Q/enforce-branches" ]; then
-  printf '%s\n' '^spec-' > "$Q/enforce-branches"
+  # Both conventions, and the docs branches beside them. The previous default, '^spec-', matched
+  # neither `spec/…` nor `docs/…`: in a repo using those it installed cleanly, printed its pattern,
+  # and enforced nothing on any branch anyone would push — the silent half of the failure the
+  # empty-pattern warning in PROTOCOL.md already covers.
+  printf '%s\n' '^(spec|docs)[-/]' > "$Q/enforce-branches"
 fi
 
 # --- the hook wrapper -------------------------------------------------------------------------
@@ -105,8 +117,21 @@ fi
 echo "PR queue installed."
 echo "  queue:     $Q"
 echo "  checkout:  $REPO"
+echo "  hook:      $HOOK -> $Q/pre-push"
 echo "  main:      $MAIN"
-echo "  enforcing: $(cat "$Q/enforce-branches")"
+# A pattern is only enforcement if it matches the branches this repo actually uses, so say so
+# here rather than leaving it to be discovered by a push that should have been refused and was
+# not. Counted over local branches other than the default one; a fresh clone has none of its own,
+# which is why the warning is gated on there being some to match.
+pat="$(cat "$Q/enforce-branches")"
+branches="$(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads | grep -vxF "$MAIN" || true)"
+total=$(printf '%s' "$branches" | grep -c . || true)
+matched=$(printf '%s' "$branches" | grep -cE "$pat" || true)
+echo "  enforcing: $pat  ($matched of $total local branches besides $MAIN)"
+if [ "$total" -gt 0 ] && [ "$matched" -eq 0 ]; then
+  echo "  WARNING: that pattern matches none of them, so the hook will refuse nothing. Re-run with
+           the ERE your branches use, e.g. sh scripts/pr-queue/install.sh '^(spec|docs)[-/]'"
+fi
 command -v gh >/dev/null 2>&1 || echo "  WARNING: 'gh' not found — the built-in remote checks need it, or install
            your own 'open-prs', 'all-prs' and 'main-green' executables in $Q (see PROTOCOL.md)."
 [ -x "$Q/open-prs" ] && echo "  NOTE: an existing 'open-prs' override is in place. It must now exclude DRAFT
