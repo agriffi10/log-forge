@@ -143,12 +143,96 @@ class _Child:
             signal.SIGKILL,
         )
 
+    @property
+    def ending(self) -> str:
+        """How the child ended, in words, for a failure that has to name *which* outcome it was.
+
+        **Which signal ended the child says more than the fact that one did**, and that is why
+        this is not folded into :attr:`blocked`, which answers only whether it was a watchdog.
+        ``SIGALRM`` is the child's own, armed in :func:`run_in_child` before ``work`` is called,
+        so an alarm that fires is proof the child left the fork and reached this module's code.
+        ``SIGKILL`` is the parent's, sent whenever it did not see the pipe close by its own
+        deadline. Any other signal is neither watchdog, and a child dying of one is a case
+        :func:`run_in_child` measures rather than a hypothetical. A report saying no more than
+        "a watchdog ended it" cannot tell those apart, and :func:`_diagnose` reads them.
+
+        The phrase is written to read after "it", so a message can say what the child did.
+
+        The signal number is rendered without its name when it has none, rather than letting
+        ``signal.Signals`` raise: this is evaluated only while a failure message is being built,
+        and a ``ValueError`` there would replace the diagnosis with an unrelated traceback.
+
+        Args:
+          None.
+
+        Returns:
+          A phrase naming how the process ended.
+
+        Raises:
+          None.
+        """
+        if os.WIFEXITED(self.status):
+            return f"exited {os.WEXITSTATUS(self.status)}"
+        if os.WIFSIGNALED(self.status):
+            number = os.WTERMSIG(self.status)
+            try:
+                return f"was killed by {signal.Signals(number).name}"
+            except ValueError:
+                return f"was killed by signal {number}"
+        return f"left wait status {self.status}"
+
+
+_child_pipe: tuple[int, int] | None = None
+
+
+def report_from_child(marker: str) -> None:
+    """Sends a marker down the child's pipe now, rather than waiting for ``work`` to return.
+
+    ``run_in_child`` reports a child through the value ``work`` returns, which says nothing at
+    all about a child that does not return — and one below ends itself on purpose. A marker
+    written just before the irreversible step is what separates "never got there" from "got
+    there and something else happened", and without it those two arrive as the same silence.
+
+    The write is a bare ``os.write`` on the inherited descriptor, not anything buffered. A
+    buffer is flushed at exit and these children leave through ``os._exit``, which flushes
+    nothing: a probe that reports through buffered output before ``os._exit`` prints the same
+    thing — nothing — whichever way it went, which is how a probe comes to have no positive
+    control.
+
+    **The descriptor is recorded with the pid that owns it, and a mismatch is refused.** A
+    child that forks a grandchild passes this module state down with the write end still open,
+    so the grandchild's marker would be merged into its parent's ``output`` and read as the
+    parent's — a report attributing one process's progress to another, which is the exact
+    confusion the marker exists to remove. Two nested forks already exist in the suite
+    (``test_sink_ownership.py``), and nothing else in this file would notice.
+
+    A marker shares the pipe with the ``!Type: msg`` a raising ``work`` leaves, so a caller
+    reads it back with ``startswith`` rather than ``in``: an exception message that happens to
+    contain the marker would otherwise forge the report.
+
+    Args:
+      marker: Text to prepend to whatever else the child reports.
+
+    Returns:
+      None.
+
+    Raises:
+      RuntimeError: If called outside the :func:`run_in_child` child that owns the pipe —
+        in the parent, where there is none, or in a grandchild, which inherited one that is
+        not its own. Silence in either would read as a child that never reached the call.
+    """
+    if _child_pipe is None or _child_pipe[0] != os.getpid():
+        raise RuntimeError("report_from_child is callable only inside its own run_in_child child")
+    os.write(_child_pipe[1], marker.encode())
+
 
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
     """Forks, runs ``work`` in the child, and reaps it.
 
     The child writes ``work``'s return value down a pipe and leaves through ``os._exit``, so it
-    never runs the parent's ``atexit`` handlers or pytest's teardown.
+    never runs the parent's ``atexit`` handlers or pytest's teardown. ``work`` can also write
+    to that pipe before it returns, or instead of returning, through
+    :func:`report_from_child`.
 
     **Both sides are bounded, and the parent's bound is not redundant.** The child arms
     ``signal.alarm`` for the ordinary case, but ``fork`` clears a pending alarm in the child and
@@ -192,6 +276,7 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     Raises:
       None.
     """
+    global _child_pipe
     read_fd, write_fd = os.pipe()
     gc.collect()
     pid = os.fork()
@@ -199,6 +284,7 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
         code = 1
         try:
             os.close(read_fd)
+            _child_pipe = (os.getpid(), write_fd)
             signal.alarm(timeout)
             os.write(write_fd, (work() or "").encode())
             code = 0
@@ -482,6 +568,61 @@ def test_a_failing_repair_is_absorbed_and_writes_no_message() -> None:
     assert "absorbed a failure while repairing the library after a fork" in child.output
 
 
+def _diagnose(child: _Child, *, reached: bool) -> str:
+    """Reads one crash-child outcome back as the single thing that happened to it.
+
+    :attr:`_Child.blocked` answers one question — was it a watchdog — and the test below turns
+    on three outcomes that all answer it the same way. This maps what was actually observed,
+    the crash marker and the terminating signal, onto the one reading that fits, so a failure
+    names the outcome instead of listing the readings and leaving the choice to the reader.
+
+    **Nothing here is derived from** :attr:`_Child.blocked` **or** :attr:`_Child.finished`. The
+    diagnosis is read from a message printed when one of those is wrong, so deriving it from
+    them would make it agree with whichever of them had broken.
+
+    The two watchdogs are not the same claim about time. ``SIGALRM`` fires a fixed interval
+    after the child armed it, which it does only once it is out of the fork; the parent's
+    deadline runs from the fork itself and allows two seconds more. So a child slow enough
+    *before* arming its alarm loses to the parent even with an alarm armed — measured, a fork
+    handler made to sleep 2.5 s ends as ``SIGKILL`` with the child demonstrably past
+    ``signal.alarm`` — and ``SIGKILL`` is therefore a disjunction, never a location.
+
+    Args:
+      child: The reaped child.
+      reached: Whether it reported reaching its own ``os.kill``.
+
+    Returns:
+      A sentence naming what happened, written to follow a colon.
+
+    Raises:
+      None.
+    """
+    ended_by = os.WTERMSIG(child.status) if os.WIFSIGNALED(child.status) else None
+    if reached:
+        if ended_by == signal.SIGALRM:
+            return "it reached `os.kill`, and its own watchdog had to end it"
+        if ended_by == signal.SIGKILL:
+            return "it reached `os.kill`, and was still alive at the parent's deadline"
+        return f"it reached `os.kill` and then {child.ending}"
+    if ended_by == signal.SIGALRM:
+        return "it armed its own watchdog and then stalled before reaching `os.kill`"
+    if ended_by == signal.SIGKILL:
+        return (
+            "no alarm ever ended it and the parent gave up waiting, so it either never "
+            "reached `signal.alarm` — still coming out of the fork, where the library's repair "
+            "handler runs — or reached it more than two seconds after the fork"
+        )
+    if ended_by is not None:
+        return (
+            f"it {child.ending} before reaching `os.kill`, which is not either watchdog: a "
+            f"child dying inside the library's repair looks like this, and `run_in_child` "
+            f"names the fork-unsafe finalizer that produced it here"
+        )
+    if child.output.startswith("!"):
+        return f"it {child.ending} without reaching `os.kill`, and the `!Type: msg` it left says why"
+    return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
+
+
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
     """A crash and a deadlock are different findings, and one test turns on telling them apart.
 
@@ -491,18 +632,207 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
     anything — and SPEC-028 measured a shipped sink taking the interpreter down with a bus
     error, so this is a crash mode the suite has already seen.
 
+    **The premise is asserted before the property, because ``blocked`` alone cannot tell three
+    outcomes apart.** A child that crashed as asked, one merely slow enough on a loaded runner
+    that a watchdog reached it first, and one genuinely stuck all leave ``finished`` false —
+    and only the first says anything about ``blocked`` at all. Read as one assertion they are
+    the same result, which is how this test failed on ``2b68b981`` (Release, py3.13) against a
+    tree byte-identical to one that had passed minutes earlier, reporting nothing but "a crash
+    must not read as a deadlock". Widening the watchdog would have made that rarer without
+    making it legible. The marker written immediately before ``os.kill`` is what separates the
+    premise from the property, and :func:`_diagnose` turns the pair into the reading.
+
+    **The premise is that a signal ended the child, not that it failed to exit cleanly.**
+    ``not finished`` is satisfied by a non-zero exit, so a ``work`` that reached the marker and
+    then left without crashing would establish the premise while leaving the property — that a
+    crash is not read as a watchdog — measured against no crash at all. ``os.WIFSIGNALED`` is
+    the observation; ``not blocked`` then says the signal was neither watchdog, which together
+    are what this test means.
+
     ``faulthandler`` is disabled in the child first. pytest enables it, and its ``SIGSEGV``
     dump would print a full traceback into the run's output — a passing test that looks like a
     catastrophe is its own kind of misleading.
     """
+    requested = "about-to-crash"
+
     def crash() -> str:
         faulthandler.disable()
+        report_from_child(requested)
         os.kill(os.getpid(), signal.SIGSEGV)
         return "survived"
 
     child = run_in_child(crash, timeout=4)
-    assert not child.finished
-    assert not child.blocked, "a crash must not read as a deadlock"
+    reached = child.output.startswith(requested)
+    reading = _diagnose(child, reached=reached)
+
+    assert reached, (
+        f"the child never asked to crash, so this run measured nothing about `blocked`: "
+        f"{reading}. It wrote {child.output!r}."
+    )
+    assert os.WIFSIGNALED(child.status), (
+        f"no signal ended the child, so there was no crash for `blocked` to misread: "
+        f"{reading}. It wrote {child.output!r}."
+    )
+    assert not child.blocked, (
+        f"a crash must not read as a deadlock: {reading}. Either `blocked` has widened to "
+        f"accept a signal that is not a watchdog, or the SIGSEGV did not end the process."
+    )
+
+
+def test_every_crash_child_outcome_is_reported_apart() -> None:
+    """The readings the test above rests on, pinned so they cannot converge in silence.
+
+    :func:`_diagnose` is read only from failure messages, so a reading that stopped
+    discriminating would leave every assertion in this file passing and every failure they can
+    produce back to saying no more than "a watchdog ended it" — the report its neighbour was
+    rewritten to stop producing. A guard whose failure is invisible earns an assertion of its
+    own.
+
+    **Two checks, because either alone has a green mutant, and both were measured.** The named
+    outcomes are anchored on a phrase and each reading must EXCLUDE every other outcome's
+    phrase: presence plus pairwise distinctness is satisfied by a reading that carries all
+    seven phrases and interpolates ``ending`` to stay unique, which is a ``_diagnose`` that has
+    gone back to listing the readings for the reader to pick from. But anchors are *points*,
+    and two of the readings are *families* — every signal that is not a watchdog, crossed with
+    every exit code — so hard-coding the two anchored points passes too: a ``_diagnose``
+    naming SIGSEGV for SIGBUS and exit 0 for exit 3 was green across the whole suite. The
+    sweep below is what covers a family: two observations the reader must be able to tell
+    apart are exactly two with a different ``(reached, ending)``, so those must never read the
+    same. It is written over ``ending`` rather than over the status, so it says what a reader
+    needs recovered rather than restating how ``_diagnose`` branches.
+
+    The statuses are built rather than forked for: reaching the watchdog cases for real costs a
+    watchdog's worth of wall clock apiece. What each status *is* is asserted through the same
+    ``os.W*`` predicates the code reads, so a platform whose encoding differs fails here rather
+    than checking a phrase against a status that means nothing on it.
+    """
+    cases = {
+        "reached, crashed": (True, int(signal.SIGSEGV), "", "and then was killed by SIGSEGV"),
+        "reached, own watchdog": (
+            True, int(signal.SIGALRM), "", "its own watchdog had to end it",
+        ),
+        "reached, parent's deadline": (
+            True, int(signal.SIGKILL), "", "still alive at the parent's deadline",
+        ),
+        "reached, ran on": (True, 0 << 8, "", "and then exited 0"),
+        "stalled after arming": (
+            False, int(signal.SIGALRM), "", "armed its own watchdog and then stalled",
+        ),
+        "stalled before arming": (
+            False, int(signal.SIGKILL), "", "never reached `signal.alarm`",
+        ),
+        "died another way": (False, int(signal.SIGBUS), "", "not either watchdog"),
+        "raised": (False, 1 << 8, "!ValueError: boom", "the `!Type: msg` it left"),
+        "left without a word": (False, 1 << 8, "", "leaving no exception report behind"),
+    }
+    readings: dict[str, str] = {}
+    for name, (reached, status, output, phrase) in cases.items():
+        assert os.WIFEXITED(status) or os.WIFSIGNALED(status), (name, status)
+        reading = _diagnose(_Child(status, output), reached=reached)
+        assert phrase in reading, (name, phrase, reading)
+        readings[name] = reading
+
+    for name, reading in readings.items():
+        intruders = [
+            other for other, case in cases.items() if other != name and case[3] in reading
+        ]
+        assert not intruders, (name, reading, intruders)
+
+    endings = [int(member) for member in (signal.SIGALRM, signal.SIGKILL)]
+    endings += [int(member) for member in (signal.SIGSEGV, signal.SIGBUS, signal.SIGILL)]
+    endings += [code << 8 for code in (0, 1, 3, 42)]
+    swept: dict[tuple[bool, str], str] = {}
+    for reached in (True, False):
+        for status in endings:
+            child = _Child(status, "")
+            swept[(reached, child.ending)] = _diagnose(child, reached=reached)
+    assert len(swept) == 2 * len(endings), swept
+    collisions = {
+        reading for reading in swept.values() if list(swept.values()).count(reading) > 1
+    }
+    assert not collisions, collisions
+
+
+def test_the_report_names_how_the_child_ended() -> None:
+    """``ending`` renders the wait status itself, and every branch of it is reachable here.
+
+    **The roster is derived, not listed.** Three hand-picked signals leave a lookup table
+    holding exactly those three green, which is a real regression: SIGBUS is this file's own
+    named crash mode (SPEC-028) and SIGSEGV the fork-unsafe-finalizer one, so a rendering that
+    silently drops to a bare number is how the *died another way* reading stops identifying
+    what it found. Every named signal this platform can report is checked instead, with a
+    floor, because an empty roster is a silent skip rather than a failure.
+
+    The unnamed-signal branch is what keeps a diagnosis from being replaced by a ``ValueError``
+    raised while the message was being built, and the stopped-status branch is unreachable
+    through ``run_in_child`` — ``os.waitpid`` is called without ``WUNTRACED`` — so neither has
+    a fork that would exercise it. Both are constructed instead.
+    """
+    reportable = [member for member in signal.Signals if os.WIFSIGNALED(int(member))]
+    assert len(reportable) >= 15, f"the signal roster collapsed to {len(reportable)}"
+    for member in reportable:
+        status = int(member)
+        assert os.WTERMSIG(status) == status, (member, status)
+        assert _Child(status, "").ending == f"was killed by {member.name}", member
+
+    for code in (0, 3):
+        status = code << 8
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == code, status
+        assert _Child(status, "").ending == f"exited {code}"
+
+    named = {int(member) for member in signal.Signals}
+    unnamed = next((number for number in range(1, 127) if number not in named), None)
+    assert unnamed is not None, "every signal number this platform can report already has a name"
+    assert os.WIFSIGNALED(unnamed) and os.WTERMSIG(unnamed) == unnamed, unnamed
+    assert _Child(unnamed, "").ending == f"was killed by signal {unnamed}"
+
+    stopped = (int(signal.SIGSTOP) << 8) | 0x7F
+    assert os.WIFSTOPPED(stopped) and not os.WIFSIGNALED(stopped), stopped
+    assert _Child(stopped, "").ending == f"left wait status {stopped}"
+
+
+def test_a_grandchild_cannot_report_into_its_parents_pipe() -> None:
+    """The owner check on the marker pipe, which is otherwise a guard nothing would miss.
+
+    A child that forks a grandchild hands down ``_child_pipe`` with the write end still open,
+    so without the check the grandchild's marker is merged into its *parent's* ``output`` — and
+    it lands first, which is what makes it dangerous: a reader of that pipe uses
+    ``startswith``, so one process's progress is reported as another's. Measured with the check
+    removed, the parent's output came back as the grandchild's marker followed by the child's
+    own, and the child read as having reached a call it never made.
+
+    Two nested forks already exist in the suite (``test_sink_ownership``), and both go through
+    :func:`run_in_child`, which rebinds the descriptor — so nothing here fires today and
+    deleting the check leaves the whole suite green. That is the definition of a guard that
+    needs its own test rather than the artifact it guards.
+
+    The grandchild reports through its **exit code**, which is the only channel it has left
+    once the pipe is refused, and three distinct codes are used so the assertion names the
+    reason: 7 is the ``RuntimeError`` this guard raises, 8 is any other exception, and 9 is the
+    write going through — a single "non-zero" would be satisfied by all three.
+    """
+
+    def work() -> str:
+        report_from_child("[child]")
+        gc.collect()
+        pid = os.fork()
+        if pid == 0:
+            code = 9
+            try:
+                report_from_child("[grandchild]")
+            except RuntimeError:
+                code = 7
+            except BaseException:
+                code = 8
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        return f"|grandchild={os.WEXITSTATUS(status)}"
+
+    child = run_in_child(work, timeout=5)
+
+    assert child.finished, f"the child did not survive forking a grandchild: {child.ending}"
+    assert child.output == "[child]|grandchild=7", child.output
 
 
 def test_the_childs_first_log_call_does_not_block(tmp_path: pathlib.Path) -> None:
@@ -546,6 +876,14 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     then blocks in ``info()`` until its watchdog kills it. Without this, the test above could
     pass against a fork that never entered the window at all, which is the failure mode the
     spec's method note names.
+
+    **This one asserts the hang positively, so a child that never got there passes it.** A
+    watchdog signal and an empty ``output`` are exactly what a child stalled anywhere earlier
+    leaves behind — measured, a ``time.sleep`` before the first line of ``unrepair_then_log``
+    is green here — so the demonstration would go quiet in the same conditions that make its
+    twin above flake. The marker is written after the lock is put back and immediately before
+    the log call, so ``output`` distinguishes "blocked in ``info()``" from "never arrived", and
+    a child that returned from ``info()`` writes past the marker rather than matching it.
     """
     sink, stream = _gated_file_sink(tmp_path)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
@@ -553,8 +891,11 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     gate = _park_the_drain_thread(stream, worker, 0)
     inherited = sink._lock
 
+    at_the_log_call = "at-the-log-call"
+
     def unrepair_then_log() -> str:
         sink._lock = inherited  # type: ignore[assignment]
+        report_from_child(at_the_log_call)
         return _log_in_child()
 
     try:
@@ -562,8 +903,12 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     finally:
         gate.release.set()
 
+    assert child.output.startswith(at_the_log_call), (
+        f"the child never reached its first log call, so the hang this demonstrates was never "
+        f"entered: it {child.ending}, having written {child.output!r}."
+    )
     assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
-    assert child.output == ""
+    assert child.output == at_the_log_call, child.output
 
 
 def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) -> None:
