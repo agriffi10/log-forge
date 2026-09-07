@@ -29,8 +29,11 @@ order agents asked, with `main` settled and green before the next**.
 - **Merging needs no lock; pushing does.** A session whose CI is green can watch, merge and drop the
   ticket without the lock. Any push of an enforced branch is refused while you do not hold it, which
   is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through. Which
-  branches are enforced is a per-install setting — the installer defaults to `^(spec|docs)[-/]` and
-  reports how many of this repo's branches that matches, so read its summary rather than assuming.
+  branches are enforced is a per-install setting: **read `enforce-branches` in the queue directory**
+  rather than assuming, and rather than re-running `install.sh` to find out, which rewrites this
+  checkout's hook. A fresh install writes a default covering the prefixes that open PRs here, but an
+  existing setting is KEPT — so a queue installed before that default changed still enforces
+  whatever it was given, and only an explicit `install.sh '<ere>'` re-points it.
 - **A DRAFT PR breaks that reasoning, in both directions.** Drafts are invisible to the open-PR check
   `turn` and `acquire` use, so releasing with one open lets a peer take the lock and open a second PR;
   un-drafting and merging then moves `main` under their green branch — the race the queue exists to

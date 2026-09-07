@@ -18,10 +18,12 @@
 # scratch run therefore takes the live hook with it — measured by doing exactly that to this
 # repo — so try it in a throwaway clone, and read the `hook:` line below to see what was touched.
 #
-# [branch-regex] is the ERE for branches the hook enforces against (default '^(spec|docs)[-/]',
-# which covers both the `spec-207` and `spec/207-name` conventions and the docs branches beside
-# them). Branches outside it push freely — see the fail-open note in pre-push. An existing setting
-# is kept when no argument is given, and the summary at the end reports how many of this repo's
+# [branch-regex] is the ERE for branches the hook enforces against. The default is
+# '^(spec|docs|ci|test|fix|feat|chore|perf|refactor)[-/]', covering both the `spec-207` and
+# `spec/207-name` conventions and the other prefixes that open PRs in these repos. Branches
+# outside it push freely — see the fail-open note in pre-push. AN EXISTING SETTING IS KEPT when no
+# argument is given, so widening this default does not reach a queue that already has one: pass
+# the ERE to re-point it. The summary at the end reports how many of this repo's
 # branches the pattern actually matches, because a default that matches none of them installs
 # cleanly and enforces nothing.
 #
@@ -136,16 +138,17 @@ pat_rc=0
 printf 'x\n' | grep -qE "$pat" >/dev/null 2>&1 || pat_rc=$?
 if [ -z "$pat" ]; then
   echo "  enforcing: (empty) — the hook exits before testing any ref, so NOTHING is enforced."
-  echo "  WARNING: set a pattern: sh scripts/pr-queue/install.sh '^(spec|docs)[-/]'"
+  echo "  WARNING: set a pattern: sh scripts/pr-queue/install.sh '^(spec|docs|ci|test|fix|feat|chore|perf|refactor)[-/]'"
 elif [ "$pat_rc" -gt 1 ]; then
   echo "  enforcing: $pat — NOT A VALID ERE, so the hook matches nothing and refuses nothing."
   echo "  WARNING: fix the expression and re-run install.sh."
 else
   matched=$(printf '%s' "$branches" | grep -cE "$pat" || true)
   echo "  enforcing: $pat  ($matched of $total local branches besides $MAIN)"
+  [ "$matched" -eq "$total" ] || echo "             (agent worktree and scratch branches are expected not to match)"
   if [ "$total" -gt 0 ] && [ "$matched" -eq 0 ]; then
     echo "  WARNING: that pattern matches none of them, so the hook will refuse nothing. Re-run with
-           the ERE your branches use, e.g. sh scripts/pr-queue/install.sh '^(spec|docs)[-/]'"
+           the ERE your branches use, e.g. sh scripts/pr-queue/install.sh '^(spec|docs|ci|test|fix|feat|chore|perf|refactor)[-/]'"
   fi
 fi
 case "$hook_status" in

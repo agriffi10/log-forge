@@ -54,15 +54,28 @@ run() {
   ok=1; why=""
   [ "$rc" = "$want" ] || { ok=0; why="exit $rc, wanted $want"; }
   for want_text in "$@"; do
-    case "$out" in *"$want_text"*) ;; *) ok=0; why="stdout lacked: $want_text" ;; esac
+    case "$out" in *"$want_text"*) ;; *) ok=0; why="${why:+$why; }stdout lacked: $want_text" ;; esac
   done
   if [ "$ok" = 1 ]; then pass=$((pass + 1)); echo "ok    $name"
   else fail=$((fail + 1)); echo "FAIL  $name: $why"; printf '%s\n' "$out" | sed 's/^/        /'; fi
 }
 
 # 1 — the default matches the branch shapes this family of repos uses.
-d=$(scratch default spec/056-x docs/thing ci/pin test/x fix/y)
-run default "$d" 0 @none -- "(5 of 5 local branches besides main)" "hook:"
+d=$(scratch default spec/056-x docs/thing ci/pin test/x fix/y feat/a chore/b perf/c refactor/d)
+run default "$d" 0 @none -- "(9 of 9 local branches besides main)"
+# The POSITIVE hook case. Case 6 asserts a foreign hook is not overwritten; nothing asserted that
+# ours is written, so deleting the wrapper heredoc left this corpus at 8 passed while the summary
+# went on printing the `hook:` line the script header tells a reader to trust.
+#
+# Matched on the queue directory's TAIL, not its full path: install.sh absolutises $Q with
+# `cd && pwd`, which on macOS resolves $TMPDIR's /var to /private/var, so a full-path comparison
+# fails for a reason that has nothing to do with the hook.
+if grep -q PR_QUEUE_WRAPPER "$d/.git/hooks/pre-push" 2>/dev/null && [ -x "$d/.git/hooks/pre-push" ] &&
+   grep -q "q-default/pre-push" "$d/.git/hooks/pre-push"; then
+  pass=$((pass + 1)); echo "ok    default-hook-written"
+else
+  fail=$((fail + 1)); echo "FAIL  default-hook-written: no executable wrapper pointing at the queue"
+fi
 
 # 2 — a pattern that matches nothing, with branches present to match.
 d=$(scratch nomatch spec/056-x docs/thing)
@@ -81,8 +94,10 @@ run invalid "$d" 0 '^spec[' -- "NOT A VALID ERE" "fix the expression"
 d=$(scratch fresh)
 run fresh "$d" 0 @none -- "(0 of 0 local branches besides main)"
 out=$(cd "$d" && PR_QUEUE_DIR="$WORK/q-fresh2" sh scripts/pr-queue/install.sh 2>/dev/null)
-case "$out" in *WARNING*) fail=$((fail + 1)); echo "FAIL  fresh: warned about a repo with no branches to match" ;;
-                       *) pass=$((pass + 1)); echo "ok    fresh-no-warning" ;; esac
+# The SPECIFIC text, not the bare word: install.sh also warns when `gh` is absent, and matching
+# on WARNING failed this case for that instead — a false accusation about the branch-count logic.
+case "$out" in *"matches none of them"*) fail=$((fail + 1)); echo "FAIL  fresh: warned about a repo with no branches to match" ;;
+                                      *) pass=$((pass + 1)); echo "ok    fresh-no-warning" ;; esac
 
 # 6 — a foreign pre-push is left alone, and the summary must SAY it was left alone rather than
 #     printing the install line: that line is what the header tells a reader to check.

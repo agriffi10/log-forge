@@ -150,7 +150,7 @@ Single-value files in the queue directory, all written by `install.sh`:
 |---|---|
 | `repo` | The checkout the remote checks run from. |
 | `main-branch` | The trunk branch name (default `main`). |
-| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^(spec\|docs\|ci\|test\|fix\|feat\|chore\|perf\|refactor)[-/]` unless you pass your own, and reports how many local branches it matches. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
+| `enforce-branches` | ERE for the branches `pre-push` enforces against; `install.sh` writes `^(spec\|docs\|ci\|test\|fix\|feat\|chore\|perf\|refactor)[-/]` **only when the file is absent or empty** — an existing setting survives a re-install, so a queue installed under an older default keeps it until you pass an ERE explicitly. The install summary reports how many local branches the live setting matches. Empty or missing enforces nothing, silently — it must match the branch names the briefing hands out. |
 
 `install-test.sh` beside `install.sh` is the corpus for that summary — the four pattern states
 (default, non-matching, empty, invalid), the fresh-clone silence case, and the foreign-hook case,
