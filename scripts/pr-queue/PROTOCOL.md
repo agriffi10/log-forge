@@ -98,7 +98,11 @@ lifecycle:
   participating branch is `enforce-branches` and nothing else — the installer default is `^spec-`,
   which matches neither `spec/…` nor `docs/…`, so an install that took it enforces nothing on those.
 - **A draft PR breaks the safety of releasing at all.** Drafts are filtered out of the open-PR check,
-  so a peer can acquire behind your draft and open a second PR. Keep the lock, or close the draft.
+  so a peer can acquire behind your draft and open a second PR. They are counted by the stale-lock
+  reaper, though — deliberately, as evidence the holder lives — so a lock abandoned behind a draft is
+  never broken by the timer, and a peer blocked by one has to escalate rather than wait. Keep the
+  lock, or close the draft; having released with only a draft open, re-ticket and acquire at once —
+  the queue will hand it back until a peer takes it.
 
 Never close and reopen a PR to reclaim the lock: that discards the checks and the review trail to
 work around a lock whose job is already done.
