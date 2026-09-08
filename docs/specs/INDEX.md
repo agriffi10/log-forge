@@ -205,6 +205,13 @@ Group related specs and record the order to build them in. Keep this section: a 
   - **039 (fork) and 041 (sink integration)** are independent of the rest and of each other.
   - **040 last, and not before `1.0.0`.** It is a behaviour-preserving refactor of the lifecycle
     state, and the arc above is what happens when that state is edited.
+    > **Superseded on the timing, not the ordering.** 040 did go last, but it landed at `4fea8f3`
+    > and no tag contains it, so it ships **in** `1.0.0` rather than after it. What overtook the
+    > note is that the tag was held for the audit arcs while the arc kept closing, and three
+    > specs then declared a dependency on it — SPEC-044, SPEC-051 and SPEC-054, which is every
+    > row of the table above whose *Depends On* names SPEC-040 — so deferring it past the tag
+    > would have meant deferring them too. The reasoning above still says why it was scheduled
+    > last; it no longer says when it shipped.
 
   **The 1.0 cut line.** Most of this arc does **not** have to precede the tag, and that follows
   from taking 034 first: with `Health` a frozen dataclass and the `Sink` members probed by name,
@@ -243,6 +250,9 @@ Group related specs and record the order to build them in. Keep this section: a 
   review — but it makes the absence of a state machine survivable rather than removing it. Built
   after `1.0.0`: it is behaviour-preserving by construction, so it is the one thing here with no
   reason to be rushed.
+  > **Superseded** (see the note under **040 last** in the build order above): it landed at
+  > `4fea8f3`, before the tag, and is carried by `1.0.0`. It was not rushed — it was reached,
+  > and three later specs declared a dependency on the shape it left.
 
 - **Lifecycle races:** SPEC-044 — the six races SPEC-040's execution frame found over its own diff
   and its Out of Scope forbade it to fix. Each reproduces byte-identically on the pre-SPEC-040
