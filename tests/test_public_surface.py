@@ -1711,6 +1711,25 @@ def _frozen_sink_pairs() -> set[tuple[str, str]]:
       None.
     """
     text = (_ROOT / "tests" / "data" / "frozen_sink_paths.txt").read_text(encoding="utf-8")
+    return _parse_frozen_pairs(text)
+
+
+def _parse_frozen_pairs(text: str) -> set[tuple[str, str]]:
+    """Parse the frozen-paths baseline: `<ClassName> <dotted.module>` per line, `#` for comments.
+
+    Split from its caller so a corpus can drive it. It was written reading a fixed path, which is
+    exactly why it shipped with nine mutants verified by hand and none of them committed -- an
+    untestable seam is an untested one.
+
+    Args:
+      text: The baseline file's contents.
+
+    Returns:
+      The `(class name, dotted module)` pairs.
+
+    Raises:
+      AssertionError: On a line that is neither blank, a comment, nor a well-formed pair.
+    """
     pairs: set[tuple[str, str]] = set()
     for raw in text.splitlines():
         line = raw.strip()
@@ -1723,6 +1742,41 @@ def _frozen_sink_pairs() -> set[tuple[str, str]]:
         assert match, f"malformed line in tests/data/frozen_sink_paths.txt: {raw!r}"
         pairs.add((match.group(1), match.group(2)))
     return pairs
+
+
+def _resolution_fault(cls: str, mod: str, module: object, exc: ImportError | None) -> str | None:
+    """What the gate reports for one frozen pair, or `None` when the promise still holds.
+
+    Split out for the same reason as `_parse_frozen_pairs`: both holes a review found here were
+    in this logic, not in the loop around it -- `hasattr` accepting a `LokiSink = None`
+    optional-dependency placeholder, and a missing transitive dependency being announced as a
+    deleted module. Neither was expressible as a test while the logic lived inline.
+
+    Args:
+      cls: The promised class name.
+      mod: The promised dotted module path.
+      module: The imported module, ignored when `exc` is given.
+      exc: The `ImportError` the import raised, or `None` if it succeeded.
+
+    Returns:
+      The fault description, or `None` if the pair is sound.
+
+    Raises:
+      None.
+    """
+    if exc is not None:
+        # Distinguish the module itself being gone from one of ITS imports failing. Both raise
+        # ImportError, and reporting the second as the first sends a contributor hunting a
+        # deleted module that is sitting right there.
+        if isinstance(exc, ModuleNotFoundError) and exc.name == mod:
+            return f"{mod} is GONE, but the 1.x freeze promises {cls} there"
+        return f"{mod} does not import: {exc!r}"
+    if not inspect.isclass(getattr(module, cls, None)):
+        # `hasattr` is not enough: `LokiSink = None` as an optional-dependency fallback satisfies
+        # it while `LokiSink(url)` raises TypeError, so the name resolving is not the promise --
+        # a constructible class at that path is.
+        return f"{mod} no longer provides {cls} as a class"
+    return None
 
 
 def test_every_frozen_sink_import_path_still_resolves() -> None:
@@ -1751,22 +1805,13 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
     broken: list[str] = []
     for cls, mod in sorted(frozen):
         try:
-            module = importlib.import_module(mod)
+            module: object = importlib.import_module(mod)
         except ImportError as exc:
-            # Distinguish the module itself being gone from one of ITS imports failing. Both
-            # raise ImportError, and reporting the second as the first sends a contributor
-            # hunting a deleted module that is sitting right there -- an optional dependency
-            # hoisted to module level produces exactly that.
-            if isinstance(exc, ModuleNotFoundError) and exc.name == mod:
-                broken.append(f"{mod} is GONE, but the 1.x freeze promises {cls} there")
-            else:
-                broken.append(f"{mod} does not import: {exc!r}")
-            continue
-        if not inspect.isclass(getattr(module, cls, None)):
-            # `hasattr` is not enough: `LokiSink = None` as an optional-dependency fallback
-            # satisfies it while `LokiSink(url)` raises TypeError, so the name resolving is not
-            # the promise -- a constructible class at that path is.
-            broken.append(f"{mod} no longer provides {cls} as a class")
+            fault = _resolution_fault(cls, mod, None, exc)
+        else:
+            fault = _resolution_fault(cls, mod, module, None)
+        if fault is not None:
+            broken.append(fault)
     assert not broken, (
         "these import paths are frozen until 2.0.0 and the package no longer provides them. "
         f"Restore them, with a re-export at the old path if the code moved: {broken}"
@@ -2131,3 +2176,119 @@ def test_the_readme_link_scanner_corpus(name: str, markdown: str, should_fire: b
         assert relative, f"{name}: a relative target must be reported, and none was"
     else:
         assert not relative, f"{name}: must be ignored, but reported {relative}"
+
+
+# `(name, baseline text, expected pairs or None to mean "must be refused")`. The baseline IS the
+# 1.x promise, so a line it silently mis-parses is a path that stops being checked -- under-
+# coverage that reports clean. Every malformed form here reached `importlib` in an earlier build
+# and surfaced as a confusing missing-module error rather than as a bad line.
+_FROZEN_BASELINE_CASES: list[tuple[str, str, set[tuple[str, str]] | None]] = [
+    ("one pair", "LokiSink log_foundry.sinks.loki", {("LokiSink", "log_foundry.sinks.loki")}),
+    ("comment and blank lines are skipped", "# header\n\nLokiSink log_foundry.sinks.loki\n",
+     {("LokiSink", "log_foundry.sinks.loki")}),
+    ("leading and trailing whitespace", "  LokiSink log_foundry.sinks.loki  \n",
+     {("LokiSink", "log_foundry.sinks.loki")}),
+    ("a dotted subpackage path", "GCSSink log_foundry.sinks.cloud.gcs",
+     {("GCSSink", "log_foundry.sinks.cloud.gcs")}),
+    ("duplicate lines collapse", "A log_foundry.sinks.a\nA log_foundry.sinks.a",
+     {("A", "log_foundry.sinks.a")}),
+    ("a tab separator is refused", "LokiSink\tlog_foundry.sinks.loki", None),
+    ("a stray third field is refused", "LokiSink log_foundry.sinks.loki # moved", None),
+    ("a bare class name is refused", "LokiSink", None),
+    ("a foreign module path is refused", "LokiSink other.package.loki", None),
+    ("a two-space separator is refused", "LokiSink  log_foundry.sinks.loki", None),
+    ("a BOM on the first pair is refused", "﻿LokiSink log_foundry.sinks.loki", None),
+]
+
+
+@pytest.mark.parametrize(("name", "text", "expected"), _FROZEN_BASELINE_CASES)
+def test_the_frozen_baseline_parser_corpus(
+    name: str, text: str, expected: set[tuple[str, str]] | None
+) -> None:
+    """The baseline parser's own evidence: what it accepts, and what it must refuse loudly.
+
+    `test_every_frozen_sink_import_path_still_resolves` running green proves the current baseline
+    parses, not that the parser is right -- and a parser that silently drops a line drops a path
+    from the promise, which is under-coverage reporting clean.
+
+    Args:
+      name: The case label, so a failure names the form rather than an index.
+      text: The baseline content.
+      expected: The pairs, or `None` when the line must be refused.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if expected is None:
+        with pytest.raises(AssertionError, match="malformed line"):
+            _parse_frozen_pairs(text)
+    else:
+        assert _parse_frozen_pairs(text) == expected, name
+
+
+class _Stub:
+    """A stand-in module for the resolution corpus, carrying whatever attributes a case needs.
+
+    Attributes:
+      None -- attributes are set per case by the corpus.
+    """
+
+
+_LIVE = _Stub()
+_LIVE.LokiSink = type("LokiSink", (), {})  # type: ignore[attr-defined]
+_PLACEHOLDER = _Stub()
+_PLACEHOLDER.LokiSink = None  # type: ignore[attr-defined]
+_RENAMED = _Stub()
+_RENAMED.LokiPushSink = type("LokiPushSink", (), {})  # type: ignore[attr-defined]
+
+# `(name, module, exc, expected fragment or None for "no fault")`.
+_RESOLUTION_CASES: list[tuple[str, object, ImportError | None, str | None]] = [
+    ("a real class at the promised path", _LIVE, None, None),
+    ("a None placeholder is not a class", _PLACEHOLDER, None, "no longer provides"),
+    ("the class was renamed away", _RENAMED, None, "no longer provides"),
+    ("the module itself is gone", None,
+     ModuleNotFoundError("No module named 'log_foundry.sinks.loki'", name="log_foundry.sinks.loki"),
+     "is GONE"),
+    ("a transitive dependency is missing", None,
+     ModuleNotFoundError("No module named 'confluent_kafka'", name="confluent_kafka"),
+     "does not import"),
+    ("a plain ImportError from inside the module", None,
+     ImportError("cannot import name 'x'"), "does not import"),
+]
+
+
+@pytest.mark.parametrize(("name", "module", "exc", "fragment"), _RESOLUTION_CASES)
+def test_the_frozen_path_resolution_corpus(
+    name: str, module: object, exc: ImportError | None, fragment: str | None
+) -> None:
+    """The resolution logic's own evidence -- both holes a review found here lived in it.
+
+    `hasattr` accepted `LokiSink = None`, the ordinary optional-dependency fallback, while
+    `LokiSink(url)` raises `TypeError`; and a missing transitive dependency was announced as a
+    deleted module, sending a contributor to hunt a file sitting right there. Neither was
+    expressible as a test while this logic was inline in the gate's loop, which is why both
+    shipped.
+
+    The two `ModuleNotFoundError` cases are the discriminating pair: same exception type, and the
+    verdict turns entirely on whether `exc.name` is the module we asked for.
+
+    Args:
+      name: The case label.
+      module: The stand-in module, or `None` when an import raised.
+      exc: The import failure, or `None` when the import succeeded.
+      fragment: A substring the report must contain, or `None` for no fault.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    fault = _resolution_fault("LokiSink", "log_foundry.sinks.loki", module, exc)
+    if fragment is None:
+        assert fault is None, f"{name}: expected no fault, got {fault!r}"
+    else:
+        assert fault is not None and fragment in fault, f"{name}: got {fault!r}"
