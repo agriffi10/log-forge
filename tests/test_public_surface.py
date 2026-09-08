@@ -1807,3 +1807,38 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
         "these sink classes ship but no README table row documents them, so the freeze does not "
         f"reach them and a later move would be silent: {undocumented}"
     )
+
+
+def test_the_readme_carries_no_relative_file_links() -> None:
+    """The README is the PyPI long description, where a relative path resolves against pypi.org.
+
+    `pyproject.toml`'s `readme = "README.md"` embeds this file in the wheel and sdist metadata,
+    and PyPI renders that copy: `[MIT](LICENSE)` becomes `https://pypi.org/project/LICENSE` and
+    404s, while a relative image `src` renders nothing at all. Both were true of this file for its
+    whole life, and the drift is silent -- nothing about editing the README says where else it is
+    published, and the page only changes when a release is cut, so a broken link ships months
+    after it is written.
+
+    In-page anchors are exempt because they resolve inside the rendered page, on GitHub and on
+    PyPI alike.
+
+    The case for a gate rather than a note: the session that absolutised these links had, three
+    commits earlier, added a *relative* `CHANGELOG.md` link two lines below an absolute one it
+    had just written for exactly this reason. Knowing the rule is not enough.
+    """
+    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    # `!` distinguishes an image from a link so the failure can say which; the label may itself
+    # contain a bracketed span, which a naive `[^\]]*` label would truncate -- the README's own
+    # badge lines are `[![PyPI](...)](...)`.
+    pattern = re.compile(r"(!?)\[(?P<label>[^\]]*(?:\[[^\]]*\][^\]]*)*)\]\((?P<target>[^)]+)\)")
+    offenders = [
+        f"{'image' if m.group(1) else 'link'} [{m.group('label')[:40]}] -> {m.group('target')}"
+        for m in pattern.finditer(text)
+        if not m.group("target").startswith(("http://", "https://", "#"))
+    ]
+    assert not offenders, (
+        "these README targets are relative, so they break on the PyPI project page (an image "
+        "renders nothing; a link 404s against pypi.org). Use an absolute URL -- "
+        "https://github.com/agriffi10/log-forge/blob/main/<path> for a file, tree/main for a "
+        f"directory, and raw.githubusercontent.com for an image: {offenders}"
+    )

@@ -44,7 +44,7 @@ it could not back up. If you are coming from any `0.x`, read its release notes b
 several of the changes are silent, and they are written against `0.10.1`, the release immediately
 before this one:
 [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
-[`CHANGELOG.md`](CHANGELOG.md) indexes every version.
+[`CHANGELOG.md`](https://github.com/agriffi10/log-forge/blob/main/CHANGELOG.md) indexes every version.
 
 ---
 
@@ -175,7 +175,7 @@ with the child span pointing at its parent via `parent_span_id`:
 
 ## How it works
 
-![log-foundry pipeline: a traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps 1–4 run on your thread; the worker and sink run on a background thread. Support modules — config, ids, model, context, console — assist every step.](docs/assets/pipeline.svg)
+![log-foundry pipeline: a traced call opens a span, gathers events, then closes and hands off to a background worker that batches events and ships them to a sink. Steps 1–4 run on your thread; the worker and sink run on a background thread. Support modules — config, ids, model, context, console — assist every step.](https://raw.githubusercontent.com/agriffi10/log-forge/main/docs/assets/pipeline.svg)
 
 A traced call travels through a small pipeline. The first four steps run on your own thread
 and are deliberately fast; the last two run on a background thread so your code never waits on
@@ -1349,7 +1349,7 @@ there. Any ceiling firing sets `truncated: true` on the event.
 length** (sign included) for an integer. They coincide for ASCII digits, and one ceiling for "how
 big may a single value get" was preferred to a second config key. Note that all four ceilings
 bound each *value* — an event of many bounded values can still be large; see
-[Known constraints](docs/architecture.md#known-constraints).
+[Known constraints](https://github.com/agriffi10/log-forge/blob/main/docs/architecture.md#known-constraints).
 
 ## Development
 
@@ -1375,7 +1375,7 @@ The library uses a src layout (`src/log_foundry/`) with a single concept per mod
 the internal `_lifecycle`, `_fork` and `_diag`, and the `sinks/` package (the `base` protocol,
 `stdout`, and one module per sink family — see [Sinks](#sinks)). Anything underscore-prefixed
 is internal and moves without notice.
-Deeper design docs live in [`docs/`](docs/) — start with [`docs/architecture.md`](docs/architecture.md).
+Deeper design docs live in [`docs/`](https://github.com/agriffi10/log-forge/tree/main/docs/) — start with [`docs/architecture.md`](https://github.com/agriffi10/log-forge/blob/main/docs/architecture.md).
 
 ### Continuous integration
 
@@ -1386,14 +1386,14 @@ worth reading before assuming a PR was audited:
 
 | Check | Does | When | Fails the build |
 |---|---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | every PR | yes |
-| [`spec-lint.yml`](.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | specs touched | yes |
-| [`dependency-review.yml`](.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | every PR | yes |
-| [`zizmor.yml`](.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflow, action, dependabot or zizmor config touched; also weekly | no — reports to code scanning |
+| [`ci.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/ci.yml) | ruff → mypy → pytest, on 3.12 **and** 3.13 | every PR | yes |
+| [`spec-lint.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/spec-lint.yml) | lints the design specs under `docs/specs/` | specs touched | yes |
+| [`dependency-review.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/dependency-review.yml) | fails a PR that *introduces* a dependency with a known advisory (`moderate`+) | every PR | yes |
+| [`zizmor.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/zizmor.yml) | static analysis of the workflow files themselves | workflow, action, dependabot or zizmor config touched; also weekly | no — reports to code scanning |
 | CodeQL | `python` + `actions`, `extended` query suite; also weekly | every PR | no — reports to code scanning |
-| [`integration.yml`](.github/workflows/integration.yml) | the extras-backed sinks against nine real services in containers | sinks, `tests/integration/`, `pyproject.toml`, `poetry.lock` or that workflow touched; also weekly | it goes red, and like every check here it is advisory — `main` requires no status check at all, and this one is furthest from earning that: nine service containers are a flakiness budget |
-| [`pip-audit.yml`](.github/workflows/pip-audit.yml) | advisories across every extra, `--strict` | **not on PRs at all** — on the merge to `main` when the lockfile, extras, the ignore list or that workflow moved, and weekly | yes, on `main` |
-| [`scorecard.yml`](.github/workflows/scorecard.yml) | OpenSSF Scorecard over the repository's own supply chain | **not on PRs** — on the merge to `main` when `.github/`, `scripts/`, `SECURITY.md`, `LICENSE` or the lockfile moved, and weekly | no — reports to code scanning |
+| [`integration.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/integration.yml) | the extras-backed sinks against nine real services in containers | sinks, `tests/integration/`, `pyproject.toml`, `poetry.lock` or that workflow touched; also weekly | it goes red, and like every check here it is advisory — `main` requires no status check at all, and this one is furthest from earning that: nine service containers are a flakiness budget |
+| [`pip-audit.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/pip-audit.yml) | advisories across every extra, `--strict` | **not on PRs at all** — on the merge to `main` when the lockfile, extras, the ignore list or that workflow moved, and weekly | yes, on `main` |
+| [`scorecard.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/scorecard.yml) | OpenSSF Scorecard over the repository's own supply chain | **not on PRs** — on the merge to `main` when `.github/`, `scripts/`, `SECURITY.md`, `LICENSE` or the lockfile moved, and weekly | no — reports to code scanning |
 
 **`scripts/docs-lint.sh` is deliberately not in that table**, because nothing in CI runs it. It
 holds the always-loaded documentation tier to its budgets and is a local pre-push gate, so its
@@ -1401,7 +1401,7 @@ failure lands on whoever caused it rather than on a shared branch. Contributors 
 with `scripts/spec-lint.sh`, before pushing.
 
 On a push to `main` the full `ci.yml` matrix still runs, but as the first job of
-[`release.yml`](.github/workflows/release.yml), which `uses:` this same workflow before it would
+[`release.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/release.yml), which `uses:` this same workflow before it would
 be allowed to publish — so on main the checks are listed under the *Release* workflow, named
 `test / test (py3.12)` and `test / test (py3.13)`. `ci.yml` deliberately carries no `push`
 trigger of its own; it had one, and the result was that every merge ran the identical matrix
@@ -1412,7 +1412,7 @@ why there is no `codeql.yml` here (adding one would disable the default setup an
 the uploads). The two scanners that don't fail a build report findings to code scanning
 deliberately: the alert count is the verdict there, not the green check mark.
 
-[`dependabot.yml`](.github/dependabot.yml) opens scheduled version updates for `pip` and
+[`dependabot.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/dependabot.yml) opens scheduled version updates for `pip` and
 `github-actions` on top of the security updates GitHub raises against advisories. Both ecosystems
 use a cooldown so a freshly published release isn't adopted within hours of appearing, and `pip`
 uses `increase-if-necessary` so an update never narrows a floor this library publishes to its
@@ -1422,7 +1422,7 @@ consumers.
 
 Please report a vulnerability through GitHub's **private** reporting rather than a public issue:
 [**open a draft advisory**](https://github.com/agriffi10/log-forge/security/advisories/new).
-[`SECURITY.md`](SECURITY.md) covers what to include and what to expect — an acknowledgement
+[`SECURITY.md`](https://github.com/agriffi10/log-forge/blob/main/SECURITY.md) covers what to include and what to expect — an acknowledgement
 within 7 days, an assessment within 30. Fixes land on the latest released minor; there are no
 long-term support branches.
 
@@ -1438,7 +1438,7 @@ everything it instruments:
 - **Every release ships a CycloneDX SBOM** as a release asset
   ([latest release](https://github.com/agriffi10/log-forge/releases/latest),
   `log-foundry-X.Y.Z.cdx.json`), describing the published wheel with every extra installed.
-  [`SECURITY.md`](SECURITY.md#software-bill-of-materials) has the detail.
+  [`SECURITY.md`](https://github.com/agriffi10/log-forge/blob/main/SECURITY.md#software-bill-of-materials) has the detail.
 
 Scanning runs continuously rather than at release time: CodeQL over the source and the workflows,
 zizmor over the workflows, `dependency-review` on every pull request, `pip-audit` across all
@@ -1454,7 +1454,7 @@ is published on the advisory database's clock, not on this repository's.
 `poetry-dynamic-versioning`, so `pyproject.toml` carries no literal version and the published
 number can't drift from what Git says.
 
-[`release.yml`](.github/workflows/release.yml) reuses the CI suite as a gate, then builds an
+[`release.yml`](https://github.com/agriffi10/log-forge/blob/main/.github/workflows/release.yml) reuses the CI suite as a gate, then builds an
 sdist and a wheel:
 
 | Trigger | Version built | Published to PyPI as |
@@ -1482,10 +1482,10 @@ one from the commit range. Both are valid, but the lookup is by exact tag name a
 takes the tag, so notes written for one version do nothing for another and notes added after
 the tagged commit are not seen. A release body cannot be amended once published — this
 repository has immutable releases — so check the file is there and named for the tag before
-pushing it. **Add the version's section to [`CHANGELOG.md`](CHANGELOG.md) in the same commit** —
+pushing it. **Add the version's section to [`CHANGELOG.md`](https://github.com/agriffi10/log-forge/blob/main/CHANGELOG.md) in the same commit** —
 it is user-facing and no gate holds it to the tags, so it goes stale by being forgotten.
-[`docs/release-notes/`](docs/release-notes/) holds the notes written so far, and
-[`docs/spec-delivery/RELEASES.md`](docs/spec-delivery/RELEASES.md) records which specs each
+[`docs/release-notes/`](https://github.com/agriffi10/log-forge/tree/main/docs/release-notes/) holds the notes written so far, and
+[`docs/spec-delivery/RELEASES.md`](https://github.com/agriffi10/log-forge/blob/main/docs/spec-delivery/RELEASES.md) records which specs each
 version carried — its top row is written in the commit that version's tag is cut from, so it can
 name a tag that does not exist yet.
 
@@ -1501,4 +1501,4 @@ deliberately off the rolling `release/v1` branch PyPA recommends, because this i
 
 ## License
 
-[MIT](LICENSE) © Andrew Griffith
+[MIT](https://github.com/agriffi10/log-forge/blob/main/LICENSE) © Andrew Griffith
