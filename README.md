@@ -23,8 +23,9 @@ calls form a tree you can query later.
 **The public API is frozen for the whole of `1.x`.** Everything in `log_foundry.__all__`, the
 `Sink` protocol and every shipped sink class stays put: nothing is removed or renamed, and no
 signature changes in a way that breaks a caller, until `2.0.0`. Behaviour is not frozen by that
-promise — a defect is still a defect, and fixing one can change what a broken path does. Anything
-underscore-prefixed is internal and outside it entirely.
+promise — a defect is still a defect, and fixing one can change what a broken path does. `__all__`
+is the boundary: an underscore-prefixed *module* — `_lifecycle`, `_fork`, `_diag` — is internal and
+moves without notice.
 
 `1.0.0` was a reliability release rather than a feature release: three audit arcs worked through
 the paths where the library could lose an event, fail its caller, block forever, or report health
@@ -49,10 +50,7 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 
 > **Breaking in `1.0.0`, if you are upgrading from `0.10.x`.** Three public shapes changed once,
 > in the release that froze the API, because none of them could have been changed afterwards
-> without a major version. These are the three likeliest to reach a caller; the release notes
-> carry the full upgrade list, ordered by how likely each item is to reach you and ending with
-> the quiet ones —
-> [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md):
+> without a major version:
 >
 > - **`health()` and `sink.losses()` return frozen dataclasses**, not `NamedTuple`s. Attribute
 >   access (`h.dropped`, `losses.failed`) is unchanged and is the whole contract; `len(h)`,
@@ -67,6 +65,11 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 >   injects through `client=`** rather than the old `sdk` keyword, with no alias, and the sink attribute the
 >   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
 >   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
+>
+> Those are the three changes of *shape*, and not the three most likely to reach you: a deleted
+> module and several new construction-time refusals rank above two of them in the release notes'
+> own ordering. Read the full list of twenty-two before you upgrade —
+> [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
 >
 > `echo`, `message` and `fields` are reserved parameter names on the emitters; pass fields of
 > those names through `fields={...}`, which also takes keys that are not Python identifiers.
@@ -1444,10 +1447,11 @@ sdist and a wheel:
 | push tag `vX.Y.Z` | `X.Y.Z` | stable release |
 
 Dev pre-releases **kept** the upload path exercised on every merge, so a real release was never
-the first time it ran. That property is suspended along with the job: the next `vX.Y.Z` tag is
-the first attempt at the upload path since `publish-dev` was disabled. `pip install log-foundry`
-resolves to the latest **stable** version either way — pip ignores pre-releases unless you pass
-`--pre`.
+the first time it ran. That property is suspended along with the job, and `v1.0.0` is the tag that
+tested it — the first upload attempted since `publish-dev` was disabled, and it succeeded. The
+next tag is in that same position again, because nothing between releases exercises the path any
+more. `pip install log-foundry` resolves to the latest **stable** version either way — pip ignores
+pre-releases unless you pass `--pre`.
 
 Cutting a release is one tag:
 
