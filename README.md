@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/log-foundry?label=pypi)](https://pypi.org/project/log-foundry/)
 [![Python](https://img.shields.io/pypi/pyversions/log-foundry)](https://pypi.org/project/log-foundry/)
 [![Build](https://img.shields.io/github/actions/workflow/status/agriffi10/log-forge/release.yml?branch=main&label=build)](https://github.com/agriffi10/log-forge/actions/workflows/release.yml)
-[![License](https://img.shields.io/pypi/l/log-foundry)](LICENSE)
+[![License](https://img.shields.io/pypi/l/log-foundry)](https://github.com/agriffi10/log-forge/blob/main/LICENSE)
 
 Consistent, structured (JSON) logs for every decorated function call — correlated by shared
 trace/span IDs, ready to ship to any of 30-plus built-in sinks (stdout by default; SQS → ELK is
