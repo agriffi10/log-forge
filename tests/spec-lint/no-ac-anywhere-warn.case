@@ -1,5 +1,6 @@
 @@@ expect exit=0
 @@@ match WARN  docs/specs/SPEC-001-x.md: has FR-* requirements but no 'Acceptance Criteria'
+@@@ match 0 file(s) failed, 1 warning(s)
 @@@ file docs/invariants.md
 # Invariants
 
@@ -41,3 +42,4 @@ What it does.
 ## Implementation Phases
 
 prose
+

@@ -9,6 +9,27 @@
 # silence cases included. Its first run found a real defect the live specs could not show:
 # the parser named every second FR "" and skipped it, so a seven-FR spec reported four.
 #
+# TWENTY-THREE OF THESE CASES ARE THE TEMPLATE'S, AND ARE DERIVED RATHER THAN EDITED.
+# The spec-driven template owns them; log-forge needs exactly two deltas on each, both
+# forced by checks the template's linter does not have. Insert the 14-line
+# `@@@ file docs/invariants.md` block (lift it verbatim from any shared case) immediately
+# before the case's FIRST `@@@ file` line — without it, 13 of the 23 fail the
+# missing-invariants check — and flip every `**Status:** Draft` to `**Status:** Completed`,
+# without which 11 fail the per-FR citation check. Change nothing else, and re-derive
+# rather than hand-edit when the template moves:
+#
+#   for c in <template>/tests/spec-lint/*.case; do ... insert block; sed Draft->Completed ... done
+#
+# Derived from the template at `39c5656`. The 27 `cite-*` cases are log-forge's own and
+# are NOT derived; they cover the citation check, which the template has no equivalent of.
+#
+# THE DERIVATION IS NOT ENFORCED BY ANYTHING. Nothing in this repo or the template compares
+# the two corpora, so a shared case that is hand-edited here, or one the template hardens
+# later, drifts silently: the floor below counts files and the self-tests prove the guards
+# fire, and neither reads content. That is exactly how four assertions went missing — a
+# take-down added the 17 cases this repo lacked and left the 6 it already had untouched,
+# five of which were already behind. Re-derive when you touch a shared case.
+#
 # Each case asserts the specific FAIL or WARN TEXT, not just the exit code. A check that
 # fails for the wrong reason is a check that will be "fixed" by changing the wrong thing.
 # Cases named `*-ok.case` assert the linter stays SILENT — no `FAIL  ` line at all — and
