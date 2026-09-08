@@ -1,5 +1,5 @@
 @@@ expect exit=0
-@@@ file docs/process.md
+@@@ file docs/architecture.md
 # Process
 
 **Paid 2026-09-02:** the register is grouped by area, and Key Decisions is its digest.

@@ -71,10 +71,14 @@ path documented `Raises: None` — and both diff reviews then found more, with n
   diff: the diff, the spec's acceptance criteria, and the `best-practices/` rules for the domains it
   touches (route via their INDEX). Handing over the authoring rationale tells the reviewer what to
   conclude.
-- **What each review is for.** A **spec** review asks: is every FR testable and binary; does any
-  acceptance criterion pass vacuously; is anything in Out of Scope actually required by an FR; does
-  it contradict a settled decision or silently supersede one without saying so; are there Open
-  Questions wearing declarative clothes. A **plan** review asks: does every FR and acceptance
+- **What each review is for.** A **spec** review asks: is every FR testable and binary; **can every
+  pair of FRs hold at once**; does any acceptance criterion pass vacuously; is anything in Out of Scope
+  actually required by an FR; does it contradict a settled decision or silently supersede one without
+  saying so; are there Open Questions wearing declarative clothes. The pairwise question is there
+  because the rest of the list tests one requirement at a time, and two FRs that are each testable,
+  binary and in scope can still be mutually exclusive. The frame that reliably catches such a pair is
+  the build-it-from-the-spec rotation below; asking the question here is what keeps the reading frames
+  from depending on it. A **plan** review asks: does every FR and acceptance
   criterion have a phase that delivers it; is existing reuse used rather than re-built; has
   out-of-scope work crept in; is a phase resting on a premise nobody has checked. A **diff** review is
   the rules below.
@@ -264,7 +268,29 @@ yields a different class of finding than any reading-based frame.*
   a gate nobody in CI will ever run. Four rounds reviewed SPEC-205 and none ran the
   sibling repo's doc-layout gate; the branch was red on it throughout, for a reason unrelated to the
   spec, and it took an agent that *built* the change to notice. A review of a change touching gated
-  files runs the gates.
+  files runs the gates. **That list of gates is a floor:** also run whatever CI will run on the branch
+  (`.github/workflows/`), which may be a gate no document names.
+
+**Adjudicating two FRs that cannot both hold**
+
+*What to do with the contradiction the rotation above exists to find. Mid-build, `session-rhythm.md`
+triages it here. At the **spec gate** the reviewer flags the pair and the author adjudicates before the
+spec is Draft-ready — there is no implementation yet, so the experiment below has nothing to run.*
+
+- **The tie-break is the shipped suite, and it has four outcomes.** Implement each reading and run the
+  suites. **Exactly one fails** a shipped test: that reading regresses a guarantee an earlier spec
+  shipped, and the pair settles in favour of the other. **Both fail**, **neither fails**, or the spec
+  **already says it supersedes** the guarantee in question: the suite has settled nothing, and the pair
+  is the product-changing call `session-rhythm.md` escalates, not one to settle in-session. Running one reading,
+  seeing red and stopping is how a coin-flip gets recorded as evidence.
+- **A failing test is evidence only while it encodes a live guarantee.** Read the test and the spec that
+  shipped it before treating red as a verdict — a test written against the bug fails exactly like one
+  holding a guarantee. If the spec under construction means to retire that guarantee, the failing test
+  is the *work*, not the answer: say so in the spec, and update the test with it. A supersession the
+  spec never states is a defect in the spec, not a fact the suite can supply.
+- **Record the verdict in the spec in place** — which FR won, and which guarantee decided it — so the
+  next reader does not re-run the experiment. The revised spec re-enters its gate (*a revised artifact
+  is a new artifact*, above), and so does the plan if a phase now delivers the FR that lost.
 
 **Exit on the trajectory of the findings, not on an empty round**
 

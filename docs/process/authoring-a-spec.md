@@ -77,7 +77,7 @@ a required section, one that contains an "Open Questions" / "Checkpoint" heading
 In Progress spec whose FR names no invariant in its Acceptance Criteria — or has no such block at
 all — or names one `docs/invariants.md` does not number; it **warns** on unfilled placeholders, a
 spec with FRs but no acceptance criteria anywhere in it, and a spec carrying more than 8 FRs. It
-cannot see a vacuous acceptance criterion, a citation of the wrong invariant, or a decision
-promised in a declarative sentence — that is what the reviewer gate is for.
+cannot see a vacuous acceptance criterion, a citation of the wrong invariant, two FRs that cannot
+both hold, or a decision promised in a declarative sentence — that is what the reviewer gate is for.
 `scripts/spec-lint-test.sh` is its fixture corpus, run in CI beside it.
 

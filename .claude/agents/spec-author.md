@@ -16,8 +16,9 @@ is Out explicitly. No Open Questions and no sentence that promises a decision: c
 you cannot make and return it as a question for the human instead of parking it in the spec. Add the
 row to `docs/specs/INDEX.md`. Run `sh scripts/spec-lint.sh` and report its output verbatim.
 
-For completion work: follow the six steps in `completion-ritual.md` in order; the register entry is
-written in its area file, and its Contents row, before its fence — never after. Run
+For completion work: follow the seven steps in `completion-ritual.md` in order; the register entry is
+written in its area file, and its Contents row, before its fence — never after — and `CLAUDE.md`'s
+`## Specs` is pruned, never appended to. Run
 `sh scripts/docs-lint.sh` and report its output verbatim.
 
 Return: the paths you wrote, the lint output, and the decisions you could not make (or "none"). You

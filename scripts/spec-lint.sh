@@ -24,6 +24,11 @@
 set -eu
 
 SPEC_DIR="${1:-docs/specs}"
+# Scratch for the per-file section check, under $TMPDIR rather than a hardcoded /tmp, and
+# removed on exit; INT and TERM exit rather than continue.
+MISSING="${TMPDIR:-/tmp}/spec-lint-missing.$$"
+trap 'rm -f "$MISSING"' EXIT
+trap 'exit 1' INT TERM
 # The invariants page sits beside the spec directory, not beside this script: the lint is
 # run with a spec directory argument, and the corpus runs it against a scratch tree.
 INVARIANTS="$(dirname "$SPEC_DIR")/invariants.md"
@@ -43,6 +48,12 @@ required_sections="## Overview
 # Headings (any level) that must NOT appear.
 banned_headers="Open Questions|Checkpoint"
 
+# A spec directory that does not exist is not an empty one: a renamed or mis-typed directory
+# reported as "nothing to check" goes green in CI for the same reason a vanished corpus would.
+if [ ! -d "$SPEC_DIR" ]; then
+  echo "FAIL  $SPEC_DIR is not a directory, so nothing was linted. Pass the spec directory, or create it."
+  exit 1
+fi
 specs=$(find "$SPEC_DIR" -maxdepth 1 -type f -name 'SPEC-*.md' 2>/dev/null | sort || true)
 
 # Split the list on newlines only — an unquoted expansion on default IFS turns a
@@ -88,14 +99,14 @@ for f in $specs; do
   echo "$required_sections" | while IFS= read -r sec; do
     [ -n "$sec" ] || continue
     grep -qiE "^${sec}([[:space:]]|\$)" "$f" || echo "MISSING|$sec"
-  done > /tmp/spec-lint-missing.$$
-  if [ -s /tmp/spec-lint-missing.$$ ]; then
+  done > "$MISSING"
+  if [ -s "$MISSING" ]; then
     while IFS='|' read -r _ sec; do
       echo "FAIL  $f: missing required section '$sec'"
-    done < /tmp/spec-lint-missing.$$
+    done < "$MISSING"
     file_fail=1
   fi
-  rm -f /tmp/spec-lint-missing.$$
+  rm -f "$MISSING"
 
   # --- banned headers (any heading level) ---
   if grep -qiE "^#{1,6}[[:space:]].*(${banned_headers})" "$f"; then

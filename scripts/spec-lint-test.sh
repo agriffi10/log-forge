@@ -32,7 +32,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CASES="${SPEC_LINT_TEST_CASES:-$ROOT/tests/spec-lint}"
 FILTER="${1:-}"
 WORK="${TMPDIR:-/tmp}/spec-lint-test.$$"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK" "$WORK.self"' EXIT
+trap 'exit 1' INT TERM
 
 # Parse the linter before exercising it. A syntax error partway through a shell script can
 # end a run with status 0 — the linter never reaches its checks and reports success on a
@@ -58,7 +59,7 @@ for case_file in "$CASES"/*.case; do
 
   want_exit=$(sed -n 's/^@@@ expect exit=//p' "$case_file")
   awk -v work="$WORK" '
-    /^@@@ file / { path = work "/" substr($0, 10); system("mkdir -p $(dirname \"" path "\")"); out = path; next }
+    /^@@@ file / { path = work "/" substr($0, 10); system("mkdir -p \"$(dirname \"" path "\")\""); out = path; next }
     /^@@@ / { out = ""; next }
     out { print >> out }
   ' "$case_file"
@@ -75,9 +76,13 @@ for case_file in "$CASES"/*.case; do
     continue
   fi
   missing=""
-  for d in $decl; do [ -f "$WORK/$d" ] || missing="$missing $d"; done
-  if [ -n "$missing" ]; then
-    fail=$((fail + 1)); echo "FAIL  $name: declared file(s) never written:$missing"
+  # Declared paths may carry a space, so they are read line by line rather than word-split.
+  printf '%s\n' "$decl" | while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ -f "$WORK/$d" ] || printf '%s\n' "$d"
+  done > "$WORK/.missing"
+  if [ -s "$WORK/.missing" ]; then
+    fail=$((fail + 1)); echo "FAIL  $name: declared file(s) never written: $(tr '\n' ' ' < "$WORK/.missing")"
     continue
   fi
   if [ "$(grep -c '^@@@' "$case_file")" != "$(grep -cE '^@@@ (file |expect exit=|match |absent )' "$case_file")" ]; then
@@ -134,6 +139,50 @@ if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && case template-unfilled in *"$FILTER"*) 
   esac
 fi
 
+if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && case template-placeholders in *"$FILTER"*) true ;; *) false ;; esac; then
+  # Each placeholder the linter's regex names, as a sed pattern that removes it. The list is
+  # kept here rather than read from the linter so that dropping an alternative from the regex
+  # is a red case, not a quieter corpus.
+  unbound=""
+  for keep in 'Feature Name' 'Requirement Name' 'SPEC-XXX' 'YYYY-MM-DD'; do
+    rm -rf "$WORK"; mkdir -p "$WORK/scripts" "$WORK/docs/specs"
+    cp "$ROOT/scripts/spec-lint.sh" "$WORK/scripts/spec-lint.sh"
+    # Scrub every placeholder except the one under test. Bracketed names are matched with the
+    # brackets escaped; the others are plain strings.
+    sed -e "$([ "$keep" = 'Feature Name' ] || printf 's/\\[Feature Name\\]/feature/g')" \
+        -e "$([ "$keep" = 'Requirement Name' ] || printf 's/\\[Requirement Name\\]/requirement/g')" \
+        -e "$([ "$keep" = 'SPEC-XXX' ] || printf 's/SPEC-XXX/SPEC-001/g')" \
+        -e "$([ "$keep" = 'YYYY-MM-DD' ] || printf 's/YYYY-MM-DD/2026-01-01/g')" \
+        "$ROOT/docs/templates/spec-template.md" > "$WORK/docs/specs/SPEC-000-template.md"
+    got=$(cd "$WORK" && sh scripts/spec-lint.sh 2>&1) && rc=0 || rc=$?
+    # The exit code is not asserted here: an unfilled copy of THIS repo's template also fails the
+    # invariant-citation check, which is the template-unfilled case's claim, not this one's.
+    case "$got" in
+      *"unfilled template placeholder(s)"*) ;;
+      *) unbound="$unbound '$keep'" ;;
+    esac
+  done
+  if [ -z "$unbound" ]; then
+    pass=$((pass + 1)); echo "ok    template-placeholders"
+  else
+    fail=$((fail + 1)); echo "FAIL  template-placeholders: left alone in the template, these placeholder(s) did not warn:$unbound"
+  fi
+fi
+
+# A spec directory that does not exist must FAIL, not report "nothing to check": the cases above
+# always build `docs/specs`, so this one drives the linter at a path that is not there. Under the
+# same filter as the cases.
+if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && case missing-dir in *"$FILTER"*) true ;; *) false ;; esac; then
+  rm -rf "$WORK"; mkdir -p "$WORK/scripts"
+  cp "$ROOT/scripts/spec-lint.sh" "$WORK/scripts/spec-lint.sh"
+  got=$(cd "$WORK" && sh scripts/spec-lint.sh docs/nowhere 2>&1) && rc=0 || rc=$?
+  case "$rc:$got" in
+    1:*"docs/nowhere is not a directory"*) pass=$((pass + 1)); echo "ok    missing-dir" ;;
+    *) fail=$((fail + 1)); echo "FAIL  missing-dir: exit $rc; a spec directory that does not exist must fail, not pass as empty"
+       printf '%s\n' "$got" | sed 's/^/        /' | head -4 ;;
+  esac
+fi
+
 echo "----"
 echo "spec-lint-test: $pass passed, $fail failed."
 [ "$fail" -eq 0 ] || exit 1
@@ -149,8 +198,8 @@ if [ -n "$FILTER" ] && [ "$pass" -eq 0 ]; then
   echo "spec-lint-test: the filter '$FILTER' matched no case. Nothing ran, so nothing passed."
   exit 1
 fi
-CASES_MIN=20
-if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
+CASES_MIN=40
+if { [ -z "${SPEC_LINT_TEST_CASES:-}" ] || [ -n "${SPEC_LINT_TEST_FLOOR:-}" ]; } && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "spec-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"
   echo "shrunk or gone missing — a run over nothing exits 0 and looks exactly like a healthy"
   echo "one. If cases were removed on purpose, lower CASES_MIN in the same change."
@@ -213,4 +262,32 @@ if [ -z "${SPEC_LINT_TEST_CASES:-}" ] && [ -z "$FILTER" ]; then
     exit 1
   fi
   echo "spec-lint-test: fixture guards verified — 3 guards, $planted vacuous cases refused."
+
+  # The FLOOR has to fire too, and nothing above proves it: the self-test invocation sets
+  # SPEC_LINT_TEST_CASES, which disables the floor so a handful of planted cases can run.
+  # SPEC_LINT_TEST_FLOOR re-enables it for this one run over a copy of three real cases —
+  # far under the floor — which must exit non-zero and name the floor. A floor that cannot
+  # be shown to fire is a success line waiting to be printed over nothing.
+  FLOOR="$WORK.floor"
+  rm -rf "$FLOOR"; mkdir -p "$FLOOR"
+  n=0
+  for c in "$CASES"/*.case; do
+    [ -f "$c" ] || continue
+    cp "$c" "$FLOOR/"; n=$((n + 1)); [ "$n" -ge 3 ] && break
+  done
+  floor_out=$(SPEC_LINT_TEST_CASES="$FLOOR" SPEC_LINT_TEST_FLOOR=1 sh "$0" 2>&1) && floor_rc=0 || floor_rc=$?
+  rm -rf "$FLOOR"
+  floor_fail=0
+  [ "$floor_rc" -ne 0 ] || { echo "FAIL  self-test: the harness exited 0 on $n cases, under a floor of $CASES_MIN."; floor_fail=1; }
+  case "$floor_out" in
+    *"against a floor of $CASES_MIN"*) ;;
+    *) echo "FAIL  self-test: a run under the floor did not name the floor."; floor_fail=1 ;;
+  esac
+  if [ "$floor_fail" -ne 0 ]; then
+    echo "----"
+    echo "spec-lint-test: the case floor is not firing. A corpus that shrinks to nothing would"
+    echo "print a success line, which is the failure the floor exists to refuse."
+    exit 1
+  fi
+  echo "spec-lint-test: the case floor fires — $n cases refused against $CASES_MIN."
 fi

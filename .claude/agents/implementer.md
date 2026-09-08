@@ -19,7 +19,8 @@ kind — reversible or technical, decide and note it; product-changing or ambigu
 with options and a recommendation. Get this repo's gates green: `poetry run ruff check .`,
 `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
 `poetry run python scripts/docstring-lint.py`, plus a linter's own `-test.sh` corpus whenever you
-changed that linter. `ruff format` is not a gate here — format only the files you edited. Run
+changed that linter, plus whatever CI will run on the branch (`.github/workflows/`) — that list is
+a floor, not the set. `ruff format` is not a gate here — format only the files you edited. Run
 `poetry install --with dev` in a fresh worktree before trusting any of them. Commit on your branch
 with messages that say why. Never push, never open a PR, never merge — the orchestrator owns the
 review gate and the remote.

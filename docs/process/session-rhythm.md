@@ -55,16 +55,25 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
   hang an application thread forever; that review is the one that now happens before the push.
 - Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
-  `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that linter.
+  `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
+  linter — plus `sh scripts/pr-queue-test.sh` if you touched the queue or its hook, and
+  `sh scripts/pr-queue/install-test.sh` if you touched its installer.
   **The last two are in that set and nothing in CI runs either.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (`operational-traps.md`). Format only the files you edited.
+- **The gates a document names are a floor, not the set — before every push, also run locally
+  whatever CI will run on the branch.** A gate no list names is the one that goes unrun, and green
+  from the named gates says nothing about it. Read `.github/workflows/` for the jobs that will
+  actually run, not just this list — including after a rebase, when a job can newly go red on work
+  that was green before `main` moved.
 - Work the **reviewed** plan's phases in order, **straight through to completion**. Summarize a phase
   in passing where it is worth saying, but do not end the turn on it — a summary that ends the turn
-  *is* a request for approval, whatever its wording says. Re-review the plan only if the phase
+  *is* a request for approval, whatever its wording says, and so is a list of options written out in
+  prose — when a decision genuinely needs the human, ask it (the triage below says how). Re-review the plan only if the phase
   changed it — a phase that revises the plan has produced a new artifact, and it goes through the
-  gate as one.
+  gate as one. A spec revised mid-build does this from the other side: if a phase now delivers a
+  requirement the spec no longer carries, that plan is a new artifact too.
 - **An acceptance criterion that cannot settle before the push does not pass the pre-push review —
   it is recorded as owed.** A criterion closing "against a green CI run" is undecidable while the
   branch is still local, and the failure mode is a reviewer ticking it vacuously, which is the exact
@@ -78,16 +87,30 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
   the relevant section(s). Apply the rules as you write; flag (don't silently break) any that conflict
   with existing code or the repo's `ruff`/`mypy` config.
 - Specs ship with **no Open Questions** — they're resolved during authoring (`authoring-a-spec.md`). An issue that emerges
-  mid-build is triaged by *kind*, not parked:
+  mid-build is triaged by *kind*, not parked — and the test for the kind is **what the wrong choice
+  would cost**: a revert or a follow-up commit, decide; a product outcome the user would have to live
+  with, ask:
   - **Reversible / technical** (naming, file layout, which helper to reuse, an obvious bug fix): just
     decide in-session and keep moving. If it changes scope or contradicts the spec, **update the spec**
     rather than leaving the divergence implicit.
   - **Product-changing / ambiguous** (anything that alters behavior the user would notice, or a call
-    with no clearly-right answer): **stop and escalate to the human.** Don't silently pick — surface the
-    options with a recommendation. Auto-deciding these is how an autonomous run drifts away from what
-    was actually wanted.
+    with no clearly-right answer): **stop and escalate to the human.** Don't silently pick — ask with
+    the **question tool** (`AskUserQuestion`), the options as selections and the recommended one
+    first, and go on with the answer; options written out in prose that end the turn are the same
+    stop by another name.
+    Auto-deciding these is how an autonomous run drifts away from what was actually wanted.
+  - **The spec contradicting itself** (two FRs that cannot both hold): a spec defect, not a preference
+    call, and the tie-break is evidence — implement **each** reading, run the suite, and record the
+    verdict in the spec. One reading run to red settles nothing. `reviewer-contract.md` (*Adjudicating two FRs that cannot both hold*) carries the
+    method, and the three outcomes that escalate instead of settling.
 
 **Landing the spec — watch PRs and watch `main`**
+- **The instruction to build the spec is the authorization for everything in this section.** Pushing
+  the reviewed branch, opening the PR, watching it and merging it on green are the last steps of the
+  build, not new decisions: do not stop to ask for them, and do not stop after announcing them — a
+  session whose turn ends at "I'll open the PR" has not built the spec. What still stops the session
+  is a product-changing call or a permission the harness refuses; say which, and ask with the
+  question tool.
 - **A branch reaches the remote already reviewed.** The gate above is the precondition for the push,
   so a PR opens carrying work whose findings are already fixed or answered. If a review round happens
   after a push anyway — a late finding, a rotated frame, a reviewer that ran long — its fixes are
@@ -112,6 +135,8 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
 - **Key the watch on the current head sha, never a bare `gh pr checks --watch`** — it can exit clean
   against the **previous** commit's checks, and a hand-written shell condition can invert and print
   "settled" while a job is still running. Both report a green that is not there.
+  `gh pr view <n> --json headRefOid,statusCheckRollup` returns the sha and the checks against it in
+  one call, and the shipped `.claude/settings.json` covers it where `gh api` is not.
 - **`main` is always watched.** After any merge, confirm `main`'s build went green. If `main` fails,
   **diagnose immediately and fix it with a new PR** — a red `main` is the top priority and blocks
   starting the next spec.

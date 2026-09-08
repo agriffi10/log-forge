@@ -24,7 +24,9 @@ The report:
   `poetry run pytest`, `sh scripts/spec-lint.sh` on any spec touched,
   `poetry run python scripts/docstring-lint.py` on any change under `src/`, and `sh scripts/docs-lint.sh`
   on any change touching `CLAUDE.md`, `docs/process/`, `docs/decisions/`, `.claude/rules/`,
-  `.claude/agents/` or a delivery doc. Report exit codes, not summary lines.
+  `.claude/agents/` or a delivery doc. That list is a floor: also run whatever CI will run on the
+  branch (`.github/workflows/`), which may be a gate no document names. Report exit codes, not
+  summary lines.
 - In the system frame, start from `docs/invariants.md`: for each numbered invariant the change
   touches, ask whether it still holds on every **twin path**, not only the path the spec names.
 - In the build frame, build the thing: write the code the artifact implies, off the branch under
