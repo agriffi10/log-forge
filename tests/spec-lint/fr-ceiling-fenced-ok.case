@@ -66,10 +66,13 @@ What it does.
 
 prose
 
-```
+  ```
 ### FR-004: quoted
-```
-<!-- ### FR-005: out -->
+  ```
+~~~
+### FR-005: tilde-fenced
+~~~
+<!-- ### FR-006: out -->
 <!--
-### FR-006: out
+### FR-007: out
 -->

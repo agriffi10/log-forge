@@ -1,5 +1,6 @@
 @@@ expect exit=0
 @@@ match WARN  docs/specs/SPEC-001-x.md: 4 FRs (over the 3 ceiling)
+@@@ match 0 file(s) failed, 1 warning(s)
 @@@ file docs/invariants.md
 # Invariants
 
@@ -15,6 +16,9 @@ text
 
 text
 @@@ file docs/specs/SPEC-001-x.md
+<!--
+```
+-->
 # Spec: X
 
 **ID:** SPEC-001
@@ -62,7 +66,7 @@ What it does.
 
 - a
 
-### FR-004: Thing 4
+### FR-004: Thing 4 <!-- keep -->
 
 #### Description:
 
@@ -75,3 +79,4 @@ What it does.
 ## Implementation Phases
 
 prose
+

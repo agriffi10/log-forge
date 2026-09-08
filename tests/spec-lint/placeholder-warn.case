@@ -1,5 +1,6 @@
 @@@ expect exit=0
 @@@ match WARN  docs/specs/SPEC-001-x.md: unfilled template placeholder(s)
+@@@ match 0 file(s) failed, 1 warning(s)
 @@@ file docs/invariants.md
 # Invariants
 
