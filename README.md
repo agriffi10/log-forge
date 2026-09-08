@@ -26,12 +26,13 @@ calls form a tree you can query later.
   definition waits for the drain it asked for.
 
 **The public API is frozen for the whole of `1.x`.** Everything in `log_foundry.__all__`, the
-`Sink` protocol, and every shipped sink class **at the import path documented for it below**
-stays put: nothing is removed, renamed or moved, and no signature changes in a way that breaks a
-caller, until `2.0.0`. The import path is part of that promise because it has to be — no concrete
-sink is exported from the top level, so `from log_foundry.sinks.sqs import SQSSink` is the only
-way to reach one, and a class pinned at a path free to move is not pinned at all. `1.0.0` is
-where they last moved; the upgrade note below says which.
+`Sink` protocol, and every shipped sink class **at the import path documented for it below** —
+together with the public names those signatures use, such as `GroupIdSource`, `DedupIdSource` and
+`Backend` — stays put: nothing is removed, renamed or moved, and no signature changes in a way
+that breaks a caller, until `2.0.0`. The import path is part of that promise because it has to
+be — no concrete sink is exported from the top level, so `from log_foundry.sinks.sqs import
+SQSSink` is the only way to reach one, and a class pinned at a path free to move is not pinned at
+all. `1.0.0` is where they last moved; the upgrade note below says which.
 
 Behaviour is not frozen by that promise — a defect is still a defect, and fixing one can change
 what a broken path does. The private half is genuinely private: underscore-prefixed modules —
@@ -41,8 +42,9 @@ what a broken path does. The private half is genuinely private: underscore-prefi
 the paths where the library could lose an event, fail its caller, block forever, or report health
 it could not back up. If you are coming from any `0.x`, read its release notes before you bump —
 several of the changes are silent, and they are written against `0.10.1`, the release immediately
-before this one. [`CHANGELOG.md`](CHANGELOG.md) indexes every version;
+before this one:
 [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
+[`CHANGELOG.md`](CHANGELOG.md) indexes every version.
 
 ---
 
@@ -1480,7 +1482,9 @@ one from the commit range. Both are valid, but the lookup is by exact tag name a
 takes the tag, so notes written for one version do nothing for another and notes added after
 the tagged commit are not seen. A release body cannot be amended once published — this
 repository has immutable releases — so check the file is there and named for the tag before
-pushing it. [`docs/release-notes/`](docs/release-notes/) holds the ones written so far, and
+pushing it. **Add the version's section to [`CHANGELOG.md`](CHANGELOG.md) in the same commit** —
+it is user-facing and no gate holds it to the tags, so it goes stale by being forgotten.
+[`docs/release-notes/`](docs/release-notes/) holds the notes written so far, and
 [`docs/spec-delivery/RELEASES.md`](docs/spec-delivery/RELEASES.md) records which specs each
 version carried — its top row is written in the commit that version's tag is cut from, so it can
 name a tag that does not exist yet.
