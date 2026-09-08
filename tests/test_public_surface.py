@@ -10,6 +10,7 @@ SPEC-032 and SPEC-035 both paid for.
 import ast
 import collections.abc
 import dataclasses
+import importlib
 import inspect
 import io
 import pathlib
@@ -1663,3 +1664,146 @@ def test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_other
         case log_foundry.SinkLosses(dropped=d, failed=f):
             matched = (d, f)
     assert matched == (1, 2)
+
+
+def _sink_pairs_the_readme_documents() -> set[tuple[str, str]]:
+    """Every (class, module) pair the README's sink tables tell a reader to import *today*.
+
+    Derived from the table rows rather than listed, for the same reason
+    `_names_the_readme_imports` is. Only the first two cells are read -- the third is prose about
+    configuration and names modules in running text that are not import instructions.
+
+    This is the CURRENT documentation, not the promise. `_frozen_sink_pairs` is the promise.
+
+    Args:
+      None.
+
+    Returns:
+      The (class name, dotted module) pairs documented anywhere in the README.
+
+    Raises:
+      None.
+    """
+    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    pattern = r"^\|\s*`(\w+)`\s*\|\s*`(log_foundry\.sinks\.[\w.]+)`\s*\|"
+    return {(m.group(1), m.group(2)) for m in re.finditer(pattern, text, re.MULTILINE)}
+
+
+def _frozen_sink_pairs() -> set[tuple[str, str]]:
+    """The (class, module) pairs the `1.x` freeze promises, read from the committed baseline.
+
+    Pinned in `tests/data/frozen_sink_paths.txt` rather than re-derived from the README, and that
+    is the whole point: the promise is temporal -- a path documented at `v1.0.0` resolves until
+    `2.0.0` -- while the README says only what is true today. A gate that compares the README to
+    the package passes any rename whose author updated both sides in one commit, which is exactly
+    the `sinks/util.py` split this promise exists to prevent; the first version of this check did
+    that and went green on a replay of it. Reading the tag at runtime is not the alternative:
+    `.github/workflows/ci.yml` checks out without tags, so `git show v1.0.0:README.md` is
+    unavailable in CI.
+
+    Args:
+      None.
+
+    Returns:
+      The frozen (class name, dotted module) pairs.
+
+    Raises:
+      None.
+    """
+    text = (_ROOT / "tests" / "data" / "frozen_sink_paths.txt").read_text(encoding="utf-8")
+    pairs: set[tuple[str, str]] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Matched whole rather than split, so a malformed line fails HERE naming itself. Split
+        # on the first space, a stray third field rode into importlib as part of the module name
+        # and was reported as a missing module; a tab separator reached it as an empty one.
+        match = re.fullmatch(r"(\w+) (log_foundry\.sinks\.[\w.]+)", line)
+        assert match, f"malformed line in tests/data/frozen_sink_paths.txt: {raw!r}"
+        pairs.add((match.group(1), match.group(2)))
+    return pairs
+
+
+def test_every_frozen_sink_import_path_still_resolves() -> None:
+    """The `1.x` freeze covers the sink class *at its documented import path* -- so gate the path.
+
+    `docs/decisions/public-api.md` -> *The frozen surface is the import path, not just the class*
+    promises the dotted path, not merely the class: no concrete sink is exported from the top
+    level, so the path is the only route to one and a class pinned at a movable path is pinned to
+    nothing.
+
+    Three assertions, and they are three because the promise has three ways to break. The path
+    stops resolving -- the break itself. The README stops documenting a frozen path -- the promise
+    survives but nobody can find it, and the drift is invisible while a sibling row keeps the
+    module documented. A new sink module ships undocumented -- it is then outside the freeze by
+    omission rather than by decision.
+    """
+    frozen = _frozen_sink_pairs()
+    # A FLOOR, not an equality: `v1.0.0` promised 37 paths and the freeze only ever grows, so a
+    # new sink appends a line and must not have to edit this number too. It exists to catch the
+    # baseline being truncated or emptied, which would turn every assertion below vacuous.
+    assert len(frozen) >= 37, (
+        f"the frozen roster carries {len(frozen)} pairs; v1.0.0 promised 37 and the freeze only "
+        "grows. A line was removed -- a path promised until 2.0.0 cannot be dropped."
+    )
+
+    broken: list[str] = []
+    for cls, mod in sorted(frozen):
+        try:
+            module = importlib.import_module(mod)
+        except ImportError as exc:
+            # Distinguish the module itself being gone from one of ITS imports failing. Both
+            # raise ImportError, and reporting the second as the first sends a contributor
+            # hunting a deleted module that is sitting right there -- an optional dependency
+            # hoisted to module level produces exactly that.
+            if isinstance(exc, ModuleNotFoundError) and exc.name == mod:
+                broken.append(f"{mod} is GONE, but the 1.x freeze promises {cls} there")
+            else:
+                broken.append(f"{mod} does not import: {exc!r}")
+            continue
+        if not inspect.isclass(getattr(module, cls, None)):
+            # `hasattr` is not enough: `LokiSink = None` as an optional-dependency fallback
+            # satisfies it while `LokiSink(url)` raises TypeError, so the name resolving is not
+            # the promise -- a constructible class at that path is.
+            broken.append(f"{mod} no longer provides {cls} as a class")
+    assert not broken, (
+        "these import paths are frozen until 2.0.0 and the package no longer provides them. "
+        f"Restore them, with a re-export at the old path if the code moved: {broken}"
+    )
+
+    documented = _sink_pairs_the_readme_documents()
+    undocumented_frozen = sorted(frozen - documented)
+    assert not undocumented_frozen, (
+        "the README no longer documents these frozen import paths, so a reader cannot find a "
+        f"path the library still promises: {undocumented_frozen}"
+    )
+
+    # `base` is the one public sink module with no table row, and correctly so: it is re-exported
+    # wholesale from the top level, so the `__all__` clause of the freeze covers it instead.
+    # Derived from its own `__all__` rather than a hand-listed set -- a listed one silently stops
+    # describing the module the moment a name is added to it.
+    from log_foundry.sinks import base as _base
+
+    exempt = "log_foundry.sinks.base"
+    not_reexported = sorted(set(_base.__all__) - set(log_foundry.__all__))
+    assert not not_reexported, (
+        f"{exempt} has no README row only because everything it exports is a top-level export; "
+        f"these are not: {not_reexported}"
+    )
+
+    # Class-level, not module-level. A module glob missed both a sink shipped in a package's
+    # `__init__.py` and a NEW class added to an already-documented module, and the promise is
+    # per class-at-path. `_sink_classes_with_emit` reads the AST, so it sees every shipped sink
+    # in an environment with no extras -- which is what CI is.
+    documented_classes = {cls for cls, _ in documented}
+    shipped_classes = {
+        node.name
+        for _, node in _sink_classes_with_emit()
+        if not node.name.startswith("_") and node.name != "Sink"
+    }
+    undocumented = sorted(shipped_classes - documented_classes)
+    assert not undocumented, (
+        "these sink classes ship but no README table row documents them, so the freeze does not "
+        f"reach them and a later move would be silent: {undocumented}"
+    )
