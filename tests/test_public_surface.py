@@ -1807,3 +1807,327 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
         "these sink classes ship but no README table row documents them, so the freeze does not "
         f"reach them and a later move would be silent: {undocumented}"
     )
+
+
+def _mask_code(text: str) -> str:
+    """Blank out fenced blocks and inline code spans, preserving offsets and line count.
+
+    A link scanner that reads code is worse than none. No fenced line in this README trips it
+    today -- the walk finds the same targets masked or not -- but the shapes that would are
+    ordinary Python this file is full of: a subscript-then-call such as `SINKS["sqs"](url)` reads
+    as a markdown link, and the likeliest next edit is someone documenting the rule below inside a
+    fence, which is a literal relative link in a code sample. Replacing with spaces rather than
+    deleting keeps reported offsets and line numbers honest.
+
+    Args:
+      text: The markdown source.
+
+    Returns:
+      The same text with code content replaced by spaces.
+
+    Raises:
+      None.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    fence: tuple[str, int] | None = None
+    for line in lines:
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        opener = re.match(r"(`{3,}|~{3,})", stripped) if indent <= 3 else None
+        if fence is None:
+            if opener and not (opener.group(1)[0] == "`" and "`" in stripped[opener.end() :]):
+                fence = (opener.group(1)[0], len(opener.group(1)))
+                out.append(_blanked(line))
+                continue
+            out.append(line)
+        else:
+            char, width = fence
+            closing = (
+                opener is not None
+                and opener.group(1)[0] == char
+                and len(opener.group(1)) >= width
+                and not stripped[opener.end() :].strip()
+            )
+            out.append(_blanked(line))
+            if closing:
+                fence = None
+    masked = "".join(out)
+
+    # Inline spans, paragraph by paragraph: a code span cannot cross a blank line, so pairing
+    # across one lets a single stray backtick flip the phase for the rest of the file. A
+    # backslash-escaped backtick is a literal and must not open one.
+    chunks: list[str] = []
+    for para in re.split(r"(\n[ \t]*\n)", masked):
+        if para.strip("\n \t") == "":
+            chunks.append(para)
+            continue
+        chunks.append(re.sub(r"(?<![`\\])(`+)(?!`).*?(?<!`)\1(?!`)", _blanked_match, para, flags=re.DOTALL))
+    return "".join(chunks)
+
+
+def _blanked(text: str) -> str:
+    """Replace every character except newlines with a space, preserving offsets.
+
+    Args:
+      text: The text to blank.
+
+    Returns:
+      The same length, newlines intact.
+
+    Raises:
+      None.
+    """
+    return "".join("\n" if c == "\n" else " " for c in text)
+
+
+def _blanked_match(match: re.Match[str]) -> str:
+    """Blank a regex match, preserving its length and newlines.
+
+    Args:
+      match: The match to blank.
+
+    Returns:
+      The blanked text.
+
+    Raises:
+      None.
+    """
+    return _blanked(match.group(0))
+
+
+def _markdown_targets(text: str) -> list[tuple[bool, str, str]]:
+    """Every inline link and image target, outermost first and then the nested ones.
+
+    A bracket walk rather than a regex, because the form that matters defeats one. A badge is
+    `[![alt](img)](href)`, and a regex scanning left to right matches the inner image, finds its
+    target absolute and never examines the outer `href` -- which is how a relative `](LICENSE)`
+    survived on line 6 of this README with the first version of this gate green over it.
+    Recursing into the label is what catches both halves.
+
+    Args:
+      text: The markdown source, already code-masked.
+
+    Returns:
+      `(is_image, label, target)` for each, targets stripped of any `"title"` and `<>` wrapper.
+
+    Raises:
+      None.
+    """
+    found: list[tuple[bool, str, str]] = []
+    i = 0
+    while i < len(text):
+        if text[i] != "[":
+            i += 1
+            continue
+        is_image = i > 0 and text[i - 1] == "!"
+        depth, j = 0, i
+        while j < len(text):
+            if text[j] == "[":
+                depth += 1
+            elif text[j] == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(text) or j + 1 >= len(text) or text[j + 1] != "(":
+            i += 1
+            continue
+        depth, k = 0, j + 1
+        while k < len(text):
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k >= len(text):
+            i += 1
+            continue
+        label, target = text[i + 1 : j], text[j + 2 : k]
+        target = re.sub(r"""\s+["'(].*$""", "", target.strip()).strip()
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+        found.append((is_image, label, target))
+        found.extend(_markdown_targets(label))
+        i = k + 1
+    return found
+
+
+def _reference_definitions(text: str) -> list[tuple[bool, str, str]]:
+    """Every link-reference definition, `[label]: destination`.
+
+    `_markdown_targets` walks INLINE links only, and a reference-style `[x][ref]` carries its
+    destination in a definition line elsewhere in the file. Scanning the definition covers all
+    three reference forms at once -- full, collapsed and shortcut -- because every one of them
+    resolves through it.
+
+    Args:
+      text: The markdown source, already code-masked.
+
+    Returns:
+      `(is_image, label, target)` for each definition; `is_image` is always False, since a
+      definition does not know how it will be used.
+
+    Raises:
+      None.
+    """
+    pattern = r"^ {0,3}\[([^\]]+)\]:[ \t]*(<[^>]*>|\S+)"
+    found = []
+    for match in re.finditer(pattern, text, re.MULTILINE):
+        target = match.group(2)
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+        found.append((False, match.group(1), target))
+    return found
+
+
+def _html_targets(text: str) -> list[tuple[bool, str, str]]:
+    """Every `src`/`href` on a raw HTML tag, which markdown allows and PyPI's renderer keeps.
+
+    `readme_renderer`'s allowlist permits `img{src}` and `a{href}`, so an HTML tag ships a broken
+    relative path exactly as markdown syntax does.
+
+    Args:
+      text: The markdown source, already code-masked.
+
+    Returns:
+      `(is_image, tag, target)` for each.
+
+    Raises:
+      None.
+    """
+    pattern = (
+        r"""<\s*(img|a)\b[^>]*?(?<![-\w])(src|href)\s*=\s*"""
+        r"""(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"""
+    )
+    return [
+        (m.group(1).lower() == "img", m.group(1), m.group(3) or m.group(4) or m.group(5))
+        for m in re.finditer(pattern, text, re.IGNORECASE)
+    ]
+
+
+def test_the_readme_carries_no_relative_file_links() -> None:
+    """The README is the PyPI long description, where a relative path resolves against pypi.org.
+
+    `pyproject.toml`'s `readme = "README.md"` embeds this file in the wheel and sdist metadata and
+    PyPI renders that copy, so `[MIT](LICENSE)` becomes `https://pypi.org/project/LICENSE` and
+    404s, while a relative image `src` renders nothing. The drift is silent twice over: nothing
+    about editing the README says where else it is published, and the page changes only when a
+    release is cut, so a broken link ships whenever the next tag happens.
+
+    In-page anchors are exempt -- `readme_renderer` prefixes heading ids with `user-content-` and
+    rewrites `href="#x"` to match, so they resolve there as on GitHub. Any `scheme:` is exempt,
+    `mailto:` included, and so is a protocol-relative `//host/path`.
+
+    The case for a gate rather than a note, twice over. PR #240 absolutised the two release-notes
+    links citing this exact reason, and added a *relative* `CHANGELOG.md` link one line below the
+    absolute one it had just written. Then the first version of THIS test passed while the README
+    still carried a relative `](LICENSE)` on line 6 -- a badge, `[![alt](img)](href)`, whose outer
+    target a left-to-right regex never examines because the inner image matches first. Knowing the
+    rule is not enough, and neither is a gate that parses only the easy shape.
+    """
+    raw = (_ROOT / "README.md").read_text(encoding="utf-8")
+    text = _mask_code(raw)
+    targets = _markdown_targets(text) + _reference_definitions(text) + _html_targets(text)
+
+    # A population guard, because a scanner that stops matching reports a clean file. The floor
+    # sits below the count at the time of writing so removing a few links needs no edit here,
+    # and still catches a collapse toward zero.
+    assert len(targets) >= 35, (
+        f"the README link scan found {len(targets)} targets, below the floor of 35. Either the "
+        "scan has stopped matching -- an absence it cannot see is not an absence -- or links "
+        "were deliberately removed, in which case lower the floor in this test and say why. "
+        "The floor cannot see a lost SHAPE, only a collapse; test_the_readme_link_scanner_corpus "
+        "is what holds the shapes."
+    )
+
+    offenders = [
+        f"{'image' if is_image else 'link'} [{label[:40]}] -> {target}"
+        for is_image, label, target in targets
+        if not re.match(r"(?i)^([a-z][a-z0-9+.-]*:|//|#)", target)
+    ]
+    assert not offenders, (
+        "these README targets are relative, so they break on the PyPI project page (an image "
+        "renders nothing; a link 404s against pypi.org). Use an absolute URL -- "
+        "https://github.com/agriffi10/log-forge/blob/main/<path> for a file, tree/main for a "
+        f"directory, and raw.githubusercontent.com for an image: {offenders}"
+    )
+
+
+# Every case is `(name, markdown, should_fire)`. A gate is not tested by running it on the thing
+# it guards -- that proves the artifact passes, not that the check works -- so this corpus is the
+# gate's own evidence, and it carries SILENCE cases because half a linter's regressions are false
+# positives. Each entry was planted into the real README and run before being written down.
+_README_LINK_CASES: list[tuple[str, str, bool]] = [
+    # --- must fire: a relative target ships and breaks the PyPI page ---
+    ("badge with a relative outer target", "[![L](https://img.shields.io/x)](LICENSE)", True),
+    ("plain relative link", "[changelog](CHANGELOG.md)", True),
+    ("relative image", "![diagram](docs/assets/pipeline.svg)", True),
+    ("bare filename", "[licence](LICENSE)", True),
+    ("relative link with a title", '[x](CHANGELOG.md "the changelog")', True),
+    ("relative angle-bracket target", "[x](<docs/architecture.md>)", True),
+    ("nested relative image inside an absolute link", "[![alt](docs/a.svg)](https://x.test/)", True),
+    ("reference-style definition", "See [arch][a].\n\n[a]: docs/architecture.md", True),
+    ("raw HTML img, double-quoted", '<img src="docs/assets/pipeline.svg" alt="x">', True),
+    ("raw HTML anchor, single-quoted", "<a href='LICENSE'>MIT</a>", True),
+    ("raw HTML img, unquoted attribute", "<img src=docs/assets/pipeline.svg alt='x'>", True),
+    # --- must stay silent: legitimate content a firing gate would drive people to disable ---
+    ("in-page anchor", "[sinks](#sinks)", False),
+    ("badge with an absolute outer target", "[![P](https://img.shields.io/x)](https://pypi.org/)", False),
+    ("mailto scheme", "[mail](mailto:security@example.test)", False),
+    ("protocol-relative target", "[x](//example.test/path)", False),
+    ("uppercase scheme", "[x](HTTPS://example.test/p)", False),
+    ("absolute link with a title", '[x](https://example.test/p "title")', False),
+    ("python subscript in a fence", '```python\nSINKS["sqs"](queue_url=url)\n```', False),
+    ("typing subscript in a fence", "```python\nCallable[[dict], None](fn)\n```", False),
+    ("a fence demonstrating this very rule", "```markdown\nWrong: [MIT](LICENSE)\n```", False),
+    ("a four-backtick fence wrapping a three-backtick one", "````markdown\n```\n[x](LICENSE)\n```\n````", False),
+    ("a tilde fence", "~~~\n[x](LICENSE)\n~~~", False),
+    ("inline code span", "Avoid `[MIT](LICENSE)` in the README.", False),
+    ("double-backtick span containing a backtick", "Use ``a ` b [x](LICENSE)`` here.", False),
+    ("a lone backtick does not flip the rest of the file", "A ` character.\n\nThen `code` here.", False),
+]
+
+
+@pytest.mark.parametrize(("name", "markdown", "should_fire"), _README_LINK_CASES)
+def test_the_readme_link_scanner_corpus(name: str, markdown: str, should_fire: bool) -> None:
+    """The link gate's own evidence: every shape it must catch, and every one it must ignore.
+
+    `test_the_readme_carries_no_relative_file_links` running green proves the README is clean, not
+    that the scanner works -- and the first version of it was green over a relative `](LICENSE)`
+    it could not see. This corpus is what holds the shapes; the population floor in that test can
+    only see a collapse toward zero, never a single lost construct, because a sum hides one small
+    term.
+
+    The silence half is not padding. A checker that fires on a python subscript, or on a fence
+    demonstrating the rule it enforces, gets switched off within a week, and this README carries
+    hundreds of fenced lines.
+
+    Known non-goals, recorded so the next reader does not mistake them for bugs. Three constructs
+    are flagged that CommonMark would not treat as prose -- a four-space-indented code block, a
+    relative `href` inside an HTML comment, and the body of an unterminated fence. All three fail
+    CLOSED: they demand an absolute URL where none was strictly needed, which costs an edit, where
+    the opposite error ships a broken link to PyPI. An escaped unmatched `]` inside a label is
+    missed. None of the four appears in this README; they are the price of a scanner small enough
+    to read, and the trade is deliberate.
+
+    Args:
+      name: The case label, so a failure names the construct rather than an index.
+      markdown: The snippet, scanned exactly as the README is.
+      should_fire: Whether a relative target must be reported.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    text = _mask_code(markdown)
+    targets = _markdown_targets(text) + _reference_definitions(text) + _html_targets(text)
+    relative = [t for _, _, t in targets if not re.match(r"(?i)^([a-z][a-z0-9+.-]*:|//|#)", t)]
+    if should_fire:
+        assert relative, f"{name}: a relative target must be reported, and none was"
+    else:
+        assert not relative, f"{name}: must be ignored, but reported {relative}"
