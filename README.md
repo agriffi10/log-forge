@@ -527,7 +527,8 @@ nothing.
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
 call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
 `SinkDeliveryError`, `SinkLosses`, `read_losses` and `flush_sink` — the last two being the probes
-a wrapper sink needs to ask a child for its losses and to push its client-side buffer. The
+a wrapper sink needs to ask a child for its losses and to push its client-side buffer — plus the
+two default bounds, `DEFAULT_SHUTDOWN_TIMEOUT` and `DEFAULT_SWAP_TIMEOUT`. The
 **concrete sinks** are not exported, so import each from its own module, e.g.
 `from log_foundry.sinks.sqs import SQSSink`.
 
@@ -841,8 +842,8 @@ disconnected, so a sustained outage moves `health().failed_batches` instead of b
 | `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id", producer_config=None)` — `producer_config` is merged **beneath** the sink's own keys, so it reaches `message.timeout.ms` and friends without displacing `bootstrap.servers`; passing it with `producer=` is a `ValueError` |
 | `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
 | `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
-| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None, blocked_connection_timeout=None, socket_timeout=None, stack_timeout=None)` — persistent messages; `pika` leaves `blocked_connection_timeout` unset, so a broker under a memory or disk alarm blocks every publish indefinitely — the sink applies `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` (30 s) unless the URL's query names one, and an explicit keyword overrides the URL |
-| `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None, publish_timeout=10.0, connect_timeout=None, max_reconnect_attempts=None, reconnect_time_wait=None, drain_timeout=None)` — `publish_timeout` bounds one whole `emit` and applies to an injected `client=` too; the four `None` timeouts are forwarded to `nats.connect` only when set, and passing one with `client=` is a `ValueError` |
+| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None, blocked_connection_timeout=None, socket_timeout=None, stack_timeout=None)` — persistent messages; `pika` leaves `blocked_connection_timeout` unset, so a broker under a memory or disk alarm blocks every publish indefinitely — the sink applies `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` (30 s) unless the URL's query names one, and an explicit keyword overrides the URL. **Read from `pika` 1.4.4 and not executed against a broker** — verify it against yours |
+| `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None, publish_timeout=10.0, connect_timeout=None, max_reconnect_attempts=None, reconnect_time_wait=None, drain_timeout=None)` — a non-positive `max_reconnect_attempts` is a `ValueError` at construction, since `nats-py` retires a server from its pool only under `max_reconnect_attempts > 0` and a non-positive value therefore never returns; `publish_timeout` bounds one whole `emit` and applies to an injected `client=` too; the four `None` timeouts are forwarded to `nats.connect` only when set, and passing one with `client=` is a `ValueError` |
 | `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
 | `AzureEventHubsSink` | `log_foundry.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
 
@@ -1052,9 +1053,10 @@ reported. They aggregate different failure populations — one can mean the dest
 data; the other never the destination — the data, or no drain thread at all (SPEC-050) — so a
 single number would hide which fix applies.
 
-`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no worker
-exists yet, or when the configured sink reports nothing (`losses()` is optional, and a sink whose
-`losses()` raises reports `None` too). Note the two `dropped` fields count
+`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when the
+configured sink reports nothing (`losses()` is optional, and a sink whose `losses()` raises reports
+`None` too). It is **not** `None` merely because no worker exists: since SPEC-054 it is answered
+from the configuration, so it reports on the orphan path too. Note the two `dropped` fields count
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
 itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
@@ -1084,8 +1086,9 @@ healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply
 
 `retired`, `orphan_lost` and `in_span_lost` are the fields reported for a process that has **no
 worker at all**. A program that only ever calls `info()`/`error()` outside a span emits
-synchronously and builds no background worker, so the rest describe something that does not exist
-and read zero — which is why that path needs counters of its own. Until it had them, such a process
+synchronously and builds no background worker, so the rest — excepting `sink` and
+`inherited_sink`, which answer from the configuration and report normally here — describe
+something that does not exist and read zero — which is why that path needs counters of its own. Until it had them, such a process
 reported `queued=0 dropped=0 failed_batches=0 stopped_reason=None` over total, permanent loss, and
 the only thing that said otherwise was a line on stderr. Its
 `shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
@@ -1442,7 +1445,8 @@ the tagged commit are not seen. A release body cannot be amended once published 
 repository has immutable releases — so check the file is there and named for the tag before
 pushing it. [`docs/release-notes/`](docs/release-notes/) holds the ones written so far, and
 [`docs/spec-delivery/RELEASES.md`](docs/spec-delivery/RELEASES.md) records which specs each
-released version carried.
+version carried — its top row is written in the commit that version's tag is cut from, so it can
+name a tag that does not exist yet.
 
 Uploads authenticate with PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
 (OIDC) through the `pypi` GitHub Environment — there is no API token stored in the repository.
