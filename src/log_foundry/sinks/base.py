@@ -37,7 +37,7 @@ class SinkLosses:
     "reports nothing" — rather than to an error anyone sees. One keyword each is the fix. The
     same decision empties ``__match_args__``, so a positional ``case SinkLosses(d, f):`` raises
     ``TypeError`` from the ``match`` statement itself rather than quietly failing to match, while
-    ``case SinkLosses(dropped=d, failed=f):`` still does.
+    ``case SinkLosses(dropped=d, failed=f):`` still matches.
 
     Attributes:
       dropped: An event the sink discarded before attempting delivery, usually one the

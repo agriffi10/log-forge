@@ -1053,9 +1053,10 @@ reported. They aggregate different failure populations — one can mean the dest
 data; the other never the destination — the data, or no drain thread at all (SPEC-050) — so a
 single number would hide which fix applies.
 
-`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when the
-configured sink reports nothing (`losses()` is optional, and a sink whose `losses()` raises reports
-`None` too). It is **not** `None` merely because no worker exists: since SPEC-054 it is answered
+`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no sink has
+been configured at all, and `None` when the configured sink reports nothing (`losses()` is
+optional, and a sink whose `losses()` raises reports `None` too). It is **not** `None` merely
+because no worker exists: since SPEC-054 it is answered
 from the configuration, so it reports on the orphan path too. Note the two `dropped` fields count
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
@@ -1084,11 +1085,13 @@ logging is doing the right thing; it is the *pair* — retired, and still being 
 means every log line since the shutdown has gone nowhere. That state used to read as perfectly
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
-`retired`, `orphan_lost` and `in_span_lost` are the fields reported for a process that has **no
-worker at all**. A program that only ever calls `info()`/`error()` outside a span emits
-synchronously and builds no background worker, so the rest — excepting `sink` and
-`inherited_sink`, which answer from the configuration and report normally here — describe
-something that does not exist and read zero — which is why that path needs counters of its own. Until it had them, such a process
+**Six of the twelve fields report for a process that has no worker at all** — `sink`, `retired`,
+`closing_sinks`, `inherited_sink`, `orphan_lost` and `in_span_lost`. That set is not a list to
+maintain by hand: it is exactly the fields in `_lifecycle`'s `Health(...)` assembly that are *not*
+guarded by `counters is None`, and re-reading that call is how to check it. A program that only
+ever calls `info()`/`error()` outside a span emits synchronously and builds no background worker,
+so the other six describe something that does not exist and read zero — which is why that path
+needs counters of its own. Until it had them, such a process
 reported `queued=0 dropped=0 failed_batches=0 stopped_reason=None` over total, permanent loss, and
 the only thing that said otherwise was a line on stderr. Its
 `shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
