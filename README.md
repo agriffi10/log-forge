@@ -29,8 +29,9 @@ moves without notice.
 
 `1.0.0` was a reliability release rather than a feature release: three audit arcs worked through
 the paths where the library could lose an event, fail its caller, block forever, or report health
-it could not back up. If you are coming from `0.10.x`, read its release notes before you bump —
-several of the changes are silent:
+it could not back up. If you are coming from any `0.x`, read its release notes before you bump —
+several of the changes are silent, and they are written against `0.10.1`, the release immediately
+before this one:
 [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
 
 ---
@@ -44,11 +45,12 @@ several of the changes are silent:
 Published on PyPI as **[`log-foundry`](https://pypi.org/project/log-foundry/)**:
 
 ```bash
-pip install log-foundry          # core, zero dependencies
-pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
+pip install log-foundry           # core, zero dependencies
+pip install 'log-foundry[aws]'    # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
+pip install 'log-foundry>=1,<2'   # pin to the frozen API above
 ```
 
-> **Breaking in `1.0.0`, if you are upgrading from `0.10.x`.** Three public shapes changed once,
+> **Breaking in `1.0.0`, if you are upgrading from any `0.x`.** Three public shapes changed once,
 > in the release that froze the API, because none of them could have been changed afterwards
 > without a major version:
 >
@@ -66,9 +68,10 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 >   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
 >   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
 >
-> Those are the three changes of *shape*, and not the three most likely to reach you: a deleted
-> module and several new construction-time refusals rank above two of them in the release notes'
-> own ordering. Read the full list of twenty-two before you upgrade —
+> Those are the three changes of *shape*, and not the three most likely to reach you:
+> `log_foundry.sinks.util` was deleted with no alias, and several new construction-time refusals
+> land, all of which rank above two of the three above in the release notes' own ordering. Read
+> the full list of twenty-two before you upgrade —
 > [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
 >
 > `echo`, `message` and `fields` are reserved parameter names on the emitters; pass fields of
