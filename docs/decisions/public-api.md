@@ -23,6 +23,7 @@ fences; pull an entry only when you need the reasoning.
 - **A protocol that is exported is a protocol that will be inherited** — `Sink`'s members are `@abstractmethod`: empty bodies let a subclass with one typo instantiate happily and return `None` from `emit`, losing events with every counter at zero. (SPEC-034)
 - **A frozen surface is keyword-first, and says what it will not grow** — every public dataclass is `kw_only`, `defaults=` takes a `Mapping` (`dict` is invariant), `context.__all__` names only the six re-exported, and the worker tunables stay **unreachable** from `configure()`. Only a typed consumer probe sees any of it — the gate stops at `src`. (SPEC-051)
 - **The frozen surface is the import path, not just the class** — no concrete sink is in `__all__`, so a class frozen at a path free to move was pinned to nothing; `1.0.0` itself deleted `sinks/util.py` and moved three classes. The documented dotted path, and the public names the signatures use, are inside the `1.x` promise. (No spec — settled on the README's 1.0.0 pass, `48299e3`.)
+
 ---
 
 ### Logs-only, send everything for now
@@ -74,7 +75,7 @@ as exported but which neither `__all__` nor "sink class" reaches.
 is one this fence now forbids. Moving a module in `1.x` therefore costs a permanent re-export at
 the old path, and that is a genuine cost rather than a loophole: a re-export added in `1.x` has to
 live until `2.0.0`, exactly like the keyword alias SPEC-034 refused for that same reason
-(`SPEC-034` AC-1: "an alias would have to live for the whole of `1.x`"). What the tag removed is
+(`SPEC-034` FR-002 AC-1: "an alias would have to live for the whole of `1.x`"). What the tag removed is
 not the cost but the **alternative** — before it, a module could be renamed and the old name
 deleted outright, which is what made refusing an alias free. That option is gone, so the trade is
 now re-export or wait for `2.0.0`, and the fence is what stops the layout drifting by accident in
@@ -92,13 +93,19 @@ reaches cannot carry one**: the release body, and the `blob/v1.0.0/` blob that `
 `CHANGELOG.md` deliberately link tag-absolute. So the marker serves the next agent reading `main`,
 not the upgrader, and the current form is what `README.md` states in full. `CHANGELOG.md` carries
 the import-path half but not the signature-names half; it states a partial new form rather than the
-old one, so it is owed no marker. **The promise is gated.**
-`test_every_documented_sink_import_path_resolves` derives the (class, module) pairs from the
-README's sink tables and asserts them against the package both ways: a documented path that does
-not resolve is a broken instruction to a reader, and a shipped sink module with no table row is
-outside the freeze by omission rather than by decision. Before it, enforcement was incidental —
-every documented pair happened to be imported at its documented path somewhere in `tests/`, two of
-them by a single file each, so one unrelated test deletion would have made a `sinks/util.py`-style
-split silent again. `sinks/base` is the one exempt module, and the exemption is *asserted* rather
-than skipped: it holds only while `Sink`, `SinkDeliveryError` and `SinkLosses` are top-level
-exports, covered by the `__all__` clause instead of this one.
+old one, so it is owed no marker. **The promise is gated against a pinned baseline, and the baseline is the point.**
+`test_every_frozen_sink_import_path_still_resolves` reads the pairs promised at `v1.0.0` from
+`tests/data/frozen_sink_paths.txt` — committed data, not re-derived from the README each run. The
+first version of this gate did re-derive it, and was useless for the reason that a *temporal*
+promise cannot be checked by a *same-commit* comparison: a contributor who renames a module and
+updates the README satisfies both sides at once, so replaying the `sinks/util.py` split against it
+came out green. Reading the tag at runtime is not the alternative either, since CI checks out
+without tags. The file therefore says in its own header that a move leaves the old line standing
+and adds a re-export, and that it is regenerated wholesale only at `2.0.0`.
+
+Three failure modes, three assertions: a frozen path stops resolving; the README stops documenting
+one, so the promise survives but no reader can find it; or a new sink module ships undocumented and
+is outside the freeze by omission rather than decision. `sinks/base` is the one exempt module, and
+the exemption is derived from its own `__all__` rather than a listed set — a listed one stops
+describing the module the moment a name is added, which is what a hand-written three-name version
+of it did while `base.__all__` already had five.

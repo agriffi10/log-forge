@@ -1,0 +1,49 @@
+# The sink import paths frozen by the 1.x API freeze.
+#
+# Generated ONCE from the v1.0.0 README and committed as data. It is the BASELINE of the promise
+# in docs/decisions/public-api.md -> 'The frozen surface is the import path, not just the class',
+# so it is deliberately NOT re-derived from the current README: a gate that reads today README
+# passes any rename whose author updated both sides, which is the exact break this exists to stop.
+#
+# Do NOT edit a line to match a move. A path here is promised until 2.0.0; moving a module means
+# leaving a re-export at the old path, and the old line stays. ADD a line when a new sink ships.
+# Regenerate wholesale only at 2.0.0, from that tag README.
+#
+# <ClassName> <dotted.module.path>
+AzureEventHubsSink log_foundry.sinks.eventhubs
+CallbackSink log_foundry.sinks.callback
+ClickHouseSink log_foundry.sinks.clickhouse
+DatadogSink log_foundry.sinks.datadog
+ElasticsearchSink log_foundry.sinks.elasticsearch
+FileSink log_foundry.sinks.file
+FilteringSink log_foundry.sinks.filtering
+FirehoseSink log_foundry.sinks.firehose
+GooglePubSubSink log_foundry.sinks.pubsub
+HTTPSink log_foundry.sinks.http
+HoneycombSink log_foundry.sinks.honeycomb
+KafkaSink log_foundry.sinks.kafka
+KinesisSink log_foundry.sinks.kinesis
+LoggingSink log_foundry.sinks.logging_sink
+LogstashSink log_foundry.sinks.logstash
+LokiSink log_foundry.sinks.loki
+MemorySink log_foundry.sinks.memory
+MongoDBSink log_foundry.sinks.mongodb
+MultiSink log_foundry.sinks.multi
+NATSSink log_foundry.sinks.nats
+NewRelicSink log_foundry.sinks.newrelic
+NullSink log_foundry.sinks.null
+OpenSearchSink log_foundry.sinks.elasticsearch
+PostgresSink log_foundry.sinks.postgres
+RabbitMQSink log_foundry.sinks.rabbitmq
+RedisListSink log_foundry.sinks.redis
+RedisStreamsSink log_foundry.sinks.redis
+RotatingFileSink log_foundry.sinks.file
+SNSSink log_foundry.sinks.sns
+SQLiteSink log_foundry.sinks.sqlite
+SQSSink log_foundry.sinks.sqs
+SentrySink log_foundry.sinks.sentry
+SplunkHECSink log_foundry.sinks.splunk
+StderrSink log_foundry.sinks.stdout
+StdoutSink log_foundry.sinks.stdout
+SyslogSink log_foundry.sinks.syslog
+TransformSink log_foundry.sinks.transform
