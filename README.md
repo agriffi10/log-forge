@@ -20,6 +20,18 @@ calls form a tree you can query later.
   a level call with **no open span**, which emits on your own thread, and `flush()`, which by
   definition waits for the drain it asked for.
 
+**The public API is frozen for the whole of `1.x`.** Everything in `log_foundry.__all__`, the
+`Sink` protocol and every shipped sink class stays put: nothing is removed or renamed, and no
+signature changes in a way that breaks a caller, until `2.0.0`. Behaviour is not frozen by that
+promise — a defect is still a defect, and fixing one can change what a broken path does. Anything
+underscore-prefixed is internal and outside it entirely.
+
+`1.0.0` was a reliability release rather than a feature release: three audit arcs worked through
+the paths where the library could lose an event, fail its caller, block forever, or report health
+it could not back up. If you are coming from `0.10.x`, read its release notes before you bump —
+several of the changes are silent:
+[`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
+
 ---
 
 ## Requirements
@@ -35,8 +47,12 @@ pip install log-foundry          # core, zero dependencies
 pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sinks
 ```
 
-> **Breaking in `1.0.0`.** Three public shapes change once, before the API is frozen under
-> semantic versioning, because none of them could be changed afterwards without a major version:
+> **Breaking in `1.0.0`, if you are upgrading from `0.10.x`.** Three public shapes changed once,
+> in the release that froze the API, because none of them could have been changed afterwards
+> without a major version. These are the three likeliest to reach a caller; the release notes
+> carry the full upgrade list, ordered by how likely each item is to reach you and ending with
+> the quiet ones —
+> [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md):
 >
 > - **`health()` and `sink.losses()` return frozen dataclasses**, not `NamedTuple`s. Attribute
 >   access (`h.dropped`, `losses.failed`) is unchanged and is the whole contract; `len(h)`,
@@ -46,7 +62,7 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 > - **`flush()` returns a `FlushResult` and `continue_trace()` a `ContinueResult`**, each truthy
 >   or falsy with a `reason` naming *why*. `if lf.flush():` is unchanged; **`lf.flush() is True`
 >   is not** — the result is an object. A one-bit return could not grow a reason later without
->   silently changing what `if flush():` means, which is why it moved now.
+>   silently changing what `if flush():` means, which is why it moved before the freeze.
 > - **`SQSSink`'s injected client is keyword-only** (`SQSSink(queue_url, client=…)`), **`SentrySink`
 >   injects through `client=`** rather than the old `sdk` keyword, with no alias, and the sink attribute the
 >   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
@@ -55,20 +71,20 @@ pip install 'log-foundry[aws]'   # + boto3 for the SQS/SNS/Kinesis/Firehose sink
 > `echo`, `message` and `fields` are reserved parameter names on the emitters; pass fields of
 > those names through `fields={...}`, which also takes keys that are not Python identifiers.
 
-> **Renamed in 0.2.0: `log_forge` → `log_foundry`.** The import package now matches the
-> distribution name — `pip install log-foundry`, then `import log_foundry`. If you are on
-> `0.1.x`, update your imports; there is no compatibility shim. The project was originally
-> called *log-forge*, but PyPI rejects that name as too similar to the unrelated, pre-existing
-> [`logforge`](https://pypi.org/project/logforge/) project — its similarity check collapses
-> separators, so `log-forge` and `logforge` count as the same name. Rather than keep a
-> distribution and an import name that disagreed, everything is now `log-foundry` /
-> `log_foundry`.
+> **Why `log-foundry`, when the repository is `log-forge`.** The distribution and the import
+> package match each other — `pip install log-foundry`, then `import log_foundry`. The project was
+> originally called *log-forge*, but PyPI rejects that name as too similar to the unrelated,
+> pre-existing [`logforge`](https://pypi.org/project/logforge/) project — its similarity check
+> collapses separators, so `log-forge` and `logforge` count as the same name. Rather than keep a
+> distribution and an import name that disagreed, everything became `log-foundry` / `log_foundry`
+> in `0.2.0`.
 >
-> Migrating from `0.1.x` is a find-and-replace on `log_forge` → `log_foundry`; no module moved
-> and no public API changed. A handful of *emitted* defaults carry the name and shift with it:
-> `LoggingSink`'s default logger (`logging.getLogger("log_foundry")`), `SyslogSink(app_name=…)`,
-> `SplunkHECSink(source=…)`, Datadog's `ddsource`, and Sentry's client tag. Override them
-> explicitly if a downstream query or dashboard pins the old string.
+> If you are still on `0.1.x`, there is no compatibility shim: migrating is a find-and-replace on
+> `log_forge` → `log_foundry`; no module moved and no public API changed. A handful of *emitted*
+> defaults carry the name and shift with it: `LoggingSink`'s default logger
+> (`logging.getLogger("log_foundry")`), `SyslogSink(app_name=…)`, `SplunkHECSink(source=…)`,
+> Datadog's `ddsource`, and Sentry's client tag. Override them explicitly if a downstream query
+> or dashboard pins the old string.
 
 ```python
 import log_foundry
