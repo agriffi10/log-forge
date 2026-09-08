@@ -1617,11 +1617,49 @@ def test_a_zero_x_sink_building_sinklosses_positionally_degrades_to_none() -> No
     row[0] for row in _PUBLIC_DATACLASSES
 ])
 def test_keyword_only_construction_empties_match_args(name, cls, args) -> None:
-    """SPEC-051 FR-001, the second outward consequence: positional pattern matching stops.
+    """SPEC-051 FR-001, the second outward consequence: `__match_args__` is empty on all five.
 
-    `kw_only=True` sets `__match_args__` to `()`, so `case Health(a, b):` no longer matches
-    while `case Health(queued=q):` still does. Recorded here because field order not being a
-    contract is exactly what that means, and a consumer would otherwise meet it after the tag.
+    What that empties means for a `match` statement is pinned by
+    `test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_others`, which is
+    the canonical statement of the behaviour; the four prose sites cite it rather than
+    restating the condition, because five hand-synced copies of one claim is how three of them
+    came to state it wrongly. Recorded here because field order not being a contract is exactly
+    what this means, and a consumer would otherwise meet it after the tag.
     """
     assert cls.__match_args__ == ()
     assert dataclasses.fields(cls), name
+
+
+def test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_others() -> None:
+    """The canonical statement of what an empty `__match_args__` does to a `match` (SPEC-051).
+
+    Three behaviours, because the claim is conditional and every prose site that dropped the
+    condition got it wrong. A positional class pattern against a subject **of that type**
+    raises `TypeError` from the `match` statement itself — it does not quietly fail to match.
+    Against a subject of any **other** type the pattern falls through as it always did, because
+    the isinstance check fails before the sub-pattern count is ever consulted, and
+    `health().sink` being `None` makes that the common case at the very call site a reader is
+    most likely to write. A keyword pattern still matches. Asserted rather than documented
+    because `sinks/base.py`, `docs/decisions/public-api.md`, `docs/spec-delivery/`'s SPEC-051
+    doc and the `v1.0.0` release notes all state this, and prose is not checkable.
+    """
+    losses = log_foundry.SinkLosses(dropped=1, failed=2)
+
+    with pytest.raises(TypeError, match=r"accepts 0 positional sub-patterns"):
+        match losses:
+            case log_foundry.SinkLosses(_d, _f):
+                pass
+
+    fell_through = False
+    match None:
+        case log_foundry.SinkLosses(_d, _f):
+            pass
+        case _:
+            fell_through = True
+    assert fell_through, "a non-instance subject must fall through, not raise"
+
+    matched = None
+    match losses:
+        case log_foundry.SinkLosses(dropped=d, failed=f):
+            matched = (d, f)
+    assert matched == (1, 2)

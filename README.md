@@ -1090,8 +1090,8 @@ healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply
 maintain by hand: it is exactly the fields in `_lifecycle`'s `Health(...)` assembly that are *not*
 guarded by `counters is None`, and re-reading that call is how to check it. A program that only
 ever calls `info()`/`error()` outside a span emits synchronously and builds no background worker,
-so the other six describe something that does not exist and read zero — which is why that path
-needs counters of its own. Until it had them, such a process
+so the other six describe something that does not exist and read their empty value — zero for the
+five counters, `None` for `stopped_reason` — which is why that path needs counters of its own. Until it had them, such a process
 reported `queued=0 dropped=0 failed_batches=0 stopped_reason=None` over total, permanent loss, and
 the only thing that said otherwise was a line on stderr. Its
 `shutdown()` still closes the sink, exactly once and without starting a thread, and `retired` reads
