@@ -1712,12 +1712,16 @@ def _frozen_sink_pairs() -> set[tuple[str, str]]:
     """
     text = (_ROOT / "tests" / "data" / "frozen_sink_paths.txt").read_text(encoding="utf-8")
     pairs: set[tuple[str, str]] = set()
-    for line in text.splitlines():
-        line = line.strip()
+    for raw in text.splitlines():
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        cls, _, mod = line.partition(" ")
-        pairs.add((cls, mod.strip()))
+        # Matched whole rather than split, so a malformed line fails HERE naming itself. Split
+        # on the first space, a stray third field rode into importlib as part of the module name
+        # and was reported as a missing module; a tab separator reached it as an empty one.
+        match = re.fullmatch(r"(\w+) (log_foundry\.sinks\.[\w.]+)", line)
+        assert match, f"malformed line in tests/data/frozen_sink_paths.txt: {raw!r}"
+        pairs.add((match.group(1), match.group(2)))
     return pairs
 
 
@@ -1736,9 +1740,12 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
     omission rather than by decision.
     """
     frozen = _frozen_sink_pairs()
-    assert len(frozen) == 37, (
-        f"the frozen roster should carry the 37 pairs promised at v1.0.0, found {len(frozen)}. "
-        "Adding a sink appends a line; a move leaves the old line and adds a re-export."
+    # A FLOOR, not an equality: `v1.0.0` promised 37 paths and the freeze only ever grows, so a
+    # new sink appends a line and must not have to edit this number too. It exists to catch the
+    # baseline being truncated or emptied, which would turn every assertion below vacuous.
+    assert len(frozen) >= 37, (
+        f"the frozen roster carries {len(frozen)} pairs; v1.0.0 promised 37 and the freeze only "
+        "grows. A line was removed -- a path promised until 2.0.0 cannot be dropped."
     )
 
     broken: list[str] = []
@@ -1755,8 +1762,11 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
             else:
                 broken.append(f"{mod} does not import: {exc!r}")
             continue
-        if not hasattr(module, cls):
-            broken.append(f"{mod} no longer provides {cls}")
+        if not inspect.isclass(getattr(module, cls, None)):
+            # `hasattr` is not enough: `LokiSink = None` as an optional-dependency fallback
+            # satisfies it while `LokiSink(url)` raises TypeError, so the name resolving is not
+            # the promise -- a constructible class at that path is.
+            broken.append(f"{mod} no longer provides {cls} as a class")
     assert not broken, (
         "these import paths are frozen until 2.0.0 and the package no longer provides them. "
         f"Restore them, with a re-export at the old path if the code moved: {broken}"
@@ -1782,14 +1792,18 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
         f"these are not: {not_reexported}"
     )
 
-    documented_modules = {mod for _, mod in documented}
-    shipped_modules = {
-        f"log_foundry.sinks.{path.relative_to(_SINK_PKG).with_suffix('').as_posix().replace('/', '.')}"
-        for path in _SINK_PKG.rglob("*.py")
-        if not any(part.startswith("_") for part in path.relative_to(_SINK_PKG).parts)
-    } - {exempt}
-    undocumented = sorted(shipped_modules - documented_modules)
+    # Class-level, not module-level. A module glob missed both a sink shipped in a package's
+    # `__init__.py` and a NEW class added to an already-documented module, and the promise is
+    # per class-at-path. `_sink_classes_with_emit` reads the AST, so it sees every shipped sink
+    # in an environment with no extras -- which is what CI is.
+    documented_classes = {cls for cls, _ in documented}
+    shipped_classes = {
+        node.name
+        for _, node in _sink_classes_with_emit()
+        if not node.name.startswith("_") and node.name != "Sink"
+    }
+    undocumented = sorted(shipped_classes - documented_classes)
     assert not undocumented, (
-        "these sink modules ship but no README table row documents them, so the freeze does not "
+        "these sink classes ship but no README table row documents them, so the freeze does not "
         f"reach them and a later move would be silent: {undocumented}"
     )

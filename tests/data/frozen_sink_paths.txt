@@ -6,8 +6,12 @@
 # passes any rename whose author updated both sides, which is the exact break this exists to stop.
 #
 # Do NOT edit a line to match a move. A path here is promised until 2.0.0; moving a module means
-# leaving a re-export at the old path, and the old line stays. ADD a line when a new sink ships.
-# Regenerate wholesale only at 2.0.0, from that tag README.
+# leaving a re-export at the old path, and the old line stays. The README keeps a row for BOTH
+# paths in that case -- the gate checks every frozen path is still documented, so dropping the
+# old row fails even though the import still works.
+#
+# ADD a line when a new sink ships, and add its README row. The count assertion is a floor, so
+# nothing else has to move. Regenerate wholesale only at 2.0.0, from that tag's README.
 #
 # <ClassName> <dotted.module.path>
 AzureEventHubsSink log_foundry.sinks.eventhubs

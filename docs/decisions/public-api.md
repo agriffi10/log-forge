@@ -103,9 +103,13 @@ came out green. Reading the tag at runtime is not the alternative either, since 
 without tags. The file therefore says in its own header that a move leaves the old line standing
 and adds a re-export, and that it is regenerated wholesale only at `2.0.0`.
 
-Three failure modes, three assertions: a frozen path stops resolving; the README stops documenting
-one, so the promise survives but no reader can find it; or a new sink module ships undocumented and
-is outside the freeze by omission rather than decision. `sinks/base` is the one exempt module, and
+Three failure modes, three assertions: a frozen path stops resolving — as a **class**, since a
+`LokiSink = None` optional-dependency fallback satisfies `hasattr` while `LokiSink(url)` raises;
+the README stops documenting a frozen path, so the promise survives but no reader can find it; or
+a new sink **class** ships undocumented and is outside the freeze by omission rather than decision.
+That third one is class-level rather than module-level because the promise is: a module-level
+version missed both a sink shipped in a package's `__init__.py` and a new class added to an
+already-documented module. `sinks/base` is the one exempt module, and
 the exemption is derived from its own `__all__` rather than a listed set — a listed one stops
 describing the module the moment a name is added, which is what a hand-written three-name version
 of it did while `base.__all__` already had five.
