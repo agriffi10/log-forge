@@ -30,6 +30,20 @@ When a spec is done, in the same pass:
    build-order notes. The new entry alone is not enough; an agent reading only the old site must see
    the reversal.
 
+6. **If the spec changed anything a caller can see, top up the pending release notes** —
+   `docs/release-notes/<next tag>.md`, when a tag is being prepared and that file exists. A note is
+   owed for a refusal, a changed default, a changed signature, a changed wire format or a changed
+   diagnostic string; nothing is owed for an internal refactor. **This step exists because that file
+   is the one release artifact no gate holds to the code.** `spec-lint`, `docs-lint` and
+   `docstring-lint` each police a tier and none of them asks whether the notes still describe
+   `main`, so the drift is invisible on a green run: at `d2153ae`, with all six gates passing,
+   `docs/release-notes/v1.0.0.md` carried nothing for SPEC-049, SPEC-051, SPEC-054 or SPEC-055 —
+   and one sentence in it, naming an `architecture.md` §12 open item, had been made false by the
+   spec that closed that item. Two of those four had landed *before* the file's last edit
+   (`212fd16`), so recency is a hint and not the test: the test is reading the delivery docs.
+   `git log --format='%h %ci' -- docs/release-notes/<tag>.md` bounds the search; it does not
+   close it.
+
 **Anti-regrowth & doc hygiene** (each rule below was earned by a real doc defect in a project run
 this way).
 

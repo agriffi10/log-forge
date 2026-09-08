@@ -179,10 +179,11 @@ class Health:
         installed", not "would deliver to now": after ``shutdown()`` the process delivers
         nowhere, and reporting ``True`` there is the point rather than a wrinkle, since an
         inherited sink left open at exit is exactly what this explains. **The referent is one
-        object, named
-        here because SPEC-033 measured three candidates disagreeing**: the worker's sink if a
-        worker exists, else the sink the orphan path recorded, else the configured one. It
-        describes that object and *not* the graph beneath it, so a child that wraps an
+        object, named here because SPEC-033 measured three candidates disagreeing** — the
+        worker's sink if a worker exists, else the sink the orphan path recorded, else the
+        configured one. That contest is over: SPEC-054 FR-005 answers this and ``sink`` from
+        the **config**, so the three candidates are history rather than a live fallback chain.
+        It describes that object and *not* the graph beneath it, so a child that wraps an
         inherited sink in a ``MultiSink`` of its own reads ``False`` here while the wrapper's
         child is still refused — stated because the opposite reading is the natural one.
         It is a **state, not a fault**, and deliberately not a term in the documented alert

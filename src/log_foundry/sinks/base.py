@@ -35,8 +35,13 @@ class SinkLosses:
     :func:`read_losses`
     swallows a raising accessor by design, that sink's loss reporting degrades to ``None`` —
     "reports nothing" — rather than to an error anyone sees. One keyword each is the fix. The
-    same decision empties ``__match_args__``, so a positional ``case SinkLosses(d, f):`` no
-    longer matches while ``case SinkLosses(dropped=d, failed=f):`` still does.
+    same decision empties ``__match_args__``, so a positional ``case SinkLosses(d, f):`` raises
+    ``TypeError`` from the ``match`` statement itself **against a** ``SinkLosses`` **subject**,
+    while ``case SinkLosses(dropped=d, failed=f):`` still matches. Against any other subject —
+    ``health().sink`` is ``None`` whenever no sink is configured — it falls through as before.
+    The three behaviours are pinned by
+    ``test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_others``, which is
+    where to check this rather than here.
 
     Attributes:
       dropped: An event the sink discarded before attempting delivery, usually one the

@@ -45,7 +45,7 @@ after this spec.
 The two consequences that reach outside the library, recorded in the register and asserted in
 the suite rather than left to be met after the tag: a `0.x` sink constructing `SinkLosses`
 positionally now raises inside `losses()`, which `read_losses` swallows into `None`; and
-`kw_only` empties `__match_args__`, so positional pattern matching on these five stops.
+`kw_only` empties `__match_args__`; what that does to a `match` statement is conditional on the subject's type, and `test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_others` is the statement of it that runs.
 
 ## Verification
 

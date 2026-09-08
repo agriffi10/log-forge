@@ -16,7 +16,7 @@ is Out explicitly. No Open Questions and no sentence that promises a decision: c
 you cannot make and return it as a question for the human instead of parking it in the spec. Add the
 row to `docs/specs/INDEX.md`. Run `sh scripts/spec-lint.sh` and report its output verbatim.
 
-For completion work: follow the five steps in `completion-ritual.md` in order; the register entry is
+For completion work: follow the six steps in `completion-ritual.md` in order; the register entry is
 written in its area file, and its Contents row, before its fence — never after. Run
 `sh scripts/docs-lint.sh` and report its output verbatim.
 
