@@ -1691,10 +1691,12 @@ def _sink_pairs_the_readme_documents() -> set[tuple[str, str]]:
 def _parse_sink_table(text: str) -> set[tuple[str, str]]:
     """Parse `| \u0060XSink\u0060 | \u0060log_foundry.sinks.y\u0060 | ...` rows out of the README's sink tables.
 
-    Split from its caller so a corpus can drive it, because this parser's failure mode is a false
+    Split from its caller so a corpus can drive it. The direction worth guarding is the false
     POSITIVE: a row it stops recognising is reported as the README having dropped a frozen path,
-    which is a true-sounding accusation about a file that still documents it. Only the first two
-    cells are read -- the third is prose that names modules in running text.
+    a true-sounding accusation about a file that still documents it. It over-recognises too --
+    it matches a row shape anywhere in the file, not only inside a sink table -- which would hide
+    a genuinely dropped row instead. Only the first two cells are read; the third is prose that
+    names modules in running text.
 
     Args:
       text: The README source.
@@ -1738,11 +1740,9 @@ def _parse_frozen_pairs(text: str) -> set[tuple[str, str]]:
     """Parse the frozen-paths baseline: `<ClassName> <dotted.module>` per line, `#` for comments.
 
     Split from its caller so a corpus can drive it with text rather than through the filesystem.
-    Note what this split is NOT. The logic was always reachable: a six-line `monkeypatch` test
-    calling the gate reddens on either hole a review found here, verified against the inline
-    version that had no split at all. It shipped untested because nobody wrote that test, not
-    because none could be written -- and the nine mutants an earlier message cited were gate
-    mutants driving `src/` and `README.md`, none of them touching this parser.
+    Note what this split is NOT: the logic was always reachable, and a short `monkeypatch` test
+    calling the gate reddens on either hole a review found here even with no split at all. It
+    shipped untested because nobody wrote that test, not because none could be written.
 
     Args:
       text: The baseline file's contents.
@@ -2206,13 +2206,12 @@ def test_the_readme_link_scanner_corpus(name: str, markdown: str, should_fire: b
 # 1.x promise, so a line it silently mis-parses is a path that stops being checked -- under-
 # coverage that reports clean.
 #
-# The refused forms are not one story, and an earlier version of this comment said they were.
-# Measured against the `partition(" ")` parser this replaced: a stray third field rode into the
-# module name and was reported as a missing module, and a foreign path reported the same; a tab
-# and a bare class name raised an uncaught `ValueError: Empty module name`; a BOM imported fine
-# and failed later at `getattr`; and a TWO-SPACE separator parsed correctly and went green.
-# That last one is a deliberate tightening, not a restored behaviour -- defensible because the
-# refusal is loud and names the line, but it is a new rule and worth knowing as one.
+# Refusing a malformed line is the point: the parser this replaced split on the first space, so a
+# bad line reached `importlib` and surfaced as a confusing error about a module that was never
+# named -- or, for a two-space separator, parsed correctly and went green. The refusals are
+# therefore a mix of restored sanity and deliberate tightening. Which is which is not recorded
+# here, because a history of a deleted parser is prose no test owns; what each form does NOW is
+# the row beside it.
 _FROZEN_BASELINE_CASES: list[tuple[str, str, set[tuple[str, str]] | None]] = [
     ("one pair", "LokiSink log_foundry.sinks.loki", {("LokiSink", "log_foundry.sinks.loki")}),
     ("comment and blank lines are skipped", "# header\n\nLokiSink log_foundry.sinks.loki\n",
@@ -2274,9 +2273,9 @@ def test_the_frozen_baseline_parser_corpus(
         assert _parse_frozen_pairs(text) == expected, name
 
 
-# Stand-in modules. `types.SimpleNamespace` is what this suite already uses for the job in
-# eleven other files, and `_resolution_fault` only ever does `getattr(module, cls, None)`, so
-# the stand-in is faithful for everything it is asked.
+# Stand-in modules. `types.SimpleNamespace` is what this suite already uses elsewhere to stand
+# in for a module, and `_resolution_fault` only ever does `getattr(module, cls, None)`, so the
+# stand-in is faithful for everything it is asked.
 _LIVE = types.SimpleNamespace(LokiSink=type("LokiSink", (), {}))
 _PLACEHOLDER = types.SimpleNamespace(LokiSink=None)
 _RENAMED = types.SimpleNamespace(LokiPushSink=type("LokiPushSink", (), {}))
@@ -2317,12 +2316,11 @@ def test_the_frozen_path_resolution_corpus(
 
     `hasattr` accepted `LokiSink = None`, the ordinary optional-dependency fallback, while
     `LokiSink(url)` raises `TypeError`; and a missing transitive dependency was announced as a
-    deleted module, sending a contributor to hunt a file sitting right there. Neither was
-    expressible as a test while this logic was inline in the gate's loop, which is why both
-    shipped.
+    deleted module, sending a contributor to hunt a file sitting right there.
 
-    The two `ModuleNotFoundError` cases are the discriminating pair: same exception type, and the
-    verdict turns entirely on whether `exc.name` is the module we asked for.
+    The `ModuleNotFoundError` cases carry the discrimination: same exception type each time, and
+    the verdict turns on whether `exc.name` is the module we asked for, so a case whose two arms
+    agree cannot tell `==` from `startswith` or `ModuleNotFoundError` from `ImportError`.
 
     Args:
       name: The case label.
@@ -2369,8 +2367,9 @@ _SINK_TABLE_CASES: list[tuple[str, str, set[tuple[str, str]]]] = [
 def test_the_sink_table_parser_corpus(name: str, text: str, expected: set[tuple[str, str]]) -> None:
     """The README table parser's own evidence, weighted toward what it must NOT reject.
 
-    A corpus of only-failures cannot see a false positive, and false positives are this parser's
-    whole risk: it feeds an assertion that accuses the README of dropping a documented path.
+    A corpus of only-failures cannot see a false positive, and this parser feeds an assertion
+    that accuses the README of dropping a documented path, so a row it stops recognising is a
+    false accusation rather than a missed one.
 
     Args:
       name: The case label.
@@ -2391,9 +2390,8 @@ def test_the_frozen_path_gate_reports_a_path_the_readme_stopped_documenting(
 ) -> None:
     """Drive the gate's README check, which no committed case reached before.
 
-    The gate has five assertions and its corpus covered two. This and the two below drive the
-    remaining three through `monkeypatch` -- which is also the standing counter-example to the
-    claim that this logic needed extracting to be testable at all.
+    The gate's other assertions are driven the same way, one test each, and together they are
+    the standing counter-example to the claim that this logic needed extracting to be testable.
 
     Args:
       monkeypatch: Fixture used to shrink the documented set by one pair.
@@ -2460,7 +2458,7 @@ def test_the_frozen_path_gate_reports_an_undocumented_sink_class(
 
 
 def test_the_frozen_path_gate_reports_a_truncated_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drive the floor, which is what stops every assertion below it going vacuous.
+    """Drive the floor, which is what stops the two assertions that read the roster going vacuous.
 
     Args:
       monkeypatch: Fixture used to shrink the frozen roster below the floor.
