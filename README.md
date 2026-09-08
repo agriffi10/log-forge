@@ -841,7 +841,7 @@ disconnected, so a sustained outage moves `health().failed_batches` instead of b
 | `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id", producer_config=None)` — `producer_config` is merged **beneath** the sink's own keys, so it reaches `message.timeout.ms` and friends without displacing `bootstrap.servers`; passing it with `producer=` is a `ValueError` |
 | `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
 | `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
-| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None)` — persistent messages |
+| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None, blocked_connection_timeout=None, socket_timeout=None, stack_timeout=None)` — persistent messages; `pika` leaves `blocked_connection_timeout` unset, so a broker under a memory or disk alarm blocks every publish indefinitely — the sink applies `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` (30 s) unless the URL's query names one, and an explicit keyword overrides the URL |
 | `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None, publish_timeout=10.0, connect_timeout=None, max_reconnect_attempts=None, reconnect_time_wait=None, drain_timeout=None)` — `publish_timeout` bounds one whole `emit` and applies to an injected `client=` too; the four `None` timeouts are forwarded to `nats.connect` only when set, and passing one with `client=` is a `ValueError` |
 | `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
 | `AzureEventHubsSink` | `log_foundry.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
@@ -857,9 +857,9 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…")` |
+| `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…", socket_timeout=None, server_selection_timeout=None)` — `pymongo`'s `socketTimeoutMS` default is `None`, so a read that never returns holds the drain thread; the sink applies `DEFAULT_SOCKET_TIMEOUT` (30 s) only when neither the keyword nor the URI query names one |
 | `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=5)` — JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
-| `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False)` — MergeTree, columnar insert |
+| `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False, chunk_size=1000, send_receive_timeout=None)` — MergeTree, columnar insert; the driver's own 300 s `send_receive_timeout` is finite so it is left alone, and forwarded only when you set it |
 
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set
 it `True` for an idempotent `CREATE TABLE IF NOT EXISTS` convenience.
