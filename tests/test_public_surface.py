@@ -16,6 +16,7 @@ import io
 import pathlib
 import pkgutil
 import re
+import sys
 import threading
 import time
 import types
@@ -1684,7 +1685,26 @@ def _sink_pairs_the_readme_documents() -> set[tuple[str, str]]:
     Raises:
       None.
     """
-    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    return _parse_sink_table((_ROOT / "README.md").read_text(encoding="utf-8"))
+
+
+def _parse_sink_table(text: str) -> set[tuple[str, str]]:
+    """Parse `| \u0060XSink\u0060 | \u0060log_foundry.sinks.y\u0060 | ...` rows out of the README's sink tables.
+
+    Split from its caller so a corpus can drive it, because this parser's failure mode is a false
+    POSITIVE: a row it stops recognising is reported as the README having dropped a frozen path,
+    which is a true-sounding accusation about a file that still documents it. Only the first two
+    cells are read -- the third is prose that names modules in running text.
+
+    Args:
+      text: The README source.
+
+    Returns:
+      The `(class name, dotted module)` pairs the tables document.
+
+    Raises:
+      None.
+    """
     pattern = r"^\|\s*`(\w+)`\s*\|\s*`(log_foundry\.sinks\.[\w.]+)`\s*\|"
     return {(m.group(1), m.group(2)) for m in re.finditer(pattern, text, re.MULTILINE)}
 
@@ -1717,9 +1737,12 @@ def _frozen_sink_pairs() -> set[tuple[str, str]]:
 def _parse_frozen_pairs(text: str) -> set[tuple[str, str]]:
     """Parse the frozen-paths baseline: `<ClassName> <dotted.module>` per line, `#` for comments.
 
-    Split from its caller so a corpus can drive it. It was written reading a fixed path, which is
-    exactly why it shipped with nine mutants verified by hand and none of them committed -- an
-    untestable seam is an untested one.
+    Split from its caller so a corpus can drive it with text rather than through the filesystem.
+    Note what this split is NOT. The logic was always reachable: a six-line `monkeypatch` test
+    calling the gate reddens on either hole a review found here, verified against the inline
+    version that had no split at all. It shipped untested because nobody wrote that test, not
+    because none could be written -- and the nine mutants an earlier message cited were gate
+    mutants driving `src/` and `README.md`, none of them touching this parser.
 
     Args:
       text: The baseline file's contents.
@@ -1750,7 +1773,8 @@ def _resolution_fault(cls: str, mod: str, module: object, exc: ImportError | Non
     Split out for the same reason as `_parse_frozen_pairs`: both holes a review found here were
     in this logic, not in the loop around it -- `hasattr` accepting a `LokiSink = None`
     optional-dependency placeholder, and a missing transitive dependency being announced as a
-    deleted module. Neither was expressible as a test while the logic lived inline.
+    deleted module. Splitting makes such a case direct rather than possible: both were reachable
+    inline through `monkeypatch`, and were simply never written.
 
     Args:
       cls: The promised class name.
@@ -2180,8 +2204,15 @@ def test_the_readme_link_scanner_corpus(name: str, markdown: str, should_fire: b
 
 # `(name, baseline text, expected pairs or None to mean "must be refused")`. The baseline IS the
 # 1.x promise, so a line it silently mis-parses is a path that stops being checked -- under-
-# coverage that reports clean. Every malformed form here reached `importlib` in an earlier build
-# and surfaced as a confusing missing-module error rather than as a bad line.
+# coverage that reports clean.
+#
+# The refused forms are not one story, and an earlier version of this comment said they were.
+# Measured against the `partition(" ")` parser this replaced: a stray third field rode into the
+# module name and was reported as a missing module, and a foreign path reported the same; a tab
+# and a bare class name raised an uncaught `ValueError: Empty module name`; a BOM imported fine
+# and failed later at `getattr`; and a TWO-SPACE separator parsed correctly and went green.
+# That last one is a deliberate tightening, not a restored behaviour -- defensible because the
+# refusal is loud and names the line, but it is a new rule and worth knowing as one.
 _FROZEN_BASELINE_CASES: list[tuple[str, str, set[tuple[str, str]] | None]] = [
     ("one pair", "LokiSink log_foundry.sinks.loki", {("LokiSink", "log_foundry.sinks.loki")}),
     ("comment and blank lines are skipped", "# header\n\nLokiSink log_foundry.sinks.loki\n",
@@ -2197,7 +2228,13 @@ _FROZEN_BASELINE_CASES: list[tuple[str, str, set[tuple[str, str]] | None]] = [
     ("a bare class name is refused", "LokiSink", None),
     ("a foreign module path is refused", "LokiSink other.package.loki", None),
     ("a two-space separator is refused", "LokiSink  log_foundry.sinks.loki", None),
-    ("a BOM on the first pair is refused", "﻿LokiSink log_foundry.sinks.loki", None),
+    # A real BOM lands on the file's first line, which is a comment -- `startswith("#")` is
+    # then False and the comment itself is refused as a malformed pair. Written as an escape
+    # rather than an invisible literal, so an editor normalising the file cannot delete the case.
+    ("a BOM before a comment is refused", "\ufeff# header\nA log_foundry.sinks.a", None),
+    ("a BOM before a pair is refused", "\ufeffLokiSink log_foundry.sinks.loki", None),
+    ("a malformed line is reported with its surrounding whitespace",
+     "  LokiSink\tlog_foundry.sinks.loki  ", None),
 ]
 
 
@@ -2223,26 +2260,27 @@ def test_the_frozen_baseline_parser_corpus(
       None.
     """
     if expected is None:
-        with pytest.raises(AssertionError, match="malformed line"):
+        # The reported text is asserted to be the RAW line, not just that some text appears.
+        # `{raw!r}` -> `{line!r}` passes any prefix- or shape-only match, and that substitution
+        # is exactly what hides a tab or a trailing space from the person reading the failure.
+        with pytest.raises(AssertionError, match="malformed line") as caught:
             _parse_frozen_pairs(text)
+        offending = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        assert any(repr(ln) in str(caught.value) for ln in offending), (
+            f"{name}: the failure must quote the offending line verbatim, including any "
+            f"surrounding whitespace; it said {caught.value}"
+        )
     else:
         assert _parse_frozen_pairs(text) == expected, name
 
 
-class _Stub:
-    """A stand-in module for the resolution corpus, carrying whatever attributes a case needs.
-
-    Attributes:
-      None -- attributes are set per case by the corpus.
-    """
-
-
-_LIVE = _Stub()
-_LIVE.LokiSink = type("LokiSink", (), {})  # type: ignore[attr-defined]
-_PLACEHOLDER = _Stub()
-_PLACEHOLDER.LokiSink = None  # type: ignore[attr-defined]
-_RENAMED = _Stub()
-_RENAMED.LokiPushSink = type("LokiPushSink", (), {})  # type: ignore[attr-defined]
+# Stand-in modules. `types.SimpleNamespace` is what this suite already uses for the job in
+# eleven other files, and `_resolution_fault` only ever does `getattr(module, cls, None)`, so
+# the stand-in is faithful for everything it is asked.
+_LIVE = types.SimpleNamespace(LokiSink=type("LokiSink", (), {}))
+_PLACEHOLDER = types.SimpleNamespace(LokiSink=None)
+_RENAMED = types.SimpleNamespace(LokiPushSink=type("LokiPushSink", (), {}))
+_FACTORY = types.SimpleNamespace(LokiSink=lambda url: None)
 
 # `(name, module, exc, expected fragment or None for "no fault")`.
 _RESOLUTION_CASES: list[tuple[str, object, ImportError | None, str | None]] = [
@@ -2257,6 +2295,17 @@ _RESOLUTION_CASES: list[tuple[str, object, ImportError | None, str | None]] = [
      "does not import"),
     ("a plain ImportError from inside the module", None,
      ImportError("cannot import name 'x'"), "does not import"),
+    # The discriminating trio. Without these, five reversals survive: relaxing
+    # `ModuleNotFoundError` to `ImportError`, dropping the isinstance arm entirely, loosening
+    # `==` to `startswith`, and widening `isclass` to `callable` or to `is not None`. Each needs
+    # a case whose two arms disagree, which the cases above never produce.
+    ("a plain ImportError NAMING this module is still not it being gone", None,
+     ImportError("cannot import name 'x', name=here", name="log_foundry.sinks.loki"),
+     "does not import"),
+    ("a missing PARENT package is not this module being gone", None,
+     ModuleNotFoundError("No module named 'log_foundry'", name="log_foundry"),
+     "does not import"),
+    ("a factory function is not a class", _FACTORY, None, "no longer provides"),
 ]
 
 
@@ -2292,3 +2341,139 @@ def test_the_frozen_path_resolution_corpus(
         assert fault is None, f"{name}: expected no fault, got {fault!r}"
     else:
         assert fault is not None and fragment in fault, f"{name}: got {fault!r}"
+
+
+# `(name, README fragment, expected pairs)`. This parser's dangerous direction is the FALSE
+# POSITIVE -- a row it stops recognising is reported as "the README no longer documents this
+# frozen path", an accusation that is false and sends a contributor looking for a missing row
+# that is right there. So the accept cases carry the cosmetic edits someone actually makes.
+_SINK_TABLE_CASES: list[tuple[str, str, set[tuple[str, str]]]] = [
+    ("a plain row", "| `LokiSink` | `log_foundry.sinks.loki` | notes |",
+     {("LokiSink", "log_foundry.sinks.loki")}),
+    ("extra spacing in the cells", "|  `LokiSink`  |  `log_foundry.sinks.loki`  | notes |",
+     {("LokiSink", "log_foundry.sinks.loki")}),
+    ("a dotted subpackage path", "| `GCSSink` | `log_foundry.sinks.cloud.gcs` | notes |",
+     {("GCSSink", "log_foundry.sinks.cloud.gcs")}),
+    ("two rows sharing a module",
+     ("| `FileSink` | `log_foundry.sinks.file` | a |\n"
+      "| `RotatingFileSink` | `log_foundry.sinks.file` | b |"),
+     {("FileSink", "log_foundry.sinks.file"), ("RotatingFileSink", "log_foundry.sinks.file")}),
+    ("a header separator row is not a pair", "|---|---|---|", set()),
+    ("a module named in prose is not a row",
+     "Import it from `log_foundry.sinks.loki` when you need it.", set()),
+    ("a foreign module path is not a sink row", "| `Other` | `other.pkg.thing` | notes |", set()),
+]
+
+
+@pytest.mark.parametrize(("name", "text", "expected"), _SINK_TABLE_CASES)
+def test_the_sink_table_parser_corpus(name: str, text: str, expected: set[tuple[str, str]]) -> None:
+    """The README table parser's own evidence, weighted toward what it must NOT reject.
+
+    A corpus of only-failures cannot see a false positive, and false positives are this parser's
+    whole risk: it feeds an assertion that accuses the README of dropping a documented path.
+
+    Args:
+      name: The case label.
+      text: The README fragment.
+      expected: The pairs the fragment documents.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    assert _parse_sink_table(text) == expected, name
+
+
+def test_the_frozen_path_gate_reports_a_path_the_readme_stopped_documenting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the gate's README check, which no committed case reached before.
+
+    The gate has five assertions and its corpus covered two. This and the two below drive the
+    remaining three through `monkeypatch` -- which is also the standing counter-example to the
+    claim that this logic needed extracting to be testable at all.
+
+    Args:
+      monkeypatch: Fixture used to shrink the documented set by one pair.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    documented = _sink_pairs_the_readme_documents()
+    victim = min(_frozen_sink_pairs() & documented)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_sink_pairs_the_readme_documents",
+        lambda: documented - {victim},
+    )
+    with pytest.raises(AssertionError, match="no longer documents these frozen import paths"):
+        test_every_frozen_sink_import_path_still_resolves()
+
+
+def test_the_frozen_path_gate_reports_a_base_export_that_is_not_re_exported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the `base` exemption, which holds only while every name it exports is top-level.
+
+    Args:
+      monkeypatch: Fixture used to add an unexported name to `base.__all__`.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks import base as _base
+
+    monkeypatch.setattr(_base, "__all__", [*_base.__all__, "SinkTimeoutError"])
+    with pytest.raises(AssertionError, match=r"these are not.*SinkTimeoutError"):
+        test_every_frozen_sink_import_path_still_resolves()
+
+
+def test_the_frozen_path_gate_reports_an_undocumented_sink_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the shipped-but-undocumented check, the one that keeps a new sink inside the freeze.
+
+    Args:
+      monkeypatch: Fixture used to add a shipped class with no README row.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    shipped = _sink_classes_with_emit()
+    extra = ("vector", ast.parse("class VectorSink:\n    def emit(self, batch): ...").body[0])
+    monkeypatch.setattr(
+        sys.modules[__name__], "_sink_classes_with_emit", lambda: [*shipped, extra]
+    )
+    with pytest.raises(AssertionError, match=r"no README table row documents them.*VectorSink"):
+        test_every_frozen_sink_import_path_still_resolves()
+
+
+def test_the_frozen_path_gate_reports_a_truncated_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drive the floor, which is what stops every assertion below it going vacuous.
+
+    Args:
+      monkeypatch: Fixture used to shrink the frozen roster below the floor.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    frozen = _frozen_sink_pairs()
+    monkeypatch.setattr(
+        sys.modules[__name__], "_frozen_sink_pairs", lambda: set(sorted(frozen)[:10])
+    )
+    with pytest.raises(AssertionError, match=r"v1\.0\.0 promised 37 and the freeze only"):
+        test_every_frozen_sink_import_path_still_resolves()
