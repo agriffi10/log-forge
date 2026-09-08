@@ -1,5 +1,10 @@
 # Log Foundry
 
+[![PyPI](https://img.shields.io/pypi/v/log-foundry?label=pypi)](https://pypi.org/project/log-foundry/)
+[![Python](https://img.shields.io/pypi/pyversions/log-foundry)](https://pypi.org/project/log-foundry/)
+[![Build](https://img.shields.io/github/actions/workflow/status/agriffi10/log-forge/release.yml?branch=main&label=build)](https://github.com/agriffi10/log-forge/actions/workflows/release.yml)
+[![License](https://img.shields.io/pypi/l/log-foundry)](LICENSE)
+
 Consistent, structured (JSON) logs for every decorated function call — correlated by shared
 trace/span IDs, ready to ship to any of 30-plus built-in sinks (stdout by default; SQS → ELK is
 the headline production path).
@@ -21,17 +26,22 @@ calls form a tree you can query later.
   definition waits for the drain it asked for.
 
 **The public API is frozen for the whole of `1.x`.** Everything in `log_foundry.__all__`, the
-`Sink` protocol and every shipped sink class stays put: nothing is removed or renamed, and no
-signature changes in a way that breaks a caller, until `2.0.0`. Behaviour is not frozen by that
-promise — a defect is still a defect, and fixing one can change what a broken path does. `__all__`
-is the boundary: an underscore-prefixed *module* — `_lifecycle`, `_fork`, `_diag` — is internal and
-moves without notice.
+`Sink` protocol, and every shipped sink class **at the import path documented for it below**
+stays put: nothing is removed, renamed or moved, and no signature changes in a way that breaks a
+caller, until `2.0.0`. The import path is part of that promise because it has to be — no concrete
+sink is exported from the top level, so `from log_foundry.sinks.sqs import SQSSink` is the only
+way to reach one, and a class pinned at a path free to move is not pinned at all. `1.0.0` is
+where they last moved; the upgrade note below says which.
+
+Behaviour is not frozen by that promise — a defect is still a defect, and fixing one can change
+what a broken path does. The private half is genuinely private: underscore-prefixed modules —
+`_lifecycle`, `_fork`, `_diag`, and the `sinks/_*.py` helpers — move without notice.
 
 `1.0.0` was a reliability release rather than a feature release: three audit arcs worked through
 the paths where the library could lose an event, fail its caller, block forever, or report health
 it could not back up. If you are coming from any `0.x`, read its release notes before you bump —
 several of the changes are silent, and they are written against `0.10.1`, the release immediately
-before this one:
+before this one. [`CHANGELOG.md`](CHANGELOG.md) indexes every version;
 [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
 
 ---
@@ -69,9 +79,10 @@ pip install 'log-foundry>=1,<2'   # pin to the frozen API above
 >   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
 >
 > Those are the three changes of *shape*, and not the three most likely to reach you:
-> `log_foundry.sinks.util` was deleted with no alias, and several new construction-time refusals
-> land, all of which rank above two of the three above in the release notes' own ordering. Read
-> the full list of twenty-two before you upgrade —
+> `log_foundry.sinks.util` was deleted with no alias — the `MemorySink`, `NullSink` and
+> `StderrSink` it held are now at `log_foundry.sinks.memory`, `…null` and `…stdout` — and
+> several new construction-time refusals land, all of which rank above two of the three above in
+> the release notes' own ordering. Read the full list of twenty-two before you upgrade —
 > [`docs/release-notes/v1.0.0.md`](https://github.com/agriffi10/log-forge/blob/v1.0.0/docs/release-notes/v1.0.0.md).
 >
 > `echo`, `message` and `fields` are reserved parameter names on the emitters; pass fields of

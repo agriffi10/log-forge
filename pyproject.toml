@@ -82,6 +82,7 @@ Homepage = "https://github.com/agriffi10/log-forge"
 Repository = "https://github.com/agriffi10/log-forge"
 Documentation = "https://github.com/agriffi10/log-forge#readme"
 "Release notes" = "https://github.com/agriffi10/log-forge/releases"
+Changelog = "https://github.com/agriffi10/log-forge/blob/main/CHANGELOG.md"
 Issues = "https://github.com/agriffi10/log-forge/issues"
 Security = "https://github.com/agriffi10/log-forge/security/policy"
 
