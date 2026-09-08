@@ -10,6 +10,7 @@ SPEC-032 and SPEC-035 both paid for.
 import ast
 import collections.abc
 import dataclasses
+import importlib
 import inspect
 import io
 import pathlib
@@ -1663,3 +1664,81 @@ def test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_other
         case log_foundry.SinkLosses(dropped=d, failed=f):
             matched = (d, f)
     assert matched == (1, 2)
+
+
+def _sink_pairs_the_readme_documents() -> set[tuple[str, str]]:
+    """Every (class, module) pair the README's sink tables tell a reader to import.
+
+    Derived from the table rows rather than listed, for the same reason
+    `_names_the_readme_imports` is: a hand-kept copy of a roster drifts from the thing it
+    describes and nothing notices. The rows are `| `XSink` | `log_foundry.sinks.y` | ...`, and
+    only the first two cells are read -- the third is prose about configuration and carries
+    module names in running text that are not import instructions.
+
+    Args:
+      None.
+
+    Returns:
+      The (class name, dotted module) pairs documented anywhere in the README.
+
+    Raises:
+      None.
+    """
+    text = (_ROOT / "README.md").read_text(encoding="utf-8")
+    pattern = r"^\|\s*`(\w+)`\s*\|\s*`(log_foundry\.sinks\.[\w.]+)`\s*\|"
+    return {(m.group(1), m.group(2)) for m in re.finditer(pattern, text, re.MULTILINE)}
+
+
+def test_every_documented_sink_import_path_resolves() -> None:
+    """The `1.x` freeze covers the sink class *at its documented import path*, so gate the path.
+
+    `docs/decisions/public-api.md` -> *The frozen surface is the import path, not just the class*
+    promises the dotted path, not merely the class: no concrete sink is exported from the top
+    level, so the path is the only route to one and a class pinned at a movable path is pinned to
+    nothing. That promise had no gate when it was written. The suite happened to import all of
+    these somewhere, so a move went red by luck -- two of them via a single test file each, so
+    one unrelated test deletion was enough to make a `sinks/util.py`-style split silent again.
+
+    This asserts the promise directly instead. It is deliberately two-way: a path the README
+    documents that does not resolve is a broken instruction to a reader, and a sink module the
+    README never documents is outside the freeze by omission rather than by decision, which is
+    the half a one-way check would let through.
+    """
+    documented = _sink_pairs_the_readme_documents()
+    assert documented, "the README-derived sink roster is empty -- the scan stopped matching"
+
+    broken: list[str] = []
+    for cls, mod in sorted(documented):
+        try:
+            module = importlib.import_module(mod)
+        except ImportError:
+            broken.append(f"{mod} (no such module, but README documents {cls} there)")
+            continue
+        if not hasattr(module, cls):
+            broken.append(f"{mod} has no {cls}")
+    assert not broken, (
+        "the README documents these sink import paths and the package does not provide them, "
+        f"which breaks the 1.x import-path promise: {broken}"
+    )
+
+    documented_modules = {mod for _, mod in documented}
+    # `base` is the one public sink module with no table row, and correctly so: everything it
+    # exports -- `Sink`, `SinkDeliveryError`, `SinkLosses` -- is re-exported from the top level
+    # and therefore frozen by the `__all__` clause instead of this one. Asserted rather than
+    # skipped, so the exemption stops holding the moment that stops being true.
+    exempt = "log_foundry.sinks.base"
+    base_exports = {"Sink", "SinkDeliveryError", "SinkLosses"}
+    assert base_exports <= set(log_foundry.__all__), (
+        f"{exempt} is exempt from the table only because its names are top-level exports; "
+        f"__all__ no longer carries {sorted(base_exports - set(log_foundry.__all__))}"
+    )
+    shipped_modules = {
+        f"log_foundry.sinks.{p.stem}"
+        for p in _SINK_PKG.glob("*.py")
+        if not p.stem.startswith("_")
+    } - {exempt}
+    undocumented = sorted(shipped_modules - documented_modules)
+    assert not undocumented, (
+        "these sink modules ship but no README table row documents them, so the freeze does not "
+        f"reach them and a move would be silent: {undocumented}"
+    )
