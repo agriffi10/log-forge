@@ -1,0 +1,31 @@
+@@@ expect exit=1
+@@@ match missing required section '## Scope'
+@@@ match missing required section '## Implementation Phases'
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Completed
+
+## Overview
+
+prose
+
+## Functional Requirements
+
+prose
+

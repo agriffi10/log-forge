@@ -1,0 +1,26 @@
+@@@ expect exit=0
+@@@ match no SPEC-*.md files in docs/specs (nothing to check)
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/archive/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Completed
+
+## Overview
+
+prose
+

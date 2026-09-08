@@ -1,5 +1,5 @@
 @@@ expect exit=0
-@@@ file docs/process.md
+@@@ file docs/architecture.md
 # Process
 
 Measured here: the cap was 1400 and caught nine of the section units.

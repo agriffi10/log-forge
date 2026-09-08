@@ -43,6 +43,10 @@ When a spec is done, in the same pass:
    (`212fd16`), so recency is a hint and not the test: the test is reading the delivery docs.
    `git log --format='%h %ci' -- docs/release-notes/<tag>.md` bounds the search; it does not
    close it.
+7. **Prune `CLAUDE.md`'s `## Specs`** of whatever the closed spec made stale. Its **Current work**
+   line carries the spec in flight or `none in flight`, and the section carries nothing recorded
+   elsewhere — the rule that section states for itself, made a step so it is done at the moment it
+   applies: a closed spec's row is in `docs/specs/INDEX.md` and its delivery doc says what shipped.
 
 **Anti-regrowth & doc hygiene** (each rule below was earned by a real doc defect in a project run
 this way).

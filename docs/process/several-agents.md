@@ -17,9 +17,14 @@ order agents asked, with `main` settled and green before the next**.
   your turn *and* the remote is clear, `acquire` takes the lock, `release` drops it — on **every**
   exit path, including failure. Poll `turn`, never `acquire`; each `turn` call is also the heartbeat
   that keeps your place. A holder that stops is this design's one real failure.
-- **The lock covers the whole PR lifecycle** — rebase, push, open, watch to green, merge, confirm
-  `main` — not just the push. One ticket per PR, released between them, so a multi-PR spec does not
+- **The lock covers the whole PR lifecycle** — fetch, rebase, re-run your gates, push, open, watch
+  to green, merge, confirm `main` — not just the push. The fetch is **inside** the lock because the
+  wait is exactly when peers merge: rebase before you get in line and you push a base the remote has
+  already moved past. One ticket per PR, released between them, so a multi-PR spec does not
   hold the line for its whole duration.
+- **The hook checks your base, not just your lock.** `pre-push` carries a second refusal beside the
+  lock's: a push whose commits do not contain the remote's current `main`. Holding the lock does not
+  exempt you from it, which is what makes the fetch above part of the lifecycle rather than advice.
 - **Release only when you are stopping, and know it is one-way.** `turn` and `acquire` refuse while
   a non-draft PR is open and do not exempt your own, and `release` drops your ticket with the lock,
   so a session that releases after opening its PR does not get the lock back on demand: it re-enters
@@ -31,7 +36,7 @@ order agents asked, with `main` settled and green before the next**.
   is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through. Which
   branches are enforced is a per-install setting: **read `enforce-branches` in the queue directory**
   rather than assuming, and rather than re-running `install.sh` to find out, which rewrites this
-  checkout's hook. A fresh install writes a default covering the prefixes that open PRs here, but an
+  checkout's hook. A fresh install writes `.` — every branch — but an
   existing setting is KEPT — so a queue installed before that default changed still enforces
   whatever it was given, and only an explicit `install.sh '<ere>'` re-points it.
 - **A DRAFT PR breaks that reasoning, in both directions.** Drafts are invisible to the open-PR check
@@ -47,11 +52,14 @@ order agents asked, with `main` settled and green before the next**.
   that goes stale; `scripts/pr-queue/PROTOCOL.md` carries the rest.
 - **The queue is not a review.** It is the last thing between an already-reviewed branch and the
   remote. This repo's gates and both diff reviews still come first, in that order.
-- **Every remote check fails closed; enforcement fails open.** The lock only orders the agents that
+- **Every remote check fails closed; enforcement fails open on CONSENT and closed on EVIDENCE.** The lock only orders the agents that
   take it, so `turn` asks the remote directly too — and a `gh` that *errors* returns empty output,
   which reads as "no PRs open" unless you check the exit status. Enforcement is the opposite case:
   linked worktrees share `.git/hooks` through the common git dir, so the hook fires for sessions that
-  never agreed to the queue, and blocking those would be worse than the problem it solves.
+  never agreed to the queue, and blocking those would be worse than the problem it solves. That is
+  the consent half. On evidence the hook is the opposite: an unreadable remote, a missing trunk or an
+  `enforce-branches` pattern it cannot compile each **refuse**, because a check that cannot run must
+  never read as a check that found nothing.
 - **Never move the shared checkout out from under a peer.** Build in your own worktree off fresh
   `origin/main` — not the shared tree, not a peer's branch — and leave the tree on the branch you
   found it on. Uncommitted changes in a shared tree are not yours to commit, stash or revert.

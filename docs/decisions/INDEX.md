@@ -31,7 +31,7 @@ same way):
   must see the reversal.
 - **Date-stamp user decisions** (YYYY-MM-DD) so "settled" has a when.
 - **Declare what an area governs.** The *Governs* column names the code trees the area's fences apply
-  to, as backticked `dir/**` globs or exact paths separated by commas, or `none`. An area that
+  to, as backticked `dir/**` or `dir/prefix-*/**` globs or exact paths separated by commas, or `none`. An area that
   governs a tree has a path-scoped rule at `.claude/rules/decisions-<slug>.md` — the area template,
   with exactly those globs — so its fences fire when a matching file is opened with Read; an area
   that governs none has no rule. A deleted rule fails, so does a rule for an area that claims no

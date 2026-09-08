@@ -1,5 +1,5 @@
 @@@ expect exit=0
-@@@ file docs/process.md
+@@@ file docs/architecture.md
 # Process
 
 Do not write this:

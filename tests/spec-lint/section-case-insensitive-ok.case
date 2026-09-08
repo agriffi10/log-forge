@@ -1,0 +1,38 @@
+@@@ expect exit=0
+@@@ absent missing required section
+@@@ file docs/invariants.md
+# Invariants
+
+## 1. One
+
+text
+
+## 2. Two
+
+text
+
+## 3. Three
+
+text
+@@@ file docs/specs/SPEC-001-x.md
+# Spec: X
+
+**ID:** SPEC-001
+**Status:** Completed
+
+## overview
+
+prose
+
+## SCOPE
+
+prose
+
+## Functional requirements
+
+prose
+
+## implementation phases
+
+prose
+

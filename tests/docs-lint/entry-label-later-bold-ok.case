@@ -40,4 +40,6 @@ intro
 ### Alpha rule
 
 The entry opens with prose, which is allowed: the check is on disagreement,
-not on presence. **A bold span further down** is not the opening label and is not compared.
+not on presence.
+
+**Rejected:** a line-initial bold further down is not the opening label and is not compared.
