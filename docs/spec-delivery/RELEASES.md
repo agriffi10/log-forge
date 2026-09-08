@@ -6,7 +6,10 @@ carry what each spec shipped, and nothing joined the two. It is history, so it b
 delivery tier rather than in the file that loads every session.
 
 Tags are the source of truth for what exists; this table is the source of truth for what each tag
-carried. Add a row when a release is cut — **with one deliberate exception, immediately below**,
+carried. **`CHANGELOG.md` at the repository root is the user-facing half of the same act**: this
+table maps a version to its SPECs, that file tells a caller what changed. Cutting a release owes
+both, and nothing gates either. Add a row when a release is cut — **with one deliberate
+exception, immediately below**,
 where the top row is written in the commit its tag will be cut from and therefore names a tag that
 does not exist yet.
 
