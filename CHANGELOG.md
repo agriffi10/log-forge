@@ -9,13 +9,26 @@ predates that promise and broke compatibility freely.
 
 Every version is a Git tag and the version is derived from it at build time, never hand-edited.
 **The artifacts are on [PyPI](https://pypi.org/project/log-foundry/)**, not on GitHub: a
-[GitHub Release](https://github.com/agriffi10/log-forge/releases) exists only for `0.10.1` and
-`1.0.0`, and each carries exactly one asset — the CycloneDX SBOM. `0.0.1` is the one tag never
-published at all.
+[GitHub Release](https://github.com/agriffi10/log-forge/releases) exists only for `0.10.1` and the
+tags cut after it, because `release.yml` has created one for every tag since, and each carries
+exactly one asset — the CycloneDX SBOM. `0.0.1` is the one tag never published at all.
 
 **Maintaining this file:** add a section when a release is cut, newest first, linking its notes if
-it has any. Nothing gates this file against the tags, so it goes stale by being forgotten rather
-than by failing.
+it has any — or, when a tag is being prepared, in the commit the tag will be cut from, which is
+required whenever that version's notes link this file at `blob/<tag>/…`, since the link resolves
+against the tagged tree. Nothing gates this file against the tags, so it goes stale by being
+forgotten rather than by failing.
+
+## 1.0.1 — 2026-09-22
+
+**No library code changed.** Upgrading from `1.0.0` is a no-op for behaviour. This release exists
+to publish the README work that landed after the `v1.0.0` tag was cut, since PyPI only rebuilds a
+project page when a new version is published: the README now reads as a released `1.0.0` — badges,
+a statement of what the `1.x` freeze covers, a `>=1,<2` pin example and an upgrade callout for any
+`0.x` reader — its links resolve on PyPI instead of 404ing, the pipeline diagram renders, and the
+project lists a Changelog URL. The freeze wording it carries is the **widened** one, covering a
+sink at its documented import path; that is the first time a published page has said so.
+[**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.0.1/docs/release-notes/v1.0.1.md).
 
 ## 1.0.0 — 2026-09-08
 
