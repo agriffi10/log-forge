@@ -1463,11 +1463,11 @@ sdist and a wheel:
 | push tag `vX.Y.Z` | `X.Y.Z` | stable release |
 
 Dev pre-releases **kept** the upload path exercised on every merge, so a real release was never
-the first time it ran. That property is suspended along with the job, and `v1.0.0` is the tag that
-tested it — the first upload attempted since `publish-dev` was disabled, and it succeeded. The
-next tag is in that same position again, because nothing between releases exercises the path any
-more. `pip install log-foundry` resolves to the latest **stable** version either way — pip ignores
-pre-releases unless you pass `--pre`.
+the first time it ran. That property is suspended along with the job, so **every** tag is now the
+first upload attempted since the previous one — `v1.0.0` was the first to sit in that position
+after `publish-dev` was disabled, and it succeeded, but nothing between releases exercises the
+path any more, so the next tag is always exposed the same way. `pip install log-foundry` resolves
+to the latest **stable** version either way — pip ignores pre-releases unless you pass `--pre`.
 
 Cutting a release is one tag:
 
