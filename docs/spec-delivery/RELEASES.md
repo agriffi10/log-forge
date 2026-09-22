@@ -27,8 +27,9 @@ therefore describes a tag that does not exist yet, and stops being a claim about
 moment its tag is pushed.
 
 **`v1.0.1`'s row is pre-written for a weaker reason**, and it is worth saying so rather than
-letting it borrow the argument above. Nothing in that tag's tree links this table, so nothing
-forced the row into the tag commit; the release was prepared in one commit and that commit is the
+letting it borrow the argument above. Nothing in that tag's tree links this table **tag-absolutely**
+— `README.md` links it at `blob/main`, which follows the branch rather than reaching the tagged
+copy — so nothing forced the row into the tag commit; the release was prepared in one commit and that commit is the
 one the tag is cut from, so there was no later commit to add it in. Convenience, not mechanism.
 
 **Which makes any pre-written row a hostage to the tag actually being cut, so re-read it before
