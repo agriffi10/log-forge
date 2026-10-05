@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 
+import pytest
+
+from log_foundry.sinks._time import epoch_nanos
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.loki import LokiSink
 from test_sinks_http import FakeOpener
@@ -35,8 +37,7 @@ def test_push_payload_labels_and_ns_timestamp() -> None:
     stream = payload["streams"][0]
     assert stream["stream"] == {"service": "api", "env": "prod", "level": "INFO"}
     ns, line = stream["values"][0]
-    expected_ns = str(int(datetime(2026, 7, 11, tzinfo=UTC).timestamp() * 1_000_000_000))
-    assert ns == expected_ns
+    assert ns == "1783728000000000000"
     assert json.loads(line)["message"] == "hello"
 
 
@@ -138,3 +139,30 @@ def test_the_budget_holds_for_a_label_value_large_enough_to_dominate_the_body() 
     sink.emit([{"service": f"{'s' * 500}-{i}", "n": i} for i in range(40)])
     oversize = [len(call["body"]) for call in opener.calls if len(call["body"]) > budget]
     assert not oversize, f"bodies past the {budget}-byte budget: {oversize}"
+
+
+# --- epoch_nanos is exact: integer arithmetic, not float seconds scaled by 1e9 ---------------
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        ("2026-10-05T12:34:56.789Z", 1791203696789000000),
+        ("2026-10-05T12:34:56.123Z", 1791203696123000000),
+        ("2026-10-05T12:34:56.001Z", 1791203696001000000),
+        ("2026-10-05T12:34:56.999Z", 1791203696999000000),
+        ("1970-01-01T00:00:00.001Z", 1000000),
+    ],
+)
+def test_epoch_nanos_is_exact_for_every_millisecond_fraction(timestamp: str, expected: int) -> None:
+    assert epoch_nanos(timestamp) == expected
+    assert epoch_nanos(timestamp) // 1_000_000 == expected // 1_000_000
+
+
+def test_the_loki_value_carries_the_exact_nanosecond_string() -> None:
+    opener = FakeOpener()
+    LokiSink("http://loki:3100", labels=("service",), opener=opener).emit(
+        [{"service": "api", "timestamp": "2026-10-05T12:34:56.789Z"}]
+    )
+    ns = json.loads(opener.calls[0]["body"])["streams"][0]["values"][0][0]
+    assert ns == "1791203696789000000"

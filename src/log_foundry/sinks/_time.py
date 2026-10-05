@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 __all__ = ["epoch_nanos", "epoch_seconds"]
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_MICROSECOND = timedelta(microseconds=1)
 
 
 def epoch_seconds(timestamp: object) -> float:
@@ -34,13 +37,24 @@ def epoch_seconds(timestamp: object) -> float:
 def epoch_nanos(timestamp: object) -> int:
     """Converts a SPEC-001 ISO-8601 timestamp to epoch nanoseconds, as Loki requires.
 
+    The conversion is integer arithmetic on the parsed ``datetime``: scaling float seconds by
+    ``1e9`` is inexact at current epochs, turning ``.789Z`` into ``...788999936`` ns, which
+    truncates to the wrong millisecond. A naive timestamp is read as local time and anything
+    :func:`epoch_seconds` would reject falls back to emit-time ``now``, exactly as there.
+
     Args:
       timestamp: The event's timestamp, of any type.
 
     Returns:
-      The epoch nanoseconds, derived from :func:`epoch_seconds`.
+      The exact epoch nanoseconds, or emit-time ``now`` when the value is absent or unparseable.
 
     Raises:
       None.
     """
-    return int(epoch_seconds(timestamp) * 1_000_000_000)
+    if isinstance(timestamp, str):
+        try:
+            parsed = datetime.fromisoformat(timestamp).astimezone(UTC)
+            return (parsed - _EPOCH) // _MICROSECOND * 1000
+        except ValueError:
+            pass
+    return time.time_ns()
