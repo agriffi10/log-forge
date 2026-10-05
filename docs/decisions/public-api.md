@@ -6,7 +6,7 @@ fences; pull an entry only when you need the reasoning.
 ## Contents
 
 - [Fences](#fences)
-- [Logs-only, send everything for now](#logs-only-send-everything-for-now)
+- [OpenTelemetry-shaped output, plural transports, send everything for now](#opentelemetry-shaped-output-plural-transports-send-everything-for-now)
 - [An extra's floor is a published contract — moved deliberately, never by a bot](#an-extras-floor-is-a-published-contract--moved-deliberately-never-by-a-bot)
 - [A public accessor hands out a copy; the library reads the live object](#a-public-accessor-hands-out-a-copy-the-library-reads-the-live-object)
 - [A result that can grow a reason must stop being a `bool` before 1.0, not after](#a-result-that-can-grow-a-reason-must-stop-being-a-bool-before-10-not-after)
@@ -16,7 +16,7 @@ fences; pull an entry only when you need the reasoning.
 
 ## Fences
 
-- **Logs-only, send everything for now** — no metrics or OTel-native traces. Sampling is deferred and **unbuilt** — no `should_send` exists in code — and the per-span flush makes the pipeline span-outcome-ready, *not* tail-sampling-ready. (arch §10, §13)
+- **OpenTelemetry-shaped output, plural transports, send everything for now** — what goes outward uses the OpenTelemetry data model and semantic-convention names, and OTLP is one more sink, never the only way out (Astra has no OTLP ingestion). **Do NOT build:** an OTel SDK/API dependency in core, in-library metrics, or a native field rename in 1.x. The mapping stays private (`_otel`) until a second consumer proves it. Sampling stays deferred and **unbuilt** — no `should_send` in code. (No spec — decided by Andrew on 2026-10-05; SPEC-056 is its first slice. arch §10, §13)
 - **An extra's floor is a published contract — moved deliberately, never by a bot** — `versioning-strategy: increase-if-necessary` stays, so floors move only when a human decides they should. A floor raise is a contract change. (No spec — it shipped alongside SPEC-022 in `v0.9.0`.)
 - **A public accessor hands out a copy; the library reads the live object** — a public getter documented "do not mutate" is a promise the caller's slip breaks silently; `_live_config()`/`_live_baggage()` are the per-event reads. (SPEC-034)
 - **A result that can grow a reason must stop being a `bool` before 1.0, not after** — a `NamedTuple` cannot be retrofitted — a non-empty tuple is always truthy, so every `if flush():` would silently keep passing. `FlushResult`/`ContinueResult` grow by new reason values only. (SPEC-034)
@@ -26,9 +26,19 @@ fences; pull an entry only when you need the reasoning.
 
 ---
 
-### Logs-only, send everything for now
+### OpenTelemetry-shaped output, plural transports, send everything for now
 
-**Logs-only, send everything for now** — no metrics/OTel-native traces; sampling is deferred and **unbuilt** — no `should_send` exists in code, and the per-span flush makes the pipeline span-outcome-ready, *not* tail-sampling-ready. (arch §10, §13)
+> **Reversed 2026-10-05.** This entry opened "Logs-only, send everything for now — no metrics/OTel-native traces". The first half is reversed as a *direction*; the sampling half is unchanged and still true. Every other site that stated the old claim carries its own marker: `architecture.md` §1, §13 and §14, `CLAUDE.md`'s Out of Scope line (edited in place, being byte-budgeted), and the SPEC-055 arc paragraph in `docs/specs/INDEX.md`.
+
+**OpenTelemetry-shaped output, plural transports, send everything for now** — Andrew decided on 2026-10-05, with no spec behind it, that the library follows industry norms and serves several outputs at once: any OTLP backend, ClickHouse, Astra (formerly KalDB) and trace views. Four parts. **(1)** What goes outward standardizes on the OpenTelemetry data model and semantic-convention names, and the transports stay plural: OTLP becomes one more sink. **(2)** OTLP is produced natively, with no OpenTelemetry SDK or API at runtime. **(3)** The "no OTel-native traces" non-goal is reversed as a direction: OTLP spans built from `span.end` are a planned item of the arc recorded in `docs/specs/INDEX.md`, and are not part of SPEC-056. In-library metrics stay out — they are derived downstream, as the OpenTelemetry Collector's `spanmetrics` connector derives them. The native JSON field names do not change in 1.x, because consumers' queries depend on them; a rename to semantic-convention names is a 2.0 question. **(4)** The mapping to the OTel shape is private (`src/log_foundry/_otel.py`), because anything public is frozen until 2.0, and it is made public only once a second consumer has proven the shape.
+
+**Why the transports stay plural.** OTLP is what Datadog, New Relic, Honeycomb, Grafana, Splunk and Elastic ingest, and ClickHouse's ClickStack and the Collector's ClickHouse exporter use a standard `otel_logs` table. Astra (`github.com/slackhq/astra`) has no OTLP ingestion at all: it takes an OpenSearch-compatible `_bulk` API (`bulkIngestApi/opensearch/BulkApiRequestParser.java`) and stores every document as a span. An OTLP-only design would therefore put Astra out of reach and force a Collector in front of every backend. Those were the reasons on the day, from sources read on 2026-10-05; they are not a standing claim about any product.
+
+**What was rejected, and why.** *Building on the OpenTelemetry SDK:* it breaks the zero-runtime-dependency core (`docs/process/ground-rules.md`) and makes the worker and sink pipeline redundant, because the SDK brings batching and exporters of its own — a redesign, effectively 2.0. *OTLP as the only transport:* the Astra reason above. *Renaming the native fields now:* the query reason in (3). *A public mapping now:* a public name is frozen until 2.0 (the import-path fence below), and one consumer cannot prove a shape.
+
+**Do NOT build** an OpenTelemetry SDK or API as a dependency of the core; in-library metrics; a rename of any native field in 1.x; or a public mapping module before a second consumer exists.
+
+**Sampling is still deferred and unbuilt** — no `should_send` exists in code, and the per-span flush makes the pipeline span-outcome-ready, *not* tail-sampling-ready. The OTLP `flags` SPEC-056 sets are the W3C trace flags with the sampled bit, because `format_traceparent` always sets it: the library records every span. OTLP traces are last in the arc because they carry the most design risk — a `span.end` dropped under queue backpressure orphans child spans in a trace view. (No spec — decided by Andrew on 2026-10-05; SPEC-056 is its first slice. arch §10, §13)
 
 
 ### An extra's floor is a published contract — moved deliberately, never by a bot
