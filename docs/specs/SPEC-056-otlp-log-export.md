@@ -80,6 +80,9 @@ on it after this.
   5,000,000 default is well under it, and a caller who raises it past 64 MiB has chosen to.
 - **Parsing an HTTP-date `Retry-After`.** `HTTPSink` reads the seconds form and falls back to its
   exponential backoff for a date, unchanged.
+- **Shared-subtree cost in `sanitize`.** The build review found the same exponential expansion of
+  a shared subtree there, on the caller's own thread. It is handled separately; nothing in this
+  spec changes `sanitize`, and FR-001's node budget bounds only this mapping.
 - **A module-qualified `code.function.name`.** The attribute carries the span's name as the library
   recorded it — `__qualname__`, a type name, or the caller's `name=` — which is not the
   fully-qualified name the convention describes; no module is added.
@@ -101,12 +104,12 @@ are lowercase **hex** (OTLP/JSON's one deviation from proto3 JSON), enums are in
 | Event | LogRecord |
 |---|---|
 | `timestamp` | `timeUnixNano`, and `observedTimeUnixNano` equal to it — the data model describes the two as typically equal for an event that originates in the producing SDK, which is what this library is |
-| `level` | `severityNumber` DEBUG 5, INFO 9, WARNING 13, ERROR 17, CRITICAL 21; `severityText` is `level` verbatim |
+| `level` | `severityNumber` DEBUG 5, INFO 9, WARNING 13, ERROR 17, CRITICAL 21; `severityText` is `level` verbatim, and absent when `level` is empty |
 | `message` | `body`, through the value encoder below |
-| `trace_id`, `span_id` | `traceId`, `spanId`, and `flags` 1 (the W3C sampled bit; `format_traceparent` always sets it) |
+| `trace_id`, `span_id` | `traceId`, `spanId` — hex of the right length in either case, written lowercase; anything else, and the all-zero W3C sentinel, is omitted — and `flags` 1 when `traceId` is written (the W3C sampled bit; `format_traceparent` always sets it) |
 | `message` of `span.start` or `span.end` | `eventName`, the same string |
 | `function`, `log_id` | attributes `code.function.name`, `log.record.uid` |
-| `parent_span_id`, `truncated`, `duration_ms`, `status` | attributes `log_foundry.parent_span_id`, `log_foundry.truncated`, `log_foundry.duration_ms`, `log_foundry.status` |
+| `parent_span_id`, `truncated`, `duration_ms`, `status` | attributes `log_foundry.parent_span_id`, `log_foundry.truncated`, `log_foundry.duration_ms` (through the value encoder: an `int` is an `intValue`, a `float` a `doubleValue`), `log_foundry.status` |
 | `error` | attributes `exception.type`, `exception.message`, `exception.stacktrace` |
 | `fields` | one attribute per key, through the value encoder below |
 
@@ -126,10 +129,10 @@ exist because each was a way to raise, to loop, or to write something a parser r
    event that is not a `dict` maps to `{}`, which is still one record per event.
 2. **A value cannot steer its own mapping.** Dispatch is on the exact type, or for a subclass on
    its builtin base through that base's unbound methods — `str.__str__`, `int.__repr__`,
-   `float.__float__`, `dict.items`, `list.__iter__`, `tuple.__iter__` — the rule `sanitize` already follows with
-   `_INT_LT` and `_FLOAT_REPR`. A subclass whose `__str__`, `__repr__`, `__eq__` or `items` lies,
-   or raises, therefore cannot change what is written. A `Mapping` or sequence that is not a `dict`
-   or `list` is outside the domain (rule 8).
+   `float.__float__`, `dict.items`, `list.__iter__`, `tuple.__iter__` — the rule `sanitize` already
+   follows with `_INT_LT` and `_FLOAT_REPR`. A subclass whose `__str__`, `__repr__`, `__eq__`,
+   `__float__` or `items` lies, or raises, therefore cannot change what is written. A `Mapping` or
+   sequence that is not a `dict`, `list` or `tuple` is outside the domain (rule 9).
 3. **Every string written is valid UTF-8.** A lone surrogate, in a value, a key, a message or any
    `error` string, is replaced by U+FFFD and the record is marked `log_foundry.truncated`, the
    SPEC-055 rule. `json.dumps` escapes a lone surrogate happily, and `json_format.Parse` then
@@ -143,23 +146,41 @@ exist because each was a way to raise, to loop, or to write something a parser r
    `stringValue` of their digits, and an integer too long for `sys.get_int_max_str_digits()` is
    `sanitize`'s `<int: ~N digits>` placeholder with the record marked (SPEC-020), decided by
    `bit_length()` and never by converting it, because converting is what raises.
-6. **Nesting is bounded in two ways.** A container is cut at 24 levels of nesting: its value
-   becomes the `stringValue` `<depth limit>` (`sanitize`'s placeholder) and the record is marked
-   `log_foundry.truncated`. 24 and not more because `json_format.Parse` refuses a document past 100
+6. **Nesting is bounded, and a cycle is found by path.** Counting from the attribute value, which
+   is level 1, **24 nested containers render and the 25th is cut**: it becomes the `stringValue`
+   `<depth limit>` and the record is marked. That is `sanitize`'s indexing — a field value is depth
+   0 and a value at depth `max_depth` is cut — applied to containers, so a scalar inside the 24th
+   container still renders. 24 and not more because `json_format.Parse` refuses a document past 100
    nested messages, and the deepest shape — a `kvlistValue` chain, three messages a level — is
    accepted at 31 levels and refused at 32 (measured against `protobuf` 7.36.2); the cap leaves
    seven levels of margin, envelope included. It is reachable: `configure(max_depth=)` has no upper
-   bound, so an event assembled under a deeper ceiling is cut here. Separately, a container that is
-   its own ancestor is detected **by path** and written `<circular>`, as `sanitize` does; like a
-   type-name placeholder it is visible on its own and does not set the mark. A depth cap alone does
-   not do this: a list holding itself twice is two branches a level, measured at 2,097,151 visits
-   and 5.6 seconds at a cap of 20 and doubling with every level beyond it.
-7. **Keys are unique.** A key that renders to one already written — two non-`str` keys of one type
-   both become `<unserializable: int>` — is dropped, its record's `droppedAttributesCount` counts
-   it, and the first stands. OTLP requires unique keys and `json_format.Parse` accepts duplicates, so
-   no parser would say so.
-8. **Anything else** — a value or key outside the domain assembly produces — becomes the
-   `stringValue` `<unserializable: T>` naming only its type, never a `repr` (arch §6).
+   bound, so an event assembled under a deeper ceiling is cut here. A container that is its own
+   ancestor is written `<circular>`, as `sanitize` does, by comparing it with its ancestors' ids; a
+   depth cap alone does not do this, since a list holding itself twice is two branches a level,
+   measured at 2,097,151 visits and 5.6 seconds at a cap of 20 and doubling with every level.
+7. **A record's work is bounded.** Path detection does not catch a shared subtree: `y = [y, y]`
+   repeated is a DAG, not a cycle, and expands to 2^n nodes — about a second at 18 levels and
+   doubling per level (measured in the build review). A record therefore has a budget of
+   `MAX_NODES = 131_072` values written, counting every value, scalar or container, in the body,
+   the attributes and everything nested in them. The first value that would exceed it becomes the
+   `stringValue` `<node limit>`, nothing after it is visited, the containers around it end there,
+   and the record is marked. The number is twice a fully populated two-level structure at the
+   default `max_keys` (256 × 256 = 65,536 values), so a wide but ordinary event is not cut, and it
+   stays small enough that the worst record costs about a tenth of a second — 131,071 shared nodes
+   took 0.11 s through the mapping and `json.dumps` on the authoring machine, and 262,143 took
+   0.58 s — which is what a hostile record may hold the drain thread for, or on the orphan path the
+   caller's, invariant 4. The constant's docstring says this beside the number. A smaller budget
+   would cut legitimate events; a larger one makes the hostile one cost seconds.
+8. **Keys are rendered, non-empty and unique.** A `str` key is used as it is (rule 3 applies); any
+   other key becomes `<unserializable: T>` and marks the record, the one placeholder invariant 8
+   says marks. A key that is **empty**, or that renders to one already written — two non-`str` keys
+   of one type both become `<unserializable: int>` — is dropped, at any level of nesting, and its
+   record's `droppedAttributesCount` counts it; the first of a repeated key stands. OTLP requires
+   unique keys and OpenTelemetry non-empty ones, `json_format.Parse` accepts duplicates and
+   `MessageToDict` writes an empty key back as no key at all, so neither would say so. Assembly does
+   produce an empty key: `lf.info("m", fields={"": 1})` carries one.
+9. **Anything else** — a value outside the domain assembly produces — becomes the `stringValue`
+   `<unserializable: T>` naming only its type, never a `repr` (arch §6); a key outside it is rule 8.
 
 **The timestamp is converted with integer arithmetic.** `sinks/_time.epoch_nanos` goes through a
 float and is inexact at nanosecond scale — measured at `68caacf`, `"2026-10-05T12:34:56.789Z"`
@@ -177,24 +198,33 @@ string is not re-clipped.
 table above, then the user's `fields` in event order. A user field whose key is one the library set
 *on this record* is displaced by it; a user field whose key starts with `log_foundry.` is dropped
 whether or not the library set that key, so it can never pose as a library attribute; and
-`droppedAttributesCount` counts every attribute dropped, by either rule or by rule 7 — a
-substitution nobody can see is a silent change to the data, which `sanitize` already refuses.
-Everything the mapping *cuts* (rules 3, 5 and 6) sets `log_foundry.truncated`; everything it
-*drops* is counted. A user field named `exception.type` on a record where the library set no
-exception attribute passes through untouched.
+`droppedAttributesCount` counts every attribute dropped, by either rule or by rule 8 — a
+substitution nobody can see is a silent change to the data, which `sanitize` already refuses. A
+user field named `exception.type` on a record where the library set no exception attribute passes
+through untouched.
+
+**What is marked and what is counted.** `log_foundry.truncated` is set by: the event's own
+`truncated: True`; a lone surrogate replaced (rule 3); an integer too long to render (rule 5); the
+depth cut and the node cut (rules 6 and 7); and a non-`str` key written as a placeholder (rule 8).
+It is **not** set by `<circular>` or by a value `<unserializable: T>`, which like any type-name
+placeholder are visible on their own (invariant 8); by an integer beyond int64 written as its
+digits, which loses nothing; or by a non-finite float spelled `"NaN"`, which is how OTLP/JSON
+writes one. Everything *dropped* — a collision, a reserved-prefix key, a repeated or empty key — is
+counted in `droppedAttributesCount` and is not marked.
 
 #### Acceptance Criteria:
 
 - [ ] `"2026-10-05T12:34:56.789Z"` maps to `timeUnixNano == "1791203696789000000"`, with
       `observedTimeUnixNano` the same string; `"1970-01-01T00:00:00.001Z"` maps to `"1000000"`.
-- [ ] A timestamp that is absent, not a `str`, lacks the `Z`, is before 1970, or is past the largest
-      `uint64` nanosecond omits both time fields, and the call returns.
-- [ ] The five levels map to 5, 9, 13, 17 and 21; `"TRACE"`, `"info"` and an absent level carry no
-      `severityNumber`, and `severityText` is the string verbatim; a `level` of `5`, `None` or
-      `{"a": 1}` gives neither field.
-- [ ] A 32-hex `trace_id` and 16-hex `span_id` pass through unchanged with `flags == 1`; a malformed
-      or all-zero `trace_id` omits `traceId` and `flags`, and a malformed `span_id` omits `spanId`
-      only.
+- [ ] A timestamp that is absent, not a `str`, lacks the `Z`, is before 1970, is past the largest
+      `uint64` nanosecond, or names an impossible date (`"2026-02-30T00:00:00.000Z"`) omits both
+      time fields, and the call returns.
+- [ ] The five levels map to 5, 9, 13, 17 and 21; `"TRACE"` and `"info"` carry no `severityNumber`
+      and a `severityText` equal to the string; an empty `level`, an absent one, and one of `5`,
+      `None` or `{"a": 1}` give neither field.
+- [ ] A 32-hex `trace_id` and 16-hex `span_id` pass through with `flags == 1`, and the same ids in
+      uppercase are written lowercase; a malformed or all-zero `trace_id` omits `traceId` and
+      `flags`, and a malformed or all-zero `span_id` omits `spanId` only.
 - [ ] `eventName` is `"span.start"` or `"span.end"` for those two messages and absent otherwise; a
       caller who logs those exact words gets the label too, the limit `model.backfill_baggage`
       already has.
@@ -203,6 +233,8 @@ exception attribute passes through untouched.
       `log_foundry.truncated`, `log_foundry.duration_ms`, `log_foundry.status`, `exception.type`,
       `exception.message`, `exception.stacktrace`; `parent_span_id: None` and an absent `truncated`
       each omit their key.
+- [ ] `duration_ms` of `12` gives `{"intValue": "12"}` and of `1.5` gives `{"doubleValue": 1.5}`; a
+      `bool`, a string and `None` omit the attribute.
 - [ ] `error` of `{"type": "OSError", "module": "builtins"}` gives `exception.type == "OSError"`;
       `{"type": "Boom", "module": "mypkg.errors"}` gives `"mypkg.errors.Boom"`; an empty or absent
       module gives the bare name; an `error` that is not a mapping adds no exception attribute.
@@ -210,8 +242,9 @@ exception attribute passes through untouched.
       `intValue "1"`; `5` to `{"intValue": "5"}`; `2**63 - 1` and `-2**63` to `intValue` decimal
       strings; `2**63`, `-2**63 - 1` and `10**100` to `{"stringValue": "<digits>"}`; `1.5` to
       `{"doubleValue": 1.5}`; `float("nan")` to `{"doubleValue": "NaN"}`; `"s"` to
-      `{"stringValue": "s"}`; `{}` to `{"kvlistValue": {}}`; `[]` to `{"arrayValue": {}}`; and
-      `{"a": [1, {"b": None}]}` to the nested `kvlistValue`/`arrayValue` with `{}` for the `None`.
+      `{"stringValue": "s"}`; `{}` to `{"kvlistValue": {}}`; `[]` to `{"arrayValue": {}}`;
+      `(1, (2,))` and a `namedtuple` to the nested `arrayValue`; and `{"a": [1, {"b": None}]}` to
+      the nested `kvlistValue`/`arrayValue` with `{}` for the `None`.
 - [ ] Under the default `sys.get_int_max_str_digits()`, `10**5000` and `-10**5000` map to
       `<int: ~N digits>` and the record carries `log_foundry.truncated == true`; neither raises.
 - [ ] Library keys of the wrong type — `function: 5`, `log_id: {}`, `parent_span_id: 5`,
@@ -220,29 +253,47 @@ exception attribute passes through untouched.
       `intValue` body, and an absent `message` no `body`; no `stringValue` or `severityText` in any
       of these records holds a non-string.
 - [ ] A lone surrogate (`"a\ud800b"`) as a message, a field value, a field key, an
-      `error.message` and a `function` is written `"a�b"` in each place, and the record
+      `error.message` and a `function` is written `"a\ufffdb"` in each place, and the record
       carries `log_foundry.truncated == true`.
 - [ ] A `class Lying(int)` whose `__str__` and `__repr__` return `"evil"`, a `str` subclass whose
-      `__str__`, `__eq__` and `__hash__` lie, a `float` subclass likewise, and a `dict` subclass
-      whose `items` raises, each map exactly as their base value would, and `"evil"` appears nowhere
-      in the output; a non-`dict` `Mapping` whose `items` raises maps to `<unserializable: T>`.
+      `__str__`, `__eq__` and `__hash__` lie, a `float` subclass whose `__float__` returns `99.0`
+      for a value of `1.5`, a `dict` subclass whose `items` raises, and a `tuple` subclass whose
+      `__iter__` lies, each map exactly as their base value would, and `"evil"` and `99.0` appear
+      nowhere in the output; a `Mapping` that is not a `dict` maps to `<unserializable: T>` both
+      when its `items` raises and when it does not (`types.MappingProxyType({"a": 1})` gives
+      `<unserializable: mappingproxy>`).
+- [ ] Nested lists around a scalar `1`: 23 and 24 deep render whole, the innermost leaf an
+      `{"intValue": "1"}`, with no mark; 25 deep renders 24 containers and the 25th is the
+      `stringValue` `<depth limit>`, marked. A list nested 2,000 deep is cut the same way at the
+      25th.
 - [ ] `x = []; x.append(x); x.append(x)` as a field value returns in under a second, written as an
-      `arrayValue` of two `<circular>` strings, unmarked; a list nested 2,000 deep is cut at 24
-      levels with `<depth limit>`, and the record carries `log_foundry.truncated == true`.
-- [ ] `fields={1: "a", 2: "b"}` gives one `<unserializable: int>` attribute holding `"a"` and
-      `droppedAttributesCount == 1`; the same pair nested in a field value is deduplicated the same
-      way and counted in the record's `droppedAttributesCount`.
+      `arrayValue` of two `<circular>` strings, unmarked.
+- [ ] `y = []` rebuilt 24 times as `y = [y, y]` — shared subtrees, not a cycle — returns within ten
+      seconds, holds no more than `MAX_NODES` values, contains `<node limit>`, and is marked; a
+      field holding 256 lists of 256 integers (about 65,800 values) is written whole and unmarked.
+- [ ] `fields={1: "a", 2: "b"}` gives one `<unserializable: int>` attribute holding `"a"`,
+      `droppedAttributesCount == 1`, and a marked record; `fields={"": 1}` gives no attribute,
+      `droppedAttributesCount == 1` and no mark; `{"a": {"": 1, "b": 2}}` and the same pair of
+      non-`str` keys nested in a field value are cleaned the same way and counted in the record's
+      `droppedAttributesCount`.
 - [ ] On a `span.end` event with an error, user `fields` named `log_foundry.status`,
       `code.function.name` and `exception.type` are all absent from the attributes, the library's
       values stand, and `droppedAttributesCount == 3`. On an ordinary `info` event the same three
       give `code.function.name` displaced and `log_foundry.status` dropped for its prefix, while
       `exception.type` passes through, so the count is 2; a field named `log_foundry.custom` is
       dropped on either event; with no collision `droppedAttributesCount` is absent.
+- [ ] The mark is exactly the one the Description lists. A record built from `<circular>`, a value
+      `<unserializable: object>`, `2**63` written as digits, `float("nan")`, and each drop that
+      leaves nothing else behind — a collision, the reserved prefix, an empty key — carries no
+      `log_foundry.truncated`; a record built from each of `<depth limit>`, `<node limit>`,
+      `10**5000`, a lone surrogate, a non-`str` key and an event with `truncated: True` carries it,
+      one record per case.
 - [ ] Every record produced by the criteria above, wrapped by FR-002's envelope, passes FR-002's
       round-trip helper — parsed, re-serialized equal, ids intact — and has no repeated key in its
       attributes or in any `kvlistValue`, asserted separately because `Parse` accepts duplicates;
       `json.dumps(record, allow_nan=False)` also succeeds on each but is not the oracle, and no
-      sentinel string planted in a `__repr__` appears in any output (invariants 1 and 8).
+      sentinel string planted in a `__repr__` appears in any output (invariants 1 and 8). This
+      criterion can close only in the phase that adds the helper and its dependency.
 - [ ] `log_record` run over five events, one of them hostile, returns five records, and the other
       four are equal to their solo mappings; no event dict differs after the call (invariant 2: a
       mutation would change what a `MultiSink` sibling delivers).
@@ -261,13 +312,30 @@ distinct key, in first-seen order**, because `configure()` mid-run changes `serv
 `env` for events not yet built and one batch can hold both. Within a group the records keep event
 order; across groups they do not, which OTLP does not require.
 
+**`resource_key` obeys FR-001's totality rules, because the sink calls it unguarded.** `_item_size`
+and `_body` both call it from inside `emit`, so a raise there fails the batch. Each stamp is read
+as FR-001 reads any string: a `str`, or a subclass of one through `str.__str__`, with a lone
+surrogate replaced by U+FFFD (rule 3); anything else is `None`, and so is every stamp of an event
+that is not a `dict`, which is read through `dict.get`, unbound. The key is therefore always a
+tuple of exact `str`s and `None`s — hashable, and valid UTF-8. The build review's repro was a `str`
+subclass whose `__hash__` raises, set on a stamp through a `TransformSink`: a `RuntimeError`
+escaped `emit` and the four innocent events beside it were lost; and a lone surrogate in a stamp
+makes `json_format.Parse` refuse the whole document. The repair is not marked: a mark belongs to a
+record, a stamp is configuration rather than record data, and `configure()` already refuses a stamp
+that cannot encode (SPEC-055), so only an event rewritten past assembly reaches it.
+
 Each `resourceLogs` carries `resource.attributes` `service.name`, `service.version` and
 `deployment.environment.name` from the key, one `scopeLogs` whose `scope` is `{"name":
 "log_foundry", "version": <library version>}` with the records under `logRecords`, and the pinned
 schema URL at both `resourceLogs` and `scopeLogs` level. The semantic-conventions version is one
 constant, `SEMCONV_VERSION = "1.44.0"` — the release current on 2026-10-05 — and the URL is derived
 from it **at call time**, with no module-level URL constant: a URL computed at import would not
-follow the version, and moving the pin is one edit and a release-noted change.
+follow the version, and moving the pin is one edit and a release-noted change. The form is
+canonical throughout: a field at its proto3 default is omitted and an empty list is never written,
+so an empty `scope_version` leaves `version` out and an event with no usable stamp leaves `resource`
+an empty object — which `MessageToDict` writes back identically, and the comparison below depends
+on it. `_otel.framing(key, scope_version)` is what one group costs around its records,
+`len(request_body([(key, "")], v)) - len(request_body([], v))`; FR-003's `_item_size` charges it.
 
 **The proof is a round trip through the generated classes.** Everything above is JSON that could be
 shaped wrongly and still look right, and a dev-only `opentelemetry-proto` is what can say so. The
@@ -281,7 +349,9 @@ is lowerCamelCase, and the re-serialization comparison can); it **accepts a hex 
 without complaint, decoding 32 hex characters into 24 wrong bytes (so the parsed `trace_id.hex()`
 must equal the id that was sent); it **refuses an `int64` out of range**, **refuses a lone
 surrogate**, and **refuses a document past 100 nested messages** (the reasons for FR-001's rules 5,
-3 and 6); and it **accepts duplicate keys** (so uniqueness is asserted by the helper itself).
+3 and 6); it **accepts duplicate keys** (so uniqueness is asserted by the helper itself); and
+`MessageToDict` **writes an attribute with an empty key back without its `key`**, which the
+comparison catches and which is why FR-001 rule 8 drops such an attribute first.
 
 **The dev dependency costs `mypy` a line, and the build owes it.** `protobuf` creates a `google/`
 namespace directory, and with it present `mypy` stops reading
@@ -289,8 +359,8 @@ namespace directory, and with it present `mypy` stops reading
 ignore[import-not-found]` — as a missing module and reads it as installed but untyped: an
 `unused-ignore` and an `import-untyped` error. `ci.yml` runs `poetry install --with dev` and then
 `poetry run mypy`, so this is red in CI the commit the dependency lands. Reproduced in the spec
-review and again at authoring with `mypy` 2.4.0 and `protobuf` 7.36.2. The fix, verified by running
-it: the inline comment becomes `# type: ignore[import-not-found, unused-ignore]`, and
+review, and in the build review on the locked `mypy` 2.3.1 (`poetry.lock`). The fix, verified by
+running it: the inline comment becomes `# type: ignore[import-not-found, unused-ignore]`, and
 `pyproject.toml` gains `[[tool.mypy.overrides]]` with `module = "google.cloud.*"` and
 `ignore_missing_imports = true`. Two alternatives were measured and fail, and the builder should not
 retry them: `[import, unused-ignore]` removes the `import-not-found` text that
@@ -312,20 +382,31 @@ headroom left — keeping `azure/` and naming `google/`, the `unused-ignore` cod
       once (invariant 2).
 - [ ] A stamp that is absent or not a `str` omits its resource attribute, and events lacking it
       share a group; two events differing only in `version` do not.
+- [ ] `resource_key` never raises: a stamp that is a `str` subclass whose `__hash__` raises, and
+      one whose `__eq__` and `__str__` lie, are read as their plain text; a stamp holding a lone
+      surrogate is read with U+FFFD in its place; a stamp of any other type, and every stamp of an
+      event that is not a `dict`, are `None`. `request_body` over five pairs, one keyed by such a
+      stamp, returns one document holding all five records, each in its own key's group, and it
+      passes the round-trip helper (invariants 1 and 2).
+- [ ] An empty `scope_version` leaves the `version` key out, and an event with all three stamps
+      unusable gives a `resource` that is `{}`; both round-trip.
+- [ ] `framing(key, v)` equals `len(request_body([(key, "")], v)) - len(request_body([], v))`, in
+      bytes, for three different keys, and a document holding `n` records of one key is exactly
+      `len(request_body([], v)) + framing(key, v) + n * record_length + (n - 1)` bytes long.
 - [ ] Patching `_otel.SEMCONV_VERSION` to `"9.9.9"` changes both schema URLs in the next
       `request_body` and nothing else, and the module has no URL constant of its own.
 - [ ] The round trip over a corpus — every level, `span.start`, `span.end` with and without an
       error, a null parent, a truncated event, nested `fields` including `{}`, `[]`, `None`, `True`,
-      `2**63 - 1`, `2**63` and a finite float, an event with no usable timestamp, two resources, a
-      `kvlistValue` chain and an `arrayValue` chain each cut at FR-001's 24-level cap, and the
-      hostile records of FR-001 — parses at `Parse`'s default recursion limit, re-serializes to the
-      converted input, and each parsed `trace_id.hex()` and `span_id.hex()` equals the id sent
-      (invariant 8).
+      `2**63 - 1`, `2**63` and a finite float, `fields={"": 1}`, an event with no usable timestamp,
+      two resources, a `kvlistValue` chain and an `arrayValue` chain each cut at FR-001's 24-level
+      cap, a record cut by its node budget, and the hostile records of FR-001 — parses at `Parse`'s
+      default recursion limit, re-serializes to the converted input, and each parsed
+      `trace_id.hex()` and `span_id.hex()` equals the id sent (invariant 8).
 - [ ] The comparison is shown able to fail: a snake_case key, an unconverted hex id, an unknown key,
       an explicit proto3 default (`"severityNumber": 0`), a lone surrogate, a chain 32 `kvlistValue`
-      levels deep and a repeated attribute key are each refused by `Parse` or by the helper's own
-      checks, asserted by reason, so a round trip that passes everything is not mistaken for one
-      that passes this.
+      levels deep, a repeated attribute key and an attribute with an empty key are each refused by
+      `Parse` or by the helper's own checks, asserted by reason, so a round trip that passes
+      everything is not mistaken for one that passes this.
 - [ ] The test imports the generated classes unconditionally, so a missing dev dependency fails the
       suite rather than skipping the proof.
 - [ ] `opentelemetry-proto` sits in `[tool.poetry.group.dev.dependencies]` only: the runtime
@@ -338,7 +419,12 @@ headroom left — keeping `azure/` and naming `google/`, the `unused-ignore` cod
       `google.cloud.*` override, `ruff check` passes on the file, and
       `tests/test_sink_integration_roster.py` still derives `pubsub` into its population.
 - [ ] `CLAUDE.md`'s "After installing extras locally" paragraph is rewritten in the same change and
-      is no longer, in bytes, than the paragraph it replaces; `sh scripts/docs-lint.sh` exits 0.
+      is no longer, in bytes, than the paragraph it replaces — a rewrite of 472 bytes against the
+      476 it replaces at `df10826` was measured to fit — and the always-loaded set has room for all
+      three of the build's `CLAUDE.md` edits together: at `df10826` it is 37,616 of 38,000 bytes, so
+      the Tech Stack Test-row note and the `_otel` Layout mention of Phase 5 must add under 384
+      bytes between them. `sh scripts/docs-lint.sh` exits 0 after the paragraph and the note, and
+      again after the Layout mention.
 - [ ] Serves invariants 2 and 8.
 
 ### FR-003: `OTLPSink` posts OTLP, retries OTLP's statuses, bounds its response, and keeps every body inside the budget
@@ -371,24 +457,30 @@ oversized body is to answer `413`, which is exactly the answer that search exist
 **The response is read under a bound.** OTLP says a client MUST limit the response body it parses
 (RECOMMENDED 4 MiB) and treat an oversized one as a non-retryable error. A second private hook,
 `HTTPSink._response_limit() -> int | None`, defaults to `None` — the unbounded read every HTTP sink
-has today — and `OTLPSink` returns 4 MiB (4,194,304). `_attempt` then reads at most one byte past
-the limit. A non-`2xx` response over it is **abandoned on the spot as non-retryable**, whatever its
-status: counted, announced, raised. A `2xx` response over it is handed to FR-004 as unadjudicated.
-`urllib` asks for `Accept-Encoding: identity`, so the body is read as sent and there is no
-decompression to bound. The request side of the
-same specification — a server MUST bound the request it parses (RECOMMENDED 64 MiB) and answer
-`413`, and a client SHOULD bound the request it sends, likewise — is met by the byte budget below,
-whose 5,000,000 default is far under it.
+has today, with `_attempt` still calling a bare `read()` — and `OTLPSink` returns 4 MiB
+(4,194,304). With a limit set, `_attempt` reads at most one byte past it. A non-`2xx` response
+longer than the limit is **abandoned on the spot as non-retryable**, whatever its status: counted,
+announced, raised. A `2xx` response reaches FR-004 as it was read, and **`_handle_response` itself
+tests `len(payload) > self._response_limit()`** — a body of exactly the limit is adjudicated, one
+byte more is not. There is no instance flag set in `_attempt` for it to read: the orphan path emits
+from application threads into one shared sink (invariant 4), so a flag would carry one thread's
+response into another's chunk. `urllib` asks for `Accept-Encoding: identity`, so the body is read
+as sent and there is no decompression to bound. The request side of the same specification — a
+server MUST bound the request it parses (RECOMMENDED 64 MiB) and answer `413`, and a client SHOULD
+bound the request it sends, likewise — is met by the byte budget below, whose 5,000,000 default is
+far under it.
 
 **The budget includes the envelope.** A chunk's body is not the sum of its records: each distinct
 resource adds a `resource`, a `scopeLogs` wrapper and two schema URLs, and a `configure()` mid-run
-can put several resources in one chunk. `_item_size` therefore charges each record the framing its
-own resource's group costs, and `_body_reserve` withholds the `{"resourceLogs":[…]}` wrapper — the
-`LokiSink` method, over-counting when events share a resource, which is the safe direction: it
-makes more requests than strictly needed and never one the destination rejects. The cost is real
-and stated: a chunk of one resource is charged an envelope per record, so it carries fewer records
-than the budget alone would allow. `max_batch_bytes` is measured on the uncompressed body.
-`MAX_BATCH_COUNT` and `MAX_BATCH_BYTES` are the inherited generic defaults (1,000 and 5,000,000).
+can put several resources in one chunk. `_item_size` therefore charges each record
+`_otel.framing(key, version)` — the framing its own resource's group costs — plus the separator that
+joins it to its neighbour, and `_body_reserve` withholds the `{"resourceLogs":[…]}` wrapper
+(`len(request_body([], v))`) — the `LokiSink` method, over-counting when events share a resource,
+which is the safe direction: it makes more requests than strictly needed and never one the
+destination rejects. The cost is real and stated: a chunk of one resource is charged an envelope per
+record, so it carries fewer records than the budget alone would allow. `max_batch_bytes` is measured
+on the uncompressed body. `MAX_BATCH_COUNT` and `MAX_BATCH_BYTES` are the inherited generic defaults
+(1,000 and 5,000,000).
 
 **Construction.** `endpoint` that is not a `str` raises `TypeError`, and one `HTTPSink`'s URL check
 refuses — no `http`/`https` scheme, no host, empty — raises `ValueError`, both naming `endpoint`
@@ -428,16 +520,26 @@ by an answer that exists only in an ancestor's docstring.
       requests that are delivered, with `losses().failed == 0` — the inherited exception, asserted
       so it is a documented behaviour and not an accident.
 - [ ] Regression guard, not a twin path: `HTTPSink`, `DatadogSink`, `NewRelicSink`, `HoneycombSink`,
-      `LokiSink`, `SplunkHECSink` and `ElasticsearchSink` each still retry a `500` and a `501`, their
-      existing tests pass unchanged, each still reads a 5 MiB response body whole, and the AST roster
-      names `OTLPSink` as the only subclass defining `_retryable_status` or `_response_limit`.
+      `LokiSink`, `SplunkHECSink` and `ElasticsearchSink` each still retry a `500` and a `501`,
+      their existing tests pass unchanged, each still reads a 5 MiB response body whole, a response
+      object whose `read` takes no argument still works with every one of them (the base keeps
+      calling a bare `read()`), and the AST roster names `OTLPSink` as the only subclass defining
+      `_retryable_status` or `_response_limit`.
 - [ ] A `503` whose body is 4 MiB plus one byte makes exactly one request, raises
       `SinkDeliveryError` and leaves `losses().failed == 1`, where the same `503` with a one-byte
-      body is retried; the fake is asked for no more than 4 MiB plus one byte of the response.
+      body is retried and a `503` whose body is exactly 4 MiB is retried too; the fake is asked for
+      no more than 4 MiB plus one byte of the response.
 - [ ] At a `max_batch_bytes` that holds about ten records of the corpus, a chunk of events from
-      three resources yields requests whose every body is no longer than `max_batch_bytes` and each
-      parses as an `ExportLogsServiceRequest`; the same holds for one resource. An `_item_size` that
-      charges no framing, planted as a mutant, fails this criterion on the length assertion.
+      one resource, and one of events alternating across three resources so that every request
+      spans all three, each yield requests whose every body is no longer than `max_batch_bytes` and
+      each parses as an `ExportLogsServiceRequest`. An `_item_size` that charges no framing, planted
+      as a mutant, fails the **three-resource** half on the length assertion; the one-resource half
+      is not asked to catch it, because there the slack left by greedy filling can absorb the single
+      uncharged envelope (measured in the build review).
+- [ ] A batch of five events, one of them carrying a stamp that is a `str` subclass whose
+      `__hash__` raises and another a stamp with a lone surrogate (both set through a
+      `TransformSink`), makes one request holding all five records, parseable, with no exception
+      out of `emit` (invariants 1 and 2).
 - [ ] An event whose record plus framing exceeds the budget is dropped and counted in
       `losses().dropped`, with one stderr line naming `OTLPSink` and a byte count and no event
       content, and the events beside it are delivered (invariants 2 and 11).
@@ -452,7 +554,7 @@ by an answer that exists only in an ancestor's docstring.
       batch emitted after it is still posted (SPEC-032); the class docstring carries the three
       lifecycle answers, and `test_sink_concurrency.py`'s concurrency, client-buffer and
       post-close lints each include `otlp.OTLPSink` in their population and pass for it.
-- [ ] Serves invariants 2, 3, 6, 7, 11 and 13.
+- [ ] Serves invariants 1, 2, 3, 6, 7, 11 and 13.
 
 ### FR-004: A `2xx` that rejects records is counted and never retried, one that rejects them all raises, and one that cannot be read is counted too
 
@@ -471,16 +573,17 @@ landed. It follows `ElasticsearchSink._parse_bulk_response` and sorts a body int
 - **Rejected.** A `partialSuccess` object whose `rejectedLogRecords` is an integer, or a string of
   ASCII decimal digits, in `1 … 2**63 - 1`. It is added to a new `rejected_records` counter, clamped
   to the chunk's size so a hostile or confused server cannot inflate `failed` past what was sent.
-  `losses()` sums it into `failed` beside the abandoned requests, and one `_diag.lost` line names the
-  class and the count. **The line never carries `errorMessage`**: it is the server's text, free to
-  repeat an attribute the caller logged, and invariant 11 names a type and never a value.
+  `losses()` sums it into `failed` beside the abandoned requests, and one `_diag.lost` line names
+  the class and the count; its noun is the literal `"log record"`, so it reads `lost 2 log
+  record(s)`. **The line never carries `errorMessage`**: it is the server's text, free to repeat an
+  attribute the caller logged, and invariant 11 names a type and never a value.
 - **Unadjudicated.** Anything present that this sink cannot read: a `partialSuccess` that is not an
   object (`5`, `[]`, `"x"`), a count that is negative, not an integer, a `bool`, a float, an
   out-of-range or over-long digit string, and a `2xx` body over FR-003's response bound. It is
   counted, with the chunk's size as the upper bound, in a new `dropped_unadjudicated` counter that
-  `losses()` also sums into `failed`, with one `_diag.lost` line naming the class, and **not
-  retried**: the request succeeded, so re-sending could duplicate what landed (SPEC-018). The chunk
-  is settled.
+  `losses()` also sums into `failed`, with one `_diag.lost` line in the same noun naming the class,
+  and **not retried**: the request succeeded, so re-sending could duplicate what landed (SPEC-018).
+  The chunk is settled.
 
 A chunk with some records accepted returns delivered and is **not retried** — OTLP forbids
 retrying a populated partial success, and a retry would re-send what landed. A chunk whose every
@@ -501,17 +604,20 @@ rejection at all.
 - [ ] `{"partialSuccess": {"rejectedLogRecords": "2", "errorMessage": "SECRET-123"}}` against five
       records leaves `rejected_records == 2` and `losses().failed == 2`, makes exactly one request,
       and `emit` returns normally; the number `2` in place of the string `"2"` behaves identically.
-- [ ] That response writes one stderr line naming `OTLPSink` and `2`, and `SECRET-123` appears
-      nowhere in stderr, in `losses()`, or in any exception message (invariant 11).
+- [ ] That response writes one stderr line reading `lost 2 log record(s)` and naming `OTLPSink`,
+      and `SECRET-123` appears nowhere in stderr, in `losses()`, or in any exception message
+      (invariant 11).
 - [ ] `rejectedLogRecords` of `"9"` against a five-record chunk counts `5`, never `9` (and, as that
       rejects the whole chunk, raises as in the criterion below).
 - [ ] Each of `"-1"`, `"x"`, `true`, `1.5`, `[]`, `"1" * 5000` and `10**30` as the count, and each of
       `5`, `[]` and `"x"` as the whole `partialSuccess`, against a five-record chunk makes exactly
       one request, raises nothing, leaves `dropped_unadjudicated == 5` and `losses().failed == 5`,
-      and writes one stderr line naming `OTLPSink` and carrying no response text (invariants 2
-      and 11).
+      and writes one stderr line naming `OTLPSink` and the noun `log record(s)` and carrying no
+      response text (invariants 2 and 11).
 - [ ] A `200` whose body is 4 MiB plus one byte is read no further than that, is counted
-      unadjudicated for the chunk's size, makes one request, and raises nothing.
+      unadjudicated for the chunk's size, makes one request, and raises nothing; a `200` whose body
+      is exactly 4 MiB — a valid `partialSuccess` of two rejected records padded with whitespace —
+      is adjudicated normally, leaving `rejected_records == 2` and `dropped_unadjudicated == 0`.
 - [ ] Five of five rejected, in one chunk, raises `SinkDeliveryError`, leaves `failed` raised by
       five, and driven through a worker leaves `flush()` falsy and `health().failed_batches`
       non-zero (invariant 7).
@@ -534,7 +640,10 @@ rejection at all.
 (`docs/decisions/public-api.md`, the import-path entry) make a documented path part of the `1.x`
 promise. Registering it is the half of the work a green suite does not volunteer, since several
 rosters are hand-listed and one is derived from the source tree, and an unlisted module fails the
-derived one.
+derived one. Four existing tests go red the moment `sinks/otlp.py` exists — the two HTTP-subclass
+rosters, the README table row `test_every_frozen_sink_import_path_still_resolves` reads, and the
+integration roster (measured in the build review) — so those registrations land with the sink, in
+the phase that creates it, and the rest follow.
 
 The README carries the table rows, the amended retry sentence — "bounded `429`/`5xx` retry" is
 untrue of this one sink — and a short subsection stating what the sink sends: the attribute names,
@@ -592,15 +701,18 @@ creates the file, because `docs-lint` refuses a rule glob that matches no file.
 # and it imports nothing from the package at runtime (the library version arrives as an argument)
 SEMCONV_VERSION: str = "1.44.0"        # the schema URL is derived from it at call time; no constant
 SCOPE_NAME: str = "log_foundry"
-MAX_NEST: int = 24                      # container levels before a value is cut (FR-001 rule 6)
+MAX_NEST: int = 24                      # nested containers that render; the 25th is cut (rule 6)
+MAX_NODES: int = 131_072                # values written per record; its docstring says why (rule 7)
 ResourceKey = tuple[str | None, str | None, str | None]       # (service, version, env)
 
 def log_record(event: Mapping[str, object]) -> dict[str, object]
     # one OTLP/JSON LogRecord; pure, total, never mutates `event`
 def resource_key(event: Mapping[str, object]) -> ResourceKey
-    # a stamp that is absent or not a str is None
+    # total: a str (or subclass, via str.__str__) with surrogates repaired, else None; never raises
 def request_body(records: Sequence[tuple[ResourceKey, str]], scope_version: str) -> str
     # ExportLogsServiceRequest JSON; one resourceLogs per distinct key, first-seen order
+def framing(key: ResourceKey, scope_version: str) -> int
+    # len(request_body([(key, "")], v)) - len(request_body([], v)): one group around its records
 
 # src/log_foundry/sinks/http.py
 class HTTPSink:
@@ -664,6 +776,7 @@ tests/
 ├── test_otel_mapping.py      # FR-001
 ├── test_otel_envelope.py     # FR-002: the round-trip helper other tests import
 ├── test_sinks_otlp.py        # FR-003, FR-004
+├── test_sinks_http.py        # FR-003: FakeResponse.read(self, n=-1); the roster and builders (FR-005)
 ├── data/frozen_sink_paths.txt   # FR-005
 └── typed_consumer/{accepts,rejects}.py   # FR-003, FR-005
 README.md                     # FR-005
@@ -676,10 +789,16 @@ docs/decisions/sink-delivery.md         # Phase 5: the sink rules this spec sett
 
 ## Implementation Phases
 
+Every phase leaves `main` and the whole suite green: a phase carries whatever registration its own
+new module makes a derived test demand, and nothing that test does not demand waits for a later one.
+
 ### Phase 1: The mapping
 
-- `_otel.log_record` with the value rules, the integer timestamp, the id handling, the cut and
-  collision accounting; `tests/test_otel_mapping.py` including the hostile corpus.
+- `_otel.log_record` with the value rules, the integer timestamp, the id handling, the cut, drop and
+  node accounting; `tests/test_otel_mapping.py` including the hostile corpus. Every FR-001 criterion
+  closes here **except** the one that runs each corpus record through the round-trip helper, which
+  cannot close until Phase 2 adds the helper and its dependency; if Phase 1 lands as a PR of its
+  own it is named there as owed (`session-rhythm.md`) and settled in Phase 2.
 - In the same change as the new file: `src/log_foundry/_otel.py` in the Public API area's *Governs*
   column in `docs/decisions/INDEX.md` and in `.claude/rules/decisions-public-api.md`, since
   `docs-lint` refuses a glob that matches no file, and a run of `sh scripts/docs-lint.sh`.
@@ -692,23 +811,41 @@ docs/decisions/sink-delivery.md         # Phase 5: the sink rules this spec sett
 - **In the same change, the `mypy` accommodation**: `pubsub.py:137` to
   `# type: ignore[import-not-found, unused-ignore]`, the `google.cloud.*` override in
   `pyproject.toml`, and `CLAUDE.md`'s "After installing extras locally" paragraph rewritten in
-  place, no longer than it is now. Run `poetry run mypy` and `ruff check` in an environment built as
+  place, no longer than it is now, with `sh scripts/docs-lint.sh` run against the paragraph and the
+  Tech Stack note together. Run `poetry run mypy` and `ruff check` in an environment built as
   `ci.yml` builds it, and `tests/test_sink_integration_roster.py`. Do not try `[import,
   unused-ignore]` or a third inline code (FR-002 says why).
-- `_otel.resource_key`, `request_body`, the pin; the round trip and its must-fail fixtures.
+- `_otel.resource_key`, `request_body`, `framing`, the pin; the round trip and its must-fail
+  fixtures; and the FR-001 criterion that Phase 1 left owed, settled now against the same helper.
 
 ### Phase 3: The sink
 
-- `HTTPSink._retryable_status` and `_response_limit` and their reads in `_send` and `_attempt`;
-  `OTLPSink` with `_render`, `_body`, `_item_size`, `_body_reserve`; the budget, response-bound and
+- `HTTPSink._retryable_status` and `_response_limit` and their reads in `_send` and `_attempt`.
+  **`tests/test_sinks_http.py:33`'s `FakeResponse.read(self)` takes no size, and four other suites
+  import it** (`test_sink_losses`, `test_sink_retry`, `test_sinks_elasticsearch`,
+  `test_sinks_saas`), so it becomes `read(self, n=-1)`, returning at most `n` bytes when `n` is
+  not negative. The base class keeps calling a bare `read()` while `_response_limit()` is `None`,
+  which is what keeps every other sink's behaviour unchanged.
+- `OTLPSink` with `_render`, `_body`, `_item_size`, `_body_reserve`; the budget, response-bound and
   `method` criteria across one and three resources.
 - `_handle_response`, `rejected_records`, `dropped_unadjudicated`, `losses()`; the partial-success
   criteria, every body shape in them driven through `emit`.
+- **In the same phase, the registrations four existing tests demand the moment `sinks/otlp.py`
+  exists**, each verified red without it: `otlp.OTLPSink` in the HTTP-subclass roster of
+  `tests/test_public_surface.py` (`test_the_http_subclass_roster_holds_every_shipped_platform_sink`);
+  the README sink-table row, which `test_every_frozen_sink_import_path_still_resolves` reads, with
+  the batch-limits row and the `OTLPSink log_foundry.sinks.otlp` line in
+  `tests/data/frozen_sink_paths.txt` beside it; `otlp.OTLPSink` in the derived-population assertion
+  and the builder list of `tests/test_sinks_http.py`
+  (`test_every_shipped_http_subclass_inherits_the_refusal`); and `UNVERIFIED["otlp"]` in
+  `tests/test_sink_integration_roster.py`
+  (`test_every_sink_that_talks_to_something_real_is_verified_or_says_why_not`).
 
-### Phase 4: Registration
+### Phase 4: The rest of the registration
 
-- Frozen-path line, README rows and subsection, every roster including the two new tie assertions
-  and `OpenSearchSink`'s entries, the typed-consumer probe; each roster entry removed once to see it
+- The README subsection and the amended retry sentence, the exact-set attribute test,
+  `_FORWARDING_SINKS` with its floor, the two builder lists with their tie assertions and
+  `OpenSearchSink`'s entries, the typed-consumer probe; each roster entry removed once to see it
   fail.
 
 ### Phase 5: The ritual
