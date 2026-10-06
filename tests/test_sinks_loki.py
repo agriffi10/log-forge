@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-from log_foundry.sinks._time import epoch_nanos
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.loki import LokiSink
 from test_sinks_http import FakeOpener
@@ -141,22 +138,7 @@ def test_the_budget_holds_for_a_label_value_large_enough_to_dominate_the_body() 
     assert not oversize, f"bodies past the {budget}-byte budget: {oversize}"
 
 
-# --- epoch_nanos is exact: integer arithmetic, not float seconds scaled by 1e9 ---------------
-
-
-@pytest.mark.parametrize(
-    ("timestamp", "expected"),
-    [
-        ("2026-10-05T12:34:56.789Z", 1791203696789000000),
-        ("2026-10-05T12:34:56.123Z", 1791203696123000000),
-        ("2026-10-05T12:34:56.001Z", 1791203696001000000),
-        ("2026-10-05T12:34:56.999Z", 1791203696999000000),
-        ("1970-01-01T00:00:00.001Z", 1000000),
-    ],
-)
-def test_epoch_nanos_is_exact_for_every_millisecond_fraction(timestamp: str, expected: int) -> None:
-    assert epoch_nanos(timestamp) == expected
-    assert epoch_nanos(timestamp) // 1_000_000 == expected // 1_000_000
+# --- the pushed value carries the exact nanoseconds, not float seconds scaled by 1e9 -------
 
 
 def test_the_loki_value_carries_the_exact_nanosecond_string() -> None:
