@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
 from log_foundry.sinks._time import epoch_nanos, epoch_seconds
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.mark.parametrize(
@@ -23,6 +27,30 @@ from log_foundry.sinks._time import epoch_nanos, epoch_seconds
     ],
 )
 def test_epoch_nanos_is_exact(timestamp: str, expected: int) -> None:
+    assert epoch_nanos(timestamp) == expected
+
+
+@pytest.fixture
+def local_time_is_utc(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Pins the process's local zone to UTC, so a naive timestamp has one exact answer."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.usefixtures("local_time_is_utc")
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        ("2026-10-05T12:34:56.789", 1791203696789000000),
+        ("2026-10-05T12:34:56.789123", 1791203696789123000),
+        ("1969-12-31T23:59:59.5", -500000000),
+        ("9999-12-31T23:59:59.999999", 253402300799999999000),
+    ],
+)
+def test_epoch_nanos_is_exact_for_a_naive_timestamp(timestamp: str, expected: int) -> None:
     assert epoch_nanos(timestamp) == expected
 
 
@@ -53,11 +81,14 @@ def test_epoch_nanos_is_exact(timestamp: str, expected: int) -> None:
 def test_epoch_nanos_agrees_with_epoch_seconds_and_never_raises(timestamp: object) -> None:
     """Each input lands where the seconds twin puts it, including both falling back to ``now``.
 
-    The tolerance is a float's spacing at year 9999 plus the time between the two calls, which
-    is what separates two reads of the clock when both helpers fall back.
+    The fixed 100 us is about three times a float's spacing at year 9999 (2**-15 s), the most
+    ``epoch_seconds`` can be off by. The clock time between the two calls is added because it is
+    what separates two reads of the clock when both helpers fall back, taken as a magnitude so a
+    wall clock stepping backward inside the window cannot fail a pair that agrees exactly. This
+    test cannot see the float defect itself, which is under 100 us; the exact tests above can.
     """
     before = time.time_ns()
     nanos = epoch_nanos(timestamp)
     seconds = epoch_seconds(timestamp)
-    elapsed = time.time_ns() - before
+    elapsed = abs(time.time_ns() - before)
     assert abs(nanos - seconds * 1e9) <= 100_000 + elapsed
