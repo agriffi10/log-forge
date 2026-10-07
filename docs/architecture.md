@@ -1293,18 +1293,26 @@ and a third copy is a fork with no merge.
   clean afterwards — and measured so the shape is on record (2026-09-04 audit, N10, at `456e9b7`):
   `tracemalloc` peak 5.3 MB at depth 1,000, 69.2 MB at 4,000, 266.5 MB at 8,000. A depth that makes
   this matter has recursed past anything a trace should describe.
-- **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
+- **The payload ceilings bound each *value*, and the pass budgets of 131,072 values and 16 MiB
+  of text bound the work, not the event's size at a destination.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event
   can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB — measured at
   `456e9b7` as a 2,060,506-byte event, serializable and marked `truncated` (2026-09-04 audit,
   N11). Acceptable because
   it is *visible* — a sink with a hard limit drops the event and counts `dropped_oversized`, so
-  the loss is signalled where it happens rather than passed downstream silently. A per-event byte
+  the loss is signalled where it happens rather than passed downstream silently. SPEC-057 bounds
+  each coercion pass as a whole: at most 131,072 values visited and 16 MiB of text charged, and
+  the value that crosses either budget becomes a marked `<node limit>` or `<size limit>` after
+  which nothing is visited. That is a *work* budget on the caller's thread, not a limit tuned to
+  any destination: `json.dumps` escapes a control character as six bytes, so the serialised worst
+  case is about six times the byte budget per pass (96 MiB), and a boundary event takes two
+  passes, `build_event`'s and `backfill_baggage`'s, so about twice that. ~~A per-event byte
   ceiling was deferred by SPEC-017, again by SPEC-020, and deliberately again by SPEC-021: it is a
   feature with real design surface (what happens on breach, which fields are sacrificed first) and
-  belongs in its own spec. Lower `max_value_bytes` / `max_keys` if your destination's limit is
-  tight. Note `max_value_bytes` carries two units — UTF-8 bytes for a string, rendered decimal
-  length for an integer (SPEC-020, SPEC-021).
+  belongs in its own spec.~~ Reversed by SPEC-057: a breach is a placeholder and a stop, and walk
+  order decides what is sacrificed. Lower `max_value_bytes` / `max_keys` if your destination's
+  limit is tight; that, not the budgets, is what meets it. Note `max_value_bytes` carries two
+  units — UTF-8 bytes for a string, rendered decimal length for an integer (SPEC-020, SPEC-021).
 
 - **Backpressure is drop-newest, and is not configurable.** When the worker's bounded queue is
   full a submission is discarded rather than blocking the caller (§9): `health().dropped` counts
