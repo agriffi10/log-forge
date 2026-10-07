@@ -22,6 +22,36 @@ _MARKER_BYTES = len(TRUNCATION_MARKER.encode("utf-8"))
 
 _CIRCULAR = "<circular>"
 _DEPTH_LIMIT = "<depth limit>"
+_NODE_LIMIT = "<node limit>"
+_SIZE_LIMIT = "<size limit>"
+
+_MAX_NODES: int = 131_072
+"""The most values one coercion pass visits, scalar or container (SPEC-057 FR-001).
+
+Twice a fully populated two-level structure at the default ``max_keys`` (256 by 256, 65,536
+values), so a wide but ordinary event is not cut, and no larger, so the worst pass stays small. It
+is SPEC-056's record budget, number, placeholder and stop alike, so that the two stay equal. A
+shared sublist is a DAG, not a cycle: ``y = [y] * 16`` applied seven times is 16^7 visits to the
+leaf, which the ancestor check never cuts and the default ``max_depth`` and ``max_keys`` allow. Memoising by ``id()``
+was rejected because the output must be a JSON tree, so a DAG's output is exponential anyway; a
+global visited set because two siblings referencing one object must both render; and a placeholder
+per value past the budget, the shape of ``<depth limit>``, because it still writes up to
+(``max_depth`` + 1) times ``max_keys`` of them after the breach. Private and not a
+``configure()`` key: :class:`_Coercer` reads it once per pass, so a test may patch it, which
+carries no promise.
+"""
+
+_MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
+"""The most bytes of text one coercion pass charges, a work budget (SPEC-057 FR-002).
+
+Not a sink's size limit: a destination's hard limit, where it has one, sits far below it
+(``SQSSink`` sends at most 256 KiB) and is met by lowering ``max_value_bytes`` or ``max_keys``,
+and reaching this budget takes more than 2,048 strings at the default 8 KiB ceiling, so in
+practice it only catches amplification — one ``Decimal`` of ten million digits referenced 256
+times is 2,560,000,000 characters of ``str()``. ``json.dumps`` escapes a control character as
+six bytes, so the serialised worst case is about six times this per pass, and a boundary event
+takes two passes. Read once per pass, like :data:`_MAX_NODES`.
+"""
 
 _LOG10_2_NUM = 30103
 _LOG10_2_DEN = 100000
@@ -178,15 +208,39 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     Raises:
       None.
     """
+    clipped, altered, _ = _clip(value, max_bytes)
+    return clipped, altered
+
+
+def _clip(value: str, max_bytes: int) -> tuple[str, bool, int]:
+    """Returns :func:`truncate_str`'s answer and the UTF-8 length of the string it returns.
+
+    The body of :func:`truncate_str`, whose docstring carries the reasoning, with the size the
+    coercer charges against the pass's byte budget (SPEC-057 FR-002). The size comes from bytes
+    this already holds: the whole encoding when nothing is clipped, the marker's 14 bytes when
+    the marker stands alone, and otherwise the kept head re-encoded, which is bounded by the
+    ceiling. The common unclipped case pays no second encode.
+
+    Args:
+      value: The string to clip.
+      max_bytes: The ceiling, in UTF-8 bytes.
+
+    Returns:
+      The clipped string, whether it was altered, and its length in UTF-8 bytes.
+
+    Raises:
+      None.
+    """
     if _STR_LEN(value) > max_bytes:
         value = _STR_SLICE(value, slice(0, max_bytes + 1))
     plain, raw, replaced = _measured(value)
     if len(raw) <= max_bytes:
-        return plain, replaced
+        return plain, replaced, len(raw)
     budget = max_bytes - _MARKER_BYTES
     if budget <= 0:
-        return TRUNCATION_MARKER, True
-    return raw[:budget].decode("utf-8", errors="ignore") + TRUNCATION_MARKER, True
+        return TRUNCATION_MARKER, True, _MARKER_BYTES
+    head = raw[:budget].decode("utf-8", errors="ignore")
+    return head + TRUNCATION_MARKER, True, len(head.encode("utf-8")) + _MARKER_BYTES
 
 
 def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
@@ -228,19 +282,38 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
 
 
 class _Coercer:
-    """One event's coercion pass: the ceilings, the truncation flag, and the ancestor chain.
+    """One coercion pass: the ceilings, the two budgets, the truncation flag, the ancestor chain.
 
     This is a pass object rather than a pure function because the ceilings fire deep in the
     recursion — a 300-key mapping eight levels down still has to set ``truncated`` on the
     top-level event — and a recursive function returning a bare value has nowhere to report
-    that. One instance per event, ``__slots__``-ed; against the timestamp, UUID and two dicts
-    ``build_event`` already allocates per event, it is noise.
+    that. One instance per pass, ``__slots__``-ed; against the timestamp, UUID and two dicts
+    ``build_event`` already allocates per event, it is noise. ``build_event`` makes one pass and
+    ``backfill_baggage`` a second, so a boundary event can hold up to twice each budget.
+
+    The two budgets (SPEC-057) bound the pass as a whole, where the ceilings bound one value
+    each: at most :data:`_MAX_NODES` values visited and :data:`_MAX_RENDERED_BYTES` of text
+    charged. Their counters live on this object, not on the module, so nothing is stranded
+    across a fork (invariant 12).
+
+    Attributes:
+      truncated: Whether any ceiling or budget fired, or any substitution was made, in the pass.
     """
 
-    __slots__ = ("_cfg", "_int_ceiling", "_parents", "truncated")
+    __slots__ = (
+        "_cfg",
+        "_charged",
+        "_int_ceiling",
+        "_max_bytes",
+        "_max_nodes",
+        "_nodes",
+        "_parents",
+        "_stopped",
+        "truncated",
+    )
 
     def __init__(self, cfg: Config) -> None:
-        """Starts a pass with the configured ceilings and an empty ancestor chain.
+        """Starts a pass with the configured ceilings, empty counters and an empty ancestor chain.
 
         ``_parents`` holds the ``id()``s of the containers currently being descended through.
         Ancestors only, never a global "visited" set: an ancestor is held alive by the
@@ -250,7 +323,8 @@ class _Coercer:
         The integer ceiling is resolved here, once per pass rather than once per integer
         (SPEC-031 FR-004): it reads ``sys.get_int_max_str_digits()``, which cannot change
         during a coercion pass, and the alternative sat four lines below an ``int.__lt__``
-        binding justified by this being a per-value hot path.
+        binding justified by this being a per-value hot path. The two budgets are read here
+        too, from the module, so a patched value applies from the next pass on.
 
         Args:
           cfg: The config supplying ``max_value_bytes``, ``max_keys`` and ``max_depth``.
@@ -265,21 +339,80 @@ class _Coercer:
         self._int_ceiling = _int_digit_ceiling(cfg.max_value_bytes)
         self.truncated = False
         self._parents: list[int] = []
+        self._max_nodes = _MAX_NODES
+        self._max_bytes = _MAX_RENDERED_BYTES
+        self._nodes = 0
+        self._charged = 0
+        self._stopped: str | None = None
+
+    def _halt(self, placeholder: str) -> None:
+        """Stops the pass at a budget, marking the event.
+
+        Every container still open ends after the member it was writing, by reading
+        ``_stopped`` after each member, so nothing later in walk order is visited.
+
+        Args:
+          placeholder: The placeholder of the budget that was spent.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._stopped = placeholder
+        self.truncated = True
+
+    def _charge(self, cost: int) -> bool:
+        """Charges text to the byte budget, or stops the pass when the charge would exceed it.
+
+        A charge that lands exactly on the budget fits, so the comparison is strict. A charge
+        that does not fit adds nothing, and its value is written as ``<size limit>`` whole,
+        never clipped to fit (SPEC-057 FR-002).
+
+        Args:
+          cost: The bytes to charge.
+
+        Returns:
+          Whether the charge fitted.
+
+        Raises:
+          None.
+        """
+        if self._charged + cost > self._max_bytes:
+            self._halt(_SIZE_LIMIT)
+            return False
+        self._charged += cost
+        return True
 
     def value(self, value: object, depth: int) -> object:
-        """Coerces one node of the structure.
+        """Coerces one node of the structure, first spending one of the pass's node budget.
+
+        Every value counts, scalar or container, including one that becomes ``<depth limit>``
+        or ``<circular>`` (SPEC-057 FR-001). The order of checks is the node budget, then
+        ``max_depth`` (at the top of :meth:`_dispatch`), then the type's own rule, whose text or
+        integer charge is the byte check: a value past the budget is ``<node limit>`` even where
+        it also sits past ``max_depth``. The value past the budget is not dispatched, so a
+        container there is replaced unread, and the pass stops rather than writing a placeholder
+        per remaining value, which is what bounds it: the shape of ``<depth limit>`` would still
+        write up to (``max_depth`` + 1) times ``max_keys`` of them. SPEC-056's record budget
+        stops the same way, with the same number and placeholder.
 
         Args:
           value: The node to coerce.
           depth: How deep the node sits, measured against ``max_depth``.
 
         Returns:
-          A JSON-serializable, bounded equivalent, or a placeholder naming the type.
+          A JSON-serializable, bounded equivalent, or a placeholder naming the type or the budget.
 
         Raises:
           None. A hostile ``__iter__``, ``__str__`` or ``__eq__`` must not reach the caller's
             stack, which is the whole point of FR-001.
         """
+        if self._nodes >= self._max_nodes:
+            self._halt(_NODE_LIMIT)
+            return _NODE_LIMIT
+        self._nodes += 1
         try:
             return self._dispatch(value, depth)
         except Exception:
@@ -294,7 +427,9 @@ class _Coercer:
         promised. ``int`` is tested ahead of the other scalars because it is the one with no
         natural ceiling, ``bool`` ahead of ``int`` among the subclass branches because it is an
         ``int`` subclass, and ``Decimal`` renders as a string so that ``Decimal("0.1")`` does
-        not become ``0.1000000000000000055``.
+        not become ``0.1000000000000000055``. Text the caller supplied goes to :meth:`text`, and
+        text this pass makes with ``str()`` or ``isoformat()`` to :meth:`produced`, because the
+        two are charged differently against the byte budget (SPEC-057 FR-002).
 
         Args:
           value: The node to route.
@@ -336,7 +471,7 @@ class _Coercer:
                 return member
             if isinstance(member, str):
                 return self.text(member)
-            return self.text(str(value))
+            return self.produced(str(value))
         if isinstance(value, bool):
             return value
         if isinstance(value, int):
@@ -344,11 +479,11 @@ class _Coercer:
         if isinstance(value, float):
             return self.real(value)
         if isinstance(value, (datetime, date, time)):
-            return self.text(value.isoformat())
+            return self.produced(value.isoformat())
         if isinstance(value, UUID):
-            return self.text(str(value))
+            return self.produced(str(value))
         if isinstance(value, Decimal):
-            return self.text(str(value))
+            return self.produced(str(value))
         if isinstance(value, (bytes, bytearray, memoryview)):
             return self.text(self._decoded(self._head_bytes(value)))
         if isinstance(value, str):
@@ -445,6 +580,14 @@ class _Coercer:
         key: a ``Mapping[str, object]``, which is what ``build_event`` passes, is not a
         ``Mapping[object, object]``. :meth:`key` coerces whatever actually arrives.
 
+        An entry's key is rendered and charged *before* its value is visited (SPEC-057 FR-002),
+        so a key that crosses the byte budget leaves its value unread: the entry is written
+        ``"<size limit>": "<size limit>"`` and the mapping ends. That reversed the order of the
+        single assignment it replaced, ``out[self.key(key)] = self.value(item, depth + 1)``,
+        because Python evaluates the right-hand side of a subscript assignment before the
+        subscript. Only a key's charge can stop the pass between the two, since a key visits no
+        value. After the value, a stop from anywhere beneath it ends this mapping too.
+
         Args:
           value: The mapping to coerce.
           depth: How deep the mapping sits, measured against ``max_depth``.
@@ -465,13 +608,22 @@ class _Coercer:
                 if len(out) >= self._cfg.max_keys:
                     self.truncated = True
                     break
-                out[self.key(key)] = self.value(item, depth + 1)
+                name = self.key(key)
+                if self._stopped is not None:
+                    out[_SIZE_LIMIT] = _SIZE_LIMIT
+                    break
+                out[name] = self.value(item, depth + 1)
+                if self._stopped is not None:
+                    break
             return out
         finally:
             self._parents.pop()
 
     def members(self, value: Iterable[object], depth: int) -> object:
         """Coerces an iterable's members into a list, capping length at ``max_keys``.
+
+        A member that spends either budget is written as its placeholder and the list ends
+        there, so nothing later in walk order is visited (SPEC-057).
 
         Args:
           value: The iterable to coerce.
@@ -494,6 +646,8 @@ class _Coercer:
                     self.truncated = True
                     break
                 out.append(self.value(item, depth + 1))
+                if self._stopped is not None:
+                    break
             return out
         finally:
             self._parents.pop()
@@ -517,11 +671,15 @@ class _Coercer:
         the loop's other two failures — the ``max_keys`` cap and a value that cannot be coerced
         — already have owners, and a third ``try`` around the loop would hide which one fired.
 
+        The placeholder is text this pass produced, so it is charged as :meth:`produced` text,
+        like every key that is not already a ``str`` (SPEC-057 FR-002).
+
         Args:
           key: The mapping key, of any type.
 
         Returns:
-          The bounded string form of the key, or the key placeholder.
+          The bounded string form of the key, the key placeholder, or ``<size limit>`` when its
+          charge spent the byte budget.
 
         Raises:
           None.
@@ -530,28 +688,30 @@ class _Coercer:
             return self._key(key)
         except Exception:
             self.truncated = True
-            return self.text(f"<unserializable key: {_type_name(key)}>")
+            return self.produced(f"<unserializable key: {_type_name(key)}>")
 
     def _key(self, key: object) -> str:
         """Renders one mapping key, since JSON object keys are always strings.
 
-        An integer key goes through :meth:`integer` first. A bare ``str()`` here would raise on
-        an over-long one — the very ``ValueError`` this module exists to keep away from a sink
-        — and the failure would be caught up in :meth:`key`, replacing the key with a
+        An integer key is bounded by :meth:`_bounded_int` first. A bare ``str()`` here would
+        raise on an over-long one — the very ``ValueError`` this module exists to keep away from
+        a sink — and the failure would be caught up in :meth:`key`, replacing the key with a
         placeholder where its digits would have done. ``bool``
-        is excluded because ``True`` must render as the key ``"True"``, not ``"1"``.
+        is excluded because ``True`` must render as the key ``"True"``, not ``"1"``. It does not
+        go through :meth:`integer`, which charges an integer *value*: a key is charged once, as
+        the string it becomes, so an integer key is never charged twice (SPEC-057 FR-002).
 
-        A float key goes through :meth:`real` for the same reason, and its ``text()`` wrap is
-        defence in depth rather than load-bearing: ``real`` computes its placeholder through
-        :data:`_FLOAT_REPR`, so it cannot hand back a long string. No test distinguishes the wrap
-        from its absence, which is recorded here rather than pinned by an assertion that cannot
-        fail.
+        A float key goes through :meth:`real` for the same reason. Its rendered form is short —
+        ``real`` computes its placeholder through :data:`_FLOAT_REPR` — but it is still text this
+        pass produced, so it is charged as such. A ``str`` key is the caller's own text and goes
+        to :meth:`text`; every other key's ``str()`` is produced and goes to :meth:`produced`.
 
         Args:
           key: The mapping key, of any type.
 
         Returns:
-          The bounded string form of the key.
+          The bounded string form of the key, or ``<size limit>`` when its charge spent the
+          byte budget.
 
         Raises:
           Exception: Whatever the key's own ``__str__`` raises; :meth:`key` is the guard.
@@ -559,15 +719,15 @@ class _Coercer:
         if isinstance(key, str):
             return self.text(key)
         if isinstance(key, int) and not isinstance(key, bool):
-            rendered = self.integer(key)
-            return self.text(rendered if isinstance(rendered, str) else str(rendered))
+            rendered, _ = self._bounded_int(key)
+            return self.produced(rendered if isinstance(rendered, str) else str(rendered))
         if isinstance(key, float):
             replaced = self.real(key)
-            return self.text(replaced if isinstance(replaced, str) else str(replaced))
-        return self.text(str(key))
+            return self.produced(replaced if isinstance(replaced, str) else str(replaced))
+        return self.produced(str(key))
 
-    def integer(self, value: int) -> object:
-        """Returns an integer unchanged, or a placeholder when it is too long to render.
+    def _bounded_int(self, value: int) -> tuple[object, int | None]:
+        """Returns an integer unchanged with its rendered length, or a placeholder when too long.
 
         The size test is ``bit_length()``, never ``len(str(value))``: converting an over-long
         integer to a string raises the very ``ValueError`` this bound exists to prevent, so the
@@ -586,7 +746,8 @@ class _Coercer:
           value: The integer to bound.
 
         Returns:
-          The integer itself, or a ``<int: ~N digits>`` placeholder naming the digit count.
+          The integer itself with its estimated rendered length, digits plus one for a sign; or
+          a ``<int: ~N digits>`` placeholder naming the digit count, with ``None``.
 
         Raises:
           None.
@@ -594,9 +755,32 @@ class _Coercer:
         digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
         rendered = digits + 1 if _INT_LT(value, 0) else digits
         if rendered <= self._int_ceiling:
-            return value
+            return value, rendered
         self.truncated = True
-        return f"<int: ~{digits} digits>"
+        return f"<int: ~{digits} digits>", None
+
+    def integer(self, value: int) -> object:
+        """Bounds an integer written as a value, and charges its rendered length to the pass.
+
+        :meth:`_bounded_int` carries the bound. A rendered integer is charged the length it
+        estimates, digits plus one for a sign (SPEC-057 FR-002); the estimate from
+        ``bit_length()`` can overcount by one digit, which errs toward the cut. A placeholder is
+        charged nothing, like every fixed placeholder, since the node budget bounds those.
+
+        Args:
+          value: The integer to bound.
+
+        Returns:
+          The integer itself, a ``<int: ~N digits>`` placeholder naming the digit count, or
+          ``<size limit>`` when its charge spent the byte budget.
+
+        Raises:
+          None.
+        """
+        out, size = self._bounded_int(value)
+        if size is not None and not self._charge(size):
+            return _SIZE_LIMIT
+        return out
 
     def real(self, value: float) -> object:
         """Replaces a non-finite float, since ``NaN`` and ``Infinity`` are not JSON.
@@ -628,19 +812,55 @@ class _Coercer:
         return f"<float: {_FLOAT_REPR(value)}>"
 
     def text(self, value: str) -> str:
-        """Applies ``max_value_bytes`` to a string, recording whether it fired.
+        """Applies ``max_value_bytes`` to the caller's text, and charges what is written.
+
+        Text from the caller — a ``str`` value or key, decoded bytes, an enum member's ``str``
+        value — already exists, and :func:`truncate_str` reads only its ceiling, so it is charged
+        at its UTF-8 length *after* clipping (SPEC-057 FR-002). Charging its full length would
+        turn a clipped 20 MB string field into ``<size limit>``, a regression for a legitimate
+        input. The value whose charge would exceed the budget becomes ``<size limit>`` whole.
 
         Args:
           value: The string to bound.
 
         Returns:
-          The bounded string.
+          The bounded string, or ``<size limit>`` when its charge spent the byte budget.
 
         Raises:
           None.
         """
-        clipped, was_truncated = truncate_str(value, self._cfg.max_value_bytes)
-        if was_truncated:
+        clipped, altered, size = _clip(value, self._cfg.max_value_bytes)
+        if not self._charge(size):
+            return _SIZE_LIMIT
+        if altered:
+            self.truncated = True
+        return clipped
+
+    def produced(self, value: str) -> str:
+        """Applies ``max_value_bytes`` to text this pass made, and charges the making of it.
+
+        Text the pass produces by calling ``str()`` or ``isoformat()`` — a ``Decimal``, ``UUID``,
+        date or time, an enum's fallback, a key that is not a ``str``, a type-name placeholder —
+        did not exist until the pass made it, so its length *is* the work: one ``Decimal`` of ten
+        million digits referenced 256 times is 2,560,000,000 characters of ``str()``, which
+        clipping afterwards does not undo. It is charged the larger of its length in characters
+        before clipping and its UTF-8 bytes after (SPEC-057 FR-002). The length is read through
+        :data:`_STR_LEN`, because ``str()`` of an object can return a ``str`` subclass.
+
+        Args:
+          value: The produced string to bound.
+
+        Returns:
+          The bounded string, or ``<size limit>`` when its charge spent the byte budget.
+
+        Raises:
+          None.
+        """
+        chars = _STR_LEN(value)
+        clipped, altered, size = _clip(value, self._cfg.max_value_bytes)
+        if not self._charge(max(chars, size)):
+            return _SIZE_LIMIT
+        if altered:
             self.truncated = True
         return clipped
 
@@ -650,20 +870,22 @@ class _Coercer:
         A type name rather than ``repr(value)`` on purpose: arch §6 refuses to auto-capture
         argument and return values so the library cannot leak secrets or PII, and ``repr()`` of
         an arbitrary object routinely prints attribute values — a credential held on a client
-        object would land in the log. The placeholder goes through :meth:`text` like any other
-        string (SPEC-055 FR-004): ``type.__name__`` is writable, so a type named with more than
-        ``max_value_bytes`` would otherwise be the one string in the event no ceiling reached.
+        object would land in the log. The placeholder goes through :meth:`produced` like any
+        other string the pass makes (SPEC-055 FR-004, SPEC-057 FR-002): ``type.__name__`` is
+        writable, so a type named with more than ``max_value_bytes`` would otherwise be the one
+        string in the event no ceiling reached, and the one no budget charged.
 
         Args:
           value: The value that could not be coerced.
 
         Returns:
-          A ``<unserializable: type>`` placeholder.
+          A ``<unserializable: type>`` placeholder, or ``<size limit>`` when its charge spent
+          the byte budget.
 
         Raises:
           None. A pathological metaclass is still not this module's problem.
         """
-        return self.text(f"<unserializable: {_type_name(value)}>")
+        return self.produced(f"<unserializable: {_type_name(value)}>")
 
 
 def _type_name(value: object) -> str:
@@ -692,7 +914,8 @@ def coerce(value: object, *, cfg: Config) -> object:
 
     The value is treated as a field value, at depth 0 — the same level it would occupy inside
     an event's ``fields``. Use :func:`sanitize_fields` for a whole event mapping; it reports
-    whether a ceiling fired, which this cannot.
+    whether a ceiling fired, which this cannot. The call is one pass, with its own node and byte
+    budgets (SPEC-057).
 
     Args:
       value: The value to coerce.
@@ -717,7 +940,8 @@ def sanitize_fields(
     ``max_depth=1`` would replace every field value with ``<depth limit>`` and emit a
     uniformly empty event. The truncation flag drives the event's ``truncated`` marker, so it
     must reflect ceilings that fired arbitrarily deep in the structure — hence the accumulator
-    rather than a pure recursive function.
+    rather than a pure recursive function. The call is one pass, with its own node and byte
+    budgets (SPEC-057); the top-level mapping and the keys are not values, so they spend no node.
 
     Args:
       fields: The mapping to coerce.

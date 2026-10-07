@@ -5,6 +5,13 @@ of the coercer read a prefix (or suffix) of the ceiling plus one, never the whol
 rendering must be byte-identical to the unbounded computation it replaced, so the tests below hold
 it to a frozen reference copy of that computation rather than to the argument in the docstrings.
 
+FR-001 and FR-002 bound the pass as a whole: at most 131,072 values visited and 16 MiB of text
+charged, the value that crosses either becoming a marked ``<node limit>`` or ``<size limit>`` after
+which nothing is visited. The hostile shapes run under a SIGALRM deadline so that a missing bound
+fails the test instead of hanging the run, and every other shape sits just over a budget for the
+same reason. Expected outputs and charge totals are written as literals, never computed by calling
+``src``, so an expectation cannot mirror the code it checks.
+
 This module is also run once against ``main``'s ``sanitize.py`` (FR-001's third criterion), so it
 must collect there: it imports only names that exist on ``main``, reads the two budgets through
 ``getattr`` with a default, and writes the two new placeholders as literals. Failure messages
@@ -14,13 +21,22 @@ crashes the xdist worker that tries to report it.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import re
+import signal
+import sys
+import threading
 import tracemalloc
+from datetime import UTC, datetime, time
+from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 import pytest
 
+import log_foundry as lf
 from log_foundry import sanitize
 from log_foundry.config import Config
 from log_foundry.model import Span, build_event
@@ -31,6 +47,7 @@ from log_foundry.sanitize import (
     truncate_str,
     truncate_tail,
 )
+from log_foundry.sinks.memory import MemorySink
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -381,3 +398,467 @@ def test_reads_are_bounded_by_the_ceiling_not_the_input(case: str) -> None:
         if not already:
             tracemalloc.stop()
     assert peak - base < _MiB, f"{case}: the call allocated {peak - base:,} bytes at its peak"
+
+
+# -- FR-001 and FR-002: the harness ------------------------------------------------------------
+
+_NODE_LIMIT = "<node limit>"
+_SIZE_LIMIT = "<size limit>"
+_ROUTES = ("in_span", "orphan")
+_S = "x" * 8192
+
+
+class _Deadline(BaseException):
+    """What the alarm raises: a ``BaseException``, because ``_Coercer.value`` catches ``Exception``.
+
+    An ``Exception`` raised inside the walk would be turned into a placeholder by the coercer's
+    own guard, and the walk would carry on; only a ``BaseException`` escapes it, as a
+    ``KeyboardInterrupt`` does (invariant 1).
+    """
+
+
+@contextlib.contextmanager
+def _deadline(seconds: float, what: str) -> Iterator[None]:
+    """Fails the test, instead of hanging the run, when the body has not returned in time."""
+    assert threading.current_thread() is threading.main_thread(), (
+        "SIGALRM reaches only the main thread, so the deadline cannot fire here"
+    )
+
+    def _ring(signum: int, frame: object) -> None:
+        raise _Deadline
+
+    previous = signal.signal(signal.SIGALRM, _ring)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    except _Deadline:
+        pytest.fail(f"{what} did not return within {seconds} s", pytrace=False)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _configure(**ceilings: int) -> MemorySink:
+    sink = MemorySink()
+    lf.configure(sink=sink, **ceilings)  # type: ignore[arg-type]
+    return sink
+
+
+def _emit(
+    route: str, fields: dict[str, object], sink: MemorySink, *, deadline: float | None = None
+) -> dict[str, object]:
+    """Runs one ``info`` on one delivery path and returns the event it produced."""
+
+    def call() -> None:
+        lf.info("m", fields=fields)
+
+    guard = _deadline(deadline, "the level call") if deadline else contextlib.nullcontext()
+    with guard:
+        if route == "orphan":
+            call()
+        else:
+            lf.trace(name="work")(call)()
+    if route == "in_span":
+        assert lf.flush(timeout=10)
+    events = [e for e in sink.events if e["message"] == "m"]
+    assert len(events) == 1, f"{route}: expected one event, got {len(events)}"
+    sink.events.clear()
+    return events[0]
+
+
+def _leaves(obj: object) -> Iterator[object]:
+    """Yields every leaf value in walk order: list members and mapping values, depth first."""
+    if isinstance(obj, list):
+        for item in obj:
+            yield from _leaves(item)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            yield from _leaves(item)
+    else:
+        yield obj
+
+
+def _values(obj: object) -> int:
+    """Counts what the pass counts: every container and every leaf, but no mapping key."""
+    if isinstance(obj, list):
+        return 1 + sum(_values(item) for item in obj)
+    if isinstance(obj, dict):
+        return 1 + sum(_values(item) for item in obj.values())
+    return 1
+
+
+def _fan_out(leaf: object) -> object:
+    """``y = leaf``, then ``y = [y] * 16`` seven times: a DAG with 16^7 paths to its leaf."""
+    shape = leaf
+    for _ in range(7):
+        shape = [shape] * 16
+    return shape
+
+
+class _Spin(list):  # type: ignore[type-arg]
+    """A list whose iteration never yields, for the deadline's positive control."""
+
+    def __iter__(self) -> Iterator[object]:
+        while True:
+            pass
+
+
+def test_the_deadline_escapes_the_coercers_guard() -> None:
+    """FR-001 AC2: the alarm is a ``BaseException`` and it does stop a walk that never returns."""
+    assert issubclass(_Deadline, BaseException)
+    assert not issubclass(_Deadline, Exception)
+    with (
+        pytest.raises(pytest.fail.Exception, match=r"did not return within 0\.2 s"),
+        _deadline(0.2, "the spinning walk"),
+    ):
+        coerce(_Spin(), cfg=Config())
+
+
+# -- FR-001: the node budget -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_shared_sublist_dag_returns_within_the_node_budget(route: str) -> None:
+    """FR-001 AC1: 16^7 leaf visits on main; the budget's count, then one placeholder, here."""
+    sink = _configure()
+    event = _emit(route, {"a": _fan_out(0)}, sink, deadline=5)
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    leaves = list(_leaves(fields["a"]))
+    assert _values(fields["a"]) == _NODES + 1
+    assert leaves[-1] == _NODE_LIMIT
+    assert leaves.count(_NODE_LIMIT) == 1
+    assert event.get("truncated") is True
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_list_at_the_node_budget_is_whole_and_one_past_it_is_cut(route: str) -> None:
+    """FR-001 AC4: ``_NODES`` values fit exactly, and the one after them is the placeholder."""
+    sink = _configure(max_keys=_NODES)
+    whole = _emit(route, {"a": [0] * (_NODES - 1)}, sink)
+    assert whole["fields"] == {"a": [0] * (_NODES - 1)}
+    assert "truncated" not in whole
+    cut = _emit(route, {"a": [0] * _NODES}, sink)
+    fields = cut["fields"]
+    assert isinstance(fields, dict)
+    assert len(fields["a"]) == _NODES
+    assert fields["a"][:-1] == [0] * (_NODES - 1)
+    assert fields["a"][-1] == _NODE_LIMIT
+    assert cut.get("truncated") is True
+
+
+def test_a_list_at_the_node_budget_is_whole_and_one_past_it_is_cut_through_coerce() -> None:
+    """FR-001 AC4's last clause: ``coerce`` is one pass on the same terms."""
+    cfg = Config(max_keys=_NODES)
+    assert coerce([0] * (_NODES - 1), cfg=cfg) == [0] * (_NODES - 1)
+    assert coerce([0] * _NODES, cfg=cfg) == [0] * (_NODES - 1) + [_NODE_LIMIT]
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_wide_ordinary_event_is_not_cut(route: str) -> None:
+    """FR-001 AC5: 256 lists of 256 integers, 65,793 values, under the default ceilings."""
+    sink = _configure()
+    event = _emit(route, {"a": [[0] * 256] * 256}, sink)
+    assert event["fields"] == {"a": [[0] * 256] * 256}
+    assert "truncated" not in event
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_the_placeholder_replaces_a_container_unread_and_ends_every_open_container(
+    route: str,
+) -> None:
+    """FR-001 AC6: the container past the budget is never entered, and ``b`` is never reached."""
+    sink = _configure(max_keys=_NODES)
+    event = _emit(route, {"a": [[0] * (_NODES - 2), [1, 2, 3]], "b": 1}, sink)
+    assert event["fields"] == {"a": [[0] * (_NODES - 2), _NODE_LIMIT]}
+    assert event.get("truncated") is True
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_the_node_check_precedes_the_depth_check(route: str) -> None:
+    """FR-001 AC7: a ``<depth limit>`` still spends a slot, and the budget is checked first."""
+    sink = _configure(max_keys=_NODES, max_depth=1)
+    event = _emit(route, {"a": [0] * _NODES}, sink)
+    assert event["fields"] == {"a": ["<depth limit>"] * (_NODES - 1) + [_NODE_LIMIT]}
+    assert event.get("truncated") is True
+
+
+_BIG_DECIMAL_9M = Decimal("1" * 9_000_000)
+
+
+@pytest.mark.parametrize("sweep", [False, True], ids=["at-close", "swept"])
+@pytest.mark.parametrize("budget", ["node", "byte"])
+def test_the_baggage_pass_honours_both_budgets(budget: str, sweep: bool) -> None:
+    """FR-001 AC8, and its byte-budget twin: ``backfill_baggage`` is a pass on the same terms.
+
+    ``span.start`` is built before the body sets the baggage and ``span.end`` is built with none,
+    so whatever either carries came through ``backfill_baggage``'s own pass. The swept twin
+    flushes inside the span, which backfills ``span.start`` on the sweep path
+    (``_sweep_open_spans``) and ``span.end`` at close: invariant 6's two paths to one promise.
+    The node shape is 262,657 values; the byte shape charges 9,000,001 and then crosses.
+    """
+    sink = _configure(max_keys=512)
+    big: object = [[0] * 512] * 512 if budget == "node" else [_BIG_DECIMAL_9M, _BIG_DECIMAL_9M]
+
+    @lf.trace(name="work")
+    def body() -> None:
+        lf.set_baggage(b=big)
+        if sweep:
+            lf.info("inside")
+            assert lf.flush(timeout=10)
+
+    body()
+    assert lf.flush(timeout=10)
+    for message in ("span.start", "span.end"):
+        events = [e for e in sink.events if e["message"] == message]
+        assert len(events) == 1, f"{message}: {len(events)} events"
+        fields = events[0]["fields"]
+        assert isinstance(fields, dict)
+        if budget == "node":
+            leaves = list(_leaves(fields["b"]))
+            assert leaves[-1] == _NODE_LIMIT, message
+            assert _values(fields["b"]) == _NODES + 1, message
+        else:
+            assert fields["b"] == ["1" * 8178 + TRUNCATION_MARKER, _SIZE_LIMIT], message
+        assert events[0].get("truncated") is True, message
+
+
+# -- FR-002: the byte budget -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_pass_charged_exactly_the_budget_is_whole_and_one_byte_more_is_cut(route: str) -> None:
+    """FR-002 AC1: 1 + 2,047 × 8,192 + 8,191 = 16,777,216 fits; one byte more does not."""
+    sink = _configure(max_keys=4096)
+    exact = _emit(route, {"a": [_S] * 2047 + ["x" * 8191]}, sink)
+    assert exact["fields"] == {"a": [_S] * 2047 + ["x" * 8191]}
+    assert "truncated" not in exact
+    over = _emit(route, {"a": [_S] * 2047 + ["x" * 8192, "z"], "b": 1}, sink)
+    assert over["fields"] == {"a": [_S] * 2047 + [_SIZE_LIMIT]}
+    assert over.get("truncated") is True
+
+
+class _Opaque:
+    """A value no rule coerces, so it becomes a type-name placeholder."""
+
+
+@pytest.mark.parametrize("over", [0, 1], ids=["exact", "over"])
+@pytest.mark.parametrize("route", _ROUTES)
+def test_produced_text_and_integers_are_charged_and_placeholders_are_not(
+    route: str, over: int
+) -> None:
+    """FR-002 AC2: every probe ahead of the special string either charges exactly or nothing.
+
+    Charges: ``a`` 1, the integer key ``12345`` 5, the tuple key 10,000 though written at 8,192,
+    2,046 strings of 8,192, and the special string; the float, the bool, the ``None``, the
+    over-long integer and the three ``<depth limit>`` values charge nothing. So 6,378 makes the
+    total exactly 16,777,216. ``10**9000`` has 9,001 digits, past ``max_value_bytes`` under any
+    interpreter limit, so it is a placeholder here whatever ``sys.get_int_max_str_digits()`` is.
+    """
+    sink = _configure(max_keys=4096, max_depth=2)
+    special = "y" * (6378 + over)
+    probes: list[object] = [{12345: None, ("x" * 9995,): None}, 1.5, True, None, 10**9000, [0]]
+    event = _emit(route, {"a": [*probes, *([_S] * 2046), special]}, sink)
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    out = fields["a"]
+    tuple_key = "('" + "x" * 8176 + TRUNCATION_MARKER
+    assert out[0] == {"12345": "<depth limit>", tuple_key: "<depth limit>"}
+    assert out[1:4] == [1.5, True, None]
+    assert isinstance(out[4], str)
+    assert out[4].startswith("<int: ")
+    assert out[5] == ["<depth limit>"]
+    assert out[6:-1] == [_S] * 2046
+    assert out[-1] == (_SIZE_LIMIT if over else special)
+    assert _SIZE_LIMIT not in list(_leaves(out))[:-1]
+
+
+def test_a_callers_string_is_charged_after_clipping_and_produced_text_before() -> None:
+    """FR-002 AC3: a caller's clipped string costs its clip; a ``Decimal`` costs its ``str()``."""
+    text = "x" * 10_000_000
+    fields, flag = sanitize_fields({"a": [text] * 256}, cfg=Config())
+    assert fields == {"a": ["x" * 8178 + TRUNCATION_MARKER] * 256}
+    assert flag is True
+    number = Decimal("1" * 10_000_000)
+    fields, flag = sanitize_fields({"a": [number, number]}, cfg=Config())
+    assert fields == {"a": ["1" * 8178 + TRUNCATION_MARKER, _SIZE_LIMIT]}
+    assert flag is True
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_key_that_crosses_leaves_its_value_unread(route: str) -> None:
+    """FR-002 AC4: the key is charged before its value is read, so ``bb``'s value never is."""
+    sink = _configure(max_keys=4096)
+    head = [_S] * 2047
+    crossed = _emit(route, {"a": [*head, "x" * 8190], "bb": None}, sink)
+    assert crossed["fields"] == {"a": [*head, "x" * 8190], _SIZE_LIMIT: _SIZE_LIMIT}
+    assert crossed.get("truncated") is True
+    fits = _emit(route, {"a": [*head, "x" * 8189], "bb": None}, sink)
+    assert fits["fields"] == {"a": [*head, "x" * 8189], "bb": None}
+    assert "truncated" not in fits
+
+
+@pytest.mark.parametrize("sign", [1, -1], ids=["positive", "negative"])
+@pytest.mark.parametrize("route", _ROUTES)
+def test_an_integer_is_charged_its_rendered_length_sign_included(route: str, sign: int) -> None:
+    """FR-002 AC5: ``10**3999`` charges 4,000, so 4,194 fit after ``a``; its negative, 4,193."""
+    limit = sys.get_int_max_str_digits()
+    assert limit == 0 or limit >= 4001, f"the premise needs a limit of 0 or >= 4,001, not {limit}"
+    number = sign * 10**3999
+    sink = _configure()
+    event = _emit(route, {"a": [[number] * 256] * 17}, sink)
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    leaves = list(_leaves(fields["a"]))
+    written = 4194 if sign == 1 else 4193
+    assert leaves[:written] == [number] * written
+    assert leaves[written:] == [_SIZE_LIMIT]
+    assert event.get("truncated") is True
+
+
+def test_a_string_past_the_budget_under_a_raised_ceiling_is_replaced_not_clipped() -> None:
+    """FR-002 AC6: under a 32 MiB ceiling, a string of the whole budget plus its key crosses."""
+    fields, flag = sanitize_fields({"a": "x" * _BYTES}, cfg=Config(max_value_bytes=32 * _MiB))
+    assert fields == {"a": _SIZE_LIMIT}
+    assert flag is True
+
+
+_BIG_DECIMAL_10M = Decimal("1" * 10_000_000)
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_shared_huge_decimal_returns_within_the_byte_budget(route: str) -> None:
+    """FR-002 AC7: 256 references to one 10,000,000-digit ``Decimal``, under the deadline."""
+    sink = _configure()
+    event = _emit(route, {"a": [_BIG_DECIMAL_10M] * 256}, sink, deadline=5)
+    assert event["fields"] == {"a": ["1" * 8178 + TRUNCATION_MARKER, _SIZE_LIMIT]}
+    assert event.get("truncated") is True
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_dag_of_a_shared_long_string_returns_within_the_byte_budget(route: str) -> None:
+    """FR-002 AC8: each leaf clips to 8,192 bytes of two-byte text, so the 2,048th crosses."""
+    sink = _configure()
+    event = _emit(route, {"a": _fan_out("é" * 1_048_576)}, sink, deadline=5)
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    leaves = list(_leaves(fields["a"]))
+    assert leaves[:2047] == ["é" * 4089 + TRUNCATION_MARKER] * 2047
+    assert leaves[2047:] == [_SIZE_LIMIT]
+    assert _NODE_LIMIT not in leaves
+    assert event.get("truncated") is True
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_nest_of_long_produced_keys_returns_within_the_byte_budget(route: str) -> None:
+    """FR-002 AC9: three levels of 256 keys whose ``str()`` is a mebibyte; the 14th inner crosses.
+
+    ``a`` costs 1, a key ``(s, i)`` its ``str()`` length (1,048,583 for ``i`` below 10, 1,048,584
+    for 10 to 99) and a ``0`` costs 1, so after the outer and middle keys the innermost mapping
+    fits thirteen entries. Those thirteen keys clip to one string and collapse into one entry.
+    """
+    s = "x" * 1_048_576
+    inner = {(s, i): 0 for i in range(256)}
+    middle = {(s, i): inner for i in range(256)}
+    outer = {(s, i): middle for i in range(256)}
+    sink = _configure()
+    event = _emit(route, {"a": outer}, sink, deadline=5)
+    key = "('" + "x" * 8176 + TRUNCATION_MARKER
+    assert event["fields"] == {"a": {key: {key: {key: 0, _SIZE_LIMIT: _SIZE_LIMIT}}}}
+    assert event.get("truncated") is True
+
+
+class _ProducedFallback(Enum):
+    """An enum whose member value has no rule of its own, so it renders as ``str(member)``."""
+
+    MEMBER_WITH_A_LONG_NAME = 2j
+
+
+class _KeyBoom:
+    """A key whose ``__str__`` raises, so it becomes the key placeholder."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("no")
+
+
+_PRODUCED_SITES: list[tuple[str, str, object, int]] = [
+    ("decimal", "value", Decimal("1" * 40), 40),
+    ("uuid", "value", UUID("12345678-1234-5678-1234-567812345678"), 36),
+    ("datetime", "value", datetime(2026, 1, 1, 12, 30, 45, 123456), 26),
+    ("time", "value", time(12, 30, 45, 123456, tzinfo=UTC), 21),
+    ("enum-fallback", "value", _ProducedFallback.MEMBER_WITH_A_LONG_NAME, 41),
+    ("value-placeholder", "value", _Opaque(), 25),
+    ("tuple-key", "key", ("x" * 20,), 25),
+    ("float-key", "key", 1.2345678901234567, 18),
+    ("int-key-past-the-ceiling", "key", 10**20, 17),
+    ("key-placeholder", "key", _KeyBoom(), 30),
+]
+
+
+@pytest.mark.parametrize(
+    ("slot", "probe", "chars"),
+    [site[1:] for site in _PRODUCED_SITES],
+    ids=[site[0] for site in _PRODUCED_SITES],
+)
+def test_each_produced_text_site_is_charged_before_clipping(
+    monkeypatch: pytest.MonkeyPatch, slot: str, probe: object, chars: int
+) -> None:
+    """Every produced text is charged its length in characters, though written as 14 bytes.
+
+    At ``max_value_bytes=14`` every one of these texts clips to the marker alone, so a site
+    charged after clipping (14) and one charged before it (its length) differ. The budget is
+    patched to sit exactly on the charge, then one byte under it: the site fits, then crosses,
+    which pins the charge to exactly its length in both directions. A ``date`` is not here: it is
+    ten characters, so it is never clipped where these are, and both charges are the same number.
+    """
+    fields: dict[str, object] = {"a": probe} if slot == "value" else {"a": {probe: 0}}
+    tail = 1 if slot == "key" else 0
+    cfg = Config(max_value_bytes=14)
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + chars + tail)
+    fits, flag = sanitize_fields(fields, cfg=cfg)
+    expected: object = TRUNCATION_MARKER if slot == "value" else {TRUNCATION_MARKER: 0}
+    assert fits == {"a": expected}
+    assert flag is True
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", chars)
+    crossed, flag = sanitize_fields(fields, cfg=cfg)
+    expected = _SIZE_LIMIT if slot == "value" else {_SIZE_LIMIT: _SIZE_LIMIT}
+    assert crossed == {"a": expected}
+    assert flag is True
+
+
+def test_the_produced_sites_are_as_long_as_the_table_says() -> None:
+    """The per-site test's premise, measured with the standard library rather than with ``src``."""
+    lengths = {
+        "decimal": len(str(Decimal("1" * 40))),
+        "uuid": len(str(UUID("12345678-1234-5678-1234-567812345678"))),
+        "datetime": len(datetime(2026, 1, 1, 12, 30, 45, 123456).isoformat()),
+        "time": len(time(12, 30, 45, 123456, tzinfo=UTC).isoformat()),
+        "enum-fallback": len(str(_ProducedFallback.MEMBER_WITH_A_LONG_NAME)),
+        "value-placeholder": len("<unserializable: _Opaque>"),
+        "tuple-key": len(str(("x" * 20,))),
+        "float-key": len(str(1.2345678901234567)),
+        "int-key-past-the-ceiling": len("<int: ~21 digits>"),
+        "key-placeholder": len("<unserializable key: _KeyBoom>"),
+    }
+    assert lengths == {site[0]: site[3] for site in _PRODUCED_SITES}
+    assert all(chars > 16 for chars in lengths.values())
+
+
+def test_the_budgets_add_no_public_name() -> None:
+    """FR-001 AC10: both budgets and both placeholders stay private."""
+    assert sanitize.__all__ == [
+        "TRUNCATION_MARKER",
+        "coerce",
+        "sanitize_fields",
+        "truncate_str",
+        "truncate_tail",
+    ]
+    for name in ("_MAX_NODES", "_MAX_RENDERED_BYTES", "_NODE_LIMIT", "_SIZE_LIMIT"):
+        assert name not in sanitize.__all__
+        assert name not in lf.__all__
+
+
+def test_the_budgets_are_the_specified_numbers() -> None:
+    """The Data Model's two numbers, read directly: the ``getattr`` defaults would hide a drift."""
+    assert sanitize._MAX_NODES == 131_072  # type: ignore[attr-defined]
+    assert sanitize._MAX_RENDERED_BYTES == 16 * 1024 * 1024  # type: ignore[attr-defined]
