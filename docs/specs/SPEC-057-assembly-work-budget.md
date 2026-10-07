@@ -216,7 +216,7 @@ digits referenced 256 times is 2,560,000,000 characters of `str()`, which clippi
 not undo.
 
 **Why 16 MiB.** No sink here accepts an event near it (SQS: 256 KB), and reaching it legitimately
-takes more than 2,048 strings at the default 8 KiB ceiling, so in practice it only catches
+takes at least 2,048 full strings at the default 8 KiB ceiling, so in practice it only catches
 amplification. The serialised worst case follows from it: six times the budget per pass
 (*Accepted Limits*).
 

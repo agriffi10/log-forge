@@ -325,8 +325,8 @@ Group related specs and record the order to build them in. Keep this section: a 
   and re-runs SPEC-058 FR-001's criteria and `tests/test_sanitize_corpus.py` before it pushes.
 - **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
   all in `sanitize.py`, closing a shared-sublist hang on the caller's thread. It depends on nothing
-  unbuilt and builds first of the two specs it touches: the OTLP log export spec (SPEC-056) specifies
-  an equal budget for its own mapping — one number, one placeholder text, one stop rule. Keeping the
-  two equal is SPEC-056's to settle when it builds (it may import `sanitize`'s private `_MAX_NODES`
-  or pin equality with a test); SPEC-057 defines its own constant and asks for no edit to SPEC-056
-  or to `_otel`.
+  unbuilt and builds first of the two specs it touches: the OTLP log export spec drafted on branch
+  `spec/056-otlp-log-export` specifies an equal budget for its own mapping — one number, one
+  placeholder text, one stop rule. Keeping the two equal is that spec's to settle when it builds
+  (it may import `sanitize`'s private `_MAX_NODES` or pin equality with a test); SPEC-057 defines
+  its own constant and asks for no edit to that spec or to `_otel`.

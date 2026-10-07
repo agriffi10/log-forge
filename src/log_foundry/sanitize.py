@@ -29,11 +29,9 @@ _MAX_NODES: int = 131_072
 """The most values one coercion pass visits, scalar or container (SPEC-057 FR-001).
 
 Twice a fully populated two-level structure at the default ``max_keys`` (256 by 256, 65,536
-values), so a wide but ordinary event is not cut, and no larger, so the worst pass stays small. It
-matches the record budget the OTLP log export spec (SPEC-056) specifies, number, placeholder and
-stop alike, so that the two can stay equal. A shared sublist is a DAG, not a cycle:
-``y = [y] * 16`` applied seven times is 16^7 visits to the leaf, which the ancestor check never
-cuts and the default ``max_depth`` and ``max_keys`` allow. Memoising by ``id()`` was rejected
+values), so a wide but ordinary event is not cut, and no larger, so the worst pass stays small. A
+shared sublist is a DAG, not a cycle: ``y = [y] * 16`` applied seven times is 16^7 visits to the
+leaf, which the ancestor check never cuts and the default ``max_depth`` and ``max_keys`` allow. Memoising by ``id()`` was rejected
 because the output must be a JSON tree, so a DAG's output is exponential anyway; a global visited
 set because two siblings referencing one object must both render; and a placeholder per value
 past the budget, the shape of ``<depth limit>``, because it still writes up to (``max_depth`` + 1)
@@ -46,7 +44,7 @@ _MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
 
 Not a sink's size limit: a destination's hard limit, where it has one, sits far below it
 (``SQSSink`` sends at most 256 KiB) and is met by lowering ``max_value_bytes`` or ``max_keys``,
-and reaching this budget takes more than 2,048 strings at the default 8 KiB ceiling, so in
+and reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
 practice it only catches amplification — one ``Decimal`` of ten million digits referenced 256
 times is 2,560,000,000 characters of ``str()``. ``json.dumps`` escapes a control character as
 six bytes, so the serialised worst case is about six times this per pass, and a boundary event
@@ -195,8 +193,7 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     The result is byte-identical to reading the whole string. The prefix's UTF-8 is a prefix of the
     whole string's, a lone surrogate is replaced one character at a time wherever it sits, and the
     clip keeps at most ``max_bytes`` minus the marker's 14 bytes, all of it inside the prefix. A
-    string of ``max_bytes`` characters or fewer is read whole, as before. A non-``str`` still raises
-    ``TypeError`` at the first unbound read, as it did at :data:`_STR_STR`.
+    string of ``max_bytes`` characters or fewer is read whole, as before.
 
     Args:
       value: The string to clip.
@@ -206,7 +203,8 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
       The clipped string and whether it was altered — clipped, or a surrogate replaced.
 
     Raises:
-      None.
+      TypeError: When ``value`` is not a ``str``, from the first unbound read, as it was raised at
+        :data:`_STR_STR` before the read was bounded.
     """
     clipped, altered, _ = _clip(value, max_bytes)
     return clipped, altered
@@ -229,7 +227,7 @@ def _clip(value: str, max_bytes: int) -> tuple[str, bool, int]:
       The clipped string, whether it was altered, and its length in UTF-8 bytes.
 
     Raises:
-      None.
+      TypeError: When ``value`` is not a ``str``, as :func:`truncate_str` documents.
     """
     if _STR_LEN(value) > max_bytes:
         value = _STR_SLICE(value, slice(0, max_bytes + 1))
@@ -267,7 +265,8 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
       The clipped string and whether it was altered — clipped, or a surrogate replaced.
 
     Raises:
-      None.
+      TypeError: When ``value`` is not a ``str``, from the first unbound read, as
+        :func:`truncate_str` documents.
     """
     length = _STR_LEN(value)
     if length > max_bytes:
@@ -395,8 +394,7 @@ class _Coercer:
         it also sits past ``max_depth``. The value past the budget is not dispatched, so a
         container there is replaced unread, and the pass stops rather than writing a placeholder
         per remaining value, which is what bounds it: the shape of ``<depth limit>`` would still
-        write up to (``max_depth`` + 1) times ``max_keys`` of them. The OTLP log export spec
-        (SPEC-056) specifies the same stop, number and placeholder for its record budget.
+        write up to (``max_depth`` + 1) times ``max_keys`` of them.
 
         Args:
           value: The node to coerce.
@@ -407,7 +405,7 @@ class _Coercer:
 
         Raises:
           None. A hostile ``__iter__``, ``__str__`` or ``__eq__`` must not reach the caller's
-            stack, which is the whole point of FR-001.
+            stack, which is the whole point of SPEC-017 FR-001.
         """
         if self._nodes >= self._max_nodes:
             self._halt(_NODE_LIMIT)
@@ -731,10 +729,11 @@ class _Coercer:
 
         The size test is ``bit_length()``, never ``len(str(value))``: converting an over-long
         integer to a string raises the very ``ValueError`` this bound exists to prevent, so the
-        obvious check would move the crash rather than remove it (FR-002). It ignores the sign,
-        so the minus sign is added back explicitly, read through an unbound ``int.__lt__`` that
-        an ``int`` subclass cannot divert — ``value < 0`` dispatches to user code, and a raise
-        there would be caught up in :meth:`value` and take every sibling key with it.
+        obvious check would move the crash rather than remove it (SPEC-020 FR-002). It ignores
+        the sign, so the minus sign is added back explicitly, read through an unbound
+        ``int.__lt__`` that an ``int`` subclass cannot divert — ``value < 0`` dispatches to user
+        code, and a raise there would be caught up in :meth:`value` and take every sibling key
+        with it.
 
         An over-long integer is replaced, not clipped, because dropping digits would silently
         change the value and a wrong number is worse than a visibly elided one. The bound
