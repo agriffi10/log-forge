@@ -307,14 +307,22 @@ def test_a_bytes_or_bytearray_subclass_is_rendered_from_the_bytes_it_stores(
 
 
 def test_a_non_contiguous_view_renders_identically_to_the_reference() -> None:
-    """FR-003 AC4: two stdlib views, one whose single row exceeds the ceiling."""
+    """FR-003 AC4: two stdlib views, one whose single row exceeds the ceiling, and an ASCII twin.
+
+    The spec's first view is every byte value in turn, so most of it does not decode and each
+    bad byte widens to three: a prefix a row short of the ceiling plus one still clips, and
+    rounding the row count down instead of up would pass it. The ASCII twin decodes byte for
+    byte, so 585 rows (8,190 bytes) would be written whole where the view is clipped.
+    """
     buf = (bytes(range(256)) * 110)[:28_000]
     narrow_rows = memoryview(buf).cast("B", shape=[2000, 14])[::2]
     one_wide_row = memoryview(bytes(range(97, 123)) * 1154)[:30_000].cast("B", shape=[3, 10_000])
-    for view in (narrow_rows, one_wide_row[::2]):
+    ascii_rows = memoryview(b"x" * 28_000).cast("B", shape=[2000, 14])[::2]
+    views = {"narrow rows": narrow_rows, "one wide row": one_wide_row[::2], "ascii": ascii_rows}
+    for label, view in views.items():
         assert not view.c_contiguous
         fields, flag = sanitize_fields({"k": view}, cfg=Config())
-        assert (fields["k"], flag) == _ref_bytes_like(view, 8192), view.shape
+        assert (fields["k"], flag) == _ref_bytes_like(view, 8192), f"{label} differs"
         assert flag is True
 
 
