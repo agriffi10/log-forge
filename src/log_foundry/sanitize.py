@@ -30,15 +30,15 @@ _MAX_NODES: int = 131_072
 
 Twice a fully populated two-level structure at the default ``max_keys`` (256 by 256, 65,536
 values), so a wide but ordinary event is not cut, and no larger, so the worst pass stays small. It
-is SPEC-056's record budget, number, placeholder and stop alike, so that the two stay equal. A
-shared sublist is a DAG, not a cycle: ``y = [y] * 16`` applied seven times is 16^7 visits to the
-leaf, which the ancestor check never cuts and the default ``max_depth`` and ``max_keys`` allow. Memoising by ``id()``
-was rejected because the output must be a JSON tree, so a DAG's output is exponential anyway; a
-global visited set because two siblings referencing one object must both render; and a placeholder
-per value past the budget, the shape of ``<depth limit>``, because it still writes up to
-(``max_depth`` + 1) times ``max_keys`` of them after the breach. Private and not a
-``configure()`` key: :class:`_Coercer` reads it once per pass, so a test may patch it, which
-carries no promise.
+matches the record budget the OTLP log export spec (SPEC-056) specifies, number, placeholder and
+stop alike, so that the two can stay equal. A shared sublist is a DAG, not a cycle:
+``y = [y] * 16`` applied seven times is 16^7 visits to the leaf, which the ancestor check never
+cuts and the default ``max_depth`` and ``max_keys`` allow. Memoising by ``id()`` was rejected
+because the output must be a JSON tree, so a DAG's output is exponential anyway; a global visited
+set because two siblings referencing one object must both render; and a placeholder per value
+past the budget, the shape of ``<depth limit>``, because it still writes up to (``max_depth`` + 1)
+times ``max_keys`` of them after the breach. Private and not a ``configure()`` key:
+:class:`_Coercer` reads it once per pass, so a test may patch it, which carries no promise.
 """
 
 _MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
@@ -87,13 +87,13 @@ _STR_LEN = str.__len__
 
 ``_STR_LEN`` and the three slices below it. A string longer than its ceiling in characters cannot
 fit, since every character is at least one byte, so :func:`truncate_str` and :func:`truncate_tail`
-read only the ceiling plus one character of it, and the coercer's bytes-like branch only the
-ceiling plus one byte. Each read goes through its type's own unbound accessor for the reason
-:data:`_STR_STR` gives: a subclass's ``__len__`` or ``__getitem__`` would otherwise choose what
-the library measures. ``str.__getitem__`` returns an exact ``str`` of the stored characters, and
-``bytes.__getitem__`` and ``bytearray.__getitem__`` an exact ``bytes`` and ``bytearray`` of the
-stored bytes, on a subclass as on the base type. A slice past the end is clamped, so a bytes-like
-needs no length read: the slice is the whole value when the value is shorter.
+read only the ceiling plus one character of it, and the coercer's bytes-like branch only as many
+bytes as cover the ceiling plus one. Each read goes through its type's own unbound accessor for
+the reason :data:`_STR_STR` gives: a subclass's ``__len__`` or ``__getitem__`` would otherwise
+choose what the library measures. ``str.__getitem__`` returns an exact ``str`` of the stored
+characters, and ``bytes.__getitem__`` and ``bytearray.__getitem__`` an exact ``bytes`` and
+``bytearray`` of the stored bytes, on a subclass as on the base type. A slice past the end is
+clamped, so a bytes-like needs no length read: the slice is the whole value when it is shorter.
 """
 _STR_SLICE = str.__getitem__
 _BYTES_SLICE = bytes.__getitem__
@@ -395,8 +395,8 @@ class _Coercer:
         it also sits past ``max_depth``. The value past the budget is not dispatched, so a
         container there is replaced unread, and the pass stops rather than writing a placeholder
         per remaining value, which is what bounds it: the shape of ``<depth limit>`` would still
-        write up to (``max_depth`` + 1) times ``max_keys`` of them. SPEC-056's record budget
-        stops the same way, with the same number and placeholder.
+        write up to (``max_depth`` + 1) times ``max_keys`` of them. The OTLP log export spec
+        (SPEC-056) specifies the same stop, number and placeholder for its record budget.
 
         Args:
           value: The node to coerce.
