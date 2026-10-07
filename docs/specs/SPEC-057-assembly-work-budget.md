@@ -266,7 +266,8 @@ bound the bytes and cut a 256 × 256 structure, and would diverge from SPEC-056.
 - [ ] With `10**3999` (4,000 digits, charged exactly 4,000) in lists of at most 256 under one field,
       4,194 are written whole and the 4,195th is `<size limit>`; with `-(10**3999)`, charged one
       more for the sign, 4,193 are. The test asserts as its premise that
-      `sys.get_int_max_str_digits()` is 0 or at least 4,000.
+      `sys.get_int_max_str_digits()` is 0 or at least 4,001, since the sign counts against the
+      integer ceiling and `-(10**3999)` renders in 4,001 characters.
 - [ ] With `max_value_bytes` configured to 32 MiB, a `str` of `_MAX_RENDERED_BYTES` bytes is
       `<size limit>`, marked and not clipped.
 - [ ] A `Decimal` of 10,000,000 digits referenced 256 times from one list returns on both routes
@@ -304,12 +305,12 @@ than the ceiling because the clip fires when the encoding *exceeds* `max_bytes`:
 today's is clipped. A string of `max_bytes` characters or fewer is read as it is today (and a subclass
 is copied by `_STR_STR`, which costs at most the ceiling).
 
-A `bytes` or `bytearray`, exact or a subclass, is read through the unbound accessors of its own type —
-`bytes.__len__` and `bytes.__getitem__(value, slice(0, n))`, and `bytearray.__len__` and
-`bytearray.__getitem__` — and never through its buffer: a subclass can override `__buffer__`
-(PEP 688), which makes `memoryview(value)` report another length and other bytes, while the unbound
-accessors read what the object stores. They take the first `max_value_bytes + 1` bytes, which is the
-whole value when it is shorter. A `memoryview` cannot be subclassed, so it is read through its own
+A `bytes` or `bytearray`, exact or a subclass, is read through the unbound slice of its own type —
+`bytes.__getitem__(value, slice(0, n))` or `bytearray.__getitem__(value, slice(0, n))` — and never
+through its buffer: a subclass can override `__buffer__` (PEP 688), which makes `memoryview(value)`
+report another length and other bytes, while the unbound accessor reads what the object stores. It
+takes the first `max_value_bytes + 1` bytes, which is the whole value when it is shorter, because a
+slice past the end is clamped; no length is read. A `memoryview` cannot be subclassed, so it is read through its own
 view. One at or below the ceiling is read whole, as today. A longer one is read as whole rows up to
 the cut: cast to bytes and sliced where it is C-contiguous (a zero-dimensional view included),
 otherwise a first-dimension slice of enough rows to cover `max_value_bytes + 1` bytes, a row being
