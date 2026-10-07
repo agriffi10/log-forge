@@ -62,6 +62,7 @@ to status only — no prose.
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
 | [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Completed | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
+| [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | Draft | SPEC-017, SPEC-020, SPEC-055 |
 
 ## Arcs (build order)
 
@@ -322,3 +323,9 @@ Group related specs and record the order to build them in. Keep this section: a 
   SPEC-058 both edit `sanitize.py`'s coercer and `docs/invariants.md` §8. Neither depends on the
   other and neither relies on the other's behaviour. Whichever lands second rebases onto the first,
   and re-runs SPEC-058 FR-001's criteria and `tests/test_sanitize_corpus.py` before it pushes.
+- **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
+  all in `sanitize.py`, closing the shared-sublist hang that invariant 1 forbids. Depends on
+  nothing unbuilt, and nothing depends on it. It shares one constant, `MAX_NODES = 131_072`, with
+  the OTLP log export spec's record budget — one number, one placeholder text, one stop rule — whose
+  home is `sanitize`; either builds first, and whichever builds second imports the constant rather
+  than defining another.
