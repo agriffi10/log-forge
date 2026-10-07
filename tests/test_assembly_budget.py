@@ -736,6 +736,8 @@ def test_an_integer_is_charged_its_rendered_length_sign_included(route: str, sig
     assert isinstance(fields, dict)
     leaves = list(_leaves(fields["a"]))
     written = 4194 if sign == 1 else 4193
+    integers = sum(1 for leaf in leaves if type(leaf) is int)
+    assert integers == written, f"{integers} integers were written before the cut, not {written}"
     assert leaves[:written] == [number] * written
     assert leaves[written:] == [_SIZE_LIMIT]
     assert event.get("truncated") is True
