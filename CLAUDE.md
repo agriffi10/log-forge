@@ -124,7 +124,7 @@ carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@do
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
-**Current work:** none in flight.
+**Current work:** SPEC-057 (assembly work budget), In Progress on `spec/057-sanitize-node-budget`.
 
 ## Key Decisions (settled — don't re-litigate)
 

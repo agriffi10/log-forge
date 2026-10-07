@@ -62,7 +62,7 @@ to status only — no prose.
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
 | [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Completed | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
-| [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | Draft | SPEC-017, SPEC-020, SPEC-055 |
+| [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | In Progress | SPEC-017, SPEC-020, SPEC-055 |
 
 ## Arcs (build order)
 
