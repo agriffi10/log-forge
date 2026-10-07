@@ -52,6 +52,23 @@ reasoning as :data:`_INT_LT` and :data:`_FLOAT_REPR`: what the library measures 
 must be computed by the library.
 """
 
+_STR_LEN = str.__len__
+"""The unbound accessors that bound a read by its ceiling, not its length (SPEC-057 FR-003).
+
+``_STR_LEN`` and the three slices below it. A string longer than its ceiling in characters cannot
+fit, since every character is at least one byte, so :func:`truncate_str` and :func:`truncate_tail`
+read only the ceiling plus one character of it, and the coercer's bytes-like branch only the
+ceiling plus one byte. Each read goes through its type's own unbound accessor for the reason
+:data:`_STR_STR` gives: a subclass's ``__len__`` or ``__getitem__`` would otherwise choose what
+the library measures. ``str.__getitem__`` returns an exact ``str`` of the stored characters, and
+``bytes.__getitem__`` and ``bytearray.__getitem__`` an exact ``bytes`` and ``bytearray`` of the
+stored bytes, on a subclass as on the base type. A slice past the end is clamped, so a bytes-like
+needs no length read: the slice is the whole value when the value is shorter.
+"""
+_STR_SLICE = str.__getitem__
+_BYTES_SLICE = bytes.__getitem__
+_BYTEARRAY_SLICE = bytearray.__getitem__
+
 _SURROGATES = re.compile("[\ud800-\udfff]")
 _REPLACEMENT = "\ufffd"
 """One U+FFFD per lone surrogate, which neither built-in error handler gives (SPEC-055 FR-001).
@@ -140,6 +157,17 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     substitution nobody can see is a silent change to the data, which is the rule
     :meth:`_Coercer.real` already applies to a non-finite float.
 
+    The work is bounded by the ceiling, not by the string (SPEC-057 FR-003): a string of more
+    than ``max_bytes`` characters cannot fit, so only its first ``max_bytes + 1`` are read, through
+    :data:`_STR_LEN` and :data:`_STR_SLICE`. One more than the ceiling, because the clip fires when
+    the encoding *exceeds* ``max_bytes``: a prefix of exactly ``max_bytes`` ASCII characters encodes
+    to exactly ``max_bytes`` bytes and would be returned whole where the whole string is clipped.
+    The result is byte-identical to reading the whole string. The prefix's UTF-8 is a prefix of the
+    whole string's, a lone surrogate is replaced one character at a time wherever it sits, and the
+    clip keeps at most ``max_bytes`` minus the marker's 14 bytes, all of it inside the prefix. A
+    string of ``max_bytes`` characters or fewer is read whole, as before. A non-``str`` still raises
+    ``TypeError`` at the first unbound read, as it did at :data:`_STR_STR`.
+
     Args:
       value: The string to clip.
       max_bytes: The ceiling, in UTF-8 bytes.
@@ -150,6 +178,8 @@ def truncate_str(value: str, max_bytes: int) -> tuple[str, bool]:
     Raises:
       None.
     """
+    if _STR_LEN(value) > max_bytes:
+        value = _STR_SLICE(value, slice(0, max_bytes + 1))
     plain, raw, replaced = _measured(value)
     if len(raw) <= max_bytes:
         return plain, replaced
@@ -169,6 +199,12 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
     than the marker. The result is an exact, strictly encodable ``str`` on the same terms as
     :func:`truncate_str`.
 
+    The read is bounded by the ceiling on :func:`truncate_str`'s terms, mirrored (SPEC-057
+    FR-003): a string of more than ``max_bytes`` characters is read as its last ``max_bytes + 1``.
+    The suffix's UTF-8 is a suffix of the whole string's, and the clip keeps at most ``max_bytes``
+    minus the marker's 14 bytes from the end, all of it inside the suffix, so the result is
+    byte-identical to reading the whole string.
+
     Args:
       value: The string to clip.
       max_bytes: The ceiling, in UTF-8 bytes.
@@ -179,6 +215,9 @@ def truncate_tail(value: str, max_bytes: int) -> tuple[str, bool]:
     Raises:
       None.
     """
+    length = _STR_LEN(value)
+    if length > max_bytes:
+        value = _STR_SLICE(value, slice(length - max_bytes - 1, length))
     plain, raw, replaced = _measured(value)
     if len(raw) <= max_bytes:
         return plain, replaced
@@ -311,7 +350,7 @@ class _Coercer:
         if isinstance(value, Decimal):
             return self.text(str(value))
         if isinstance(value, (bytes, bytearray, memoryview)):
-            return self.text(self._decoded(bytes(value)))
+            return self.text(self._decoded(self._head_bytes(value)))
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, Mapping):
@@ -321,6 +360,59 @@ class _Coercer:
         if isinstance(value, Sequence) and not isinstance(value, _TEXTLIKE):
             return self.members(value, depth)
         return self._placeholder(value)
+
+    def _head_bytes(self, value: bytes | bytearray | memoryview[int]) -> bytes:
+        """Reads the first ``max_value_bytes + 1`` bytes of a bytes-like, never more (SPEC-057).
+
+        Enough to decide the clip: :meth:`text` fires when the encoding *exceeds* the ceiling, and
+        a decoded unit is never shorter than its source, so a prefix one byte past the ceiling
+        decodes to text that is clipped exactly where the whole value's would be. The decoder
+        works left to right and a sequence split by the cut starts no earlier than three bytes
+        before it, while the clip keeps at most the ceiling minus the marker's 14 bytes, so
+        everything kept was decoded identically. The rendering is byte-identical to decoding the
+        whole value, flag included.
+
+        A ``bytes`` or ``bytearray``, exact or a subclass, is read through :data:`_BYTES_SLICE` or
+        :data:`_BYTEARRAY_SLICE` and never through its buffer: a subclass can override
+        ``__buffer__`` (PEP 688), which makes ``memoryview(value)`` report another length and
+        other bytes, while the unbound accessor reads what the object stores. That is a recorded
+        exception, hostile-only: a ``bytes`` subclass overriding ``__bytes__``, or a ``bytearray``
+        subclass overriding ``__bytes__`` or ``__buffer__``, was rendered through the override by
+        the ``bytes(value)`` this replaced, and is now rendered from the bytes it stores, as
+        :data:`_STR_STR` already does for a ``str`` subclass. An exact short ``bytes`` slices to
+        itself, so the common case copies nothing.
+
+        A ``memoryview`` cannot be subclassed, so it is read through its own view: whole when it
+        is at or below the ceiling, as before, and otherwise as whole rows up to the cut. A
+        C-contiguous view, a zero-dimensional one included, is cast to bytes and sliced. Any other
+        is sliced along its first dimension to enough rows to cover the prefix, a row being one
+        item of a one-dimensional view; a non-contiguous view is never zero-dimensional, so it has
+        a first dimension. That is an accepted limit: a single row is read whole, so a view whose
+        one row exceeds the ceiling costs that row.
+
+        Args:
+          value: The bytes-like to read.
+
+        Returns:
+          An exact ``bytes`` of at least ``max_value_bytes + 1`` bytes, or of the whole value when
+          it is shorter.
+
+        Raises:
+          Exception: Whatever a released or exotic ``memoryview`` raises; :meth:`value` is the
+            guard.
+        """
+        limit = self._cfg.max_value_bytes + 1
+        if isinstance(value, bytes):
+            return _BYTES_SLICE(value, slice(0, limit))
+        if isinstance(value, bytearray):
+            return bytes(_BYTEARRAY_SLICE(value, slice(0, limit)))
+        if value.nbytes < limit:
+            return bytes(value)
+        if value.c_contiguous:
+            return bytes(value.cast("B")[:limit])
+        rows = value.shape[0] if value.shape else 1
+        row = value.nbytes // rows
+        return bytes(value[: -(-limit // row)])
 
     def _decoded(self, value: bytes) -> str:
         """Decodes bytes as UTF-8, replacing what does not decode and recording that it did.
