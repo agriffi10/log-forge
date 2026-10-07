@@ -232,8 +232,9 @@ def _clip(value: str, max_bytes: int) -> tuple[str, bool, int]:
     if _STR_LEN(value) > max_bytes:
         value = _STR_SLICE(value, slice(0, max_bytes + 1))
     plain, raw, replaced = _measured(value)
-    if len(raw) <= max_bytes:
-        return plain, replaced, len(raw)
+    size = len(raw)
+    if size <= max_bytes:
+        return plain, replaced, size
     budget = max_bytes - _MARKER_BYTES
     if budget <= 0:
         return TRUNCATION_MARKER, True, _MARKER_BYTES
@@ -361,28 +362,6 @@ class _Coercer:
         """
         self._stopped = placeholder
         self.truncated = True
-
-    def _charge(self, cost: int) -> bool:
-        """Charges text to the byte budget, or stops the pass when the charge would exceed it.
-
-        A charge that lands exactly on the budget fits, so the comparison is strict. A charge
-        that does not fit adds nothing, and its value is written as ``<size limit>`` whole,
-        never clipped to fit (SPEC-057 FR-002).
-
-        Args:
-          cost: The bytes to charge.
-
-        Returns:
-          Whether the charge fitted.
-
-        Raises:
-          None.
-        """
-        if self._charged + cost > self._max_bytes:
-            self._halt(_SIZE_LIMIT)
-            return False
-        self._charged += cost
-        return True
 
     def value(self, value: object, depth: int) -> object:
         """Coerces one node of the structure, first spending one of the pass's node budget.
@@ -727,6 +706,10 @@ class _Coercer:
     def _bounded_int(self, value: int) -> tuple[object, int | None]:
         """Returns an integer unchanged with its rendered length, or a placeholder when too long.
 
+        This is the bound for an integer *key*. :meth:`integer` carries the same bound inline for
+        an integer value, the hot path, and a test holds the two to one answer on both sides of
+        every edge.
+
         The size test is ``bit_length()``, never ``len(str(value))``: converting an over-long
         integer to a string raises the very ``ValueError`` this bound exists to prevent, so the
         obvious check would move the crash rather than remove it (SPEC-020 FR-002). It ignores
@@ -761,10 +744,13 @@ class _Coercer:
     def integer(self, value: int) -> object:
         """Bounds an integer written as a value, and charges its rendered length to the pass.
 
-        :meth:`_bounded_int` carries the bound. A rendered integer is charged the length it
-        estimates, digits plus one for a sign (SPEC-057 FR-002); the estimate from
-        ``bit_length()`` can overcount by one digit, which errs toward the cut. A placeholder is
-        charged nothing, like every fixed placeholder, since the node budget bounds those.
+        The bound is :meth:`_bounded_int`'s, whose docstring carries the reasoning, and the charge
+        is :meth:`text`'s; both are written out here rather than called, because this runs once
+        per integer in the event and two calls and a tuple were most of what the byte budget
+        cost it. A rendered integer is charged the length it estimates, digits plus one
+        for a sign (SPEC-057 FR-002); the estimate from ``bit_length()`` can overcount by one
+        digit, which errs toward the cut. A placeholder is charged nothing, like every fixed
+        placeholder, since the node budget bounds those.
 
         Args:
           value: The integer to bound.
@@ -776,10 +762,17 @@ class _Coercer:
         Raises:
           None.
         """
-        out, size = self._bounded_int(value)
-        if size is not None and not self._charge(size):
+        digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
+        rendered = digits + 1 if _INT_LT(value, 0) else digits
+        if rendered > self._int_ceiling:
+            self.truncated = True
+            return f"<int: ~{digits} digits>"
+        charged = self._charged + rendered
+        if charged > self._max_bytes:
+            self._halt(_SIZE_LIMIT)
             return _SIZE_LIMIT
-        return out
+        self._charged = charged
+        return value
 
     def real(self, value: float) -> object:
         """Replaces a non-finite float, since ``NaN`` and ``Infinity`` are not JSON.
@@ -817,7 +810,15 @@ class _Coercer:
         value — already exists, and :func:`truncate_str` reads only its ceiling, so it is charged
         at its UTF-8 length *after* clipping (SPEC-057 FR-002). Charging its full length would
         turn a clipped 20 MB string field into ``<size limit>``, a regression for a legitimate
-        input. The value whose charge would exceed the budget becomes ``<size limit>`` whole.
+        input.
+
+        The charge is the byte check, and :meth:`integer` and :meth:`produced` repeat it. A
+        charge that lands exactly on the budget fits, so the comparison is strict; one that does
+        not fit adds nothing, stops the pass, and its value is written as ``<size limit>`` whole,
+        never clipped to fit. It is written out in each of the three rather than called, because
+        they run once per string and per integer in the event and a method call there was a
+        large part of what the budget cost the hot path; each copy has its own exactness test,
+        one byte either side of the budget.
 
         Args:
           value: The string to bound.
@@ -829,8 +830,11 @@ class _Coercer:
           None.
         """
         clipped, altered, size = _clip(value, self._cfg.max_value_bytes)
-        if not self._charge(size):
+        charged = self._charged + size
+        if charged > self._max_bytes:
+            self._halt(_SIZE_LIMIT)
             return _SIZE_LIMIT
+        self._charged = charged
         if altered:
             self.truncated = True
         return clipped
@@ -843,8 +847,9 @@ class _Coercer:
         did not exist until the pass made it, so its length *is* the work: one ``Decimal`` of ten
         million digits referenced 256 times is 2,560,000,000 characters of ``str()``, which
         clipping afterwards does not undo. It is charged the larger of its length in characters
-        before clipping and its UTF-8 bytes after (SPEC-057 FR-002). The length is read through
-        :data:`_STR_LEN`, because ``str()`` of an object can return a ``str`` subclass.
+        before clipping and its UTF-8 bytes after (SPEC-057 FR-002), on :meth:`text`'s terms.
+        The length is read through :data:`_STR_LEN`, because ``str()`` of an object can return a
+        ``str`` subclass.
 
         Args:
           value: The produced string to bound.
@@ -857,8 +862,11 @@ class _Coercer:
         """
         chars = _STR_LEN(value)
         clipped, altered, size = _clip(value, self._cfg.max_value_bytes)
-        if not self._charge(max(chars, size)):
+        charged = self._charged + max(chars, size)
+        if charged > self._max_bytes:
+            self._halt(_SIZE_LIMIT)
             return _SIZE_LIMIT
+        self._charged = charged
         if altered:
             self.truncated = True
         return clipped

@@ -743,6 +743,62 @@ def test_an_integer_is_charged_its_rendered_length_sign_included(route: str, sig
     assert event.get("truncated") is True
 
 
+@pytest.mark.parametrize(
+    ("fits", "crosses"), [(12345, 123456), (-1234, -12345)], ids=["positive", "negative"]
+)
+def test_an_integer_landing_exactly_on_the_budget_fits(fits: int, crosses: int) -> None:
+    """The integer charge is exact at the budget: five characters fit the last five bytes.
+
+    ``a`` costs 1, 2,047 strings of 8,192 and one of 8,186 cost 16,777,211, so an integer that
+    renders in five characters (``12345``, or ``-1234`` with its sign) lands exactly on the
+    budget and is written, and one that renders in six crosses it. This holds the integer's own
+    copy of the byte check to the same strict comparison as the strings', which the
+    budget-exactness test pins only for text.
+    """
+    head = [_S] * 2047 + ["x" * 8186]
+    cfg = Config(max_keys=4096)
+    whole, flag = sanitize_fields({"a": [*head, fits]}, cfg=cfg)
+    assert whole["a"][-1] == fits
+    assert flag is False
+    cut, flag = sanitize_fields({"a": [*head, crosses]}, cfg=cfg)
+    assert cut["a"][-1] == _SIZE_LIMIT
+    assert cut["a"][:-1] == head
+    assert flag is True
+
+
+def _int_window(cfg: Config) -> list[int]:
+    """Integers either side of the configured integer ceiling, both signs, for the parity test."""
+    limit = sys.get_int_max_str_digits()
+    ceiling = cfg.max_value_bytes if limit == 0 else min(cfg.max_value_bytes, limit)
+    out = []
+    for digits in range(max(1, ceiling - 3), ceiling + 3):
+        out += [10 ** (digits - 1), 10**digits - 1, -(10 ** (digits - 1)), -(10**digits - 1)]
+    return out
+
+
+@pytest.mark.parametrize("ceiling", [8192, 5])
+def test_an_integer_value_and_an_integer_key_are_bounded_alike(ceiling: int) -> None:
+    """The value path and the key path carry one bound in two places, so hold them to one answer.
+
+    ``integer`` writes the bound out inline for speed and ``_bounded_int`` keeps it for keys. On
+    every integer in a window either side of the effective ceiling, both signs, the value is
+    kept exactly when the key renders as its own digits, and a replaced value names the same
+    placeholder the key does. The window's edge is computed here only to aim it; what is
+    asserted is that the two paths agree, not where either draws the line.
+    """
+    cfg = Config(max_value_bytes=ceiling)
+    disagreements = []
+    for number in _int_window(cfg):
+        value = coerce(number, cfg=cfg)
+        fields, _ = sanitize_fields({"a": {number: 0}}, cfg=cfg)
+        key = next(iter(fields["a"]))
+        value_kept = type(value) is int and value == number
+        key_kept = key.lstrip("-").isdigit()
+        if value_kept != key_kept or (ceiling == 8192 and not value_kept and key != value):
+            disagreements.append((number.bit_length(), number < 0, value_kept, key_kept))
+    assert not disagreements, f"(bits, negative, value kept, key kept): {disagreements}"
+
+
 def test_a_string_past_the_budget_under_a_raised_ceiling_is_replaced_not_clipped() -> None:
     """FR-002 AC6: under a 32 MiB ceiling, a string of the whole budget plus its key crosses."""
     fields, flag = sanitize_fields({"a": "x" * _BYTES}, cfg=Config(max_value_bytes=32 * _MiB))
