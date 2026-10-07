@@ -12,8 +12,9 @@ where `info()` is called and only the sink I/O moves to the drain thread, and ou
 emit is synchronous (invariant 4). The coercion pass it runs bounds how deep a value nests
 (`max_depth`), how wide a container is (`max_keys`) and how long a string is (`max_value_bytes`),
 and it finds a cycle by ancestor path. It bounds nothing about the pass's *total* work, so a
-pathological but legal argument can hold the application's thread, or inflate the event without
-limit, and invariant 1 does not survive it. Three effects, each readable from `sanitize.py` as it
+pathological but legal argument can hold the application's thread — a call that never returns
+breaches invariant 1's "returns normally" — or inflate the event without limit. The bound itself is
+stated on invariant 8's observable (FR-004). Three effects, each readable from `sanitize.py` as it
 stands at `324936e`:
 
 - **A shared sublist is walked once per path.** `y = 0`, then `y = [y] * 16` seven times, then
@@ -25,10 +26,10 @@ stands at `324936e`:
   blow up instead.
 - **The work to read one value is proportional to its length, not to its ceiling.**
   `truncate_str` and `truncate_tail` encode the whole string before they clip it, and `_dispatch`
-  copies and decodes a whole `bytes`, `bytearray` or `memoryview` first; `str()` of a `Decimal`, or
-  of a non-`str` key, costs its digits or its contents. Even once the walk is bounded to 131,072
-  values (FR-001), a 1 MiB string shared across all of them is 131,072 full encodes, 128 GiB of
-  work, from one small argument.
+  decodes a whole `bytes`, `bytearray` or `memoryview` first, copying all but an exact `bytes`
+  to do it; `str()` of a `Decimal`, or of a non-`str` key, costs its digits or its contents. Even
+  once the walk is bounded to 131,072 values (FR-001), a 1 MiB string shared across all of them is
+  131,072 full encodes, 128 GiB of work, from one small argument.
 - **The event has no size bound.** Even once the walk is bounded to 131,072 values, an 8 KiB string
   shared across all of them is 131,072 × 8,192 bytes, 1 GiB of strings. `json.dumps` escapes — a
   control character becomes six bytes — so the serialised event is up to 6 GiB, and on the orphan
@@ -36,42 +37,39 @@ stands at `324936e`:
 
 This spec bounds every coercion pass three ways: by the number of values it visits, by the bytes
 it charges, and — so that neither budget is spent by reading rather than by writing — by making a
-read cost the ceiling instead of the input's length. It adds no configuration key.
+read cost the ceiling instead of the input's length. It adds no configuration key and no public
+name.
 
 ## Scope
 
 ### In Scope
 
-- A node budget per coercion pass: `sanitize.MAX_NODES = 131_072` values, past which the walk
+- A node budget per coercion pass: 131,072 values (`sanitize._MAX_NODES`), past which the walk
   stops at a `<node limit>` placeholder (FR-001).
-- A byte budget per coercion pass: `sanitize.MAX_RENDERED_BYTES = 16 * 1024 * 1024`, past which the
-  walk stops at a `<size limit>` placeholder (FR-002).
+- A byte budget per coercion pass: 16 MiB (`sanitize._MAX_RENDERED_BYTES`), past which the walk
+  stops at a `<size limit>` placeholder (FR-002).
 - Reads bounded by the ceiling: `truncate_str`, `truncate_tail` and the bytes-like branch of
-  `_dispatch` read a prefix of `max_bytes + 1` characters (items, for a bytes-like) of a longer
-  input (FR-003).
+  `_dispatch` read a prefix of `max_bytes + 1` characters, or enough bytes to cover that many, of a
+  longer input (FR-003).
 - The promise restated at the four sites outside the register that state the old claim (FR-004).
-- **Sequencing with SPEC-056 (OTLP log export).** That spec bounds its own OTLP mapping with a record
-  budget of the same number, the same placeholder text and the same stop rule, and leaves `sanitize`
-  out of its own scope. The constant has one home, `sanitize`, which imports nothing from the
-  package at runtime, so a module that imports it from there cannot close a cycle. Whichever of the
-  two builds second shares that constant instead of defining another: if SPEC-056 has built first,
-  FR-001 replaces the mapping's definition with an import of `sanitize.MAX_NODES` and leaves the
-  mapping's placeholder text and stop rule as they are.
 
 ### Out of Scope
 
-- **A `configure()` knob for either budget.** Both are module constants. A constant can become a
-  knob later by appending a keyword, while a knob that ships cannot be withdrawn (invariant 10, and
-  the deferral of the worker tunables in `docs/decisions/public-api.md`). SPEC-056's budget is
-  likewise a constant, not a key.
+- **A `configure()` knob for either budget, and a public constant.** Both are private module
+  constants, not in `__all__`: the README says anything underscore-prefixed is internal and moves
+  without notice, so no public surface grows (invariant 10) and rebinding one is not a supported
+  knob. `_Coercer` reads them per pass, so a test may patch them; that carries no promise. A knob
+  can be appended later, while one that ships cannot be withdrawn (invariant 10, and the deferral of
+  the worker tunables in `docs/decisions/public-api.md`).
 - **Changing the defaults** of `max_value_bytes`, `max_stack_bytes`, `max_keys` or `max_depth`.
 - **The cost of a caller's own `__str__`, `__repr__`, `__iter__` or `__hash__`.** That is user code.
   The budgets bound how often the library calls it, not what one call costs.
-- **A `TransformSink` that adds a DAG after assembly.** It runs on the drain thread, and SPEC-056's
-  mapping carries its own budget for what it serialises.
+- **A `TransformSink` that adds a DAG after assembly.** Its function is the caller's own code. It
+  runs where the sink runs — the drain thread inside a span, and the caller's thread on the orphan
+  path — and what it builds is not the coercion pass's to bound.
 - **Sink-side size limits.** A destination's hard limit is still met by lowering `max_value_bytes`
-  or `max_keys`, and `dropped_oversized` still counts what a sink refuses. `MAX_RENDERED_BYTES` is a
-  work budget on the caller's thread, not a limit tuned to any destination.
+  or `max_keys`, and `dropped_oversized` still counts what a sink refuses. `_MAX_RENDERED_BYTES` is
+  a work budget on the caller's thread, not a limit tuned to any destination.
 - **The three config stamps** (`service`, `version`, `env`), which bypass assembly and are recorded
   as an exception on invariant 8 already.
 
@@ -86,15 +84,18 @@ Stated here rather than left to be found.
   to twice each budget. The work on the caller's thread is still bounded, per pass.
 - **A pathological `defaults` is walked on every event.** The budget bounds each pass, not their
   sum over a process's life; a `configure(defaults=…)` that reaches the budget pays it per event.
-- **The serialised worst case is about six times the byte budget**, 96 MiB, because `json.dumps`
-  escapes a control character as six bytes, plus the uncharged scalars and punctuation, which the
-  node count bounds at a few tens of bytes per node.
+- **The serialised worst case is about six times the byte budget per pass**, 96 MiB, because
+  `json.dumps` escapes a control character as six bytes; a boundary event takes two passes, so about
+  192 MiB. To that add the uncharged scalars and punctuation, which the node count bounds at a few
+  tens of bytes per node.
+- **A non-contiguous view is read in whole rows.** A single row is read whole, so a non-contiguous
+  multi-dimensional `memoryview` whose one row exceeds the ceiling costs that row on each visit.
 - **The new placeholders are written as they stand**, 12 bytes each, like `<depth limit>` and
   `<circular>`. A `max_value_bytes` below a placeholder's length is already exceeded by
   `<depth limit>`, by `<circular>` and by the 14-byte truncation marker; the two new placeholders
   share that gap, and this spec does not close it.
-- **Neither budget adds module-level mutable state.** The counters live on the pass object, so
-  nothing is stranded across a fork (invariant 12).
+- **Neither budget adds module-level mutable state.** The library never rebinds the constants and
+  the counters live on the pass object, so nothing is stranded across a fork (invariant 12).
 
 ---
 
@@ -107,17 +108,17 @@ Stated here rather than left to be found.
 The pass counts every value it visits, scalar or container, including one that becomes
 `<depth limit>` or `<circular>`: every entry to `_Coercer.value`. The top-level `fields` mapping
 (entered at depth −1, without passing through `value`) and mapping keys (rendered by `key()`) are
-not values and are not counted. The value that would be the `MAX_NODES + 1`th is not dispatched: it
+not values and are not counted. The value that would be the `_MAX_NODES + 1`th is not dispatched: it
 becomes the placeholder `<node limit>`, the event is marked `truncated`, and nothing after it is
 visited. Every container still open ends after the member it was writing, so the siblings that come
 later in walk order are dropped. That is the stated cost: walk order decides what is sacrificed, and
-the first `MAX_NODES` values in walk order survive. A `max_keys` raised past `MAX_NODES` cannot
+the first `_MAX_NODES` values in walk order survive. A `max_keys` raised past `_MAX_NODES` cannot
 widen a container past the budget.
 
 The order of checks on one value is: node budget, then `max_depth`, then the type's own rule. A
 value past the budget is `<node limit>` even where it also sits past `max_depth`, and a value that
 becomes `<depth limit>` still spends a slot. The number, the placeholder text, the stop and the
-counting are deliberately those of SPEC-056's record budget (see *Scope*).
+counting are deliberately those of SPEC-056's record budget, so that the two stay equal.
 
 **Why 131,072.** It is twice a fully populated two-level structure at the default `max_keys`
 (256 × 256 = 65,536 values), so a wide but ordinary event is not cut, and no larger, so the worst
@@ -133,35 +134,43 @@ placeholder while containers keep iterating* (the shape of `<depth limit>`): it 
 
 - [ ] `y = 0`, then `y = [y] * 16` seven times, passed as `fields={"a": y}`, returns on both routes
       (a level call inside a `@trace`, and one with no span open) before a 5-second alarm.
-      `fields["a"]` holds exactly `MAX_NODES + 1` values counting itself — `MAX_NODES` visited plus
-      `<node limit>`, which is last in walk order — and the event is marked `truncated`.
+      `fields["a"]` holds exactly `_MAX_NODES + 1` values counting itself — `_MAX_NODES` visited
+      plus `<node limit>`, which is last in walk order — and the event is marked `truncated`.
 - [ ] The alarm is `signal.setitimer(signal.ITIMER_REAL, …)` with a handler that raises a
       `BaseException` subclass, because `_Coercer.value`'s guard catches `Exception` and would turn
       an `Exception` into a placeholder; the test first asserts that it runs on the main thread, the
       only one signals reach.
-- [ ] The test is run once against `main`'s `sanitize.py` (checked out into a scratch worktree,
-      never by switching this branch) and fails by the alarm; the PR body records that run.
-- [ ] With `max_keys` raised to `MAX_NODES`, a field holding a list of `MAX_NODES − 1` integers
-      (`MAX_NODES` values counting the list) is written whole with `truncated` absent; a list of
-      `MAX_NODES` integers keeps its first `MAX_NODES − 1` intact, ends in `<node limit>`, and is
+- [ ] The test is run once against `main`'s `sanitize.py`, checked out into a scratch worktree and
+      never by switching this branch, with `log_foundry.sanitize.__file__` asserted to lie under
+      that worktree. It fails by the alarm, not by an `ImportError`: no test module imports a new
+      name, and `_MAX_NODES` and `_MAX_RENDERED_BYTES` are read only after the call under test
+      returns, or through `getattr` with a default. The PR body records that run.
+- [ ] With `max_keys` raised to `_MAX_NODES`, a field holding a list of `_MAX_NODES − 1` integers
+      (`_MAX_NODES` values counting the list) is written whole with `truncated` absent; a list of
+      `_MAX_NODES` integers keeps its first `_MAX_NODES − 1` intact, ends in `<node limit>`, and is
       marked. `coerce` on the same two lists gives the same two answers.
 - [ ] A field holding 256 lists of 256 integers (65,793 values) is written whole, with `truncated`
       absent.
-- [ ] With `max_keys` raised, `fields={"a": [[0] * (MAX_NODES − 2), [1, 2, 3]], "b": 1}` yields
-      `a == [[0] * (MAX_NODES − 2), "<node limit>"]`, no key `b`, and a marked event: the
+- [ ] With `max_keys` raised, `fields={"a": [[0] * (_MAX_NODES − 2), [1, 2, 3]], "b": 1}` yields
+      `a == [[0] * (_MAX_NODES − 2), "<node limit>"]`, no key `b`, and a marked event: the
       placeholder replaced a container unread, and every open container ended.
-- [ ] With `max_depth=1` and `max_keys` raised, `{"a": [0] * MAX_NODES}` writes `<depth limit>` for
-      its first `MAX_NODES − 1` members and `<node limit>` for the last: the node check precedes the
-      depth check, and a value that becomes `<depth limit>` still counts.
-- [ ] A `@trace`d function that sets a baggage value shaped like the first input has `<node limit>`
-      in the `fields` of both `span.start` and `span.end`, each marked: the `backfill_baggage` pass
-      honours the budget on the same terms.
-- [ ] `tests/test_sanitize_corpus.py` gains a row for a three-level 256-wide shared nest, expecting
-      `<node limit>` and `truncated`, and a silence row for a 256 × 256 structure, expecting neither.
+- [ ] With `max_depth=1` and `max_keys` raised, `{"a": [0] * _MAX_NODES}` writes `<depth limit>` for
+      its first `_MAX_NODES − 1` members and `<node limit>` for the last: the node check precedes
+      the depth check, and a value that becomes `<depth limit>` still counts.
+- [ ] A `@trace`d function that sets a baggage value `[[0] * 512] * 512`, with `max_keys` raised to
+      512 (262,657 values, just over the budget), has `<node limit>` in the `fields` of both
+      `span.start` and `span.end`, each marked: the `backfill_baggage` pass honours the budget on
+      the same terms.
+- [ ] `tests/test_sanitize_corpus.py` gains a row for `[[[0, 0]] * 256] * 256` under the corpus's
+      `max_keys` of 256 (196,865 values, just over the budget), expecting `<node limit>` and
+      `truncated`, and a silence row for a 256 × 256 structure, expecting neither.
+- [ ] `sanitize.__all__` and `log_foundry.__all__` are unchanged by this spec.
 - [ ] Planted out once each — the node check, each stop `break` in `mapping` and `members`, and the
       order of the node check ahead of the depth check, and likewise every new guard of FR-002 and
       FR-003 (the byte check, the produced-text charge, each bounded read) — a named test
-      reddens; the PR body records each guard and the test that caught it.
+      reddens, and each named test is either alarm-guarded or built on a shape just over the budget,
+      so a planted-out guard fails it instead of hanging the run; the PR body records each guard and
+      the test that caught it.
 - [ ] Serves invariants 1, 6 and 8: the criteria that build an event run on both delivery paths,
       the baggage criterion covers the boundary-event pass, and `truncated` marks the cut.
 
@@ -169,7 +178,7 @@ placeholder while containers keep iterating* (the shape of `<depth limit>`): it 
 
 #### Description:
 
-The pass keeps a running charge against `MAX_RENDERED_BYTES` (16,777,216). What is charged is the
+The pass keeps a running charge against `_MAX_RENDERED_BYTES` (16,777,216). What is charged is the
 table under *Data Model*, in three classes:
 
 - **Text from the caller** — a `str` value or key, the text decoded from a bytes-like, an enum
@@ -187,6 +196,12 @@ table under *Data Model*, in three classes:
 Fixed placeholders (`<depth limit>`, `<circular>`, `<node limit>`, `<size limit>`, `<int: …>`,
 `<float: …>`), floats, bools and `None` are not charged; the node count bounds them.
 
+**Order within an entry.** A mapping entry's key is rendered and charged *before* its value is
+visited. That reverses today's order: `out[self.key(key)] = self.value(item, depth + 1)` in
+`mapping()` evaluates the value first, because Python evaluates the right-hand side of a subscript
+assignment before the subscript. Key-first is what lets a key that crosses the budget leave its
+value unread.
+
 The value whose charge would push the total past the budget becomes `<size limit>` — whole, never
 partially clipped — and the event is marked. Nothing after it is visited and every open container
 ends after the member it was writing: FR-001's breach rule exactly, and the pass stops when *either*
@@ -202,13 +217,16 @@ not undo.
 
 **Why 16 MiB.** No sink here accepts an event near it (SQS: 256 KB), and reaching it legitimately
 takes more than 2,048 strings at the default 8 KiB ceiling, so in practice it only catches
-amplification. The serialised worst case follows from it: six times the budget (*Accepted Limits*).
+amplification. The serialised worst case follows from it: six times the budget per pass
+(*Accepted Limits*).
 
 **Behaviour that changes.** A single value of more than 16 MiB of produced text — a `Decimal` of more
 than about 16.7 million digits — becomes `<size limit>` where today it is clipped, and so does a
-caller's string longer than the budget under a `max_value_bytes` configured above it. That agrees with
-the fence "a value too large to *render* is replaced, never clipped"
-(`docs/decisions/event-assembly.md`, SPEC-020).
+caller's string longer than the budget under a `max_value_bytes` configured above it. This is not the
+case of the fence "a value too large to *render* is replaced, never clipped"
+(`docs/decisions/event-assembly.md`, SPEC-020), which governs numbers, and a `Decimal` under the
+budget is still clipped as today. It follows the same instinct for a value past the budget: replaced
+whole rather than clipped to fit.
 
 **A deferral reversed.** `architecture.md` §13 says a per-event byte ceiling "was deferred by
 SPEC-017, again by SPEC-020, and deliberately again by SPEC-021", because it has real design surface:
@@ -224,36 +242,52 @@ bound the bytes and cut a 256 × 256 structure, and would diverge from SPEC-056.
 
 #### Acceptance Criteria:
 
-- [ ] A structure whose charged total is exactly `MAX_RENDERED_BYTES` is written whole with
+- [ ] A structure whose charged total is exactly `_MAX_RENDERED_BYTES` is written whole with
       `truncated` absent: key `a` (1 byte), 2,047 strings of 8,192 bytes and one of 8,191, in one
       flat list with `max_keys` raised. Replacing the 8,191-byte string with one of 8,192 makes
       that string `<size limit>` and marks the event; a sibling `"z"` after it in the list, and a
       second field `b`, are absent.
-- [ ] The exact structure also holds an integer key, a float, a bool, a `None`, an over-long integer
-      (which becomes `<int: …>`) and a value at `max_depth` (`<depth limit>`), adjusted so the total
-      is still exact: the last five charge nothing and the key charges once, so a charge-rule error
-      moves the total by at least a byte and reddens the test.
+- [ ] The same exactness holds for a structure that also holds, ahead of the special string in walk
+      order, an integer key, a one-element tuple key whose `str()` is 10,000 characters (charged
+      10,000 though written at 8,192), a float, a bool, a `None`, an over-long integer and a
+      `<depth limit>` value (the last five charge nothing), the special string's length chosen so the
+      total is exact. It is written whole with no `<size limit>`, and the over-by-one variant, which
+      keeps every probe, ends in `<size limit>`. The clipped key and the placeholders mark this
+      structure, so `truncated` is not evidence here; an undercharged produced key, or a charged
+      placeholder, shifts the total and reddens one of the two.
 - [ ] 256 references to one `str` of 10,000,000 characters are each clipped, the event is marked by
       the clips, and none is `<size limit>`; a list of two references to one `Decimal` of
       10,000,000 digits is `[<clipped Decimal>, "<size limit>"]` and marked.
 - [ ] A mapping key that crosses: after a first field `a` charging 16,777,215 bytes with its key, a
-      second field `bb` yields `"<size limit>": "<size limit>"` and no `bb`.
+      second field `bb` with the value `None` yields `"<size limit>": "<size limit>"` and no `bb` —
+      the key is charged before the value is read, so a value-first walk would give
+      `"<size limit>": None`. With `a` charging 16,777,214, `bb: None` is written whole and the
+      event is unmarked.
 - [ ] With `10**3999` (4,000 digits, charged exactly 4,000) in lists of at most 256 under one field,
-      4,194 are written whole and the 4,195th is `<size limit>`. The test asserts as its premise
-      that `sys.get_int_max_str_digits()` is 0 or at least 4,000.
-- [ ] With `max_value_bytes` configured to 32 MiB, a `str` of `MAX_RENDERED_BYTES` bytes is
+      4,194 are written whole and the 4,195th is `<size limit>`; with `-(10**3999)`, charged one
+      more for the sign, 4,193 are. The test asserts as its premise that
+      `sys.get_int_max_str_digits()` is 0 or at least 4,000.
+- [ ] With `max_value_bytes` configured to 32 MiB, a `str` of `_MAX_RENDERED_BYTES` bytes is
       `<size limit>`, marked and not clipped.
-- [ ] Each of these returns on both routes before the 5-second alarm and is marked: a `Decimal` of
-      10,000,000 digits referenced 256 times from one list, which is `[<clipped>, "<size limit>"]`;
-      the fan-out-16, depth-7 shape with a shared 1,048,576-character non-ASCII string as its leaf,
-      which contains `<size limit>` and not `<node limit>`; and a three-deep nest of 256-key
-      mappings whose keys are `(s, i)`, `s` a shared 1,048,576-character string and each value the
-      next level's one shared mapping, which contains `<size limit>`. Each is run once against
-      `main`'s `sanitize.py`, and the PR body names whether it failed by the alarm or by its
+- [ ] A `Decimal` of 10,000,000 digits referenced 256 times from one list returns on both routes
+      before the 5-second alarm as `[<clipped>, "<size limit>"]`, marked.
+- [ ] The fan-out-16, depth-7 shape with a shared 1,048,576-character non-ASCII string as its leaf
+      returns on both routes before the alarm, marked: its first 2,047 leaves in walk order are
+      clipped strings of 8,192 bytes, its 2,048th is `<size limit>`, and no `<node limit>` appears.
+- [ ] A three-deep nest of 256-key mappings, keyed `(s, i)` with `s` a shared string of 1,048,576
+      `x` characters and every value the next level's one shared mapping (innermost values `0`),
+      returns on both routes before the alarm, marked. Field key `a` costs 1, a key costs its `str()`
+      length (1,048,583 for `i` below 10, 1,048,584 for 10 to 99, 1,048,585 from 100) and a `0`
+      costs 1, so the crossing key is the 14th (`i = 13`) of the innermost mapping. The 13 earlier
+      keys clip to one string `K` and collapse, so `fields["a"] == {K: {K: {K: 0, "<size limit>":
+      "<size limit>"}}}`.
+- [ ] Each of the three hostile shapes above is run once against `main`'s `sanitize.py` on the terms
+      of FR-001's third criterion, and the PR body names whether each failed by the alarm or by its
       assertion.
 - [ ] `tests/test_sanitize_corpus.py` gains a row for a list of two references to one 9,000,000-digit
-      `Decimal`, expecting `<size limit>` second and `truncated`, and a silence row for 100 references
-      to a clipped 10,000,000-character `str`, expecting no `<size limit>`.
+      `Decimal`, expecting `<size limit>` second and `truncated`; a control row for 100 references to
+      a clipped 10,000,000-character `str`, expecting `truncated` and no `<size limit>`; and a
+      silence row for 100 strings of exactly 8,192 ASCII bytes, expecting neither.
 - [ ] Serves invariants 1, 6 and 8: the byte budget is a work bound on the caller's thread and holds
       on both delivery paths and the boundary-event pass, and `truncated` marks the cut.
 
@@ -268,29 +302,31 @@ cannot divert them — the module's existing rule (`_STR_STR`, `_INT_LT`, `_FLOA
 than the ceiling because the clip fires when the encoding *exceeds* `max_bytes`: a prefix of exactly
 `max_bytes` ASCII characters encodes to exactly `max_bytes` bytes and would be returned whole where
 today's is clipped. A string of `max_bytes` characters or fewer is read as it is today (and a subclass
-is copied by `_STR_STR`, which costs at most the ceiling). A `bytes`, `bytearray` or `memoryview` is
-read through its buffer at every size, never through a method a subclass can override, and its size
-through the type's own unbound accessor (`bytes.__len__`, `bytearray.__len__`,
-`memoryview.nbytes`); one longer than `max_value_bytes` bytes is read only through its first
-`max_value_bytes + 1` bytes. A memoryview is sliced where its layout allows — one-dimensional at any
-stride, where the slice counts items and so yields at least that many bytes, or C-contiguous after a
-cast to bytes.
+is copied by `_STR_STR`, which costs at most the ceiling).
+
+A `bytes` or `bytearray`, exact or a subclass, is read through the unbound accessors of its own type —
+`bytes.__len__` and `bytes.__getitem__(value, slice(0, n))`, and `bytearray.__len__` and
+`bytearray.__getitem__` — and never through its buffer: a subclass can override `__buffer__`
+(PEP 688), which makes `memoryview(value)` report another length and other bytes, while the unbound
+accessors read what the object stores. They take the first `max_value_bytes + 1` bytes, which is the
+whole value when it is shorter. A `memoryview` cannot be subclassed, so it is read through its own
+view. One at or below the ceiling is read whole, as today. A longer one is read as whole rows up to
+the cut: cast to bytes and sliced where it is C-contiguous (a zero-dimensional view included),
+otherwise a first-dimension slice of enough rows to cover `max_value_bytes + 1` bytes, a row being
+one item for a one-dimensional view; then `bytes()`.
 
 The rendering is **byte-identical to today's unbounded computation, flag included**; it is a pure
 work reduction. The prefix's UTF-8 is a prefix of the whole string's, and the clip keeps at most
 `max_bytes − 14` bytes of head or tail (the marker is 14 bytes). A lone surrogate is replaced by
 U+FFFD wherever it sits, so one before or after the cut gives one result. For bytes the decoder works
 left to right, a sequence split by the cut starts no earlier than three bytes before it, and a decoded
-unit is never shorter than its source, so everything the clip keeps was decoded identically. The
-criteria hold this to a reference copy of today's algorithm rather than to this argument.
+unit is never shorter than its source, so everything the clip keeps was decoded identically; a prefix
+of whole rows is at least `max_value_bytes + 1` bytes, which is all that argument needs. The criteria
+hold this to a reference copy of today's algorithm rather than to this argument.
 
-**Two recorded exceptions**, both hostile-only or unreachable from the standard library. A `bytes` or
-`bytearray` subclass that overrides `__bytes__` is rendered from its buffer, as `_STR_STR` already
-does for a `str` subclass; today `bytes(value)` honours the override. A memoryview longer than the
-ceiling that is neither one-dimensional nor C-contiguous — constructible only by an extension type
-such as a strided NumPy slice — cannot be prefix-read, and falls to the `<unserializable: memoryview>`
-placeholder through `value()`'s guard where today it is clipped and marked. No criterion asserts the
-second, because the standard library cannot build one; the guard carries it.
+**One recorded exception**, hostile-only. A `bytes` subclass that overrides `__bytes__`, or a
+`bytearray` subclass that overrides `__bytes__` or `__buffer__`, is rendered from the bytes it stores,
+as `_STR_STR` already does for a `str` subclass; today `bytes(value)` honours those overrides.
 
 This bounds *reading*. Producing text — `str(Decimal)`, a key's `str()` — costs what it costs, and
 FR-002 bounds how often the pass does it. The `model.py` callers (`message`, `function`, the four
@@ -302,19 +338,27 @@ FR-002 bounds how often the pass does it. The `model.py` callers (`message`, `fu
       the new code returns an identical `(text, flag)` over a corpus of: ASCII; 2-, 3- and 4-byte
       characters at every offset around the cut; a lone surrogate before the cut and after it;
       invalid and truncated UTF-8 at and after the cut; ceilings from 1 to 40 bytes; strings of
-      exactly `max_bytes` characters (whole, unmarked) and of `max_bytes + 1` (clipped, marked); and
-      a `bytes`, `bytearray` and `memoryview` — contiguous, strided one-dimensional, itemsize
-      above 1, zero-dimensional, two-dimensional C-contiguous — of each such content.
+      exactly `max_bytes` ASCII characters (whole, unmarked) and of `max_bytes + 1` characters
+      (clipped, marked); and a `bytes`, `bytearray` and `memoryview` of each such content — the
+      memoryview contiguous, strided one-dimensional, itemsize above 1, two-dimensional
+      C-contiguous, and zero-dimensional (a ctypes `Structure` larger than the ceiling, since a
+      `c_int` is only 4 bytes).
 - [ ] A `str` subclass whose `__len__`, `__getitem__`, `encode` and `__str__` each lie or raise,
       longer and shorter than the ceiling, gives the answer for its plain text as an exact `str`,
       consulting none of them.
-- [ ] A `bytes` subclass whose `__bytes__` returns other content, longer and shorter than the
-      ceiling, is rendered from its buffer (the first recorded exception).
+- [ ] A `bytes` subclass and a `bytearray` subclass whose `__bytes__`, `__buffer__` (reporting another
+      length and other bytes), `__len__` and `__getitem__` each lie or raise, longer and shorter than
+      the ceiling, are rendered from the bytes they store (the recorded exception).
+- [ ] A non-contiguous two-dimensional view built from the standard library,
+      `memoryview(buf).cast("B", shape=[2000, 14])[::2]` over a 28,000-byte buffer, renders
+      byte-identically to the reference and is marked as today; so does `shape=[3, 10000]` with
+      `[::2]`, whose one row exceeds the ceiling.
 - [ ] The work is bounded by allocation, not by time: with the input allocated before tracing
       starts, the traced peak of `truncate_str`, `truncate_tail` and `coerce` is under 1 MiB for a
       32 MiB exact `str` and a 32 MiB `str` subclass, and of `coerce` for a 32 MiB `bytes`,
       `bytearray` and `memoryview`; and of `build_event` for a 32 MiB `message` and a 32 MiB span
-      name. Each is run once against `main`'s module, where it exceeds the bound.
+      name. Each is run once against `main`'s module on the terms of FR-001's third criterion, where
+      it exceeds the bound.
 - [ ] The existing criteria in `tests/test_sanitize.py` and every row of `tests/test_sanitize_corpus.py`
       pass unchanged on both routes.
 - [ ] Serves invariants 1 and 8: no input makes the call return late for want of a bound on the read,
@@ -327,18 +371,21 @@ FR-002 bounds how often the pass does it. The `model.py` callers (`message`, `fu
 "The ceilings bound each *value*, not the event" is the old claim, and after FR-001 to FR-003 it is
 no longer the whole of it: the four ceilings still bound a value, each pass is now bounded as a whole
 in work, and the event's size is still not bounded to any destination's limit. It is stated at five
-sites. This FR amends the four that are not the register; the register is written at completion.
+sites. This FR amends the four that are not the register; the register is written at completion. The
+two budgets are described by value (131,072 values; 16 MiB of text) wherever a reader meets them, and
+named by their private constants only where the tests are.
 
 - `docs/invariants.md` §8: the statement, the *Observable* and *Guarded* gain the two budgets, the two
-  placeholders and the new tests. The observable is kept exact — a pass visits at most `MAX_NODES`
-  values and charges at most `MAX_RENDERED_BYTES`, and the value that crosses either is a marked
-  placeholder after which nothing is visited. A *Recorded exceptions* line gains the two-pass boundary
-  event. This FR edits invariant 8's own text, so it cites invariant 8.
+  placeholders and the new tests. The observable is kept exact — a pass visits at most 131,072 values
+  and charges at most 16 MiB, and the value that crosses either is a marked placeholder after which
+  nothing is visited. A *Recorded exceptions* line gains the two-pass boundary event. This FR edits
+  invariant 8's own text, so it cites invariant 8.
 - `docs/architecture.md` §13, the bullet "The payload ceilings bound each *value*, not the event as a
   whole": amended in place. It keeps the 2,060,506-byte measurement with its `456e9b7` anchor, states
-  the 16 MiB work budget, the node budget and the serialised worst case at six times the byte budget,
-  and says that a destination's limit is still met by lowering the ceilings. The sentence deferring a
-  per-event byte ceiling is struck through, not deleted.
+  the 16 MiB work budget, the node budget and the serialised worst case at six times the byte budget
+  per pass (about twice that for a boundary event, which takes two passes), and says that a
+  destination's limit is still met by lowering the ceilings. The sentence deferring a per-event byte
+  ceiling is struck through, not deleted.
 - `src/log_foundry/config.py`, the `Config` docstring: "They bound each *value*, not the event as a
   whole" is amended to say what now bounds the pass.
 - `README.md`, *Field values are coerced and bounded*: "all four ceilings bound each *value*" is
@@ -355,14 +402,15 @@ specs shipped, and their statement stays true of the four ceilings.
 
 #### Acceptance Criteria:
 
-- [ ] `docs/invariants.md` §8 names `MAX_NODES`, `MAX_RENDERED_BYTES`, `<node limit>` and
-      `<size limit>`, records the two-pass boundary event as an exception, and lists
-      `tests/test_assembly_budget.py` under *Guarded*; `tests/test_invariants_model.py`'s
+- [ ] `docs/invariants.md` §8 states the two numbers (131,072 values, 16 MiB), names
+      `sanitize._MAX_NODES` and `sanitize._MAX_RENDERED_BYTES` as where they live, names
+      `<node limit>` and `<size limit>`, records the two-pass boundary event as an exception, and
+      lists `tests/test_assembly_budget.py` under *Guarded*; `tests/test_invariants_model.py`'s
       `test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do` passes.
-- [ ] The `architecture.md` §13 bullet states the budgets and the six-times serialised bound, keeps
-      the `456e9b7` anchor on its measurement, and shows the deferral sentence struck through with
-      `~~`, not removed.
-- [ ] The `Config` docstring and the README paragraph each name the two budgets, and
+- [ ] The `architecture.md` §13 bullet states the budgets and the six-times-per-pass serialised
+      bound, with the boundary event's two passes, keeps the `456e9b7` anchor on its measurement,
+      and shows the deferral sentence struck through with `~~`, not removed.
+- [ ] The `Config` docstring and the README paragraph each name the two budgets by value, and
       `poetry run python scripts/docstring-lint.py` passes.
 - [ ] A search of `README.md`, `docs/architecture.md`, `docs/invariants.md` and `src/` for "not the
       event" and for "each *value*" finds each hit only in a sentence that also names the budgets;
@@ -376,18 +424,18 @@ specs shipped, and their statement stays true of the four ceilings.
 ## Data Model
 
 ```
-# src/log_foundry/sanitize.py            (no module-level mutable state; the counters are per pass)
-MAX_NODES: int = 131_072                 # values visited per pass; its docstring says why (FR-001)
-MAX_RENDERED_BYTES: int = 16 * 1024 * 1024   # 16_777_216 bytes charged per pass (FR-002)
+# src/log_foundry/sanitize.py            (private; __all__ is unchanged; no module-level mutable state)
+_MAX_NODES: int = 131_072                # values visited per pass; its docstring says why (FR-001)
+_MAX_RENDERED_BYTES: int = 16 * 1024 * 1024   # 16_777_216 bytes charged per pass (FR-002)
 _NODE_LIMIT = "<node limit>"             # beside _DEPTH_LIMIT and _CIRCULAR
 _SIZE_LIMIT = "<size limit>"
-__all__ += ["MAX_NODES", "MAX_RENDERED_BYTES"]
 
 class _Coercer:                          # __slots__ gains, per pass:
     #   values visited so far, bytes charged so far, and which limit (if any) has stopped the walk
+    #   reads _MAX_NODES / _MAX_RENDERED_BYTES when the pass runs, so a test may patch them
 ```
 
-What is charged against `MAX_RENDERED_BYTES`:
+What is charged against `_MAX_RENDERED_BYTES`:
 
 | Item written | Charge |
 |---|---|
@@ -397,14 +445,15 @@ What is charged against `MAX_RENDERED_BYTES`:
 | `<depth limit>`, `<circular>`, `<node limit>`, `<size limit>`, `<int: …>`, `<float: …>`, finite float, `bool`, `None` | nothing |
 
 Order of checks on one value: node budget, `max_depth`, the type's rule (whose text or integer
-charge is the byte check).
+charge is the byte check). Order within a mapping entry: key rendered and charged, then value visited.
 
 ## API / Interface Contract
 
-No signature changes: `truncate_str(value: str, max_bytes: int) -> tuple[str, bool]`,
-`truncate_tail`, `coerce(value, *, cfg)` and `sanitize_fields(fields, *, cfg)` keep their shapes and
-return types. The only additions are the two module constants, listed in `sanitize.__all__`; neither
-is re-exported from `log_foundry`.
+No signature changes and no public name added: `truncate_str(value: str, max_bytes: int) ->
+tuple[str, bool]`, `truncate_tail`, `coerce(value, *, cfg)` and `sanitize_fields(fields, *, cfg)` keep
+their shapes and return types, and `sanitize.__all__` and `log_foundry.__all__` are unchanged. The
+two constants are underscore-prefixed, so the README's rule applies to them: internal, and moved
+without notice.
 
 ```
 # a pass that reaches either budget
@@ -414,7 +463,7 @@ sanitize_fields({"a": big}, cfg=cfg) -> ({"a": [<clipped>, "<size limit>"]}, Tru
 
 ## Configuration / Environment
 
-None. The budgets are constants, not `configure()` keys (*Out of Scope*).
+None. The budgets are private constants, not `configure()` keys (*Out of Scope*).
 
 ## File & Folder Structure
 
@@ -443,12 +492,13 @@ README.md              # Field values are coerced and bounded
 
 ### Phase 2: The two budgets (FR-001, FR-002)
 
-- Write the four hostile-input tests with the alarm guard; run them once against `main`'s
-  `sanitize.py` from a scratch worktree, and keep the reasons for the PR body.
-- Add the constants, the placeholders and the per-pass counters to `_Coercer`; the node check ahead of
-  the depth check in `value()`; the charge rules in `text()` and `integer()`; the stop in `mapping()`
-  and `members()`; the additions to `__all__`. If SPEC-056 has built, replace its definition with an
-  import of `MAX_NODES`.
+- Write the hostile-input tests with the alarm guard; run them once against `main`'s `sanitize.py`
+  from a scratch worktree, as FR-001's third criterion says, and keep the reasons for the PR body.
+- Add the private constants, the placeholders and the per-pass counters to `_Coercer`; the node check
+  ahead of the depth check in `value()`; the charge rules in `text()` and `integer()`; key-first order
+  in `mapping()`; the stop in `mapping()` and `members()`.
+- If SPEC-056 has merged before this builds, add a test pinning `_otel`'s `MAX_NODES` equal to
+  `sanitize._MAX_NODES`.
 
 ### Phase 3: The remaining tests and the docs (FR-001, FR-002, FR-004)
 
