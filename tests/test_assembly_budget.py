@@ -31,7 +31,7 @@ import tracemalloc
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
 import pytest
@@ -808,67 +808,147 @@ class _KeyBoom:
         raise RuntimeError("no")
 
 
-_PRODUCED_SITES: list[tuple[str, str, object, int]] = [
-    ("decimal", "value", Decimal("1" * 40), 40),
-    ("uuid", "value", UUID("12345678-1234-5678-1234-567812345678"), 36),
-    ("datetime", "value", datetime(2026, 1, 1, 12, 30, 45, 123456), 26),
-    ("time", "value", time(12, 30, 45, 123456, tzinfo=UTC), 21),
-    ("enum-fallback", "value", _ProducedFallback.MEMBER_WITH_A_LONG_NAME, 41),
-    ("value-placeholder", "value", _Opaque(), 25),
-    ("tuple-key", "key", ("x" * 20,), 25),
-    ("float-key", "key", 1.2345678901234567, 18),
-    ("int-key-past-the-ceiling", "key", 10**20, 17),
-    ("key-placeholder", "key", _KeyBoom(), 30),
+class _Site(NamedTuple):
+    """One produced-text site: what it is fed, at which ceiling, what it costs and writes."""
+
+    id: str
+    slot: str
+    probe: object
+    ceiling: int
+    charge: int
+    written: str
+
+
+_EMOJI_KEY = ("😀" * 20,)
+_EMOJI_KEY_TEXT = "('" + "😀" * 20 + "',)"
+
+_PRODUCED_SITES: list[_Site] = [
+    _Site("decimal", "value", Decimal("1" * 40), 14, 40, TRUNCATION_MARKER),
+    _Site("uuid", "value", UUID("12345678-1234-5678-1234-567812345678"), 14, 36, TRUNCATION_MARKER),
+    _Site("datetime", "value", datetime(2026, 1, 1, 12, 30, 45, 123456), 14, 26, TRUNCATION_MARKER),
+    _Site("time", "value", time(12, 30, 45, 123456, tzinfo=UTC), 14, 21, TRUNCATION_MARKER),
+    _Site(
+        "enum-fallback",
+        "value",
+        _ProducedFallback.MEMBER_WITH_A_LONG_NAME,
+        14,
+        41,
+        TRUNCATION_MARKER,
+    ),
+    _Site("value-placeholder", "value", _Opaque(), 14, 25, TRUNCATION_MARKER),
+    _Site("tuple-key", "key", ("x" * 20,), 14, 25, TRUNCATION_MARKER),
+    _Site("float-key", "key", 1.2345678901234567, 14, 18, TRUNCATION_MARKER),
+    _Site("int-key-past-the-ceiling", "key", 10**20, 14, 17, TRUNCATION_MARKER),
+    _Site("key-placeholder", "key", _KeyBoom(), 14, 30, TRUNCATION_MARKER),
+    _Site("non-ascii-key-unclipped", "key", _EMOJI_KEY, 8192, 85, _EMOJI_KEY_TEXT),
 ]
 
 
-@pytest.mark.parametrize(
-    ("slot", "probe", "chars"),
-    [site[1:] for site in _PRODUCED_SITES],
-    ids=[site[0] for site in _PRODUCED_SITES],
-)
+@pytest.mark.parametrize("site", _PRODUCED_SITES, ids=[site.id for site in _PRODUCED_SITES])
 def test_each_produced_text_site_is_charged_before_clipping(
-    monkeypatch: pytest.MonkeyPatch, slot: str, probe: object, chars: int
+    monkeypatch: pytest.MonkeyPatch, site: _Site
 ) -> None:
-    """Every produced text is charged its length in characters, though written as 14 bytes.
+    """Produced text is charged the larger of its characters before clipping and its bytes after.
 
-    At ``max_value_bytes=14`` every one of these texts clips to the marker alone, so a site
-    charged after clipping (14) and one charged before it (its length) differ. The budget is
-    patched to sit exactly on the charge, then one byte under it: the site fits, then crosses,
-    which pins the charge to exactly its length in both directions. A ``date`` is not here: it is
-    ten characters, so it is never clipped where these are, and both charges are the same number.
+    At ``max_value_bytes=14`` every clipped site's text becomes the marker alone, so a site
+    charged after clipping (14) and one charged before it (its length in characters) differ.
+    The non-ASCII key is the other half: unclipped at the default ceiling, its 25 characters are
+    85 bytes, so a site charged its characters alone would undercharge it. The budget is patched
+    to sit exactly on the charge, then one byte under it: the site fits, then crosses, which pins
+    the charge to exactly its number in both directions. A ``date`` is not here: it is ten
+    characters, never clipped where these are, so both charges are the same number.
     """
-    fields: dict[str, object] = {"a": probe} if slot == "value" else {"a": {probe: 0}}
-    tail = 1 if slot == "key" else 0
-    cfg = Config(max_value_bytes=14)
-    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + chars + tail)
+    keyed = site.slot == "key"
+    fields: dict[str, object] = {"a": {site.probe: 0}} if keyed else {"a": site.probe}
+    tail = 1 if keyed else 0
+    cfg = Config(max_value_bytes=site.ceiling)
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + site.charge + tail)
     fits, flag = sanitize_fields(fields, cfg=cfg)
-    expected: object = TRUNCATION_MARKER if slot == "value" else {TRUNCATION_MARKER: 0}
+    expected: object = site.written if site.slot == "value" else {site.written: 0}
     assert fits == {"a": expected}
-    assert flag is True
-    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", chars)
+    assert flag is (site.written == TRUNCATION_MARKER)
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", site.charge)
     crossed, flag = sanitize_fields(fields, cfg=cfg)
-    expected = _SIZE_LIMIT if slot == "value" else {_SIZE_LIMIT: _SIZE_LIMIT}
+    expected = _SIZE_LIMIT if site.slot == "value" else {_SIZE_LIMIT: _SIZE_LIMIT}
     assert crossed == {"a": expected}
     assert flag is True
 
 
 def test_the_produced_sites_are_as_long_as_the_table_says() -> None:
     """The per-site test's premise, measured with the standard library rather than with ``src``."""
-    lengths = {
-        "decimal": len(str(Decimal("1" * 40))),
-        "uuid": len(str(UUID("12345678-1234-5678-1234-567812345678"))),
-        "datetime": len(datetime(2026, 1, 1, 12, 30, 45, 123456).isoformat()),
-        "time": len(time(12, 30, 45, 123456, tzinfo=UTC).isoformat()),
-        "enum-fallback": len(str(_ProducedFallback.MEMBER_WITH_A_LONG_NAME)),
-        "value-placeholder": len("<unserializable: _Opaque>"),
-        "tuple-key": len(str(("x" * 20,))),
-        "float-key": len(str(1.2345678901234567)),
-        "int-key-past-the-ceiling": len("<int: ~21 digits>"),
-        "key-placeholder": len("<unserializable key: _KeyBoom>"),
+    texts = {
+        "decimal": str(Decimal("1" * 40)),
+        "uuid": str(UUID("12345678-1234-5678-1234-567812345678")),
+        "datetime": datetime(2026, 1, 1, 12, 30, 45, 123456).isoformat(),
+        "time": time(12, 30, 45, 123456, tzinfo=UTC).isoformat(),
+        "enum-fallback": str(_ProducedFallback.MEMBER_WITH_A_LONG_NAME),
+        "value-placeholder": "<unserializable: _Opaque>",
+        "tuple-key": str(("x" * 20,)),
+        "float-key": str(1.2345678901234567),
+        "int-key-past-the-ceiling": "<int: ~21 digits>",
+        "key-placeholder": "<unserializable key: _KeyBoom>",
+        "non-ascii-key-unclipped": str(_EMOJI_KEY),
     }
-    assert lengths == {site[0]: site[3] for site in _PRODUCED_SITES}
-    assert all(chars > 16 for chars in lengths.values())
+    assert set(texts) == {site.id for site in _PRODUCED_SITES}
+    for site in _PRODUCED_SITES:
+        text = texts[site.id]
+        if site.ceiling == 14:
+            assert len(text) == site.charge > 16, site.id
+        else:
+            assert text == site.written, site.id
+            assert len(text) == 25, site.id
+            assert len(text.encode("utf-8")) == site.charge <= site.ceiling, site.id
+
+
+class _CallerText(NamedTuple):
+    """One caller-text case: the value, its ceiling, what it costs and what it is written as."""
+
+    id: str
+    value: object
+    ceiling: int
+    charge: int
+    written: str
+
+
+_CALLER_TEXTS: list[_CallerText] = [
+    _CallerText("clip-mid-character", "😀" * 3000, 8192, 8190, "😀" * 2044 + TRUNCATION_MARKER),
+    _CallerText("clipped-bytes", b"x" * 20_000, 8192, 8192, "x" * 8178 + TRUNCATION_MARKER),
+    _CallerText("marker-alone", "x" * 20, 10, 14, TRUNCATION_MARKER),
+    _CallerText("unclipped-non-ascii", "é" * 100, 8192, 200, "é" * 100),
+]
+
+
+@pytest.mark.parametrize("case", _CALLER_TEXTS, ids=[case.id for case in _CALLER_TEXTS])
+def test_caller_text_is_charged_its_utf8_length_after_clipping(
+    monkeypatch: pytest.MonkeyPatch, case: _CallerText
+) -> None:
+    """A caller's text costs exactly the UTF-8 bytes it is written as, wherever the clip lands.
+
+    The budget-exactness test clips only where a cut lands on a whole character, so these pin
+    the rest. Four-byte characters leave 8,176 of the 8,178 head bytes, so the clip is 8,190
+    bytes, not the ceiling. Bytes are the caller's text once decoded, charged as such: the
+    8,193-character prefix read from them would cost one more as produced text. A marker that
+    stands alone under a ceiling below its own length costs its 14 bytes, not the ceiling. And
+    unclipped text costs its bytes, not its characters. The budget is patched to sit exactly on
+    the charge, then one byte under it, so the charge is pinned in both directions.
+    """
+    cfg = Config(max_value_bytes=case.ceiling)
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + case.charge)
+    fits, flag = sanitize_fields({"a": case.value}, cfg=cfg)
+    assert fits == {"a": case.written}
+    assert flag is (case.written.endswith(TRUNCATION_MARKER))
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", case.charge)
+    crossed, flag = sanitize_fields({"a": case.value}, cfg=cfg)
+    assert crossed == {"a": _SIZE_LIMIT}
+    assert flag is True
+
+
+def test_the_caller_texts_are_as_long_as_the_table_says() -> None:
+    """The caller-text test's premise, measured with the standard library rather than ``src``."""
+    for case in _CALLER_TEXTS:
+        assert len(case.written.encode("utf-8")) == case.charge, case.id
+    assert len("😀".encode()) == 4
+    assert len(TRUNCATION_MARKER.encode("utf-8")) == 14
 
 
 def test_the_budgets_add_no_public_name() -> None:
