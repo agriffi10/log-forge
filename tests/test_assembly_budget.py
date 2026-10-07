@@ -504,14 +504,18 @@ class _Spin(list):  # type: ignore[type-arg]
 
 
 def test_the_deadline_escapes_the_coercers_guard() -> None:
-    """FR-001 AC2: the alarm is a ``BaseException`` and it does stop a walk that never returns."""
-    assert issubclass(_Deadline, BaseException)
-    assert not issubclass(_Deadline, Exception)
+    """FR-001 AC2: the alarm stops a walk that never returns, through the coercer's own guard.
+
+    The behaviour is checked before the class: were ``_Deadline`` an ``Exception``, the coercer
+    would turn the interrupted walk into a placeholder and return, and this would not raise.
+    """
     with (
         pytest.raises(pytest.fail.Exception, match=r"did not return within 0\.2 s"),
         _deadline(0.2, "the spinning walk"),
     ):
         coerce(_Spin(), cfg=Config())
+    assert issubclass(_Deadline, BaseException)
+    assert not issubclass(_Deadline, Exception)
 
 
 # -- FR-001: the node budget -------------------------------------------------------------------
@@ -570,7 +574,10 @@ def test_the_placeholder_replaces_a_container_unread_and_ends_every_open_contain
     """FR-001 AC6: the container past the budget is never entered, and ``b`` is never reached."""
     sink = _configure(max_keys=_NODES)
     event = _emit(route, {"a": [[0] * (_NODES - 2), [1, 2, 3]], "b": 1}, sink)
-    assert event["fields"] == {"a": [[0] * (_NODES - 2), _NODE_LIMIT]}
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    assert list(fields) == ["a"], "an entry after the cut was written"
+    assert fields == {"a": [[0] * (_NODES - 2), _NODE_LIMIT]}
     assert event.get("truncated") is True
 
 
@@ -579,7 +586,12 @@ def test_the_node_check_precedes_the_depth_check(route: str) -> None:
     """FR-001 AC7: a ``<depth limit>`` still spends a slot, and the budget is checked first."""
     sink = _configure(max_keys=_NODES, max_depth=1)
     event = _emit(route, {"a": [0] * _NODES}, sink)
-    assert event["fields"] == {"a": ["<depth limit>"] * (_NODES - 1) + [_NODE_LIMIT]}
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    assert list(fields) == ["a"]
+    assert len(fields["a"]) == _NODES
+    assert fields["a"][-1] == _NODE_LIMIT
+    assert fields["a"][:-1] == ["<depth limit>"] * (_NODES - 1)
     assert event.get("truncated") is True
 
 
@@ -631,10 +643,17 @@ def test_a_pass_charged_exactly_the_budget_is_whole_and_one_byte_more_is_cut(rou
     """FR-002 AC1: 1 + 2,047 × 8,192 + 8,191 = 16,777,216 fits; one byte more does not."""
     sink = _configure(max_keys=4096)
     exact = _emit(route, {"a": [_S] * 2047 + ["x" * 8191]}, sink)
-    assert exact["fields"] == {"a": [_S] * 2047 + ["x" * 8191]}
+    exact_fields = exact["fields"]
+    assert isinstance(exact_fields, dict)
+    assert exact_fields["a"][-1] == "x" * 8191
+    assert exact_fields == {"a": [_S] * 2047 + ["x" * 8191]}
     assert "truncated" not in exact
     over = _emit(route, {"a": [_S] * 2047 + ["x" * 8192, "z"], "b": 1}, sink)
-    assert over["fields"] == {"a": [_S] * 2047 + [_SIZE_LIMIT]}
+    over_fields = over["fields"]
+    assert isinstance(over_fields, dict)
+    assert over_fields["a"][2047] == _SIZE_LIMIT
+    assert over_fields["a"][2048:] == [], "a sibling after the cut was written"
+    assert over_fields == {"a": [_S] * 2047 + [_SIZE_LIMIT]}
     assert over.get("truncated") is True
 
 
@@ -669,7 +688,8 @@ def test_produced_text_and_integers_are_charged_and_placeholders_are_not(
     assert out[4].startswith("<int: ")
     assert out[5] == ["<depth limit>"]
     assert out[6:-1] == [_S] * 2046
-    assert out[-1] == (_SIZE_LIMIT if over else special)
+    last = _SIZE_LIMIT if over else special
+    assert out[-1] == last
     assert _SIZE_LIMIT not in list(_leaves(out))[:-1]
 
 
@@ -677,10 +697,12 @@ def test_a_callers_string_is_charged_after_clipping_and_produced_text_before() -
     """FR-002 AC3: a caller's clipped string costs its clip; a ``Decimal`` costs its ``str()``."""
     text = "x" * 10_000_000
     fields, flag = sanitize_fields({"a": [text] * 256}, cfg=Config())
+    assert _SIZE_LIMIT not in fields["a"]
     assert fields == {"a": ["x" * 8178 + TRUNCATION_MARKER] * 256}
     assert flag is True
     number = Decimal("1" * 10_000_000)
     fields, flag = sanitize_fields({"a": [number, number]}, cfg=Config())
+    assert fields["a"][-1] == _SIZE_LIMIT
     assert fields == {"a": ["1" * 8178 + TRUNCATION_MARKER, _SIZE_LIMIT]}
     assert flag is True
 
@@ -691,7 +713,10 @@ def test_a_key_that_crosses_leaves_its_value_unread(route: str) -> None:
     sink = _configure(max_keys=4096)
     head = [_S] * 2047
     crossed = _emit(route, {"a": [*head, "x" * 8190], "bb": None}, sink)
-    assert crossed["fields"] == {"a": [*head, "x" * 8190], _SIZE_LIMIT: _SIZE_LIMIT}
+    crossed_fields = crossed["fields"]
+    assert isinstance(crossed_fields, dict)
+    assert crossed_fields.get(_SIZE_LIMIT) == _SIZE_LIMIT, "the crossing key's value was read"
+    assert crossed_fields == {"a": [*head, "x" * 8190], _SIZE_LIMIT: _SIZE_LIMIT}
     assert crossed.get("truncated") is True
     fits = _emit(route, {"a": [*head, "x" * 8189], "bb": None}, sink)
     assert fits["fields"] == {"a": [*head, "x" * 8189], "bb": None}
