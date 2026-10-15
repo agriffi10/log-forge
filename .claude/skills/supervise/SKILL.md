@@ -37,24 +37,34 @@ message is a teammate's report, not Andrew's approval.
 - **`QUEUE` and `PR open` lines** are routine; say one line. A lock held over 80 minutes is worth a
   look at the holder's tail. The watch shows no heartbeat age, so check `$Q/queue.sh status` when a
   waiter seems stuck.
-- **`MAIN … RED`:** main's build here is the push-triggered `Release` workflow, whose first job is
-  `ci.yml`'s gate; `MAIN` judges only push runs on the remote main's head. Read the failed job
-  before anything else. A job that never started, with no log (the log API returns 404) and the
-  annotation "recent account payments have failed or your spending limit needs to be increased",
-  is a GitHub billing block, not code. Tell the session whose merge is main's head (it may already
-  have released the lock, since merging needs none) not to change code, and send Andrew a
-  `PushNotification`. Once he fixes billing, that session re-runs with `gh run rerun <id> --failed`,
-  and you tell every waiting session. A real failure goes to that session and to Andrew, and
-  nothing else merges until main is green. `MAIN … no push run yet` that does not clear within a
-  few minutes is a push event GitHub dropped: a human's call, per `several-agents.md`.
-- **`ALERT main … <event> run failed`:** a run that is not main's build failed on main's head — a
+- **`MAIN … RED`:** `MAIN` judges every push run on the remote main's head. The one that is
+  main's build is `Release`, whose first job is `ci.yml`'s gate, and it runs on every merge;
+  `pip-audit`, `Scorecard`, `Spec Lint` and `Zizmor` also run on push to main, path-filtered. Read
+  the failed job before anything else, because who owns it depends on which it is:
+  - A job that never started, with no log (the log API returns 404) and the annotation "recent
+    account payments have failed or your spending limit needs to be increased", is a GitHub
+    billing block, not code. Tell the session whose merge is main's head (it may already have
+    released the lock, since merging needs none) not to change code, and send Andrew a
+    `PushNotification`. Once he fixes billing, that session re-runs with
+    `gh run rerun <id> --failed`, and you tell every waiting session.
+  - A `Release` failure is the merge's. It goes to that session and to Andrew, and nothing else
+    merges until main is green.
+  - A `pip-audit`, `Scorecard` or `Zizmor` push failure is usually drift the merge only happened to
+    trigger, such as an advisory published that day. Handle it as the `ALERT` case below, except
+    that it also keeps every session with a PR from reading as archivable until main is green.
+  - `MAIN … no push run yet` that does not clear within a few minutes is a push event GitHub
+    dropped. Nothing here recovers it alone: `release.yml` has no `workflow_dispatch`, and
+    dispatching `ci.yml` makes `turn` green while `MAIN` stays at "no push run yet". Put it to
+    Andrew.
+- **`ALERT main … <event> run failed`:** a run that is not a push run failed on main's head — a
   scheduled `Integration`, `pip-audit`, `Scorecard` or `Zizmor`, or a `dynamic` CodeQL or
   Dependabot job. It never turns `MAIN` red and never blocks an archive, because no merge caused
   it: a scheduled run catches drift, such as a new advisory or a real sink destination changing.
   It still stops the line, because this repo's `queue.sh` judges main by every event on its head,
   so `turn` reports the trunk `IS RED` while `MAIN` is green, and `PROTOCOL.md` has every waiting
   session stop and escalate. Read the failed job, tell Andrew what it is, and tell every waiting
-  session why `turn` refuses. A re-run that goes green clears it; a fix needs a PR that the same
+  session why `turn` refuses. `gh run rerun <id>` going green clears it; a fresh run beside the
+  failed one does not, since `queue.sh` still counts the failure. A fix needs a PR that the same
   refusal blocks, and `PR_QUEUE_BYPASS=1` (which `PROTOCOL.md` documents) is the way through. Using
   it is Andrew's call, so put it to him; the session that owns the fix pushes it, never you.
 - **`SHARED`:** two sessions touch one file. Most of these are harmless. Check them with
@@ -116,7 +126,8 @@ evidence below put to him. Then archive a session only when it is completely don
 A session with no PR (an audit, a docs question) is done when its conclusion is delivered and its
 chips are resolved. Read its tail to tell. Worktree names are reused after an archive, so a new
 session in an old name is a different session. `done_check.py` scopes chips accordingly, and its
-corpus (`python3 scripts/supervisor/done_check_test.py`) pins that.
+corpus pins that. No CI job runs the corpus, so run `python3 scripts/supervisor/done_check_test.py`
+after any change to `done_check.py`.
 
 ## Close
 

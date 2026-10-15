@@ -5,6 +5,7 @@ decision waiting in, and nothing says so. The two ways that happens are both abo
 are read: a worktree folder holding an earlier, archived session's transcripts, and the main
 checkout's folder holding every session run there. Each case below builds a fake transcripts root
 and a session record and asserts the exact pending set, including a case that must be empty.
+The last case pins the other silent guard: which sessions belong to this checkout at all.
 
 Usage: ``python3 scripts/supervisor/done_check_test.py`` — no arguments, standard library only,
 non-zero exit if any case does not behave as declared. It needs no desktop app and no network.
@@ -169,12 +170,29 @@ def case_record_with_cwd_only_is_scoped_to_its_worktree(root: str) -> list[str]:
     return [] if got == ["task_abcdef12"] else [f"cwd-only record: expected ['task_abcdef12'], got {got}"]
 
 
+def case_sibling_folder_does_not_belong(root: str) -> list[str]:
+    """A folder whose name only starts with the checkout's is not the checkout; one under it is.
+
+    Args:
+      root: A fresh fake transcripts root, unused.
+
+    Returns:
+      Failure messages, empty when the case holds.
+
+    Raises:
+      None.
+    """
+    got = [done_check.belongs(p, REPO) for p in (REPO, f"{REPO}/.claude/worktrees/x", f"{REPO}-other")]
+    return [] if got == [True, True, False] else [f"belongs: expected [True, True, False], got {got}"]
+
+
 CASES: list[Callable[[str], list[str]]] = [
     case_worktree_ignores_an_earlier_sessions_chips,
     case_main_checkout_reads_only_its_own_transcript,
     case_every_chip_resolved_is_silent,
     case_undatable_transcript_still_counts,
     case_record_with_cwd_only_is_scoped_to_its_worktree,
+    case_sibling_folder_does_not_belong,
 ]
 
 

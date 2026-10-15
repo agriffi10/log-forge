@@ -51,6 +51,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -79,6 +80,25 @@ def _run(argv: list[str], cwd: str | None = None) -> subprocess.CompletedProcess
       None.
     """
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False, env=_ENV)  # noqa: S603
+
+
+def belongs(cwd: str, repo: str) -> bool:
+    """Whether a session working in ``cwd`` belongs to the checkout at ``repo``.
+
+    It does when ``cwd`` is the checkout or a path under it. A bare string prefix would also claim
+    a sibling folder whose name merely starts with this one's.
+
+    Args:
+      cwd: The session's working directory.
+      repo: The main checkout.
+
+    Returns:
+      True for the checkout itself or any path inside it.
+
+    Raises:
+      None.
+    """
+    return cwd == repo or cwd.startswith(repo + "/")
 
 
 def repo_root() -> str:
@@ -156,7 +176,7 @@ def first_timestamp_ms(path: str) -> float | None:
     return None
 
 
-def transcripts(session: dict[str, Any], repo: str, projects: str = PROJECTS) -> list[str]:
+def transcripts(session: Mapping[str, Any], repo: str, projects: str = PROJECTS) -> list[str]:
     """Returns the transcripts that belong to this session and to no earlier one.
 
     A worktree transcript that cannot be dated is kept rather than dropped: dropping it would hide
@@ -186,7 +206,7 @@ def transcripts(session: dict[str, Any], repo: str, projects: str = PROJECTS) ->
     return kept
 
 
-def pending_chips(session: dict[str, Any], repo: str, projects: str = PROJECTS) -> list[str]:
+def pending_chips(session: Mapping[str, Any], repo: str, projects: str = PROJECTS) -> list[str]:
     """Returns the chips this session offered that the user has neither started nor dismissed.
 
     Args:
@@ -337,7 +357,7 @@ def scratch_worktrees(repo: str, name: str, cli_session_id: str | None) -> list[
     return [p for p in paths if "/scratchpad/" in p and any(m in p for m in marks)]
 
 
-def problems_for(session: dict[str, Any], repo: str, green: bool, held: str | None) -> list[str]:
+def problems_for(session: Mapping[str, Any], repo: str, green: bool, held: str | None) -> list[str]:
     """Returns every reason this session is not yet archivable.
 
     Args:
@@ -387,9 +407,6 @@ def problems_for(session: dict[str, Any], repo: str, green: bool, held: str | No
 def main() -> int:
     """Prints each non-archived session of this checkout with its verdict.
 
-    A session belongs to this checkout when its ``cwd`` is the checkout or a path under it. A bare
-    string prefix would also claim a sibling folder whose name merely starts with this one's.
-
     Args:
       None.
 
@@ -412,8 +429,7 @@ def main() -> int:
         with open(record) as fh:
             session = json.load(fh)
         sid = session["sessionId"]
-        cwd = str(session.get("cwd", ""))
-        if session.get("isArchived") or sid == args.self_id or not (cwd == repo or cwd.startswith(repo + "/")):
+        if session.get("isArchived") or sid == args.self_id or not belongs(str(session.get("cwd", "")), repo):
             continue
         if args.only and sid not in args.only:
             continue

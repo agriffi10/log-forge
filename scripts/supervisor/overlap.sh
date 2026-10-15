@@ -6,6 +6,10 @@
 # session is committing in, and nothing here stages, stashes or checks out. bash 3.2-safe, because
 # that is the bash a Mac ships.
 #
+# Three worktree shapes are read: a desktop session's `.claude/worktrees/<adj>-<name>-<hex>`, a
+# subagent's `.claude/worktrees/agent-<hex>` (implementers here build on named branches in those),
+# and a session's own `<scratchpad>/wt-*`. A detached tree has no branch and is skipped below.
+#
 # A worktree whose branch has a merged PR is skipped: squash merges leave its commits unmerged by
 # ancestry, so it would otherwise report conflicts that no longer exist. A pair conflict whose files
 # are all already one side's conflicts with main is printed as CONFLICT-ALSO-MAIN rather than
@@ -25,7 +29,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 gh pr list --state merged --limit 100 --json headRefName --jq '.[].headRefName' > "$TMP/merged" 2>/dev/null
 git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' \
-  | grep -E '\.claude/worktrees/[a-z]+-[a-z]+-[0-9a-f]{6}$|/scratchpad/wt-' > "$TMP/wts"
+  | grep -E '\.claude/worktrees/[a-z]+-[a-z]+-[0-9a-f]{6}$|\.claude/worktrees/agent-[0-9a-f]+$|/scratchpad/wt-' > "$TMP/wts"
 
 while IFS= read -r wt; do
   [ -d "$wt" ] || continue

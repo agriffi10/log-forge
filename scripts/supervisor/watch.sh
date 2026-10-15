@@ -12,7 +12,7 @@
 #
 # The state file persists between runs, so a relaunch never replays the baseline; delete it to see
 # the whole snapshot once. The queue is read from the Q= line of the main checkout's pre-push hook,
-# which several-agents.md names as the one authority for where the live queue is.
+# which scripts/pr-queue/install.sh writes when it points the hook at the queue it built.
 #
 # Usage: scripts/supervisor/watch.sh --self <this session's id> [--until-change|--stream]
 #   SUPERVISOR_STATE_DIR  where watch.state lives (default: $TMPDIR/supervisor-<checkout name>)
@@ -78,9 +78,10 @@ print("MAIN %s %s" % (sha[:8], verdict))'
   # build: the push-triggered Release run is, and its first job is ci.yml's gate. It is still news.
   # A scheduled run (Integration, pip-audit, Scorecard, Zizmor) catches drift no merge caused, and
   # this repo's queue.sh judges main by every event on its head, so the same failure that leaves
-  # MAIN green makes `turn` report the trunk RED and stops the line.
+  # MAIN green makes `turn` report the trunk RED and stops the line. The limit is queue.sh's own, so
+  # an ALERT never names a failure `turn` can no longer see.
   if [ -n "$head" ]; then
-    if other=$(gh run list --branch main --limit 40 --json headSha,name,event,status,conclusion 2>&1); then
+    if other=$(gh run list --branch main --limit 30 --json headSha,name,event,status,conclusion 2>&1); then
       echo "$other" | HEAD_SHA="$head" python3 -c '
 import json, os, sys
 sha = os.environ["HEAD_SHA"]
