@@ -872,6 +872,20 @@ class _KeyBoom:
         raise RuntimeError("no")
 
 
+class _ZeroLen(str):
+    """A ``str`` subclass that reports its length as zero."""
+
+    def __len__(self) -> int:
+        return 0
+
+
+class _SubclassKey:
+    """A key whose ``str()`` is a ``str`` subclass lying about its length, which ``str()`` keeps."""
+
+    def __str__(self) -> str:
+        return _ZeroLen("x" * 20)
+
+
 class _Site(NamedTuple):
     """One produced-text site: what it is fed, at which ceiling, what it costs and writes."""
 
@@ -905,6 +919,7 @@ _PRODUCED_SITES: list[_Site] = [
     _Site("int-key-past-the-ceiling", "key", 10**20, 14, 17, TRUNCATION_MARKER),
     _Site("key-placeholder", "key", _KeyBoom(), 14, 30, TRUNCATION_MARKER),
     _Site("non-ascii-key-unclipped", "key", _EMOJI_KEY, 8192, 85, _EMOJI_KEY_TEXT),
+    _Site("key-str-returns-a-subclass", "key", _SubclassKey(), 14, 20, TRUNCATION_MARKER),
 ]
 
 
@@ -920,7 +935,10 @@ def test_each_produced_text_site_is_charged_before_clipping(
     85 bytes, so a site charged its characters alone would undercharge it. The budget is patched
     to sit exactly on the charge, then one byte under it: the site fits, then crosses, which pins
     the charge to exactly its number in both directions. A ``date`` is not here: it is ten
-    characters, never clipped where these are, so both charges are the same number.
+    characters, never clipped where these are, so both charges are the same number. The last
+    site's ``str()`` is a ``str`` subclass whose ``__len__`` says zero: its characters are counted
+    through ``str.__len__``, so it costs its 20, and a count through its own ``__len__`` would
+    charge it the 14 of the marker it clips to.
     """
     keyed = site.slot == "key"
     fields: dict[str, object] = {"a": {site.probe: 0}} if keyed else {"a": site.probe}
@@ -952,7 +970,10 @@ def test_the_produced_sites_are_as_long_as_the_table_says() -> None:
         "int-key-past-the-ceiling": "<int: ~21 digits>",
         "key-placeholder": "<unserializable key: _KeyBoom>",
         "non-ascii-key-unclipped": str(_EMOJI_KEY),
+        "key-str-returns-a-subclass": str.__str__(str(_SubclassKey())),
     }
+    assert type(str(_SubclassKey())) is _ZeroLen
+    assert len(str(_SubclassKey())) == 0
     assert set(texts) == {site.id for site in _PRODUCED_SITES}
     for site in _PRODUCED_SITES:
         text = texts[site.id]
@@ -972,6 +993,13 @@ class _CallerText(NamedTuple):
     ceiling: int
     charge: int
     written: str
+    slot: str = "value"
+
+
+class _TextEnum(Enum):
+    """An enum whose member value is a ``str``: the caller's text, not text the pass produces."""
+
+    LONG = "x" * 30
 
 
 _CALLER_TEXTS: list[_CallerText] = [
@@ -979,6 +1007,8 @@ _CALLER_TEXTS: list[_CallerText] = [
     _CallerText("clipped-bytes", b"x" * 20_000, 8192, 8192, "x" * 8178 + TRUNCATION_MARKER),
     _CallerText("marker-alone", "x" * 20, 10, 14, TRUNCATION_MARKER),
     _CallerText("unclipped-non-ascii", "é" * 100, 8192, 200, "é" * 100),
+    _CallerText("clipped-str-key", "x" * 30, 20, 20, "x" * 6 + TRUNCATION_MARKER, "key"),
+    _CallerText("clipped-enum-str-value", _TextEnum.LONG, 20, 20, "x" * 6 + TRUNCATION_MARKER),
 ]
 
 
@@ -993,17 +1023,24 @@ def test_caller_text_is_charged_its_utf8_length_after_clipping(
     bytes, not the ceiling. Bytes are the caller's text once decoded, charged as such: the
     8,193-character prefix read from them would cost one more as produced text. A marker that
     stands alone under a ceiling below its own length costs its 14 bytes, not the ceiling. And
-    unclipped text costs its bytes, not its characters. The budget is patched to sit exactly on
+    unclipped text costs its bytes, not its characters. A ``str`` key and an enum member's ``str``
+    value are the caller's text too: each is 30 characters clipped to 20 bytes, and costs the 20,
+    where charged as produced text it would cost the 30. The budget is patched to sit exactly on
     the charge, then one byte under it, so the charge is pinned in both directions.
     """
+    keyed = case.slot == "key"
+    fields: dict[str, object] = {"a": {case.value: 0}} if keyed else {"a": case.value}
+    tail = 1 if keyed else 0
     cfg = Config(max_value_bytes=case.ceiling)
-    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + case.charge)
-    fits, flag = sanitize_fields({"a": case.value}, cfg=cfg)
-    assert fits == {"a": case.written}
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 1 + case.charge + tail)
+    fits, flag = sanitize_fields(fields, cfg=cfg)
+    expected: object = {case.written: 0} if keyed else case.written
+    assert fits == {"a": expected}
     assert flag is (case.written.endswith(TRUNCATION_MARKER))
     monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", case.charge)
-    crossed, flag = sanitize_fields({"a": case.value}, cfg=cfg)
-    assert crossed == {"a": _SIZE_LIMIT}
+    crossed, flag = sanitize_fields(fields, cfg=cfg)
+    expected = {_SIZE_LIMIT: _SIZE_LIMIT} if keyed else _SIZE_LIMIT
+    assert crossed == {"a": expected}
     assert flag is True
 
 
