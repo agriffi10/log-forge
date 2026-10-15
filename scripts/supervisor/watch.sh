@@ -48,29 +48,37 @@ snapshot() {
     spec=$(awk '$1=="spec"{print $2}' "$Q/lock/holder"); br=$(awk '$1=="branch"{print $2}' "$Q/lock/holder")
     since=$(awk '$1=="since"{print $2}' "$Q/lock/holder")
     echo "QUEUE lock held by $spec on $br since $since"
-    age=$(( $(date -u +%s) - $(date -ju -f %Y-%m-%dT%H:%M:%SZ "$since" +%s 2>/dev/null || date -u +%s) ))
-    [ "$age" -gt 4800 ] && echo "ALERT lock held by $spec for over 80 minutes"
+    if t0=$(date -ju -f %Y-%m-%dT%H:%M:%SZ "$since" +%s 2>/dev/null); then
+      [ $(( $(date -u +%s) - t0 )) -gt 4800 ] && echo "ALERT lock held by $spec for over 80 minutes"
+    else
+      echo "ALERT cannot read the lock's age from since=$since; the 80-minute check is off"
+    fi
   else
     echo "QUEUE lock free"
   fi
   for t in "${Q:-/nonexistent}"/tickets/*; do [ -d "$t" ] || continue
     echo "QUEUE waiting $(basename "$t") $(cat "$t/spec" 2>/dev/null)"
   done
-  if prs=$(gh pr list --state open --json number,headRefName,isDraft --jq '.[]|"PR open #\(.number) \(.headRefName)\(if .isDraft then " DRAFT" else "" end)"' 2>&1); then
+  if prs=$(gh pr list --state open --json number,headRefName,isDraft --jq '.[]|"PR open #\(.number) \(.headRefName)\(if .isDraft then " DRAFT" else "" end)"' 2>/dev/null); then
     [ -n "$prs" ] && echo "$prs"
   else echo "ALERT gh pr list failed"; fi
   # main is judged at the remote's head, not at the newest run: a push GitHub dropped leaves the
-  # newest run on the PREVIOUS commit, green, while the merge was never deployed.
+  # newest run on the PREVIOUS commit, green, while the merge was never deployed. A list that does
+  # not parse prints an ALERT rather than no line, because a vanished `MAIN … RED` reads as recovered.
   head=$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')
   if [ -z "$head" ]; then
     echo "ALERT could not read main's head from origin"
-  elif runs=$(gh run list --branch main --event push --limit 20 --json headSha,name,status,conclusion 2>&1); then
+  elif runs=$(gh run list --branch main --event push --limit 20 --json headSha,name,status,conclusion 2>/dev/null); then
     echo "$runs" | HEAD_SHA="$head" python3 -c '
 import json, os, sys
 sha = os.environ["HEAD_SHA"]
-mine = [r for r in json.load(sys.stdin) if r["headSha"] == sha]
-bad = [r["name"] for r in mine if r["status"] == "completed" and r["conclusion"] not in ("success", "skipped", "neutral")]
-busy = [r for r in mine if r["status"] != "completed"]
+try:
+    mine = [r for r in json.load(sys.stdin) if r["headSha"] == sha]
+    bad = [r["name"] for r in mine if r["status"] == "completed" and r["conclusion"] not in ("success", "skipped", "neutral")]
+    busy = [r for r in mine if r["status"] != "completed"]
+except (ValueError, KeyError, TypeError) as e:
+    print("ALERT could not parse the push runs on main (%s); MAIN unknown" % type(e).__name__)
+    sys.exit(0)
 verdict = "no push run yet" if not mine else "RED: " + ", ".join(bad) if bad else "building" if busy else "green"
 print("MAIN %s %s" % (sha[:8], verdict))'
   else echo "ALERT gh run list failed"; fi
@@ -81,13 +89,16 @@ print("MAIN %s %s" % (sha[:8], verdict))'
   # MAIN green makes `turn` report the trunk RED and stops the line. The limit is queue.sh's own, so
   # an ALERT never names a failure `turn` can no longer see.
   if [ -n "$head" ]; then
-    if other=$(gh run list --branch main --limit 30 --json headSha,name,event,status,conclusion 2>&1); then
+    if other=$(gh run list --branch main --limit 30 --json headSha,name,event,status,conclusion 2>/dev/null); then
       echo "$other" | HEAD_SHA="$head" python3 -c '
 import json, os, sys
 sha = os.environ["HEAD_SHA"]
-for r in json.load(sys.stdin):
-    if r["headSha"] == sha and r["event"] != "push" and r["status"] == "completed" and r["conclusion"] not in ("success", "skipped", "neutral"):
-        print("ALERT main %s %s run failed: %s" % (sha[:8], r["event"], r["name"]))'
+try:
+    for r in json.load(sys.stdin):
+        if r["headSha"] == sha and r["event"] != "push" and r["status"] == "completed" and r["conclusion"] not in ("success", "skipped", "neutral"):
+            print("ALERT main %s %s run failed: %s" % (sha[:8], r["event"], r["name"]))
+except (ValueError, KeyError, TypeError) as e:
+    print("ALERT could not parse the other runs on main (%s)" % type(e).__name__)'
     else echo "ALERT gh run list of main's other runs failed"; fi
   fi
   "$HERE/overlap.sh" 2>/dev/null | grep -E '^(SHARED|CONFLICT)'

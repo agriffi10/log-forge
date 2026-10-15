@@ -393,8 +393,11 @@ def problems_for(session: Mapping[str, Any], repo: str, green: bool, held: str |
     for path in [wt, *scratch_worktrees(repo, os.path.basename(wt), session.get("cliSessionId"))]:
         if not os.path.isdir(path) or path == repo:
             continue
+        readable, head = git(repo, "rev-parse", "HEAD", cwd=path)
+        if readable != 0:
+            problems.append(f"unreadable worktree {os.path.basename(path)}")
+            continue
         _, dirty = git(repo, "status", "--porcelain", cwd=path)
-        _, head = git(repo, "rev-parse", "HEAD", cwd=path)
         _, ahead = git(repo, "rev-list", "--count", "origin/main..HEAD", cwd=path)
         _, branch = git(repo, "branch", "--show-current", cwd=path)
         if dirty:

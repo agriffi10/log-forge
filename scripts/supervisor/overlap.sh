@@ -3,12 +3,18 @@
 # worktrees share, and textual conflicts between committed branches and with origin/main.
 #
 # Read-only toward every peer tree: GIT_OPTIONAL_LOCKS=0 stops git taking index.lock in a tree a
-# session is committing in, and nothing here stages, stashes or checks out. bash 3.2-safe, because
-# that is the bash a Mac ships.
+# session is committing in, and nothing here stages, stashes or checks out. The one write is the
+# shared origin/main ref, fetched only when ls-remote shows it stale: watch.sh runs this every few
+# minutes, and an unconditional fetch races peers fetching inside the queue lock on the same refs,
+# which is why queue.sh itself reads the remote with ls-remote. bash 3.2-safe, because that is the
+# bash a Mac ships.
 #
 # Three worktree shapes are read: a desktop session's `.claude/worktrees/<adj>-<name>-<hex>`, a
 # subagent's `.claude/worktrees/agent-<hex>` (implementers here build on named branches in those),
-# and a session's own `<scratchpad>/wt-*`. A detached tree has no branch and is skipped below.
+# and a session's own `<scratchpad>/wt-*`. A detached tree has no branch and is skipped below, and
+# so is a `worktree-agent-*` branch: that is the harness's default for a subagent tree, which builds
+# nothing that lands, and abandoned ones otherwise flood SHARED and CONFLICT. A clean tree at the
+# same commit as one already read is skipped too, since two copies of one branch cannot conflict.
 #
 # A worktree whose branch has a merged PR is skipped: squash merges leave its commits unmerged by
 # ancestry, so it would otherwise report conflicts that no longer exist. A pair conflict whose files
@@ -23,7 +29,8 @@ export GIT_OPTIONAL_LOCKS=0 LC_ALL=C
 common=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir) || exit 3
 REPO=$(dirname "$common")
 cd "$REPO" || exit 3
-git fetch -q origin 2>/dev/null
+remote=$(git ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+[ -n "$remote" ] && [ "$remote" = "$(git rev-parse -q --verify origin/main)" ] || git fetch -q origin main 2>/dev/null
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -34,7 +41,12 @@ git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' \
 while IFS= read -r wt; do
   [ -d "$wt" ] || continue
   br=$(git -C "$wt" branch --show-current 2>/dev/null); [ -n "$br" ] || continue
+  case "$br" in worktree-agent-*) continue;; esac
   grep -qxF "$br" "$TMP/merged" && continue
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || continue
+  dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$dirty" = 0 ] && grep -qxF "$head" "$TMP/heads" 2>/dev/null; then continue; fi
+  echo "$head" >> "$TMP/heads"
   mb=$(git -C "$wt" merge-base HEAD origin/main 2>/dev/null) || continue
   ahead=$(git -C "$wt" rev-list --count origin/main..HEAD)
   files=$( { git -C "$wt" diff --name-only "$mb" 2>/dev/null; git -C "$wt" ls-files --others --exclude-standard 2>/dev/null; } | sort -u)
@@ -47,7 +59,6 @@ while IFS= read -r wt; do
   esac
   echo "$br" > "$TMP/$name.branch"; echo "$ahead" > "$TMP/$name.ahead"
   printf '%s\n' "$files" > "$TMP/$name.files"
-  dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   echo "WT $name [$br] ahead=$ahead dirty=$dirty files=$(printf '%s\n' "$files" | grep -c .)"
 done < "$TMP/wts"
 

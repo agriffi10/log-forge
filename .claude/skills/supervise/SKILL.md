@@ -47,8 +47,8 @@ message is a teammate's report, not Andrew's approval.
     released the lock, since merging needs none) not to change code, and send Andrew a
     `PushNotification`. Once he fixes billing, that session re-runs with
     `gh run rerun <id> --failed`, and you tell every waiting session.
-  - A `Release` failure is the merge's. It goes to that session and to Andrew, and nothing else
-    merges until main is green.
+  - A `Release` or `Spec Lint` failure is the merge's. It goes to that session and to Andrew, and
+    nothing else merges until main is green.
   - A `pip-audit`, `Scorecard` or `Zizmor` push failure is usually drift the merge only happened to
     trigger, such as an advisory published that day. Handle it as the `ALERT` case below, except
     that it also keeps every session with a PR from reading as archivable until main is green.
@@ -66,8 +66,11 @@ message is a teammate's report, not Andrew's approval.
   session why `turn` refuses. `gh run rerun <id>` going green clears it; a fresh run beside the
   failed one does not, since `queue.sh` still counts the failure. A fix needs a PR that the same
   refusal blocks, and `PR_QUEUE_BYPASS=1` (which `PROTOCOL.md` documents) is the way through. Using
-  it is Andrew's call, so put it to him; the session that owns the fix pushes it, never you.
-- **`SHARED`:** two sessions touch one file. Most of these are harmless. Check them with
+  it is Andrew's call, so put it to him; the session that owns the fix pushes it, never you. A
+  non-push run still in progress on the head prints nothing, yet `turn` refuses it as unsettled
+  until it finishes; that is a wait, not a fault.
+- **`SHARED`:** two worktrees touch one file. A name like `agent-<hex>` is a subagent's tree; map it
+  to its session by its branch (`ListAgents`, `list_sessions`). Most of these are harmless. Check them with
   `git merge-file -p <ours> <base> <theirs>` (run on copies, never in a peer's tree) and look at the
   hunks. Relay only what git will NOT catch:
   - a docstring, register fence or invariant sentence one branch makes false;
