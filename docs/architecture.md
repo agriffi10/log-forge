@@ -939,6 +939,47 @@ close it.
   builtin-container key against the node budget before rendering it, a node per member per path
   as the pass counts a value, or by rendering such a key as the `<unserializable key: T>`
   placeholder.
+- **An object that only claims a scalar type is routed as that type and reaches the event as itself**
+  (SPEC-057 sweep; invariant 8). `isinstance` and `kind in _PLAIN_SCALARS` consult `__class__`,
+  `__hash__` and `__eq__`, which a caller's object controls. Three routes in `_dispatch`, none
+  guarded: an object whose `__class__` claims `bool` takes the `isinstance(value, bool)` branch and
+  is returned as it is; one claiming `float` has its own `__float__` decide `isfinite()` in
+  `real()` and is then returned itself; and a class whose metaclass defines `__hash__` and `__eq__`
+  to match `int` passes `kind in _PLAIN_SCALARS`. Each puts a non-JSON object in the event, so a
+  sink's bare `json.dumps` raises. Pre-existing and not regressed: the same three branches stand at
+  `324936e`, and a probe of each returns the object itself there and on the SPEC-057 tree. SPEC-057
+  closed the sibling routes for the types its own reads depend on (`int`, `str`, `bytes`,
+  `bytearray`, `memoryview`) and left these, which no budget depends on. **Closed by** a
+  spec that replaces every spoofable type routing on the assembly path (`sanitize.py`, `model.py`
+  and `api.py`) with an exact-type identity test or an unbound builtin accessor.
+- **`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded nor
+  total** (SPEC-057 system-frame review; invariants 1 and 6). `context.format_baggage_header` writes
+  `quote(str(v), safe='')` for each value and `current_baggage_header()` calls it on the live
+  baggage. Measured inside a span at `b282c1d`, on the main thread under a 5 s `setitimer` with a
+  null sink: (a) a baggage value that is a shared-sublist DAG (`y = 0`, then `y = [y] * 16` seven
+  times) does not return, because `str` of it recurses through the shared member once per path; and
+  (b) a value whose `__str__` raises makes the call raise that `RuntimeError` into the caller,
+  although the docstring says `Raises: None.`. A short string returns at once in the same run, and
+  the same two values go through assembly there without hanging or raising, so the library's two
+  text producers for one baggage disagree. Pre-dates SPEC-057: `context.py` is untouched by
+  `324936e..5337fe6`, and the same two outcomes were measured at `324936e` with no span open.
+  **Closed by** rendering header values through a bounded, total path within W3C baggage
+  encoding: `sanitize`'s coercion under its pass budgets, or a type-name placeholder when the
+  render fails.
+- **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
+  invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
+  Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and
+  `max_keys=True` are accepted and stored as given, while a `str` is refused only by the
+  comparison's own `TypeError`, not by a check that names the ceiling. `max_keys=2.5` kept three
+  of four list entries and marked the event, and `True` kept one. A float
+  `max_value_bytes` makes the slice in `truncate_str` raise `TypeError` for any string past it; the
+  per-value guard catches that, so a 200-character string silently becomes
+  `<unserializable: str>`, unmarked, where the ceiling should have clipped it, at `324936e` too.
+  SPEC-057's bounded reads widened it: the bytes-like read slices to `max_value_bytes + 1`, so
+  even a SHORT `bytes` or `bytearray` now becomes `<unserializable: bytes>` or
+  `<unserializable: bytearray>`, where at `324936e` it was written whole. **Closed by**
+  `configure()` refusing a non-`int` ceiling with a `TypeError` at the call, deciding at the same
+  time whether a `bool` or another `int` subclass passes (invariant 13).
 
 ### Resolved
 

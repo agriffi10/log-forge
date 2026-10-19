@@ -1,7 +1,7 @@
 # Spec: Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling
 
 **ID:** SPEC-057  
-**Status:** In Progress  
+**Status:** Completed  
 **Last Updated:** 2026-10-19  
 **Depends On:** SPEC-017, SPEC-020, SPEC-055
 
