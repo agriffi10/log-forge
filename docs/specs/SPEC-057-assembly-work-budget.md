@@ -63,7 +63,12 @@ name.
   the worker tunables in `docs/decisions/public-api.md`).
 - **Changing the defaults** of `max_value_bytes`, `max_stack_bytes`, `max_keys` or `max_depth`.
 - **The cost of a caller's own `__str__`, `__repr__`, `__iter__` or `__hash__`.** That is user code.
-  The budgets bound how often the library calls it, not what one call costs.
+  The budgets bound how often the library calls it, not what one call costs. The same holds for
+  every other method the pass calls on the caller's object to *render* it — a date's `isoformat`,
+  a mapping's `items`, an enum member's `value`, a type's `__name__` — whose text is then charged
+  and clipped as produced text. The budgets' and ceilings' own measures — a string's length and
+  slice, a bytes-like's slice, an integer's magnitude — are read through unbound builtins, never
+  the caller's methods.
 - **A `TransformSink` that adds a DAG after assembly.** Its function is the caller's own code. It
   runs where the sink runs — the drain thread inside a span, and the caller's thread on the orphan
   path — and what it builds is not the coercion pass's to bound.
