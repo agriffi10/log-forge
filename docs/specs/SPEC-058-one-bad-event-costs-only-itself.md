@@ -2,7 +2,7 @@
 
 **ID:** SPEC-058
 **Status:** Draft
-**Last Updated:** 2026-10-15
+**Last Updated:** 2026-10-19
 **Depends On:** SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036
 
 ## Overview
@@ -10,8 +10,13 @@
 A batch is the worker's unit of retry, so anything that raises inside one `emit` costs every event
 in the batch, not the one that provoked it. Assembly closed that door for the events themselves
 (invariant 8: every value is coerced once, at `build_event`, so a sink may `json.dumps` bare), but
-four places still let one event take its batch down. Every measurement below was taken at
-`324936e`, the tree this spec is written on.
+five places still let one event take its batch down, or leave it counted in no term at all. Every
+measurement below is anchored to `324936e`, the tree this spec was drafted on (the spec review ran
+at `69dac4f`, whose `src/` is identical). Probes A to D were run by the author. The 60-event corpus
+and its timing (FR-001) and the 18-sink sweep's population were measured by the orchestrating
+session: the sweep measured five sinks by probe (SNS, Pub/Sub, Kafka, HTTP `_items`, Syslog UDP) and
+read the other thirteen from code. The `MultiSink` and depth measurements were run by the spec
+reviewer and re-run by the author from its probe scripts.
 
 - **A transform can break invariant 8's premise.** `TransformSink` runs its function *after*
   assembly, so the function can put `bytes`, a `datetime` or a NaN into an event, and 25 files under
@@ -45,34 +50,60 @@ four places still let one event take its batch down. Every measurement below was
   counts for 1 event), Pub/Sub and Kafka (12 for 3), HTTP `_items` (4 for 1) and Syslog UDP (4 for
   1). `sinks/_socket.py`'s `_sendable` docstring already records the inflation for the socket sinks
   and claims "Nothing here can fix it … the fix belongs one level up". That claim is wrong for the
-  deferral below, which is sink-local.
+  deferral below, which is sink-local — and sink-local is safe only because every catcher of a
+  raise counts what it swallows (the principle below, and FR-007 for the one catcher that did not).
+- **`MultiSink` swallows a reporting child's raise and trusts the child to have counted it.**
+  `MultiSink.emit` returns normally when a sibling delivered, and counts the lost events only for a
+  child that reports nothing (`read_losses(child) is None`, SPEC-036 FR-005), leaving a reporting
+  child "to report itself". Any deferral breaks that trust, because a deferring child raises
+  *without* having counted. Modelled by subclassing the sink to apply this spec's rule, at
+  `69dac4f`: *(a)* `MultiSink(HTTPSink(500, max_batch_bytes=2000, max_retries=0), MemorySink())`
+  with one 5,000-byte `info` reads `SinkLosses(dropped=1, failed=1)` today and `(dropped=0,
+  failed=1)` under FR-005's rule — the oversized event in no term; *(b)*
+  `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())`, where `fn` fails for one
+  event and the stream then breaks for the next nine, reads `failed == 12` today through the
+  silent-child count and `(dropped=1, failed=0)` under FR-003 — the first counted failure makes the
+  wrapper "reporting", so the nine are counted nowhere, a regression of SPEC-036 FR-005. And
+  *(c)*, with no spec applied at all:
+  `MultiSink(TransformSink(HTTPSink(500, max_retries=0), fn), MemorySink())` where `fn` fails for
+  one event among 30 reads `SinkLosses(dropped=0, failed=0)` today — the whole
+  batch uncounted, because the wrapper reports and `MultiSink` therefore does not.
 
-**The deferral rule**, stated once because three FRs apply it: *a per-event drop decided during an
-`emit` is counted and announced only when that `emit` returns normally; when it raises, nothing it
-decided is counted, because the worker owns the batch.* The worker retries the whole batch, so the
-same drops are decided again on the next attempt, and on abandonment its own line counts the batch
-once. Counting inside a raising `emit` is therefore counting once per attempt. The rule is
-implemented once, as one private helper that FR-002, FR-004 and FR-005 share, so that applying it
-to the other sinks (Out of Scope) is mechanical.
+**The principle, stated once and cited from every FR below:** *a raising `emit` counts nothing;
+whoever catches the raise owns the batch's count.* There are exactly three catchers — the worker
+(its abandon line, after its retries), the orphan path (`orphan_lost`) and `MultiSink`, which
+swallows a child's raise when a sibling delivered (FR-007). The instrument for "exactly three" is
+`grep -rn '\.emit(' src/log_foundry` at `324936e`: the calls in `worker.py`, `api.py` and
+`multi.py` catch, and the ones in `transform.py`, `filtering.py` and `logstash.py` only delegate. **The deferral rule** is that principle
+seen from inside a sink: *a per-event drop decided during an `emit` is counted and announced only
+when that `emit` returns normally; when it raises, nothing it decided is counted.* The worker
+retries the whole batch, so the same drops are decided again on the next attempt, and counting
+inside a raising `emit` is counting once per attempt. The rule is implemented once, as one private
+helper that FR-002, FR-004, FR-005 and FR-007 share, so that applying it to the other sinks (Out
+of Scope) is mechanical.
 
-Four calls were settled with the maintainer before this draft and are recorded here as made: the
-repair for a transform's output happens **at the transform** (FR-001); a caller callable that fails
-for one event costs **only that event** (FR-002); the SQS id callables are **folded in** beside
-the wrappers (FR-004); and `HTTPSink._items` renders **per event** as a backstop (FR-005).
+Five calls were settled with the maintainer and are recorded here as made: the repair for a
+transform's output happens **at the transform** (FR-001); a caller callable that fails for one
+event costs **only that event** (FR-002); the SQS id callables are **folded in** beside the
+wrappers (FR-004); `HTTPSink._items` renders **per event** as a backstop (FR-005); and `MultiSink`
+**counts every raise it swallows** (FR-007).
 
 ## Scope
 
 ### In Scope
 
 - A transform's output reaching the inner sink JSON-safe, by a check and a types-only coercion that
-  clips nothing (FR-001).
+  applies no configured ceiling (FR-001).
 - A wrapper's caller callable failing for one event costing only that event, under the ledger rule
   and the deferral rule (FR-002).
 - Each wrapper reporting its own drops through `losses()` (FR-003).
 - `SQSSink`'s id callables costing only their event, and its oversize drop counted once (FR-004).
 - `HTTPSink._items` rendering per event, and its drops counted only when `emit` returns (FR-005).
-- Restating every claim the above made false or incomplete, in source and in the two docs that
-  carry them (FR-006).
+- Restating every claim the above made false or incomplete, in source, in the docs that carry them
+  and by a superseded marker on the SPEC-036 sites that state the claim FR-007 reverses (FR-006).
+- `MultiSink` counting every child raise it swallows, and only when it returns (FR-007). It is in
+  this spec rather than beside it because FR-002, FR-004 and FR-005 are unsafe without it: their
+  deferral leaves a reporting child's loss under a `MultiSink` in no term.
 
 ### Out of Scope
 
@@ -99,8 +130,8 @@ the wrappers (FR-004); and `HTTPSink._items` renders **per event** as a backstop
   that runs once per event in front of one.
 - **Changing what a *total* failure raises.** When every event of a batch fails, the first
   exception is re-raised unchanged and nothing is counted — today's behaviour, byte for byte,
-  because the worker's retry and its abandon line already own that case and a wrapper count beside
-  them would count the batch twice.
+  because the catcher above (the worker's retry and abandon line, `orphan_lost`, or `MultiSink`)
+  already owns that case and a wrapper count beside it would count the batch twice.
 - **Any new public name or `configure()` key.** Every public name is frozen for 1.x (invariant 10);
   the counts, the helper and the coercion entry point are private.
 
@@ -108,20 +139,23 @@ the wrappers (FR-004); and `HTTPSink._items` renders **per event** as a backstop
 
 - **Worker path and orphan path.** Both call the configured sink's `emit`; the worker with the
   drained batch, the orphan path (`api.py`) with a **one-event** batch, absorbing a raise into
-  `orphan_lost`. Every FR's behaviour holds on both, and the one-event batch is the reason the
-  ledger rule exists: an event whose callable fails *is* the whole batch there, so the exception is
-  re-raised and `orphan_lost` counts it once, where a wrapper count as well would count it twice.
+  `orphan_lost`. They are two of the three catchers the principle names. Every FR's behaviour holds
+  on both, and the one-event batch is the reason the ledger rule exists: an event whose callable
+  fails *is* the whole batch there, so the exception is re-raised and `orphan_lost` counts it once,
+  where a wrapper count as well would count it twice.
 - **A sink's `emit` and its `flush`.** The wrappers' `flush` only forwards and carries no events,
   so nothing here changes it; no FR adds a drop that `flush` could also decide.
-- **`MultiSink` with one of these as a child.** The child's own `losses()` is summed with its
-  siblings', so a wrapper's drop count appears once in the total and nothing is counted twice
-  (FR-003).
+- **`MultiSink` with one of these as a child.** This is the third catcher. A child that raises while a sibling delivers is *swallowed*, so
+  neither the worker nor the orphan path ever sees it, and `MultiSink` has to own that batch's
+  count: FR-007 makes it count the batch for a reporting child exactly as it already did for a
+  silent one. Each of FR-002, FR-003, FR-004 and FR-005 carries one `MultiSink` criterion using its
+  own child; FR-007 carries the model re-runs.
 
 ---
 
 ## Functional Requirements
 
-### FR-001: A transform's output reaches the inner sink JSON-safe — coerced at the transform, never clipped
+### FR-001: A transform's output reaches the inner sink JSON-safe — coerced at the transform, under no configured ceiling
 
 #### Description:
 
@@ -129,29 +163,46 @@ Every `dict` the function returns is checked once with one expression, which is 
 observable: `json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")`. It is the
 stricter of the two readings on purpose — a NaN and a lone surrogate both pass a bare
 `json.dumps`, and the second is what the SQL sinks' drivers reject once it reaches a column
-(SPEC-055). A result that passes is
-forwarded as **the same object**, untouched. A result that fails — with any `Exception`, a
+(SPEC-055). A result that passes is forwarded as **the same object**, untouched. A result that fails — with any `Exception`, a
 `RecursionError` included — is replaced by a **types-only coercion**: the conversions assembly
 already applies (`sanitize`'s per-type rules — `bytes` decoded, `datetime` to ISO text,
 `Decimal` and `UUID` to text, a non-finite float to its marker, a lone surrogate to U+FFFD, a
-cycle to its marker, anything else to the type-name placeholder) with **no size ceiling**: no
-`max_value_bytes`, `max_keys` or `max_depth` clipping. `truncated: True` is set on the event when
-the coercion made a substitution assembly marks (a non-finite float, a lone surrogate, undecodable
-bytes); a type-name placeholder does not set it, which is invariant 8's existing rule. The
-coercion builds a new mapping and never mutates the one the function returned. A coercion is not
-loss: nothing is counted and nothing is announced, because assembly does neither. A result the
-coercion still cannot make pass the check, or whose coercion raised, is the same failure as the
-function raising (FR-002).
+cycle to its marker, anything else to the type-name placeholder) with **no configured ceiling**:
+`max_value_bytes`, `max_keys` and `max_depth` do not apply. `truncated: True` is set on the event
+when the coercion made a substitution assembly marks (a non-finite float, a lone surrogate,
+undecodable bytes); a type-name placeholder does not set it, which is invariant 8's existing rule.
+The coercion builds a new mapping and never mutates the one the function returned. A coercion is
+not loss: nothing is counted and nothing is announced, because assembly does neither.
+
+*One fixed structural bound.* The pass has one private constant depth of **100**, the same on
+every thread, past which a value is replaced by `<depth limit>` — assembly's own marker, with
+assembly's own test (`depth >= bound`) — and `truncated: True` is set. Depth is counted from the
+event's own values: its top-level values sit at depth 0, the values of `fields` at depth 1, and
+so on. Without a bound the pass is cut by the interpreter instead, and unmarked: an unbounded
+`_Coercer` pass over a 20,000-deep nest stopped at depth 331 on the main thread and 328 on another
+thread, with `<unserializable: dict>` and `truncated` false — a stack-dependent clip that no
+reader can tell from the caller's own data. The bound is accepted as a cost: a caller who sets
+`max_depth` above 99 and whose transform output fails the check gets that output cut at 100,
+marked.
+
+*A coercion that does not rescue.* A result that still fails the check after coercion, or whose
+coercion raises, is the same failure as the function raising (FR-002), and the exception it
+carries is the one the post-coercion check, or the coercion, raised — that is what FR-002's rule 1
+re-raises and what its detail line names by type. Unlike `sanitize_fields`, which answers a
+top-level mapping it cannot enter with an empty one, the entry point lets that exception reach the
+wrapper's guard: an empty event delivered in place of a hostile one is a silent change to the data.
 
 *Why types-only.* Running `sanitize_fields` over a whole event pushes `fields` one level deeper, so
 `max_depth` cuts a level early, and clips a long `error.stack`-style string to `max_value_bytes`
-rather than `max_stack_bytes`. Measured at `324936e`, a types-only pass left all 60 events of a
-hostile-input corpus (8 KB+ strings, NaN, lone surrogates, 40 KB stacks, 300-key maps, 8-deep
-nesting) unclipped, at about 6 µs per event. *Why check first.* A valid result is untouched by
-construction, and only a result that already failed ever meets the coercer. A peer spec in flight
+rather than `max_stack_bytes`. Measured by the orchestrating session at `324936e` (not by this
+spec's author), a types-only pass left all 60 events of a hostile-input corpus (8 KB+ strings,
+NaN, lone surrogates, 40 KB stacks, 300-key maps, 8-deep nesting) unclipped, at about 6 µs per
+event. *Why check first.* A valid result is untouched by construction, and only a result that
+already failed ever meets the coercer. A peer spec in flight
 (SPEC-057) adds per-pass node and byte budgets to `sanitize.py`; the coercion here runs under
 whatever pass-level budget `sanitize.py` carries when it runs, and this spec adds none and removes
-none.
+none. That peer spec also edits the coercer and invariant 8, and is not a dependency: neither
+relies on the other's behaviour, and `docs/specs/INDEX.md` records which rebases.
 
 The coercion entry point is a new private module function in `src/log_foundry/sanitize.py`, taking
 the event mapping and returning the coerced mapping and the `truncated` flag; its name is an
@@ -174,11 +225,18 @@ size ceilings do not bound what a transform adds — FR-006 records that on inva
       absent.
 - [ ] A NaN, and separately a lone surrogate, as the only fault in a result are coerced — both pass
       a bare `json.dumps`, so a check weaker than the one above would forward them.
-- [ ] No ceiling: a result that fails the check for one reason and also carries a string of three
-      times `max_value_bytes`, a 300-key mapping, an 8-deep nest and a 40 KB `error.stack` reaches the
-      sink with all four equal to the input, and `truncated` absent.
-- [ ] A result nested 20,000 deep, whose check raises `RecursionError`, reaches the inner sink as an
-      event that passes the check, and no `RecursionError` escapes `emit`.
+- [ ] No configured ceiling: a result that fails the check for one reason and also carries a string
+      of three times `max_value_bytes`, a 300-key mapping, an 8-deep nest and a 40 KB `error.stack`
+      reaches the sink with all four equal to the input, and `truncated` absent.
+- [ ] The structural bound: a result nesting single-key mappings 20,000 deep under `fields`, whose
+      check raises `RecursionError`, reaches the inner sink with 99 intact levels below `fields` and
+      `<depth limit>` as the value reached after 100 steps, `truncated: True`, and no
+      `RecursionError` escaping `emit`; the output is equal when produced on the drain thread, on
+      the main thread via the orphan path, and in a thread with a small stack. Lifting the bound
+      (an unbounded pass) reddens it, because the cut then falls near depth 330 and varies by thread.
+- [ ] A `dict` subclass result whose `items()` raises `KeyError`, as the only event: `emit` raises a
+      `KeyError`, the inner `emit` is not called, and nothing is counted; as one event of several it
+      is dropped under FR-002 and the line names `KeyError`, not a wrapper-made type.
 - [ ] A coercion writes nothing to stderr and leaves `losses()` and `health()` as they were
       (invariant 2: a coercion is not loss).
 - [ ] The same transform on the orphan path (`info()` outside a span) delivers the coerced event,
@@ -204,8 +262,10 @@ wrapper builds a `TypeError` naming its own class and the type returned, never t
 1. **If every event in the batch failed this way** — at least one event, nothing forwarded and
    nothing deliberately dropped by a `None` return, a `False` predicate or the level floor — the
    first failure's exception is re-raised unchanged and **nothing is counted or announced** by the
-   wrapper. That is today's behaviour on that path: the worker's retry and its abandon line own the
-   batch, and on the orphan path it is absorbed into `orphan_lost` exactly as today.
+   wrapper. That is today's behaviour on that path: the catcher above owns the batch — the worker's
+   retry and its abandon line, `orphan_lost` on the orphan path, or `MultiSink` (FR-007) — and the
+   exception is the function's own, or for a non-`dict` result the `TypeError` built here, or for
+   a result FR-001's coercion could not rescue the exception FR-001 names.
 2. **Otherwise** the failed events are set aside and the rest, if any, is forwarded. If the inner
    `emit` raises, it propagates and **nothing is counted** — the worker retries the whole batch, the
    callable runs again, and counting now would count the same event once per attempt. Only once the
@@ -219,10 +279,14 @@ siblings succeeded, because retrying the batch would re-deliver the siblings, an
 invariant 2 worse than one counted loss. The guard catches `Exception`, never `BaseException`
 (invariant 1's convention), so a `KeyboardInterrupt` from the callable propagates untouched.
 
-The pending drops of one `emit` are local to that call, so the worker's `emit` and orphan callers
-on other threads never share them (SPEC-028); the deferral rule is one private helper that
-FR-002, FR-004 and FR-005 all use, defined once. Its name, module and shape are implementation
-detail the criteria do not bind.
+This is the principle of the Overview applied to a wrapper: a raising `emit` counts nothing, and
+the catcher above owns the batch. The pending drops of one `emit` are local to that call, so the
+worker's `emit` and orphan callers on other threads never share them (SPEC-028). The deferral
+rule is **one private helper** that FR-002, FR-004, FR-005 and FR-007 all use, defined once: it
+holds one call's pending drops and, only after the call is known not to raise, adds them to the
+owner's own count under the owner's lock, announcing where the site announces (a wrapper once per
+batch; `MultiSink` keeps its existing per-raise `_diag.absorbed` line). Its name, module and shape
+are implementation detail the criteria do not bind.
 
 #### Acceptance Criteria:
 
@@ -255,14 +319,20 @@ detail the criteria do not bind.
       (invariant 11).
 - [ ] An empty batch calls nothing, counts nothing and returns normally; a `KeyboardInterrupt`
       raised by the callable propagates out of `emit` uncounted.
-- [ ] Two concurrent `emit` calls on one wrapper keep separate pending drops: while call A's inner
-      `emit` is parked, call B (one failure, inner succeeds) commits and announces its own one drop,
-      and A then raising leaves the count at B's one.
+- [ ] Two concurrent `emit` calls on one wrapper keep separate pending drops. Call A's batch also
+      carries one failure and its inner `emit` is parked; call B (one failure, inner succeeds)
+      returns, and the count is 1 (B's), not 2. When A's inner then raises, the count is still 1.
+      Holding pending drops on the instance instead of per call reddens it, at B's return.
 - [ ] Orphan path: `info()` outside a span through a wrapper whose callable raises for that event
       is absorbed into `orphan_lost == 1` exactly as before, with the wrapper's count 0 and no line
       from it (invariant 6: the one-event batch is the all-failed case).
-- [ ] `transform.py`, `filtering.py`, `sqs.py` and `http.py` take their deferral from the one private
-      helper; none defines its own accumulate-then-commit state.
+- [ ] Under `MultiSink(TransformSink(inner, fn), MemorySink())`, `inner` a sink that raises and
+      reports nothing: a four-event batch where `fn` fails for one event leaves the wrapper's count
+      at 0 (its inner raised) and `MultiSink.losses() == SinkLosses(dropped=0, failed=4)` — all four
+      in the absorbed term once (FR-007); with an `inner` that succeeds, the wrapper counts 1 and
+      `MultiSink.losses() == SinkLosses(dropped=1, failed=0)`.
+- [ ] `transform.py`, `filtering.py`, `multi.py`, `sqs.py` and `http.py` take their deferral from the
+      one private helper; none defines its own accumulate-then-commit state.
 - [ ] Serves invariants 2, 7 and 11, and invariant 6 on both delivery paths.
 
 ### FR-003: Each wrapper reports its own drops through `losses()`
@@ -297,8 +367,18 @@ counted.
       no count appearing twice (invariant 6).
 - [ ] `TransformSink(FilteringSink(...))` counts each wrapper's own failures once, in its own
       `losses()`, and the outer reports the sum.
-- [ ] Sixteen threads each calling `emit` on a two-event batch whose second event fails lose no
-      increment: the final count is exactly 16.
+- [ ] A lost increment is impossible, shown at a preemption point: a test-only seam parks one
+      committing thread between its read and its write of the count (the precedent of
+      `tests/test_lifecycle_races.py`, in `tests/conftest.py::run_concurrently` style), a second
+      `emit` commits while it is parked, and after both resume the count is 2. Removing the count's
+      lock reddens it at 1. A plain 16-thread hammer is not the criterion: an unlocked counter lost
+      nothing in 3.2 million increments under 16 threads on 3.13.
+- [ ] A wrapper turning from silent to reporting mid-run loses nothing under a fan-out (model (b)):
+      `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())` with `fn` failing for the
+      first event only and the stream then breaking for the next nine events reads
+      `health().sink == SinkLosses(dropped=1, failed=9)` — one event in the wrapper's exact term,
+      nine in `MultiSink`'s absorbed term (FR-007), where today it reads `failed == 12` and the
+      wrapper's first count alone would read `(1, 0)`.
 - [ ] After `os.fork()` repair, a child that inherited the wrapper while a parent thread held its
       count lock can call `emit` and `losses()` without blocking (invariant 12).
 - [ ] Neither wrapper's public attribute names change (the sets of names not starting with `_`,
@@ -316,9 +396,10 @@ re-raised and nothing is counted; otherwise the failed events are counted, and a
 batch, only once `emit` is known not to raise. The count is private and folded into
 `losses().dropped`; the public `dropped_oversized` keeps meaning oversize only.
 
-In the **same function**, the existing oversize drop gets the same deferral. `_chunks` counts and
-announces it before any `_send`, and `emit` can then raise `SinkDeliveryError` and be retried
-(Probe D: `dropped == 4` for one event). It is a twin of the new drop in the function this FR
+Both drops follow the Overview's principle: a raising `emit` counts nothing, and the catcher above
+owns the batch. In the **same function**, the existing oversize drop gets the same deferral.
+`_chunks` counts and announces it before any `_send`, and `emit` can then raise
+`SinkDeliveryError` and be retried (Probe D: `dropped == 4` for one event). It is a twin of the new drop in the function this FR
 already restructures, and its announcement keeps today's shape — one line per oversized event —
 but is written only when `emit` returns normally. `emit` raises `SinkDeliveryError` when every chunk
 failed and something recoverable was lost, and re-raises the first id-callable exception when every
@@ -337,7 +418,9 @@ callables are never consulted, and only the oversize deferral applies.
       normally, the client is never called, and `losses().dropped == 2`.
 - [ ] Retry probe, id failure: a client that fails the whole first `emit` (so it raises
       `SinkDeliveryError`) and serves the second — after the first, `losses().dropped == 0` and no
-      line; after the second, `losses().dropped == 1` and exactly one line.
+      id-failure line; after the second, `losses().dropped == 1` and exactly one id-failure line.
+      The `lost N message(s) … ConnectionError` line `_send` writes for each failed attempt is a
+      different line, is left alone by this spec, and is not counted by this criterion.
 - [ ] Retry probe, oversize (Probe D, re-run): after the worker abandons the batch,
       `dropped_oversized == 0`, `losses().dropped == 0`, no oversize line is written, and the abandon
       line is the only count of the event; with a client that fails once then succeeds, the oversized
@@ -349,6 +432,11 @@ callables are never consulted, and only the oversize deferral applies.
       (invariant 11).
 - [ ] Orphan path: `info()` outside a span with a raising id callable is absorbed into
       `orphan_lost == 1`, `losses().dropped == 0` (invariant 6).
+- [ ] Under `MultiSink(SQSSink(...), MemorySink())` with a FIFO queue, an id callable failing for one
+      event of a four-event batch and a client raising on every send: `SQSSink` counts no id failure
+      (its `emit` raised `SinkDeliveryError`), the sibling delivers, and `MultiSink.losses()` has
+      `dropped == 0` and `failed` equal to the `SQSSink`'s own `failed` plus 4 — the id-failed event
+      in the absorbed term once (FR-007).
 - [ ] The deferral is the helper FR-002 defines, not a second copy.
 - [ ] Serves invariants 2, 7 and 11, and invariant 6 on both delivery paths.
 
@@ -361,7 +449,8 @@ callables are never consulted, and only the oversize deferral applies.
 guard that catches `Exception`, never `BaseException`, and a raise drops that event only. All drops
 decided in `_items` — oversize **and** unrenderable — are counted and announced only when `emit`
 does not raise; when it raises `SinkDeliveryError`, nothing from `_items` is counted and nothing is
-announced, because the worker owns the batch. That closes Probe C for the whole HTTP family, since
+announced, because the catcher above owns the batch (the Overview's principle: the worker, the
+orphan path, or `MultiSink` under FR-007). That closes Probe C for the whole HTTP family, since
 `NewRelicSink`, `OpenSearchSink` and the rest reach `_items` through the one `emit`. The unrenderable
 count is private and folded into `losses().dropped`; `dropped_oversized` keeps meaning oversize
 only. That fold-in must reach every subclass's `losses()`: `ElasticsearchSink` (and so
@@ -403,10 +492,15 @@ one event.
 - [ ] Orphan path: a single unrenderable event through `info()` outside a span settles inside the
       sink — `losses().dropped == 1`, `orphan_lost == 0` — the way an all-oversized one does today,
       and the event is in exactly one term (invariant 6).
+- [ ] Under `MultiSink(HTTPSink(max_batch_bytes=2000, max_retries=0, opener=500), MemorySink())`
+      (model (a)), one span with a 5,000-byte `info`: `health().sink.dropped == 0` and
+      `health().sink.failed` equals the `HTTPSink`'s own `failed` plus 3, the batch's length — the
+      oversized event in the absorbed term once, where today it reads `(dropped=1, failed=1)` and
+      FR-005's rule alone would read `(0, 1)`, the event in no term.
 - [ ] The deferral is the helper FR-002 defines, not a second copy.
 - [ ] Serves invariants 2, 7, 8 and 11, and invariant 6 on both delivery paths.
 
-### FR-006: Every claim the above made false or incomplete is restated
+### FR-006: Every claim the above made false or incomplete is restated, and a reversed one is marked where it stands
 
 #### Description:
 
@@ -429,16 +523,41 @@ was repeated. The sites, by path:
   caller-supplied callable raises" and the oversize wording.
 - **`sinks/http.py` and `sinks/elasticsearch.py`:** the `HTTPSink` class `Attributes:`, `_items`,
   `emit` and both `losses` docstrings, for the per-event guard and the unrenderable fold-in.
+- **`sinks/base.py`, `read_losses`:** its `Returns:` says the shipped wrapper sinks return `None`
+  "when what they wrap reports nothing". FR-003 makes that incomplete — a wrapper that has counted
+  a drop of its own reports non-`None` over an inner that reports nothing.
+- **`sinks/multi.py`:** the `emit` docstring ("a failing child that reports **nothing** of its own
+  is counted here") and the `losses` docstring (the SPEC-036 paragraph ending "so a reporting child
+  is still left to report itself and nothing is counted twice", and its `Returns:` "no silent child
+  has lost a batch") are restated for FR-007, each carrying a superseded marker naming this spec.
+- **Superseded markers, struck in place and never deleted (SPEC-021's rule), at the other sites
+  stating the clause FR-007 reverses** — "a reporting child is left to report itself":
+  `docs/specs/SPEC-036-flush-and-buffer-visibility.md` (FR-005's description and its AC-2),
+  `docs/spec-delivery/SPEC-036-flush-and-buffer-visibility.md` (its FR-005 line) and the sentence
+  "A `MultiSink` child that reports nothing is charged to the fan-out in **events**" in the entry
+  "A sink that delivered nothing raises; one that delivered something reports" in
+  `docs/decisions/sink-delivery.md`. The two tests that pin the reversed clause,
+  `tests/test_sink_losses.py::test_the_aggregate_does_not_double_count_a_reporting_child` and
+  `::test_a_child_that_gains_losses_is_categorised_at_the_time_of_each_failure`, change meaning and
+  are rewritten.
 - **`docs/invariants.md` §8:** the premise reads as holding at assembly *and* at a transform's
   coercion, and a Recorded exception says the ceilings bound the values of an assembled event and do
   not bound what a transform adds. **§2's Recorded exceptions:** its count of losses counted but
   never retried (three) is restated to include a wrapper's or an SQS id callable's per-event failure
-  when its siblings were delivered, and an unrenderable HTTP event.
+  when its siblings were delivered, and an unrenderable HTTP event. **§7** gains a Recorded
+  exception: an `emit` may return normally having delivered nothing, because what it did not
+  deliver was counted — an all-oversized or all-unrenderable HTTP batch, a wrapper batch of one
+  failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized event.
 - **`docs/architecture.md`:** §6's statement that one pass at assembly is correct by consequence for
-  every `json.dumps` call site, and §8's "three cases where nothing landed and the sink still must
-  not raise", which gains the unrenderable event beside the oversized one.
+  every `json.dumps` call site; and §8's "three cases where nothing landed and the sink still must
+  not raise", which gains the unrenderable event, FR-002's "one failure, the rest deliberately
+  dropped" and FR-004's "id failure plus an oversized event".
+- **`docs/decisions/event-assembly.md`:** the fence and the entry "An event is safe by construction
+  — coerced and bounded once at assembly, not per sink". FR-001 now coerces at a transform, for
+  type only, so "once, at assembly" is incomplete. It is listed here so the claim has an owner and is
+  restated in place by the completion ritual's register step, beside the new entry for this spec.
 
-The decisions-register entry is not part of this FR; the completion ritual writes it.
+The decisions-register entry *for this spec* is not part of this FR; the completion ritual writes it.
 
 #### Acceptance Criteria:
 
@@ -451,22 +570,107 @@ The decisions-register entry is not part of this FR; the completion ritual write
       `grep -rn 'Whatever the mapping' src/log_foundry/sinks/`,
       `grep -rn 'Whatever the predicate' src/log_foundry/sinks/` and
       `grep -rn 'Whatever a caller' src/log_foundry/sinks/` finds anything.
-- [ ] `docs/invariants.md` §8 and §2 carry the restatements above, and §8's `Guarded:` line names
-      the test that asserts FR-001.
-- [ ] `docs/architecture.md` §6 and §8 are restated as above.
+- [ ] `read_losses`'s `Returns:` and `multi.py`'s `emit` and `losses` docstrings are restated, and
+      `grep -n 'left to report itself' src/log_foundry/sinks/multi.py` finds the phrase only inside
+      a struck-through, superseded passage naming SPEC-058.
+- [ ] The three SPEC-036 / register sites carry a struck-through passage and a superseded marker
+      naming SPEC-058 beside the old claim, and the old text is still readable.
+- [ ] The two named tests are rewritten, and a diff of `pytest --collect-only -q` names before and
+      after shows no other test removed or renamed.
+- [ ] `docs/invariants.md` §8, §2 and §7 carry the restatements above, and §8's `Guarded:` line
+      names the test that asserts FR-001.
+- [ ] `docs/architecture.md` §6 and §8 are restated as above, and `docs/decisions/event-assembly.md`'s
+      fence and entry are restated in place at completion.
 - [ ] `sh scripts/docs-lint.sh`, `poetry run python scripts/docstring-lint.py` and
       `sh scripts/spec-lint.sh` pass, and every test that asserts a docstring (`grep -rn '__doc__'
       tests/`) still passes.
 - [ ] `sinks/_socket.py` and `HTTPSink._drop_refused` are not edited (Out of Scope).
 - [ ] Serves invariant 8, which the invariants page's text and the docstrings must state alike.
 
+### FR-007: `MultiSink` counts every child raise it swallows, and counts only when it returns
+
+#### Description:
+
+`MultiSink.emit` is the third catcher of the Overview's principle. When a child raises and a sibling
+delivered, it returns normally and *swallows* the raise, so neither the worker nor the orphan path
+ever sees it. Today it counts the lost events only for a child that reports nothing
+(`read_losses(child) is None`, SPEC-036 FR-005) and trusts a reporting child to have counted its own
+loss before raising. That trust is what FR-002, FR-004 and FR-005 remove, because a deferring
+child raises having counted nothing — and a child that gained a count mid-run, like a wrapper after
+its first drop, silently changed category. The rule becomes:
+
+- **When a child raises and `MultiSink` returns normally**, it counts `len(batch)` events for that
+  child in its own private absorbed count, reported through `losses().failed`, for a reporting child
+  as well as a silent one. The count replaces the silent-only one.
+- **When every child raised and `MultiSink` re-raises the first, as today**, it counts no events:
+  the catcher above owns the batch. The public `failed` attribute — a count of child *calls* that
+  raised, which is not part of `losses()` — keeps moving per call exactly as today, and the
+  `_diag.absorbed` line per child raise is unchanged. This also ends a defect of the old rule: a
+  silent child was counted at catch time even when `MultiSink` went on to re-raise, so the worker's
+  retries counted the same batch once per attempt.
+- **`losses()` keeps its shape:** `None` only when no child reported and the absorbed count is zero;
+  otherwise the children's sum plus the absorbed count in `failed`.
+
+*A reversal, in part, of SPEC-036 FR-005.* That spec chose to leave a reporting child "to report
+itself", and its AC-2 recorded the opposite choice as 6 lost events reading 12 against a real
+`SyslogSink` on a closed port. This FR reverses the choice on purpose, because without it the
+deferral leaves an event in no term (the three models in the Overview). Two costs are accepted.
+`failed` over-counts when a reporting child had already counted failures before raising
+(`HTTPSink.failed` per abandoned chunk, `SQSSink`'s failed entries); `SinkLosses` documents `failed`
+as an upper bound. And for the sinks this spec does not yet defer (Out of Scope), a drop they
+counted before raising is also in `MultiSink`'s `failed` until the follow-up spec defers them:
+counted once in the exact term and once in the upper-bound term, never twice in `dropped`.
+
+#### Acceptance Criteria:
+
+- [ ] Model (a), through the worker: `MultiSink(HTTPSink(max_batch_bytes=2000, max_retries=0,
+      opener=500), MemorySink())` with one span carrying a 5,000-byte `info` reads
+      `health().sink.dropped == 0` and `health().sink.failed` equal to the `HTTPSink`'s own
+      `failed` plus 3 (today `(dropped=1, failed=1)`). Counting only for a silent child reddens it.
+- [ ] Model (b): `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())`, `fn` failing for
+      the first event only and the stream then breaking for the next nine, reads
+      `SinkLosses(dropped=1, failed=9)` (today `failed == 12`). Counting only for a silent child
+      reddens it, at `(1, 0)`.
+- [ ] Model (c): `MultiSink(TransformSink(HTTPSink(500, max_retries=0), fn), MemorySink())` where `fn`
+      fails for one of 30 events reads `SinkLosses(dropped=0, failed=<the HTTPSink's own failed> +
+      30)` (today `(0, 0)`) — the failed event among 30 in the absorbed term once. Counting only for
+      a silent child reddens it.
+- [ ] Every child raises: `MultiSink` re-raises the first child's exception (`is`), its absorbed
+      count and `losses()` are unchanged by the call, the public `failed` rises by one per child,
+      and one `_diag.absorbed` line per child is written. Committing the count at catch time rather
+      than at return reddens it.
+- [ ] Worker retry then success: attempt 1 has every child raise, attempt 2 has one child raise
+      while the sibling delivers; the batch is counted `len(batch)` events once, not twice. Counting
+      at catch time reddens it at twice.
+- [ ] Worker abandonment: every child raises on every attempt; `MultiSink`'s absorbed count is 0 and
+      the worker's abandon line is the only count of the batch.
+- [ ] Orphan path, a one-event batch: a child raises and the sibling delivers — `MultiSink` counts 1
+      and `orphan_lost == 0`; every child raises — `orphan_lost == 1` and `MultiSink` counts 0
+      (invariant 6).
+- [ ] Nested: `MultiSink(MultiSink(raising, delivering), delivering)` counts the batch once in the
+      inner absorbed count and none in the outer; `MultiSink(MultiSink(raising, raising),
+      delivering)` has the inner re-raise counting nothing and the outer count the batch once. Each
+      event is in exactly one absorbed count; an inner that counts before re-raising reddens it.
+- [ ] `losses()` shape: after one swallowed raise from a child that reports nothing, with no
+      reporting sibling, `losses() == SinkLosses(dropped=0, failed=len(batch))`, not `None`; a
+      fan-out that has lost nothing still reads `None`.
+- [ ] A silent dead child with a delivering sibling still reads one `failed` per lost event
+      (`MultiSink(QuietSink, DeadSink)`, three two-event batches, `failed == 6`): SPEC-036 FR-005
+      AC-1 holds.
+- [ ] A lost increment is impossible at a preemption point: a test-only seam parks one committing
+      thread between its read and its write of the absorbed count, a second `emit` commits while it
+      is parked, and after both resume the count is the sum of both batches. Removing the count's
+      lock reddens it with one batch missing.
+- [ ] `multi.py` takes its pending-then-commit from the one private helper FR-002 defines.
+- [ ] Serves invariants 2, 6 and 7.
+
 ---
 
 ## API / Interface Contract
 
 Nothing public changes. Constructors, `emit`, `flush` and `close` keep their signatures; the only
-observable additions are non-zero values in `losses().dropped` and the lines FR-002, FR-004 and
-FR-005 write.
+observable additions are non-zero values in `losses().dropped` and `losses().failed` and the lines
+FR-002, FR-004 and FR-005 write.
 
 ```
 # unchanged public signatures
@@ -478,14 +682,18 @@ TransformSink.losses() -> SinkLosses | None
 FilteringSink.losses() -> SinkLosses | None
     # None only if inner reports None AND the wrapper's own count is 0; else
     # SinkLosses(dropped=inner.dropped + own, failed=inner.failed), an inner None read as zeros
+MultiSink.losses() -> SinkLosses | None
+    # None only if no child reported AND the absorbed count is 0; else
+    # SinkLosses(dropped=sum(children.dropped), failed=sum(children.failed) + absorbed)
 
 # private, src/log_foundry/sanitize.py — the name is the implementation's; nothing is exported
 _coerce_unbounded(event: dict[str, object]) -> tuple[dict[str, object], bool]
-    # types-only coercion, no size ceiling; the flag is `truncated`
+    # types-only coercion: no configured ceiling, one fixed depth bound of 100; the flag is
+    # `truncated`; a hostile top-level mapping's exception propagates to the caller's guard
 
-# private, one definition shared by transform.py, filtering.py, sqs.py and http.py
+# private, one definition shared by transform.py, filtering.py, multi.py, sqs.py and http.py
 # the deferral rule: per-emit local pending drops, committed to the owner's own count and
-# announced once per batch, only after the emit is known not to raise
+# announced where the site announces, only after the emit is known not to raise
 ```
 
 ## File & Folder Structure
@@ -496,6 +704,8 @@ src/log_foundry/
 └── sinks/
     ├── transform.py            # FR-001, FR-002, FR-003, FR-006
     ├── filtering.py            # FR-002, FR-003, FR-006
+    ├── multi.py                # FR-007, FR-006 (superseded markers)
+    ├── base.py                 # FR-006 (read_losses docstring)
     ├── sqs.py                  # FR-004, FR-006
     ├── http.py                 # FR-005, FR-006
     ├── elasticsearch.py        # FR-005 (losses), FR-006
@@ -503,8 +713,13 @@ src/log_foundry/
     ├── clickhouse.py  postgres.py  syslog.py                 # FR-006 (_row / _frame docstring)
     └── <the deferral helper's home>                          # defined once; FR-002
 docs/
-├── invariants.md               # FR-006: §8 and §2's Recorded exceptions
-└── architecture.md             # FR-006: §6 and §8
+├── invariants.md               # FR-006: §8, §2's Recorded exceptions, §7's new one
+├── architecture.md             # FR-006: §6 and §8
+├── decisions/
+│   ├── sink-delivery.md        # FR-006: superseded marker on the MultiSink sentence
+│   └── event-assembly.md       # FR-006: fence and entry, restated at completion
+├── specs/SPEC-036-flush-and-buffer-visibility.md        # FR-006: superseded markers
+└── spec-delivery/SPEC-036-flush-and-buffer-visibility.md   # FR-006: superseded marker
 tests/                          # one group per FR, beside the existing per-sink test files
 ```
 
@@ -516,6 +731,9 @@ tests/                          # one group per FR, beside the existing per-sink
   `TransformSink` (FR-001).
 - The deferral helper, `TransformSink` and `FilteringSink` per-event failure under the ledger rule
   (FR-002), and their own drop counts through `losses()` (FR-003).
+- `MultiSink` counting every swallowed raise, only on return (FR-007). It lands in this phase,
+  before Phase 2 puts the deferring sinks live, so that no intermediate state leaves a reporting
+  child's loss in no term.
 
 ### Phase 2: Terminal sinks
 
@@ -525,18 +743,37 @@ tests/                          # one group per FR, beside the existing per-sink
 
 ### Phase 3: Prose
 
-- The docstrings, `docs/invariants.md` and `docs/architecture.md` sites FR-006 lists.
+- The docstrings, the superseded markers, `docs/invariants.md` and `docs/architecture.md` sites
+  FR-006 lists.
 
 ---
 
 ## Revision history
 
-- **2026-10-15 — first draft.** Written at `324936e`. Probes A, B and C were re-run against this
-  tree while drafting and reproduced the counts stated in the Overview; Probe D was first run
-  without `max_value_bytes=500_000` and counted nothing, because assembly clips a 300 KB string at
-  its 8 KB ceiling — the event is only oversized for SQS once the ceiling is raised, which is why
-  the probe states the setting. The 18-sink sweep and the 60-event corpus timing are carried from
-  the evidence behind the decisions rather than re-run here.
+- **2026-10-15 — first draft.** Written at `324936e`. Probes A, B and C were re-run by the author
+  against this tree while drafting and reproduced the counts stated in the Overview; Probe D was
+  first run without `max_value_bytes=500_000` and counted nothing, because assembly clips a 300 KB
+  string at its 8 KB ceiling — the event is only oversized for SQS once the ceiling is raised,
+  which is why the probe states the setting. The 60-event corpus and its timing were measured by
+  the orchestrating session at `324936e`, not by the author; the 18-sink sweep measured five sinks by
+  probe (SNS, Pub/Sub, Kafka, HTTP `_items`, Syslog UDP) and read the rest from code.
+- **2026-10-19 — spec review at `69dac4f`: one blocker, two majors, six minors.**
+  - *Blocker.* `MultiSink` swallows a reporting child's raise and counts only a silent child's, so
+    the deferral left an event in no term, and a wrapper turning "reporting" mid-run uncounted the
+    rest (models (a), (b), (c) in the Overview). The first draft's Twin paths section claimed the
+    opposite and was wrong for the unmodified tree too, as model (c) shows. Changed: the Overview
+    states the principle once; FR-007 added and `multi.py` brought into scope; FR-002, FR-003,
+    FR-004 and FR-005 each gained a `MultiSink` criterion; Twin paths corrected.
+  - *Depth.* The first draft asserted that a 20,000-deep result "passes the check" while saying no
+    `max_depth` applied; the unbounded pass cut it near depth 330, unmarked and by thread. FR-001
+    now has one fixed bound of 100 and asserts the marker.
+  - *Concurrency criterion.* The first draft's 16-thread count lost nothing against an unlocked
+    counter; FR-003 and FR-007 now assert at an injected preemption point.
+  - *Minors.* FR-002's two-call criterion now counts 1, not 2, after A raises; FR-004's id probe
+    is qualified as the id-failure line; the exception a failed coercion carries is decided in
+    FR-001; FR-006 gained `base.py`, `multi.py`, `event-assembly.md`, the SPEC-036 supersessions and
+    invariants §7; the provenance of the measurements is stated exactly (Overview and above); and
+    `docs/specs/INDEX.md` records the build-order note with SPEC-057.
 - **Considered and not taken:** running `sanitize_fields` over the whole event as the coercion.
   It is rejected on the reasoning in FR-001's description — it pushes `fields` one level deeper and
   clips a long stack to the value ceiling rather than the stack ceiling. No earlier draft or build
