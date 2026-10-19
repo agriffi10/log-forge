@@ -1,7 +1,7 @@
 # Spec: One Bad Event Costs Only Itself — Transform Output, Per-Event Callables and Retry-Safe Drop Counts
 
 **ID:** SPEC-058
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-10-19
 **Depends On:** SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036
 
