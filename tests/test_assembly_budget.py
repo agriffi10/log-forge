@@ -1081,8 +1081,8 @@ def test_an_int_subclass_cannot_divert_the_measure_of_its_own_size(
 ) -> None:
     """The integer charge, ceiling and key bound read the stored magnitude, never ``bit_length``.
 
-    The lying integer is ``1``, ahead of 2,500 references to one 8 KiB string, 20 MiB of text
-    against the 16 MiB budget. As a value it charges 1 after ``a``'s 1; as a key ``"1"`` it
+    The lying integer is ``1``, ahead of 2,500 references to one 8 KiB string, 20,480,000 bytes
+    of text against the 16 MiB budget. As a value it charges 1 after ``a``'s 1; as a key ``"1"`` it
     charges 1 and its value ``0`` another, so the head costs 2 or 3 and 2,047 strings
     (16,769,024 bytes) fit while the 2,048th crosses either way. A charge computed from a
     ``nan`` answer is ``nan``, which no comparison finds over the budget, so all 2,500 were

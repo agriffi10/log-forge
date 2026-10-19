@@ -63,7 +63,7 @@ integer value is charged against the byte budget, and the lower bound that decid
 integer key is rendered at all (SPEC-057 FR-002). Measured before it, at ``b282c1d``: an ``int``
 subclass whose own ``bit_length`` returned ``nan``, written ahead of 2,500 references to one
 8 KiB string, made the pass's running charge ``nan``, so every later test against the budget
-was false and all 2,500 were written, 20 MiB against a 16 MiB budget; one returning a negative
+was false and all 2,500 were written, 20,480,000 bytes against 16 MiB; one returning a negative
 number credited the budget instead. The unbound accessor reads the magnitude the object stores,
 and refuses with ``TypeError`` an object that only claims to be an ``int`` through
 ``__class__``. The same rule as :data:`_INT_LT` beside it and :data:`_FLOAT_REPR` below: what
