@@ -2,7 +2,7 @@
 
 **ID:** SPEC-057  
 **Status:** In Progress  
-**Last Updated:** 2026-10-07  
+**Last Updated:** 2026-10-19  
 **Depends On:** SPEC-017, SPEC-020, SPEC-055
 
 ## Overview
@@ -96,6 +96,24 @@ Stated here rather than left to be found.
   share that gap, and this spec does not close it.
 - **Neither budget adds module-level mutable state.** The library never rebinds the constants and
   the counters live on the pass object, so nothing is stranded across a fork (invariant 12).
+- **A container mapping key is rendered before any budget applies.** A key that is not a `str`,
+  `int` or `float` — a `tuple`, a `frozenset`, or anything a caller `Mapping` yields, which need
+  not even hash — is rendered by `str(key)`, the builtin `repr`, which recurses through shared
+  members once per path. A key built from a shared sub-structure is therefore still exponential on
+  the caller's thread: the DAG FR-001 bounds as a value is unbounded as a key, because the budgets
+  charge the text only once it exists. This is pre-existing at `324936e` and not regressed —
+  measured at `324936e` and at `b282c1d` — and is recorded as open in `architecture.md` §12, with
+  what would close it.
+- **The walk follows `merged`'s insertion order.** `build_event` coerces one mapping built from
+  config defaults, then span defaults, then baggage, then per-call fields, a key overridden later
+  keeping the position where it was first inserted. A default or a baggage value near either
+  budget therefore sacrifices the per-call fields after it. Every cut is marked.
+- **An integer key is rendered on the caller's thread.** Its exact charge is known only once it is
+  rendered, so it is first priced at a lower bound of its length (FR-002), and no key longer than
+  what is left of the byte budget, plus one digit, is rendered. At the interpreter's default
+  `sys.get_int_max_str_digits()` the integer ceiling already holds each key to at most 4,300
+  characters; with that limit lifted and `max_value_bytes` raised, one key can cost up to the
+  budget in digits, once per pass.
 
 ---
 
@@ -189,9 +207,14 @@ table under *Data Model*, in three classes:
   (`<unserializable: T>`, `<unserializable key: T>`) — is charged at the *larger* of its length in
   characters before clipping and its UTF-8 bytes after, because producing it was the work.
 - **An integer written as a value** is charged at the rendered length `integer()` estimates, digits
-  plus one for a sign (the estimate can overcount by one, which errs toward the cut). A key is
-  charged once, as the string it becomes, so an integer key is never charged both by `integer()` and
-  as a string.
+  plus one for a sign (the estimate can overcount by one, which errs toward the cut). The estimate
+  is computed from the unbound `int.bit_length`, never the value's own: a subclass's override
+  returning `nan` made the running charge `nan` and switched the budget off for the rest of the
+  pass. A key is charged once, as the string it becomes, so an integer key is never charged both by
+  `integer()` and as a string. An integer key is priced before it is rendered, because rendering is
+  the work: when a lower bound of its rendered length — the estimate less one, sign included —
+  already crosses the budget, it becomes `<size limit>` unrendered; otherwise it is rendered and
+  charged its actual length.
 
 Fixed placeholders (`<depth limit>`, `<circular>`, `<node limit>`, `<size limit>`, `<int: …>`,
 `<float: …>`), floats, bools and `None` are not charged; the node count bounds them.
@@ -282,6 +305,14 @@ bound the bytes and cut a 256 × 256 structure, and would diverge from SPEC-056.
       costs 1, so the crossing key is the 14th (`i = 13`) of the innermost mapping. The 13 earlier
       keys clip to one string `K` and collapse, so `fields["a"] == {K: {K: {K: 0, "<size limit>":
       "<size limit>"}}}`.
+- [ ] An `int` subclass whose own `bit_length` returns `nan`, or a negative number, written as a
+      value or as a key ahead of 2,500 references to one 8 KiB string, leaves exactly 2,047 strings
+      written and then `<size limit>`, marked, on both routes, and its `bit_length` is never
+      consulted.
+- [ ] With the budget patched small, an integer key whose lower bound already crosses is
+      `<size limit>` and never rendered, and one that fits exactly is rendered and written; `999`
+      (which the estimate overcounts), `-999` and `1000` pin the bound to the estimate less one,
+      sign included.
 - [ ] Each of the three hostile shapes above is run once against `main`'s `sanitize.py` on the terms
       of FR-001's third criterion, and the PR body names whether each failed by the alarm or by its
       assertion.
@@ -311,7 +342,9 @@ through its buffer: a subclass can override `__buffer__` (PEP 688), which makes 
 report another length and other bytes, while the unbound accessor reads what the object stores. It
 takes the first `max_value_bytes + 1` bytes, which is the whole value when it is shorter, because a
 slice past the end is clamped; no length is read. A `memoryview` cannot be subclassed, so it is read through its own
-view. One at or below the ceiling is read whole, as today. A longer one is read as whole rows up to
+view, once its exact type is confirmed: `isinstance` consults `__class__`, and an object that only
+claims to be a `memoryview` is a type-name placeholder, never read. One at or below the ceiling is
+read whole, as today. A longer one is read as whole rows up to
 the cut: cast to bytes and sliced where it is C-contiguous (a zero-dimensional view included),
 otherwise a first-dimension slice of enough rows to cover `max_value_bytes + 1` bytes, a row being
 one item for a one-dimensional view; then `bytes()`.
@@ -350,6 +383,9 @@ FR-002 bounds how often the pass does it. The `model.py` callers (`message`, `fu
 - [ ] A `bytes` subclass and a `bytearray` subclass whose `__bytes__`, `__buffer__` (reporting another
       length and other bytes), `__len__` and `__getitem__` each lie or raise, longer and shorter than
       the ceiling, are rendered from the bytes they store (the recorded exception).
+- [ ] An object claiming through `__class__` to be a `memoryview`, `bytes`, `bytearray`, `int` or
+      `str` becomes a type-name placeholder as a value, and a marked key placeholder as a key, and
+      none of its own accessors is read.
 - [ ] A non-contiguous two-dimensional view built from the standard library,
       `memoryview(buf).cast("B", shape=[2000, 14])[::2]` over a 28,000-byte buffer, renders
       byte-identically to the reference and is marked as today; so does `shape=[3, 10000]` with
@@ -446,7 +482,8 @@ What is charged against `_MAX_RENDERED_BYTES`:
 | `<depth limit>`, `<circular>`, `<node limit>`, `<size limit>`, `<int: …>`, `<float: …>`, finite float, `bool`, `None` | nothing |
 
 Order of checks on one value: node budget, `max_depth`, the type's rule (whose text or integer
-charge is the byte check). Order within a mapping entry: key rendered and charged, then value visited.
+charge is the byte check). Order within a mapping entry: key rendered and charged, then value visited;
+an integer key is first priced at a lower bound of its length, and not rendered when that crosses.
 
 ## API / Interface Contract
 

@@ -926,6 +926,19 @@ close it.
   drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
   library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
+- **A mapping key built from a shared sub-structure is rendered whole before any budget applies**
+  (SPEC-057, Accepted Limits; invariants 1 and 8). `_Coercer._key` renders a key that is not a
+  `str`, `int` or `float` by `str(key)`, so a `tuple` or `frozenset` key — or any key a caller
+  `Mapping` yields, which need not even hash — is rendered by the builtin `repr`, which recurses
+  through a shared member once per path. The DAG SPEC-057 FR-001 bounds as a value is unbounded as
+  a key: SPEC-057's budgets charge the text only once it exists, turning a long one into
+  `<size limit>` afterwards, so the work is unchanged rather than regressed. Measured on the
+  caller's thread with `f = frozenset({f, (f, i)})` applied 16, 18, 20 and 22 times, one key costs
+  0.04, 0.17, 0.69 and 2.83 s of CPU at `324936e` and 0.04, 0.16, 0.63 and 2.61 s at `b282c1d`,
+  doubling per level, which extrapolates to days at forty. **Closed by** pre-counting a
+  builtin-container key against the node budget before rendering it, a node per member per path
+  as the pass counts a value, or by rendering such a key as the `<unserializable key: T>`
+  placeholder.
 
 ### Resolved
 

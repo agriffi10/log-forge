@@ -55,6 +55,20 @@ _LOG10_2_NUM = 30103
 _LOG10_2_DEN = 100000
 
 _INT_LT = int.__lt__
+_INT_BIT_LENGTH = int.bit_length
+"""``int.bit_length``, unbound, so an ``int`` subclass cannot divert the measure of its own size.
+
+Every integer measurement here starts from it: the integer ceiling, the rendered length an
+integer value is charged against the byte budget, and the lower bound that decides whether an
+integer key is rendered at all (SPEC-057 FR-002). Measured before it, at ``b282c1d``: an ``int``
+subclass whose own ``bit_length`` returned ``nan``, written ahead of 2,500 references to one
+8 KiB string, made the pass's running charge ``nan``, so every later test against the budget
+was false and all 2,500 were written, 20 MiB against a 16 MiB budget; one returning a negative
+number credited the budget instead. The unbound accessor reads the magnitude the object stores,
+and refuses with ``TypeError`` an object that only claims to be an ``int`` through
+``__class__``. The same rule as :data:`_INT_LT` beside it and :data:`_FLOAT_REPR` below: what
+the library measures about a value must be computed by the library.
+"""
 _FLOAT_REPR = float.__repr__
 """``float.__repr__``, unbound, so a subclass cannot divert the placeholder's text.
 
@@ -502,6 +516,15 @@ class _Coercer:
         a first dimension. That is an accepted limit: a single row is read whole, so a view whose
         one row exceeds the ceiling costs that row.
 
+        The view is tested by its exact type before any of it is read, because ``isinstance``
+        consults ``__class__``, which any object may override: one claiming to be a
+        ``memoryview`` reached this branch, and its own ``nbytes`` and ``__bytes__`` chose how
+        much the library read and decoded — measured, a cached 16 MiB ``__bytes__`` behind an
+        ``nbytes`` of zero was decoded whole on every visit, the read FR-003 bounds. Such an
+        object is refused here and becomes a type-name placeholder. The two slices above refuse
+        an impostor of their own types on the same terms, since an unbound accessor applies only
+        to an instance of its type.
+
         Args:
           value: The bytes-like to read.
 
@@ -510,6 +533,8 @@ class _Coercer:
           it is shorter.
 
         Raises:
+          TypeError: When ``value`` only claims to be a ``bytes``, ``bytearray`` or
+            ``memoryview`` through ``__class__``; :meth:`value` is the guard.
           Exception: Whatever a released or exotic ``memoryview`` raises; :meth:`value` is the
             guard.
         """
@@ -518,6 +543,8 @@ class _Coercer:
             return _BYTES_SLICE(value, slice(0, limit))
         if isinstance(value, bytearray):
             return bytes(_BYTEARRAY_SLICE(value, slice(0, limit)))
+        if type(value) is not memoryview:
+            raise TypeError("not a memoryview")
         if value.nbytes < limit:
             return bytes(value)
         if value.c_contiguous:
@@ -632,11 +659,13 @@ class _Coercer:
     def key(self, key: object) -> str:
         """Coerces a mapping key to a bounded string, and is total (SPEC-055 FR-004).
 
-        Whatever the key's own ``__str__``, ``bit_length`` or ``__lt__`` raises is caught here
-        rather than in :meth:`value`, whose guard sits around the *enclosing* mapping: measured,
-        ``{"sib": 1, KeyBoom(): 2}`` reached the sink as ``<unserializable: dict>`` with
-        ``truncated`` unset, so one hostile key took every sibling with it — the exact outcome
-        the integer branch below was written to prevent for one kind of key. The key becomes a
+        Whatever rendering the key raises — its own ``__str__``, or an unbound accessor refusing
+        an object that only claims through ``__class__`` to be an ``int`` or a ``str`` — is
+        caught here rather than in :meth:`value`, whose guard sits around the *enclosing*
+        mapping: measured, ``{"sib": 1, KeyBoom(): 2}`` reached the sink as
+        ``<unserializable: dict>`` with ``truncated`` unset, so one hostile key took every
+        sibling with it — the exact outcome the integer branch below was written to prevent for
+        one kind of key. The key becomes a
         ``<unserializable key: T>`` placeholder naming its type, on :meth:`_placeholder`'s
         no-``repr`` rule, and ``truncated`` is set: a value placeholder is visible on its own,
         but a key that could not be rendered is a substitution the reader must be told about.
@@ -678,6 +707,21 @@ class _Coercer:
         go through :meth:`integer`, which charges an integer *value*: a key is charged once, as
         the string it becomes, so an integer key is never charged twice (SPEC-057 FR-002).
 
+        An integer key that will render as its digits is priced before it is rendered, because
+        rendering is the work: ``str()`` of an integer costs more than its length, and with the
+        interpreter's digit limit lifted a key of seventeen million digits was rendered in full
+        and only then became ``<size limit>``. The pass's charge is tested against a lower bound
+        of the rendered length, one less than :meth:`_bounded_int`'s estimate, sign included;
+        when even that crosses, the key becomes ``<size limit>`` unrendered and the pass halts,
+        as it does when a rendered key crosses. Otherwise the key is rendered and charged its
+        actual length, as before, so the charge stays exact. It is a true lower bound because the
+        estimate overcounts by at most one digit below about 48 million digits — its ratio,
+        30103/100000, exceeds ``log10(2)`` by under 5e-9, too little to add a second digit
+        before then — and the byte budget admits no key that long. It bounds the integer's own
+        digits, while ``str()`` of a subclass is the subclass's ``__str__``: one that renders
+        shorter than its digits can be cut where its text would have fitted, which errs toward
+        the cut.
+
         A float key goes through :meth:`real` for the same reason. Its rendered form is short —
         ``real`` computes its placeholder through :data:`_FLOAT_REPR` — but it is still text this
         pass produced, so it is charged as such. A ``str`` key is the caller's own text and goes
@@ -696,7 +740,10 @@ class _Coercer:
         if isinstance(key, str):
             return self.text(key)
         if isinstance(key, int) and not isinstance(key, bool):
-            rendered, _ = self._bounded_int(key)
+            rendered, length = self._bounded_int(key)
+            if length is not None and self._charged + length - 1 > self._max_bytes:
+                self._halt(_SIZE_LIMIT)
+                return _SIZE_LIMIT
             return self.produced(rendered if isinstance(rendered, str) else str(rendered))
         if isinstance(key, float):
             replaced = self.real(key)
@@ -719,10 +766,12 @@ class _Coercer:
         with it.
 
         An over-long integer is replaced, not clipped, because dropping digits would silently
-        change the value and a wrong number is worse than a visibly elided one. The bound
-        trusts ``bit_length()``: a subclass that overrides it to understate its own magnitude
-        defeats this and nothing here can tell, which is the same trust every coercion rule
-        extends to a subclass's dunders.
+        change the value and a wrong number is worse than a visibly elided one. The magnitude
+        is read through :data:`_INT_BIT_LENGTH`, never the value's own ``bit_length``: a
+        subclass's override once chose the size the bound tested, so one understating its
+        magnitude passed the ceiling and one returning ``nan`` was named a ``nan``-digit
+        placeholder, and the rendered length returned here is now also the lower bound that
+        decides whether :meth:`_key` renders the key at all (SPEC-057).
 
         Args:
           value: The integer to bound.
@@ -734,7 +783,7 @@ class _Coercer:
         Raises:
           None.
         """
-        digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
+        digits = _INT_BIT_LENGTH(value) * _LOG10_2_NUM // _LOG10_2_DEN + 1
         rendered = digits + 1 if _INT_LT(value, 0) else digits
         if rendered <= self._int_ceiling:
             return value, rendered
@@ -752,6 +801,11 @@ class _Coercer:
         digit, which errs toward the cut. A placeholder is charged nothing, like every fixed
         placeholder, since the node budget bounds those.
 
+        The charge is computed from the magnitude, so the magnitude is read through
+        :data:`_INT_BIT_LENGTH`, never the value's own ``bit_length``: a subclass's override
+        returning ``nan`` made the running charge ``nan`` and switched the byte budget off for
+        the rest of the pass, and one returning a negative number credited it.
+
         Args:
           value: The integer to bound.
 
@@ -762,7 +816,7 @@ class _Coercer:
         Raises:
           None.
         """
-        digits = value.bit_length() * _LOG10_2_NUM // _LOG10_2_DEN + 1
+        digits = _INT_BIT_LENGTH(value) * _LOG10_2_NUM // _LOG10_2_DEN + 1
         rendered = digits + 1 if _INT_LT(value, 0) else digits
         if rendered > self._int_ceiling:
             self.truncated = True

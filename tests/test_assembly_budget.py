@@ -1052,6 +1052,220 @@ def test_the_caller_texts_are_as_long_as_the_table_says() -> None:
     assert len(TRUNCATION_MARKER.encode("utf-8")) == 14
 
 
+# -- what the pass measures, the library computes: no subclass or impostor diverts it ----------
+
+_BITS_ASKED: list[str] = []
+
+
+class _NanBits(int):
+    """An ``int`` whose own ``bit_length`` answers ``nan``, recording that it was asked."""
+
+    def bit_length(self) -> int:
+        _BITS_ASKED.append("nan")
+        return float("nan")  # type: ignore[return-value]
+
+
+class _NegativeBits(int):
+    """An ``int`` whose own ``bit_length`` answers a large negative number."""
+
+    def bit_length(self) -> int:
+        _BITS_ASKED.append("negative")
+        return -(10**12)
+
+
+@pytest.mark.parametrize("lie", [_NanBits, _NegativeBits], ids=["nan", "negative"])
+@pytest.mark.parametrize("site", ["value", "key"])
+@pytest.mark.parametrize("route", _ROUTES)
+def test_an_int_subclass_cannot_divert_the_measure_of_its_own_size(
+    route: str, site: str, lie: type[int]
+) -> None:
+    """The integer charge, ceiling and key bound read the stored magnitude, never ``bit_length``.
+
+    The lying integer is ``1``, ahead of 2,500 references to one 8 KiB string, 20 MiB of text
+    against the 16 MiB budget. As a value it charges 1 after ``a``'s 1; as a key ``"1"`` it
+    charges 1 and its value ``0`` another, so the head costs 2 or 3 and 2,047 strings
+    (16,769,024 bytes) fit while the 2,048th crosses either way. A charge computed from a
+    ``nan`` answer is ``nan``, which no comparison finds over the budget, so all 2,500 were
+    written; a negative answer credited the budget. On the key path the same lie named the key
+    ``<int: ~nan digits>``, or slipped a negative length past the ceiling and the key's
+    pre-render bound, so there the consultation itself, and the key's rendering, are the
+    evidence.
+    """
+    number = lie(1)
+    head: object = number if site == "value" else {number: 0}
+    sink = _configure()
+    _BITS_ASKED.clear()
+    event = _emit(route, {"a": [head, *([[_S] * 250] * 10)]}, sink)
+    asked = list(_BITS_ASKED)
+    assert asked == [], f"the subclass's own bit_length was consulted: {asked}"
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    out = fields["a"]
+    assert out[0] == (1 if site == "value" else {"1": 0})
+    written = list(_leaves(out[1:]))
+    strings = sum(1 for leaf in written if leaf == _S)
+    assert strings == 2047, f"{strings} strings were written before the cut, not 2,047"
+    assert written == [_S] * 2047 + [_SIZE_LIMIT]
+    assert event.get("truncated") is True
+
+
+_RENDERED: list[str] = []
+
+
+class _RecordingInt(int):
+    """An ``int`` key that records each time it is rendered, and renders as its own digits."""
+
+    def __str__(self) -> str:
+        _RENDERED.append("__str__")
+        return int.__repr__(self)
+
+    def __repr__(self) -> str:
+        _RENDERED.append("__repr__")
+        return int.__repr__(self)
+
+
+class _KeyBound(NamedTuple):
+    """One integer key priced before rendering: its text, and the budgets either side."""
+
+    id: str
+    key: int
+    text: str
+    budget: int
+    rendered: bool
+    fits: bool
+
+
+_KEY_BOUNDS: list[_KeyBound] = [
+    _KeyBound("overcounted-fits-exactly", 999, "999", 4, True, True),
+    _KeyBound("overcounted-lower-bound-crosses", 999, "999", 3, False, False),
+    _KeyBound("negative-fits-exactly", -999, "-999", 5, True, True),
+    _KeyBound("negative-lower-bound-crosses", -999, "-999", 4, False, False),
+    _KeyBound("exact-fits-exactly", 1000, "1000", 5, True, True),
+    _KeyBound("exact-lower-bound-fits-but-key-crosses", 1000, "1000", 4, True, False),
+]
+
+
+@pytest.mark.parametrize("case", _KEY_BOUNDS, ids=[case.id for case in _KEY_BOUNDS])
+def test_an_integer_key_is_priced_before_it_is_rendered(
+    monkeypatch: pytest.MonkeyPatch, case: _KeyBound
+) -> None:
+    """A key whose lower bound crosses is never rendered; one that fits is charged exactly.
+
+    ``999`` has ten bits, which the estimate prices at four digits; it renders in three, so its
+    lower bound is three and the key fits a budget of ``a``'s 1 plus 3 exactly. ``-999`` is the
+    same plus a sign. ``1000`` also has ten bits and renders in all four, so at a budget of 4
+    its lower bound fits, it is rendered, and only its actual charge crosses. A bound taken as
+    the estimate itself would cut the overcounted keys where they fit and leave ``1000``
+    unrendered; one without the sign would render ``-999`` where it cannot fit; no bound at all
+    renders every key that crosses.
+    """
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", case.budget)
+    _RENDERED.clear()
+    fields, flag = sanitize_fields({"a": {_RecordingInt(case.key): None}}, cfg=Config())
+    rendered = list(_RENDERED)
+    assert rendered == (["__str__"] if case.rendered else []), f"renders: {rendered}"
+    if case.fits:
+        assert fields == {"a": {case.text: None}}
+        assert flag is False
+    else:
+        assert fields == {"a": {_SIZE_LIMIT: _SIZE_LIMIT}}
+        assert flag is True
+
+
+def test_the_key_bounds_are_as_the_table_says() -> None:
+    """The per-key test's premise, measured with the standard library rather than with ``src``."""
+    assert (999).bit_length() == (1000).bit_length() == (-999).bit_length() == 10
+    for case in _KEY_BOUNDS:
+        assert str(case.key) == case.text, case.id
+        assert (1 + len(case.text) <= case.budget) is case.fits, case.id
+
+
+_READS: list[str] = []
+
+
+class _Posing:
+    """Claims another type through ``__class__``, and records every read a branch makes of it.
+
+    ``isinstance`` consults ``__class__``, so this reaches the claimed type's branch; each of
+    the claimed types' own accessors answers a plausible lie, so a branch that reads the object
+    instead of refusing it shows up as a read, and the memoryview's lies are the ones that made
+    the library decode a whole cached buffer on every visit.
+    """
+
+    claimed: type = object
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return self.claimed
+
+    @property
+    def nbytes(self) -> int:
+        _READS.append("nbytes")
+        return 0
+
+    def __bytes__(self) -> bytes:
+        _READS.append("__bytes__")
+        return b"x" * 20_000
+
+    def bit_length(self) -> int:
+        _READS.append("bit_length")
+        return 3
+
+    def __len__(self) -> int:
+        _READS.append("__len__")
+        return 3
+
+    def __getitem__(self, key: object) -> object:
+        _READS.append("__getitem__")
+        return "LIE"
+
+    def __str__(self) -> str:
+        _READS.append("__str__")
+        return "LIE"
+
+    def __getattr__(self, name: str) -> object:
+        _READS.append(name)
+        raise AttributeError(name)
+
+
+@pytest.mark.parametrize(
+    ("claimed", "slot"),
+    [
+        (memoryview, "value"),
+        (bytes, "value"),
+        (bytearray, "value"),
+        (int, "value"),
+        (int, "key"),
+        (str, "value"),
+        (str, "key"),
+    ],
+    ids=["memoryview", "bytes", "bytearray", "int", "int-key", "str", "str-key"],
+)
+def test_an_impostor_is_refused_before_any_of_it_is_read(claimed: type, slot: str) -> None:
+    """An object claiming a measured type through ``__class__`` is a placeholder, never read.
+
+    The memoryview branch read the impostor's own ``nbytes`` and ``__bytes__``, and the integer
+    branches its own ``bit_length``, before this; the bytes, bytearray and str branches already
+    refused one through their unbound accessors, and are here so the claim stays true of all of
+    them.
+    """
+    posing = type("_PosingAs" + claimed.__name__, (_Posing,), {"claimed": claimed})()
+    assert isinstance(posing, claimed), "the premise: isinstance believes the claim"
+    _READS.clear()
+    fields, flag = sanitize_fields(
+        {"a": posing} if slot == "value" else {"a": {posing: 0}}, cfg=Config()
+    )
+    reads = list(_READS)
+    assert reads == [], f"the impostor was read: {reads}"
+    name = type(posing).__name__
+    if slot == "value":
+        assert fields == {"a": f"<unserializable: {name}>"}
+        assert flag is False
+    else:
+        assert fields == {"a": {f"<unserializable key: {name}>": 0}}
+        assert flag is True
+
+
 def test_the_budgets_add_no_public_name() -> None:
     """FR-001 AC10: both budgets and both placeholders stay private."""
     assert sanitize.__all__ == [
