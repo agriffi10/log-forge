@@ -2,7 +2,7 @@
 
 **ID:** SPEC-058
 **Status:** In Progress
-**Last Updated:** 2026-10-19
+**Last Updated:** 2026-10-21
 **Depends On:** SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036
 
 ## Overview
@@ -61,9 +61,14 @@ reviewer and re-run by the author from its probe scripts.
   with one 5,000-byte `info` reads `SinkLosses(dropped=1, failed=1)` today and `(dropped=0,
   failed=1)` under FR-005's rule — the oversized event in no term; *(b)*
   `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())`, where `fn` fails for one
-  event and the stream then breaks for the next nine, reads `failed == 12` today through the
-  silent-child count and `(dropped=1, failed=0)` under FR-003 — the first counted failure makes the
-  wrapper "reporting", so the nine are counted nowhere, a regression of SPEC-036 FR-005. And
+  event and the stream then breaks for the next nine — over **four direct three-event batches** (one
+  span's shape each), `fn` failing on the first event of the first batch and the stream accepting
+  that batch's two forwarded lines, then raising on every later write — reads `failed == 12` today
+  through the silent-child count and `(dropped=1, failed=0)` under FR-003: the first counted
+  failure makes the wrapper "reporting", so the nine are counted nowhere, a regression of SPEC-036
+  FR-005. The shape matters: with one-event batches the failing event is a whole batch (FR-002's
+  all-failed case), so the wrapper's exact term would be 0 and the event would sit in the absorbed
+  term instead. And
   *(c)*, with no spec applied at all:
   `MultiSink(TransformSink(HTTPSink(500, max_retries=0), fn), MemorySink())` where `fn` fails for
   one event among 30 reads `SinkLosses(dropped=0, failed=0)` today — the whole
@@ -232,8 +237,10 @@ size ceilings do not bound what a transform adds — FR-006 records that on inva
       check raises `RecursionError`, reaches the inner sink with 99 intact levels below `fields` and
       `<depth limit>` as the value reached after 100 steps, `truncated: True`, and no
       `RecursionError` escaping `emit`; the output is equal when produced on the drain thread, on
-      the main thread via the orphan path, and in a thread with a small stack. Lifting the bound
-      (an unbounded pass) reddens it, because the cut then falls near depth 330 and varies by thread.
+      the main thread via the orphan path, and in a thread with a 4 MiB stack
+      (`threading.stack_size(4 * 1024 * 1024)`), where the check raises `RecursionError` rather
+      than killing the process (see the Known Constraint in FR-006). Lifting the bound (an
+      unbounded pass) reddens it, because the cut then falls near depth 330 and varies by thread.
 - [ ] A `dict` subclass result whose `items()` raises `KeyError`, as the only event: `emit` raises a
       `KeyError`, the inner `emit` is not called, and nothing is counted; as one event of several it
       is dropped under FR-002 and the line names `KeyError`, not a wrapper-made type.
@@ -332,7 +339,10 @@ are implementation detail the criteria do not bind.
       in the absorbed term once (FR-007); with an `inner` that succeeds, the wrapper counts 1 and
       `MultiSink.losses() == SinkLosses(dropped=1, failed=0)`.
 - [ ] `transform.py`, `filtering.py`, `multi.py`, `sqs.py` and `http.py` take their deferral from the
-      one private helper; none defines its own accumulate-then-commit state.
+      one private helper, and an AST check refuses a second accumulate-then-commit in any of them:
+      `tests/test_deferral.py::test_every_deferring_site_takes_the_one_helper`, with a fixture
+      corpus (`::test_the_deferral_lint_reports_what_it_claims_to`) asserting its failure text,
+      the silent cases included. Deleting each of its checks in turn reddens the matching corpus case.
 - [ ] Serves invariants 2, 7 and 11, and invariant 6 on both delivery paths.
 
 ### FR-003: Each wrapper reports its own drops through `losses()`
@@ -373,9 +383,11 @@ counted.
       `emit` commits while it is parked, and after both resume the count is 2. Removing the count's
       lock reddens it at 1. A plain 16-thread hammer is not the criterion: an unlocked counter lost
       nothing in 3.2 million increments under 16 threads on 3.13.
-- [ ] A wrapper turning from silent to reporting mid-run loses nothing under a fan-out (model (b)):
+- [ ] A wrapper turning from silent to reporting mid-run loses nothing under a fan-out (model (b)),
+      over four direct three-event `MultiSink.emit` calls:
       `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())` with `fn` failing for the
-      first event only and the stream then breaking for the next nine events reads
+      first event of the first batch only and the stream accepting that batch's two forwarded lines
+      then raising on every later write reads
       `health().sink == SinkLosses(dropped=1, failed=9)` — one event in the wrapper's exact term,
       nine in `MultiSink`'s absorbed term (FR-007), where today it reads `failed == 12` and the
       wrapper's first count alone would read `(1, 0)`.
@@ -437,7 +449,8 @@ callables are never consulted, and only the oversize deferral applies.
       (its `emit` raised `SinkDeliveryError`), the sibling delivers, and `MultiSink.losses()` has
       `dropped == 0` and `failed` equal to the `SQSSink`'s own `failed` plus 4 — the id-failed event
       in the absorbed term once (FR-007).
-- [ ] The deferral is the helper FR-002 defines, not a second copy.
+- [ ] The deferral is the helper FR-002 defines, not a second copy: the AST check FR-002 names
+      covers this file.
 - [ ] Serves invariants 2, 7 and 11, and invariant 6 on both delivery paths.
 
 ### FR-005: `HTTPSink` renders per event, and counts what it dropped only when `emit` returns
@@ -497,7 +510,8 @@ one event.
       `health().sink.failed` equals the `HTTPSink`'s own `failed` plus 3, the batch's length — the
       oversized event in the absorbed term once, where today it reads `(dropped=1, failed=1)` and
       FR-005's rule alone would read `(0, 1)`, the event in no term.
-- [ ] The deferral is the helper FR-002 defines, not a second copy.
+- [ ] The deferral is the helper FR-002 defines, not a second copy: the AST check FR-002 names
+      covers this file.
 - [ ] Serves invariants 2, 7, 8 and 11, and invariant 6 on both delivery paths.
 
 ### FR-006: Every claim the above made false or incomplete is restated, and a reversed one is marked where it stands
@@ -536,10 +550,16 @@ was repeated. The sites, by path:
   `docs/spec-delivery/SPEC-036-flush-and-buffer-visibility.md` (its FR-005 line) and the sentence
   "A `MultiSink` child that reports nothing is charged to the fan-out in **events**" in the entry
   "A sink that delivered nothing raises; one that delivered something reports" in
-  `docs/decisions/sink-delivery.md`. The two tests that pin the reversed clause,
-  `tests/test_sink_losses.py::test_the_aggregate_does_not_double_count_a_reporting_child` and
-  `::test_a_child_that_gains_losses_is_categorised_at_the_time_of_each_failure`, change meaning and
-  are rewritten.
+  `docs/decisions/sink-delivery.md`. Four tests in `tests/test_sink_losses.py` pin or sit beside
+  the reversed clause. A measured run with FR-007's rule prototyped at `7042810` failed exactly
+  three, which flip and are rewritten:
+  `test_the_aggregate_does_not_double_count_a_reporting_child` (8 → 12),
+  `test_a_reporting_child_that_fails_is_never_charged_twice` (3 → 6) and
+  `test_a_reporting_child_that_does_not_self_count_stays_invisible` ((0,0) → (0,2)). The fourth,
+  `test_a_child_that_gains_losses_is_categorised_at_the_time_of_each_failure`, stays green (3, then
+  4) but its docstring states the per-call categorisation FR-007 retires, so it is restated. The two
+  whose names state the reversed claim — `..._is_never_charged_twice` and `..._stays_invisible` —
+  may be renamed to state the new one.
 - **`docs/invariants.md` §8:** the premise reads as holding at assembly *and* at a transform's
   coercion, and a Recorded exception says the ceilings bound the values of an assembled event and do
   not bound what a transform adds. **§2's Recorded exceptions:** its count of losses counted but
@@ -551,7 +571,15 @@ was repeated. The sites, by path:
 - **`docs/architecture.md`:** §6's statement that one pass at assembly is correct by consequence for
   every `json.dumps` call site; and §8's "three cases where nothing landed and the sink still must
   not raise", which gains the unrenderable event, FR-002's "one failure, the rest deliberately
-  dropped" and FR-004's "id failure plus an oversized event".
+  dropped" and FR-004's "id failure plus an oversized event". §13's **Known constraints** gains
+  one entry: a transform output nested deeper than the C stack allows can crash the process in
+  `json.dumps` on a thread whose stack the caller set small — measured by the implementation
+  planner on macOS at `7042810`: SIGBUS on a 1 MiB thread on 3.13.1, `RecursionError` at 2 MiB and
+  4 MiB, and `RecursionError` even at 256 KiB on 3.12.12. FR-001's check adds that `json.dumps` in
+  front of inner sinks that never serialized (`MemorySink`, `CallbackSink`, `LoggingSink`), but the
+  same output already crashes every JSON sink's own `json.dumps` today, and assembly bounds
+  library-built events at `max_depth`, so only a transform can produce one. It is a limit of
+  invariant 1's reach, since a process-killing signal is not an exception any guard catches.
 - **`docs/decisions/event-assembly.md`:** the fence and the entry "An event is safe by construction
   — coerced and bounded once at assembly, not per sink". FR-001 now coerces at a transform, for
   type only, so "once, at assembly" is incomplete. It is listed here so the claim has an owner and is
@@ -575,12 +603,15 @@ The decisions-register entry *for this spec* is not part of this FR; the complet
       a struck-through, superseded passage naming SPEC-058.
 - [ ] The three SPEC-036 / register sites carry a struck-through passage and a superseded marker
       naming SPEC-058 beside the old claim, and the old text is still readable.
-- [ ] The two named tests are rewritten, and a diff of `pytest --collect-only -q` names before and
-      after shows no other test removed or renamed.
+- [ ] The three flipping tests are rewritten to the figures above and the fourth is restated. A
+      diff of `pytest --collect-only -q` names before and after shows no test removed, and no test
+      renamed except `..._is_never_charged_twice` and `..._stays_invisible`; every other test keeps
+      its name.
 - [ ] `docs/invariants.md` §8, §2 and §7 carry the restatements above, and §8's `Guarded:` line
       names the test that asserts FR-001.
-- [ ] `docs/architecture.md` §6 and §8 are restated as above, and `docs/decisions/event-assembly.md`'s
-      fence and entry are restated in place at completion.
+- [ ] `docs/architecture.md` §6 and §8 are restated as above, §13's Known constraints carries the
+      stack-depth entry with its measurement anchored to `7042810` and its platform, and
+      `docs/decisions/event-assembly.md`'s fence and entry are restated in place at completion.
 - [ ] `sh scripts/docs-lint.sh`, `poetry run python scripts/docstring-lint.py` and
       `sh scripts/spec-lint.sh` pass, and every test that asserts a docstring (`grep -rn '__doc__'
       tests/`) still passes.
@@ -627,21 +658,24 @@ counted once in the exact term and once in the upper-bound term, never twice in 
       opener=500), MemorySink())` with one span carrying a 5,000-byte `info` reads
       `health().sink.dropped == 0` and `health().sink.failed` equal to the `HTTPSink`'s own
       `failed` plus 3 (today `(dropped=1, failed=1)`). Counting only for a silent child reddens it.
-- [ ] Model (b): `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())`, `fn` failing for
-      the first event only and the stream then breaking for the next nine, reads
-      `SinkLosses(dropped=1, failed=9)` (today `failed == 12`). Counting only for a silent child
-      reddens it, at `(1, 0)`.
+- [ ] Model (b), over four direct three-event `MultiSink.emit` calls:
+      `MultiSink(TransformSink(StdoutSink(stream), fn), MemorySink())`, `fn` failing for the first
+      event of the first batch only and the stream accepting that batch's two forwarded lines then
+      raising on every later write, reads `SinkLosses(dropped=1, failed=9)` (today `failed == 12`).
+      Counting only for a silent child reddens it, at `(1, 0)`.
 - [ ] Model (c): `MultiSink(TransformSink(HTTPSink(500, max_retries=0), fn), MemorySink())` where `fn`
       fails for one of 30 events reads `SinkLosses(dropped=0, failed=<the HTTPSink's own failed> +
       30)` (today `(0, 0)`) — the failed event among 30 in the absorbed term once. Counting only for
       a silent child reddens it.
 - [ ] Every child raises: `MultiSink` re-raises the first child's exception (`is`), its absorbed
-      count and `losses()` are unchanged by the call, the public `failed` rises by one per child,
-      and one `_diag.absorbed` line per child is written. Committing the count at catch time rather
+      count is unchanged by the call and — with children that count nothing themselves — so is
+      `losses()`, the public `failed` rises by one per child, and one `_diag.absorbed` line per
+      child is written. Committing the count at catch time rather
       than at return reddens it.
-- [ ] Worker retry then success: attempt 1 has every child raise, attempt 2 has one child raise
-      while the sibling delivers; the batch is counted `len(batch)` events once, not twice. Counting
-      at catch time reddens it at twice.
+- [ ] Worker retry then success: attempt 1 has both children raise, attempt 2 has one child raise
+      while the sibling delivers; the batch is counted `len(batch)` events once, not once per
+      catch. Counting at catch time reddens it at `3 * len(batch)` — the first attempt's two
+      catches and the second's one.
 - [ ] Worker abandonment: every child raises on every attempt; `MultiSink`'s absorbed count is 0 and
       the worker's abandon line is the only count of the batch.
 - [ ] Orphan path, a one-event batch: a child raises and the sibling delivers — `MultiSink` counts 1
@@ -661,7 +695,8 @@ counted once in the exact term and once in the upper-bound term, never twice in 
       thread between its read and its write of the absorbed count, a second `emit` commits while it
       is parked, and after both resume the count is the sum of both batches. Removing the count's
       lock reddens it with one batch missing.
-- [ ] `multi.py` takes its pending-then-commit from the one private helper FR-002 defines.
+- [ ] `multi.py` takes its pending-then-commit from the one private helper FR-002 defines: the AST
+      check FR-002 names covers this file.
 - [ ] Serves invariants 2, 6 and 7.
 
 ---
@@ -774,6 +809,13 @@ tests/                          # one group per FR, beside the existing per-sink
     FR-001; FR-006 gained `base.py`, `multi.py`, `event-assembly.md`, the SPEC-036 supersessions and
     invariants §7; the provenance of the measurements is stated exactly (Overview and above); and
     `docs/specs/INDEX.md` records the build-order note with SPEC-057.
+- **2026-10-21 — six amendments found by the implementation plan at `7042810`.** FR-006 names
+  all four `MultiSink`-loss tests (three flip, one is restated) and lets the two whose names state
+  the reversed claim be renamed; model (b) names its batch shape in the Overview, FR-003 and FR-007;
+  FR-007's catch-time mutant reddens at three times, not twice; its all-raise `losses()` claim is
+  qualified to children that count nothing; FR-001's small stack is 4 MiB and FR-006 records the
+  deeper-nest crash as a Known Constraint; and the "one helper" criteria name the AST check that
+  can fail.
 - **Considered and not taken:** running `sanitize_fields` over the whole event as the coercion.
   It is rejected on the reasoning in FR-001's description — it pushes `fields` one level deeper and
   clips a long stack to the value ceiling rather than the stack ceiling. No earlier draft or build
