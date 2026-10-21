@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -157,6 +158,7 @@ class SQSSink:
         self.message_deduplication_id = message_deduplication_id
         self.dropped_oversized = 0
         self.failed = 0
+        self._id_failed = 0
         self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
@@ -174,7 +176,9 @@ class SQSSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._id_failed, failed=self.failed
+            )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks the batch to SQS limits and sends each chunk (FR-001, FR-002).
@@ -200,13 +204,14 @@ class SQSSink:
         """
         chunks = delivered = 0
         recoverable_loss = False
-        for chunk in self._chunks(batch):
-            chunks += 1
-            accepted, retryable_lost = self._send(chunk)
-            delivered += accepted
-            recoverable_loss = recoverable_loss or retryable_lost
-        if chunks and not delivered and recoverable_loss:
-            raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
+        with Deferral(self) as pending:
+            for chunk in self._chunks(batch, pending):
+                chunks += 1
+                accepted, retryable_lost = self._send(chunk)
+                delivered += accepted
+                recoverable_loss = recoverable_loss or retryable_lost
+            if chunks and not delivered and recoverable_loss:
+                raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-005).
@@ -271,7 +276,9 @@ class SQSSink:
 
         return new_log_id()
 
-    def _chunks(self, batch: list[dict[str, object]]) -> list[list[_Prepared]]:
+    def _chunks(
+        self, batch: list[dict[str, object]], pending: Deferral
+    ) -> list[list[_Prepared]]:
         """Splits the batch into sends within both the entry-count and byte limits.
 
         Each event is serialized once, and on a FIFO queue its ids are resolved once here too
@@ -284,6 +291,8 @@ class SQSSink:
 
         Args:
           batch: The events to split.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise (SPEC-058 FR-004).
 
         Returns:
           The chunks, each valid for one request.
@@ -294,23 +303,25 @@ class SQSSink:
         chunks: list[list[_Prepared]] = []
         current: list[_Prepared] = []
         current_bytes = 0
+        oversized: list[int] = []
+        failures = 0
+        first: Exception | None = None
         for event in batch:
             body = json.dumps(event)
             size = len(body.encode("utf-8"))
             group_id: str | None = None
             dedup_id: str | None = None
             if self.fifo:
-                group_id = self._group_id(event)
-                dedup_id = self._dedup_id(event)
+                try:
+                    group_id = self._group_id(event)
+                    dedup_id = self._dedup_id(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
                 size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if size > self.MAX_BYTES:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost(
-                    "event",
-                    1,
-                    f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
-                )
+                oversized.append(size)
                 continue
             if current and (
                 len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
@@ -322,7 +333,41 @@ class SQSSink:
             current_bytes += size
         if current:
             chunks.append(current)
+        if first is not None:
+            if not chunks and not oversized:
+                raise first
+            kind = type(first).__name__
+            pending.count("_id_failed", failures)
+            pending.announce(
+                lambda: _diag.lost("event", failures, f"SQSSink, a FIFO id callable raised {kind}")
+            )
+        if oversized:
+            pending.count("dropped_oversized", len(oversized))
+            pending.announce(lambda: self._announce_oversized(oversized))
         return chunks
+
+    def _announce_oversized(self, sizes: list[int]) -> None:
+        """Writes one line per event dropped for exceeding the message limit (FR-004).
+
+        One line per event is today's shape, kept on purpose; what SPEC-058 FR-004 changed is
+        only *when* the lines are written — through the calling ``emit``'s deferral, after the
+        count, and only when that ``emit`` returned normally.
+
+        Args:
+          sizes: The costed size of each dropped event, in the order they were met.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for size in sizes:
+            _diag.lost(
+                "event",
+                1,
+                f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
+            )
 
     def _send(self, prepared: list[_Prepared]) -> tuple[int, bool]:
         """Sends one valid chunk, retrying only the failed entries within a bounded count.
