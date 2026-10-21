@@ -478,17 +478,25 @@ from `losses()`. The exclusion has a real reason — the units differ, `MultiSin
 the fix is neither to fold it in nor to leave it out, and `self.failed` as it stands cannot support
 either: it is a single counter with no per-child breakdown, so there is no way to add "events from
 the silent children only". `MultiSink` must count **per child** — for each child that `read_losses`
-returns `None` for, add `len(batch)` on each failing call — and leave a reporting child to report
-itself.
+returns `None` for, add `len(batch)` on each failing call — ~~and leave a reporting child to report
+itself.~~
+
+> **Superseded in part by SPEC-058 FR-007.** `MultiSink` now counts `len(batch)` for **every**
+> child raise it swallows, a reporting child's included, and only when its own `emit` returns.
+> SPEC-058's deferring sinks raise having counted nothing, so leaving a reporting child to report
+> itself left their events in no term. The old text is kept above, struck, so the reversal reads in
+> place.
 
 #### Acceptance Criteria:
 
 - [ ] AC-1: A `MultiSink` with one permanently failing child reports non-zero loss through
       `health().sink`.
-- [ ] AC-2: A child that implements `losses()` is **not** double-counted — one reporting child and
+- [ ] AC-2: ~~A child that implements `losses()` is **not** double-counted — one reporting child and
       one silent child, asserting the exact total. The aggregate adds `len(batch)` per failing
-      **silent** child, matching `SinkLosses.failed`'s unit; the existing `self.failed` stays out of
-      the sum.
+      **silent** child, matching `SinkLosses.failed`'s unit;~~ the existing `self.failed` stays out of
+      the sum. — **Superseded in part by SPEC-058 FR-007:** the aggregate adds `len(batch)` per
+      failing child, reporting or silent, so the test this AC names now reads 12, not 8, with the
+      over-count in `failed`, the upper-bound term.
 - [ ] AC-3: Which children are silent is decided by `read_losses(child) is None`, so a child that
       gains a `losses()` later moves categories automatically. The consequence is recorded: the
       aggregate can **fall** when a child starts reporting, against `SinkLosses`'s "cumulative for its

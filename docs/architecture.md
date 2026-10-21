@@ -224,8 +224,14 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
   whole — the same shape as the integer, which raises instead. Both keep *which* value it was
   rather than coercing to `None` or `0.0`: a wrong number is worse than a visibly elided one.
   Both set `truncated: true`, because a substitution nobody can see is a silent change to the
-  caller's data. Both live in `sanitize`, not at the sinks — one pass at assembly is correct by
-  consequence for all 40-odd `json.dumps` call sites and reaches the non-JSON sinks too.
+  caller's data. Both live in `sanitize`, not at the sinks — one pass at assembly is ~~correct by
+  consequence for all 40-odd `json.dumps` call sites~~ — superseded in part by SPEC-058 — correct
+  for every event assembly built, and reaches the non-JSON sinks too. It is not correct by
+  consequence for an event a `TransformSink` returns, because the function runs after assembly and
+  can put any value back in. So the transform checks each result with invariant 8's observable and
+  coerces one that fails, for type only — the same `sanitize` rules, no configured ceiling, one
+  fixed depth bound — and an HTTP sink drops an event whose render still raises, alone, rather
+  than losing the batch.
 - **The rule holds for what the library says about *itself*, not just for events.** A stderr
   diagnostic is also a place caller data was not asked to reach, and an exception's message
   routinely carries the value that provoked it — so an absorbed failure is reported by
@@ -398,11 +404,18 @@ event is lost. `losses()` is optional (`Sink` is structural, so a pre-SPEC-026 s
 satisfying it) and is read through `sinks.base.read_losses`, which treats absent, non-callable,
 raising and wrong-shaped alike as "reports nothing".
 
-Three cases where nothing landed and the sink still must not raise, each settled by an earlier
+~~Three~~ cases where nothing landed and the sink still must not raise, each settled by an earlier
 spec: an **unadjudicable** batch response (SPEC-018 — the sink cannot prove nothing landed, so a
 retry risks duplicating), an **SQS sender fault** (SPEC-016 FR-006 — provably rejected, and a
 byte-identical re-send can only fail the same way), and an **oversized** event (it can never fit,
-so there is nothing to retry). All three are reported through `losses()` instead.
+so there is nothing to retry). All three are reported through `losses()` instead. — Superseded
+in part by SPEC-058, which settles three more cases the same way, counted rather than raised: an
+**unrenderable** event in the HTTP family, alone or beside oversized ones (the sink's own render
+of identical input fails identically), a wrapper batch of **one failure and every other event
+deliberately dropped**, and an SQS batch of **an id-callable failure and an oversized event**.
+Beneath all of them sits SPEC-058's principle: a raising `emit` counts nothing, and whoever
+catches the raise — the worker, the orphan path, or a `MultiSink` that swallowed it — owns the
+batch's count, so a per-event drop is counted only by an `emit` that returned.
 
 **The same rule reaches the sink's own lifecycle** (SPEC-032): a sink whose `close()` released or
 invalidated a transport must **raise** on a later non-empty `emit` rather than absorb it — a
@@ -1552,6 +1565,16 @@ and a third copy is a fork with no merge.
   the session exit code. The rates behind all of this are in the commit that closed it, measured
   against its parent, rather than restated here where nobody can re-run them.
   (No spec — a defect fix.)
+
+- **A transform output nested deeper than the C stack allows can crash the process.** Measured
+  by the SPEC-058 implementation planner on macOS at `7042810`: `json.dumps` on a 20,000-deep
+  nest killed the interpreter with `SIGBUS` on a thread with a 1 MiB stack under CPython 3.13.1,
+  raised `RecursionError` at 2 MiB and 4 MiB, and raised `RecursionError` even at 256 KiB under
+  3.12.12; Linux frame sizes are unmeasured. SPEC-058 FR-001's check adds that `json.dumps` in
+  front of inner sinks that never serialized (`MemorySink`, `CallbackSink`, `LoggingSink`), but
+  the same output already crashes every JSON sink's own `json.dumps`, and assembly bounds
+  library-built events at `max_depth`, so only a transform can produce one. It is a limit of
+  invariant 1's reach: a process-killing signal is not an exception any guard catches. (SPEC-058)
 
 ---
 

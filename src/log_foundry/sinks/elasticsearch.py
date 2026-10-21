@@ -98,7 +98,10 @@ class ElasticsearchSink(HTTPSink):
           The two newline-joined lines, without the trailing newline :meth:`_body` adds.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001). If one does,
+            ``HTTPSink._items`` drops that event alone and counts it (SPEC-058 FR-005).
         """
         action = json.dumps({"index": {"_index": self._index}})
         return f"{action}\n{json.dumps(event)}"
@@ -134,7 +137,8 @@ class ElasticsearchSink(HTTPSink):
           The counters. All three sources are summed into ``failed`` because each is an event
           the server did not confirm; they stay apart on the instance for anyone who needs to
           tell "the request never landed" from "the request landed and these items bounced" from
-          "the response did not say".
+          "the response did not say". ``dropped`` is the oversized events plus those whose
+          render raised, as in the base class this overrides (SPEC-058 FR-005).
 
         Raises:
           None.

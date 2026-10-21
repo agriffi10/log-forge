@@ -81,6 +81,22 @@ class TransformSink:
     are never mutated in place: only the function's return values are forwarded, so a transform
     must copy before mutating.
 
+    **What the function returns is checked, and coerced when it fails** (SPEC-058 FR-001). The
+    function runs after assembly, so it can put a value into an event that assembly would have
+    coerced — ``bytes``, a ``datetime``, a NaN — and invariant 8 promised every sink an event it
+    could serialize bare. Each result is checked with that promise's observable; one that passes
+    is forwarded as the same object, and one that fails is replaced by a new mapping coerced for
+    type only, under no configured ceiling and one fixed depth bound. A coercion is not loss:
+    nothing is counted and nothing is announced.
+
+    **A function that fails for one event costs only that event** (SPEC-058 FR-002). A raise, a
+    result that is neither ``None`` nor a ``dict``, or a result the coercion could not rescue
+    drops that event; the rest of the batch is forwarded, and the failures are counted in
+    :meth:`losses` and announced once per batch, only once the inner sink's ``emit`` returned.
+    When every event of a batch failed, the first exception is re-raised unchanged and nothing is
+    counted, because whoever catches it — the worker, the orphan path or a ``MultiSink`` — owns
+    the batch.
+
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
     belong to the inner sink. A guard here would refuse batches the inner sink would have taken.
@@ -119,7 +135,18 @@ class TransformSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Applies the function to each event, forwarding the non-``None`` results (FR-004).
 
-        When every event is dropped, the inner sink's ``emit`` is not called at all.
+        Each event runs under its own guard (SPEC-058 FR-002), which catches ``Exception`` and
+        never ``BaseException``: a raise, a result that is neither ``None`` nor a ``dict``, or a
+        result whose coercion could not rescue it drops that event only. A ``None`` declines an
+        event, which is the configuration working rather than loss. When nothing is left to
+        forward, the inner sink's ``emit`` is not called at all.
+
+        The failures are counted and announced through the deferral helper, so they land only
+        if this call returns normally. An inner sink that raises propagates with nothing
+        counted: the worker retries the whole batch and the function runs again, so counting now
+        would count the same event once per attempt. An event whose function failed transiently
+        is therefore lost without a retry when its siblings were delivered — retrying would
+        re-deliver the siblings, and a duplicate is worse than one counted loss.
 
         Args:
           batch: The events to transform.
@@ -128,7 +155,10 @@ class TransformSink:
           None.
 
         Raises:
-          Exception: Whatever the mapping function or the inner sink raises.
+          Exception: The first failure's own exception, unchanged and with nothing counted, when
+            every event of the batch failed and none was declined — the function's, the
+            ``TypeError`` built for a non-``dict`` result, or the coercion's. Otherwise whatever
+            the inner sink's ``emit`` raises.
         """
         forwarded: list[dict[str, object]] = []
         declined = False
@@ -251,21 +281,24 @@ class TransformSink:
         flush_sink(self._inner)
 
     def losses(self) -> SinkLosses | None:
-        """Reports the inner sink's losses (SPEC-026 FR-002).
+        """Reports the inner sink's losses plus the events this wrapper's function failed on.
 
         A wrapper that reported nothing would hide the destination it wraps: ``health().sink``
-        would read ``None`` for a transform in front of a sink that counts perfectly well.
-        Events this sink itself declines to forward are not loss — they are the configuration
-        working, the same reason ``NullSink`` reports nothing.
+        would read ``None`` for a transform in front of a sink that counts perfectly well
+        (SPEC-026 FR-002). Events this sink itself declines to forward are not loss — they are
+        the configuration working, the same reason ``NullSink`` reports nothing. Events the
+        function *failed* on are: :meth:`emit` counts them once the batch is settled, and they
+        are added to ``dropped`` here (SPEC-058 FR-003).
 
         Args:
           None.
 
         Returns:
-          The inner sink's losses. ``None`` passes through unchanged rather than becoming
-          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports
-          nothing" from "the sink reports no loss", and flattening the two would claim a
-          clean bill of health on a sink that never gave one.
+          ``None`` only when the inner sink reports ``None`` and this wrapper has counted
+          nothing: FR-003 distinguishes "the sink reports nothing" from "the sink reports no
+          loss", and flattening the two would claim a clean bill of health on a sink that never
+          gave one. Otherwise the inner sink's losses, an inner ``None`` read as zeros, with this
+          wrapper's own count added to ``dropped`` (SPEC-058 FR-003).
 
         Raises:
           None.

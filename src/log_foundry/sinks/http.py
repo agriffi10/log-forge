@@ -409,7 +409,10 @@ class HTTPSink:
         budget cannot see.
       failed: Requests abandoned past the retry bound, counted per chunk.
       dropped_oversized: Events dropped for exceeding the per-event ceiling, plus those a
-        destination answered ``413`` to and no split could rescue.
+        destination answered ``413`` to and no split could rescue. The ceiling drops are counted
+        only when ``emit`` returns normally (SPEC-058 FR-005); a ``413`` drop is counted when it
+        happens. An event whose render raised is counted apart from this and folded into
+        ``losses().dropped``, so this stays oversize only.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -520,6 +523,13 @@ class HTTPSink:
         :meth:`_body` and :meth:`_handle_response`, which is what keeps the chunk loop on every
         path to the wire.
 
+        The drops :meth:`_items` decides — an oversized event, an unrenderable one — are counted
+        and announced through the deferral helper, so they land only if this call returns
+        normally (SPEC-058 FR-005). They are decided before any request, and this call can still
+        raise afterwards and be retried whole: counting them first counted one oversized event
+        once per attempt. The ``413`` and abandonment counters below keep counting as they
+        happen, which is outside SPEC-058's scope.
+
         Args:
           batch: The events to ship. An empty batch is a no-op.
 
@@ -533,7 +543,9 @@ class HTTPSink:
             retry — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
             identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
             already apply). A batch that settled *some* chunks does not raise either: the worker
-            retries whole batches, so raising would re-send what landed.
+            retries whole batches, so raising would re-send what landed. A raise leaves nothing
+            from :meth:`_items` counted, and a batch whose every event was unrenderable or
+            oversized makes no request and does not raise.
         """
         if not batch:
             return
@@ -723,6 +735,14 @@ class HTTPSink:
         rather than one line per event, because a batch of oversized events is a configuration
         fault and 5,980 identical stderr lines describe it no better than one does.
 
+        **Each event renders under its own guard** (SPEC-058 FR-005), around :meth:`_render` and
+        :meth:`_item_size` both, catching ``Exception`` and never ``BaseException``: one event
+        whose render raises is dropped and counted, rather than abandoning the batch. Unlike a
+        wrapper's callable, a batch of nothing but unrenderable events is not re-raised —
+        re-rendering identical input in the sink's own code fails identically, so a retry cannot
+        help. The line names the class and the first exception's type, never its message. Both
+        kinds of drop go to ``pending`` rather than to the counters.
+
         Args:
           batch: The events to render.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
@@ -868,7 +888,10 @@ class HTTPSink:
           The serialized form.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001). If one does,
+            ``HTTPSink._items`` drops that event alone and counts it (SPEC-058 FR-005).
         """
         return json.dumps(event)
 
@@ -950,7 +973,8 @@ class HTTPSink:
         Returns:
           The counters. ``failed`` counts abandoned requests rather than events, since this
           class has no per-event outcome to report and an abandoned request took its whole body
-          with it; subclasses that do learn per-record outcomes add them.
+          with it; subclasses that do learn per-record outcomes add them. ``dropped`` is the
+          oversized events plus those whose render raised (SPEC-058 FR-005).
 
         Raises:
           None.

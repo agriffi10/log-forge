@@ -52,9 +52,15 @@ spans started; for orphan logs, delivered + `orphan_lost` equals calls made; an 
 not be *built* is in `in_span_lost` or `orphan_lost`; loss a sink absorbed is in `health().sink`.
 *Recorded exceptions:* `dropped` counts submissions, not events, and a sink's `failed` is an upper
 bound (`health()` docstring); `queued` also counts a `flush()` marker stranded by a racing
-`shutdown()`, for the life of the process (`Health.queued` docstring, SPEC-050 FR-001); three
+`shutdown()`, for the life of the process (`Health.queued` docstring, SPEC-050 FR-001); ~~three
 losses are counted but never retried, because a retry would duplicate — an unadjudicable batch
-response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017).
+response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017)~~ — superseded
+by SPEC-058: five losses are counted but never retried — an unadjudicable batch response, an SQS
+sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or an SQS id
+callable's per-event failure when its siblings were delivered, and an unrenderable HTTP event
+(SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
+Each is counted only by an `emit` that returned; one that raised counts nothing, and whoever
+caught it — the worker, the orphan path or `MultiSink` — owns the batch (SPEC-058).
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`; `tests/test_invariants_model.py`
 is the identity itself.
 
@@ -137,6 +143,11 @@ released nothing keeps accepting (SPEC-032).
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
+*Recorded exceptions:* an `emit` may return normally having delivered nothing, because what it
+did not deliver was counted — an all-oversized or all-unrenderable HTTP batch, a wrapper batch of
+one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized event
+(SPEC-058). Nothing in such a batch is helped by a retry, which is the test this page's rule turns
+on.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/integration/` against real services (SPEC-041).
 
@@ -145,7 +156,10 @@ with one that fails some calls, nothing raised, `losses()` is non-zero, and no e
 `build_event` coerces and bounds every value, so a sink may `json.dumps` bare; the ceilings bound
 each *value*, not the event; an unserializable value becomes a type name, never a `repr`; a
 number too large to render is replaced, never clipped; a reserved word has exactly one route
-through (SPEC-017, SPEC-020, SPEC-025, SPEC-034).
+through (SPEC-017, SPEC-020, SPEC-025, SPEC-034). The premise holds at assembly **and at a
+transform's coercion**: a `TransformSink` runs its function after assembly, so it checks each
+result with the observable below and replaces one that fails with a coercion by assembly's
+per-type rules (SPEC-058).
 
 *Observable:* for any value, the call returns, every string in the event encodes as UTF-8 and
 `json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
@@ -154,10 +168,15 @@ top-level key was overwritten. A lone surrogate is replaced by U+FFFD and marked
 cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-055).
 *Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
-(invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope).
+(invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). The
+ceilings bound the values of an assembled event and do not bound what a transform adds: a
+transform's coercion is for type only, under no configured ceiling and one fixed depth bound of
+100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
+choosing the size (SPEC-058).
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
 by `tests/test_public_surface.py`, and `tests/test_sanitize_corpus.py`, which holds every
-hostile value to the whole observable on both delivery paths.
+hostile value to the whole observable on both delivery paths; a transform's output by
+`tests/test_transform_coercion.py` (SPEC-058).
 
 ## 9. Context is scoped, and an adopted context confers nothing
 

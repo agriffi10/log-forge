@@ -76,6 +76,9 @@ class HoneycombSink(HTTPSink):
           The serialized entry.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001). If one does,
+            ``HTTPSink._items`` drops that event alone and counts it (SPEC-058 FR-005).
         """
         return json.dumps({"data": event})

@@ -170,7 +170,9 @@ class SQSSink:
         Returns:
           The counters. Sender faults land in ``failed`` alongside the retry-exhausted entries:
           SQS rejected the request itself, so the entry is as lost as one that timed out, and
-          SPEC-016 settled that it must not be re-sent byte-identical.
+          SPEC-016 settled that it must not be re-sent byte-identical. An event dropped because
+          a FIFO id callable raised for it is in ``dropped`` beside the oversized ones, while
+          ``dropped_oversized`` keeps meaning oversize only (SPEC-058 FR-004).
 
         Raises:
           None.
@@ -182,6 +184,12 @@ class SQSSink:
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks the batch to SQS limits and sends each chunk (FR-001, FR-002).
+
+        The per-event drops :meth:`_chunks` decides — oversize, and on a FIFO queue a failed id
+        callable — are counted and announced through the deferral helper, so they land only if
+        this call returns normally (SPEC-058 FR-004). They are decided before any send, and this
+        call can still raise afterwards and be retried whole; counting them first counted one
+        oversized event once per attempt.
 
         Args:
           batch: The events to ship.
@@ -201,6 +209,9 @@ class SQSSink:
             cost of the sender-fault chunk being re-sent and re-rejected alongside it — futile
             but harmless, where silently dropping recoverable events would be the failure
             SPEC-026 exists to remove.
+          Exception: The first id callable's own exception, unchanged, when every event's id
+            callable failed and nothing reached a chunk or was dropped as oversized (SPEC-058
+            FR-004). A raise of either kind leaves nothing from :meth:`_chunks` counted.
         """
         chunks = delivered = 0
         recoverable_loss = False
@@ -240,7 +251,8 @@ class SQSSink:
           The group id.
 
         Raises:
-          Exception: Whatever a caller-supplied callable raises.
+          Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+            into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_group_id
         if isinstance(source, str):
@@ -266,7 +278,8 @@ class SQSSink:
           The deduplication id.
 
         Raises:
-          Exception: Whatever a caller-supplied callable raises.
+          Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+            into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_deduplication_id
         raw = source(event) if source is not None else str(event.get("log_id", ""))
@@ -289,6 +302,14 @@ class SQSSink:
         otherwise ship as a lone over-budget request that SQS rejects as a sender fault, losing
         the event as an opaque failure instead of a labelled oversize drop.
 
+        **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
+        under the wrappers' ledger rule: when every event failed and nothing reached a chunk or
+        was dropped as oversized, the first exception is re-raised unchanged and nothing is
+        counted; otherwise the failed events are set aside. Both drops — oversize and id failure
+        — go to ``pending`` rather than to the counters, so they are counted and announced only
+        when the calling ``emit`` returns normally; the oversize lines keep their one-per-event
+        shape, and the id failures are announced once per batch, naming the exception's type.
+
         Args:
           batch: The events to split.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
@@ -298,7 +319,8 @@ class SQSSink:
           The chunks, each valid for one request.
 
         Raises:
-          Exception: Whatever a caller-supplied id callable raises.
+          Exception: The first id callable's own exception, when every event's id callable
+            failed and nothing reached a chunk or was dropped as oversized.
         """
         chunks: list[list[_Prepared]] = []
         current: list[_Prepared] = []

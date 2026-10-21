@@ -67,13 +67,27 @@ class MultiSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Forwards the batch to every child in construction order, isolating failures (FR-002).
 
-        A failing child that reports **nothing** of its own is counted here, in events, because
+        ~~A failing child that reports **nothing** of its own is counted here, in events, because
         otherwise it is invisible: ``losses()`` sums only children with a ``losses()``, so a
         destination that has delivered nothing since the process started reported zero loss
         forever (SPEC-036 FR-005). Which children are silent is decided by ``read_losses`` per
         call, the same probe the aggregate uses, so a child that gains a ``losses()`` later moves
         categories on its own — at the cost that the aggregate can then *fall*, which is why the
-        counter is per child rather than a single total.
+        counter is per child rather than a single total.~~ — superseded by SPEC-058 FR-007.
+
+        **Every child raise this call swallows is counted here, in events, whatever the child
+        reports** (SPEC-058 FR-007): ``len(batch)`` per raising child, through the deferral
+        helper, so the count lands only when this call returns normally. This fan-out is the
+        third catcher of SPEC-058's principle — a raising ``emit`` counts nothing, and whoever
+        catches the raise owns the batch's count — and a deferring child raises having counted
+        nothing, so trusting a reporting child to have counted its own loss left its events in no
+        term. A fan-out that goes on to re-raise counts nothing, because the catcher above it
+        owns the batch; the old rule counted a silent child at catch time even then, so the
+        worker's retries counted the same batch once per attempt. Three costs are accepted, all
+        in ``losses().failed``, the upper-bound term: a reporting child that had already counted
+        its own failures before raising is counted twice; a sink not yet deferring is counted
+        once in its own ``dropped`` and once here; and a raising wrapper child is charged its
+        whole batch, including the events it chose not to forward.
 
         Partial success stays isolated: a retry there would re-deliver the batch to the children
         that already took it, and duplicates are worse than the one failure already counted on
@@ -210,14 +224,20 @@ class MultiSink:
         superseded in part by SPEC-036 FR-005. ``failed`` is still absent, and still for that
         reason. What was wrong was concluding that the fan-out therefore reports nothing: a child
         with no ``losses()`` contributed nothing to the total, so a permanently dead destination
-        was invisible with ``health()`` reading all zeros. ``_silent_failed`` is the same loss in
-        the **right unit** — events from failing children that report nothing — so a reporting
-        child is still left to report itself and nothing is counted twice.
+        was invisible with ``health()`` reading all zeros. ~~``_silent_failed`` is the same loss
+        in the **right unit** — events from failing children that report nothing — so a reporting
+        child is still left to report itself and nothing is counted twice.~~ — superseded by
+        SPEC-058 FR-007. ``_absorbed`` is that loss in the same unit, events, for **every** child
+        raise this fan-out swallowed, a reporting child's included: a child that defers its own
+        count raises having counted nothing, so leaving it to report itself counted its events
+        nowhere. The cost is that ``failed`` can now count an event twice, once as the child's
+        own and once here — an upper bound, as ``SinkLosses`` documents it; ``dropped`` never
+        counts one twice.
 
         The figure is a **total**, not a breakdown: it cannot say which child is failing. The
         per-batch stderr line names the class (:meth:`emit`), which is where that lives.
 
-        ``close()`` deliberately does not move ``_silent_failed``. Its failure path has no batch,
+        ``close()`` deliberately does not move ``_absorbed``. Its failure path has no batch,
         so there is no event count to add, and a ``+1`` there would mix units in exactly the way
         that keeps ``failed`` out of this sum. A client buffer lost to a failed close is of
         unknown size, and an invented number is worse than an absent one.
@@ -226,10 +246,11 @@ class MultiSink:
           None.
 
         Returns:
-          The summed losses, or ``None`` when no child reported anything **and** no silent child
-          has lost a batch. FR-003 separates "reports nothing" from "reports no loss", and a tree
-          of silent children that has lost nothing has still not given a clean bill of health —
-          but one that *has* lost something now says so, which is the whole of FR-005.
+          The summed losses, or ``None`` when no child reported anything **and** ~~no silent
+          child has lost a batch~~ — superseded by SPEC-058 FR-007 — this fan-out has absorbed
+          nothing. FR-003 separates "reports nothing" from "reports no loss", and a tree of silent
+          children that has lost nothing has still not given a clean bill of health — but one
+          that *has* lost something now says so, which is the whole of FR-005.
 
         Raises:
           None. A child without ``losses()`` contributes zero, and a child whose accessor raises

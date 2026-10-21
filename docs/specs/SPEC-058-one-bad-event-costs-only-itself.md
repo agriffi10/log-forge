@@ -645,12 +645,17 @@ its first drop, silently changed category. The rule becomes:
 *A reversal, in part, of SPEC-036 FR-005.* That spec chose to leave a reporting child "to report
 itself", and its AC-2 recorded the opposite choice as 6 lost events reading 12 against a real
 `SyslogSink` on a closed port. This FR reverses the choice on purpose, because without it the
-deferral leaves an event in no term (the three models in the Overview). Two costs are accepted.
+deferral leaves an event in no term (the three models in the Overview). Three costs are accepted.
 `failed` over-counts when a reporting child had already counted failures before raising
 (`HTTPSink.failed` per abandoned chunk, `SQSSink`'s failed entries); `SinkLosses` documents `failed`
-as an upper bound. And for the sinks this spec does not yet defer (Out of Scope), a drop they
+as an upper bound. For the sinks this spec does not yet defer (Out of Scope), a drop they
 counted before raising is also in `MultiSink`'s `failed` until the follow-up spec defers them:
-counted once in the exact term and once in the upper-bound term, never twice in `dropped`.
+counted once in the exact term and once in the upper-bound term, never twice in `dropped`. And a
+raising wrapper child is charged `len(batch)`, which includes the events the wrapper chose not to
+forward — filtered out, below the level floor, or `None` from a transform — so `failed` grows with
+the filter ratio: `MultiSink(FilteringSink(HTTPSink(500, max_retries=0), min_level="error"),
+MemorySink())` given nine `info` events and one `error` reads `failed == http.failed + 10`. That is
+a documented upper bound, not a defect; the fan-out cannot see what the wrapper declined.
 
 #### Acceptance Criteria:
 
