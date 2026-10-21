@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -61,6 +62,8 @@ class FilteringSink:
         self._stop_signal: threading.Event | None = None
         self._predicate = predicate
         self._min_rank: int | None = None
+        self._counter_lock = threading.Lock()
+        self._dropped = 0
         if min_level is not None:
             rank = _LEVELS.get(min_level.upper())
             if rank is None:
@@ -83,9 +86,34 @@ class FilteringSink:
         Raises:
           Exception: Whatever the predicate or the inner sink raises.
         """
-        kept = [event for event in batch if self._passes(event)]
-        if kept:
-            self._inner.emit(kept)
+        kept: list[dict[str, object]] = []
+        declined = False
+        failures = 0
+        first: Exception | None = None
+        with Deferral(self) as pending:
+            for event in batch:
+                try:
+                    passes = self._passes(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
+                if passes:
+                    kept.append(event)
+                else:
+                    declined = True
+            if first is not None and not kept and not declined:
+                raise first
+            if failures:
+                kind = type(first).__name__
+                pending.count("_dropped", failures)
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", failures, f"FilteringSink, the predicate raised {kind}"
+                    )
+                )
+            if kept:
+                self._inner.emit(kept)
 
     def _passes(self, event: dict[str, object]) -> bool:
         """Reports whether an event clears the predicate and the minimum level.
@@ -193,7 +221,10 @@ class FilteringSink:
         Raises:
           None.
         """
-        return read_losses(self._inner)
+        inner = read_losses(self._inner)
+        with self._counter_lock:
+            own = self._dropped
+        return wrapped_losses(inner, own)
 
     def close(self) -> None:
         """Closes the inner sink (FR-003).

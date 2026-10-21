@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.sanitize import _coerce_unbounded
+from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -112,6 +113,8 @@ class TransformSink:
         self._inner = inner
         self._stop_signal: threading.Event | None = None
         self._fn = fn
+        self._counter_lock = threading.Lock()
+        self._dropped = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Applies the function to each event, forwarding the non-``None`` results (FR-004).
@@ -127,13 +130,63 @@ class TransformSink:
         Raises:
           Exception: Whatever the mapping function or the inner sink raises.
         """
-        transformed: list[dict[str, object]] = []
-        for event in batch:
-            result = self._fn(event)
-            if result is not None:
-                transformed.append(_json_safe(result))
-        if transformed:
-            self._inner.emit(transformed)
+        forwarded: list[dict[str, object]] = []
+        declined = False
+        failures = 0
+        first: Exception | None = None
+        with Deferral(self) as pending:
+            for event in batch:
+                try:
+                    result = self._apply(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
+                if result is None:
+                    declined = True
+                else:
+                    forwarded.append(result)
+            if first is not None and not forwarded and not declined:
+                raise first
+            if failures:
+                kind = type(first).__name__
+                pending.count("_dropped", failures)
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", failures, f"TransformSink, the function raised {kind}"
+                    )
+                )
+            if forwarded:
+                self._inner.emit(forwarded)
+
+    def _apply(self, event: dict[str, object]) -> dict[str, object] | None:
+        """Runs the function on one event and makes its result safe to forward (SPEC-058).
+
+        A result that is neither ``None`` nor a ``dict`` is the same failure as a raise, so the
+        ``TypeError`` is built here — naming this class and the type returned, never the value —
+        and raised into :meth:`emit`'s per-event guard. Raising in a helper rather than inside
+        that guard's ``try`` keeps the ``try`` body to the one call that can fail.
+
+        Args:
+          event: The event to transform.
+
+        Returns:
+          ``None`` when the function declined the event, else its result, checked and, when it
+          fails the check, coerced (FR-001).
+
+        Raises:
+          TypeError: If the function returned neither ``None`` nor a ``dict``.
+          Exception: Whatever the function raises, or the coercion when it cannot rescue the
+            result.
+        """
+        result = self._fn(event)
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise TypeError(
+                f"TransformSink's function returned {type(result).__name__}, not a dict or None"
+            )
+        return _json_safe(result)
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:
@@ -217,7 +270,10 @@ class TransformSink:
         Raises:
           None.
         """
-        return read_losses(self._inner)
+        inner = read_losses(self._inner)
+        with self._counter_lock:
+            own = self._dropped
+        return wrapped_losses(inner, own)
 
     def close(self) -> None:
         """Closes the inner sink (FR-004).

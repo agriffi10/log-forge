@@ -197,15 +197,17 @@ def test_a_fan_out_that_lost_nothing_reports_none() -> None:
     assert multi.losses() is None
 
 
-class _ParkingCounter:
+class ParkingCounter:
     """A data descriptor that, once armed, parks the first store inside the commit.
 
     The commit is ``setattr(owner, name, getattr(owner, name) + n)`` under the owner's lock, so a
     store parked here sits after the read and before the write — the window a lost increment
     needs. Unarmed it is an ordinary attribute, so construction and ``losses()`` behave as usual.
+    Shared with ``test_wrapper_failures.py``, whose wrappers commit the same way.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, name: str) -> None:
+        self._slot = f"_parked_{name}"
         self.armed = False
         self.parked = threading.Event()
         self.release = threading.Event()
@@ -213,17 +215,17 @@ class _ParkingCounter:
     def __get__(self, obj: object, owner: type | None = None) -> object:
         if obj is None:
             return self
-        return obj.__dict__.get("_parked_absorbed", 0)
+        return obj.__dict__.get(self._slot, 0)
 
     def __set__(self, obj: object, value: int) -> None:
         if self.armed:
             self.armed = False
             self.parked.set()
             self.release.wait(5.0)
-        obj.__dict__["_parked_absorbed"] = value
+        obj.__dict__[self._slot] = value
 
 
-class _SpyLock:
+class SpyLock:
     """A real lock that says when a thread had to wait for it because another one held it.
 
     Only a *contended* acquisition is reported. ``MultiSink.emit`` takes this lock twice — once
@@ -255,10 +257,10 @@ def test_a_parked_absorbed_commit_loses_no_increment(monkeypatch: pytest.MonkeyP
     then overwrites it — one batch missing. No sleep decides the outcome: the test waits for
     whichever comes first, B contending for the lock or B finishing.
     """
-    counter = _ParkingCounter()
+    counter = ParkingCounter("_absorbed")
     monkeypatch.setattr(MultiSink, "_absorbed", counter, raising=False)
     multi = MultiSink(Raising(), Delivering())
-    multi._counter_lock = _SpyLock()
+    multi._counter_lock = SpyLock()
 
     counter.armed = True
     a = threading.Thread(target=multi.emit, args=(_batch(2),), name="A")
