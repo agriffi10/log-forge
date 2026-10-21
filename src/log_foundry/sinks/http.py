@@ -14,6 +14,7 @@ from typing import Any, NoReturn, TypedDict
 from urllib.parse import urlparse
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import clamp_server_delay, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -509,6 +510,7 @@ class HTTPSink:
         self._opener = opener if opener is not None else _no_redirect_opener()
         self.failed = 0
         self.dropped_oversized = 0
+        self._unrenderable = 0
         self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -535,43 +537,46 @@ class HTTPSink:
         """
         if not batch:
             return
-        items = self._items(batch)
-        if not items:
-            return
-        budget = self._chunk_budget()
-        refused_at: int | None = None
-        reductions = index = chunks = settled = 0
-        while index < len(items):
-            chunk = self._take(items, index, budget)
-            if self._known_refused(chunk, refused_at):
-                self._drop_refused(chunk)
-                chunks += 1
-                settled += 1
-                index += 1
-                continue
-            try:
-                delivered = self._deliver(chunk)
-            except _PayloadTooLarge as refusal:
-                refused_at = (
-                    refusal.size if refused_at is None else min(refused_at, refusal.size)
-                )
-                if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
-                    budget = max(min(budget, refusal.size) // 2, 1)
-                    reductions += 1
+        with Deferral(self) as pending:
+            items = self._items(batch, pending)
+            if not items:
+                return
+            budget = self._chunk_budget()
+            refused_at: int | None = None
+            reductions = index = chunks = settled = 0
+            while index < len(items):
+                chunk = self._take(items, index, budget)
+                if self._known_refused(chunk, refused_at):
+                    self._drop_refused(chunk)
+                    chunks += 1
+                    settled += 1
+                    index += 1
+                    continue
+                try:
+                    delivered = self._deliver(chunk)
+                except _PayloadTooLarge as refusal:
+                    refused_at = (
+                        refusal.size if refused_at is None else min(refused_at, refusal.size)
+                    )
+                    if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
+                        budget = max(min(budget, refusal.size) // 2, 1)
+                        reductions += 1
+                        continue
+                    chunks += 1
+                    if len(chunk) == 1:
+                        self._drop_refused(chunk)
+                        settled += 1
+                    else:
+                        self._abandon_unreduced(chunk)
+                    index += len(chunk)
                     continue
                 chunks += 1
-                if len(chunk) == 1:
-                    self._drop_refused(chunk)
-                    settled += 1
-                else:
-                    self._abandon_unreduced(chunk)
+                settled += delivered
                 index += len(chunk)
-                continue
-            chunks += 1
-            settled += delivered
-            index += len(chunk)
-        if chunks and not settled:
-            raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
+            if chunks and not settled:
+                raise SinkDeliveryError(
+                    f"{type(self).__name__} delivered none of {chunks} chunk(s)"
+                )
 
     def _known_refused(self, chunk: list[_Item], refused_at: int | None) -> bool:
         """Reports whether this chunk is provably no smaller than one already refused.
@@ -709,7 +714,7 @@ class HTTPSink:
             f"{type(self).__name__}, refused at the smallest request this sink can build",
         )
 
-    def _items(self, batch: list[dict[str, object]]) -> list[_Item]:
+    def _items(self, batch: list[dict[str, object]], pending: Deferral) -> list[_Item]:
         """Renders each event and discards any that cannot fit a request on its own.
 
         ``chunk_items`` documents oversized items as the caller's to filter, because a group it
@@ -720,6 +725,8 @@ class HTTPSink:
 
         Args:
           batch: The events to render.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise (SPEC-058 FR-005).
 
         Returns:
           The items that can be sent, in order.
@@ -729,24 +736,38 @@ class HTTPSink:
         """
         ceiling = self._event_ceiling()
         items: list[_Item] = []
-        dropped = 0
-        largest = 0
+        dropped = largest = failures = 0
+        first: Exception | None = None
         for event in batch:
-            rendered = self._render(event)
-            size = self._item_size(rendered, event)
+            try:
+                rendered = self._render(event)
+                size = self._item_size(rendered, event)
+            except Exception as err:
+                failures += 1
+                first = first if first is not None else err
+                continue
             if size > ceiling:
                 dropped += 1
                 largest = max(largest, size)
                 continue
             items.append(_Item(event=event, rendered=rendered, size=size))
         if dropped:
-            with self._counter_lock:
-                self.dropped_oversized += dropped
-            _diag.lost(
-                "event",
-                dropped,
-                f"{type(self).__name__}, up to {largest} bytes exceeds the "
-                f"{ceiling}-byte per-event ceiling",
+            pending.count("dropped_oversized", dropped)
+            pending.announce(
+                lambda: _diag.lost(
+                    "event",
+                    dropped,
+                    f"{type(self).__name__}, up to {largest} bytes exceeds the "
+                    f"{ceiling}-byte per-event ceiling",
+                )
+            )
+        if first is not None:
+            kind = type(first).__name__
+            pending.count("_unrenderable", failures)
+            pending.announce(
+                lambda: _diag.lost(
+                    "event", failures, f"{type(self).__name__}, rendering raised {kind}"
+                )
             )
         return items
 
@@ -935,7 +956,9 @@ class HTTPSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unrenderable, failed=self.failed
+            )
 
     def close(self) -> None:
         """Does nothing, since ``urllib`` opens a fresh connection per request (FR-012).

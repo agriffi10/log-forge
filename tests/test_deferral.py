@@ -550,3 +550,21 @@ def test_the_deferral_lint_reports_what_it_claims_to(case: str) -> None:
     """Each check's failure text, and the shapes that must stay silent, on synthetic modules."""
     source, sites, expected = _CORPUS[case]
     assert deferral_findings("m.py", source, sites, IMMEDIATE) == expected
+
+
+def test_every_deferring_site_takes_the_one_helper() -> None:
+    """FR-002's instrument, over the real package: five sites, one helper, no second ledger.
+
+    The construction rule runs over every module under ``src/``, so a sixth site that builds a
+    ``Deferral`` is held to it before anyone adds it to :data:`DEFERRING_SITES`; the other three
+    checks run on the five sites by name, and a site that has moved is a finding.
+    """
+    modules = {path.relative_to(_SRC).as_posix(): path for path in sorted(_SRC.rglob("*.py"))}
+    assert set(DEFERRING_SITES) <= set(modules), (
+        f"a deferring site's module is gone: {sorted(set(DEFERRING_SITES) - set(modules))}"
+    )
+    findings: list[str] = []
+    for where, path in modules.items():
+        source = path.read_text(encoding="utf-8")
+        findings.extend(deferral_findings(where, source, DEFERRING_SITES.get(where), IMMEDIATE))
+    assert findings == [], "\n".join(findings)

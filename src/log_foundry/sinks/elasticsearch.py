@@ -141,7 +141,7 @@ class ElasticsearchSink(HTTPSink):
         """
         with self._counter_lock:
             return SinkLosses(
-                dropped=self.dropped_oversized,
+                dropped=self.dropped_oversized + self._unrenderable,
                 failed=self.failed + self.item_errors + self.dropped_unadjudicated,
             )
 
