@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import SinkLosses, flush_sink, read_losses
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ class MultiSink:
         """
         self._sinks = sinks
         self.failed = 0
-        self._silent_failed = 0
+        self._absorbed = 0
         self._counter_lock = threading.Lock()
         self._stop_signal: threading.Event | None = None
 
@@ -96,24 +97,23 @@ class MultiSink:
         """
         first_error: Exception | None = None
         delivered = 0
-        for sink in self._sinks:
-            try:
-                sink.emit(batch)
-            except Exception as err:
-                silent = read_losses(sink) is None
-                with self._counter_lock:
-                    self.failed += 1
-                    if silent:
-                        self._silent_failed += len(batch)
-                if first_error is None:
-                    first_error = err
-                _diag.absorbed(
-                    "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"
-                )
-            else:
-                delivered += 1
-        if delivered == 0 and first_error is not None:
-            raise first_error
+        with Deferral(self) as pending:
+            for sink in self._sinks:
+                try:
+                    sink.emit(batch)
+                except Exception as err:
+                    with self._counter_lock:
+                        self.failed += 1
+                    pending.count("_absorbed", len(batch))
+                    if first_error is None:
+                        first_error = err
+                    _diag.absorbed(
+                        "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"
+                    )
+                else:
+                    delivered += 1
+            if delivered == 0 and first_error is not None:
+                raise first_error
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:
@@ -239,12 +239,12 @@ class MultiSink:
         children = [read_losses(sink) for sink in self._sinks]
         reported = [child for child in children if child is not None]
         with self._counter_lock:
-            silent_failed = self._silent_failed
-        if not reported and not silent_failed:
+            absorbed = self._absorbed
+        if not reported and not absorbed:
             return None
         return SinkLosses(
             dropped=sum(child.dropped for child in reported),
-            failed=sum(child.failed for child in reported) + silent_failed,
+            failed=sum(child.failed for child in reported) + absorbed,
         )
 
     def close(self) -> None:
