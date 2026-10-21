@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sanitize import _coerce_unbounded
 from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
@@ -14,6 +16,60 @@ if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink, SinkLosses
 
 __all__ = ["TransformSink"]
+
+
+def _check(result: object) -> None:
+    """Raises unless ``result`` meets invariant 8's observable, in one expression (SPEC-058 FR-001).
+
+    ``allow_nan=False`` and the UTF-8 encode are what make it the stricter of the two readings:
+    a NaN and a lone surrogate both pass a bare ``json.dumps``, and the second is what the SQL
+    sinks' drivers reject once it reaches a column (SPEC-055).
+
+    Args:
+      result: What the transform returned, or its coercion.
+
+    Returns:
+      None.
+
+    Raises:
+      Exception: Whatever ``json.dumps`` or the encode raises — ``TypeError``, ``ValueError``,
+        ``UnicodeEncodeError``, a ``RecursionError`` on a nest deeper than the stack allows, or a
+        ``dict`` subclass's own ``items()`` failure.
+    """
+    json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
+
+
+def _json_safe(result: dict[str, object]) -> dict[str, object]:
+    """Returns ``result`` itself when it passes the check, else a new types-only coercion of it.
+
+    Check first, so a valid result is untouched by construction and only one that already failed
+    ever meets the coercer. The coercion runs **outside** the ``except`` block, so an exception it
+    or the post-check raises is not chained onto the check's own: it is the exception SPEC-058
+    FR-002's rule carries, and its type is what the wrapper's line names. ``truncated`` is set
+    only when the coercion made a substitution assembly marks; a coercion is not loss, so nothing
+    is counted and nothing is announced here.
+
+    Args:
+      result: The mapping the transform returned. It is never mutated.
+
+    Returns:
+      ``result`` when it passes, or the coerced mapping.
+
+    Raises:
+      Exception: Whatever the coercion raises, or the post-coercion check when the coercion did
+        not rescue the result.
+    """
+    try:
+        _check(result)
+    except Exception:
+        pass
+    else:
+        return result
+    coerced, marked = _coerce_unbounded(result)
+    if marked:
+        coerced["truncated"] = True
+    _check(coerced)
+    return coerced
 
 
 class TransformSink:
@@ -75,7 +131,7 @@ class TransformSink:
         for event in batch:
             result = self._fn(event)
             if result is not None:
-                transformed.append(result)
+                transformed.append(_json_safe(result))
         if transformed:
             self._inner.emit(transformed)
 
