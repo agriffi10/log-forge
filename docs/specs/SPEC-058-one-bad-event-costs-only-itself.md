@@ -133,6 +133,12 @@ wrappers (FR-004); `HTTPSink._items` renders **per event** as a backstop (FR-005
   bound.
 - **`CallbackSink`.** Its function runs once per batch and is the terminal destination, not code
   that runs once per event in front of one.
+- **`LoggingSink`, a per-event caller-code sibling this spec does not name.** Its `emit` calls
+  `logger.handle` once per event, so a `logging.Filter` that raises for one event leaves `emit`
+  after the events before it were handled, and the worker's retry re-delivers them. Measured at
+  `ed21cc6` by the second diff review: a filter raising for one of 7 events gave 16 handled
+  records for 4 distinct events, then "lost 7; batch abandoned". Pre-existing — this spec never
+  edits `sinks/logging_sink.py` — and left to a follow-up spec.
 - **Changing what a *total* failure raises.** When every event of a batch fails, the first
   exception is re-raised unchanged and nothing is counted — today's behaviour, byte for byte,
   because the catcher above (the worker's retry and abandon line, `orphan_lost`, or `MultiSink`)

@@ -186,7 +186,10 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 """The functions in each site that decide a per-event drop, by module, class and name.
 
 A class or function named here and missing from its module is a finding, not a skip: a rename
-would otherwise shrink the guard as silently as a deletion.
+would otherwise shrink the guard as silently as a deletion. The other direction is held too: a
+class anywhere under ``src/`` whose ``emit`` enters a ``Deferral`` and is not named here with
+``emit`` is a finding, so converting a sink to the helper without listing it cannot leave its
+old immediate stores unchecked.
 """
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
@@ -288,6 +291,43 @@ def _methods(cls: ast.ClassDef) -> dict[str, ast.FunctionDef]:
     return {item.name: item for item in cls.body if isinstance(item, ast.FunctionDef)}
 
 
+def _enters_deferral(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True when ``fn``, nested code included, has a ``with`` item that is a ``Deferral(...)``."""
+    return any(
+        isinstance(node, ast.With)
+        and any(_is_deferral_call(item.context_expr) for item in node.items)
+        for node in ast.walk(fn)
+    )
+
+
+def _unlisted_deferring_classes(
+    where: str, tree: ast.Module, sites: dict[str, tuple[str, ...]] | None
+) -> list[str]:
+    """Every class whose ``emit`` enters a ``Deferral`` and is not listed, one line each.
+
+    The roster is derived rather than trusted: without this, a class converted to the helper but
+    left out of :data:`DEFERRING_SITES` would be held to nothing past the construction rule, so a
+    store left behind in it — the half-converted sink — would pass in silence. Every class is
+    visited, nested ones included, and an ``async def emit`` counts, so a shape the site list
+    cannot name fails closed as "not found; the site list is stale" once listed, rather than
+    passing. Reported in source order.
+    """
+    listed = sites or {}
+    classes = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)),
+        key=lambda node: node.lineno,
+    )
+    return [
+        f"{where}: {cls.name}.emit enters a Deferral but is not listed in DEFERRING_SITES"
+        for cls in classes
+        for item in cls.body
+        if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
+        and item.name == "emit"
+        and _enters_deferral(item)
+        and "emit" not in listed.get(cls.name, ())
+    ]
+
+
 def _self_path(node: ast.expr) -> str | None:
     """``"a.b"`` for a target spelt ``self.a.b``, ``self.a[k].b`` or ``self.a.b[k]``, else ``None``.
 
@@ -380,7 +420,8 @@ def _reach(
             continue
         findings.append(
             f"{where}:{line}: {cls_name}.{fn.name}{via} stores self.{attr} directly; "
-            f"count it through the Deferral"
+            f"count it through the Deferral, or, if it must count as it happens, add "
+            f"({cls_name}, {fn.name}) to IMMEDIATE with the reason"
         )
     for name in _self_calls(fn):
         callee = methods.get(name)
@@ -403,14 +444,17 @@ def deferral_findings(
     **What it checks.** Everywhere: every ``Deferral(...)`` call, spelt as a bare name or as an
     attribute, is the context expression of a ``with`` item directly inside a function named
     ``emit``, binding nothing or a bare local name — built anywhere else, or bound to an
-    attribute, a subscript or an unpacking, its pending drops outlive the call. In a named site
-    only: the module imports ``Deferral`` from the helper's module; every named class exists at
-    module level and every named method in its body, so a rename is a finding rather than a
-    smaller guard; each named ``emit`` enters a ``Deferral``; and no named method, nor any method
-    of the same class it reaches through ``self.<name>(...)`` calls — followed transitively, each
-    once — stores to ``self`` (:func:`_self_stores` says which forms count) except where
-    ``immediate`` allows that attribute in that method. A store there is a second ledger
-    committed beside the helper's, which is the defect FR-002 refuses.
+    attribute, a subscript or an unpacking, its pending drops outlive the call. Also everywhere:
+    every class whose ``emit`` enters a ``Deferral`` is listed in ``sites`` with ``emit`` among
+    its functions, so the site list is derived from the tree rather than trusted, and a class
+    converted to the helper but never listed is a finding rather than a site the store checks
+    below never visit. In a named site only: the module imports ``Deferral`` from the helper's
+    module; every named class exists at module level and every named method in its body, so a
+    rename is a finding rather than a smaller guard; each named ``emit`` enters a ``Deferral``;
+    and no named method, nor any method of the same class it reaches through ``self.<name>(...)``
+    calls — followed transitively, each once — stores to ``self`` (:func:`_self_stores` says
+    which forms count) except where ``immediate`` allows that attribute in that method. A store
+    there is a second ledger committed beside the helper's, which is the defect FR-002 refuses.
 
     **What it does not check.** It follows only a call spelt ``self.<name>(...)`` to a ``def`` in
     the same class body, so an inherited method, an override in a subclass (the HTTP platform
@@ -419,6 +463,8 @@ def deferral_findings(
     name spelt ``self``, so an alias (``me = self``) hides one, and it does not see a mutating
     method call (``self.counts.update(...)``). Outside a named site it does not see a blessed
     ``Deferral``'s local stored afterwards; inside one that is a store to ``self`` and a finding.
+    A ``Deferral`` entered by an ``emit`` that is not a method — a module-level function — has
+    no class to list, so it is held only to the construction rule.
     It reads syntax, not data flow: a store on a path ``emit`` never takes at run time is still a
     finding, which is why the allowlist names methods. That the allowlist itself is exact is
     :func:`stale_immediate`'s check, over the whole tree.
@@ -454,6 +500,7 @@ def deferral_findings(
                 f"{where}:{call.lineno}: Deferral(...) bound to {ast.unparse(target)}, not a "
                 f"local name; one call's pending drops must stay local to that call"
             )
+    findings.extend(_unlisted_deferring_classes(where, tree, sites))
     if sites is None:
         return findings
     if not _imports_the_helper(tree):
@@ -470,11 +517,7 @@ def deferral_findings(
             if fn is None:
                 findings.append(f"{where}: {cls_name}.{name} not found; the site list is stale")
                 continue
-            if name == "emit" and not any(
-                isinstance(node, ast.With)
-                and any(_is_deferral_call(item.context_expr) for item in node.items)
-                for node in ast.walk(fn)
-            ):
+            if name == "emit" and not _enters_deferral(fn):
                 findings.append(f"{where}: {cls_name}.emit enters no Deferral")
             findings.extend(_reach(where, cls_name, fn, None, methods, seen, immediate, used))
     return findings
@@ -520,7 +563,16 @@ _BUILT_OUTSIDE = (
     "Deferral(...) built outside a `with` item in an emit; one call's pending drops must stay "
     "local to that call"
 )
-_STORES = "directly; count it through the Deferral"
+
+
+def _stores(cls_name: str, method: str) -> str:
+    """The tail of a store finding: both routes, the second naming the method that stores."""
+    return (
+        "directly; count it through the Deferral, or, if it must count as it happens, add "
+        f"({cls_name}, {method}) to IMMEDIATE with the reason"
+    )
+
+
 _BOUND = "not a local name; one call's pending drops must stay local to that call"
 _STALE_IMPORT = "m.py: does not import Deferral from log_foundry.sinks._deferral"
 
@@ -537,7 +589,7 @@ class Sink:
             self.dropped += len(batch)
 """,
         _ONE_EMIT,
-        [f"m.py:6: Sink.emit stores self.dropped {_STORES}"],
+        [f"m.py:6: Sink.emit stores self.dropped {_stores('Sink', 'emit')}"],
     ),
     "a locked += is still a second ledger": (
         _IMPORT
@@ -550,7 +602,7 @@ class Sink:
             self.dropped_oversized += 1
 """,
         _ONE_EMIT,
-        [f"m.py:8: Sink.emit stores self.dropped_oversized {_STORES}"],
+        [f"m.py:8: Sink.emit stores self.dropped_oversized {_stores('Sink', 'emit')}"],
     ),
     "a tuple target and a setattr are stores too": (
         _IMPORT
@@ -563,9 +615,9 @@ class Sink:
 """,
         _ONE_EMIT,
         [
-            f"m.py:6: Sink.emit stores self.a {_STORES}",
-            f"m.py:6: Sink.emit stores self.stats.b {_STORES}",
-            f"m.py:7: Sink.emit stores self.c {_STORES}",
+            f"m.py:6: Sink.emit stores self.a {_stores('Sink', 'emit')}",
+            f"m.py:6: Sink.emit stores self.stats.b {_stores('Sink', 'emit')}",
+            f"m.py:7: Sink.emit stores self.c {_stores('Sink', 'emit')}",
         ],
     ),
     "MultiSink's call counter is immediate on purpose": (
@@ -589,7 +641,7 @@ class Sink:
             self.failed += 1
 """,
         _ONE_EMIT,
-        [f"m.py:6: Sink.emit stores self.failed {_STORES}"],
+        [f"m.py:6: Sink.emit stores self.failed {_stores('Sink', 'emit')}"],
     ),
     "a helper the emit delegates to is checked by name": (
         _IMPORT
@@ -599,7 +651,7 @@ class Sink:
         self.dropped_oversized += 1
 """,
         {"Sink": ("emit", "_items")},
-        [f"m.py:10: Sink._items stores self.dropped_oversized {_STORES}"],
+        [f"m.py:10: Sink._items stores self.dropped_oversized {_stores('Sink', '_items')}"],
     ),
     "missing import": (_DEFERRED_EMIT, _ONE_EMIT, [_STALE_IMPORT]),
     "a Deferral imported from elsewhere is not the helper": (
@@ -628,7 +680,10 @@ class Sink:
             pass
 """,
         _ONE_EMIT,
-        [f"m.py:5: {_BUILT_OUTSIDE}", f"m.py:5: Sink.emit stores self._pending {_STORES}"],
+        [
+            f"m.py:5: {_BUILT_OUTSIDE}",
+            f"m.py:5: Sink.emit stores self._pending {_stores('Sink', 'emit')}",
+        ],
     ),
     "a with item outside an emit": (
         _IMPORT
@@ -653,7 +708,10 @@ class Sink:
     "a renamed class": (
         _IMPORT + _DEFERRED_EMIT.replace("class Sink", "class Renamed"),
         _ONE_EMIT,
-        ["m.py: class Sink not found; the site list is stale"],
+        [
+            "m.py: Renamed.emit enters a Deferral but is not listed in DEFERRING_SITES",
+            "m.py: class Sink not found; the site list is stale",
+        ],
     ),
     "a construction spelt through the module is still a construction": (
         _IMPORT
@@ -669,7 +727,7 @@ class Sink:
         _ONE_EMIT,
         [f"m.py:9: {_BUILT_OUTSIDE}"],
     ),
-    "a module that is not a site is held only to the construction rule": (
+    "a module that is not a site is not held to the store rule": (
         _IMPORT
         + """
 class Other:
@@ -679,6 +737,54 @@ class Other:
 """,
         None,
         [f"m.py:6: {_BUILT_OUTSIDE}"],
+    ),
+    "a class that enters a Deferral and is not listed is refused": (
+        _IMPORT
+        + """
+class Sink:
+    def emit(self, batch):
+        with Deferral(self) as pending:
+            records = self._records(batch)
+    def _records(self, batch):
+        with self._counter_lock:
+            self.dropped_oversized += 1
+""",
+        None,
+        ["m.py: Sink.emit enters a Deferral but is not listed in DEFERRING_SITES"],
+    ),
+    "an unlisted class beside a listed one is refused": (
+        _IMPORT
+        + _DEFERRED_EMIT
+        + """
+class Other:
+    def emit(self, batch):
+        with Deferral(self) as pending:
+            pass
+""",
+        _ONE_EMIT,
+        ["m.py: Other.emit enters a Deferral but is not listed in DEFERRING_SITES"],
+    ),
+    "a listed class whose emit is not among its functions is refused": (
+        _IMPORT
+        + _DEFERRED_EMIT
+        + """
+    def _items(self, batch):
+        pass
+""",
+        {"Sink": ("_items",)},
+        ["m.py: Sink.emit enters a Deferral but is not listed in DEFERRING_SITES"],
+    ),
+    "every listed class that enters a Deferral is silent": (
+        _IMPORT
+        + _DEFERRED_EMIT
+        + """
+class Other:
+    def emit(self, batch):
+        with Deferral(self) as pending:
+            pass
+""",
+        {"Sink": ("emit",), "Other": ("emit",)},
+        [],
     ),
     "a store in a method a named function calls is still a store": (
         _IMPORT
@@ -694,7 +800,10 @@ class Sink:
             self.dropped_oversized += n
 """,
         {"Sink": ("emit", "_items")},
-        [f"m.py:11: Sink._bump, called from Sink._items, stores self.dropped_oversized {_STORES}"],
+        [
+            "m.py:11: Sink._bump, called from Sink._items, stores self.dropped_oversized "
+            + _stores("Sink", "_bump")
+        ],
     ),
     "a store two calls below the emit is still a store": (
         _IMPORT
@@ -709,7 +818,10 @@ class Sink:
         self.dropped += 1
 """,
         _ONE_EMIT,
-        [f"m.py:10: Sink._second, called from Sink._first, stores self.dropped {_STORES}"],
+        [
+            "m.py:10: Sink._second, called from Sink._first, stores self.dropped "
+            + _stores("Sink", "_second")
+        ],
     ),
     "a named function another one calls is reported under its own name": (
         _IMPORT
@@ -722,7 +834,7 @@ class Sink:
         self.dropped += 1
 """,
         {"Sink": ("emit", "_items")},
-        [f"m.py:8: Sink._items stores self.dropped {_STORES}"],
+        [f"m.py:8: Sink._items stores self.dropped {_stores('Sink', '_items')}"],
     ),
     "a helper two callers share is reported once": (
         _IMPORT
@@ -740,7 +852,7 @@ class Sink:
         self.dropped += 1
 """,
         _ONE_EMIT,
-        [f"m.py:13: Sink._c, called from Sink._a, stores self.dropped {_STORES}"],
+        [f"m.py:13: Sink._c, called from Sink._a, stores self.dropped {_stores('Sink', '_c')}"],
     ),
     "a recursive helper is walked once": (
         _IMPORT
@@ -755,7 +867,10 @@ class Sink:
         self.dropped += 1
 """,
         _ONE_EMIT,
-        [f"m.py:10: Sink._walk, called from Sink.emit, stores self.dropped {_STORES}"],
+        [
+            "m.py:10: Sink._walk, called from Sink.emit, stores self.dropped "
+            + _stores("Sink", "_walk")
+        ],
     ),
     "a call that reaches no store through self is silent": (
         _IMPORT
@@ -805,6 +920,26 @@ class HTTPSink:
         {"HTTPSink": ("emit",)},
         [],
     ),
+    "a store finding names the IMMEDIATE route for the method that stores": (
+        _IMPORT
+        + """
+class HTTPSink:
+    def emit(self, batch):
+        with Deferral(self) as pending:
+            self._give_up(batch)
+    def _give_up(self, chunk):
+        with self._counter_lock:
+            self.failed += 1
+""",
+        {"HTTPSink": ("emit",)},
+        [
+            (
+                "m.py:9: HTTPSink._give_up, called from HTTPSink.emit, stores self.failed "
+                "directly; count it through the Deferral, or, if it must count as it happens, "
+                "add (HTTPSink, _give_up) to IMMEDIATE with the reason"
+            )
+        ],
+    ),
     "the allowance is the method's, not the class's": (
         _IMPORT
         + """
@@ -819,7 +954,7 @@ class HTTPSink:
         [
             (
                 f"m.py:8: HTTPSink._items, called from HTTPSink.emit, stores "
-                f"self.dropped_oversized {_STORES}"
+                f"self.dropped_oversized {_stores('HTTPSink', '_items')}"
             )
         ],
     ),
@@ -834,7 +969,7 @@ class Sink:
         _ONE_EMIT,
         [
             f"m.py:5: Deferral(...) bound to self._pending, {_BOUND}",
-            f"m.py:5: Sink.emit stores self._pending {_STORES}",
+            f"m.py:5: Sink.emit stores self._pending {_stores('Sink', 'emit')}",
         ],
     ),
     "a Deferral bound to a subscript is refused outside a site too": (
@@ -847,7 +982,10 @@ class Other:
             pass
 """,
         None,
-        [f"m.py:6: Deferral(...) bound to box[0], {_BOUND}"],
+        [
+            f"m.py:6: Deferral(...) bound to box[0], {_BOUND}",
+            "m.py: Other.emit enters a Deferral but is not listed in DEFERRING_SITES",
+        ],
     ),
     "a for target on self is a store": (
         _IMPORT
@@ -859,7 +997,7 @@ class Sink:
                 pass
 """,
         _ONE_EMIT,
-        [f"m.py:6: Sink.emit stores self.dropped {_STORES}"],
+        [f"m.py:6: Sink.emit stores self.dropped {_stores('Sink', 'emit')}"],
     ),
     "every other binding form that can take an attribute is a store": (
         _IMPORT
@@ -884,7 +1022,7 @@ class Sink:
 """,
         _ONE_EMIT,
         [
-            f"m.py:{line}: Sink.emit stores self.{attr} {_STORES}"
+            f"m.py:{line}: Sink.emit stores self.{attr} {_stores('Sink', 'emit')}"
             for attr, line in [
                 ("a", 6),
                 ("b", 7),
@@ -940,9 +1078,10 @@ class Sink:
 def test_every_deferring_site_takes_the_one_helper() -> None:
     """FR-002's instrument, over the real package: five sites, one helper, no second ledger.
 
-    The construction rule runs over every module under ``src/``, so a sixth site that builds a
-    ``Deferral`` is held to it before anyone adds it to :data:`DEFERRING_SITES`; the other checks
-    run on the five sites by name, and a site that has moved is a finding. The allowlist is held
+    The construction rule and the roster rule run over every module under ``src/``, so a sixth
+    site that builds a ``Deferral`` is held to the first, and one whose ``emit`` enters a
+    ``Deferral`` is a finding until it is added to :data:`DEFERRING_SITES`; the other checks run
+    on the listed sites by name, and a site that has moved is a finding. The allowlist is held
     exact over the same run: an :data:`IMMEDIATE` entry no deferring function reached is stale.
     """
     modules = {path.relative_to(_SRC).as_posix(): path for path in sorted(_SRC.rglob("*.py"))}

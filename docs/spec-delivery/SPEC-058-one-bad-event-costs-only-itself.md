@@ -11,7 +11,8 @@ count.**
   commits them on a clean exit only, under the owner's `_counter_lock`; `wrapped_losses` is the
   wrappers' `losses()` rule. An AST check with a fixture corpus (`tests/test_deferral.py`) refuses a
   second accumulate-then-commit in the five modules that use it, following `self.<method>()` calls
-  within each class; the stores kept immediate on purpose are named in its `IMMEDIATE` allowlist.
+  within each class; a class whose `emit` enters a `Deferral` unlisted is itself a finding, and
+  the stores kept immediate on purpose are named in its `IMMEDIATE` allowlist.
 - **`MultiSink` counts every raise it swallows** (FR-007), a reporting child's included, and only
   when it returns; all children raising re-raises the first and counts nothing.
 - **A transform's output is checked, then coerced for type only** (FR-001): invariant 8's
@@ -75,6 +76,11 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
   `KafkaSink`, `GooglePubSubSink`, and `HTTPSink._drop_refused`'s conditional path. It applies
   `Deferral` to each and revisits `_socket.py`'s "nothing here can fix it" and the "`dropped` is an
   exact count" claims, both left standing.
+- **`LoggingSink`'s per-event caller code** is a sibling the spec does not name, pre-existing and
+  not a regression: `emit` calls `logger.handle` per event, so a `logging.Filter` raising for one
+  event leaves after the events before it were handled and the retry re-delivers them. Measured
+  at `ed21cc6`: one such event of 7 gave 16 handled records for 4 distinct events, then "lost 7;
+  batch abandoned". Recorded in the spec's *Out of Scope*; a follow-up spec's.
 - **Unmeasured:** the 4 MiB small-stack criterion assumes the check raises `RecursionError` rather
   than killing the process; measured on macOS only (3.13.1 dies at 1 MiB). Linux frame sizes on CI
   are unmeasured. The criterion runs in a child interpreter, so a crash there fails that one test
