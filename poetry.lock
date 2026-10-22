@@ -225,16 +225,16 @@ redis = ["redis (>=2.10.5)"]
 
 [[package]]
 name = "certifi"
-version = "2026.6.17"
+version = "2026.10.19"
 description = "Python package for providing Mozilla's CA Bundle."
 optional = false
 python-versions = ">=3.7"
 groups = ["main", "security"]
 files = [
-    {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
-    {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
+    {file = "certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b"},
+    {file = "certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae"},
 ]
-markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\"", security = "python_version < \"4.0\""}
+markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "cffi"
@@ -465,7 +465,7 @@ files = [
     {file = "charset_normalizer-3.4.9-py3-none-any.whl", hash = "sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5"},
     {file = "charset_normalizer-3.4.9.tar.gz", hash = "sha256:673611bbd43f0810bec0b0f028ddeaaa501190339cac411f347ac76917c3ae7b"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "clickhouse-connect"
@@ -1163,7 +1163,7 @@ files = [
     {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
     {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [package.extras]
 all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
@@ -2611,7 +2611,7 @@ files = [
     {file = "requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0"},
     {file = "requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [package.dependencies]
 certifi = ">=2023.5.7"
@@ -3038,7 +3038,7 @@ files = [
     {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
     {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
 ]
-markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\")", security = "python_version == \"3.12\""}
+markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")", security = "python_version == \"3.12\""}
 
 [[package]]
 name = "tzdata"
@@ -3080,7 +3080,7 @@ files = [
     {file = "urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3"},
     {file = "urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63"},
 ]
-markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\"", security = "python_version < \"4.0\""}
+markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
 
 [package.extras]
 brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.0) ; platform_python_implementation != \"CPython\""]
