@@ -513,6 +513,33 @@ def test_nested_wrappers_each_count_their_own() -> None:
     assert outer.losses() == SinkLosses(dropped=2, failed=0)
 
 
+_PUBLIC_AT_324936E = frozenset({"close", "emit", "flush", "log_foundry_stop_signal", "losses"})
+"""Both wrappers' names not starting with ``_``, measured on instances built from ``324936e``.
+
+Taken from that tree's own source (``git archive 324936e src``, imported in isolation, the same
+for both classes), not from the code under test, so a new public name fails here rather than
+being copied into the expectation.
+"""
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_neither_wrapper_gains_a_public_name(kind: str) -> None:
+    """FR-003: the count is private, so the public names equal the pre-SPEC-058 set (invariant 10).
+
+    Checked after construction and again after a counted failure, so a public attribute set
+    lazily by the first commit is caught too.
+    """
+    sink = _wrapper(kind, Recording(), fails=lambda e: e["i"] == 1)
+
+    def public() -> set[str]:
+        return {name for name in dir(sink) if not name.startswith("_")}
+
+    assert public() == _PUBLIC_AT_324936E
+    sink.emit([_ev(0), _ev(1)])
+    assert sink.losses() == SinkLosses(dropped=1, failed=0), "the failure was counted"
+    assert public() == _PUBLIC_AT_324936E
+
+
 def test_a_parked_commit_loses_no_increment(monkeypatch: pytest.MonkeyPatch) -> None:
     """A second commit while the first is parked between its read and its write: both land."""
     counter = ParkingCounter("_dropped")
