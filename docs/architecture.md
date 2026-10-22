@@ -413,9 +413,16 @@ in part by SPEC-058, which settles three more cases the same way, counted rather
 **unrenderable** event in the HTTP family, alone or beside oversized ones (the sink's own render
 of identical input fails identically), a wrapper batch of **one failure and every other event
 deliberately dropped**, and an SQS batch of **an id-callable failure and an oversized event**.
-Beneath all of them sits SPEC-058's principle: a raising `emit` counts nothing, and whoever
+Beneath those three sits SPEC-058's principle: a raising `emit` counts nothing, and whoever
 catches the raise — the worker, the orphan path, or a `MultiSink` that swallowed it — owns the
-batch's count, so a per-event drop is counted only by an `emit` that returned.
+batch's count. SPEC-058 applies it at five sites — the drops `TransformSink`, `FilteringSink`,
+`SQSSink._chunks` and `HTTPSink._items` decide, and `MultiSink`'s absorbed count — and only
+there is a count made only by an `emit` that returned. Elsewhere a count can still land before a
+raise and again on the worker's retry: a sink's own `failed` count, an upper bound, the SQS
+sender fault included — `SQSSink._send` counts it before `emit` raises for a recoverable loss
+beside it — and in `dropped`, `HTTPSink._drop_refused`'s conditional `413` path and the nine sinks a
+follow-up spec owns, listed in the `docs/decisions/sink-delivery.md` entry *A raising `emit`
+counts nothing*.
 
 **The same rule reaches the sink's own lifecycle** (SPEC-032): a sink whose `close()` released or
 invalidated a transport must **raise** on a later non-empty `emit` rather than absorb it — a

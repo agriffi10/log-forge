@@ -55,12 +55,19 @@ bound (`health()` docstring); `queued` also counts a `flush()` marker stranded b
 `shutdown()`, for the life of the process (`Health.queued` docstring, SPEC-050 FR-001); ~~three
 losses are counted but never retried, because a retry would duplicate — an unadjudicable batch
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017)~~ — superseded
-by SPEC-058: five losses are counted but never retried — an unadjudicable batch response, an SQS
-sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or an SQS id
-callable's per-event failure when its siblings were delivered, and an unrenderable HTTP event
-(SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
-Each is counted only by an `emit` that returned; one that raised counts nothing, and whoever
-caught it — the worker, the orphan path or `MultiSink` — owns the batch (SPEC-058).
+by SPEC-058: five losses are counted but never retried by the sink — an unadjudicable batch
+response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or
+an SQS id callable's per-event failure when its siblings were delivered, and an unrenderable HTTP
+event (SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
+At the five sites SPEC-058 defers — the drops `TransformSink`, `FilteringSink`, `SQSSink._chunks`
+and `HTTPSink._items` decide, and `MultiSink`'s absorbed count — a count is made only by an
+`emit` that returned; one that raised counts none of them, and whoever caught it — the worker,
+the orphan path or `MultiSink` — owns the batch (SPEC-058). Elsewhere a count can land before a
+raise and again each time the worker retries that batch: a sink's own `failed` count, the upper
+bound above, the SQS sender fault included (`SQSSink._send` counts it before `emit` raises for a
+recoverable loss beside it); and in `dropped`, `HTTPSink._drop_refused`'s conditional `413` path
+and the nine sinks a follow-up spec owns (`docs/decisions/sink-delivery.md`, the entry *A raising
+`emit` counts nothing*).
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`; `tests/test_invariants_model.py`
 is the identity itself.
 

@@ -10,7 +10,8 @@ count.**
 - **One deferral helper** (`sinks/_deferral.py`): `Deferral` holds one call's pending drops and
   commits them on a clean exit only, under the owner's `_counter_lock`; `wrapped_losses` is the
   wrappers' `losses()` rule. An AST check with a fixture corpus (`tests/test_deferral.py`) refuses a
-  second accumulate-then-commit in the five modules that use it.
+  second accumulate-then-commit in the five modules that use it, following `self.<method>()` calls
+  within each class; the stores kept immediate on purpose are named in its `IMMEDIATE` allowlist.
 - **`MultiSink` counts every raise it swallows** (FR-007), a reporting child's included, and only
   when it returns; all children raising re-raises the first and counts nothing.
 - **A transform's output is checked, then coerced for type only** (FR-001): invariant 8's
@@ -49,9 +50,12 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
 - A transform's non-JSON output (`bytes`, `datetime`, NaN, a lone surrogate) is coerced, not a failed
   batch; a result nested past 100 levels is cut at `<depth limit>` and marked `truncated`.
 - A transform's non-`dict`, non-`None` result is now a per-event failure (it was forwarded).
-- `dropped` at the edited sites is counted when `emit` returns: a retried batch counts a drop once,
-  an abandoned one zero times at the sink. The oversize lines of `HTTPSink` and `SQSSink` print after
-  the requests, not before.
+- A count decided at the five deferring sites — the drops of `TransformSink`, `FilteringSink`,
+  `SQSSink._chunks` and `HTTPSink._items`, and `MultiSink`'s absorbed count — lands when `emit`
+  returns: a retried batch counts a drop once, an abandoned one zero times at the sink.
+  `HTTPSink._drop_refused`'s `413` drop, a sink's own `failed` (the SQS sender fault included) and
+  the nine sinks under *Follow-ups* still count as they happen. The oversize lines of `HTTPSink`
+  and `SQSSink` print after the requests, not before.
 - `TransformSink.losses()` and `FilteringSink.losses()` are non-`None` once the wrapper has counted a
   drop, over an inner sink that reports nothing. `HTTPSink`'s all-unrenderable batch settles without
   raising, so a single unrenderable event moves from `orphan_lost` to `health().sink.dropped`.
@@ -73,7 +77,8 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
   exact count" claims, both left standing.
 - **Unmeasured:** the 4 MiB small-stack criterion assumes the check raises `RecursionError` rather
   than killing the process; measured on macOS only (3.13.1 dies at 1 MiB). Linux frame sizes on CI
-  are unmeasured; a crash would surface as an xdist "node down".
+  are unmeasured. The criterion runs in a child interpreter, so a crash there fails that one test
+  with the child's return code (a negative signal number) rather than taking an xdist worker down.
 - SPEC-057 also edits the coercer and §8; whichever lands second rebases (`INDEX.md` Arcs).
 
 ## Verification
