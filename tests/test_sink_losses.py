@@ -77,8 +77,12 @@ class DeadSink(QuietSink):
 class FailingReporter(QuietSink):
     """Fails *and* counts its own loss — what a sink satisfying SPEC-026 FR-001 does.
 
-    The case `MultiSink`'s per-child probe exists for: charging its events to the fan-out as
-    well would report every one of them twice.
+    ~~The case `MultiSink`'s per-child probe exists for: charging its events to the fan-out as
+    well would report every one of them twice.~~ — superseded by SPEC-058 FR-007, which removed
+    the probe. The fan-out now absorbs every raise it swallows, this child's included, so its
+    events are in ``failed`` twice: once as its own count and once as the fan-out's. That is the
+    upper-bound term, and FR-007 accepts the over-count there so that a child which raises
+    *without* counting — every deferring sink — still leaves its events in some term.
     """
 
     def __init__(self) -> None:
@@ -361,15 +365,16 @@ def test_a_healthy_fan_out_still_reports_zero() -> None:
 
 
 def test_a_child_that_gains_losses_is_categorised_at_the_time_of_each_failure() -> None:
-    """AC-3. Silence is decided per call by ``read_losses``, not cached at construction.
+    """SPEC-036 AC-3, restated by SPEC-058 FR-007: there is no category left to decide.
 
-    The accrual happens at **emit** time, not when the aggregate is read, so what a child
-    *gaining* a ``losses()`` does is make the total **rise** — the events it lost while silent
-    stay charged to the fan-out, and it now adds its own on top. The spec's AC-3 was written
-    expecting a decision at aggregate time and recorded the consequence as a fall; that is the
-    wrong direction for this implementation, and the fall is reachable the other way, by a child
-    that *stops* reporting (see below). Caching the category at construction would be worse
-    still: a child would be permanently miscategorised.
+    ~~Silence is decided per call by ``read_losses``, not cached at construction.~~ — superseded
+    by SPEC-058 FR-007. The fan-out no longer asks whether a failing child reports: it counts
+    every raise it swallows, in events, at the moment ``emit`` returns. So a child *gaining* a
+    ``losses()`` still makes the total **rise**, for a simpler reason than before — the 3 the
+    fan-out absorbed stay absorbed, and the child's own 1 is added on top. The figures are the
+    same under both rules (3, then 4), which is why this test kept its name; what changed is
+    that a raising child that reports from the start is now absorbed too, which the three tests
+    below pin. The fall in the other direction, a child that *stops* reporting, is unchanged.
     """
 
     class LateReporter(QuietSink):
@@ -426,46 +431,50 @@ def test_the_aggregate_can_fall_when_a_child_stops_reporting() -> None:
 
 
 def test_the_aggregate_does_not_double_count_a_reporting_child() -> None:
-    """AC-2. The exact total, with one reporting child and one silent one.
+    """SPEC-036 AC-2, reversed in part by SPEC-058 FR-007: the reporting child is absorbed too.
 
-    ``FailingReporter`` is the case the guard exists for and the one a first draft of this file
-    did not have: a child that **both fails and reports its own loss**. Every other child here
-    either succeeds (`CountingSink`) or fails while reporting ``None``, and against those the
-    per-child probe is unobservable — deleting it (`silent = True`) left the whole suite green.
-    Measured against a real `SyslogSink` on a closed port: 6 lost events read as 12.
+    ~~The exact total, with one reporting child and one silent one: 4 the reporting child
+    counted itself + 4 events at the silent one, 8 and not 12.~~ — superseded by SPEC-058
+    FR-007. A deferring child raises having counted nothing, so trusting a reporting child to
+    have counted its own loss left that loss in no term. The fan-out now absorbs every raise it
+    swallows, and 12 is the accepted figure: the reporting child's 4 are in ``failed`` twice,
+    once as its own count and once as the fan-out's. ``failed`` is the upper-bound term
+    (``SinkLosses``), so this over-count is the documented cost; ``dropped``, the exact term, is
+    still never counted twice, and the name keeps that half of its claim.
     """
     multi = MultiSink(QuietSink(), FailingReporter(), DeadSink())
     multi.emit([{"a": 1}, {"b": 2}, {"c": 3}, {"d": 4}])  # a sibling took it, so no total failure
 
-    assert multi.losses() == SinkLosses(dropped=0, failed=8), (
-        "4 the reporting child counted itself + 4 events at the silent one — not 12, which is "
-        "what charging the reporting child's events to the fan-out as well would give"
+    assert multi.losses() == SinkLosses(dropped=0, failed=12), (
+        "4 the reporting child counted itself + 4 absorbed for it + 4 absorbed for the silent one"
     )
     assert multi.failed == 2, "and the call counter still counts calls, both of them"
 
 
-def test_a_reporting_child_that_fails_is_never_charged_twice() -> None:
-    """AC-2 at the boundary: the fan-out must add **nothing** for a child that reports itself."""
+def test_a_reporting_child_that_fails_is_absorbed_by_the_fan_out_too() -> None:
+    """SPEC-058 FR-007 at the boundary: a swallowed raise is absorbed whatever the child reports.
+
+    Renamed from ``..._is_never_charged_twice``, which stated the SPEC-036 claim FR-007
+    reverses. The child's own 3 are in the sum, and the fan-out adds the batch it swallowed.
+    """
     multi = MultiSink(QuietSink(), FailingReporter())
     multi.emit([{"a": 1}, {"b": 2}, {"c": 3}])
 
-    assert multi.losses() == SinkLosses(dropped=0, failed=3), (
-        "the child's own 3, and not a second 3 from the fan-out"
+    assert multi.losses() == SinkLosses(dropped=0, failed=6), (
+        "the child's own 3, plus the 3 the fan-out absorbed when it swallowed the raise"
     )
 
 
-def test_a_reporting_child_that_does_not_self_count_stays_invisible() -> None:
-    """The premise FR-005 rests on, made explicit rather than assumed.
+def test_a_reporting_child_that_does_not_self_count_is_absorbed_by_the_fan_out() -> None:
+    """The premise SPEC-036 FR-005 rested on, and the reason SPEC-058 FR-007 removed it.
 
-    The fix leaves a reporting child to report itself, which is only safe because a sink that
-    raises also counts. A child implementing ``losses()`` that raises *without* self-counting is
-    therefore invisible — it is not silent, so the fan-out adds nothing, and it reports zero.
-    That is a defect in such a child, not in the fan-out. The obligation is written down —
-    SinkLosses's own docstring in sinks/base.py requires the counter to move before the
-    total-failure raise, and every shipped sink with a losses() does increment first — but
-    Sink.losses's wording ("loss it absorbed") read alone would excuse a raising sink from
-    counting, so which sentence wins is exactly what this test depends on. Pinned here so a later
-    reader meets it as a decision rather than discovering it as a surprise.
+    Renamed from ``..._stays_invisible``. ~~The fix leaves a reporting child to report itself,
+    which is only safe because a sink that raises also counts; a child implementing ``losses()``
+    that raises without self-counting is therefore invisible.~~ — superseded by SPEC-058 FR-007.
+    Every deferring sink is exactly such a child: under the deferral rule a raising ``emit``
+    counts nothing, so the catcher above owns the batch, and when a sibling delivered the
+    catcher is this fan-out. It therefore counts the swallowed batch for a reporting child as it
+    always did for a silent one.
     """
 
     class ReportsNothingUseful(QuietSink):
@@ -478,8 +487,8 @@ def test_a_reporting_child_that_does_not_self_count_stays_invisible() -> None:
     multi = MultiSink(QuietSink(), ReportsNothingUseful())
     multi.emit([{"a": 1}, {"b": 2}])
 
-    assert multi.losses() == SinkLosses(dropped=0, failed=0), (
-        "not a number this fan-out can invent: the child said it lost nothing"
+    assert multi.losses() == SinkLosses(dropped=0, failed=2), (
+        "the child reported zero, but its raise was swallowed here, so its two events are absorbed"
     )
 
 

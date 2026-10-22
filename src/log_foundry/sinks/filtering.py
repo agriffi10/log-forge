@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -24,6 +25,14 @@ class FilteringSink:
     This is a static, emit-time filter in front of an inner sink, not the reserved
     tail-sampling ``should_send`` seam (arch §10) — that stays deferred and owns rate policy at
     span-decision time, while this only reshapes an already-built batch on its way to a sink.
+
+    **A predicate that fails for one event costs only that event** (SPEC-058 FR-002). The
+    predicate runs before the level floor, as it always has, so a below-floor event whose
+    predicate raises is a failure rather than a quiet drop. A failure drops that event, the rest
+    of the batch is forwarded, and the failures are counted in :meth:`losses` and announced once
+    per batch, only once the inner sink's ``emit`` returned. When every event of a batch failed,
+    the first exception is re-raised unchanged and nothing is counted, because whoever catches it
+    owns the batch.
 
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
@@ -61,6 +70,8 @@ class FilteringSink:
         self._stop_signal: threading.Event | None = None
         self._predicate = predicate
         self._min_rank: int | None = None
+        self._counter_lock = threading.Lock()
+        self._dropped = 0
         if min_level is not None:
             rank = _LEVELS.get(min_level.upper())
             if rank is None:
@@ -72,7 +83,14 @@ class FilteringSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Forwards the events that clear both the predicate and the level floor, in order.
 
-        When nothing passes, the inner sink's ``emit`` is not called at all (FR-003).
+        When nothing passes, the inner sink's ``emit`` is not called at all (FR-003). Each event
+        is tested under its own guard (SPEC-058 FR-002), which catches ``Exception`` and never
+        ``BaseException``, so a predicate that raises for one event drops that event only. A
+        ``False`` predicate or the level floor declines an event, which is not loss.
+
+        The failures are counted and announced through the deferral helper, so they land only
+        if this call returns normally: an inner sink that raises propagates with nothing counted,
+        because the worker retries the whole batch and the predicate runs again.
 
         Args:
           batch: The events to filter.
@@ -81,11 +99,38 @@ class FilteringSink:
           None.
 
         Raises:
-          Exception: Whatever the predicate or the inner sink raises.
+          Exception: The predicate's first exception, unchanged and with nothing counted, when
+            every event of the batch failed and none was declined. Otherwise whatever the inner
+            sink's ``emit`` raises.
         """
-        kept = [event for event in batch if self._passes(event)]
-        if kept:
-            self._inner.emit(kept)
+        kept: list[dict[str, object]] = []
+        declined = False
+        failures = 0
+        first: Exception | None = None
+        with Deferral(self) as pending:
+            for event in batch:
+                try:
+                    passes = self._passes(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
+                if passes:
+                    kept.append(event)
+                else:
+                    declined = True
+            if first is not None and not kept and not declined:
+                raise first
+            if failures:
+                kind = type(first).__name__
+                pending.count("_dropped", failures)
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", failures, f"FilteringSink, the predicate raised {kind}"
+                    )
+                )
+            if kept:
+                self._inner.emit(kept)
 
     def _passes(self, event: dict[str, object]) -> bool:
         """Reports whether an event clears the predicate and the minimum level.
@@ -100,7 +145,8 @@ class FilteringSink:
           True when the event should be forwarded.
 
         Raises:
-          Exception: Whatever the predicate raises.
+          Exception: The predicate's own exception, propagated so :meth:`emit` can count it as
+            that one event's failure (SPEC-058 FR-002).
         """
         if self._predicate is not None and not self._predicate(event):
             return False
@@ -174,26 +220,32 @@ class FilteringSink:
         flush_sink(self._inner)
 
     def losses(self) -> SinkLosses | None:
-        """Reports the inner sink's losses (SPEC-026 FR-002).
+        """Reports the inner sink's losses plus the events this wrapper's predicate failed on.
 
         A wrapper that reported nothing would hide the destination it wraps: ``health().sink``
-        would read ``None`` for a filter in front of a sink that counts perfectly well. Events
-        this sink itself declines to forward are not loss — they are the configuration working,
-        the same reason ``NullSink`` reports nothing.
+        would read ``None`` for a filter in front of a sink that counts perfectly well
+        (SPEC-026 FR-002). Events this sink itself declines to forward are not loss — they are
+        the configuration working, the same reason ``NullSink`` reports nothing. Events the
+        predicate *failed* on are: :meth:`emit` counts them once the batch is settled, and they
+        are added to ``dropped`` here (SPEC-058 FR-003).
 
         Args:
           None.
 
         Returns:
-          The inner sink's losses. ``None`` passes through unchanged rather than becoming
-          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports
-          nothing" from "the sink reports no loss", and flattening the two would claim a
-          clean bill of health on a sink that never gave one.
+          ``None`` only when the inner sink reports ``None`` and this wrapper has counted
+          nothing: FR-003 distinguishes "the sink reports nothing" from "the sink reports no
+          loss", and flattening the two would claim a clean bill of health on a sink that never
+          gave one. Otherwise the inner sink's losses, an inner ``None`` read as zeros, with this
+          wrapper's own count added to ``dropped`` (SPEC-058 FR-003).
 
         Raises:
           None.
         """
-        return read_losses(self._inner)
+        inner = read_losses(self._inner)
+        with self._counter_lock:
+            own = self._dropped
+        return wrapped_losses(inner, own)
 
     def close(self) -> None:
         """Closes the inner sink (FR-003).

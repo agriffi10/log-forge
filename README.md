@@ -1095,10 +1095,14 @@ because no worker exists: since SPEC-054 it is answered
 from the configuration, so it reports on the orphan path too. Note the two `dropped` fields count
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
-itself two causes, which is why the diagnostic line matters. Most sinks drop only what can never
-fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused outright, which may
-be backpressure one layer further out than the worker's, or may be a misconfiguration. The stderr
-line carries the exception type that distinguishes them.
+itself several causes, which is why the diagnostic line matters. Most sinks drop only what can
+never fit; `KafkaSink` and `GooglePubSubSink` also count what their client refused outright, which
+may be backpressure one layer further out than the worker's, or may be a misconfiguration — the
+stderr line carries the exception type that distinguishes them. And `TransformSink`,
+`FilteringSink`, a FIFO `SQSSink` and the HTTP sinks count an event that your own code — the
+transform, the predicate, an id callable — or the sink's render failed on, dropped alone so the
+rest of its batch is still delivered; each such batch writes one `log-foundry: lost N event(s)`
+line to stderr naming the sink and the exception type.
 
 `sink.failed` is an **upper bound** on loss, not a count of it. A sink that raises on total failure
 counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a

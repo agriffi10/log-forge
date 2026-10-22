@@ -408,7 +408,9 @@ class PostgresSink:
           The statement parameters, in column order.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001).
         """
         return (*(event.get(col) for col in _COLUMNS), json.dumps(event))
 

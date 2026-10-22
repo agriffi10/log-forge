@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.honeycomb import HoneycombSink
@@ -281,7 +282,7 @@ def test_splunk_still_offers_an_event_whose_real_body_is_smaller_than_one_refuse
         {"timestamp": stamp, "pad": "x" * 30},
     ]
     probe = SplunkHECSink("http://splunk:8088", "tok")
-    items = [probe._items([event])[0] for event in events]
+    items = [probe._items([event], Deferral(probe))[0] for event in events]
     bodies = [len(probe._body([item])[0]) for item in items]
     assert bodies[0] - bodies[1] == 1, f"fixture must straddle the one-byte window: {bodies}"
     assert items[1].size == bodies[0], (

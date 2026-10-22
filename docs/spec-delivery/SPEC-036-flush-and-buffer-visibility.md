@@ -19,8 +19,10 @@ counter is visible. Shipped in three PRs, grouped by review frame rather than by
   `Health.in_span_lost`, incremented under a dedicated `decorator._loss_lock`.
 - **FR-004 — a task outliving its span.** `_flush` detaches the buffer by swap; `Span.closed` is
   read by `api._log` at append time so a late append takes the orphan route.
-- **FR-005 — a dead `MultiSink` child is visible.** Per-child accrual for children that report
-  nothing, in events rather than calls.
+- **FR-005 — a dead `MultiSink` child is visible.** ~~Per-child accrual for children that report
+  nothing, in events rather than calls.~~ — superseded by SPEC-058 FR-007: accrual for **every**
+  child raise the fan-out swallows, reporting or silent, still in events, committed only when its
+  `emit` returns.
 
 **Deviations, each recorded in place.** FR-002 AC-3's "count the remainder" is not counted as
 loss: those messages are still queued, so booking them would report a loss that has not happened.

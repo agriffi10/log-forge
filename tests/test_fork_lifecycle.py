@@ -42,6 +42,7 @@ from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
 
 # FR-004 AC-5's roster is the one `test_sink_concurrency` already derives -- every class in
@@ -909,6 +910,88 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     )
     assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
     assert child.output == at_the_log_call, child.output
+
+
+def _fails_for_marked(event: dict[str, object]) -> dict[str, object]:
+    """A transform that fails for the one event marked ``bad``, so a commit takes the lock."""
+    if event.get("bad"):
+        raise ValueError("marked")
+    return event
+
+
+def _held_by_a_parent_thread(lock: Any) -> tuple[threading.Event, threading.Thread]:
+    """Holds ``lock`` on a parent thread until the returned event is set."""
+    holding, released = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with lock:
+            holding.set()
+            released.wait(5.0)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert holding.wait(5.0)
+    return released, holder
+
+
+def test_a_child_does_not_block_on_a_wrappers_inherited_count_lock() -> None:
+    """SPEC-058 FR-003. A wrapper's count lock, held by a parent thread at the fork, is repaired.
+
+    The wrapper is configured so the walk can reach it — a wrapper nothing in the package holds
+    keeps whatever it inherited, as every owned sink does. The child's batch carries one failure
+    beside a good event, so ``emit`` commits a count and takes the lock, and ``losses()`` takes it
+    again.
+    """
+    wrapper = TransformSink(MemorySink(), _fails_for_marked)
+    log_foundry.configure(service="fork", version="0", env="test", sink=wrapper)
+    released, holder = _held_by_a_parent_thread(wrapper._counter_lock)
+
+    def emit_then_read() -> str:
+        wrapper.emit([{"bad": True}, {"bad": False}])
+        losses = wrapper.losses()
+        return f"dropped={losses.dropped if losses else None}"
+
+    try:
+        child = run_in_child(emit_then_read)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "dropped=1", child.output
+
+
+def test_the_same_child_blocks_when_the_wrappers_count_lock_is_put_back() -> None:
+    """The positive control: with the inherited lock restored, the same child hangs in ``emit``.
+
+    The marker is written after the lock is put back and immediately before the call, so
+    ``output`` tells "blocked at the commit" from "never arrived" — the precedent's construction.
+    """
+    wrapper = TransformSink(MemorySink(), _fails_for_marked)
+    log_foundry.configure(service="fork", version="0", env="test", sink=wrapper)
+    inherited = wrapper._counter_lock
+    released, holder = _held_by_a_parent_thread(inherited)
+
+    at_the_call = "at-the-call"
+
+    def unrepair_then_emit() -> str:
+        wrapper._counter_lock = inherited  # type: ignore[assignment]
+        report_from_child(at_the_call)
+        wrapper.emit([{"bad": True}, {"bad": False}])
+        return "returned"
+
+    try:
+        child = run_in_child(unrepair_then_emit, timeout=4)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.output.startswith(at_the_call), (
+        f"the child never reached the call, so the hang was never entered: it {child.ending}, "
+        f"having written {child.output!r}."
+    )
+    assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
+    assert child.output == at_the_call, child.output
 
 
 def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) -> None:

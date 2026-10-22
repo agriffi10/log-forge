@@ -278,7 +278,9 @@ def read_losses(sink: object) -> SinkLosses | None:
       The sink's losses, or ``None`` when it reports nothing. ``None`` covers four cases
       deliberately treated alike: no ``losses`` attribute, one that is not callable, one that
       raised, and one that returned anything other than a ``SinkLosses`` — including ``None``
-      itself, which the shipped wrapper sinks return when what they wrap reports nothing.
+      itself, which the shipped wrapper sinks return when what they wrap reports nothing and
+      they have counted nothing of their own; one that has counted a drop reports it over an
+      inner sink that reports nothing (SPEC-058 FR-003).
 
     Raises:
       None. ``health()`` is documented as never raising and is the call an operator makes when

@@ -14,6 +14,7 @@ from typing import Any, NoReturn, TypedDict
 from urllib.parse import urlparse
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import clamp_server_delay, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -408,7 +409,10 @@ class HTTPSink:
         budget cannot see.
       failed: Requests abandoned past the retry bound, counted per chunk.
       dropped_oversized: Events dropped for exceeding the per-event ceiling, plus those a
-        destination answered ``413`` to and no split could rescue.
+        destination answered ``413`` to and no split could rescue. The ceiling drops are counted
+        only when ``emit`` returns normally (SPEC-058 FR-005); a ``413`` drop is counted when it
+        happens. An event whose render raised is counted apart from this and folded into
+        ``losses().dropped``, so this stays oversize only.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -509,6 +513,7 @@ class HTTPSink:
         self._opener = opener if opener is not None else _no_redirect_opener()
         self.failed = 0
         self.dropped_oversized = 0
+        self._unrenderable = 0
         self._counter_lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -517,6 +522,13 @@ class HTTPSink:
         Subclasses must not override this. They shape the request through :meth:`_render`,
         :meth:`_body` and :meth:`_handle_response`, which is what keeps the chunk loop on every
         path to the wire.
+
+        The drops :meth:`_items` decides — an oversized event, an unrenderable one — are counted
+        and announced through the deferral helper, so they land only if this call returns
+        normally (SPEC-058 FR-005). They are decided before any request, and this call can still
+        raise afterwards and be retried whole: counting them first counted one oversized event
+        once per attempt. The ``413`` and abandonment counters below keep counting as they
+        happen, which is outside SPEC-058's scope.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -531,47 +543,52 @@ class HTTPSink:
             retry — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
             identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
             already apply). A batch that settled *some* chunks does not raise either: the worker
-            retries whole batches, so raising would re-send what landed.
+            retries whole batches, so raising would re-send what landed. A raise leaves nothing
+            from :meth:`_items` counted, and a batch whose every event was unrenderable or
+            oversized makes no request and does not raise.
         """
         if not batch:
             return
-        items = self._items(batch)
-        if not items:
-            return
-        budget = self._chunk_budget()
-        refused_at: int | None = None
-        reductions = index = chunks = settled = 0
-        while index < len(items):
-            chunk = self._take(items, index, budget)
-            if self._known_refused(chunk, refused_at):
-                self._drop_refused(chunk)
-                chunks += 1
-                settled += 1
-                index += 1
-                continue
-            try:
-                delivered = self._deliver(chunk)
-            except _PayloadTooLarge as refusal:
-                refused_at = (
-                    refusal.size if refused_at is None else min(refused_at, refusal.size)
-                )
-                if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
-                    budget = max(min(budget, refusal.size) // 2, 1)
-                    reductions += 1
+        with Deferral(self) as pending:
+            items = self._items(batch, pending)
+            if not items:
+                return
+            budget = self._chunk_budget()
+            refused_at: int | None = None
+            reductions = index = chunks = settled = 0
+            while index < len(items):
+                chunk = self._take(items, index, budget)
+                if self._known_refused(chunk, refused_at):
+                    self._drop_refused(chunk)
+                    chunks += 1
+                    settled += 1
+                    index += 1
+                    continue
+                try:
+                    delivered = self._deliver(chunk)
+                except _PayloadTooLarge as refusal:
+                    refused_at = (
+                        refusal.size if refused_at is None else min(refused_at, refusal.size)
+                    )
+                    if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
+                        budget = max(min(budget, refusal.size) // 2, 1)
+                        reductions += 1
+                        continue
+                    chunks += 1
+                    if len(chunk) == 1:
+                        self._drop_refused(chunk)
+                        settled += 1
+                    else:
+                        self._abandon_unreduced(chunk)
+                    index += len(chunk)
                     continue
                 chunks += 1
-                if len(chunk) == 1:
-                    self._drop_refused(chunk)
-                    settled += 1
-                else:
-                    self._abandon_unreduced(chunk)
+                settled += delivered
                 index += len(chunk)
-                continue
-            chunks += 1
-            settled += delivered
-            index += len(chunk)
-        if chunks and not settled:
-            raise SinkDeliveryError(f"{type(self).__name__} delivered none of {chunks} chunk(s)")
+            if chunks and not settled:
+                raise SinkDeliveryError(
+                    f"{type(self).__name__} delivered none of {chunks} chunk(s)"
+                )
 
     def _known_refused(self, chunk: list[_Item], refused_at: int | None) -> bool:
         """Reports whether this chunk is provably no smaller than one already refused.
@@ -709,7 +726,7 @@ class HTTPSink:
             f"{type(self).__name__}, refused at the smallest request this sink can build",
         )
 
-    def _items(self, batch: list[dict[str, object]]) -> list[_Item]:
+    def _items(self, batch: list[dict[str, object]], pending: Deferral) -> list[_Item]:
         """Renders each event and discards any that cannot fit a request on its own.
 
         ``chunk_items`` documents oversized items as the caller's to filter, because a group it
@@ -718,8 +735,18 @@ class HTTPSink:
         rather than one line per event, because a batch of oversized events is a configuration
         fault and 5,980 identical stderr lines describe it no better than one does.
 
+        **Each event renders under its own guard** (SPEC-058 FR-005), around :meth:`_render` and
+        :meth:`_item_size` both, catching ``Exception`` and never ``BaseException``: one event
+        whose render raises is dropped and counted, rather than abandoning the batch. Unlike a
+        wrapper's callable, a batch of nothing but unrenderable events is not re-raised —
+        re-rendering identical input in the sink's own code fails identically, so a retry cannot
+        help. The line names the class and the first exception's type, never its message. Both
+        kinds of drop go to ``pending`` rather than to the counters.
+
         Args:
           batch: The events to render.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise (SPEC-058 FR-005).
 
         Returns:
           The items that can be sent, in order.
@@ -729,24 +756,38 @@ class HTTPSink:
         """
         ceiling = self._event_ceiling()
         items: list[_Item] = []
-        dropped = 0
-        largest = 0
+        dropped = largest = failures = 0
+        first: Exception | None = None
         for event in batch:
-            rendered = self._render(event)
-            size = self._item_size(rendered, event)
+            try:
+                rendered = self._render(event)
+                size = self._item_size(rendered, event)
+            except Exception as err:
+                failures += 1
+                first = first if first is not None else err
+                continue
             if size > ceiling:
                 dropped += 1
                 largest = max(largest, size)
                 continue
             items.append(_Item(event=event, rendered=rendered, size=size))
         if dropped:
-            with self._counter_lock:
-                self.dropped_oversized += dropped
-            _diag.lost(
-                "event",
-                dropped,
-                f"{type(self).__name__}, up to {largest} bytes exceeds the "
-                f"{ceiling}-byte per-event ceiling",
+            pending.count("dropped_oversized", dropped)
+            pending.announce(
+                lambda: _diag.lost(
+                    "event",
+                    dropped,
+                    f"{type(self).__name__}, up to {largest} bytes exceeds the "
+                    f"{ceiling}-byte per-event ceiling",
+                )
+            )
+        if first is not None:
+            kind = type(first).__name__
+            pending.count("_unrenderable", failures)
+            pending.announce(
+                lambda: _diag.lost(
+                    "event", failures, f"{type(self).__name__}, rendering raised {kind}"
+                )
             )
         return items
 
@@ -847,7 +888,10 @@ class HTTPSink:
           The serialized form.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001). If one does,
+            ``HTTPSink._items`` drops that event alone and counts it (SPEC-058 FR-005).
         """
         return json.dumps(event)
 
@@ -929,13 +973,16 @@ class HTTPSink:
         Returns:
           The counters. ``failed`` counts abandoned requests rather than events, since this
           class has no per-event outcome to report and an abandoned request took its whole body
-          with it; subclasses that do learn per-record outcomes add them.
+          with it; subclasses that do learn per-record outcomes add them. ``dropped`` is the
+          oversized events plus those whose render raised (SPEC-058 FR-005).
 
         Raises:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unrenderable, failed=self.failed
+            )
 
     def close(self) -> None:
         """Does nothing, since ``urllib`` opens a fresh connection per request (FR-012).

@@ -9,7 +9,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -645,4 +645,73 @@ def sanitize_fields(
         return {}, True
     if not isinstance(result, dict):
         return {}, True
+    return result, coercer.truncated
+
+
+_TRANSFORM_MAX_DEPTH = 100
+"""The one structural bound on a transform's coercion, the same on every thread (SPEC-058 FR-001).
+
+Without a bound the pass is cut by the interpreter instead, and unmarked: an unbounded
+``_Coercer`` pass over a 20,000-deep nest stopped near depth 330, varying by thread, with
+``<unserializable: dict>`` and ``truncated`` false — measured by the spec review at ``69dac4f``
+and re-measured by the implementation plan at ``7042810``. A fixed bound puts assembly's own
+``<depth limit>`` marker at the same place on the drain thread, the orphan path and a small
+stack. The cost is accepted in the spec: a ``max_depth`` above 99 does not reach a transform's
+output that fails the check.
+"""
+
+
+class _TypesOnly:
+    """The three ceilings ``_Coercer`` reads, set so that only the structural bound applies.
+
+    A transform's output is coerced for type only (SPEC-058 FR-001): what a transform adds is the
+    caller's code choosing the size, so ``max_value_bytes`` and ``max_keys`` are lifted to
+    ``sys.maxsize`` and ``max_depth`` is the fixed bound rather than the configured one. A
+    stand-in rather than a ``Config`` because a ``Config`` validates its ceilings, and because
+    the coercer reads exactly these three attributes — which
+    ``tests/test_transform_coercion.py`` derives from ``_Coercer``'s source, so a fourth read
+    there fails a test rather than an event.
+
+    Attributes:
+      max_value_bytes: No per-value ceiling.
+      max_keys: No per-container ceiling.
+      max_depth: The fixed structural bound, :data:`_TRANSFORM_MAX_DEPTH`.
+    """
+
+    __slots__ = ()
+    max_value_bytes = sys.maxsize
+    max_keys = sys.maxsize
+    max_depth = _TRANSFORM_MAX_DEPTH
+
+
+def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], bool]:
+    """Coerces a transform's output for type only, under no configured ceiling (SPEC-058 FR-001).
+
+    The rules are assembly's, unchanged — ``bytes`` decoded, a ``datetime`` to ISO text,
+    ``Decimal`` and ``UUID`` to text, a non-finite float to its marker, a lone surrogate to
+    U+FFFD, a cycle to its marker, anything else to its type-name placeholder — applied by the
+    same ``_Coercer`` with :class:`_TypesOnly` for its config. The event is entered at depth
+    ``-1``, so its top-level values sit at depth 0 and the values of ``fields`` at depth 1.
+
+    **Unlike** :func:`sanitize_fields` **it has no top-level guard.** A mapping that cannot be
+    entered — a ``dict`` subclass whose ``items()`` raises — propagates its exception to the
+    caller, because an empty event delivered in place of a hostile one is a silent change to the
+    data, where a raise reaches the wrapper's per-event guard and is counted there.
+
+    Args:
+      event: The mapping the transform returned. It is never mutated.
+
+    Returns:
+      A new coerced mapping, and whether the pass made a substitution assembly marks with
+      ``truncated``.
+
+    Raises:
+      Exception: Whatever the top-level mapping's own iteration raises.
+      TypeError: If the pass returned something other than a mapping, which a fresh pass over a
+        mapping cannot; checked so the return type is a promise rather than a cast.
+    """
+    coercer = _Coercer(cast("Config", _TypesOnly()))
+    result = coercer.mapping(event, -1)
+    if not isinstance(result, dict):
+        raise TypeError(f"a transform's coercion produced {type(result).__name__}, not a dict")
     return result, coercer.truncated

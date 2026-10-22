@@ -2,18 +2,98 @@
 
 from __future__ import annotations
 
+import json
+import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sanitize import _coerce_unbounded
+from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks.base import Sink, SinkLosses
 
 __all__ = ["TransformSink"]
+
+
+def _check(result: object) -> None:
+    """Raises unless ``result`` meets invariant 8's observable, in one expression (SPEC-058 FR-001).
+
+    ``allow_nan=False`` and the UTF-8 encode are what make it the stricter of the two readings:
+    a NaN and a lone surrogate both pass a bare ``json.dumps``, and the second is what the SQL
+    sinks' drivers reject once it reaches a column (SPEC-055).
+
+    Args:
+      result: What the transform returned, or its coercion.
+
+    Returns:
+      None.
+
+    Raises:
+      Exception: Whatever ``json.dumps`` or the encode raises — ``TypeError``, ``ValueError``,
+        ``UnicodeEncodeError``, a ``RecursionError`` on a nest deeper than the stack allows, or a
+        ``dict`` subclass's own ``items()`` failure.
+    """
+    json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
+
+
+def _passes(result: object) -> bool:
+    """Reports whether ``result`` meets invariant 8's observable, as a verdict rather than a raise.
+
+    The catch is broad on purpose: SPEC-058 FR-001 makes *any* ``Exception`` from the check a
+    failure, a ``RecursionError`` and a ``dict`` subclass's own ``items()`` failure included, and
+    the failure is converted here to ``False`` rather than swallowed — :func:`_json_safe` acts on
+    it by coercing. Answering with a ``bool`` is also what keeps the coercion out of any
+    ``except`` block: an exception the coercion or the post-coercion check raises is then not
+    chained onto the check's own, so it is the exception FR-002's rule carries and its type is
+    the one the wrapper's line names. ``BaseException`` is not caught.
+
+    Args:
+      result: What the transform returned.
+
+    Returns:
+      True when the check passed.
+
+    Raises:
+      None.
+    """
+    try:
+        _check(result)
+    except Exception:
+        return False
+    return True
+
+
+def _json_safe(result: dict[str, object]) -> dict[str, object]:
+    """Returns ``result`` itself when it passes the check, else a new types-only coercion of it.
+
+    Check first, so a valid result is untouched by construction and only one that already failed
+    ever meets the coercer. :func:`_passes` answers the first check as a ``bool``, so the
+    coercion runs outside any ``except`` block and what it, or the post-coercion check, raises is
+    not chained onto the first check's exception. ``truncated`` is set only when the coercion made
+    a substitution assembly marks; a coercion is not loss, so nothing is counted and nothing is
+    announced here.
+
+    Args:
+      result: The mapping the transform returned. It is never mutated.
+
+    Returns:
+      ``result`` when it passes, or the coerced mapping.
+
+    Raises:
+      Exception: Whatever the coercion raises, or the post-coercion check when the coercion did
+        not rescue the result.
+    """
+    if _passes(result):
+        return result
+    coerced, marked = _coerce_unbounded(result)
+    if marked:
+        coerced["truncated"] = True
+    _check(coerced)
+    return coerced
 
 
 class TransformSink:
@@ -23,6 +103,22 @@ class TransformSink:
     rename keys — and returning ``None`` drops that event. The caller's batch and event dicts
     are never mutated in place: only the function's return values are forwarded, so a transform
     must copy before mutating.
+
+    **What the function returns is checked, and coerced when it fails** (SPEC-058 FR-001). The
+    function runs after assembly, so it can put a value into an event that assembly would have
+    coerced — ``bytes``, a ``datetime``, a NaN — and invariant 8 promised every sink an event it
+    could serialize bare. Each result is checked with that promise's observable; one that passes
+    is forwarded as the same object, and one that fails is replaced by a new mapping coerced for
+    type only, under no configured ceiling and one fixed depth bound. A coercion is not loss:
+    nothing is counted and nothing is announced.
+
+    **A function that fails for one event costs only that event** (SPEC-058 FR-002). A raise, a
+    result that is neither ``None`` nor a ``dict``, or a result the coercion could not rescue
+    drops that event; the rest of the batch is forwarded, and the failures are counted in
+    :meth:`losses` and announced once per batch, only once the inner sink's ``emit`` returned.
+    When every event of a batch failed, the first exception is re-raised unchanged and nothing is
+    counted, because whoever catches it — the worker, the orphan path or a ``MultiSink`` — owns
+    the batch.
 
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003): it holds no transport and its ``close()`` only forwards, so both decisions
@@ -56,11 +152,24 @@ class TransformSink:
         self._inner = inner
         self._stop_signal: threading.Event | None = None
         self._fn = fn
+        self._counter_lock = threading.Lock()
+        self._dropped = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Applies the function to each event, forwarding the non-``None`` results (FR-004).
 
-        When every event is dropped, the inner sink's ``emit`` is not called at all.
+        Each event runs under its own guard (SPEC-058 FR-002), which catches ``Exception`` and
+        never ``BaseException``: a raise, a result that is neither ``None`` nor a ``dict``, or a
+        result whose coercion could not rescue it drops that event only. A ``None`` declines an
+        event, which is the configuration working rather than loss. When nothing is left to
+        forward, the inner sink's ``emit`` is not called at all.
+
+        The failures are counted and announced through the deferral helper, so they land only
+        if this call returns normally. An inner sink that raises propagates with nothing
+        counted: the worker retries the whole batch and the function runs again, so counting now
+        would count the same event once per attempt. An event whose function failed transiently
+        is therefore lost without a retry when its siblings were delivered — retrying would
+        re-deliver the siblings, and a duplicate is worse than one counted loss.
 
         Args:
           batch: The events to transform.
@@ -69,15 +178,68 @@ class TransformSink:
           None.
 
         Raises:
-          Exception: Whatever the mapping function or the inner sink raises.
+          Exception: The first failure's own exception, unchanged and with nothing counted, when
+            every event of the batch failed and none was declined — the function's, the
+            ``TypeError`` built for a non-``dict`` result, or the coercion's. Otherwise whatever
+            the inner sink's ``emit`` raises.
         """
-        transformed: list[dict[str, object]] = []
-        for event in batch:
-            result = self._fn(event)
-            if result is not None:
-                transformed.append(result)
-        if transformed:
-            self._inner.emit(transformed)
+        forwarded: list[dict[str, object]] = []
+        declined = False
+        failures = 0
+        first: Exception | None = None
+        with Deferral(self) as pending:
+            for event in batch:
+                try:
+                    result = self._apply(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
+                if result is None:
+                    declined = True
+                else:
+                    forwarded.append(result)
+            if first is not None and not forwarded and not declined:
+                raise first
+            if failures:
+                kind = type(first).__name__
+                pending.count("_dropped", failures)
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", failures, f"TransformSink, the transform failed with {kind}"
+                    )
+                )
+            if forwarded:
+                self._inner.emit(forwarded)
+
+    def _apply(self, event: dict[str, object]) -> dict[str, object] | None:
+        """Runs the function on one event and makes its result safe to forward (SPEC-058).
+
+        A result that is neither ``None`` nor a ``dict`` is the same failure as a raise, so the
+        ``TypeError`` is built here — naming this class and the type returned, never the value —
+        and raised into :meth:`emit`'s per-event guard. Raising in a helper rather than inside
+        that guard's ``try`` keeps the ``try`` body to the one call that can fail.
+
+        Args:
+          event: The event to transform.
+
+        Returns:
+          ``None`` when the function declined the event, else its result, checked and, when it
+          fails the check, coerced (FR-001).
+
+        Raises:
+          TypeError: If the function returned neither ``None`` nor a ``dict``.
+          Exception: Whatever the function raises, or the coercion when it cannot rescue the
+            result.
+        """
+        result = self._fn(event)
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise TypeError(
+                f"TransformSink's function returned {type(result).__name__}, not a dict or None"
+            )
+        return _json_safe(result)
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:
@@ -142,26 +304,32 @@ class TransformSink:
         flush_sink(self._inner)
 
     def losses(self) -> SinkLosses | None:
-        """Reports the inner sink's losses (SPEC-026 FR-002).
+        """Reports the inner sink's losses plus the events this wrapper's function failed on.
 
         A wrapper that reported nothing would hide the destination it wraps: ``health().sink``
-        would read ``None`` for a transform in front of a sink that counts perfectly well.
-        Events this sink itself declines to forward are not loss — they are the configuration
-        working, the same reason ``NullSink`` reports nothing.
+        would read ``None`` for a transform in front of a sink that counts perfectly well
+        (SPEC-026 FR-002). Events this sink itself declines to forward are not loss — they are
+        the configuration working, the same reason ``NullSink`` reports nothing. Events the
+        function *failed* on are: :meth:`emit` counts them once the batch is settled, and they
+        are added to ``dropped`` here (SPEC-058 FR-003).
 
         Args:
           None.
 
         Returns:
-          The inner sink's losses. ``None`` passes through unchanged rather than becoming
-          ``SinkLosses(dropped=0, failed=0)``: FR-003 distinguishes "the sink reports
-          nothing" from "the sink reports no loss", and flattening the two would claim a
-          clean bill of health on a sink that never gave one.
+          ``None`` only when the inner sink reports ``None`` and this wrapper has counted
+          nothing: FR-003 distinguishes "the sink reports nothing" from "the sink reports no
+          loss", and flattening the two would claim a clean bill of health on a sink that never
+          gave one. Otherwise the inner sink's losses, an inner ``None`` read as zeros, with this
+          wrapper's own count added to ``dropped`` (SPEC-058 FR-003).
 
         Raises:
           None.
         """
-        return read_losses(self._inner)
+        inner = read_losses(self._inner)
+        with self._counter_lock:
+            own = self._dropped
+        return wrapped_losses(inner, own)
 
     def close(self) -> None:
         """Closes the inner sink (FR-004).

@@ -226,7 +226,9 @@ class SyslogSink:
           The exact bytes to put on the wire.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``sanitize`` prevents.
+          TypeError: If the event is not JSON-serializable. Neither source of events should
+            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
+            checks and coerces what its function returns (SPEC-058 FR-001).
         """
         level = event.get("level")
         severity = _SEVERITY.get(level.upper(), _DEFAULT_SEVERITY) if isinstance(level, str) else (

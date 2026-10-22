@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -157,6 +158,7 @@ class SQSSink:
         self.message_deduplication_id = message_deduplication_id
         self.dropped_oversized = 0
         self.failed = 0
+        self._id_failed = 0
         self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
@@ -168,16 +170,26 @@ class SQSSink:
         Returns:
           The counters. Sender faults land in ``failed`` alongside the retry-exhausted entries:
           SQS rejected the request itself, so the entry is as lost as one that timed out, and
-          SPEC-016 settled that it must not be re-sent byte-identical.
+          SPEC-016 settled that it must not be re-sent byte-identical. An event dropped because
+          a FIFO id callable raised for it is in ``dropped`` beside the oversized ones, while
+          ``dropped_oversized`` keeps meaning oversize only (SPEC-058 FR-004).
 
         Raises:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._id_failed, failed=self.failed
+            )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks the batch to SQS limits and sends each chunk (FR-001, FR-002).
+
+        The per-event drops :meth:`_chunks` decides — oversize, and on a FIFO queue a failed id
+        callable — are counted and announced through the deferral helper, so they land only if
+        this call returns normally (SPEC-058 FR-004). They are decided before any send, and this
+        call can still raise afterwards and be retried whole; counting them first counted one
+        oversized event once per attempt.
 
         Args:
           batch: The events to ship.
@@ -197,16 +209,20 @@ class SQSSink:
             cost of the sender-fault chunk being re-sent and re-rejected alongside it — futile
             but harmless, where silently dropping recoverable events would be the failure
             SPEC-026 exists to remove.
+          Exception: The first id callable's own exception, unchanged, when every event's id
+            callable failed and nothing reached a chunk or was dropped as oversized (SPEC-058
+            FR-004). A raise of either kind leaves nothing from :meth:`_chunks` counted.
         """
         chunks = delivered = 0
         recoverable_loss = False
-        for chunk in self._chunks(batch):
-            chunks += 1
-            accepted, retryable_lost = self._send(chunk)
-            delivered += accepted
-            recoverable_loss = recoverable_loss or retryable_lost
-        if chunks and not delivered and recoverable_loss:
-            raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
+        with Deferral(self) as pending:
+            for chunk in self._chunks(batch, pending):
+                chunks += 1
+                accepted, retryable_lost = self._send(chunk)
+                delivered += accepted
+                recoverable_loss = recoverable_loss or retryable_lost
+            if chunks and not delivered and recoverable_loss:
+                raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-005).
@@ -235,7 +251,8 @@ class SQSSink:
           The group id.
 
         Raises:
-          Exception: Whatever a caller-supplied callable raises.
+          Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+            into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_group_id
         if isinstance(source, str):
@@ -261,7 +278,8 @@ class SQSSink:
           The deduplication id.
 
         Raises:
-          Exception: Whatever a caller-supplied callable raises.
+          Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+            into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_deduplication_id
         raw = source(event) if source is not None else str(event.get("log_id", ""))
@@ -271,7 +289,9 @@ class SQSSink:
 
         return new_log_id()
 
-    def _chunks(self, batch: list[dict[str, object]]) -> list[list[_Prepared]]:
+    def _chunks(
+        self, batch: list[dict[str, object]], pending: Deferral
+    ) -> list[list[_Prepared]]:
         """Splits the batch into sends within both the entry-count and byte limits.
 
         Each event is serialized once, and on a FIFO queue its ids are resolved once here too
@@ -282,35 +302,48 @@ class SQSSink:
         otherwise ship as a lone over-budget request that SQS rejects as a sender fault, losing
         the event as an opaque failure instead of a labelled oversize drop.
 
+        **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
+        under the wrappers' ledger rule: when every event failed and nothing reached a chunk or
+        was dropped as oversized, the first exception is re-raised unchanged and nothing is
+        counted; otherwise the failed events are set aside. Both drops — oversize and id failure
+        — go to ``pending`` rather than to the counters, so they are counted and announced only
+        when the calling ``emit`` returns normally; the oversize lines keep their one-per-event
+        shape, and the id failures are announced once per batch, naming the exception's type.
+
         Args:
           batch: The events to split.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise (SPEC-058 FR-004).
 
         Returns:
           The chunks, each valid for one request.
 
         Raises:
-          Exception: Whatever a caller-supplied id callable raises.
+          Exception: The first id callable's own exception, when every event's id callable
+            failed and nothing reached a chunk or was dropped as oversized.
         """
         chunks: list[list[_Prepared]] = []
         current: list[_Prepared] = []
         current_bytes = 0
+        oversized: list[int] = []
+        failures = 0
+        first: Exception | None = None
         for event in batch:
             body = json.dumps(event)
             size = len(body.encode("utf-8"))
             group_id: str | None = None
             dedup_id: str | None = None
             if self.fifo:
-                group_id = self._group_id(event)
-                dedup_id = self._dedup_id(event)
+                try:
+                    group_id = self._group_id(event)
+                    dedup_id = self._dedup_id(event)
+                except Exception as err:
+                    failures += 1
+                    first = first if first is not None else err
+                    continue
                 size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
             if size > self.MAX_BYTES:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost(
-                    "event",
-                    1,
-                    f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
-                )
+                oversized.append(size)
                 continue
             if current and (
                 len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
@@ -322,7 +355,41 @@ class SQSSink:
             current_bytes += size
         if current:
             chunks.append(current)
+        if first is not None:
+            if not chunks and not oversized:
+                raise first
+            kind = type(first).__name__
+            pending.count("_id_failed", failures)
+            pending.announce(
+                lambda: _diag.lost("event", failures, f"SQSSink, a FIFO id callable raised {kind}")
+            )
+        if oversized:
+            pending.count("dropped_oversized", len(oversized))
+            pending.announce(lambda: self._announce_oversized(oversized))
         return chunks
+
+    def _announce_oversized(self, sizes: list[int]) -> None:
+        """Writes one line per event dropped for exceeding the message limit (FR-004).
+
+        One line per event is today's shape, kept on purpose; what SPEC-058 FR-004 changed is
+        only *when* the lines are written — through the calling ``emit``'s deferral, after the
+        count, and only when that ``emit`` returned normally.
+
+        Args:
+          sizes: The costed size of each dropped event, in the order they were met.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for size in sizes:
+            _diag.lost(
+                "event",
+                1,
+                f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
+            )
 
     def _send(self, prepared: list[_Prepared]) -> tuple[int, bool]:
         """Sends one valid chunk, retrying only the failed entries within a bounded count.
