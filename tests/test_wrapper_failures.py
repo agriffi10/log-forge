@@ -155,7 +155,7 @@ def test_a_transform_failing_for_one_event_costs_only_that_event(capsys) -> None
     assert health.failed_batches == 0
     assert health.sink == SinkLosses(dropped=1, failed=0)
     assert _lost_lines(capsys.readouterr().err) == [
-        "log-foundry: lost 1 event(s); TransformSink, the function raised ValueError"
+        "log-foundry: lost 1 event(s); TransformSink, the transform failed with ValueError"
     ]
 
 
@@ -294,7 +294,7 @@ def test_a_non_dict_result_is_a_failure_named_by_type(capsys) -> None:
     err = capsys.readouterr().err
     assert SENTINEL not in err
     assert _lost_lines(err) == [
-        "log-foundry: lost 1 event(s); TransformSink, the function raised TypeError"
+        "log-foundry: lost 1 event(s); TransformSink, the transform failed with TypeError"
     ]
 
     every = TransformSink(Recording(), lambda event: f"text {SENTINEL}")  # type: ignore[arg-type,return-value]
@@ -435,7 +435,7 @@ def test_a_hostile_mapping_among_several_is_dropped_and_named_by_its_own_type(ca
     assert inner.calls == [[_ev(0), _ev(2)]]
     assert sink.losses() == SinkLosses(dropped=1, failed=0)
     assert _lost_lines(capsys.readouterr().err) == [
-        "log-foundry: lost 1 event(s); TransformSink, the function raised KeyError"
+        "log-foundry: lost 1 event(s); TransformSink, the transform failed with KeyError"
     ]
 
 

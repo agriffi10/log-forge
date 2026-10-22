@@ -40,15 +40,42 @@ def _check(result: object) -> None:
     json.dumps(result, allow_nan=False, ensure_ascii=False).encode("utf-8")
 
 
+def _passes(result: object) -> bool:
+    """Reports whether ``result`` meets invariant 8's observable, as a verdict rather than a raise.
+
+    The catch is broad on purpose: SPEC-058 FR-001 makes *any* ``Exception`` from the check a
+    failure, a ``RecursionError`` and a ``dict`` subclass's own ``items()`` failure included, and
+    the failure is converted here to ``False`` rather than swallowed — :func:`_json_safe` acts on
+    it by coercing. Answering with a ``bool`` is also what keeps the coercion out of any
+    ``except`` block: an exception the coercion or the post-coercion check raises is then not
+    chained onto the check's own, so it is the exception FR-002's rule carries and its type is
+    the one the wrapper's line names. ``BaseException`` is not caught.
+
+    Args:
+      result: What the transform returned.
+
+    Returns:
+      True when the check passed.
+
+    Raises:
+      None.
+    """
+    try:
+        _check(result)
+    except Exception:
+        return False
+    return True
+
+
 def _json_safe(result: dict[str, object]) -> dict[str, object]:
     """Returns ``result`` itself when it passes the check, else a new types-only coercion of it.
 
     Check first, so a valid result is untouched by construction and only one that already failed
-    ever meets the coercer. The coercion runs **outside** the ``except`` block, so an exception it
-    or the post-check raises is not chained onto the check's own: it is the exception SPEC-058
-    FR-002's rule carries, and its type is what the wrapper's line names. ``truncated`` is set
-    only when the coercion made a substitution assembly marks; a coercion is not loss, so nothing
-    is counted and nothing is announced here.
+    ever meets the coercer. :func:`_passes` answers the first check as a ``bool``, so the
+    coercion runs outside any ``except`` block and what it, or the post-coercion check, raises is
+    not chained onto the first check's exception. ``truncated`` is set only when the coercion made
+    a substitution assembly marks; a coercion is not loss, so nothing is counted and nothing is
+    announced here.
 
     Args:
       result: The mapping the transform returned. It is never mutated.
@@ -60,11 +87,7 @@ def _json_safe(result: dict[str, object]) -> dict[str, object]:
       Exception: Whatever the coercion raises, or the post-coercion check when the coercion did
         not rescue the result.
     """
-    try:
-        _check(result)
-    except Exception:
-        pass
-    else:
+    if _passes(result):
         return result
     coerced, marked = _coerce_unbounded(result)
     if marked:
@@ -183,7 +206,7 @@ class TransformSink:
                 pending.count("_dropped", failures)
                 pending.announce(
                     lambda: _diag.lost(
-                        "event", failures, f"TransformSink, the function raised {kind}"
+                        "event", failures, f"TransformSink, the transform failed with {kind}"
                     )
                 )
             if forwarded:
