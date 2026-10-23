@@ -244,8 +244,9 @@ Each criterion holds for `SyslogSink` and for the socket branch of `LogstashSink
 - [ ] `transport._lock.locked()` is `False` at the moment the datagram-limit line is written.
 - [ ] `send_all(messages)` and `_sendable(messages)` without a ledger are refused with a
       `TypeError`, and `poetry run mypy` is clean over the callers.
-- [ ] Every test that called `send_all` directly passes a ledger, and the `pytest --collect-only
-      -q` names before and after are equal.
+- [ ] Every test that called `send_all` directly passes a ledger, and over the test files that
+      existed at `33a0cd3`, the `pytest --collect-only -q` names before and after are equal (the new
+      test files add names; none is removed or renamed).
 - [ ] Orphan path: one oversized frame through `info()` outside a span, with
       `configure(max_value_bytes=…)` raised above `max_datagram_bytes` so assembly does not clip
       it first, is counted once with `orphan_lost == 0` (unchanged).
@@ -646,6 +647,9 @@ One PR.
   was silent and first-name matching would miss `self._socket.dropped_oversized += 1`. (3) FR-006
   gains `README.md`'s `sink.dropped` row and the Kafka/Pub/Sub paragraph beneath it, which FR-003
   makes false for a batch refused whole and which the PyPI page carries.
+- **2026-10-23 — plan review at `8b6a147`: one major, five minors, answered in the plan.** One
+  spec change: FR-002's collect-only criterion compares the test files that existed at `33a0cd3`,
+  since the new test files add names and "equal" over the whole suite could not hold.
 - **Considered and not taken:** putting the `Deferral` inside `SocketTransport.send_all`. It needs
   the gate's construction rule widened to a second entry name, and it makes the commit depend on
   `send_all` being the last statement of its callers. And an allowlist for the derived check: a
