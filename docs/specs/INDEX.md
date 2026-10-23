@@ -61,6 +61,7 @@ to status only — no prose.
 | [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Completed | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
+| [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Draft | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
 
 ## Arcs (build order)
 
