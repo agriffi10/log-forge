@@ -20,9 +20,10 @@ class _Counted(Protocol):
     Every shipped owner already guards its other counters with this one lock, which is the point:
     the commit, the owner's immediate ``failed`` increments and a ``losses()`` read taken under
     that lock are serialised together, so the commit needs no lock of its own and such a read
-    never sees a commit half-applied. Since SPEC-059 the commit is the only writer of a counter
-    some ``losses()`` reports as ``dropped`` — ``tests/test_deferral.py`` derives those counters
-    and holds them to it — so no counter has both a deferred writer and an immediate one.
+    never sees a commit half-applied. Since SPEC-059 the commit is the only writer, after
+    construction, of a counter some ``losses()`` reports as ``dropped`` — ``tests/test_deferral.py``
+    derives those counters and holds them to it — so no counter has both a deferred writer and an
+    immediate one.
 
     Attributes:
       _counter_lock: The lock every write to the owner's counters takes.

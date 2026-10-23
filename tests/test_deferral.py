@@ -198,10 +198,10 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
-SPEC-058 listed the first five modules and SPEC-059 the other ten, which is every shipped sink that
-decides a per-event drop. ``SocketTransport`` is the one entry without an ``emit``: the ledger is
-entered by ``SyslogSink.emit`` and ``LogstashSink.emit`` and handed to its ``send_all``, so the
-roster rule below, which starts from an ``emit``, cannot require it and it is named by hand.
+SPEC-058 listed the first five modules and SPEC-059 the other ten. ``SocketTransport`` is the one
+entry without an ``emit``: the ledger is entered by ``SyslogSink.emit`` and ``LogstashSink.emit``
+and handed to its ``send_all``, so the roster rule below, which starts from an ``emit``, cannot
+require it and it is named by hand.
 
 A class or function named here and missing from its module is a finding, not a skip: a rename
 would otherwise shrink the guard as silently as a deletion. The other direction is held too: a

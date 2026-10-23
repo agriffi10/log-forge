@@ -186,8 +186,9 @@ class KafkaSink:
           process, while ``failed`` is the delivery callback's verdict on a message the producer
           did accept. A refusal is counted and announced only when ``emit`` returns (SPEC-059
           FR-003), so ``dropped`` holds the refusals of batches whose other messages were handed
-          off; a batch refused whole raised instead, and the worker's ``failed_batches`` — or
-          ``orphan_lost`` outside a span — counts it, once however many attempts it took.
+          off. A batch refused whole raised instead and is counted where the raise was caught —
+          the worker's ``failed_batches`` once its retries are spent, or ``orphan_lost`` outside a
+          span — and a retry that hands it off counts nothing.
 
         Raises:
           None.

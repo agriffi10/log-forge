@@ -104,9 +104,9 @@ class AzureEventHubsSink:
         attempted batch, or ``create_batch`` raising, discards it, and the worker's retry
         decides it afresh. The ledger is entered **outside** the emit lock — the ``Deferral``
         first, ``_lock`` inside it — so the lock is released before the commit takes the counter
-        lock and writes the line, and a stderr write never runs under the transport lock
+        lock and writes the oversize line, which therefore never runs under the transport lock
         (SPEC-028's two-lock decision). The failed-send count and line :meth:`_send` writes stay
-        where they are.
+        where they are, under the lock (SPEC-059 *Out of Scope*).
 
         Args:
           batch: The events to send. An empty batch is a no-op.
