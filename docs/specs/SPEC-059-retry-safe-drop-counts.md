@@ -157,7 +157,9 @@ When each `emit` raises, which is what discards the ledger:
 - `KinesisSink` and `FirehoseSink`: `SinkDeliveryError` when at least one chunk was sent, none
   delivered and none unadjudicable. A raise from building a record (`json.dumps`) or a
   `BaseException` from the client also leaves `emit`.
-- `SNSSink`: `SinkDeliveryError` when at least one chunk was sent and none delivered.
+- `SNSSink`: `SinkDeliveryError` when at least one chunk was sent and none delivered; also a
+  raise from building a body (`json.dumps`), a malformed `Failed` entry (`entry["Id"]` in
+  `_send`), or a `BaseException` from the client.
 - `MongoDBSink`: closed on entry, before `_documents`, so nothing has been decided; a connection
   error past the retry bound; a bulk write whose every document was rejected. A bulk write that
   stored some returns normally and so commits.
@@ -180,8 +182,8 @@ Each criterion below holds for all five sinks unless it names one, and is one pa
       `failed_batches == 0`.
 - [ ] A batch of nothing but oversized events makes no request, returns normally, and counts all
       N (unchanged).
-- [ ] A `KeyboardInterrupt` raised by the client leaves `emit` with nothing counted and no line
-      written.
+- [ ] A batch of one oversized and one ordinary event, the client raising `KeyboardInterrupt` on
+      the send: `emit` raises it with nothing counted and no oversize line written.
 - [ ] MongoDB: a bulk write that stored some documents, beside an oversized one, returns, counts
       the oversized drop and counts the rejects.
 - [ ] MongoDB and Event Hubs, closed: `emit` raises `SinkDeliveryError` and counts nothing
@@ -189,8 +191,9 @@ Each criterion below holds for all five sinks unless it names one, and is one pa
 - [ ] Event Hubs: `sink._lock.locked()` is `False` at the moment the oversize line is written.
 - [ ] Kinesis and Firehose: two oversized events of different sizes in one batch write two lines,
       each naming its own size.
-- [ ] Orphan path: one oversized event through `info()` outside a span is counted once with
-      `orphan_lost == 0` (unchanged).
+- [ ] Orphan path: one oversized event through `info()` outside a span, with
+      `configure(max_value_bytes=…)` raised above the sink's own limit so assembly does not clip
+      it first, is counted once with `orphan_lost == 0` (unchanged).
 - [ ] `MultiSink(<the sink with a failing client>, MemorySink())` given one oversized and one
       ordinary event reads `dropped == 0` and `failed == <the child's own failed> + 2`; today the
       oversized event is in `dropped` and in `failed`.
@@ -243,8 +246,9 @@ Each criterion holds for `SyslogSink` and for the socket branch of `LogstashSink
       `TypeError`, and `poetry run mypy` is clean over the callers.
 - [ ] Every test that called `send_all` directly passes a ledger, and the `pytest --collect-only
       -q` names before and after are equal.
-- [ ] Orphan path: one oversized frame through `info()` outside a span is counted once with
-      `orphan_lost == 0` (unchanged).
+- [ ] Orphan path: one oversized frame through `info()` outside a span, with
+      `configure(max_value_bytes=…)` raised above `max_datagram_bytes` so assembly does not clip
+      it first, is counted once with `orphan_lost == 0` (unchanged).
 - [ ] `MultiSink(SyslogSink(<udp, failing>), MemorySink())` given one oversized and one ordinary
       event reads `dropped == 0` and `failed == <the transport's own failed> + 2`.
 - [ ] Serves invariants 2, 6, 7 and 11.
@@ -260,7 +264,10 @@ count records a loss that never happened. This is SPEC-058 FR-002's ledger rule 
 sink's own hand-off: when every event is refused the sink raises and counts nothing, and the
 catcher owns the batch. Both `emit`s count `rejected` and announce through a `Deferral` whose
 `with` encloses the produce/publish loop, `_reap()` (Pub/Sub) and the total-failure raise. One
-line per refused event, same text, written only when `emit` returns.
+line per refused event, same text, written only when `emit` returns. Each line names its own
+event's exception type (`type(err).__name__`), and that type is bound when the line is
+registered, not when it is written, so two refusals of different types in one batch each name
+their own.
 
 When each `emit` raises: `KafkaSink` when closed on entry, when every message was refused, and
 when anything raises mid-loop (`json.dumps`, `_key`, `poll`). `GooglePubSubSink` when closed on
@@ -285,6 +292,8 @@ Each criterion holds for both sinks.
       three events reach the producer or client on the second attempt, and `failed_batches == 0`.
 - [ ] One refusal of three, the others accepted: `emit` returns, `rejected == 1`,
       `losses().dropped == 1`, and one refusal line is written.
+- [ ] Two refusals of different exception types beside one accepted event write two lines, each
+      naming its own type.
 - [ ] A refusal followed by a raise elsewhere in the same `emit` (Kafka's `poll`, Pub/Sub's
       `_reap`) leaves `rejected` unmoved and writes no line.
 - [ ] Closed on entry: `emit` raises `SinkDeliveryError` with nothing counted (unchanged).
@@ -328,8 +337,9 @@ a `_drop_refused` only through a later chunk's exception that `_deliver` does no
 - [ ] Over every `HTTPSink` subclass, derived transitively from `__subclasses__()`, the down
       probe counts 0 in `losses().dropped`; `ElasticsearchSink` and `OpenSearchSink`, which fold
       `dropped_oversized` into their own `losses()`, are among them.
-- [ ] Orphan path: a single `413` event through `info()` outside a span settles inside the sink,
-      is counted once, and reads `orphan_lost == 0` (unchanged).
+- [ ] Orphan path: a single event the opener answers `413`, through `info()` outside a span,
+      settles inside the sink, is counted once, and reads `orphan_lost == 0` (unchanged). The
+      opener answers by request and not by size, so `max_value_bytes` need not be raised.
 - [ ] `MultiSink(HTTPSink(<Probe D>), MemorySink())` reads `dropped == 0` and
       `failed == <the HTTPSink's own failed> + 2`.
 - [ ] Serves invariants 2, 6 and 7.
@@ -371,11 +381,20 @@ no roster entry reaches, or in a sink nobody listed, passes both. The new check 
 only by a `Deferral` commit.
 
 - *Derivation, from the tree and never by hand.* Every `self.<attr>` read in the `dropped`
-  argument (keyword, or first positional) of a `SinkLosses(...)` call — the callee spelt bare or
-  as an attribute — inside a method named `losses`, and in the `own` argument (keyword, or second
-  positional) of a `wrapped_losses(...)` call there. That includes a local name assigned from
-  `self.<attr>` in the same method, which is how `TransformSink` and `FilteringSink` read
-  `self._dropped`.
+  argument (keyword, or first positional) of every `SinkLosses(...)` call — the callee spelt bare
+  or as an attribute — and in the `own` argument (keyword, or second positional) of every
+  `wrapped_losses(...)` call, in any function under `src/`. The calls are not required to sit in a
+  method named `losses`: a sink that builds its report in a helper would otherwise contribute
+  nothing, and a wider derivation fails closed — a false positive is a finding someone reads, a
+  false negative is a counter nobody checks. The derivation includes a local name, in the same
+  function, whose assigned value reads `self.<attr>` — every `self.<attr>` read anywhere in that
+  value counts — which is how `TransformSink` and `FilteringSink` read `self._dropped`, and how
+  `dropped = self.dropped_oversized + self._unrenderable` followed by a `SinkLosses` call passing
+  `dropped=dropped` contributes both names. The step is **one hop**: a local's own assigned value,
+  never the locals that value reads in turn. `MultiSink.losses` passes
+  `sum(child.dropped for child in reported)`, and `reported` is built from `self._sinks`; a
+  transitive step would put `_sinks` in the derived set, and every attribute a comprehension over
+  children touches with it, which widens the set without guarding a count.
 - *The finding.* Every store to one of those attributes — the forms `_self_stores` already
   recognises: assignment, augmented assignment, annotated assignment, `for`, `with` and
   comprehension targets, unpacking, `setattr(self, …)` — in any method other than `__init__`, of
@@ -410,8 +429,9 @@ only by a `Deferral` commit.
       `rejected`.
 - [ ] The corpus asserts the finding text for each derivation form: `dropped=` keyword; first
       positional; callee spelt as an attribute; a sum of two attributes; a local name assigned
-      from `self.<attr>`; `wrapped_losses` with `own=` and with the second positional; and a
-      counter reported by one class and stored by another.
+      from `self.<attr>`; a local assigned from a sum of two attributes; `wrapped_losses` with
+      `own=` and with the second positional; and a counter reported by one class and stored by
+      another.
 - [ ] The corpus asserts the finding text for each store form `_self_stores` recognises.
 - [ ] The corpus asserts silence for: a store in `__init__`; a store to `failed`, which no
       `losses()` reports as `dropped`; a count through `pending.count("rejected")`; a class whose
@@ -547,17 +567,25 @@ docs/
 - The five record-building sinks take the `Deferral` (FR-001).
 - The socket transport, `SyslogSink` and `LogstashSink` take the ledger as a required parameter,
   and the direct `send_all` tests are edited (FR-002).
+- Each site lands with its `DEFERRING_SITES` entry and the `IMMEDIATE` entries for the stores the
+  gate then finds in it (FR-005 parts 1 and 2), because converting a sink without its roster entry
+  already reddens `test_every_deferring_site_takes_the_one_helper` ("enters a Deferral but is not
+  listed in DEFERRING_SITES").
 
 ### Phase 2: Refusals and `413`
 
 - `KafkaSink.emit` and `GooglePubSubSink.emit` (FR-003).
 - `HTTPSink._drop_refused` (FR-004).
+- Each site again lands with its roster and allowlist entries, including the removal of
+  `("HTTPSink", "_drop_refused")` from `IMMEDIATE`, which converting `_drop_refused` makes stale,
+  and the corpus runner's own fixed allowlist, which has to land with that removal (FR-005
+  part 2).
 
-### Phase 3: The gate
+### Phase 3: The derived check
 
-- The ten roster entries, `IMMEDIATE` re-derived, the corpus runner's own allowlist, and the
-  derived check with its floor and corpus (FR-005). It follows Phases 1 and 2 because the roster is
-  red until every site is converted.
+- The derived check with its floor, its corpus and the tree-test assertions (FR-005 part 3). The
+  existing gate stays green after every phase because each site lands with its entries; the derived
+  check comes last because it is only green once every site is converted.
 
 ### Phase 4: Prose
 
@@ -575,6 +603,21 @@ One PR.
   once) probes, the gate prototype that produced the fifteen stores in thirteen methods, and the
   check that `IncompleteRead` is an `HTTPException` and not an `OSError`, and read the same
   figures; the remaining probes were not re-run by it.
+- **2026-10-23 — spec review at `23788c2`: one major, five minors, all fixed.** The reviewer
+  reproduced probes A–D and the population claim independently at `23788c2` (whose `src/` equals
+  `33a0cd3`), with its own AST sweep.
+  - The refusal line's exception type (FR-003): the major. The type is bound when the line is
+    registered, not when it is written; the reviewer reproduced the defect with a loop-local
+    closure that wrote both lines naming the last type.
+  - The `KeyboardInterrupt` criterion (FR-001) required no oversized event, so it passed against
+    today's code; it now sends one oversized and one ordinary event.
+  - The derivation (FR-005) is widened: no `losses`-only restriction, and the local-name step reads
+    the whole assigned value, one hop deep (a transitive step would derive `MultiSink._sinks`).
+  - The phase order: each site lands with its `DEFERRING_SITES` and `IMMEDIATE` entries, since the
+    shipped gate reddens otherwise.
+  - SNS's raise reading (FR-001) is as complete as Kinesis's.
+  - The orphan-path criteria (FR-001, FR-002) run with `max_value_bytes` raised above the sink's
+    own limit; FR-004's does not need it.
 - **Considered and not taken:** putting the `Deferral` inside `SocketTransport.send_all`. It needs
   the gate's construction rule widened to a second entry name, and it makes the commit depend on
   `send_all` being the last statement of its callers. And an allowlist for the derived check: a
