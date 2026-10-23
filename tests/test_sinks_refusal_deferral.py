@@ -298,7 +298,7 @@ def test_probe_c_an_orphan_refusal_is_in_orphan_lost_only(name: str) -> None:
 
 @pytest.mark.parametrize("name", _SINKS)
 def test_a_fanout_absorbs_the_refused_batch(name: str) -> None:
-    """The child refused everything and raised, its sibling delivered: the fan-out owns all three."""
+    """The child refused everything and raised, its sibling delivered: the fan-out owns all 3."""
     error = _refusal(name)
     child, _ = _build(name, lambda _call: error)
     multi = MultiSink(child, MemorySink())

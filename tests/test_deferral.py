@@ -1,11 +1,14 @@
-"""SPEC-058 — the one deferral helper, and the AST check that keeps it the only one.
+"""SPEC-058 and SPEC-059 — the one deferral helper, and the AST checks that keep it the only one.
 
 The helper carries the deferral rule: a per-event drop decided during an ``emit`` is counted and
 announced only when that ``emit`` returns normally. The behavioural tests below pin the helper's
-own contract; each site's tests pin that the site uses it. The AST check
-(:func:`deferral_findings`) is the instrument FR-002 names for "a second accumulate-then-commit is
-refused", and it is a gate, so it carries a fixture corpus asserting its failure text — silent
-cases included — beside the run over the real tree.
+own contract; each site's tests pin that the site uses it. Two AST checks hold the rule over the
+tree. :func:`deferral_findings` is the instrument SPEC-058 FR-002 names for "a second
+accumulate-then-commit is refused": it holds each listed *site* to the helper. SPEC-059 FR-005's
+:func:`dropped_store_findings` holds each *counter*: an attribute some ``losses()`` reports as
+``dropped``, derived from the tree, is written only by a ``Deferral`` commit. Both are gates, so
+each carries a fixture corpus asserting its failure text — silent cases included — beside the run
+over the real tree.
 """
 
 from __future__ import annotations
@@ -195,6 +198,11 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
+SPEC-058 listed the first five modules and SPEC-059 the other ten, which is every shipped sink that
+decides a per-event drop. ``SocketTransport`` is the one entry without an ``emit``: the ledger is
+entered by ``SyslogSink.emit`` and ``LogstashSink.emit`` and handed to its ``send_all``, so the
+roster rule below, which starts from an ``emit``, cannot require it and it is named by hand.
+
 A class or function named here and missing from its module is a finding, not a skip: a rename
 would otherwise shrink the guard as silently as a deletion. The other direction is held too: a
 class anywhere under ``src/`` whose ``emit`` enters a ``Deferral`` and is not named here with
@@ -224,13 +232,17 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
 Derived by running the gate over the tree with this dict empty, not written from memory, and
-held exact by :func:`stale_immediate`: an entry no deferring function reaches is a finding. Each
-entry, with why it counts as it happens rather than through the ``Deferral``:
+held exact by :func:`stale_immediate`: an entry no deferring function reaches is a finding. None
+may name a counter some ``losses()`` reports as ``dropped`` — that count is exact by promise, and
+the tree test of :func:`dropped_store_findings` refuses the overlap — so every entry is ``failed``,
+an upper bound, a counter that feeds it, or state that is not a count. Each entry, with why it
+counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
 - ``HTTPSink._abandon`` / ``failed``: a request abandoned past the retry bound, counted before
-  the raise by design; ``failed`` is an upper bound SPEC-058 does not recount (*Out of Scope*).
+  the raise by design; ``failed`` is an upper bound neither SPEC-058 nor SPEC-059 recounts (each
+  spec's *Out of Scope*).
 - ``HTTPSink._abandon_unreduced`` / ``failed``: a chunk the reduction budget could not shrink;
   the same upper bound, the same *Out of Scope* clause.
 - ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
@@ -1132,7 +1144,7 @@ class Sink:
 
 
 def test_every_deferring_site_takes_the_one_helper() -> None:
-    """FR-002's instrument, over the real package: five sites, one helper, no second ledger.
+    """SPEC-058 FR-002's instrument over the real package: every site, one helper, one ledger.
 
     The construction rule and the roster rule run over every module under ``src/``, so a sixth
     site that builds a ``Deferral`` is held to the first, and one whose ``emit`` enters a
@@ -1683,6 +1695,6 @@ derivation and the store scan together; the failure text is asserted whole.
 
 @pytest.mark.parametrize("case", sorted(_DROPPED_CORPUS))
 def test_the_dropped_counter_check_reports_what_it_claims_to(case: str) -> None:
-    """Each derivation form's and store form's finding text, and the shapes that must stay silent."""
+    """Each derivation and store form's finding text, and the shapes that must stay silent."""
     source, expected = _DROPPED_CORPUS[case]
     assert dropped_store_findings("m.py", source, dropped_counters(source)) == expected
