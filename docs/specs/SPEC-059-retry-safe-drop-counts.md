@@ -148,9 +148,9 @@ calling `emit`'s `Deferral` and counts `dropped_oversized` and announces through
 SPEC-058 FR-005 gave `HTTPSink._items`. The `Deferral` is the outermost block of the work in
 `emit`, so a raise from anywhere beneath it discards the ledger. The announcement keeps today's
 shape — one line per oversized event, same text — written only when `emit` returns. A line whose
-text carries the event's size (Kinesis's and Firehose's) binds that size when it is registered,
-not when it is written, so two oversized events of different sizes in one batch each name their
-own.
+text carries the event's size (Kinesis's and Firehose's) binds that size when the drop is
+decided, not when the line is written, so two oversized events of different sizes in one batch each
+name their own.
 
 When each `emit` raises, which is what discards the ledger:
 
@@ -265,8 +265,8 @@ sink's own hand-off: when every event is refused the sink raises and counts noth
 catcher owns the batch. Both `emit`s count `rejected` and announce through a `Deferral` whose
 `with` encloses the produce/publish loop, `_reap()` (Pub/Sub) and the total-failure raise. One
 line per refused event, same text, written only when `emit` returns. Each line names its own
-event's exception type (`type(err).__name__`), and that type is bound when the line is
-registered, not when it is written, so two refusals of different types in one batch each name
+event's exception type (`type(err).__name__`), and that type is bound when the refusal is
+decided, not when the line is written, so two refusals of different types in one batch each name
 their own.
 
 When each `emit` raises: `KafkaSink` when closed on entry, when every message was refused, and
@@ -403,6 +403,13 @@ only by a `Deferral` commit.
   inheritance resolution (`ElasticsearchSink.losses` reads attributes `HTTPSink` writes); the
   cost is that an unrelated class storing a same-named attribute outside `__init__` is a finding
   too, and renames it.
+- *Dotted paths, and a computed name.* On the reading side a chain `self.a.b` derives its **last**
+  name, `b` — the attribute that holds the count; the objects on the way to it are not counts, and
+  deriving them would make a legitimate rebinding of one (a lazily opened client, say) a finding.
+  On the storing side a derived name matches at **any** position in the stored path, so
+  `self._socket.dropped_oversized += 1` is a finding even though its first name is `_socket`. A
+  `setattr(self, <name>, …)` whose name is not a string literal is a finding too, since nothing
+  shows it is not a counter. Both rules fail closed; neither fires on the tree at `33a0cd3`.
 - *No allowlist.* A `dropped` count is exact by promise (invariant 2), so a store that has to be
   immediate is not excused here; breaking that promise should mean editing the gate, deliberately.
 - *The floor.* The tree test asserts the derived set contains `dropped_oversized`,
@@ -432,7 +439,9 @@ only by a `Deferral` commit.
       from `self.<attr>`; a local assigned from a sum of two attributes; `wrapped_losses` with
       `own=` and with the second positional; and a counter reported by one class and stored by
       another.
-- [ ] The corpus asserts the finding text for each store form `_self_stores` recognises.
+- [ ] The corpus asserts the finding text for each store form `_self_stores` recognises, for a
+      derived name stored at a non-first position of a dotted path, and for a `setattr(self, …)`
+      whose name is computed; and asserts that a chained read `self.a.b` derives `b` and not `a`.
 - [ ] The corpus asserts silence for: a store in `__init__`; a store to `failed`, which no
       `losses()` reports as `dropped`; a count through `pending.count("rejected")`; a class whose
       `losses()` reports `dropped=0`; and a `dropped` argument that reads no `self` attribute
@@ -478,6 +487,13 @@ The sites, by path, each found by a sweep at `33a0cd3`:
   line gains `tests/test_deferral.py`.
 - **`docs/architecture.md`:** the passage in §8 ("SPEC-058 applies it at five sites … and the nine
   sinks a follow-up spec owns"), restated the same way.
+- **`README.md`, which is also the PyPI page:** the `sink.dropped` row of the health-fields table
+  ("an oversized record, or one the client refused outright") and the paragraph below it saying
+  `KafkaSink` and `GooglePubSubSink` "also count what their client refused outright". After FR-003
+  a refusal is counted in `sink.dropped` only when the rest of its batch was handed off; a batch
+  refused whole raises, so the worker's retry engages and `failed_batches` records it
+  (`orphan_lost` outside a span). Both are restated, and the paragraph says once that a drop is
+  counted only when the sink's `emit` returns, so a retried batch counts it once.
 
 Listed so each claim has an owner, and restated by the completion ritual rather than by this FR:
 the fence and the entry "A raising `emit` counts nothing…" in `docs/decisions/sink-delivery.md`
@@ -493,6 +509,8 @@ count as they happen — each gets a done-by marker naming SPEC-059, the old tex
 
 - [ ] `grep -rn 'Nothing here can fix' src/` and `grep -rn 'one level up'
       src/log_foundry/sinks/` find nothing.
+- [ ] `grep -n 'refused outright' README.md` finds nothing, and the README's `sink.dropped` row
+      says a batch refused whole is counted by the worker, not in `sink.dropped`.
 - [ ] `grep -n 'nine sinks' docs/invariants.md docs/architecture.md` finds nothing, and
       `grep -rn 'not yet deferring' src/` finds nothing.
 - [ ] Every docstring the Description lists says the drop is counted and announced only when
@@ -618,6 +636,16 @@ One PR.
   - SNS's raise reading (FR-001) is as complete as Kinesis's.
   - The orphan-path criteria (FR-001, FR-002) run with `max_value_bytes` raised above the sink's
     own limit; FR-004's does not need it.
+- **2026-10-23 — three amendments found by the implementation plan at `ae105bb`.** The plan
+  prototyped every FR and ran the whole suite. (1) "Bound when the line is registered" is
+  restated as "bound when the drop is decided": the idiom the old wording suggests, a
+  default-argument lambda, fails `mypy --strict` ("Cannot infer type of lambda") at all four sites,
+  and `SQSSink`'s collect-then-announce shape satisfies the criteria. (2) FR-005 states how a
+  dotted path is read and stored — the last name of a read chain is derived, a derived name matches
+  at any position of a stored path, and a computed `setattr` name is a finding — where the draft
+  was silent and first-name matching would miss `self._socket.dropped_oversized += 1`. (3) FR-006
+  gains `README.md`'s `sink.dropped` row and the Kafka/Pub/Sub paragraph beneath it, which FR-003
+  makes false for a batch refused whole and which the PyPI page carries.
 - **Considered and not taken:** putting the `Deferral` inside `SocketTransport.send_all`. It needs
   the gate's construction rule widened to a second entry name, and it makes the commit depend on
   `send_all` being the last statement of its callers. And an allowlist for the derived check: a
