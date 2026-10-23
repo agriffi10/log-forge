@@ -190,6 +190,8 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
     "sinks/syslog.py": {"SyslogSink": ("emit",)},
     "sinks/logstash.py": {"LogstashSink": ("emit",)},
+    "sinks/kafka.py": {"KafkaSink": ("emit",)},
+    "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -214,6 +216,11 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("SocketTransport", "_send_one"): frozenset({"failed"}),
     ("SocketTransport", "_socket"): frozenset({"_sock"}),
     ("SocketTransport", "_reset"): frozenset({"_sock"}),
+    ("GooglePubSubSink", "emit"): frozenset({"failed"}),
+    ("GooglePubSubSink", "_resolve"): frozenset({"failed"}),
+    ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
+    ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
+    ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -243,6 +250,17 @@ entry, with why it counts as it happens rather than through the ``Deferral``:
   same upper bound.
 - ``SocketTransport._socket`` and ``SocketTransport._reset`` / ``_sock``: the held socket, opened
   and dropped as the connection comes and goes; state, not a count.
+- ``GooglePubSubSink.emit`` / ``failed``: a future orphaned by a close landing mid-batch; it was
+  handed to the client and may land, so it is unconfirmed — the same upper bound.
+- ``GooglePubSubSink._resolve`` / ``failed``: a future that resolved to an error; the same upper
+  bound.
+- ``GooglePubSubSink._drain_pending`` / ``failed``: futures still in flight when the close bound
+  expired; the same upper bound.
+- ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
+  pending list, rebound as futures settle or are put back; state, not a count.
+
+``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
+``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).
 """
 
 

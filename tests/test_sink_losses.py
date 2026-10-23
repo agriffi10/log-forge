@@ -1067,10 +1067,12 @@ def test_kafka_raises_only_when_every_produce_was_refused() -> None:
 
     class Producer:
         def __init__(self, refuse_from: int = 0) -> None:
+            self.calls = 0
             self.produced: list[bytes] = []
             self._refuse_from = refuse_from
 
         def produce(self, topic, value, key, callback) -> None:
+            self.calls += 1
             if len(self.produced) >= self._refuse_from:
                 raise BufferError("local queue full")
             self.produced.append(value)
@@ -1081,10 +1083,14 @@ def test_kafka_raises_only_when_every_produce_was_refused() -> None:
         def flush(self) -> None:
             pass
 
-    sink = KafkaSink("t", producer=Producer(refuse_from=0))
+    refusing = Producer(refuse_from=0)
+    sink = KafkaSink("t", producer=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
-    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert refusing.calls == 2, "the premise: both messages were offered and refused"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    )
 
     partial = KafkaSink("t", producer=Producer(refuse_from=1))
     partial.emit([{"a": 1}, {"b": 2}])  # one was accepted: retrying would duplicate it
@@ -1105,10 +1111,14 @@ def test_pubsub_raises_only_when_every_publish_was_refused() -> None:
                 raise RuntimeError("no credentials")
             return object()
 
-    sink = GooglePubSubSink("t", client=Client(refuse_from=0))
+    refusing = Client(refuse_from=0)
+    sink = GooglePubSubSink("t", client=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
-    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert refusing.calls == 2, "the premise: both events were offered and refused"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    )
 
     partial = GooglePubSubSink("t", client=Client(refuse_from=1))
     partial.emit([{"a": 1}, {"b": 2}])
@@ -1452,8 +1462,16 @@ def test_pubsub_names_which_counter_moved(capsys) -> None:
     from log_foundry.sinks.pubsub import GooglePubSubSink
 
     class RefusingClient:
+        """Refuses the first publish and accepts the rest, so the refusal's emit returns."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
         def publish(self, topic, data):
-            raise RuntimeError("no credentials")
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("no credentials")
+            return object()
 
     class UnconfirmedClient:
         def publish(self, topic, data):
@@ -1462,8 +1480,7 @@ def test_pubsub_names_which_counter_moved(capsys) -> None:
         def result(self):
             raise TimeoutError("never acked")
 
-    with pytest.raises(SinkDeliveryError):
-        GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}])
+    GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}, {"a": 2}])
     refused = capsys.readouterr().err
     assert "refused the publish" in refused
 

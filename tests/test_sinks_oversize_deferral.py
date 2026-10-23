@@ -77,7 +77,7 @@ class _InterruptingSNS(SNSClient):
 
 
 class _NumberedCollection(FakeCollection):
-    """A collection whose ``insert_many`` raises on chosen call numbers, or always raises ``error``."""
+    """A collection whose ``insert_many`` fails on chosen call numbers, or always with ``error``."""
 
     def __init__(self, fail_on: set[int], error: BaseException | None) -> None:
         super().__init__()
@@ -234,7 +234,7 @@ def test_an_all_oversized_batch_makes_no_request_and_counts_all(name: str, capsy
 
 @pytest.mark.parametrize("name", sorted(_SINKS))
 def test_a_keyboard_interrupt_on_the_send_counts_nothing(name: str, capsys) -> None:
-    """A ``BaseException`` from the client leaves ``emit`` and discards the drop decided before it."""
+    """A ``BaseException`` from the client leaves ``emit`` and discards the drop made before it."""
     case = _SINKS[name]
     sink = case.build(set(), KeyboardInterrupt())
 

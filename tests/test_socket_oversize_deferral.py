@@ -1,4 +1,4 @@
-"""SPEC-059 FR-002 — the socket transport's oversize drop counts only when the sink's emit returns.
+"""SPEC-059 FR-002 — the socket transport's oversize drop counts only when emit returns.
 
 ``SocketTransport._sendable`` discarded a UDP datagram over ``max_datagram_bytes`` and counted it at
 once, so when the sendable remainder then failed totally ``send_all`` raised, the worker retried
