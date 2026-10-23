@@ -1,7 +1,7 @@
 # Spec: Retry-Safe Drop Counts in Every Sink
 
 **ID:** SPEC-059
-**Status:** Draft
+**Status:** In Progress
 **Last Updated:** 2026-10-23
 **Depends On:** SPEC-026, SPEC-036, SPEC-038, SPEC-058
 
