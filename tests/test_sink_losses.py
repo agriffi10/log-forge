@@ -1250,7 +1250,9 @@ def test_an_oversized_event_does_not_cause_a_phantom_eventhubs_send(monkeypatch)
         sink.emit([{"pad": "x" * 200}, {"ok": 1}])  # oversized, then a normal event
 
     assert 0 not in producer.sizes, "an empty batch is never sent"
-    assert sink.losses() == SinkLosses(dropped=1, failed=1)
+    assert sink.losses() == SinkLosses(dropped=0, failed=1), (
+        "the raise discards the oversize drop (SPEC-059 FR-001); the worker's abandon line owns it"
+    )
 
 
 def test_a_sender_fault_chunk_does_not_mask_a_recoverable_one() -> None:

@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -98,6 +99,15 @@ class AzureEventHubsSink:
         empty send and returns, a phantom success that counted as delivery and suppressed the
         raise for everything else in the emit.
 
+        An oversize drop :meth:`_send_batch` decides is counted and announced only when
+        ``emit`` returns, through the deferral helper (SPEC-059 FR-001): a send failure on every
+        attempted batch, or ``create_batch`` raising, discards it, and the worker's retry
+        decides it afresh. The ledger is entered **outside** the emit lock — the ``Deferral``
+        first, ``_lock`` inside it — so the lock is released before the commit takes the counter
+        lock and writes the line, and a stderr write never runs under the transport lock
+        (SPEC-028's two-lock decision). The failed-send count and line :meth:`_send` writes stay
+        where they are.
+
         Args:
           batch: The events to send. An empty batch is a no-op.
 
@@ -108,18 +118,18 @@ class AzureEventHubsSink:
           SinkDeliveryError: When every batch failed to send and at least one was attempted
             (SPEC-026 FR-001). An event dropped for being too large is not a send failure — it
             can never fit — so a batch of nothing but oversized events has nothing to retry and
-            is reported through :meth:`losses` instead.
+            is reported through :meth:`losses` instead; a raise leaves none of them counted.
         """
         if not batch:
             return
-        with self._lock:
+        with Deferral(self) as pending, self._lock:
             if self._closed:
                 raise SinkDeliveryError(
                     f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
                 )
-            self._send_batch(batch)
+            self._send_batch(batch, pending)
 
-    def _send_batch(self, batch: list[dict[str, object]]) -> None:
+    def _send_batch(self, batch: list[dict[str, object]], pending: Deferral) -> None:
         """Packs and sends the batch, with the emit lock already held.
 
         Split out so the lock's extent is one line in :meth:`emit`. The driver requirement
@@ -129,8 +139,16 @@ class AzureEventHubsSink:
         state besides — two threads packing into batches from one producer interleave
         ``create_batch``/``add``/``send`` on it.
 
+        An event too large for an empty batch goes to ``pending`` rather than to the counter, so
+        it is counted and announced only when ``emit`` returns (SPEC-059 FR-001), and its line is
+        written after the emit lock is released rather than under it. The line names no
+        per-event value, so each drop registers its own count and its own line, one per event as
+        before.
+
         Args:
           batch: The events to send, known non-empty.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise.
 
         Returns:
           None.
@@ -150,9 +168,12 @@ class AzureEventHubsSink:
                 delivered += self._send(current)
             current = self.producer.create_batch()
             if not _try_add(current, data):
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost("event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch")
+                pending.count("dropped_oversized")
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch"
+                    )
+                )
         if len(current) > 0:
             attempted += 1
             delivered += self._send(current)

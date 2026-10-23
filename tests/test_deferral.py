@@ -182,6 +182,11 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/multi.py": {"MultiSink": ("emit",)},
     "sinks/sqs.py": {"SQSSink": ("emit", "_chunks")},
     "sinks/http.py": {"HTTPSink": ("emit", "_items")},
+    "sinks/kinesis.py": {"KinesisSink": ("emit", "_records")},
+    "sinks/firehose.py": {"FirehoseSink": ("emit", "_records")},
+    "sinks/sns.py": {"SNSSink": ("emit", "_bodies")},
+    "sinks/mongodb.py": {"MongoDBSink": ("emit", "_documents")},
+    "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -198,6 +203,11 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("HTTPSink", "_abandon_unreduced"): frozenset({"failed"}),
     ("HTTPSink", "_drop_refused"): frozenset({"dropped_oversized"}),
     ("SQSSink", "_send"): frozenset({"failed"}),
+    ("KinesisSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
+    ("FirehoseSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
+    ("SNSSink", "_send"): frozenset({"failed"}),
+    ("MongoDBSink", "emit"): frozenset({"failed"}),
+    ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -215,6 +225,14 @@ entry, with why it counts as it happens rather than through the ``Deferral``:
   conditional path is the drop-recount follow-up's (*Out of Scope*), not this spec's.
 - ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
   happen, before ``emit`` can raise; the same upper bound, the same *Out of Scope* clause.
+- ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:
+  records failed past the bound, and records in a chunk whose response could not be paired to
+  them, which ``losses()`` folds into ``failed``; an upper bound SPEC-059 does not recount.
+- ``SNSSink._send`` / ``failed``: entries failed past the bound; the same upper bound.
+- ``MongoDBSink.emit`` / ``failed``: rejected documents and connection errors past the bound; the
+  same upper bound.
+- ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
+  bound, its line still written under the emit lock as before (SPEC-059 *Out of Scope*).
 """
 
 

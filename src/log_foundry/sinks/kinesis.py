@@ -9,6 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -102,6 +103,13 @@ class KinesisSink:
         prove nothing was delivered, so the events in a plainly-failed sibling chunk stay a
         counted loss rather than a duplicated delivery.
 
+        An oversize drop :meth:`_records` decides is counted and announced only when ``emit``
+        returns, through the deferral helper whose ``with`` is the outermost block of the work
+        (SPEC-059 FR-001). The drop is decided before any send, and this call can still raise
+        afterwards — the total-failure raise below, a ``json.dumps`` failure, a
+        ``BaseException`` from the client — and be retried whole; counting it at once counted
+        one oversized event once per attempt.
+
         Args:
           batch: The events to write.
 
@@ -111,25 +119,27 @@ class KinesisSink:
         Raises:
           SinkDeliveryError: When every chunk failed, at least one was sent, and none was
             unadjudicable (SPEC-026 FR-001). Records dropped before sending are not a send
-            failure and are reported through :meth:`losses`.
+            failure and are reported through :meth:`losses`; a raise leaves none of them
+            counted.
         """
-        records = self._records(batch)
         chunks = delivered = 0
         unknown = False
-        for chunk in chunk_items(
-            records,
-            max_count=self.MAX_RECORDS,
-            max_bytes=self.MAX_REQUEST_BYTES,
-            size_of=_record_size,
-        ):
-            chunks += 1
-            outcome = self._send(chunk)
-            if outcome is None:
-                unknown = True
-            else:
-                delivered += outcome
-        if chunks and not delivered and not unknown:
-            raise SinkDeliveryError(f"KinesisSink delivered none of {chunks} chunk(s)")
+        with Deferral(self) as pending:
+            records = self._records(batch, pending)
+            for chunk in chunk_items(
+                records,
+                max_count=self.MAX_RECORDS,
+                max_bytes=self.MAX_REQUEST_BYTES,
+                size_of=_record_size,
+            ):
+                chunks += 1
+                outcome = self._send(chunk)
+                if outcome is None:
+                    unknown = True
+                else:
+                    delivered += outcome
+            if chunks and not delivered and not unknown:
+                raise SinkDeliveryError(f"KinesisSink delivered none of {chunks} chunk(s)")
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops, abandoned records and unadjudicable chunks (FR-002).
@@ -165,11 +175,21 @@ class KinesisSink:
           None.
         """
 
-    def _records(self, batch: list[dict[str, object]]) -> list[dict[str, Any]]:
+    def _records(
+        self, batch: list[dict[str, object]], pending: Deferral
+    ) -> list[dict[str, Any]]:
         """Builds the request entries, dropping any record too large to ever fit (FR-011).
+
+        A drop goes to ``pending`` rather than to the counter, so it is counted and announced
+        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
+        discards it, and the worker's retry decides it afresh. Each dropped record's charged size
+        is collected here, as the drop is decided, and the announcer writes one line per size —
+        today's shape, each line naming its own record rather than the last one met.
 
         Args:
           batch: The events to convert.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise.
 
         Returns:
           The records that can be sent.
@@ -178,22 +198,43 @@ class KinesisSink:
           None.
         """
         records: list[dict[str, Any]] = []
+        oversized: list[int] = []
         for event in batch:
             data = json.dumps(event).encode("utf-8")
             key = _partition_key(str(event.get(self.partition_key_field) or "log-foundry"))
             charged = len(data) + len(key.encode("utf-8"))
             if charged > self.MAX_RECORD_BYTES:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost(
-                    "event",
-                    1,
-                    f"KinesisSink, {charged} bytes with its partition key exceeds the "
-                    f"{self.MAX_RECORD_BYTES}-byte per-record limit",
-                )
+                oversized.append(charged)
                 continue
             records.append({"Data": data, "PartitionKey": key})
+        if oversized:
+            pending.count("dropped_oversized", len(oversized))
+            pending.announce(lambda: self._announce_oversized(oversized))
         return records
+
+    def _announce_oversized(self, sizes: list[int]) -> None:
+        """Writes one line per record dropped for exceeding the per-record limit (FR-011).
+
+        Called by the calling ``emit``'s deferral after the count is committed, outside the
+        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-001).
+
+        Args:
+          sizes: The charged size of each dropped record, partition key included, in the order
+            they were met.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for size in sizes:
+            _diag.lost(
+                "event",
+                1,
+                f"KinesisSink, {size} bytes with its partition key exceeds the "
+                f"{self.MAX_RECORD_BYTES}-byte per-record limit",
+            )
 
     def _send(self, records: list[dict[str, Any]]) -> int | None:
         """Sends one chunk, retrying only the records the response flags as failed (FR-003).
