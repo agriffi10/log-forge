@@ -17,6 +17,7 @@ import pytest
 from conftest import run_concurrently
 from log_foundry import SinkLosses
 from log_foundry.sinks import _socket
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.sqlite import SQLiteSink
@@ -1534,7 +1535,8 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
         monkeypatch.setattr(_socket, "_make_tcp", make)
         transport = _socket.SocketTransport("localhost", 5140)
-        transport.send_all([b"warm up "])
+        with Deferral(transport) as pending:
+            transport.send_all([b"warm up "], pending)
         return transport, lambda: len(opened)
     if name == "postgres":
         from log_foundry.sinks.postgres import PostgresSink
@@ -1651,7 +1653,8 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
 
     with pytest.raises(SinkDeliveryError):
         if name == "socket":
-            sink.send_all([b"<14>1 after close"])
+            with Deferral(sink) as pending:
+                sink.send_all([b"<14>1 after close"], pending)
         else:
             sink.emit([event(0, 0)])
 
@@ -1666,7 +1669,8 @@ def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     sink, _ = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
     if name == "socket":
-        sink.send_all([])
+        with Deferral(sink) as pending:
+            sink.send_all([], pending)
     else:
         sink.emit([])
 

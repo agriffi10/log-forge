@@ -7,6 +7,7 @@ import os
 import socket
 from typing import TYPE_CHECKING
 
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 
 if TYPE_CHECKING:
@@ -120,6 +121,13 @@ class SyslogSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Frames each event as RFC 5424 and sends it over the socket (FR-006).
 
+        This is the boundary the worker retries, so the ledger lives here: a ``Deferral`` owned by
+        the transport, which already guards its counters with the lock the commit takes, is
+        handed to ``send_all`` (SPEC-059 FR-002). A UDP frame over the datagram limit is
+        therefore counted and announced only when ``emit`` returns; a raise — the transport
+        closed, or nothing sendable reaching the socket — discards it, and the worker's retry
+        decides it afresh rather than counting it once per attempt.
+
         Args:
           batch: The events to ship. An empty batch is a no-op.
 
@@ -127,11 +135,12 @@ class SyslogSink:
           None.
 
         Raises:
-          SinkDeliveryError: If no frame reached the socket.
+          SinkDeliveryError: If no frame reached the socket, leaving nothing counted.
         """
         if not batch:
             return
-        self._socket.send_all([self._frame(event) for event in batch])
+        with Deferral(self._socket) as pending:
+            self._socket.send_all([self._frame(event) for event in batch], pending)
 
     def close(self) -> None:
         """Closes the underlying socket (FR-006).

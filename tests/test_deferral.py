@@ -187,6 +187,9 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/sns.py": {"SNSSink": ("emit", "_bodies")},
     "sinks/mongodb.py": {"MongoDBSink": ("emit", "_documents")},
     "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
+    "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
+    "sinks/syslog.py": {"SyslogSink": ("emit",)},
+    "sinks/logstash.py": {"LogstashSink": ("emit",)},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -208,6 +211,9 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("SNSSink", "_send"): frozenset({"failed"}),
     ("MongoDBSink", "emit"): frozenset({"failed"}),
     ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
+    ("SocketTransport", "_send_one"): frozenset({"failed"}),
+    ("SocketTransport", "_socket"): frozenset({"_sock"}),
+    ("SocketTransport", "_reset"): frozenset({"_sock"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -233,6 +239,10 @@ entry, with why it counts as it happens rather than through the ``Deferral``:
   same upper bound.
 - ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
   bound, its line still written under the emit lock as before (SPEC-059 *Out of Scope*).
+- ``SocketTransport._send_one`` / ``failed``: a message abandoned past the reconnect bound; the
+  same upper bound.
+- ``SocketTransport._socket`` and ``SocketTransport._reset`` / ``_sock``: the held socket, opened
+  and dropped as the connection comes and goes; state, not a count.
 """
 
 
