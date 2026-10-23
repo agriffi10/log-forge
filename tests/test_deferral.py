@@ -206,7 +206,6 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
     ("HTTPSink", "_abandon"): frozenset({"failed"}),
     ("HTTPSink", "_abandon_unreduced"): frozenset({"failed"}),
-    ("HTTPSink", "_drop_refused"): frozenset({"dropped_oversized"}),
     ("SQSSink", "_send"): frozenset({"failed"}),
     ("KinesisSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
     ("FirehoseSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
@@ -234,8 +233,6 @@ entry, with why it counts as it happens rather than through the ``Deferral``:
   the raise by design; ``failed`` is an upper bound SPEC-058 does not recount (*Out of Scope*).
 - ``HTTPSink._abandon_unreduced`` / ``failed``: a chunk the reduction budget could not shrink;
   the same upper bound, the same *Out of Scope* clause.
-- ``HTTPSink._drop_refused`` / ``dropped_oversized``: a ``413`` drop, counted as it happens; its
-  conditional path is the drop-recount follow-up's (*Out of Scope*), not this spec's.
 - ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
   happen, before ``emit`` can raise; the same upper bound, the same *Out of Scope* clause.
 - ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:
@@ -623,6 +620,19 @@ _BOUND = "not a local name; one call's pending drops must stay local to that cal
 _STALE_IMPORT = "m.py: does not import Deferral from log_foundry.sinks._deferral"
 
 _ONE_EMIT = {"Sink": ("emit",)}
+
+_CORPUS_IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
+    ("MultiSink", "emit"): frozenset({"failed"}),
+    ("HTTPSink", "_drop_refused"): frozenset({"dropped_oversized"}),
+}
+"""The corpus's own allowlist, fixed, so its cases test the allowlist mechanism and not the tree's.
+
+The corpus read the shipped :data:`IMMEDIATE` until SPEC-059, and two of its cases lean on an entry
+there: ``MultiSink.emit`` / ``failed``, and ``HTTPSink._drop_refused`` / ``dropped_oversized`` in
+"an allowed store is silent in the method the allowlist names". SPEC-059 FR-004 removed the second
+from the shipped list, which would have reddened a case about the mechanism over a change to an
+entry. Every case's source and expected findings are what they were.
+"""
 
 _CORPUS: dict[str, tuple[str, dict[str, tuple[str, ...]] | None, list[str]]] = {
     "helper-only emit": (_IMPORT + _DEFERRED_EMIT, _ONE_EMIT, []),
@@ -1089,7 +1099,7 @@ class Sink:
 def test_the_deferral_lint_reports_what_it_claims_to(case: str) -> None:
     """Each check's failure text, and the shapes that must stay silent, on synthetic modules."""
     source, sites, expected = _CORPUS[case]
-    assert deferral_findings("m.py", source, sites, IMMEDIATE) == expected
+    assert deferral_findings("m.py", source, sites, _CORPUS_IMMEDIATE) == expected
 
 
 def test_an_allowance_nothing_reaches_is_reported_stale() -> None:

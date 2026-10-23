@@ -148,15 +148,21 @@ def test_a_mixed_batch_keeps_the_two_counts_apart() -> None:
 
 
 _RECIPES = {
-    "DatadogSink": lambda: log_foundry.sinks.datadog.DatadogSink("key"),
-    "ElasticsearchSink": lambda: ElasticsearchSink("http://es", index="i"),
-    "HoneycombSink": lambda: log_foundry.sinks.honeycomb.HoneycombSink("key", "dataset"),
-    "LokiSink": lambda: LokiSink("http://loki"),
-    "NewRelicSink": lambda: log_foundry.sinks.newrelic.NewRelicSink("key"),
-    "OpenSearchSink": lambda: OpenSearchSink("http://os", index="i"),
-    "SplunkHECSink": lambda: log_foundry.sinks.splunk.SplunkHECSink("http://splunk", "tok"),
+    "DatadogSink": lambda **kw: log_foundry.sinks.datadog.DatadogSink("key", **kw),
+    "ElasticsearchSink": lambda **kw: ElasticsearchSink("http://es", index="i", **kw),
+    "HoneycombSink": lambda **kw: log_foundry.sinks.honeycomb.HoneycombSink("key", "dataset", **kw),
+    "LokiSink": lambda **kw: LokiSink("http://loki", **kw),
+    "NewRelicSink": lambda **kw: log_foundry.sinks.newrelic.NewRelicSink("key", **kw),
+    "OpenSearchSink": lambda **kw: OpenSearchSink("http://os", index="i", **kw),
+    "SplunkHECSink": lambda **kw: log_foundry.sinks.splunk.SplunkHECSink(
+        "http://splunk", "tok", **kw
+    ),
 }
-"""How to build each shipped ``HTTPSink`` subclass. A class with no recipe fails the sweep."""
+"""How to build each shipped ``HTTPSink`` subclass. A class with no recipe fails the sweep.
+
+Each recipe forwards keyword arguments, so a sweep can hand every subclass the same ``opener=``
+and request shape (SPEC-059 FR-004); every subclass accepts them through ``HTTPForwardKwargs``.
+"""
 
 
 def _shipped_http_subclasses() -> list[type[HTTPSink]]:
