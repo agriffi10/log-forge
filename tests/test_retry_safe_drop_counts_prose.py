@@ -96,8 +96,14 @@ def test_every_listed_docstring_says_the_drop_counts_on_return(module: str, qual
 
 @pytest.mark.parametrize(("module", "qualname"), _LISTED, ids=[q for _, q in _LISTED])
 def test_no_listed_docstring_says_the_drop_counts_as_it_happens(module: str, qualname: str) -> None:
-    """None of the listed docstrings says its drop is counted as it happens."""
-    assert "as it happens" not in _docstring(_SINKS / module, qualname), (module, qualname)
+    """None of the listed docstrings says its drop is counted as it happens.
+
+    A regression guard, not evidence of the restatement: before SPEC-059 only ``HTTPSink.emit``
+    used the wording ("as they happen"), so the other rows were already silent. The positive half
+    above is what tells the restated docstrings from the old ones.
+    """
+    doc = _docstring(_SINKS / module, qualname)
+    assert "as it happens" not in doc and "as they happen" not in doc, (module, qualname)
 
 
 @pytest.mark.parametrize(("where", "phrase"), _RETIRED, ids=[p for _, p in _RETIRED])

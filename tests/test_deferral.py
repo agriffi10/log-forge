@@ -1527,6 +1527,17 @@ class Sink:
 """,
         [_dropped_store(8, "Sink", "bump", "a")],
     ),
+    "a local bound by unpacking": (
+        """
+class Sink:
+    def losses(self):
+        first, *own = 0, self.a
+        return SinkLosses(dropped=sum(own), failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a")],
+    ),
     "a local from a walrus": (
         """
 class Sink:
@@ -1640,6 +1651,17 @@ class Sink:
         self.a.n += 1
 """,
         [_dropped_store(7, "Sink", "bump", "a.n")],
+    ),
+    "a chained read through a subscript derives its last name": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.by_kind["x"].n, failed=0)
+    def bump(self):
+        self.by_kind = {}
+        self.by_kind["x"].n += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "by_kind.n")],
     ),
     "a store in __init__ is silent": (
         """
