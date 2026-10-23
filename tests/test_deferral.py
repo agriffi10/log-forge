@@ -387,7 +387,7 @@ def _self_path(node: ast.expr) -> str | None:
     return None
 
 
-def _self_stores(fn: ast.FunctionDef) -> list[tuple[str, int]]:
+def _self_stores(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, int]]:
     """Every store to state reached through ``self`` in ``fn``, nested code included, by line.
 
     A store is recognised by the context the parser gives its target, not by listing statements.
@@ -1153,3 +1153,536 @@ def test_every_deferring_site_takes_the_one_helper() -> None:
         )
     findings.extend(stale_immediate(IMMEDIATE, used))
     assert findings == [], "\n".join(findings)
+
+
+# --- SPEC-059 FR-005: a dropped counter is written only by a Deferral commit --------------
+
+DROPPED_FLOOR = frozenset(
+    {"dropped_oversized", "_unrenderable", "_id_failed", "rejected", "_dropped"}
+)
+"""Counters the derivation must find over the tree; a floor, not the set.
+
+A new counter needs no edit here, because the set is derived. What the floor catches is the
+opposite drift: a refactor that blinds :func:`dropped_counters` — a renamed helper, a call it no
+longer recognises — would otherwise shrink the guard as silently as a deletion.
+"""
+
+_REPORTED_CALLS = {"SinkLosses": ("dropped", 0), "wrapped_losses": ("own", 1)}
+"""Each call that reports a drop count, with the argument that carries it: keyword, position."""
+
+
+def _callee(call: ast.Call) -> str | None:
+    """The called name, spelt bare (``SinkLosses``) or as an attribute (``base.SinkLosses``)."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _argument(call: ast.Call, keyword: str, position: int) -> ast.expr | None:
+    """The argument passed as ``keyword=``, else the one at ``position``, else ``None``.
+
+    ``SinkLosses`` is keyword-only, so its positional form never constructs at run time; it is
+    read anyway, as syntax, because reading it fails closed.
+    """
+    for item in call.keywords:
+        if item.arg == keyword:
+            return item.value
+    if len(call.args) > position:
+        return call.args[position]
+    return None
+
+
+def _self_rooted(node: ast.expr) -> bool:
+    """True when ``node`` is a chain of attributes and subscripts that starts at ``self``."""
+    while isinstance(node, ast.Attribute | ast.Subscript):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id == "self"
+
+
+def _reported_names(node: ast.AST) -> set[str]:
+    """The **last** name of every ``self``-rooted chain read anywhere in ``node``.
+
+    ``self.a.b`` yields ``b``, the attribute holding the count; ``a`` is an object on the way to
+    it, and deriving it would make a legitimate rebinding of that object (a lazily opened client)
+    a finding. A chain is taken whole at its outermost attribute and not descended into, so its
+    inner names are never yielded.
+    """
+    if isinstance(node, ast.Attribute) and _self_rooted(node):
+        return {node.attr}
+    names: set[str] = set()
+    for child in ast.iter_child_nodes(node):
+        names |= _reported_names(child)
+    return names
+
+
+def _bound_names(target: ast.expr) -> list[str]:
+    """The bare local names a target binds, through tuple, list and starred unpacking."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple | ast.List):
+        return [name for item in target.elts for name in _bound_names(item)]
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    return []
+
+
+def _local_values(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, list[ast.expr]]:
+    """Every value ``fn`` assigns to each bare local name, nested functions included.
+
+    Plain, annotated and augmented assignment and the walrus all count; a nested function's
+    assignments are visible to the outer lookup, which is wider than Python's scoping and so fails
+    closed.
+    """
+    values: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            pairs = [(target, node.value) for target in node.targets]
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr) and node.value:
+            pairs = [(node.target, node.value)]
+        else:
+            continue
+        for target, value in pairs:
+            for name in _bound_names(target):
+                values.setdefault(name, []).append(value)
+    return values
+
+
+def dropped_counters(source: str) -> set[str]:
+    """Every attribute one module's code reports as ``dropped``, derived from the syntax.
+
+    **What it derives.** In every function at any depth — not only one named ``losses``, since a
+    sink may build its report in a helper — every call to ``SinkLosses`` or ``wrapped_losses``,
+    spelt bare or as an attribute. From ``SinkLosses`` it reads the ``dropped`` argument (keyword,
+    else first positional); from ``wrapped_losses`` the ``own`` argument (keyword, else second
+    positional). In that argument it takes the last name of every ``self``-rooted chain
+    (:func:`_reported_names`), and, for every bare name it reads, the same from each value the
+    function assigns to that name (:func:`_local_values`) — which is how ``TransformSink`` and
+    ``FilteringSink`` report ``self._dropped`` through a local. That step is **one hop**: a
+    value's own names are not followed, so ``MultiSink.losses``' ``reported``, built from
+    ``self._sinks``, contributes nothing, where a transitive step would derive ``_sinks``.
+
+    Args:
+      source: The module's text.
+
+    Returns:
+      The derived attribute names; the tree test unions them over every module.
+    """
+    counters: set[str] = set()
+    for fn in ast.walk(ast.parse(source)):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        assigned = _local_values(fn)
+        for call in ast.walk(fn):
+            if not isinstance(call, ast.Call):
+                continue
+            spec = _REPORTED_CALLS.get(_callee(call) or "")
+            if spec is None:
+                continue
+            argument = _argument(call, *spec)
+            if argument is None:
+                continue
+            counters |= _reported_names(argument)
+            for name in ast.walk(argument):
+                if isinstance(name, ast.Name):
+                    for value in assigned.get(name.id, []):
+                        counters |= _reported_names(value)
+    return counters
+
+
+def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[str]:
+    """Every store to a derived counter outside ``__init__``, as lines a reader can act on.
+
+    **What it checks.** In every method of every class in the module, nested classes included,
+    except ``__init__``: each store :func:`_self_stores` recognises whose path names a derived
+    counter at **any** position — so ``self._socket.dropped_oversized += 1`` is a finding though
+    its first name is ``_socket`` — and each ``setattr(self, <name>, ...)`` whose name is not a
+    string literal, since nothing shows it is not a counter. The match is by attribute name across
+    the tree, not within the reporting class, so it needs no inheritance resolution
+    (``ElasticsearchSink.losses`` reads attributes ``HTTPSink`` writes); the cost is that an
+    unrelated class storing a same-named attribute outside ``__init__`` is a finding too, and
+    renames it. There is no allowlist: a ``dropped`` count is exact by promise (invariant 2), so a
+    store that has to be immediate belongs to a counter no ``losses()`` reports as ``dropped``.
+
+    **What it does not see.** It reads syntax. A store through an alias of ``self``
+    (``me = self``), a mutating method call (``self.counts.update(...)``), a store outside a
+    class, and a counter reported through a call or a property rather than a plain ``self``
+    read — ``SyslogSink.losses`` returns ``self._socket.losses()``, which is that — are not
+    findings. ``Deferral.__exit__`` writes through ``setattr(owner, ...)``, not ``self``, which is
+    why the one permitted writer is invisible to a check that refuses every ``self`` store.
+
+    Args:
+      where: The module's path, for the message.
+      source: The module's text.
+      counters: The derived counter names, from :func:`dropped_counters` over the whole tree.
+
+    Returns:
+      The findings in source order, empty when the module complies.
+    """
+    findings: list[tuple[int, str]] = []
+    for cls in ast.walk(ast.parse(source)):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for fn in cls.body:
+            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef) or fn.name == "__init__":
+                continue
+            for path, line in _self_stores(fn):
+                if path == "<dynamic>":
+                    what = "stores through setattr(self, ...) with a computed name, which may be "
+                    why = "a counter a losses() reports as dropped; name it, or count it"
+                elif counters.intersection(path.split(".")):
+                    what = f"stores self.{path}, which "
+                    why = "a losses() reports as dropped; count it"
+                else:
+                    continue
+                text = f"{where}:{line}: {cls.name}.{fn.name} {what}{why}{_THROUGH_THE_LEDGER}"
+                findings.append((line, text))
+    return [text for _, text in sorted(findings, key=lambda finding: finding[0])]
+
+
+_THROUGH_THE_LEDGER = " through the calling emit's Deferral"
+"""The close every store finding shares: where the count belongs instead."""
+
+
+def _tree_sources() -> dict[str, str]:
+    """Every module under ``src/log_foundry``, by its path relative to the package."""
+    return {
+        path.relative_to(_SRC).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(_SRC.rglob("*.py"))
+    }
+
+
+def _tree_counters(sources: dict[str, str]) -> set[str]:
+    """The derived counters, unioned over the whole package."""
+    counters: set[str] = set()
+    for source in sources.values():
+        counters |= dropped_counters(source)
+    return counters
+
+
+def test_every_dropped_counter_is_written_only_by_a_deferral_commit() -> None:
+    """FR-005 part 3, over the real package: a ``dropped`` counter moves only in a commit.
+
+    The roster and the allowlist hold a *site* to the helper, so a counter written in a method no
+    roster entry reaches, or in a sink nobody listed, passed both. This holds the *counter*. The
+    derived set must contain the floor, and no :data:`IMMEDIATE` entry may excuse a store to a
+    derived counter, since that allowlist exists for counts that are not ``dropped``.
+    """
+    sources = _tree_sources()
+    counters = _tree_counters(sources)
+    assert counters >= DROPPED_FLOOR, f"the derivation lost {sorted(DROPPED_FLOOR - counters)}"
+    excused = {attr for attrs in IMMEDIATE.values() for attr in attrs} & counters
+    assert not excused, f"IMMEDIATE excuses a store to a dropped counter: {sorted(excused)}"
+    findings: list[str] = []
+    for where, source in sources.items():
+        findings.extend(dropped_store_findings(where, source, counters))
+    assert findings == [], "\n".join(findings)
+
+
+def _plant_in_on_delivery(source: str) -> tuple[str, int]:
+    """``sinks/kafka.py`` with ``self.rejected += 1`` planted first in ``_on_delivery``'s body.
+
+    The line goes after the docstring, at the body's own indentation, and its number is read
+    from the parsed tree rather than written as a literal, so an edit above the method moves the
+    expectation with it.
+    """
+    kafka = _class(ast.parse(source), "KafkaSink")
+    assert kafka is not None, "KafkaSink is gone from sinks/kafka.py"
+    method = _methods(kafka).get("_on_delivery")
+    assert method is not None and len(method.body) > 1, "KafkaSink._on_delivery has moved"
+    first = method.body[1]
+    lines = source.splitlines(keepends=True)
+    lines.insert(first.lineno - 1, " " * first.col_offset + "self.rejected += 1\n")
+    return "".join(lines), first.lineno
+
+
+def test_a_rejected_store_planted_in_an_unreached_kafka_method_is_named() -> None:
+    """The gap this check closes: a store the roster never reaches is still a finding.
+
+    ``_on_delivery`` is handed to ``produce`` uncalled, so the site check does not follow it and
+    stays silent over the plant; the counter check names the module, the line, the class, the
+    method and the stored path.
+    """
+    sources = _tree_sources()
+    planted, line = _plant_in_on_delivery(sources["sinks/kafka.py"])
+    named = (
+        f"sinks/kafka.py:{line}: KafkaSink._on_delivery stores self.rejected, which a losses() "
+        f"reports as dropped; count it through the calling emit's Deferral"
+    )
+
+    assert dropped_store_findings("sinks/kafka.py", planted, _tree_counters(sources)) == [named]
+    assert (
+        deferral_findings(
+            "sinks/kafka.py", planted, DEFERRING_SITES["sinks/kafka.py"], IMMEDIATE, set()
+        )
+        == []
+    ), "the premise: the site check does not reach the plant"
+
+
+def _dropped_store(line: int, cls: str, method: str, path: str) -> str:
+    """One expected store finding on the corpus module ``m.py``."""
+    return (
+        f"m.py:{line}: {cls}.{method} stores self.{path}, which a losses() reports as dropped; "
+        f"count it through the calling emit's Deferral"
+    )
+
+
+_REPORTS = """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped={dropped}, failed=self.failed)
+    def bump(self):
+        self.a += 1
+        self.b += 1
+"""
+
+_DROPPED_CORPUS: dict[str, tuple[str, list[str]]] = {
+    "dropped= keyword": (
+        _REPORTS.format(dropped="self.a"),
+        [_dropped_store(6, "Sink", "bump", "a")],
+    ),
+    "first positional": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(self.a, self.b)
+    def bump(self):
+        self.a += 1
+        self.b += 1
+""",
+        [_dropped_store(6, "Sink", "bump", "a")],
+    ),
+    "callee spelt as an attribute": (
+        """
+class Sink:
+    def losses(self):
+        return base.SinkLosses(dropped=self.a, failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(6, "Sink", "bump", "a")],
+    ),
+    "a sum of two attributes": (
+        _REPORTS.format(dropped="self.a + self.b"),
+        [_dropped_store(6, "Sink", "bump", "a"), _dropped_store(7, "Sink", "bump", "b")],
+    ),
+    "a local assigned from an attribute": (
+        """
+class Sink:
+    def losses(self):
+        with self._counter_lock:
+            own = self.a
+        return SinkLosses(dropped=own, failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(8, "Sink", "bump", "a")],
+    ),
+    "a local assigned from a sum of two attributes": (
+        """
+class Sink:
+    def losses(self):
+        dropped = self.a + self.b
+        return SinkLosses(dropped=dropped, failed=0)
+    def bump(self):
+        self.a += 1
+        self.b += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a"), _dropped_store(8, "Sink", "bump", "b")],
+    ),
+    "a local from an annotated assignment": (
+        """
+class Sink:
+    def losses(self):
+        own: int = self.a
+        return SinkLosses(dropped=own, failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a")],
+    ),
+    "a local from an augmented assignment": (
+        """
+class Sink:
+    def losses(self):
+        own = 0
+        own += self.a
+        return SinkLosses(dropped=own, failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(8, "Sink", "bump", "a")],
+    ),
+    "a local from a walrus": (
+        """
+class Sink:
+    def losses(self):
+        if (own := self.a) >= 0:
+            return SinkLosses(dropped=own, failed=0)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a")],
+    ),
+    "wrapped_losses with own=": (
+        """
+class Sink:
+    def losses(self):
+        return wrapped_losses(read_losses(self._inner), own=self.a)
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(6, "Sink", "bump", "a")],
+    ),
+    "wrapped_losses with the second positional": (
+        """
+class Sink:
+    def losses(self):
+        return wrapped_losses(read_losses(self._inner), self.a)
+    def bump(self):
+        self.a += 1
+        self._inner = None
+""",
+        [_dropped_store(6, "Sink", "bump", "a")],
+    ),
+    "a counter reported by one class and stored by another": (
+        """
+class Reporter:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+class Writer:
+    def bump(self):
+        self.a += 1
+""",
+        [_dropped_store(7, "Writer", "bump", "a")],
+    ),
+    "every store form": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    async def bump(self, batch):
+        self.a = 1
+        self.a += 1
+        self.a: int = 1
+        for self.a in batch:
+            pass
+        with open(path) as self.a:
+            pass
+        [0 for self.a in batch]
+        {0 for self.a in batch}
+        {0: 0 for self.a in batch}
+        list(0 for self.a in batch)
+        async for self.a in batch:
+            pass
+        async with lock as self.a:
+            pass
+        self.b, (self.a, *rest) = 1, (2, 3)
+        self.a["k"] = 1
+        setattr(self, "a", 1)
+        del self.a
+""",
+        [
+            _dropped_store(line, "Sink", "bump", "a")
+            for line in (6, 7, 8, 9, 11, 13, 14, 15, 16, 17, 19, 21, 22, 23)
+        ],
+    ),
+    "a store through an object self holds": (
+        """
+class Transport:
+    def losses(self):
+        return SinkLosses(dropped=self.dropped_oversized, failed=0)
+class Sink:
+    def emit(self, batch):
+        self._socket.dropped_oversized += 1
+        self._socket = None
+""",
+        [_dropped_store(7, "Sink", "emit", "_socket.dropped_oversized")],
+    ),
+    "a dynamic setattr(self, ...)": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    def bump(self, name):
+        setattr(self, name, 1)
+        setattr(self, "b", 1)
+""",
+        [
+            (
+                "m.py:6: Sink.bump stores through setattr(self, ...) with a computed name, which "
+                "may be a counter a losses() reports as dropped; name it, or count it through the "
+                "calling emit's Deferral"
+            )
+        ],
+    ),
+    "a chained read derives its last name": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a.n, failed=0)
+    def bump(self):
+        self.a = None
+        self.a.n += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a.n")],
+    ),
+    "a store in __init__ is silent": (
+        """
+class Sink:
+    def __init__(self):
+        self.a = 0
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+""",
+        [],
+    ),
+    "a store to failed is silent": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=self.failed)
+    def bump(self):
+        self.failed += 1
+""",
+        [],
+    ),
+    "a count through the ledger is silent": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.rejected, failed=0)
+    def emit(self, batch):
+        with Deferral(self) as pending:
+            pending.count("rejected")
+""",
+        [],
+    ),
+    "a class reporting dropped=0 is silent": (_REPORTS.format(dropped="0"), []),
+    "a sum over children reads no self attribute": (
+        """
+class Fanout:
+    def losses(self):
+        children = [read_losses(sink) for sink in self._sinks]
+        reported = [child for child in children if child is not None]
+        return SinkLosses(dropped=sum(child.dropped for child in reported), failed=0)
+    def replace(self, sinks):
+        self._sinks = sinks
+""",
+        [],
+    ),
+}
+"""The derived check's corpus: each derivation form and store form, and the shapes that are silent.
+
+Each case is one synthetic module whose counters are derived from itself, so a case exercises the
+derivation and the store scan together; the failure text is asserted whole.
+"""
+
+
+@pytest.mark.parametrize("case", sorted(_DROPPED_CORPUS))
+def test_the_dropped_counter_check_reports_what_it_claims_to(case: str) -> None:
+    """Each derivation form's and store form's finding text, and the shapes that must stay silent."""
+    source, expected = _DROPPED_CORPUS[case]
+    assert dropped_store_findings("m.py", source, dropped_counters(source)) == expected
