@@ -113,7 +113,13 @@ def test_the_retired_wording_is_gone(where: str, phrase: str) -> None:
 
 
 def test_the_readme_says_a_batch_refused_whole_is_counted_by_the_worker() -> None:
-    """The README's ``sink.dropped`` row — the PyPI page too — says where a whole refusal goes."""
+    """The README's ``sink.dropped`` row (the PyPI page too) names each catcher of a whole refusal.
+
+    Three code paths catch a raising ``emit`` and count its batch: the worker, the orphan path and
+    a ``MultiSink`` whose other children delivered, which absorbs the raise rather than passing it
+    to the worker, so a row naming only the first two sends a fan-out's reader to a field that
+    never moves.
+    """
     rows = [
         line
         for line in (_REPO / "README.md").read_text(encoding="utf-8").splitlines()
@@ -122,7 +128,9 @@ def test_the_readme_says_a_batch_refused_whole_is_counted_by_the_worker() -> Non
     assert len(rows) == 1, rows
     row = " ".join(rows[0].split())
     assert "refused **whole** is not counted here" in row, row
-    assert "the worker counts it in `failed_batches`" in row, row
+    assert "in `failed_batches` by the worker once its retries are spent" in row, row
+    assert "in `orphan_lost` outside a span" in row, row
+    assert "in the fan-out's `sink.failed` when a `MultiSink` sibling delivered" in row, row
 
 
 def test_invariant_2_states_the_rule_at_every_shipped_site() -> None:

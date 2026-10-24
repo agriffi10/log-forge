@@ -494,8 +494,10 @@ The sites, by path, each found by a sweep at `33a0cd3`:
   `KafkaSink` and `GooglePubSubSink` "also count what their client refused outright". After FR-003
   a refusal is counted in `sink.dropped` only when the rest of its batch was handed off; a batch
   refused whole raises, so the worker's retry engages and `failed_batches` records it
-  (`orphan_lost` outside a span). Both are restated, and the paragraph says once that a drop is
-  counted only when the sink's `emit` returns, so a retried batch counts it once.
+  (`orphan_lost` outside a span), or, under a `MultiSink` whose sibling delivered, the fan-out
+  absorbs the raise and counts the batch in its own `sink.failed`. Both are restated, and the
+  paragraph says once that a drop is counted only when the sink's `emit` returns, so a retried
+  batch counts it once.
 
 Listed so each claim has an owner, and restated by the completion ritual rather than by this FR:
 the fence and the entry "A raising `emit` counts nothing…" in `docs/decisions/sink-delivery.md`
@@ -652,6 +654,10 @@ One PR.
   spec change: FR-002's collect-only criterion became "every name listed at `33a0cd3` is still
   listed, under the same name", since the build adds names — some in files that existed at base
   (FR-005's own tests in `test_deferral.py`) — and "equal" could not hold over any set of files.
+- **2026-10-23 — diff review frame 1 at `7b0a042`: three minors, all fixed** — the derived check
+  now scans closures in `__init__` and methods under class-body blocks; a stale ordinal in the
+  gate's docstring; the README, `KafkaSink.losses` and FR-006 name `MultiSink` as the third
+  catcher of a batch refused whole.
 - **Considered and not taken:** putting the `Deferral` inside `SocketTransport.send_all`. It needs
   the gate's construction rule widened to a second entry name, and it makes the commit depend on
   `send_all` being the last statement of its callers. And an allowlist for the derived check: a

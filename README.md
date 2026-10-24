@@ -1074,7 +1074,7 @@ They tell you different things, and they want different responses:
 | `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` sweeps — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget. Delivery continues. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
-| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused while the rest of its batch was handed off. A batch the client refused **whole** is not counted here: the sink raises, and the worker counts it in `failed_batches` once its retries are spent (`orphan_lost` outside a span). | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
+| `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused while the rest of its batch was handed off. A batch the client refused **whole** is not counted here: the sink raises, and it is counted where the raise is caught — in `failed_batches` by the worker once its retries are spent, in `orphan_lost` outside a span, or in the fan-out's `sink.failed` when a `MultiSink` sibling delivered. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
 | `retired` + `submitted_after_shutdown` | `shutdown()` was called and the process **kept logging**. Those events are queued where nothing will drain them — total loss, for as long as the process runs. | Use `flush()`, not `shutdown()`, in a process that logs again. This is the serverless mistake below. |
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
@@ -1097,8 +1097,10 @@ different things: the worker's is backpressure at *its* queue, the sink's is an 
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
 itself several causes, which is why the diagnostic line matters. Most sinks drop only what can
 never fit; `KafkaSink` and `GooglePubSubSink` also count an event their client refused while the
-rest of its batch was handed off. A batch refused whole raises instead, so the worker's retry
-engages and `failed_batches` records it if every attempt fails (`orphan_lost` outside a span). A
+rest of its batch was handed off. A batch refused whole raises instead and is counted where the
+raise is caught: in `failed_batches` once the worker's retries are spent, in `orphan_lost`
+outside a span, or in the fan-out's `sink.failed` under a `MultiSink` whose other children
+delivered, since a fan-out absorbs a partial failure rather than re-raising it. A
 refusal may be backpressure one layer further out than the worker's, or a misconfiguration — the
 stderr line carries the exception type that distinguishes them. Every one of these drops is
 counted only when the sink's `emit` returns, so a batch the worker retries counts each drop once,

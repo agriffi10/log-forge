@@ -16,13 +16,16 @@ from __future__ import annotations
 import ast
 import threading
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import pytest
 
 import log_foundry
 from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 _SRC = Path(log_foundry.__file__).parent
 
@@ -399,8 +402,16 @@ def _self_path(node: ast.expr) -> str | None:
     return None
 
 
-def _self_stores(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, int]]:
+def _self_stores(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    walk: Callable[[ast.AST], Iterator[ast.AST]] = ast.walk,
+) -> list[tuple[str, int]]:
     """Every store to state reached through ``self`` in ``fn``, nested code included, by line.
+
+    ``walk`` yields the nodes looked at: every node under ``fn`` by default, which is what
+    :func:`deferral_findings` reads; :func:`dropped_store_findings` passes
+    :func:`_outside_nested_methods`, so the functions of a class nested in ``fn``, which that
+    class's own scan covers, are not scanned twice.
 
     A store is recognised by the context the parser gives its target, not by listing statements.
     The binding forms in ``ast``'s grammar whose target is an expression are ``Assign.targets``,
@@ -415,7 +426,7 @@ def _self_stores(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, 
     source order whatever order ``ast.walk`` visits in.
     """
     stores: list[tuple[str, int, int]] = []
-    for node in ast.walk(fn):
+    for node in walk(fn):
         if isinstance(node, ast.Attribute | ast.Subscript) and isinstance(node.ctx, ast.Store):
             path = _self_path(node)
             if path is not None:
@@ -1146,8 +1157,8 @@ class Sink:
 def test_every_deferring_site_takes_the_one_helper() -> None:
     """SPEC-058 FR-002's instrument over the real package: every site, one helper, one ledger.
 
-    The construction rule and the roster rule run over every module under ``src/``, so a sixth
-    site that builds a ``Deferral`` is held to the first, and one whose ``emit`` enters a
+    The construction rule and the roster rule run over every module under ``src/``, so a site not
+    yet listed that builds a ``Deferral`` is held to the first, and one whose ``emit`` enters a
     ``Deferral`` is a finding until it is added to :data:`DEFERRING_SITES`; the other checks run
     on the listed sites by name, and a site that has moved is a finding. The allowlist is held
     exact over the same run: an :data:`IMMEDIATE` entry no deferring function reached is stale.
@@ -1304,26 +1315,104 @@ def dropped_counters(source: str) -> set[str]:
     return counters
 
 
-def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[str]:
-    """Every store to a derived counter outside ``__init__``, as lines a reader can act on.
+def _code_roots(node: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]:
+    """The outermost functions and lambdas under ``node``, entering neither a class nor one of them.
 
-    **What it checks.** In every method of every class in the module, nested classes included,
-    except ``__init__``: each store :func:`_self_stores` recognises whose path names a derived
+    Every other child is descended through — a class body's ``if``, ``else``, ``try``, ``with``,
+    loop and ``match`` blocks, the expression a lambda sits in — so a method is found wherever its
+    ``def`` sits in the body's statement tree. A function or lambda reached is a root and is not
+    entered, since a scan of it covers everything it nests; a class reached is skipped, since
+    :func:`dropped_store_findings` scans every class as its own.
+    """
+    roots: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            roots.append(child)
+        elif not isinstance(child, ast.ClassDef):
+            roots.extend(_code_roots(child))
+    return roots
+
+
+def _code_name(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> str:
+    """A function's own name, or ``<lambda>`` as ``__qualname__`` spells a lambda's."""
+    return "<lambda>" if isinstance(fn, ast.Lambda) else fn.name
+
+
+def _scan_roots(
+    cls: ast.ClassDef,
+) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]]:
+    """Each piece of ``cls``'s code that can run after construction, with the name a finding uses.
+
+    That is every root :func:`_code_roots` finds in the class, named ``Sink.bump`` or
+    ``Sink.<lambda>``, except ``__init__``: its own statements run during construction and are
+    exempt. A function or lambda nested in ``__init__`` can run after it — a callback handed to a
+    client is the realistic shape — so each outermost one is a root of its own, named as
+    ``__qualname__`` names it: ``Sink.__init__.<locals>.refused``.
+    """
+    roots: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda]] = []
+    for fn in _code_roots(cls):
+        if _code_name(fn) != "__init__":
+            roots.append((f"{cls.name}.{_code_name(fn)}", fn))
+            continue
+        roots.extend(
+            (f"{cls.name}.__init__.<locals>.{_code_name(inner)}", inner)
+            for inner in _code_roots(fn)
+        )
+    return roots
+
+
+def _outside_nested_methods(node: ast.AST, in_class: bool = False) -> Iterator[ast.AST]:
+    """``node`` and every node under it, except the functions and lambdas of a class nested in it.
+
+    Those are roots of the nested class, which :func:`dropped_store_findings` scans as its own, so
+    walking them here too would report each of their stores twice, the second time under the
+    enclosing function's name. The rest of a nested class — the statements its body runs when the
+    enclosing code defines it, which can close over that code's ``self`` — is walked, since no
+    other scan reaches it.
+    """
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if in_class and isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        yield from _outside_nested_methods(child, in_class or isinstance(child, ast.ClassDef))
+
+
+def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[str]:
+    """Every store to a derived counter after construction, as lines a reader can act on.
+
+    **Where it looks.** Every class in the module, nested classes included, each scanned as its
+    own. In a class it scans every function and lambda the body holds, with everything they nest:
+    a method wherever its ``def`` sits in the body's statement tree — under an ``if``, ``else``,
+    ``try``, ``with``, loop or ``match`` block as well as at the top — and a lambda in the body,
+    named ``Sink.<lambda>``. ``__init__``'s own statements are exempt, since they run during
+    construction. A function or lambda nested in ``__init__`` can run after it, so each is
+    scanned, named as ``__qualname__`` names it — ``Sink.__init__.<locals>.refused``,
+    ``Sink.__init__.<locals>.<lambda>``. Each store is reported once: the search for a class's
+    functions enters neither a nested class nor another function (:func:`_code_roots`), and the
+    scan of a function skips the functions of a class defined inside it
+    (:func:`_outside_nested_methods`), each of which that class's own scan covers.
+
+    **What it checks.** Each store :func:`_self_stores` recognises whose path names a derived
     counter at **any** position — so ``self._socket.dropped_oversized += 1`` is a finding though
     its first name is ``_socket`` — and each ``setattr(self, <name>, ...)`` whose name is not a
     string literal, since nothing shows it is not a counter. The match is by attribute name across
     the tree, not within the reporting class, so it needs no inheritance resolution
     (``ElasticsearchSink.losses`` reads attributes ``HTTPSink`` writes); the cost is that an
-    unrelated class storing a same-named attribute outside ``__init__`` is a finding too, and
+    unrelated class storing a same-named attribute after construction is a finding too, and
     renames it. There is no allowlist: a ``dropped`` count is exact by promise (invariant 2), so a
     store that has to be immediate belongs to a counter no ``losses()`` reports as ``dropped``.
 
     **What it does not see.** It reads syntax. A store through an alias of ``self``
     (``me = self``), a mutating method call (``self.counts.update(...)``), a store outside a
-    class, and a counter reported through a call or a property rather than a plain ``self``
-    read — ``SyslogSink.losses`` returns ``self._socket.losses()``, which is that — are not
-    findings. ``Deferral.__exit__`` writes through ``setattr(owner, ...)``, not ``self``, which is
-    why the one permitted writer is invisible to a check that refuses every ``self`` store.
+    class, ``__init__``'s own statements, the statements a class body runs as the class is
+    defined — unless the class is defined inside scanned code, whose scan takes them as its own,
+    since they can close over that code's ``self`` — and a counter reported through a call or a
+    property rather than a plain ``self`` read — ``SyslogSink.losses`` returns
+    ``self._socket.losses()``, which is that — are not findings. Syntax cannot say when code runs,
+    either, so a function nested in ``__init__`` is a finding even when ``__init__`` calls it
+    before returning, and so is a method only ``__init__`` calls; both fail closed.
+    ``Deferral.__exit__`` writes through ``setattr(owner, ...)``, not ``self``, which is why the
+    one permitted writer is invisible to a check that refuses every ``self`` store.
 
     Args:
       where: The module's path, for the message.
@@ -1337,10 +1426,8 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
     for cls in ast.walk(ast.parse(source)):
         if not isinstance(cls, ast.ClassDef):
             continue
-        for fn in cls.body:
-            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef) or fn.name == "__init__":
-                continue
-            for path, line in _self_stores(fn):
+        for name, fn in _scan_roots(cls):
+            for path, line in _self_stores(fn, _outside_nested_methods):
                 if path == "<dynamic>":
                     what = "stores through setattr(self, ...) with a computed name, which may be "
                     why = "a counter a losses() reports as dropped; name it, or count it"
@@ -1349,7 +1436,7 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
                     why = "a losses() reports as dropped; count it"
                 else:
                     continue
-                text = f"{where}:{line}: {cls.name}.{fn.name} {what}{why}{_THROUGH_THE_LEDGER}"
+                text = f"{where}:{line}: {name} {what}{why}{_THROUGH_THE_LEDGER}"
                 findings.append((line, text))
     return [text for _, text in sorted(findings, key=lambda finding: finding[0])]
 
@@ -1663,6 +1750,136 @@ class Sink:
 """,
         [_dropped_store(7, "Sink", "bump", "by_kind.n")],
     ),
+    "a closure in __init__ is scanned, __init__'s own store is not": (
+        """
+class Sink:
+    def __init__(self, producer):
+        self.rejected = 0
+        def refused(err):
+            self.rejected += 1
+        async def drained():
+            self.rejected = 0
+        producer.on_error = refused
+    def losses(self):
+        return SinkLosses(dropped=self.rejected, failed=0)
+""",
+        [
+            _dropped_store(6, "Sink", "__init__.<locals>.refused", "rejected"),
+            _dropped_store(8, "Sink", "__init__.<locals>.drained", "rejected"),
+        ],
+    ),
+    "a lambda in __init__ is scanned": (
+        """
+class Sink:
+    def __init__(self, producer):
+        self.rejected = 0
+        producer.on_error = lambda err: setattr(self, "rejected", self.rejected + 1)
+    def losses(self):
+        return SinkLosses(dropped=self.rejected, failed=0)
+""",
+        [_dropped_store(5, "Sink", "__init__.<locals>.<lambda>", "rejected")],
+    ),
+    "a method under a class-body if or else": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    if True:
+        def bump(self):
+            self.a += 1
+    else:
+        def bump(self):
+            self.a += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "a"), _dropped_store(10, "Sink", "bump", "a")],
+    ),
+    "a method under every other class-body block": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    try:
+        def b1(self):
+            self.a += 1
+    except ImportError:
+        def b2(self):
+            self.a += 1
+    finally:
+        def b3(self):
+            self.a += 1
+    with lock:
+        def b4(self):
+            self.a += 1
+    for _ in ():
+        def b5(self):
+            self.a += 1
+    while False:
+        def b6(self):
+            self.a += 1
+    match mode:
+        case _:
+            def b7(self):
+                self.a += 1
+""",
+        [
+            _dropped_store(line, "Sink", method, "a")
+            for line, method in (
+                (7, "b1"),
+                (10, "b2"),
+                (13, "b3"),
+                (16, "b4"),
+                (19, "b5"),
+                (22, "b6"),
+                (26, "b7"),
+            )
+        ],
+    ),
+    "a lambda in the class body": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    bump = lambda self: setattr(self, "a", 1)
+""",
+        [_dropped_store(5, "Sink", "<lambda>", "a")],
+    ),
+    "a nested class is scanned once, as its own": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    class Inner:
+        def bump(self):
+            self.a += 1
+""",
+        [_dropped_store(7, "Inner", "bump", "a")],
+    ),
+    "a closure in a method is reported once, as the method": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    def start(self, client):
+        def bump(err):
+            self.a += 1
+        client.on_error = bump
+""",
+        [_dropped_store(7, "Sink", "start", "a")],
+    ),
+    "a class defined in a method: its body with the method, its methods once": (
+        """
+class Sink:
+    def losses(self):
+        return SinkLosses(dropped=self.a, failed=0)
+    def make(self):
+        class Inner:
+            self.a += 1
+            def bump(self):
+                self.a += 1
+        return Inner
+""",
+        [_dropped_store(7, "Sink", "make", "a"), _dropped_store(9, "Inner", "bump", "a")],
+    ),
     "a store in __init__ is silent": (
         """
 class Sink:
@@ -1711,7 +1928,10 @@ class Fanout:
 """The derived check's corpus: each derivation form and store form, and the shapes that are silent.
 
 Each case is one synthetic module whose counters are derived from itself, so a case exercises the
-derivation and the store scan together; the failure text is asserted whole.
+derivation and the store scan together; the failure text is asserted whole. The cases on where a
+store sits — a closure or lambda in ``__init__``, a method under a class-body block, a nested or
+locally defined class — assert the whole list, so a store reported twice fails as surely as one
+missed.
 """
 
 

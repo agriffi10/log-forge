@@ -187,8 +187,9 @@ class KafkaSink:
           did accept. A refusal is counted and announced only when ``emit`` returns (SPEC-059
           FR-003), so ``dropped`` holds the refusals of batches whose other messages were handed
           off. A batch refused whole raised instead and is counted where the raise was caught —
-          the worker's ``failed_batches`` once its retries are spent, or ``orphan_lost`` outside a
-          span — and a retry that hands it off counts nothing.
+          the worker's ``failed_batches`` once its retries are spent, ``orphan_lost`` outside a
+          span, or a ``MultiSink``'s own ``failed`` when a sibling delivered — and a retry that
+          hands it off counts nothing.
 
         Raises:
           None.
