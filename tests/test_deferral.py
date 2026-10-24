@@ -531,6 +531,11 @@ def deferral_findings(
     ``Deferral``'s local stored afterwards; inside one that is a store to ``self`` and a finding.
     A ``Deferral`` entered by an ``emit`` that is not a method — a module-level function — has
     no class to list, so it is held only to the construction rule.
+    Nor does it check the block's extent: neither this check nor :func:`dropped_store_findings`
+    verifies that an ``emit``'s ``with Deferral(...)`` encloses every statement that can raise
+    after a drop is decided, so a send or a ``raise`` moved out of the block commits the drop
+    before the raise abandons the batch, and both stay silent. Each converted site's down probe,
+    the behaviour test that an abandoned batch counts nothing, is the guard for that.
     It reads syntax, not data flow: a store on a path ``emit`` never takes at run time is still a
     finding, which is why the allowlist names methods. That the allowlist itself is exact is
     :func:`stale_immediate`'s check, over the whole tree.
@@ -1252,12 +1257,37 @@ def _bound_names(target: ast.expr) -> list[str]:
     return []
 
 
+def _paired_values(target: ast.expr, value: ast.expr) -> list[tuple[str, ast.expr]]:
+    """Each bare local name a target binds, with the part of ``value`` the name can hold.
+
+    A tuple or list target over a tuple or list value of the same length, with no starred element
+    on either side, pairs element-wise, recursively into a nested tuple or list, so
+    ``dropped, failed = self.dropped_oversized, self.failed`` gives ``dropped`` the first element
+    alone. Every other unpacking — unequal lengths, a starred element on either side, a value that
+    is not a tuple or list display — maps each name to the whole value (:func:`_bound_names`):
+    that can derive more than the name holds, never less, and so fails closed.
+    """
+    if (
+        isinstance(target, ast.Tuple | ast.List)
+        and isinstance(value, ast.Tuple | ast.List)
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(item, ast.Starred) for item in (*target.elts, *value.elts))
+    ):
+        return [
+            pair
+            for item, part in zip(target.elts, value.elts, strict=True)
+            for pair in _paired_values(item, part)
+        ]
+    return [(name, value) for name in _bound_names(target)]
+
+
 def _local_values(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, list[ast.expr]]:
     """Every value ``fn`` assigns to each bare local name, nested functions included.
 
     Plain, annotated and augmented assignment and the walrus all count; a nested function's
     assignments are visible to the outer lookup, which is wider than Python's scoping and so fails
-    closed.
+    closed. An unpacking assigns each name the part of the value :func:`_paired_values` pairs it
+    with — one element of an equal-length tuple, else the whole value.
     """
     values: dict[str, list[ast.expr]] = {}
     for node in ast.walk(fn):
@@ -1268,8 +1298,8 @@ def _local_values(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, list[
         else:
             continue
         for target, value in pairs:
-            for name in _bound_names(target):
-                values.setdefault(name, []).append(value)
+            for name, part in _paired_values(target, value):
+                values.setdefault(name, []).append(part)
     return values
 
 
@@ -1282,10 +1312,11 @@ def dropped_counters(source: str) -> set[str]:
     else first positional); from ``wrapped_losses`` the ``own`` argument (keyword, else second
     positional). In that argument it takes the last name of every ``self``-rooted chain
     (:func:`_reported_names`), and, for every bare name it reads, the same from each value the
-    function assigns to that name (:func:`_local_values`) — which is how ``TransformSink`` and
-    ``FilteringSink`` report ``self._dropped`` through a local. That step is **one hop**: a
-    value's own names are not followed, so ``MultiSink.losses``' ``reported``, built from
-    ``self._sinks``, contributes nothing, where a transitive step would derive ``_sinks``.
+    function assigns to that name (:func:`_local_values`, which gives an unpacked name its own
+    element where the two shapes match) — which is how ``TransformSink`` and ``FilteringSink``
+    report ``self._dropped`` through a local. That step is **one hop**: a value's own names are
+    not followed, so ``MultiSink.losses``' ``reported``, built from ``self._sinks``, contributes
+    nothing, where a transitive step would derive ``_sinks``.
 
     Args:
       source: The module's text.
@@ -1403,7 +1434,9 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
     store that has to be immediate belongs to a counter no ``losses()`` reports as ``dropped``.
 
     **What it does not see.** It reads syntax. A store through an alias of ``self``
-    (``me = self``), a mutating method call (``self.counts.update(...)``), a store outside a
+    (``me = self``), a mutating method call (``self.counts.update(...)``), a store through
+    ``self.__dict__[...]`` (its path is ``__dict__``, which names no counter), a counter reported
+    as ``SinkLosses(**mapping)`` (there is no ``dropped`` argument to read), a store outside a
     class, ``__init__``'s own statements, the statements a class body runs as the class is
     defined — unless the class is defined inside scanned code, whose scan takes them as its own,
     since they can close over that code's ``self`` — and a counter reported through a call or a
@@ -1471,7 +1504,10 @@ def test_every_dropped_counter_is_written_only_by_a_deferral_commit() -> None:
     """
     sources = _tree_sources()
     counters = _tree_counters(sources)
-    assert counters >= DROPPED_FLOOR, f"the derivation lost {sorted(DROPPED_FLOOR - counters)}"
+    assert counters >= DROPPED_FLOOR, (
+        f"the derivation lost {sorted(DROPPED_FLOOR - counters)} — a refactor blinded the "
+        f"derivation, or a counter was renamed (then rename it in DROPPED_FLOOR too)"
+    )
     excused = {attr for attrs in IMMEDIATE.values() for attr in attrs} & counters
     assert not excused, f"IMMEDIATE excuses a store to a dropped counter: {sorted(excused)}"
     findings: list[str] = []
@@ -1624,6 +1660,61 @@ class Sink:
         self.a += 1
 """,
         [_dropped_store(7, "Sink", "bump", "a")],
+    ),
+    "a tuple-unpacked local pairs element-wise": (
+        """
+class Sink:
+    def losses(self):
+        dropped, failed = self.dropped_oversized, self.failed
+        return SinkLosses(dropped=dropped, failed=failed)
+    def emit(self, batch):
+        self.dropped_oversized += 1
+    def fail(self):
+        self.failed += 1
+""",
+        [_dropped_store(7, "Sink", "emit", "dropped_oversized")],
+    ),
+    "a nested tuple-unpacked local pairs element-wise": (
+        """
+class Sink:
+    def losses(self):
+        queued, (dropped, failed) = self.queued, (self.a, self.failed)
+        return SinkLosses(dropped=dropped, failed=failed)
+    def bump(self):
+        self.queued += 1
+        self.a += 1
+        self.failed += 1
+""",
+        [_dropped_store(8, "Sink", "bump", "a")],
+    ),
+    "an unequal unpacking maps each name to the whole value": (
+        """
+class Sink:
+    def losses(self):
+        first, *rest = self.x, self.y, self.z
+        return SinkLosses(dropped=sum(rest), failed=0)
+    def bump(self):
+        self.x += 1
+        self.y += 1
+        self.z += 1
+""",
+        [
+            _dropped_store(7, "Sink", "bump", "x"),
+            _dropped_store(8, "Sink", "bump", "y"),
+            _dropped_store(9, "Sink", "bump", "z"),
+        ],
+    ),
+    "a starred value of equal length maps each name to the whole value": (
+        """
+class Sink:
+    def losses(self):
+        first, *rest = *self.pair, self.z
+        return SinkLosses(dropped=sum(rest), failed=0)
+    def bump(self):
+        self.pair = ()
+        self.z += 1
+""",
+        [_dropped_store(7, "Sink", "bump", "pair"), _dropped_store(8, "Sink", "bump", "z")],
     ),
     "a local from a walrus": (
         """
