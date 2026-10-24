@@ -399,8 +399,10 @@ only by a `Deferral` commit.
   children touches with it, which widens the set without guarding a count.
 - *The finding.* Every store to one of those attributes — the forms `_self_stores` already
   recognises: assignment, augmented assignment, annotated assignment, `for`, `with` and
-  comprehension targets, unpacking, `setattr(self, …)` — in any method other than `__init__`, of
-  any class under `src/`, is a finding naming the module, line, class, method and attribute. It
+  comprehension targets, unpacking, `setattr(self, …)` — anywhere in a class's code except
+  `__init__`'s own statements (a closure or lambda defined in `__init__` runs after construction
+  and is scanned, as is a method under a class-body `if` or `try`), of any class under `src/`, is
+  a finding naming the module, line, class, method and attribute. It
   matches by attribute name across the tree rather than within the reporting class, so it needs no
   inheritance resolution (`ElasticsearchSink.losses` reads attributes `HTTPSink` writes); the
   cost is that an unrelated class storing a same-named attribute outside `__init__` is a finding
