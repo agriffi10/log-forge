@@ -110,13 +110,21 @@ def test_a_batch_every_event_of_which_was_refused_still_raises() -> None:
     """
 
     class RefusingPublisher:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def publish(self, topic, data=None, **attrs):
+            self.calls += 1
             raise RuntimeError("refused")
 
-    sink = GooglePubSubSink("projects/p/topics/t", client=RefusingPublisher())
+    client = RefusingPublisher()
+    sink = GooglePubSubSink("projects/p/topics/t", client=client)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"a": 2}])
-    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert client.calls == 2, "the premise: both events were offered and refused"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    )
 
 
 # --- SPEC-038 FR-004: the futures are reaped, and the pending list is bounded -------------

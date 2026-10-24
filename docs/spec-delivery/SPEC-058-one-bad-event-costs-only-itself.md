@@ -43,9 +43,10 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
 
 - `MultiSink.losses().failed` now includes `len(batch)` for **every** child raise it swallows, a
   reporting child's too; it was silent children only. Three accepted over-counts: a reporting child's
-  own `failed` also counts; a not-yet-deferred sink's counted drop is in `dropped` and in `failed`;
-  a raising wrapper child is charged declined events as well. When every child raises nothing is
-  counted by the fan-out (a silent child used to be counted per attempt).
+  own `failed` also counts; ~~a not-yet-deferred sink's counted drop is in `dropped` and in
+  `failed`~~ — done by SPEC-059 (no shipped sink counts before raising now; it remains for a
+  third-party sink); a raising wrapper child is charged declined events as well. When every child
+  raises nothing is counted by the fan-out (a silent child used to be counted per attempt).
 - New stderr lines, one per batch, naming the class and the exception **type**: `lost N event(s)`
   from `TransformSink`, `FilteringSink`, `SQSSink` (id callables) and the HTTP sinks (unrenderable).
 - A transform's non-JSON output (`bytes`, `datetime`, NaN, a lone surrogate) is coerced, not a failed
@@ -54,8 +55,9 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
 - A count decided at the five deferring sites — the drops of `TransformSink`, `FilteringSink`,
   `SQSSink._chunks` and `HTTPSink._items`, and `MultiSink`'s absorbed count — lands when `emit`
   returns: a retried batch counts a drop once, an abandoned one zero times at the sink.
-  `HTTPSink._drop_refused`'s `413` drop, a sink's own `failed` (the SQS sender fault included) and
-  the nine sinks under *Follow-ups* still count as they happen. The oversize lines of `HTTPSink`
+  ~~`HTTPSink._drop_refused`'s `413` drop~~, a sink's own `failed` (the SQS sender fault included) and
+  ~~the nine sinks under *Follow-ups*~~ still count as they happen — the two struck are done by
+  SPEC-059; a sink's own `failed` alone still does. The oversize lines of `HTTPSink`
   and `SQSSink` print after the requests, not before.
 - `TransformSink.losses()` and `FilteringSink.losses()` are non-`None` once the wrapper has counted a
   drop, over an inner sink that reports nothing. `HTTPSink`'s all-unrenderable batch settles without
@@ -71,11 +73,12 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
 
 ## Follow-ups and open limits
 
-- **The drop recount in the other sinks** is a separate spec: `SyslogSink`/`LogstashSink`
+- ~~**The drop recount in the other sinks** is a separate spec: `SyslogSink`/`LogstashSink`
   (`_socket.py`), `MongoDBSink`, `KinesisSink`, `FirehoseSink`, `SNSSink`, `AzureEventHubsSink`,
   `KafkaSink`, `GooglePubSubSink`, and `HTTPSink._drop_refused`'s conditional path. It applies
   `Deferral` to each and revisits `_socket.py`'s "nothing here can fix it" and the "`dropped` is an
-  exact count" claims, both left standing.
+  exact count" claims, both left standing.~~ — done by SPEC-059: each applies `Deferral`, and both
+  claims are restated.
 - **`LoggingSink`'s per-event caller code** is a sibling the spec does not name, pre-existing and
   not a regression: `emit` calls `logger.handle` per event, so a `logging.Filter` raising for one
   event leaves after the events before it were handled and the retry re-delivers them. Measured

@@ -5,10 +5,14 @@ from __future__ import annotations
 import errno
 import socket
 import threading
+from typing import TYPE_CHECKING
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+if TYPE_CHECKING:
+    from log_foundry.sinks._deferral import Deferral
 
 __all__ = ["SocketTransport"]
 
@@ -117,7 +121,9 @@ class SocketTransport:
     Attributes:
       failed: Messages abandoned past the reconnect-retry bound.
       dropped_oversized: UDP datagrams discarded before any send for exceeding
-        ``max_datagram_bytes``.
+        ``max_datagram_bytes``, counted and announced only when ``emit`` returns — the calling
+        sink's, whose ``Deferral`` :meth:`send_all` is handed (SPEC-059 FR-002) — so a batch the
+        worker retries counts its oversized frame once, and one it abandons not at all.
 
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``send_all`` puts the bytes on the
@@ -184,7 +190,7 @@ class SocketTransport:
         self._lock = threading.Lock()
         self._closed = False
 
-    def send_all(self, messages: list[bytes]) -> None:
+    def send_all(self, messages: list[bytes], pending: Deferral) -> None:
         """Sends each pre-framed message, reconnecting on error (FR-005, FR-006).
 
         The lock spans the whole call, not each message: it also guards ``_sock``, which a
@@ -196,8 +202,18 @@ class SocketTransport:
         ``log_foundry.info()`` after ``shutdown()`` would open a TCP connection nothing will ever
         reap — measured, and the same leak ``RabbitMQSink`` had (SPEC-028).
 
+        **The oversize drop is the calling sink's to commit** (SPEC-059 FR-002). :meth:`_sendable`
+        records it in ``pending``, the ``Deferral`` the sink's ``emit`` entered, so it is counted
+        and announced only when ``emit`` returns: a raise from here leaves nothing counted, and
+        the worker's retry decides the drop afresh. The ledger is a required parameter, never
+        defaulted, so a caller that forgets it is refused by mypy and by a ``TypeError`` rather
+        than counting at once. The commit runs after this call has released the send lock, so
+        the datagram-limit line is never written under it.
+
         Args:
           messages: The exact bytes to put on the wire, one call per message.
+          pending: The calling sink's ``emit``'s deferral, owned by this transport, which holds
+            the oversize drop until that ``emit`` is known not to raise.
 
         Returns:
           None.
@@ -207,7 +223,8 @@ class SocketTransport:
             this transport propagate a dead destination to the worker instead of reporting
             success (SPEC-026 FR-001). A partial send does not raise, because the worker's retry
             would re-send the messages that already landed, and an empty call is a no-op rather
-            than a total failure. Also when the transport is already closed.
+            than a total failure. Also when the transport is already closed, before anything is
+            decided. Either raise leaves nothing in ``pending`` counted.
         """
         if not messages:
             return
@@ -217,7 +234,7 @@ class SocketTransport:
                     f"SocketTransport delivered none of {len(messages)} message(s): "
                     f"the transport is closed"
                 )
-            sendable = self._sendable(messages)
+            sendable = self._sendable(messages, pending)
             delivered = 0
             for message in sendable:
                 if self._send_one(message):
@@ -227,7 +244,7 @@ class SocketTransport:
                 f"SocketTransport delivered none of {len(sendable)} message(s)"
             )
 
-    def _sendable(self, messages: list[bytes]) -> list[bytes]:
+    def _sendable(self, messages: list[bytes], pending: Deferral) -> list[bytes]:
         """Discards UDP datagrams too large to send, before any attempt (FR-007 AC-1).
 
         A 70 KB event produced ``OSError errno=40`` (EMSGSIZE), which the retry loop treated as
@@ -240,18 +257,20 @@ class SocketTransport:
         path, so there is nothing for a retry to fix, and reporting it as a delivery failure
         would have the worker re-send the rest of the batch alongside it.
 
-        **``dropped_oversized`` inflates in one case, and it is recorded rather than hidden.**
-        If a batch holds an oversized frame *and* its sendable remainder then fails totally, the
-        emit raises, the worker retries the whole batch, and this filter re-frames and re-drops
-        the same event once per attempt — up to four times for one unsendable frame. Everywhere
-        else ``dropped`` is an exact count, so the exception matters. Nothing here can fix it:
-        the worker owns the retry and hands back the original events, so the sink cannot know it
-        has seen them before. ``FirehoseSink._records`` and ``KinesisSink._records`` have the
-        same shape and predate this, which is why the fix belongs one level up if it is ever
-        taken.
+        **The drop is counted and announced only when ``emit`` returns** — the calling sink's,
+        whose ``Deferral`` arrives here as ``pending`` (SPEC-059 FR-002). If a batch holds an
+        oversized frame *and* its sendable remainder then fails totally, :meth:`send_all` raises,
+        the sink's ``emit`` raises with it, and the ledger is discarded; the worker retries the
+        whole batch and this filter decides the same drop afresh. So one unsendable frame is
+        counted once when a later attempt returns, and not at all when the worker abandons the
+        batch, whose abandon line is then its only count. Counting it here, as it was decided,
+        counted it once per attempt — up to four times for one frame. The line keeps its shape,
+        one per call that dropped anything, carrying the count.
 
         Args:
           messages: The framed messages, in order.
+          pending: The calling sink's ``emit``'s deferral, which holds the drop decided here
+            until that ``emit`` is known not to raise.
 
         Returns:
           Those within the datagram limit. All of them under TCP, which is a stream.
@@ -264,12 +283,13 @@ class SocketTransport:
         sendable = [m for m in messages if len(m) <= self._max_datagram_bytes]
         dropped = len(messages) - len(sendable)
         if dropped:
-            with self._counter_lock:
-                self.dropped_oversized += dropped
-            _diag.lost(
-                "message",
-                dropped,
-                f"SocketTransport, over the {self._max_datagram_bytes}-byte datagram limit",
+            pending.count("dropped_oversized", dropped)
+            pending.announce(
+                lambda: _diag.lost(
+                    "message",
+                    dropped,
+                    f"SocketTransport, over the {self._max_datagram_bytes}-byte datagram limit",
+                )
             )
         return sendable
 

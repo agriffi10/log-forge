@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -222,6 +223,12 @@ class MongoDBSink:
         counted and not retried: the successes are already in, and a retry would duplicate them
         or re-error.
 
+        An oversize drop :meth:`_documents` decides is counted and announced only when ``emit``
+        returns, through the deferral helper (SPEC-059 FR-001). Its ``with`` encloses everything
+        from :meth:`_documents` to the last raise, so a connection error past the retry bound or
+        a bulk write that stored nothing discards the drop, and a bulk write that stored some
+        returns and commits it. The closed check sits before the ``with`` and decides nothing.
+
         Args:
           batch: The events to insert.
 
@@ -235,7 +242,8 @@ class MongoDBSink:
             past the retry bound, or a bulk write every one of whose documents the server
             rejected. A bulk write that stored some is partial and never raises. A batch of
             nothing but oversized documents does not raise either: they can never fit, so there
-            is nothing to retry, and they are reported through :meth:`losses`.
+            is nothing to retry, and they are reported through :meth:`losses`. A raise leaves
+            none of them counted.
         """
         if not batch:
             return
@@ -243,44 +251,45 @@ class MongoDBSink:
             raise SinkDeliveryError(
                 f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
             )
-        documents = self._documents(batch)
-        if not documents:
-            return
-        for attempt in range(self.max_retries + 1):
-            try:
-                self._collection.insert_many(documents, ordered=False)
+        with Deferral(self) as pending:
+            documents = self._documents(batch, pending)
+            if not documents:
                 return
-            except Exception as err:
-                details = getattr(err, "details", None)
-                if isinstance(details, dict) and "writeErrors" in details:
-                    rejects = len(details["writeErrors"])
+            for attempt in range(self.max_retries + 1):
+                try:
+                    self._collection.insert_many(documents, ordered=False)
+                    return
+                except Exception as err:
+                    details = getattr(err, "details", None)
+                    if isinstance(details, dict) and "writeErrors" in details:
+                        rejects = len(details["writeErrors"])
+                        with self._counter_lock:
+                            self.failed += rejects
+                        total = rejects >= len(documents)
+                        _diag.lost(
+                            "document",
+                            rejects,
+                            "MongoDBSink bulk write; none were inserted" if total
+                            else "MongoDBSink bulk write; the rest were inserted",
+                        )
+                        if total:
+                            raise SinkDeliveryError(
+                                f"MongoDBSink inserted none of {len(documents)} document(s)"
+                            ) from None
+                        return
+                    if attempt < self.max_retries:
+                        wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
+                        continue
                     with self._counter_lock:
-                        self.failed += rejects
-                    total = rejects >= len(documents)
+                        self.failed += len(documents)
                     _diag.lost(
                         "document",
-                        rejects,
-                        "MongoDBSink bulk write; none were inserted" if total
-                        else "MongoDBSink bulk write; the rest were inserted",
+                        len(documents),
+                        f"MongoDBSink, {self.max_retries + 1} attempts, {type(err).__name__}",
                     )
-                    if total:
-                        raise SinkDeliveryError(
-                            f"MongoDBSink inserted none of {len(documents)} document(s)"
-                        ) from None
-                    return
-                if attempt < self.max_retries:
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(documents)
-                _diag.lost(
-                    "document",
-                    len(documents),
-                    f"MongoDBSink, {self.max_retries + 1} attempts, {type(err).__name__}",
-                )
-                raise SinkDeliveryError(
-                    f"MongoDBSink inserted none of {len(documents)} document(s)"
-                ) from None
+                    raise SinkDeliveryError(
+                        f"MongoDBSink inserted none of {len(documents)} document(s)"
+                    ) from None
 
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
@@ -314,13 +323,22 @@ class MongoDBSink:
             if self._owns_client:
                 self._client.close()
 
-    def _documents(self, batch: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _documents(
+        self, batch: list[dict[str, object]], pending: Deferral
+    ) -> list[dict[str, object]]:
         """Copies each event and drops any document too large to ever fit.
 
         The copy is what keeps ``_id`` insertion by the driver from mutating the caller's dicts.
 
+        A drop goes to ``pending`` rather than to the counter, so it is counted and announced
+        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
+        discards it, and the worker's retry decides it afresh. The line names no per-event value,
+        so each drop registers its own count and its own line, one per document as before.
+
         Args:
           batch: The events to convert.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise.
 
         Returns:
           The documents that can be inserted.
@@ -331,9 +349,10 @@ class MongoDBSink:
         documents: list[dict[str, object]] = []
         for event in batch:
             if len(json.dumps(event).encode("utf-8")) > _MAX_DOC_BYTES:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
+                pending.count("dropped_oversized")
+                pending.announce(
+                    lambda: _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
+                )
                 continue
             documents.append(dict(event))
         return documents

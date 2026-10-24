@@ -15,6 +15,7 @@ import pytest
 import log_foundry
 import log_foundry.sinks._socket as socket_mod
 from conftest import install_worker
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.multi import MultiSink
@@ -545,8 +546,8 @@ def test_socket_transport_raises_when_nothing_was_sent(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
 
-    with pytest.raises(SinkDeliveryError):
-        transport.send_all([b"a", b"b"])
+    with pytest.raises(SinkDeliveryError), Deferral(transport) as pending:
+        transport.send_all([b"a", b"b"], pending)
     assert transport.losses() == SinkLosses(dropped=0, failed=2)
 
 
@@ -557,7 +558,8 @@ def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
 
-    transport.send_all([b"a", b"b"])  # must not raise
+    with Deferral(transport) as pending:
+        transport.send_all([b"a", b"b"], pending)  # must not raise
 
     assert sock.sent == [b"a"]
     assert transport.losses() == SinkLosses(dropped=0, failed=1)
@@ -565,7 +567,9 @@ def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
 
 def test_an_empty_send_is_not_a_total_failure(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: _HalfDeadSocket())
-    socket_mod.SocketTransport("h", 1, transport="udp").send_all([])  # must not raise
+    transport = socket_mod.SocketTransport("h", 1, transport="udp")
+    with Deferral(transport) as pending:
+        transport.send_all([], pending)  # must not raise
 
 
 def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
@@ -934,8 +938,8 @@ def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=-1)
 
-    with pytest.raises(SinkDeliveryError):
-        transport.send_all([b"a"])
+    with pytest.raises(SinkDeliveryError), Deferral(transport) as pending:
+        transport.send_all([b"a"], pending)
     assert transport.losses() == SinkLosses(dropped=0, failed=1), "abandoned without a counter"
 
 
@@ -1063,10 +1067,12 @@ def test_kafka_raises_only_when_every_produce_was_refused() -> None:
 
     class Producer:
         def __init__(self, refuse_from: int = 0) -> None:
+            self.calls = 0
             self.produced: list[bytes] = []
             self._refuse_from = refuse_from
 
         def produce(self, topic, value, key, callback) -> None:
+            self.calls += 1
             if len(self.produced) >= self._refuse_from:
                 raise BufferError("local queue full")
             self.produced.append(value)
@@ -1077,10 +1083,14 @@ def test_kafka_raises_only_when_every_produce_was_refused() -> None:
         def flush(self) -> None:
             pass
 
-    sink = KafkaSink("t", producer=Producer(refuse_from=0))
+    refusing = Producer(refuse_from=0)
+    sink = KafkaSink("t", producer=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
-    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert refusing.calls == 2, "the premise: both messages were offered and refused"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    )
 
     partial = KafkaSink("t", producer=Producer(refuse_from=1))
     partial.emit([{"a": 1}, {"b": 2}])  # one was accepted: retrying would duplicate it
@@ -1101,10 +1111,14 @@ def test_pubsub_raises_only_when_every_publish_was_refused() -> None:
                 raise RuntimeError("no credentials")
             return object()
 
-    sink = GooglePubSubSink("t", client=Client(refuse_from=0))
+    refusing = Client(refuse_from=0)
+    sink = GooglePubSubSink("t", client=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
-    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert refusing.calls == 2, "the premise: both events were offered and refused"
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
+        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    )
 
     partial = GooglePubSubSink("t", client=Client(refuse_from=1))
     partial.emit([{"a": 1}, {"b": 2}])
@@ -1250,7 +1264,9 @@ def test_an_oversized_event_does_not_cause_a_phantom_eventhubs_send(monkeypatch)
         sink.emit([{"pad": "x" * 200}, {"ok": 1}])  # oversized, then a normal event
 
     assert 0 not in producer.sizes, "an empty batch is never sent"
-    assert sink.losses() == SinkLosses(dropped=1, failed=1)
+    assert sink.losses() == SinkLosses(dropped=0, failed=1), (
+        "the raise discards the oversize drop (SPEC-059 FR-001); the worker's abandon line owns it"
+    )
 
 
 def test_a_sender_fault_chunk_does_not_mask_a_recoverable_one() -> None:
@@ -1446,8 +1462,16 @@ def test_pubsub_names_which_counter_moved(capsys) -> None:
     from log_foundry.sinks.pubsub import GooglePubSubSink
 
     class RefusingClient:
+        """Refuses the first publish and accepts the rest, so the refusal's emit returns."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
         def publish(self, topic, data):
-            raise RuntimeError("no credentials")
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("no credentials")
+            return object()
 
     class UnconfirmedClient:
         def publish(self, topic, data):
@@ -1456,8 +1480,7 @@ def test_pubsub_names_which_counter_moved(capsys) -> None:
         def result(self):
             raise TimeoutError("never acked")
 
-    with pytest.raises(SinkDeliveryError):
-        GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}])
+    GooglePubSubSink("t", client=RefusingClient()).emit([{"a": 1}, {"a": 2}])
     refused = capsys.readouterr().err
     assert "refused the publish" in refused
 

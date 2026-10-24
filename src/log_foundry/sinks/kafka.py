@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -82,7 +83,9 @@ class KafkaSink:
       failed: Messages whose delivery callback reported an error, plus any still queued when
         that close flush expired — the count ``flush()`` returns.
       rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
-        — which never reached the producer's batch at all.
+        — which never reached the producer's batch at all. Counted only when :meth:`emit`
+        returns, so only when the rest of the batch was handed off: a batch refused whole raises
+        and is counted where the raise is caught (SPEC-059 FR-003).
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``confluent-kafka`` documents its ``Producer`` as thread-safe, and this sink adds no state
@@ -181,7 +184,12 @@ class KafkaSink:
         Returns:
           The counters. Refusals are reported as ``dropped``, since nothing ever left the
           process, while ``failed`` is the delivery callback's verdict on a message the producer
-          did accept.
+          did accept. A refusal is counted and announced only when ``emit`` returns (SPEC-059
+          FR-003), so ``dropped`` holds the refusals of batches whose other messages were handed
+          off. A batch refused whole raised instead and is counted where the raise was caught —
+          the worker's ``failed_batches`` once its retries are spent, ``orphan_lost`` outside a
+          span, or a ``MultiSink``'s own ``failed`` when a sibling delivered — and a retry that
+          hands it off counts nothing.
 
         Raises:
           None.
@@ -193,8 +201,16 @@ class KafkaSink:
         """Produces one message per event and serves delivery callbacks without blocking.
 
         ``produce()`` is a local hand-off, so what it refuses is the only failure this call can
-        observe (FR-002). A partial refusal is counted and left alone, since the messages that
-        were accepted are already on their way.
+        observe (FR-002). A refusal is counted and announced only when ``emit`` returns, through
+        the deferral helper whose ``with`` encloses the produce loop and the total-failure raise
+        (SPEC-059 FR-003). A partial refusal returns, so its count lands then, with one line per
+        refused message naming that message's own exception type, bound as the refusal was
+        decided; the messages that were accepted are already on their way, so it is not retried.
+        When every message was refused the call raises and counts nothing — whoever catches the
+        raise owns the batch, so a batch refused on one attempt and accepted on the next records
+        no loss that never happened. A raise mid-loop (``json.dumps``, the key callable,
+        ``poll``) discards the refusals too. A delivery callback ``poll(0)`` serves counts
+        ``failed`` immediately, which stays an upper bound this does not defer.
 
         A closed sink refuses the batch before touching the producer (SPEC-032 FR-001). Refusing
         is not a loss this sink absorbed, so it moves no counter here: it is a failure reported
@@ -214,7 +230,7 @@ class KafkaSink:
         Raises:
           SinkDeliveryError: When the sink is closed, or when every message was refused so the
             batch reached nothing — the total failure the worker's retry exists for
-            (SPEC-026 FR-001).
+            (SPEC-026 FR-001). Either leaves no refusal counted.
         """
         if not batch:
             return
@@ -222,21 +238,44 @@ class KafkaSink:
             raise SinkDeliveryError(
                 f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
             )
-        accepted = 0
-        for event in batch:
-            body = json.dumps(event).encode("utf-8")
-            key = self._key(event)
-            try:
-                self.producer.produce(self.topic, value=body, key=key, callback=self._on_delivery)
-            except Exception as err:
-                with self._counter_lock:
-                    self.rejected += 1
-                _diag.lost("message", 1, f"KafkaSink produce, {type(err).__name__}")
-                continue
-            accepted += 1
-            self.producer.poll(0)
-        if batch and not accepted:
-            raise SinkDeliveryError(f"KafkaSink produced none of {len(batch)} message(s)")
+        with Deferral(self) as pending:
+            accepted = 0
+            refused: list[str] = []
+            for event in batch:
+                body = json.dumps(event).encode("utf-8")
+                key = self._key(event)
+                try:
+                    self.producer.produce(
+                        self.topic, value=body, key=key, callback=self._on_delivery
+                    )
+                except Exception as err:
+                    refused.append(type(err).__name__)
+                    continue
+                accepted += 1
+                self.producer.poll(0)
+            if refused:
+                pending.count("rejected", len(refused))
+                pending.announce(lambda: self._announce_refused(refused))
+            if batch and not accepted:
+                raise SinkDeliveryError(f"KafkaSink produced none of {len(batch)} message(s)")
+
+    def _announce_refused(self, kinds: list[str]) -> None:
+        """Writes one line per message ``produce()`` refused, naming its exception type (FR-002).
+
+        Called by the calling ``emit``'s deferral after the count is committed, outside the
+        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003).
+
+        Args:
+          kinds: Each refused message's exception type name, in the order they were refused.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for kind in kinds:
+            _diag.lost("message", 1, f"KafkaSink produce, {kind}")
 
     def close(self) -> None:
         """Flushes the producer so buffered messages are delivered before exit (FR-002).

@@ -85,9 +85,10 @@ class MultiSink:
         owns the batch; the old rule counted a silent child at catch time even then, so the
         worker's retries counted the same batch once per attempt. Three costs are accepted, all
         in ``losses().failed``, the upper-bound term: a reporting child that had already counted
-        its own failures before raising is counted twice; a sink not yet deferring is counted
-        once in its own ``dropped`` and once here; and a raising wrapper child is charged its
-        whole batch, including the events it chose not to forward.
+        its own failures before raising is counted twice; a third-party sink that counts a drop
+        before raising is counted once in its own ``dropped`` and once here — no shipped sink
+        does, since SPEC-059 deferred the last of them; and a raising wrapper child is charged
+        its whole batch, including the events it chose not to forward.
 
         Partial success stays isolated: a retry there would re-deliver the batch to the children
         that already took it, and duplicates are worse than the one failure already counted on

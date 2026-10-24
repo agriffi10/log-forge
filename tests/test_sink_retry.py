@@ -16,6 +16,7 @@ import pytest
 import log_foundry.sinks._socket as socket_mod
 from conftest import retire_process
 from log_foundry import _lifecycle
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import clamp_server_delay, usable_timeout, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
 from log_foundry.worker import Worker
@@ -223,7 +224,8 @@ def test_the_socket_transport_backoff_is_interruptible(monkeypatch) -> None:
 
     def send() -> None:
         try:
-            transport.send_all([b"x"])
+            with Deferral(transport) as pending:
+                transport.send_all([b"x"], pending)
         except Exception as err:
             outcome.append(type(err).__name__)
 
