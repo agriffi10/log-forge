@@ -396,7 +396,10 @@ only by a `Deferral` commit.
   never the locals that value reads in turn. `MultiSink.losses` passes
   `sum(child.dropped for child in reported)`, and `reported` is built from `self._sinks`; a
   transitive step would put `_sinks` in the derived set, and every attribute a comprehension over
-  children touches with it, which widens the set without guarding a count.
+  children touches with it, which widens the set without guarding a count. An unpacked local is
+  paired **element-wise** when target and value are tuples or lists of one length with no starred
+  element, so `dropped, failed = self.dropped_oversized, self.failed` derives only
+  `dropped_oversized`; every other unpacking shape gives each name the whole value, failing closed.
 - *The finding.* Every store to one of those attributes — the forms `_self_stores` already
   recognises: assignment, augmented assignment, annotated assignment, `for`, `with` and
   comprehension targets, unpacking, `setattr(self, …)` — anywhere in a class's code except
@@ -660,6 +663,15 @@ One PR.
   now scans closures in `__init__` and methods under class-body blocks; a stale ordinal in the
   gate's docstring; the README, `KafkaSink.losses` and FR-006 name `MultiSink` as the third
   catcher of a batch refused whole.
+- **2026-10-23 — diff review frame 2 at `c951a2e`: two minors, both answered; no blocker or major.**
+  The system frame ran every converted sink across its twin paths and wrappers (no count in zero
+  terms or two; base mismatched), concurrency, fork with each `_counter_lock` held, and the Event
+  Hubs close races. Fixed: an unpacked local now pairs element-wise (FR-005), since mapping each
+  name to the whole value made `dropped, failed = …` derive `failed` and redden a correct
+  refactor. Answered in the gate's docstring rather than by a new rule: neither tree check verifies
+  that a site's `with Deferral(...)` encloses every raise after a drop is decided — each site's
+  down probe is that guard. A tail-position rule was considered and not taken: it would be new gate
+  machinery arriving after the last review frame, reviewed by nobody.
 - **Considered and not taken:** putting the `Deferral` inside `SocketTransport.send_all`. It needs
   the gate's construction rule widened to a second entry name, and it makes the commit depend on
   `send_all` being the last statement of its callers. And an allowlist for the derived check: a
