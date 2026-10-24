@@ -73,4 +73,8 @@ passed 3003 with 11 skipped, the extra skip being `test_version`, which has no d
 in that venv. 45 mutants were all killed: 30 on the derived check, 10 guards, 4 deferral-matters and
 1 planted store. At the base, 52 of the new behavioural tests failed and 34 passed, every pass an
 unchanged criterion or a named guard. `pytest --collect-only` shows no name collected at `ae105bb`
-removed or renamed. Not run: `tests/integration` (no Docker daemon here); owed on CI.
+removed or renamed. The two diff-review fix commits added 12 mutants, all killed (nine for the
+derived check's closures and block-nested methods, three for element-wise unpacking); at `28a983e`
+`pytest` passed 3016 with 10 skipped and every gate above exited 0, and the frame-2 reviewer re-ran
+the extras leg (3018 passed) and Python 3.12.12 there at `c951a2e`. Not run: `tests/integration`
+(no Docker daemon here); owed on CI.
