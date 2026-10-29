@@ -234,7 +234,7 @@ files = [
     {file = "certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b"},
     {file = "certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae"},
 ]
-markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
+markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\"", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "cffi"
@@ -465,7 +465,7 @@ files = [
     {file = "charset_normalizer-3.4.9-py3-none-any.whl", hash = "sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5"},
     {file = "charset_normalizer-3.4.9.tar.gz", hash = "sha256:673611bbd43f0810bec0b0f028ddeaaa501190339cac411f347ac76917c3ae7b"},
 ]
-markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
 
 [[package]]
 name = "clickhouse-connect"
@@ -1163,7 +1163,7 @@ files = [
     {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
     {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
-markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
 
 [package.extras]
 all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
@@ -1906,15 +1906,15 @@ nkeys = ["nkeys"]
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.43.0"
+version = "1.45.1"
 description = "OpenTelemetry Python API"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"gcp-pubsub\""
 files = [
-    {file = "opentelemetry_api-1.43.0-py3-none-any.whl", hash = "sha256:20acf45e9b21851926835292e4045d290acade1edd2ff3de86d2f069687ba1fd"},
-    {file = "opentelemetry_api-1.43.0.tar.gz", hash = "sha256:107d0d03857ea8fc7c5fcbbbd83f800c281f0d560553d61c1d675fccfd1761c1"},
+    {file = "opentelemetry_api-1.45.1-py3-none-any.whl", hash = "sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb"},
+    {file = "opentelemetry_api-1.45.1.tar.gz", hash = "sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75"},
 ]
 
 [package.dependencies]
@@ -1922,40 +1922,40 @@ typing-extensions = ">=4.5.0"
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.43.0"
+version = "1.45.1"
 description = "OpenTelemetry Python SDK"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"gcp-pubsub\""
 files = [
-    {file = "opentelemetry_sdk-1.43.0-py3-none-any.whl", hash = "sha256:d1323a547c1ce69d6a069a17a44b7da82bb8b332051ecb074041f87642c86823"},
-    {file = "opentelemetry_sdk-1.43.0.tar.gz", hash = "sha256:d8187c81c162df9913e4003dd6485f7390d9a24fc17026ec7387b8b8218b08e9"},
+    {file = "opentelemetry_sdk-1.45.1-py3-none-any.whl", hash = "sha256:c604c11dc429810812348989115fa44bd558772a3d7442afc43d024f2c250ca4"},
+    {file = "opentelemetry_sdk-1.45.1.tar.gz", hash = "sha256:63d24a6ca645019a631e6a51999c73e93adcac1196ca640b8ae78a7cc4762bf3"},
 ]
 
 [package.dependencies]
-opentelemetry-api = "1.43.0"
-opentelemetry-semantic-conventions = "0.64b0"
+opentelemetry-api = "1.45.1"
+opentelemetry-semantic-conventions = "0.66b1"
 typing-extensions = ">=4.5.0"
 
 [package.extras]
-file-configuration = ["jsonschema (>=4.0)", "pyyaml (>=6.0)"]
+file-configuration = ["opentelemetry-configuration (==0.66b1)"]
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.64b0"
+version = "0.66b1"
 description = "OpenTelemetry Semantic Conventions"
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"gcp-pubsub\""
 files = [
-    {file = "opentelemetry_semantic_conventions-0.64b0-py3-none-any.whl", hash = "sha256:ea77e85e354b8f604ddbe5f3d9135216f982fa4d77e5859ac30f6d8a50505aa6"},
-    {file = "opentelemetry_semantic_conventions-0.64b0.tar.gz", hash = "sha256:72f76fb2d1582d9d033dd1fcd84532e961e6ff3d90d24ba6fabc72975a83864c"},
+    {file = "opentelemetry_semantic_conventions-0.66b1-py3-none-any.whl", hash = "sha256:d4cddeb4315490b35213f55e2bdc9ac54bb1e4d318927475bed62b35545e581b"},
+    {file = "opentelemetry_semantic_conventions-0.66b1.tar.gz", hash = "sha256:497ca63bf383723411e8eaf60c8779e9877633c936bb641080adab59d0eb6ec8"},
 ]
 
 [package.dependencies]
-opentelemetry-api = "1.43.0"
+opentelemetry-api = "1.45.1"
 typing-extensions = ">=4.5.0"
 
 [[package]]
@@ -2611,7 +2611,7 @@ files = [
     {file = "requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0"},
     {file = "requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed"},
 ]
-markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
+markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\"", security = "python_version < \"4.0\""}
 
 [package.dependencies]
 certifi = ">=2023.5.7"
@@ -3038,7 +3038,7 @@ files = [
     {file = "typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548"},
     {file = "typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466"},
 ]
-markers = {main = "extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\")", security = "python_version == \"3.12\""}
+markers = {main = "extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or python_version == \"3.12\" and (extra == \"postgres\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\")", security = "python_version == \"3.12\""}
 
 [[package]]
 name = "tzdata"
@@ -3080,7 +3080,7 @@ files = [
     {file = "urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3"},
     {file = "urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63"},
 ]
-markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\") or extra == \"aws\" or extra == \"sentry\" or extra == \"gcp-pubsub\" or extra == \"azure-eventhubs\"", security = "python_version < \"4.0\""}
+markers = {main = "python_version <= \"3.14\" and (extra == \"clickhouse\" or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\") or extra == \"aws\" or extra == \"azure-eventhubs\" or extra == \"gcp-pubsub\" or extra == \"sentry\"", security = "python_version < \"4.0\""}
 
 [package.extras]
 brotli = ["brotli (>=1.2.0) ; platform_python_implementation == \"CPython\"", "brotlicffi (>=1.2.0.0) ; platform_python_implementation != \"CPython\""]
