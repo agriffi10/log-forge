@@ -26,7 +26,7 @@ _NODE_LIMIT = "<node limit>"
 _SIZE_LIMIT = "<size limit>"
 
 _MAX_NODES: int = 131_072
-"""The most values one coercion pass visits, scalar or container (SPEC-057 FR-001).
+"""The most values one budgeted coercion pass visits, scalar or container (SPEC-057 FR-001).
 
 Twice a fully populated two-level structure at the default ``max_keys`` (256 by 256, 65,536
 values), so a wide but ordinary event is not cut, and no larger, so the worst pass stays small. A
@@ -40,11 +40,12 @@ times ``max_keys`` of them after the breach. Private and not a ``configure()`` k
 """
 
 _MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
-"""The most bytes of text one coercion pass charges, a work budget (SPEC-057 FR-002).
+"""The most bytes of text one budgeted coercion pass charges, a work budget (SPEC-057 FR-002).
 
-Not a sink's size limit: a destination's hard limit, where it has one, sits far below it
-(``SQSSink`` sends at most 256 KiB) and is met by lowering ``max_value_bytes`` or ``max_keys``,
-and reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
+Not a sink's size limit: a destination's hard limit is met by lowering ``max_value_bytes`` or
+``max_keys`` (``SQSSink`` sends at most 256 KiB). ``MongoDBSink``'s 16 MiB document limit is the
+same number, so one string over it becomes ``<size limit>`` before that sink's check sees it. And
+reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
 practice it only catches amplification — one ``Decimal`` of ten million digits referenced 256
 times is 2,560,000,000 characters of ``str()``. ``json.dumps`` escapes a control character as
 six bytes, so the serialised worst case is about six times this per pass, and a boundary event
@@ -308,7 +309,7 @@ class _Coercer:
     The two budgets (SPEC-057) bound the pass as a whole, where the ceilings bound one value
     each: at most :data:`_MAX_NODES` values visited and :data:`_MAX_RENDERED_BYTES` of text
     charged. Their counters live on this object, not on the module, so nothing is stranded
-    across a fork (invariant 12).
+    across a fork (invariant 12). Only :func:`_coerce_unbounded` asks for an unbudgeted pass.
 
     Attributes:
       truncated: Whether any ceiling or budget fired, or any substitution was made, in the pass.
@@ -340,7 +341,7 @@ class _Coercer:
         binding justified by this being a per-value hot path. The two budgets are read here
         too, from the module, so a patched value applies from the next pass on. An unbudgeted
         pass lifts both, because a budget's cut would clip what a transform's coercion promises
-        to keep (SPEC-057 FR-002); only :func:`_coerce_unbounded` asks for one.
+        to keep; only :func:`_coerce_unbounded` asks for one.
 
         Args:
           cfg: The config supplying ``max_value_bytes``, ``max_keys`` and ``max_depth``.
@@ -1073,10 +1074,11 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
     same ``_Coercer`` with :class:`_TypesOnly` for its config. The event is entered at depth
     ``-1``, so its top-level values sit at depth 0 and the values of ``fields`` at depth 1.
 
-    It runs outside SPEC-057's two budgets, which bound work on the caller's thread at assembly.
-    A cut here would drop the values after it, envelope keys included, from output this pass
-    promises not to clip, and the check that sends an event here has already walked all of it
-    with ``json.dumps``, so a budget would bound little of the work.
+    It runs outside SPEC-057's two budgets, which bound work at assembly. A cut here would drop
+    the values after it, envelope keys included, from output this pass promises not to clip. The
+    cost is accepted: ``json.dumps`` stops at the first fault, so a result that faults early reaches
+    this pass nearly unwalked, and a shared-sublist result then costs its whole expansion here. That
+    is the caller's own code, and the same shape with no fault costs as much in the check.
 
     **Unlike** :func:`sanitize_fields` **it has no top-level guard.** A mapping that cannot be
     entered — a ``dict`` subclass whose ``items()`` raises — propagates its exception to the

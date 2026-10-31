@@ -72,10 +72,11 @@ name.
 - **A `TransformSink` that adds a DAG after assembly.** Its function is the caller's own code. It
   runs where the sink runs — the drain thread inside a span, and the caller's thread on the orphan
   path — and what it builds is not the coercion pass's to bound. **SPEC-058's types-only coercion
-  of that output runs outside both budgets too:** it promises not to clip, a cut would drop the
-  values after it, envelope keys included, and its check has already walked the output with
-  `json.dumps`, so a budget there would bound little. `_Coercer(budgeted=False)` is that pass and
-  no other. Recorded when SPEC-058 landed first and this spec rebased onto it, by the human's call.
+  of that output runs outside both budgets too:** it promises not to clip, and a cut would drop
+  the values after it, envelope keys included. `_Coercer(budgeted=False)` is that pass and no
+  other. The cost is accepted and measured in the register entry: a result that faults early costs
+  its whole expansion in the coercion. Recorded when SPEC-058 landed first and this spec rebased
+  onto it, by the human's call.
 - **Sink-side size limits.** A destination's hard limit is still met by lowering `max_value_bytes`
   or `max_keys`, and `dropped_oversized` still counts what a sink refuses. `_MAX_RENDERED_BYTES` is
   a work budget on the caller's thread, not a limit tuned to any destination.

@@ -213,7 +213,8 @@ already failed ever meets the coercer. A peer spec in flight
 (SPEC-057) adds per-pass node and byte budgets to `sanitize.py`; the coercion here runs under
 whatever pass-level budget `sanitize.py` carries when it runs, and this spec adds none and removes
 none. That peer spec also edits the coercer and invariant 8, and is not a dependency: neither
-relies on the other's behaviour, and `docs/specs/INDEX.md` records which rebases.
+relies on the other's behaviour, and `docs/specs/INDEX.md` records which rebases. **Superseded when
+SPEC-057 landed:** the budgets would have clipped this coercion, so it runs outside them.
 
 The coercion entry point is a new private module function in `src/log_foundry/sanitize.py`, taking
 the event mapping and returning the coerced mapping and the `truncated` flag; its name is an

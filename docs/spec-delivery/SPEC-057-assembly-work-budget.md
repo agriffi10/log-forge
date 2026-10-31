@@ -31,6 +31,8 @@ name was added, and `sanitize.__all__` and `log_foundry.__all__` are unchanged.
 A transform's types-only coercion (SPEC-058) runs outside both budgets, through
 `_Coercer(budgeted=False)`, so a transform's output is still never clipped. That was decided when
 this spec rebased onto SPEC-058: the two passed their tests together while the budgets cut it.
+The cost of the exemption is in the register entry. `MongoDBSink`'s oversize drop can no longer be
+reached by one string over 16 MiB, so SPEC-059's orphan test patches the budget out of its way.
 
 The spec's *Accepted Limits* stand as written there and are not restated here.
 

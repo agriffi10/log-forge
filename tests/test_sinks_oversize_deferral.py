@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
-from log_foundry import _diag
+from log_foundry import _diag, sanitize
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.eventhubs import AzureEventHubsSink
 from log_foundry.sinks.firehose import FirehoseSink
@@ -306,9 +306,16 @@ def test_two_oversized_events_each_name_their_own_size(name: str, capsys) -> Non
 
 
 @pytest.mark.parametrize("name", sorted(_SINKS))
-def test_an_orphan_oversized_event_is_counted_once(name: str) -> None:
-    """Unchanged: outside a span the batch is the one event, which never raises and counts once."""
+def test_an_orphan_oversized_event_is_counted_once(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unchanged: outside a span the batch is the one event, which never raises and counts once.
+
+    The byte budget is patched out of the way: ``MongoDBSink``'s limit equals it, so a string over
+    the limit would otherwise be ``<size limit>`` before the sink's check saw it (SPEC-057).
+    """
     case = _SINKS[name]
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", case.oversized * 2)
     sink = case.build(set(), None)
     log_foundry.configure(service="t", sink=sink, max_value_bytes=case.oversized * 2)
 

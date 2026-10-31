@@ -1357,7 +1357,7 @@ and a third copy is a fork with no merge.
   the loss is signalled where it happens rather than passed downstream silently. SPEC-057 bounds
   each coercion pass as a whole: at most 131,072 values visited and 16 MiB of text charged, and
   the value that crosses either budget becomes a marked `<node limit>` or `<size limit>` after
-  which nothing is visited. That is a *work* budget on the caller's thread, not a limit tuned to
+  which nothing is visited. A transform's types-only coercion runs outside both. That is a *work* budget on the caller's thread, not a limit tuned to
   any destination: `json.dumps` escapes a control character as six bytes, so the serialised worst
   case is about six times the byte budget per pass (96 MiB), and a boundary event takes two
   passes, `build_event`'s and `backfill_baggage`'s, so about twice that. ~~A per-event byte

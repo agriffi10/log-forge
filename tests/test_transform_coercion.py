@@ -399,10 +399,7 @@ def test_the_orphan_path_delivers_the_coerced_event() -> None:
 
 
 def test_a_budget_does_not_clip_a_transforms_output() -> None:
-    """A 20 MiB string past the byte budget stays whole, and the key after it survives.
-
-    ``event`` carries ``bytes`` so the check fails and the coercion actually runs.
-    """
+    """A 20 MiB string past the byte budget stays whole, and the key after it survives."""
     big = "y" * (20 * 1024 * 1024)
     assert len(big) > sanitize._MAX_RENDERED_BYTES
     result, truncated = sanitize._coerce_unbounded({"raw": b"x", "big": big, "after": 1})
@@ -419,6 +416,27 @@ def test_a_node_budget_does_not_cut_a_transforms_output() -> None:
     assert len(result) == count + 1
     assert result["raw"] == "x"
     assert truncated is False
+
+
+def test_a_transform_delivers_output_past_both_budgets_whole() -> None:
+    """The real path: the check fails on ``bytes``, and the coercion cuts nothing.
+
+    The direct tests above would stay green if ``TransformSink`` stopped calling the unbudgeted pass.
+    """
+    big = "y" * (sanitize._MAX_RENDERED_BYTES + 1)
+    wide = {f"k{i}": i for i in range(sanitize._MAX_NODES + 1)}
+    returned = _one({"raw": b"x", "big": big, **wide}, after=1)
+    sink, inner = _transform(lambda event: returned)
+
+    sink.emit([_one({})])
+
+    delivered = inner.events[0]
+    fields = delivered["fields"]
+    assert fields["raw"] == "x"
+    assert fields["big"] == big
+    assert len(fields) == len(wide) + 2
+    assert delivered["after"] == 1
+    assert "truncated" not in delivered
 
 
 def test_the_budgets_still_bind_an_ordinary_pass() -> None:

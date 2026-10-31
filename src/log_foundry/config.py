@@ -21,7 +21,7 @@ class Config:
     The four ``max_*`` ceilings bound every event payload (SPEC-017 FR-002), defaulted so
     that the overwhelming majority of events are untouched; they exist to stop one
     pathological value getting a whole event rejected by a sink's hard limit. They bound
-    each *value*; each coercion pass is also bounded as a whole, at 131,072 values visited and
+    each *value*; each assembly pass is also bounded as a whole, at 131,072 values visited and
     16 MiB of text charged (SPEC-057), which bounds the work on the caller's thread and not the
     event's size at a destination — see arch §13 Known Constraints.
 
