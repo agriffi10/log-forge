@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -96,7 +97,9 @@ class GooglePubSubSink:
       max_pending: Outstanding futures held between emits before ``emit`` waits on the oldest.
       overflow_timeout: Seconds one over-bound publish is waited on before being put back.
       failed: Publishes the client did not confirm.
-      rejected: Publishes the client refused outright, before any future existed.
+      rejected: Publishes the client refused before any future existed. Counted only when
+        :meth:`emit` returns, so only when the rest of the batch was published: a batch refused
+        whole raises and is counted where the raise is caught (SPEC-059 FR-003).
     """
 
     def __init__(
@@ -200,6 +203,18 @@ class GooglePubSubSink:
         The reap runs *before* the total-failure test, so a batch the client refused outright
         still returns the pending list to its bound on the way out.
 
+        A refusal is counted and announced only when ``emit`` returns, through the deferral
+        helper whose ``with`` encloses the publish loop, :meth:`_reap` and the total-failure
+        raise (SPEC-059 FR-003). When every event was refused the call raises and counts nothing
+        — whoever catches the raise owns the batch, so a batch refused on one attempt and
+        accepted on the next records no loss that never happened — and a refusal followed by a
+        raise from :meth:`_reap` is discarded too. A partial refusal returns, and its count and
+        one line per refused event, each naming that event's own exception type bound as the
+        refusal was decided, land then. The lines are written after the reap, so one can trail
+        its refusal by up to one overflow wait, which ``overflow_timeout`` bounds; writing it
+        earlier would count before the call is known to return. The orphaned-future count above,
+        and the reap's, stay immediate: they are ``failed``, an upper bound this does not defer.
+
         Args:
           batch: The events to publish.
 
@@ -208,7 +223,7 @@ class GooglePubSubSink:
 
         Raises:
           SinkDeliveryError: When the sink was already closed on entry, or when every event was
-            refused (SPEC-026 FR-001).
+            refused (SPEC-026 FR-001). Either leaves no refusal counted.
         """
         if not batch:
             return
@@ -216,31 +231,56 @@ class GooglePubSubSink:
             raise SinkDeliveryError(
                 f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed"
             )
-        refused = 0
-        for event in batch:
-            try:
-                future = self.client.publish(self.topic, data=json.dumps(event).encode("utf-8"))
-            except Exception as err:
-                refused += 1
-                with self._counter_lock:
-                    self.rejected += 1
-                _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {type(err).__name__}")
-                continue
-            with self._futures_lock:
-                orphaned = self._closed
-                if not orphaned:
-                    self._futures.append(future)
-            if orphaned:
-                with self._counter_lock:
-                    self.failed += 1
-                _diag.lost(
-                    "event", 1, "GooglePubSubSink publish unconfirmed, the sink closed mid-batch"
+        with Deferral(self) as pending:
+            refused: list[str] = []
+            for event in batch:
+                try:
+                    future = self.client.publish(
+                        self.topic, data=json.dumps(event).encode("utf-8")
+                    )
+                except Exception as err:
+                    refused.append(type(err).__name__)
+                    continue
+                with self._futures_lock:
+                    orphaned = self._closed
+                    if not orphaned:
+                        self._futures.append(future)
+                if orphaned:
+                    with self._counter_lock:
+                        self.failed += 1
+                    _diag.lost(
+                        "event",
+                        1,
+                        "GooglePubSubSink publish unconfirmed, the sink closed mid-batch",
+                    )
+            if refused:
+                pending.count("rejected", len(refused))
+                pending.announce(lambda: self._announce_refused(refused))
+            self._reap()
+            if len(refused) == len(batch):
+                raise SinkDeliveryError(
+                    f"GooglePubSubSink published none of {len(batch)} event(s)"
                 )
-        self._reap()
-        if refused == len(batch):
-            raise SinkDeliveryError(
-                f"GooglePubSubSink published none of {len(batch)} event(s)"
-            )
+
+    def _announce_refused(self, kinds: list[str]) -> None:
+        """Writes one line per publish the client refused, naming its exception type (FR-008).
+
+        Called by the calling ``emit``'s deferral after the count is committed, outside the
+        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003). The text
+        says "refused", where an unconfirmed future's says "unconfirmed", because the two lines
+        name different counters.
+
+        Args:
+          kinds: Each refused event's exception type name, in the order they were refused.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for kind in kinds:
+            _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {kind}")
 
     def _reap(self) -> None:
         """Resolves the futures that have settled, and waits on the oldest if over the bound.

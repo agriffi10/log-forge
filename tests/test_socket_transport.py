@@ -7,6 +7,7 @@ import errno
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._socket import SocketTransport
 from log_foundry.sinks.base import SinkDeliveryError
 
@@ -62,8 +63,11 @@ def test_a_permanent_errno_reports_the_one_attempt_it_made(monkeypatch, capsys) 
     monkeypatch.setattr(socket_mod, "wait", lambda _delay, _stop=None: None)
     transport = SocketTransport("h", 9, transport="udp", max_retries=3, max_datagram_bytes=1000)
 
-    with pytest.raises(SinkDeliveryError, match="delivered none of 1"):
-        transport.send_all([b"x" * 10])
+    with (
+        pytest.raises(SinkDeliveryError, match="delivered none of 1"),
+        Deferral(transport) as pending,
+    ):
+        transport.send_all([b"x" * 10], pending)
     assert sock.attempts == 1
     lines = _abandonment_lines(capsys)
     assert len(lines) == 1 and "1 attempt(s)" in lines[0], lines
@@ -76,8 +80,11 @@ def test_a_retryable_errno_still_reports_every_attempt(monkeypatch, capsys) -> N
     monkeypatch.setattr(socket_mod, "wait", lambda _delay, _stop=None: None)
     transport = SocketTransport("h", 9, transport="udp", max_retries=3, max_datagram_bytes=1000)
 
-    with pytest.raises(SinkDeliveryError, match="delivered none of 1"):
-        transport.send_all([b"x" * 10])
+    with (
+        pytest.raises(SinkDeliveryError, match="delivered none of 1"),
+        Deferral(transport) as pending,
+    ):
+        transport.send_all([b"x" * 10], pending)
     assert sock.attempts == 4
     lines = _abandonment_lines(capsys)
     assert len(lines) == 1 and "4 attempt(s)" in lines[0], lines

@@ -59,17 +59,21 @@ by SPEC-058: five losses are counted but never retried by the sink — an unadju
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or
 an SQS id callable's per-event failure when its siblings were delivered, and an unrenderable HTTP
 event (SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
-At the five sites SPEC-058 defers — the drops `TransformSink`, `FilteringSink`, `SQSSink._chunks`
-and `HTTPSink._items` decide, and `MultiSink`'s absorbed count — a count is made only by an
-`emit` that returned; one that raised counts none of them, and whoever caught it — the worker,
-the orphan path or `MultiSink` — owns the batch (SPEC-058). Elsewhere a count can land before a
-raise and again each time the worker retries that batch: a sink's own `failed` count, the upper
-bound above, the SQS sender fault included (`SQSSink._send` counts it before `emit` raises for a
-recoverable loss beside it); and in `dropped`, `HTTPSink._drop_refused`'s conditional `413` path
-and the nine sinks a follow-up spec owns (`docs/decisions/sink-delivery.md`, the entry *A raising
-`emit` counts nothing*).
-*Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`; `tests/test_invariants_model.py`
-is the identity itself.
+At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
+that returned; one that raised counts none of them, and whoever caught it — the worker, the
+orphan path or `MultiSink` — owns the batch. The sites are the drops `TransformSink`,
+`FilteringSink`, `SQSSink._chunks` and `HTTPSink._items` decide and `MultiSink`'s absorbed count
+(SPEC-058), and the oversize drops of the record-building sinks and the socket transport, the
+hand-offs `KafkaSink` and `GooglePubSubSink` see refused, and `HTTPSink._drop_refused`'s `413`
+(SPEC-059). A counter some `losses()` reports as `dropped` is written only by that commit: the
+counters are derived from the tree and the rule checked over it (`tests/test_deferral.py`). The
+exception is a sink's own `failed` count, the upper bound above: it can land before a raise and
+again each time the worker retries that batch, the SQS sender fault included (`SQSSink._send`
+counts it before `emit` raises for a recoverable loss beside it). A third-party sink that counts
+a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
+cost).
+*Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`;
+`tests/test_invariants_model.py` is the identity itself.
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 

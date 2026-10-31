@@ -18,8 +18,12 @@ class _Counted(Protocol):
     """An owner whose loss counters a deferral commits into, under the owner's counter lock.
 
     Every shipped owner already guards its other counters with this one lock, which is the point:
-    a deferred ``dropped_oversized`` increment and an immediate one from ``_drop_refused`` are
-    serialised by the same lock, where two locks guarding one counter would lose increments.
+    the commit, the owner's immediate ``failed`` increments and a ``losses()`` read taken under
+    that lock are serialised together, so the commit needs no lock of its own and such a read
+    never sees a commit half-applied. Since SPEC-059 the commit is the only writer, after
+    construction, of a counter some ``losses()`` reports as ``dropped`` — ``tests/test_deferral.py``
+    derives those counters and holds them to it — so no counter has both a deferred writer and an
+    immediate one.
 
     Attributes:
       _counter_lock: The lock every write to the owner's counters takes.
@@ -77,7 +81,7 @@ class Deferral:
     def count(self, counter: str, n: int = 1) -> None:
         """Adds ``n`` to the owner's ``counter``, pending the call's clean exit.
 
-        The counter is named rather than typed, so one helper serves five owner types; the cost
+        The counter is named rather than typed, so one helper serves every owner type; the cost
         is that mypy cannot check the name, and a misspelt one raises ``AttributeError`` from the
         commit on the first clean call that drops something, which every site's tests exercise.
         A zero is not recorded, so it cannot make a clean exit take the lock for nothing.

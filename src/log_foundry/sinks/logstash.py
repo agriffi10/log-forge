@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     import threading
 
 from log_foundry import _lifecycle
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink
@@ -188,6 +189,12 @@ class LogstashSink:
         The assertion narrows the type for mypy rather than checking at runtime: the constructor
         guarantees exactly one backend is set, and the branch above covers the other.
 
+        In socket mode this is the boundary the worker retries, so the ledger lives here: a
+        ``Deferral`` owned by the transport is handed to ``send_all`` (SPEC-059 FR-002), and a
+        UDP frame over the datagram limit is counted and announced only when ``emit`` returns.
+        A raise discards it, and the worker's retry decides it afresh rather than counting it
+        once per attempt. The HTTP branch delegates to ``HTTPSink.emit``, which enters its own.
+
         Args:
           batch: The events to ship. An empty batch is a no-op.
 
@@ -195,7 +202,7 @@ class LogstashSink:
           None.
 
         Raises:
-          SinkDeliveryError: If the backend delivered nothing.
+          SinkDeliveryError: If the backend delivered nothing, leaving nothing counted.
         """
         if not batch:
             return
@@ -204,7 +211,8 @@ class LogstashSink:
         else:
             assert self._socket is not None  # noqa: S101
             frames = [(json.dumps(event) + "\n").encode("utf-8") for event in batch]
-            self._socket.send_all(frames)
+            with Deferral(self._socket) as pending:
+                self._socket.send_all(frames, pending)
 
     def close(self) -> None:
         """Closes whichever backend is held (FR-005).

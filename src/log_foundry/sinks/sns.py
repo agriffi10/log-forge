@@ -8,6 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -88,6 +89,13 @@ class SNSSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks to the publish limits and sends each chunk, retrying failures (FR-010).
 
+        An oversize drop :meth:`_bodies` decides is counted and announced only when ``emit``
+        returns, through the deferral helper whose ``with`` is the outermost block of the work
+        (SPEC-059 FR-001). The drop is decided before any publish, and this call can still raise
+        afterwards — the total-failure raise below, a ``json.dumps`` failure, a malformed
+        ``Failed`` entry, a ``BaseException`` from the client — and be retried whole; counting it
+        at once counted one oversized event once per attempt.
+
         Args:
           batch: The events to publish.
 
@@ -98,17 +106,19 @@ class SNSSink:
           SinkDeliveryError: When every chunk failed and at least one was sent (SPEC-026
             FR-001). Events dropped before sending, being too large to ever fit, are not a send
             failure and do not make a batch of nothing but oversized events raise — they can
-            never be retried into existence, and are reported through :meth:`losses`.
+            never be retried into existence, and are reported through :meth:`losses`. A raise
+            leaves none of them counted.
         """
-        bodies = self._bodies(batch)
         chunks = delivered = 0
-        for chunk in chunk_items(
-            bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
-        ):
-            chunks += 1
-            delivered += self._send(chunk)
-        if chunks and not delivered:
-            raise SinkDeliveryError(f"SNSSink published none of {chunks} chunk(s)")
+        with Deferral(self) as pending:
+            bodies = self._bodies(batch, pending)
+            for chunk in chunk_items(
+                bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
+            ):
+                chunks += 1
+                delivered += self._send(chunk)
+            if chunks and not delivered:
+                raise SinkDeliveryError(f"SNSSink published none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-001).
@@ -123,11 +133,18 @@ class SNSSink:
           None.
         """
 
-    def _bodies(self, batch: list[dict[str, object]]) -> list[str]:
+    def _bodies(self, batch: list[dict[str, object]], pending: Deferral) -> list[str]:
         """Serializes each event, dropping any message too large to ever fit (FR-011).
+
+        A drop goes to ``pending`` rather than to the counter, so it is counted and announced
+        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
+        discards it, and the worker's retry decides it afresh. The line names no per-event value,
+        so each drop registers its own count and its own line, one per event as before.
 
         Args:
           batch: The events to serialize.
+          pending: The calling ``emit``'s deferral, which holds every drop decided here until
+            that ``emit`` is known not to raise.
 
         Returns:
           The serialized bodies that can be sent.
@@ -139,9 +156,12 @@ class SNSSink:
         for event in batch:
             body = json.dumps(event)
             if len(body.encode("utf-8")) > self.MAX_BYTES:
-                with self._counter_lock:
-                    self.dropped_oversized += 1
-                _diag.lost("event", 1, f"SNSSink, exceeds the {self.MAX_BYTES}-byte message limit")
+                pending.count("dropped_oversized")
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", 1, f"SNSSink, exceeds the {self.MAX_BYTES}-byte message limit"
+                    )
+                )
                 continue
             bodies.append(body)
         return bodies

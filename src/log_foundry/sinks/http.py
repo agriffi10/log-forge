@@ -409,10 +409,10 @@ class HTTPSink:
         budget cannot see.
       failed: Requests abandoned past the retry bound, counted per chunk.
       dropped_oversized: Events dropped for exceeding the per-event ceiling, plus those a
-        destination answered ``413`` to and no split could rescue. The ceiling drops are counted
-        only when ``emit`` returns normally (SPEC-058 FR-005); a ``413`` drop is counted when it
-        happens. An event whose render raised is counted apart from this and folded into
-        ``losses().dropped``, so this stays oversize only.
+        destination answered ``413`` to and no split could rescue. Both are counted and
+        announced only when ``emit`` returns (SPEC-058 FR-005, SPEC-059 FR-004), so a batch the
+        worker retries counts each once. An event whose render raised is counted apart from this
+        and folded into ``losses().dropped``, so this stays oversize only.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -527,8 +527,14 @@ class HTTPSink:
         and announced through the deferral helper, so they land only if this call returns
         normally (SPEC-058 FR-005). They are decided before any request, and this call can still
         raise afterwards and be retried whole: counting them first counted one oversized event
-        once per attempt. The ``413`` and abandonment counters below keep counting as they
-        happen, which is outside SPEC-058's scope.
+        once per attempt. A ``413`` drop — a lone item the destination refused, or one
+        :meth:`_known_refused` discards without offering it — is counted and announced only when
+        ``emit`` returns as well, through :meth:`_drop_refused` and the same ledger (SPEC-059
+        FR-004). Once a drop has settled a chunk, this call raises only through a later chunk's
+        exception :meth:`_deliver` does not catch — an ``http.client.HTTPException`` such as
+        ``IncompleteRead``, which is not an ``OSError`` — or a ``BaseException``, and that raise
+        now discards the drop rather than leaving it counted once per attempt. The abandonment
+        counter stays immediate: ``failed`` is an upper bound neither spec recounts.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -544,8 +550,8 @@ class HTTPSink:
             identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
             already apply). A batch that settled *some* chunks does not raise either: the worker
             retries whole batches, so raising would re-send what landed. A raise leaves nothing
-            from :meth:`_items` counted, and a batch whose every event was unrenderable or
-            oversized makes no request and does not raise.
+            from :meth:`_items` or :meth:`_drop_refused` counted, and a batch whose every event
+            was unrenderable or oversized makes no request and does not raise.
         """
         if not batch:
             return
@@ -559,7 +565,7 @@ class HTTPSink:
             while index < len(items):
                 chunk = self._take(items, index, budget)
                 if self._known_refused(chunk, refused_at):
-                    self._drop_refused(chunk)
+                    self._drop_refused(chunk, pending)
                     chunks += 1
                     settled += 1
                     index += 1
@@ -576,7 +582,7 @@ class HTTPSink:
                         continue
                     chunks += 1
                     if len(chunk) == 1:
-                        self._drop_refused(chunk)
+                        self._drop_refused(chunk, pending)
                         settled += 1
                     else:
                         self._abandon_unreduced(chunk)
@@ -692,16 +698,21 @@ class HTTPSink:
             f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the destination",
         )
 
-    def _drop_refused(self, chunk: list[_Item]) -> None:
+    def _drop_refused(self, chunk: list[_Item], pending: Deferral) -> None:
         """Discards a single item this destination will not accept at any size available.
 
         Only ever called with one item. It reaches here two ways: the item was offered alone and
         answered ``413``, or :meth:`_known_refused` proved its body is no smaller than one this
         ``emit`` has already had refused — in which case it was **never offered**, which is the
-        whole point of that shortcut. Either way it is permanently undeliverable here, so it is
-        counted against ``dropped_oversized`` and the chunk reports *settled*: a retry would
-        re-run the identical search and re-count the identical drops, which is why ``dropped``
-        can stay an exact count while ``failed`` is only an upper bound.
+        whole point of that shortcut. Either way it is permanently undeliverable here, so the
+        chunk reports *settled*, and the drop goes to ``pending`` against ``dropped_oversized``:
+        it is counted and announced only when ``emit`` returns (SPEC-059 FR-004). Permanence
+        alone never made ``dropped`` exact. Once a drop has settled a chunk, ``emit`` can still
+        raise through a later chunk's exception :meth:`_deliver` does not catch — an
+        ``http.client.HTTPException`` such as ``IncompleteRead`` — or a ``BaseException``; the
+        worker then retried the batch, re-ran the identical search and re-counted the identical
+        drop once per attempt. It is the deferral that keeps ``dropped`` an exact count, while
+        ``failed`` stays an upper bound. The line keeps its shape, one per call.
 
         A *multi*-item chunk reaching the end of the reduction budget is deliberately **not**
         routed here. It needs a pathological ``_item_size`` to happen at all (measured: an
@@ -711,6 +722,8 @@ class HTTPSink:
 
         Args:
           chunk: The refused items.
+          pending: The calling ``emit``'s deferral, which holds the drop until that ``emit`` is
+            known not to raise.
 
         Returns:
           None.
@@ -718,12 +731,14 @@ class HTTPSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            self.dropped_oversized += len(chunk)
-        _diag.lost(
-            "event",
-            len(chunk),
-            f"{type(self).__name__}, refused at the smallest request this sink can build",
+        refused = len(chunk)
+        pending.count("dropped_oversized", refused)
+        pending.announce(
+            lambda: _diag.lost(
+                "event",
+                refused,
+                f"{type(self).__name__}, refused at the smallest request this sink can build",
+            )
         )
 
     def _items(self, batch: list[dict[str, object]], pending: Deferral) -> list[_Item]:
