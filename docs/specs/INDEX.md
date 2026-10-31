@@ -319,10 +319,10 @@ Group related specs and record the order to build them in. Keep this section: a 
   while a wrap shipped first freezes its semantics at 1.0. If wrapping is chosen it is a spec of
   its own, SPEC-056, built after SPEC-055 and replacing its FR-003.
 
-- **Coercer and invariant 8 (SPEC-057, SPEC-058):** SPEC-057 (in progress on a peer branch) and
-  SPEC-058 both edit `sanitize.py`'s coercer and `docs/invariants.md` §8. Neither depends on the
-  other and neither relies on the other's behaviour. Whichever lands second rebases onto the first,
-  and re-runs SPEC-058 FR-001's criteria and `tests/test_sanitize_corpus.py` before it pushes.
+- **Coercer and invariant 8 (SPEC-057, SPEC-058):** both edit `sanitize.py`'s coercer and
+  `docs/invariants.md` §8. SPEC-058 landed first and SPEC-057 rebased onto it. They did interact:
+  SPEC-057's budgets would have cut the output SPEC-058 promises not to clip, so a transform's
+  coercion runs outside them.
 - **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
   all in `sanitize.py`, closing a shared-sublist hang on the caller's thread. It depends on nothing
   unbuilt and builds first of the two specs it touches: the OTLP log export spec drafted on branch

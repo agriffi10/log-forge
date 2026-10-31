@@ -326,7 +326,7 @@ class _Coercer:
         "truncated",
     )
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, budgeted: bool = True) -> None:
         """Starts a pass with the configured ceilings, empty counters and an empty ancestor chain.
 
         ``_parents`` holds the ``id()``s of the containers currently being descended through.
@@ -338,10 +338,13 @@ class _Coercer:
         (SPEC-031 FR-004): it reads ``sys.get_int_max_str_digits()``, which cannot change
         during a coercion pass, and the alternative sat four lines below an ``int.__lt__``
         binding justified by this being a per-value hot path. The two budgets are read here
-        too, from the module, so a patched value applies from the next pass on.
+        too, from the module, so a patched value applies from the next pass on. An unbudgeted
+        pass lifts both, because a budget's cut would clip what a transform's coercion promises
+        to keep (SPEC-057 FR-002); only :func:`_coerce_unbounded` asks for one.
 
         Args:
           cfg: The config supplying ``max_value_bytes``, ``max_keys`` and ``max_depth``.
+          budgeted: Whether the pass stops at the two budgets.
 
         Returns:
           None.
@@ -353,8 +356,8 @@ class _Coercer:
         self._int_ceiling = _int_digit_ceiling(cfg.max_value_bytes)
         self.truncated = False
         self._parents: list[int] = []
-        self._max_nodes = _MAX_NODES
-        self._max_bytes = _MAX_RENDERED_BYTES
+        self._max_nodes = _MAX_NODES if budgeted else sys.maxsize
+        self._max_bytes = _MAX_RENDERED_BYTES if budgeted else sys.maxsize
         self._nodes = 0
         self._charged = 0
         self._stopped: str | None = None
@@ -1070,6 +1073,11 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
     same ``_Coercer`` with :class:`_TypesOnly` for its config. The event is entered at depth
     ``-1``, so its top-level values sit at depth 0 and the values of ``fields`` at depth 1.
 
+    It runs outside SPEC-057's two budgets, which bound work on the caller's thread at assembly.
+    A cut here would drop the values after it, envelope keys included, from output this pass
+    promises not to clip, and the check that sends an event here has already walked all of it
+    with ``json.dumps``, so a budget would bound little of the work.
+
     **Unlike** :func:`sanitize_fields` **it has no top-level guard.** A mapping that cannot be
     entered — a ``dict`` subclass whose ``items()`` raises — propagates its exception to the
     caller, because an empty event delivered in place of a hostile one is a silent change to the
@@ -1087,7 +1095,7 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
       TypeError: If the pass returned something other than a mapping, which a fresh pass over a
         mapping cannot; checked so the return type is a promise rather than a cast.
     """
-    coercer = _Coercer(cast("Config", _TypesOnly()))
+    coercer = _Coercer(cast("Config", _TypesOnly()), budgeted=False)
     result = coercer.mapping(event, -1)
     if not isinstance(result, dict):
         raise TypeError(f"a transform's coercion produced {type(result).__name__}, not a dict")

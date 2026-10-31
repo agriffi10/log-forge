@@ -29,6 +29,7 @@ import pytest
 
 import log_foundry
 from log_foundry import sanitize
+from log_foundry.config import Config
 from log_foundry.sanitize import _TypesOnly
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.memory import MemorySink
@@ -395,6 +396,36 @@ def test_the_orphan_path_delivers_the_coerced_event() -> None:
 
 
 # --- AC: nothing public, and the seam between the stand-in and the coercer ----------------
+
+
+def test_a_budget_does_not_clip_a_transforms_output() -> None:
+    """A 20 MiB string past the byte budget stays whole, and the key after it survives.
+
+    ``event`` carries ``bytes`` so the check fails and the coercion actually runs.
+    """
+    big = "y" * (20 * 1024 * 1024)
+    assert len(big) > sanitize._MAX_RENDERED_BYTES
+    result, truncated = sanitize._coerce_unbounded({"raw": b"x", "big": big, "after": 1})
+    assert result == {"raw": "x", "big": big, "after": 1}
+    assert truncated is False
+
+
+def test_a_node_budget_does_not_cut_a_transforms_output() -> None:
+    """More values than the node budget all arrive, each coerced."""
+    count = sanitize._MAX_NODES + 1
+    event: dict[str, object] = {f"k{i}": i for i in range(count)}
+    event["raw"] = b"x"
+    result, truncated = sanitize._coerce_unbounded(event)
+    assert len(result) == count + 1
+    assert result["raw"] == "x"
+    assert truncated is False
+
+
+def test_the_budgets_still_bind_an_ordinary_pass() -> None:
+    """The exemption is the transform's alone: the same input through ``coerce`` is cut."""
+    big = "y" * (20 * 1024 * 1024)
+    cfg = Config(max_value_bytes=len(big.encode()) + 1)
+    assert sanitize.coerce({"big": big, "after": 1}, cfg=cfg) == {"big": "<size limit>"}
 
 
 def test_sanitize_exports_nothing_new() -> None:

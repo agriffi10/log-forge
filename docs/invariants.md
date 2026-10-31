@@ -189,8 +189,8 @@ the config without a ceiling — `configure()` refuses one that is not a `str` o
 event takes two passes, `build_event`'s and `backfill_baggage`'s, so `span.start` and `span.end`
 can each hold up to twice each budget (SPEC-057). The
 ceilings bound the values of an assembled event and do not bound what a transform adds: a
-transform's coercion is for type only, under no configured ceiling and one fixed depth bound of
-100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
+transform's coercion is for type only, under no configured ceiling, outside the two pass budgets,
+and with one fixed depth bound of 100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
 choosing the size (SPEC-058).
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
 by `tests/test_public_surface.py`, `tests/test_sanitize_corpus.py`, which holds every

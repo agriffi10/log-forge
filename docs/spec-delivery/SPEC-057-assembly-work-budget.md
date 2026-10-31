@@ -28,6 +28,10 @@ name was added, and `sanitize.__all__` and `log_foundry.__all__` are unchanged.
   docstring and the README. The register entry and its fence are "Each coercion pass is bounded by a
   node and a byte budget" in `docs/decisions/event-assembly.md`.
 
+A transform's types-only coercion (SPEC-058) runs outside both budgets, through
+`_Coercer(budgeted=False)`, so a transform's output is still never clipped. That was decided when
+this spec rebased onto SPEC-058: the two passed their tests together while the budgets cut it.
+
 The spec's *Accepted Limits* stand as written there and are not restated here.
 
 ## What changed from earlier specs?
