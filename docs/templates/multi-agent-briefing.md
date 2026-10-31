@@ -54,7 +54,8 @@ contain the remote's current `main` whether or not you hold the lock. One ticket
 release between them so the others interleave. If `turn` reports the trunk `IS RED`, stop and
 escalate; a red `main` is fixed before anything else merges.
 
-**Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how.] A
+**Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how: the
+supervisor session by its `ListAgents` name, if one is running `/supervise`, else Andrew.] A
 product-changing or ambiguous call, a conflict you cannot resolve without discarding someone's work,
 and a red `main` all stop the session — the reversible technical calls are still yours to make. When
 you do stop, ask with the question tool: the options as selections, the recommended one first, and
