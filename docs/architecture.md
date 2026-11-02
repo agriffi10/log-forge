@@ -12,9 +12,16 @@ code — sections describe the target design, not necessarily what's implemented
 
 ## 1. Purpose & scope
 
-log-foundry owns the **logs** pillar of observability. It does **not** (yet) ship
-metrics or traces, but it deliberately uses tracing vocabulary and ID conventions so
-its output can be correlated with — or later promoted into — traces.
+log-foundry owns the **logs** pillar of observability. It does **not** ship metrics, and
+OTLP traces are a planned arc item, not a built one. It deliberately uses tracing
+vocabulary and ID conventions so its output correlates with — or is promoted into — traces.
+The direction for what goes outward is the OpenTelemetry data model over plural transports:
+OTLP is one sink among several, never the only way out.
+
+> **Superseded in part, 2026-10-05.** This section said the library "does **not** (yet) ship
+> metrics or traces" and stays logs-only. The direction is reversed for traces and for the
+> data model; in-library metrics stay out. Full entry: `docs/decisions/public-api.md`; first
+> slice: SPEC-056.
 
 The unit of work is a **decorated function call**. Each call:
 
@@ -1084,7 +1091,10 @@ close it.
 
 ## 13. Non-goals (for now)
 
-- Emitting metrics or OpenTelemetry-native traces (we stay logs-only, but ID-compatible).
+- ~~Emitting metrics or OpenTelemetry-native traces (we stay logs-only, but ID-compatible).~~ —
+  **superseded in part, 2026-10-05.** In-library metrics stay a non-goal: they are derived
+  downstream. OpenTelemetry-native traces are no longer one — OTLP spans built from `span.end`
+  are a planned arc item, not yet built. Full entry: `docs/decisions/public-api.md`.
 - Querying, dashboards, or alerting — that's ELK / downstream.
 - Log *routing* logic beyond a single configured sink per process.
 
@@ -1656,5 +1666,5 @@ and a third copy is a fork with no merge.
 | Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3), continued across processes via W3C `traceparent` + `baggage` (SPEC-014). |
 | Head vs tail sampling | Neither is built. Span-outcome sampling has a natural call site; true tail sampling needs a trace-scoped buffer we don't have (§10). |
 | Cardinality explosion | High-cardinality fields allowed in logs; never auto-promoted to metric labels (§6). |
-| One event, three views | Logs-only today, but trace_id/span_id make traces derivable later (§13). |
+| One event, three views | Logs first; `trace_id`/`span_id` make traces derivable, and OTLP traces from `span.end` are a planned arc item, not built (§13; superseded 2026-10-05 — `docs/decisions/public-api.md`). |
 | Symptom vs cause alerting | We stamp `duration_ms` / `status` / `error.type` — the fields alerts key off (§6). |

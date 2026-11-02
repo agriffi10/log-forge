@@ -149,7 +149,7 @@ the register and the rules to it, and refuses anything in this section but this 
 
 ## Out of Scope (don't build)
 
-Metrics or OTel-native traces · querying / dashboards / alerting (that's ELK/downstream) · log routing
+In-library metrics (derive them downstream) · an OTel SDK/API dependency in core · OTLP traces outside their own arc spec (`docs/decisions/public-api.md`) · querying / dashboards / alerting (that's ELK/downstream) · log routing
 beyond one configured sink per process · **auto**-instrumented propagation — no HTTP-client patching,
 middleware or boto3 hooks; the caller moves the header (cross-process continuation itself shipped in
 SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (deferred).

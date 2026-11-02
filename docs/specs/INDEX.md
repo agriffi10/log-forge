@@ -60,6 +60,7 @@ to status only — no prose.
 | [SPEC-053](SPEC-053-marking-walk-claims.md) | The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them | Completed | SPEC-042, SPEC-052 |
 | [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Completed | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
+| [SPEC-056](SPEC-056-otlp-log-export.md) | OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink | Draft | SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-057, SPEC-058, SPEC-059 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
 | [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Completed | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
 | [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | Completed | SPEC-017, SPEC-020, SPEC-055 |
@@ -316,8 +317,10 @@ Group related specs and record the order to build them in. Keep this section: a 
   edge fixes are independent of one another. One FR carries a product decision that is not the
   spec's to make — whether a generator function is *refused* at decoration or its iteration is
   *wrapped* — and the spec recommends refusing, because a refusal can later be lifted into a wrap
-  while a wrap shipped first freezes its semantics at 1.0. If wrapping is chosen it is a spec of
-  its own, SPEC-056, built after SPEC-055 and replacing its FR-003.
+  while a wrap shipped first freezes its semantics at 1.0. ~~If wrapping is chosen it is a spec of
+  its own, SPEC-056, built after SPEC-055 and replacing its FR-003.~~ — **superseded 2026-10-05:**
+  refusing was chosen and shipped (SPEC-055 FR-003), so no wrapping spec exists and the number
+  SPEC-056 names the OTLP log export spec below.
 
 - **Coercer and invariant 8 (SPEC-057, SPEC-058):** both edit `sanitize.py`'s coercer and
   `docs/invariants.md` §8. SPEC-058 landed first and SPEC-057 rebased onto it. They did interact:
@@ -325,8 +328,25 @@ Group related specs and record the order to build them in. Keep this section: a 
   coercion runs outside them.
 - **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
   all in `sanitize.py`, closing a shared-sublist hang on the caller's thread. It depends on nothing
-  unbuilt and builds first of the two specs it touches: the OTLP log export spec drafted on branch
-  `spec/056-otlp-log-export` specifies an equal budget for its own mapping — one number, one
-  placeholder text, one stop rule. Keeping the two equal is that spec's to settle when it builds
-  (it may import `sanitize`'s private `_MAX_NODES` or pin equality with a test); SPEC-057 defines
-  its own constant and asks for no edit to that spec or to `_otel`.
+  unbuilt and builds first of the two specs it touches: SPEC-056, the OTLP log export spec (Draft),
+  specifies an equal budget for its own mapping — one number, one placeholder text, one stop rule.
+  Keeping the two equal is SPEC-056's to settle when it builds, and it settles it with a test that
+  pins `_otel.MAX_NODES` to `sanitize`'s private `_MAX_NODES` and imports nothing from `sanitize`;
+  SPEC-057 defines its own constant and asks for no edit to that spec or to `_otel`.
+
+- **OpenTelemetry-shaped output:** SPEC-056, then three planned items that have no spec number yet.
+  The arc follows a direction Andrew decided on 2026-10-05 (`docs/decisions/public-api.md`): what
+  goes outward standardizes on the OpenTelemetry data model and semantic-convention names, the
+  transports stay plural, and OTLP is produced natively with no OpenTelemetry SDK dependency.
+  Build order: **SPEC-056** — the private mapping and an OTLP/HTTP JSON logs sink, first because
+  the ClickHouse layout and the traces item both reuse its mapping, and after SPEC-057, whose
+  `sanitize._MAX_NODES` it pins its own record budget equal to (see the *Assembly work budget*
+  entry above; SPEC-056 imports nothing from `sanitize` and settles the equality with a test) —
+  then **a `ClickHouseSink` `otel_logs` layout**, which reuses
+  that mapping and is the first possible second consumer of it (the register keeps the mapping
+  private until a second consumer has proven its shape) — then **an Astra profile on the `_bulk`
+  path**, which is independent of the OTel work and may move earlier, since Astra ingests through an
+  OpenSearch-compatible `_bulk` API and has no OTLP ingestion — then **OTLP traces from `span.end`**
+  (plus an `otel_traces` layout), last because it carries the most design risk: a `span.end`
+  dropped under queue backpressure orphans child spans in a trace view. In-library metrics are not
+  an item; they are derived downstream.

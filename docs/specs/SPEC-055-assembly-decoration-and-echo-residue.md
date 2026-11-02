@@ -56,9 +56,10 @@ options, both complete:
   `athrow` and `aclose`. This is a real feature with semantics no other span has: `duration_ms`
   counts suspended time; a generator finalised by the collector runs its close in whatever
   context happens to be current, where the span-stack token belongs to another context; and the
-  decorator gains two more twin paths for invariant 6 to police. Chosen, it is a spec of its own
+  decorator gains two more twin paths for invariant 6 to police. ~~Chosen, it is a spec of its own
   — SPEC-056, beside this one as an arc — and FR-003 below is replaced by a refusal-free dispatch
-  to it.
+  to it.~~ — **superseded 2026-10-05:** Option A was chosen, so no wrapping spec exists; the number
+  SPEC-056 names the OTLP log export spec (`docs/specs/INDEX.md`).
 
 **Recommendation: Option A, now.** It closes the wrong-data defect before the tag at the cost of
 a `TypeError` a consumer meets at import, and it leaves Option B open at zero cost. FR-003 is
@@ -82,7 +83,7 @@ built regardless. **Decided 2026-09-05: Option A**, and built in the spec's seco
 
 ### Out of Scope
 
-- **Wrapping a generator's iteration** — Option B above. If chosen, it is SPEC-056.
+- **Wrapping a generator's iteration** — Option B above. ~~If chosen, it is SPEC-056.~~ — **superseded 2026-10-05:** not chosen; SPEC-056 is the OTLP log export spec.
 - **Detecting a plain function that *returns* a generator object without advertising it.**
   FR-003 tests the code flags at decoration, which is where invariant 13 refuses — on the
   callable, on what it advertises through `__wrapped__` (so `@contextmanager`, `@lru_cache` and a
