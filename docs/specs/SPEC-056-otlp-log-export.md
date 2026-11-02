@@ -3,7 +3,7 @@
 **ID:** SPEC-056
 **Status:** Draft
 **Last Updated:** 2026-11-02
-**Depends On:** SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-058, SPEC-059
+**Depends On:** SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-057, SPEC-058, SPEC-059
 
 ## Overview
 
@@ -83,7 +83,7 @@ on it after this.
   exponential backoff for a date, unchanged.
 - **Shared-subtree cost in `sanitize`, and a byte budget in `_otel`.** The build review found the
   same exponential expansion of a shared subtree in assembly, on the caller's own thread. SPEC-057
-  (PR #273) closes it there, with a per-pass node budget `sanitize._MAX_NODES = 131_072`, a
+  (`e8cbd5d`) closes it there, with a per-pass node budget `sanitize._MAX_NODES = 131_072`, a
   16 MiB text budget and the placeholder `<node limit>`; nothing in this spec changes `sanitize`,
   and FR-001's node budget bounds only this mapping. The two budgets are equal in number,
   placeholder text and stop rule on purpose (FR-001 rule 7), and a test pins that equality. Two
@@ -199,7 +199,7 @@ raise, to loop, or to write something a parser refuses.
    `<node limit>`. The budget is checked before `MAX_NEST`, so a value past both is `<node limit>`.
    **The number, the placeholder text, the stop and the order of checks are SPEC-057's**, which
    gives `sanitize` a private `_MAX_NODES = 131_072`, a `<node limit>` placeholder and the same
-   stop rule for an assembly pass (PR #273), and they are equal on purpose: one hostile shape
+   stop rule for an assembly pass (`e8cbd5d`), and they are equal on purpose: one hostile shape
    should cost the same wherever it is walked. `_otel` stays a leaf and imports nothing from the
    package, so the equality is pinned by a test that compares `_otel.MAX_NODES` with
    `sanitize._MAX_NODES` and the placeholder text with `sanitize._NODE_LIMIT`; it pins the constants
@@ -215,9 +215,9 @@ raise, to loop, or to write something a parser refuses.
    thread for, or on the orphan path the caller's, invariant 4. The constant's docstring says this beside the number. A smaller budget
    would cut legitimate events; a larger one makes the hostile one cost seconds.
 8. **Keys are rendered, non-empty and unique.** A `str` key is used as it is (rule 3 applies); any
-   other key becomes `<unserializable: T>` and marks the record, the one placeholder invariant 8
+   other key becomes `<unserializable key: T>` and marks the record, the one placeholder invariant 8
    says marks. A key that is **empty**, or that renders to one already written — two non-`str` keys
-   of one type both become `<unserializable: int>` — is dropped, at any level of nesting, and its
+   of one type both become `<unserializable key: int>` — is dropped, at any level of nesting, and its
    record's `droppedAttributesCount` counts it; the first of a repeated key stands. OTLP requires
    unique keys and OpenTelemetry non-empty ones, `json_format.Parse` accepts duplicates and
    `MessageToDict` writes an empty key back as no key at all, so neither would say so. Assembly does
@@ -330,7 +330,7 @@ counted in `droppedAttributesCount` and is not marked.
       field) is written whole and unmarked.
 - [ ] `_otel.MAX_NODES == sanitize._MAX_NODES` and the `<node limit>` text written equals
       `sanitize._NODE_LIMIT`, so SPEC-057's budget and this one cannot drift apart unseen.
-- [ ] `fields={1: "a", 2: "b"}` gives one `<unserializable: int>` attribute holding `"a"`,
+- [ ] `fields={1: "a", 2: "b"}` gives one `<unserializable key: int>` attribute holding `"a"`,
       `droppedAttributesCount == 1`, and a marked record; `fields={"": 1}` gives no attribute,
       `droppedAttributesCount == 1` and no mark; `{"a": {"": 1, "b": 2}}` and the same pair of
       non-`str` keys nested in a field value are cleaned the same way and counted in the record's
@@ -1016,7 +1016,7 @@ new module makes a derived test demand, and nothing that test does not demand wa
   roster line numbers, the `FakeResponse` importer count and the `== 7` assertion, and adds the two
   SPEC-058 and SPEC-059 sweeps that go red for any `HTTPSink` subclass and cannot be satisfied by a
   recipe alone; `pubsub.py:137` is now `:140`; `Depends On` gains SPEC-058 and SPEC-059; Out of Scope
-  now says what SPEC-057 (PR #273) does about the shared-subtree cost and why `_otel` keeps its own
+  now says what SPEC-057 (`e8cbd5d`) does about the shared-subtree cost and why `_otel` keeps its own
   node budget and pins it equal. Not re-measured, because they were taken on a prototype of a
   mapping that does not exist at `1130461`: the shared-subtree timings in FR-001 rule 7 and the
   cap-20 cycle figures in rule 6. Re-measured at `1130461` against `opentelemetry-proto` 1.45.0 and

@@ -60,7 +60,7 @@ to status only — no prose.
 | [SPEC-053](SPEC-053-marking-walk-claims.md) | The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them | Completed | SPEC-042, SPEC-052 |
 | [SPEC-054](SPEC-054-one-lifecycle-owner.md) | One Lifecycle Owner for Both Delivery Paths | Completed | SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050 |
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
-| [SPEC-056](SPEC-056-otlp-log-export.md) | OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink | Draft | SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-058, SPEC-059 |
+| [SPEC-056](SPEC-056-otlp-log-export.md) | OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink | Draft | SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-057, SPEC-058, SPEC-059 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
 | [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Completed | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
 | [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | Completed | SPEC-017, SPEC-020, SPEC-055 |
