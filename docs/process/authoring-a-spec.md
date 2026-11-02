@@ -1,6 +1,8 @@
 # Authoring a spec
 
-Specs are written from `docs/templates/spec-template.md`. What makes a spec *buildable*:
+Specs are written from `docs/templates/spec-template.md`. Its frontmatter is the spec's one home for
+its id, title, one-sentence description, status and dependencies — the keys and the subset they are
+written in: `knowledge-layout.md` → *Frontmatter*. What makes a spec *buildable*:
 
 - **Overview** — user/business intent, no implementation detail. Understandable cold.
 - **Scope: In / Out** — explicitly list what's *excluded*, especially anything a reader would
@@ -21,8 +23,8 @@ Specs are written from `docs/templates/spec-template.md`. What makes a spec *bui
   tree, not a standing claim about today's corpus — `completion-ritual.md` forbids a rule resting on a number that
   rots, and the anchor is what makes this one re-measurable rather than merely dated.) Growing one
   spec is the wrong repair;
-  the right one is a second spec beside it, with the pair's build order recorded in `INDEX.md` as
-  an **arc** (`spec-lifecycle.md`). Splitting keeps paying off past the
+  the right one is a second spec beside it, with the pair's build order recorded as an **arc** —
+  `arc` and `arc_order` in both specs' frontmatter (`spec-lifecycle.md`). Splitting keeps paying off past the
   first cut — a three-spec arc reads better than one twelve-FR spec, and each piece earns its own
   reviewed plan, its own review gate and its own delivery doc. Cut along a seam the system already
   has — a layer, a surface, a switchover, the point where something inert goes live — never at
@@ -60,20 +62,21 @@ and these rotted the moment SPEC-036 was right-sized before its build. So:
   checkbox they re-read every session.
 - **Provenance goes at the bottom, not inside the requirement.** "An earlier draft said X and was
   measurably wrong" is genuinely valuable — SPEC-021's rule is that a superseded decision is
-  struck in place, never deleted — but it is *history*, and `INDEX.md` says the builder reads the whole
+  struck in place, never deleted — but it is *history*, and `docs/process/INDEX.md` says the builder reads the whole
   spec every session. Put it under a `## Revision history` heading, or in the delivery doc, and
   leave a one-line strike-through where it was.
 - **Don't cite another unbuilt spec's AC number.** SPEC-034, 036 and 037 cited each other's
   criteria 21 times, to the point where one AC had to disclaim its own circularity in writing.
-  Cross-spec coupling is a sequencing decision; make it in `INDEX.md`'s build order, where it can
+  Cross-spec coupling is a sequencing decision; make it in the arc's `arc_order`, where it can
   be read in one place and changed in one place.
 - **Reserve mutation testing for assertions that guard a fixed defect.** "Every assertion is
   mutation-tested" applied to a README-wording criterion multiplies the work without protecting
   anything. The rule that earns its keep is narrower: *a test that claims to catch a bug must be
   run against that bug.*
 
-`scripts/spec-lint.sh` enforces the structural side of this in CI: it **fails** a spec that is missing
-a required section, one that contains an "Open Questions" / "Checkpoint" heading, and a Draft or
+`scripts/spec-lint.sh` enforces the structural side of this in CI: it **fails** a spec whose
+frontmatter breaks the subset or its rules (`knowledge-layout.md` → *Frontmatter* lists them), one that
+is missing a required section, one that contains an "Open Questions" / "Checkpoint" heading, and a Draft or
 In Progress spec whose FR names no invariant in its Acceptance Criteria — or has no such block at
 all — or names one `docs/invariants.md` does not number; it **warns** on unfilled placeholders, a
 spec with FRs but no acceptance criteria anywhere in it, and a spec carrying more than 8 FRs. It

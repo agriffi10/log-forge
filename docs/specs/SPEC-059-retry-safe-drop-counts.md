@@ -1,9 +1,11 @@
-# Spec: Retry-Safe Drop Counts in Every Sink
-
-**ID:** SPEC-059
-**Status:** Completed
-**Last Updated:** 2026-10-23
-**Depends On:** SPEC-026, SPEC-036, SPEC-038, SPEC-058
+---
+type: Spec
+id: SPEC-059
+title: "Retry-Safe Drop Counts in Every Sink"
+description: "Applies the rule that a raising emit counts nothing to every remaining sink, so a retried batch never counts a drop twice."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-036, SPEC-038, SPEC-058]
+---
 
 ## Overview
 

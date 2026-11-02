@@ -1,9 +1,13 @@
-# Spec: Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration
-
-**ID:** SPEC-030  
-**Status:** Completed  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-013, SPEC-019
+---
+type: Spec
+id: SPEC-030
+title: "Lifecycle Signals — Post-Shutdown Logging and Late Reconfiguration"
+description: "Gives two documented user errors a signal: logging after shutdown() and a late configure(sink=...)."
+spec_status: Completed
+depends_on: [SPEC-013, SPEC-019]
+arc: audit-remediation
+arc_order: 7
+---
 
 ## Overview
 

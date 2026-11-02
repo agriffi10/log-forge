@@ -62,11 +62,11 @@ path documented `Raises: None` — and both diff reviews then found more, with n
   argued with. A finding silently dropped is a finding that was not reviewed; a finding rejected in
   one sentence is a finding that was. **Write a rejection down only when it carries a lesson worth
   keeping** — then it belongs in the spec, its delivery doc, or its area's register entry, as
-  reasoning, not as a paper trail. (The register is `docs/decisions/`, one file per area, added
-  2026-09-02; each area file opens with its fences and `architecture.md` holds the system-shape
-  reasoning behind them.)
+  reasoning, not as a paper trail. (The register is `docs/decisions/`, added 2026-09-02 and one
+  file per decision since `knowledge-layout.md`; `docs/decisions/index.yaml` lists the fences and
+  `architecture.md` holds the system-shape reasoning behind them.)
 - **The reviewer gets the artifact and its sources, never the author's reasoning.** For a spec: the
-  spec file, its build-order entry in `INDEX.md`, the `architecture.md` sections it claims to follow,
+  spec file, its arc in `docs/specs/index.yaml`, the `architecture.md` sections it claims to follow,
   and the specs it depends on. For a plan: the plan, the spec, and `component-inventory.md`. For a
   diff: the diff, the spec's acceptance criteria, and the `best-practices/` rules for the domains it
   touches (route via their INDEX). Handing over the authoring rationale tells the reviewer what to

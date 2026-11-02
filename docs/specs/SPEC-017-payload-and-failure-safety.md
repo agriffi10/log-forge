@@ -1,9 +1,13 @@
-# Spec: Payload and Failure Safety
-
-**ID:** SPEC-017
-**Status:** Completed
-**Last Updated:** 2026-07-27
-**Depends On:** SPEC-001 (`build_event`, `model`), SPEC-004 (background worker), SPEC-006 (`MultiSink`)
+---
+type: Spec
+id: SPEC-017
+title: "Payload and Failure Safety"
+description: "Closes three ways logging could break the caller or hide loss: unserializable fields, unbounded values, and an all-children-down MultiSink."
+spec_status: Completed
+depends_on: [SPEC-001, SPEC-004, SPEC-006]
+arc: robustness
+arc_order: 1
+---
 
 ## Overview
 

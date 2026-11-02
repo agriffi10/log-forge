@@ -1,7 +1,7 @@
 # The sink import paths frozen by the 1.x API freeze.
 #
 # Generated ONCE from the v1.0.0 README and committed as data. It is the BASELINE of the promise
-# in docs/decisions/public-api.md -> 'The frozen surface is the import path, not just the class',
+# in docs/decisions/public-api/ -> 'The frozen surface is the import path, not just the class',
 # so it is deliberately NOT re-derived from the current README: a gate that reads today README
 # passes any rename whose author updated both sides, which is the exact break this exists to stop.
 #

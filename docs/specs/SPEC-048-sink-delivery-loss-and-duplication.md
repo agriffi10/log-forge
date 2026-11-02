@@ -1,9 +1,13 @@
-# Spec: Sink Delivery — Loss and Duplication
-
-**ID:** SPEC-048
-**Status:** Completed
-**Last Updated:** 2026-09-02
-**Depends On:** SPEC-016, SPEC-018, SPEC-026, SPEC-027, SPEC-032, SPEC-036, SPEC-038
+---
+type: Spec
+id: SPEC-048
+title: "Sink Delivery — Loss and Duplication"
+description: "Fixes seven sink defects that put events on the wire wrongly, twice or not at all."
+spec_status: Completed
+depends_on: [SPEC-016, SPEC-018, SPEC-026, SPEC-027, SPEC-032, SPEC-036, SPEC-038]
+arc: sink-delivery-correctness
+arc_order: 1
+---
 
 ## Overview
 

@@ -1,9 +1,13 @@
-# Spec: Stdlib Logging Bridge Sink
-
-**ID:** SPEC-007
-**Status:** Completed
-**Last Updated:** 2026-07-10
-**Depends On:** SPEC-001
+---
+type: Spec
+id: SPEC-007
+title: "Stdlib Logging Bridge Sink"
+description: "LoggingSink, a bridge that hands built events to Python's standard logging framework and its handler ecosystem."
+spec_status: Completed
+depends_on: [SPEC-001]
+arc: sink-expansion
+arc_order: 2
+---
 
 ## Overview
 

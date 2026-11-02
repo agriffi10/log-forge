@@ -1,9 +1,13 @@
-# Spec: Lifecycle Races
-
-**ID:** SPEC-044  
-**Status:** Completed  
-**Last Updated:** 2026-08-31  
-**Depends On:** SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042
+---
+type: Spec
+id: SPEC-044
+title: "Lifecycle Races"
+description: "Closes five of the six reproduced races in the delivery lifecycle's shared state and documents the sixth."
+spec_status: Completed
+depends_on: [SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-035, SPEC-039, SPEC-040, SPEC-042]
+arc: lifecycle-races
+arc_order: 1
+---
 
 ## Overview
 

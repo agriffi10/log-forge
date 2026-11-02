@@ -1,8 +1,9 @@
 # Completion ritual (keep the always-loaded tier lean)
 
 When a spec is done, in the same pass:
-1. Set the spec file header `Status: Completed`.
-2. Update its one-line row in `docs/specs/INDEX.md` (**status only** — no prose).
+1. Set the spec's frontmatter `spec_status: Completed`.
+2. Regenerate the indexes — `sh scripts/gen-index.sh` — and commit them with it. They are never edited
+   by hand; `docs-lint.sh` fails one that is stale.
 3. Write a **short** delivery doc at `docs/spec-delivery/SPEC-XXX-<name>.md` from
    `docs/templates/spec-completion-template.md` — *what shipped + what changed*, aimed well under a
    page, **no code/config pasted** (the code + component-inventory are the source of truth for
@@ -10,25 +11,25 @@ When a spec is done, in the same pass:
    doc, not a target: it means nobody may lengthen that doc, never that a new one may run to it.
 4. If reusable modules/services/components were added, add a **one-line** row to
    `docs/component-inventory.md`.
-5. A *new architectural decision* gets its **full `###` entry in its area file under
-   `docs/decisions/` first, plus a row in that file's `## Contents`** — an entry the Contents does
-   not reach is findable only by reading the whole file, and `scripts/docs-lint.sh` fails for it
-   locally, before the push. Then, and only then, **one fence** under that file's `## Fences`: the
-   claim and its constraint in one line, its bold label equal to the entry's heading. Entry first,
-   fence second: the fence is **never the only home of a fact**, never a paragraph — past
-   `DIGEST_MAX_BYTES` it has stopped being a reminder and become the reasoning, which belongs behind
-   it — and **never a line in `CLAUDE.md`**. Only a new *area* touches `CLAUDE.md`: a row in its Key
-   Decisions table, mirrored — with its *Governs* column — in `docs/decisions/INDEX.md` in the same
-   order, a file copied from an existing area's, and — only when the area governs a tree — a
-   `.claude/rules/decisions-<slug>.md` carrying exactly the globs *Governs* names. An area whose
-   *Governs* is `none` has no rule, and docs-lint refuses one. A reversal that changes an entry's **heading** must move three
-   copies of it with the heading — its Contents row, its fence label, and the entry's own opening
-   bold label — or the row points at a dead anchor, the label still names the old decision, and
-   docs-lint fails. If the decision **supersedes an earlier one**, update the old entry in place and
-   add a superseded marker (short blockquote: what changed, which spec, where the full entry lives)
-   at every *other* doc site that still states the old claim — `architecture.md` sections, `INDEX.md`
-   build-order notes. The new entry alone is not enough; an agent reading only the old site must see
-   the reversal.
+5. A *new architectural decision* is **one new file** in its area, `docs/decisions/<area>/<decision>.md`:
+   its frontmatter `description` is the **fence** — the claim and its constraint in one line — and its
+   body is the **entry**, ending in a dated `## History` whose first entry is when it was settled. Fence
+   and entry are written together, in one file, so the fence is **never the only home of a fact**; it is
+   never a paragraph — past `DIGEST_MAX_BYTES` it has stopped being a reminder and become the reasoning,
+   which belongs in the body — and **never a line in `CLAUDE.md`**. Only a new *area* touches
+   `CLAUDE.md`: a new directory `docs/decisions/<slug>/` with its concept `<slug>.md` (`type: Decision
+   Area`, `title`, `governs`), a row in the Key Decisions table in slug order, and — only when it governs
+   a tree — its rule `.claude/rules/decisions-<slug>.md` carrying exactly those globs and the area
+   template's body. An area with `governs: []` has no rule, and docs-lint refuses one. Then
+   `sh scripts/gen-index.sh`. Deprecating a decision is a reversal: set `status: deprecated` and add a
+   dated History entry saying so. The rules and both templates in full: `knowledge-layout.md` → *The
+   decision register*. If the decision **reverses or refines an earlier one**, rewrite that decision's
+   file in place — title, fence, entry — and add a dated History entry at the top saying what changed
+   and why; mark it `status: deprecated` only when it is retired with no replacement, and never delete
+   it. Then add a superseded marker (short blockquote: what changed, which spec, where the decision
+   lives) at every *other* doc site that still states the old claim — `architecture.md` sections,
+   `docs/specs/ARCS.md` narratives. The rewritten file alone is not enough; an agent reading only the
+   old site must see the reversal.
 
 6. **If the spec changed anything a caller can see, top up the pending release notes** —
    `docs/release-notes/<next tag>.md`, when a tag is being prepared and that file exists. A note is
@@ -46,7 +47,7 @@ When a spec is done, in the same pass:
 7. **Prune `CLAUDE.md`'s `## Specs`** of whatever the closed spec made stale. Its **Current work**
    line carries the spec in flight or `none in flight`, and the section carries nothing recorded
    elsewhere — the rule that section states for itself, made a step so it is done at the moment it
-   applies: a closed spec's row is in `docs/specs/INDEX.md` and its delivery doc says what shipped.
+   applies: a closed spec's status is in its frontmatter and its delivery doc says what shipped.
 
 **Anti-regrowth & doc hygiene** (each rule below was earned by a real doc defect in a project run
 this way).
@@ -64,9 +65,9 @@ this way).
   question a reader arrives with is "what has been settled about X", never "what did SPEC-033
   decide". A register is the only home of the rejected alternatives and the fences, so a shape that
   reads as disposable gets treated as disposable. **Paid 2026-09-02, and routed since:**
-  `docs/decisions/` holds the entries, one file per area, each opening with its own fences; the Key
-  Decisions table in `CLAUDE.md` names the areas and nothing more. A completion **extends its area's
-  file** rather than appending to the always-loaded tier — appending is what took `CLAUDE.md` from
+  `docs/decisions/` holds one file per decision in one directory per area, and each area's fences lead
+  its block of the generated index; the Key Decisions table in `CLAUDE.md` names the areas and nothing
+  more. A completion **adds a file to its area** rather than appending to the always-loaded tier — appending is what took `CLAUDE.md` from
   7,350 bytes at `ad898fc8` to 89,340 at `e60b60d`, with this rule stated here throughout. Both ends
   are anchored so a reader can re-measure them; neither the entry count nor the area count is stated
   here, because both move every time a spec closes.
@@ -76,15 +77,15 @@ this way).
   someone else's unrelated work and becomes a thing to be waived. It holds the always-loaded set — `CLAUDE.md` and
   the two files the router's *Loaded every session* table names — to a byte budget, and holds Key
   Decisions to an intro and one area table, refusing every other construct in that section; requires
-  `docs/decisions/INDEX.md` to name the same areas in the same order, every area to have a file and
-  every file a row; holds each area file to fences-first, each **fence** — a bullet with its
-  continuations — to a length, a `###` entry for every fence and a fence for every entry, every entry
-  listed in its Contents under a name that matches the anchor beside it, and an entry's opening bold
-  label — where it has one, below any superseded marker — equal to its own heading; holds
+  that table's rows to name the area directories by their titles, in slug order, every row a directory
+  and every directory a row; holds every decision to its frontmatter, its **fence** to a length, an
+  entry behind every fence and a dated History, newest first (`knowledge-layout.md` → *The decision
+  register* lists the rest); holds
   `docs/process/` to its router (imports match the loaded table, every part a row and every row a
   file, no nested imports), and `.claude/rules/` and `.claude/agents/` to their shapes — the two rule
   templates, the allowed glob forms, the allowed models, the routing table; requires every Completed
-  spec to have a delivery doc; checks that the pointers out of the always-loaded files resolve; and
+  spec — read from its frontmatter, failing a spec whose `spec_status` cannot be read rather than
+  skipping it — to have a delivery doc; checks that the pointers out of the always-loaded files resolve; and
   refuses one
   shape of unanchored evidence — "measured" or "as of" followed by an ISO date, immediately or
   across one adverb of time from a closed set, with no commit SHA in the same bullet, paragraph or
@@ -95,7 +96,10 @@ this way).
   prompted the check were `pyproject.toml` comments. **The population, the exclusions and the
   reasons for each live beside the check in the script and nowhere else**, so that the list a
   reader trusts is the one the code uses; a population restated here is a population that will
-  disagree with itself.
+  disagree with itself. It regenerates every index and fails one that is missing, stale or refused by
+  the generator, and holds each rulebook to its sources: frontmatter, every footnote resolving to a
+  source, every source cited, and a `stale_after` date that has not passed (`knowledge-layout.md` →
+  *Rulebooks*).
   **`scripts/docs-lint-test.sh` is the corpus that proves those checks still fire** — running the
   linter against the repo's own documents proves the documents pass and nothing about whether any
   check works, which is how four rounds of regressions reached main. A change to the linter runs
@@ -129,15 +133,15 @@ this way).
   write and neither is checked, so they drift silently and the reader follows the wrong one.
 - **Status never appears in the heading of a doc whose status can change** — an arc, an
   `architecture.md` section, a register entry. It rots the day the next spec lands, and a reader who
-  greps the heading gets an answer that was true once. Status lives in `INDEX.md` and the spec
-  header — the two places the completion ritual keeps in step **by hand**, since `spec-lint.sh` does
-  not compare them. (A delivery doc's `# Completed Spec — …` title is not this: it names a finished
+  greps the heading gets an answer that was true once. A spec's status lives in one place, its
+  frontmatter `spec_status`; `docs/specs/index.yaml` is generated from it and `docs-lint.sh` fails the
+  index when it is stale, so there is no second copy to keep in step by hand. (A delivery doc's `# Completed Spec — …` title is not this: it names a finished
   record whose status cannot change.)
 - **A heading in a doc read by SUBJECT names the subject, not the spec that produced it** — that is
   `architecture.md` and the rulebooks, where a reader arrives asking "how does the worker shut down",
   never "what did SPEC-030 decide". The scope is deliberate and stops there: a decisions entry IS a
   record of what one spec settled, and its number is part of its identity when you arrive from a
-  delivery doc or a superseded marker, so those headings keep theirs.
+  delivery doc or a superseded marker, so those titles keep theirs.
 - **Standing rules never cite volatile numbers** (line counts, row counts, section ranges) — state the
   principle. The numbers rot, and a rule resting on false evidence teaches readers to distrust it.
   **Dating the measurement does not save it**, which is the tempting half-fix: a dated number still
@@ -161,7 +165,7 @@ this way).
   other docs must match a greppable heading — "read the entry for your area" must be a jump, not a
   full-file read.
 - **Live findings and obligations never live in historical or cancelled narrative** — rehome them to
-  the right `docs/decisions/` area file (entry first, then its fence) or the relevant
+  a decision in the right `docs/decisions/` area or the relevant
   `architecture.md` section, and leave a pointer behind.
   `docs/audits/` is history: a live obligation parked in a handoff doc is one nobody will read.
 

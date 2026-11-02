@@ -1,9 +1,13 @@
-# Spec: Integer Value Bounds
-
-**ID:** SPEC-020  
-**Status:** Completed  
-**Last Updated:** 2026-07-29  
-**Depends On:** SPEC-017
+---
+type: Spec
+id: SPEC-020
+title: "Integer Value Bounds"
+description: "Bounds Python's arbitrary-precision int at assembly, the one type left that JSON serialization could refuse."
+spec_status: Completed
+depends_on: [SPEC-017]
+arc: robustness
+arc_order: 4
+---
 
 ## Overview
 

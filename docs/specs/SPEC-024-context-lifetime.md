@@ -1,9 +1,13 @@
-# Spec: Context Lifetime — Scoping Baggage and Adopted Trace Context
-
-**ID:** SPEC-024  
-**Status:** Completed  
-**Last Updated:** 2026-08-05  
-**Depends On:** SPEC-014, SPEC-015
+---
+type: Spec
+id: SPEC-024
+title: "Context Lifetime — Scoping Baggage and Adopted Trace Context"
+description: "Scopes baggage and adopted trace context to the request that set them, so neither leaks onto the next request's events."
+spec_status: Completed
+depends_on: [SPEC-014, SPEC-015]
+arc: audit-remediation
+arc_order: 1
+---
 
 ## Overview
 

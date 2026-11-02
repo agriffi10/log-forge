@@ -1,9 +1,13 @@
-# Spec: Orphan-Path Sink Handoff
-
-**ID:** SPEC-033  
-**Status:** Completed  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031
+---
+type: Spec
+id: SPEC-033
+title: "Orphan-Path Sink Handoff"
+description: "Extends configure(sink=...)'s drain-and-close promise to processes that log only through the orphan path and build no worker."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-027, SPEC-028, SPEC-030, SPEC-031]
+arc: orphan-path-sink-handoff
+arc_order: 1
+---
 
 ## Overview
 

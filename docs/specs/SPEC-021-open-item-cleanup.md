@@ -1,9 +1,13 @@
-# Spec: Open-Item Cleanup
-
-**ID:** SPEC-021  
-**Status:** Completed  
-**Last Updated:** 2026-07-30  
-**Depends On:** SPEC-013, SPEC-017, SPEC-019, SPEC-020
+---
+type: Spec
+id: SPEC-021
+title: "Open-Item Cleanup"
+description: "Triages the open items four robustness specs left behind, so each ends fixed, settled or recorded as a constraint."
+spec_status: Completed
+depends_on: [SPEC-013, SPEC-017, SPEC-019, SPEC-020]
+arc: robustness
+arc_order: 5
+---
 
 ## Overview
 

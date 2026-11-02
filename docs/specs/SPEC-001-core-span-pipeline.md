@@ -1,9 +1,13 @@
-# Spec: Core Span Pipeline
-
-**ID:** SPEC-001
-**Status:** Completed
-**Last Updated:** 2026-07-09
-**Depends On:** None
+---
+type: Spec
+id: SPEC-001
+title: "Core Span Pipeline"
+description: "The minimum end-to-end span pipeline: configuration, W3C-compatible IDs, the JSON event schema, contextvars propagation, a stdout sink and the synchronous @trace decorator."
+spec_status: Completed
+depends_on: []
+arc: core-logging-pipeline
+arc_order: 1
+---
 
 ## Overview
 

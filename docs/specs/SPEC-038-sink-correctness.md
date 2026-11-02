@@ -1,9 +1,13 @@
-# Spec: Sink Correctness
-
-**ID:** SPEC-038  
-**Status:** Completed  
-**Last Updated:** 2026-08-10  
-**Depends On:** SPEC-018, SPEC-026, SPEC-027, SPEC-032
+---
+type: Spec
+id: SPEC-038
+title: "Sink Correctness"
+description: "Ten one-file fixes where a sink did not match what its destination actually requires."
+spec_status: Completed
+depends_on: [SPEC-018, SPEC-026, SPEC-027, SPEC-032]
+arc: audit-2026-08-07
+arc_order: 4
+---
 
 ## Overview
 

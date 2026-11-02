@@ -29,5 +29,17 @@ list project-specific; seed it the first time a trap bites and never again.
   of container uptime and failed on the integration job's first CI run. A readiness probe asks the
   question a client asks — a real request, or Kafka's metadata call, never a bare connect. Bit in
   SPEC-041.
+- **A branch cut before the frontmatter layout conflicts somewhere that does not say so.** Git reads
+  the old `docs/specs/INDEX.md` as renamed to `docs/specs/ARCS.md`, so an edit to the old index conflicts
+  in ARCS.md and re-inserts the status table; every gate stays green if both sides are kept. Take
+  HEAD's ARCS.md, and move the edit: a status to the spec's `spec_status`, an order to `arc`/`arc_order`,
+  narrative to the arc's heading. A spec with the old header gets frontmatter in place of it
+  (`knowledge-layout.md` → *A spec's keys*). A modify/delete on `docs/decisions/<area>.md` is **not**
+  resolved by `git rm` alone, which drops the new entry with the gates green: write the entry as its own
+  file in `docs/decisions/<area>/`, or rewrite the decision it changes and date it in its History. Then
+  `sh scripts/gen-index.sh`. Neither gate reads for conflict markers, so grep for them. Frozen records —
+  Completed specs, delivery docs, audits, release notes — keep the paths they were written with:
+  `docs/decisions/<area>.md` now reads `docs/decisions/<area>/`, and `docs/specs/INDEX.md` reads
+  `docs/specs/index.yaml` or `docs/specs/ARCS.md`.
 - _(add your own as they bite — one line each, with the fix.)_
 

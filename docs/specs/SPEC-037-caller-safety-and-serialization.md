@@ -1,9 +1,13 @@
-# Spec: Caller Safety and Serialization
-
-**ID:** SPEC-037  
-**Status:** Completed  
-**Last Updated:** 2026-08-09  
-**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-034 (FR-008 only)
+---
+type: Spec
+id: SPEC-037
+title: "Caller Safety and Serialization"
+description: "Makes the never-fail-the-caller and safe-by-construction promises hold on the paths their own specs did not check."
+spec_status: Completed
+depends_on: [SPEC-017, SPEC-020, SPEC-025, SPEC-034]
+arc: audit-2026-08-07
+arc_order: 3
+---
 
 ~~**Depends On:** … SPEC-036 — FR-001 AC-5 routes an absorbed **orphan** failure into the
 `orphan_lost` counter SPEC-036 FR-003 adds, so it cannot be built before it~~ — struck

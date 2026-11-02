@@ -1,9 +1,13 @@
-# Spec: HTTP and Log-Platform Sinks
-
-**ID:** SPEC-009
-**Status:** Completed
-**Last Updated:** 2026-07-11
-**Depends On:** SPEC-001, SPEC-005
+---
+type: Spec
+id: SPEC-009
+title: "HTTP and Log-Platform Sinks"
+description: "A stdlib HTTPSink core and platform sinks for Elasticsearch, Loki, Logstash, Syslog, Datadog and similar destinations."
+spec_status: Completed
+depends_on: [SPEC-001, SPEC-005]
+arc: sink-expansion
+arc_order: 4
+---
 
 ## Overview
 

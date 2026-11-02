@@ -1,6 +1,31 @@
+---
+type: Rulebook
+title: Python best practices
+description: "Python language style for coding agents in log-foundry: naming, interfaces, types, exceptions and docstrings, layered over ruff and mypy."
+sources:
+  - id: pep-8
+    resource: https://peps.python.org/pep-0008/
+    title: PEP 8 – Style Guide for Python Code
+  - id: pep-257
+    resource: https://peps.python.org/pep-0257/
+    title: PEP 257 – Docstring Conventions
+  - id: pep-484
+    resource: https://peps.python.org/pep-0484/
+    title: PEP 484 – Type Hints
+  - id: pep-526
+    resource: https://peps.python.org/pep-0526/
+    title: PEP 526 – Syntax for Variable Annotations
+  - id: pep-604
+    resource: https://peps.python.org/pep-0604/
+    title: PEP 604 – Allow writing union types as X | Y
+  - id: google-style
+    resource: https://google.github.io/styleguide/pyguide.html
+    title: Google Python Style Guide
+stale_after: 2027-11-02T00:00:00Z
+---
 # Python Best Practices — Agent Reference
 
-> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-foundry** (runtime **Python ≥ 3.12**, the floor in `pyproject.toml`; CI gates 3.12 **and** 3.13, so a 3.13-only call is a bug here; a `src`-layout library, distribution `log-foundry` / import `log_foundry`). Distilled from **PEP 8** (+ PEP 257 docstrings, PEP 484/526 typing) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**, adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
+> Token-efficient rulebook for LLM coding agents writing/refactoring Python in **log-foundry** (runtime **Python ≥ 3.12**, the floor in `pyproject.toml`; CI gates 3.12 **and** 3.13, so a 3.13-only call is a bug here; a `src`-layout library, distribution `log-foundry` / import `log_foundry`). Distilled from **PEP 8**[^pep-8] (+ PEP 257 docstrings[^pep-257], PEP 484/526 typing[^pep-484][^pep-526]) and the **[Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)**[^google-style], adapted to this repo. Each section is self-contained; load only what the task needs. Rules are imperative; ✅ = do, 🔴 = don't.
 >
 > **Run the formatter/linter — don't hand-format.** Mechanics (§2, §3) are owned by `ruff`; this doc is for the choices a tool can't make (naming, interfaces, idioms) and for review. Style is *guidance*: the repo's configured tools win (line length **100**, quote style), and "a foolish consistency is the hobgoblin of little minds" — when a rule hurts readability in a specific case, deviate and flag it (§1).
 >
@@ -104,8 +129,8 @@ Exceptions are allowed but disciplined; never swallow, never use `assert` for re
 ## §8 Types & annotations
 Annotate public surfaces; make `None` explicit; prefer abstract types in signatures.
 
-- ✅ Annotate **every def** (the repo runs `mypy --strict` — no untyped defs) and module/class-level variables where it adds clarity. Don't annotate `self`/`cls` or `__init__`'s `None` return beyond what strict requires. Ship the `py.typed` marker so consumers get the types.
-- ✅ **Explicit `X | None`** for nullable args (3.10+ union syntax preferred over `Optional[X]`); a nullable arg *must* be declared nullable — no implicit `a: str = None`.
+- ✅ Annotate **every def** (the repo runs `mypy --strict` — no untyped defs) and module/class-level variables[^pep-526] where it adds clarity. Don't annotate `self`/`cls`[^google-style]. `__init__`'s return is the one place the two sources differ: Google does not require `-> None`[^google-style], PEP 484 asks for it so an argument-less `__init__` is still type-checked[^pep-484] — write it, as every `__init__` in `src/` does. Ship the `py.typed` marker so consumers get the types.
+- ✅ **Explicit `X | None`** for nullable args (3.10+ union syntax[^pep-604] preferred over `Optional[X]`); a nullable arg *must* be declared nullable — no implicit `a: str = None`[^pep-484][^google-style].
 - ✅ In signatures prefer **abstract containers** (`collections.abc.Sequence`, `Mapping`) over concrete `list`/`dict`; use built-in generics (`list[dict[str, object]]`, `tuple[str, ...]`) over `typing.List`/`Tuple`. Always parameterize generics (`Mapping[int, str]`, not bare `Mapping` → implicit `Any`).
 - 🔴 **Never use a mutable default argument** (`def f(a, b=[])`, `={}`) — created once and shared across every call. ✅ Default to `None` and build inside, or use `dataclasses.field(default_factory=dict)` for dataclass fields (as `Config.defaults` / `Span.events` do). (Empty tuple `()` is fine — immutable, which is why the span-stack `ContextVar` defaults to `()`.)
 - ✅ **Spacing:** `def f(x: int = 0) -> str:` — space after `:`, and spaces around `=` *because* the parameter is annotated (§3).
@@ -161,8 +186,8 @@ Close what you open; avoid mutable global state; use the right concurrency primi
 ## §14 Docstrings & comments
 Docstrings describe the interface and are the **primary source of context**. In `src/` they are the *only* prose — `CLAUDE.md` forbids comments there outright, and the bullets below carry that scope. Elsewhere (`tests/`, `scripts/`) comments explain the non-obvious and should be rare.
 
-- ✅ Triple-double-quoted `"""` docstrings (PEP 257) for every module, function, class, and method. 🔴 **`src/` admits no exception for a private or trivial one** — CLAUDE.md's rule is absolute there, and it is also the practice: every underscore-private function in `src/` carries one. The only defs without a docstring are the two `@overload` stubs at `decorator.py:608,610`, where the implementation below carries it. First line a summary ending in a period, ≤ the docstring line limit; multi-line = summary, blank line, details, closing `"""` on its own line. 🔴 No docstring on a `lambda`. Enough info to call it without reading the body.
-- ✅ Use the section format when it adds info: **`Args:`** (each param + description; note types if not annotated), **`Returns:`** (or **`Yields:`** for generators), **`Raises:`** (exceptions relevant to the interface). 🔴 **In `src/`, `CLAUDE.md` overrides the "omit it" half of PEP 257 here**: on a function or method all three sections are always present, filled with `None.` where they do not apply, so a missing section is a defect rather than a judgement call. A **class** docstring is governed by the bullet below instead — it takes `Attributes:`, not the callable trio.
+- ✅ Triple-double-quoted `"""` docstrings (PEP 257[^pep-257]) for every module, function, class, and method. 🔴 **`src/` admits no exception for a private or trivial one** — CLAUDE.md's rule is absolute there, and it is also the practice: every underscore-private function in `src/` carries one. The only defs without a docstring are the two `@overload` stubs at `decorator.py:608,610`, where the implementation below carries it. First line a summary ending in a period, ≤ the docstring line limit; multi-line = summary, blank line, details, closing `"""` on its own line. 🔴 No docstring on a `lambda`. Enough info to call it without reading the body.
+- ✅ Use the section format when it adds info: **`Args:`** (each param + description; note types if not annotated), **`Returns:`** (or **`Yields:`** for generators), **`Raises:`** (exceptions relevant to the interface). 🔴 **In `src/`, `CLAUDE.md` overrides the "omit it" half of the Google guide here**: on a function or method all three sections are always present, filled with `None.` where they do not apply, so a missing section is a defect rather than a judgement call. A **class** docstring is governed by the bullet below instead — it takes `Attributes:`, not the callable trio.
 - ✅ Class docstring below the `class` line summarizing what an **instance represents** (an `Exception` subclass says what it *represents*, not when it's raised); document public attributes in an `Attributes:` section.
 - ✅ **When code needs explaining, prefer expanding the docstring over adding comments.** Docstrings are discoverable (`help()`, hover, generated docs); scattered comments are not.
 - 🔴 **`src/` carries no comments at all — see `CLAUDE.md` → Code Conventions, which governs.** Docstrings are the only prose there, and reasoning that would have been a comment goes *in* the docstring (the bullet above, made absolute). `# noqa`, `# type:` and `# pragma:` are directives, not comments, and stay, as is any `<tool>:` prefix — `scripts/docstring-lint.py` matches directives by that shape rather than by a list, because a list was already wrong once by omission. Outside `src/` — `tests/`, `scripts/` — the ordinary rule applies: comments explain *why*, not *what*, in complete sentences kept in sync with the code; no paragraph-length comment, none that narrates the next line, none that contradicts it; block comments at the code's indent, inline comments ≥2 spaces from code.
@@ -175,3 +200,14 @@ Modules stay importable; avoid Python's fancy machinery.
 - ✅ This is a **library** — imported, never run as a script — so no module does real work at import time and no `__main__` guard is needed. 🔴 Don't do real work at module top level (the lazy `StdoutSink` default and lazy worker creation exist precisely to defer side effects out of import).
 - 🔴 **Avoid power features** — custom metaclasses, bytecode access, dynamic inheritance, reflection tricks (`getattr` hacks), `__del__` cleanup, import hacks. Stdlib/framework internals that use them (`dataclasses`, `enum`, `contextvars`, `typing.Protocol`) are fine to *use*.
 - ✅ `from __future__ import annotations` is encouraged to adopt modern semantics per-file and to make forward refs / `TYPE_CHECKING`-only imports free (as `config.py` already does).
+
+---
+
+## Sources
+
+[^pep-8]: PEP 8 – Style Guide for Python Code
+[^pep-257]: PEP 257 – Docstring Conventions
+[^pep-484]: PEP 484 – Type Hints
+[^pep-526]: PEP 526 – Syntax for Variable Annotations
+[^pep-604]: PEP 604 – Allow writing union types as X | Y
+[^google-style]: Google Python Style Guide

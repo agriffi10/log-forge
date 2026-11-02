@@ -1,9 +1,13 @@
-# Spec: Composition and Adapter Sinks
-
-**ID:** SPEC-006
-**Status:** Completed
-**Last Updated:** 2026-07-10
-**Depends On:** SPEC-001
+---
+type: Spec
+id: SPEC-006
+title: "Composition and Adapter Sinks"
+description: "Four zero-dependency sinks that combine other sinks or adapt user code: CallbackSink, MultiSink, FilteringSink and a transform adapter."
+spec_status: Completed
+depends_on: [SPEC-001]
+arc: sink-expansion
+arc_order: 1
+---
 
 ## Overview
 

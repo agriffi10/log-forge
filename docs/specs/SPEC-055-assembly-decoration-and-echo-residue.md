@@ -1,9 +1,13 @@
-# Spec: Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe
-
-**ID:** SPEC-055
-**Status:** Completed
-**Last Updated:** 2026-09-05
-**Depends On:** SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037
+---
+type: Spec
+id: SPEC-055
+title: "Assembly, Decoration and Echo Residue — a Surrogate, a Nameless Callable, a Hostile Key and a Broken Pipe"
+description: "Fixes five runtime defects at the edges of build_event and @trace that health() cannot see."
+spec_status: Completed
+depends_on: [SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037]
+arc: assembly-decoration-and-echo-residue
+arc_order: 1
+---
 
 ## Overview
 

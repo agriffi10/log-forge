@@ -1,9 +1,13 @@
-# Spec: Sink Construction Validation and Driver Bounds
-
-**ID:** SPEC-049
-**Status:** Completed
-**Last Updated:** 2026-09-05
-**Depends On:** SPEC-021, SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048
+---
+type: Spec
+id: SPEC-049
+title: "Sink Construction Validation and Driver Bounds"
+description: "Makes sink constructors refuse unusable arguments up front rather than fail later on a background thread."
+spec_status: Completed
+depends_on: [SPEC-021, SPEC-026, SPEC-027, SPEC-041, SPEC-043, SPEC-047, SPEC-048]
+arc: sink-delivery-correctness
+arc_order: 2
+---
 
 ## Overview
 

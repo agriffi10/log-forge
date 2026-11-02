@@ -1,9 +1,11 @@
-# Spec: Baggage on Boundary Events
-
-**ID:** SPEC-015
-**Status:** Completed
-**Last Updated:** 2026-07-22
-**Depends On:** SPEC-002 (`set_baggage`), SPEC-014 (`_reparent_current_span`, the backfill precedent)
+---
+type: Spec
+id: SPEC-015
+title: "Baggage on Boundary Events"
+description: "Carries baggage on span.start and span.end, the two boundary events that were built without it."
+spec_status: Completed
+depends_on: [SPEC-002, SPEC-014]
+---
 
 ## Overview
 

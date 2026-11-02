@@ -1,9 +1,13 @@
-# Spec: Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling
-
-**ID:** SPEC-057  
-**Status:** Completed  
-**Last Updated:** 2026-10-19  
-**Depends On:** SPEC-017, SPEC-020, SPEC-055
+---
+type: Spec
+id: SPEC-057
+title: "Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling"
+description: "Adds node and byte budgets to each assembly pass and bounds its reads by the ceiling, closing a shared-sublist hang on the caller's thread."
+spec_status: Completed
+depends_on: [SPEC-017, SPEC-020, SPEC-055]
+arc: coercer-and-invariant-8
+arc_order: 2
+---
 
 ## Overview
 

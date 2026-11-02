@@ -1,9 +1,13 @@
-# Spec: Security Scanning in CI
-
-**ID:** SPEC-022
-**Status:** Completed
-**Last Updated:** 2026-07-31
-**Depends On:** SPEC-012
+---
+type: Spec
+id: SPEC-022
+title: "Security Scanning in CI"
+description: "Adds security scanning to CI and pins the release workflow's actions, protecting the path that publishes to PyPI."
+spec_status: Completed
+depends_on: [SPEC-012]
+arc: supply-chain-and-code-security
+arc_order: 1
+---
 
 ## Overview
 

@@ -18,10 +18,14 @@ text
 
 text
 @@@ file docs/specs/SPEC-001-x.md
-# Spec: X
-
-**ID:** SPEC-001
-**Status:** Completed
+---
+type: Spec
+id: SPEC-001
+title: X
+description: A spec.
+spec_status: Completed
+depends_on: []
+---
 
 ## Overview
 
@@ -50,10 +54,14 @@ What it does.
 prose
 
 @@@ file docs/specs/SPEC-002-y.md
-# Spec: X
-
-**ID:** SPEC-001
-**Status:** Completed
+---
+type: Spec
+id: SPEC-002
+title: X
+description: A spec.
+spec_status: Completed
+depends_on: []
+---
 
 ## Overview
 
@@ -68,10 +76,14 @@ prose
 prose
 
 @@@ file docs/specs/SPEC-003-z.md
-# Spec: X
-
-**ID:** SPEC-001
-**Status:** Completed
+---
+type: Spec
+id: SPEC-003
+title: X
+description: A spec.
+spec_status: Completed
+depends_on: []
+---
 
 ## Overview
 

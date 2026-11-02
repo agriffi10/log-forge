@@ -1,13 +1,17 @@
-# Spec: Shutdown Lifecycle
+---
+type: Spec
+id: SPEC-035
+title: "Shutdown Lifecycle"
+description: "Repairs four defects in the process-lifecycle plumbing, two of them regressions from SPEC-033."
+spec_status: Completed
+depends_on: [SPEC-027, SPEC-028, SPEC-030, SPEC-033]
+arc: audit-2026-08-07
+arc_order: 1
+---
 
 ~~Shutdown **and Fork** Lifecycle~~ — the fork half is SPEC-039. The **filename keeps `-and-fork-`**
 deliberately: it is what every link, commit message and delivery doc in the arc already points at,
 and a rename to tidy a title would break them to save nothing.
-
-**ID:** SPEC-035  
-**Status:** Completed  
-**Last Updated:** 2026-08-09  
-**Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033
 
 ## Overview
 

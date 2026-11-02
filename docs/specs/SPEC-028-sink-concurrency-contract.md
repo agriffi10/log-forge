@@ -1,9 +1,13 @@
-# Spec: The Sink Concurrency Contract
-
-**ID:** SPEC-028  
-**Status:** Completed  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-002, SPEC-004, SPEC-008
+---
+type: Spec
+id: SPEC-028
+title: "The Sink Concurrency Contract"
+description: "States the sink concurrency contract the orphan path relies on, and locks the sinks that hold mutable transport state."
+spec_status: Completed
+depends_on: [SPEC-002, SPEC-004, SPEC-008]
+arc: audit-remediation
+arc_order: 6
+---
 
 ## Overview
 

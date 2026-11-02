@@ -1,9 +1,13 @@
-# Spec: The Library Must Not Fail the Caller
-
-**ID:** SPEC-025  
-**Status:** Completed  
-**Last Updated:** 2026-08-05  
-**Depends On:** SPEC-004, SPEC-017
+---
+type: Spec
+id: SPEC-025
+title: "The Library Must Not Fail the Caller"
+description: "Closes the remaining places where the library invented an exception the caller received, and ships _diag.py."
+spec_status: Completed
+depends_on: [SPEC-004, SPEC-017]
+arc: audit-remediation
+arc_order: 2
+---
 
 ## Overview
 

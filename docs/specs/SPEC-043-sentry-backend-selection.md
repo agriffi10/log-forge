@@ -1,9 +1,11 @@
-# Spec: Sentry Backend Selection
-
-**ID:** SPEC-043  
-**Status:** Completed  
-**Last Updated:** 2026-08-31  
-**Depends On:** SPEC-026, SPEC-032, SPEC-041
+---
+type: Spec
+id: SPEC-043
+title: "Sentry Backend Selection"
+description: "Makes SentrySink's backend an explicit choice rather than whatever happens to import."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-032, SPEC-041]
+---
 
 ## Overview
 

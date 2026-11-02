@@ -1,9 +1,13 @@
-# Spec: SQSSink and Optional `sqs` Extra
-
-**ID:** SPEC-005
-**Status:** Completed
-**Last Updated:** 2026-07-09
-**Depends On:** SPEC-004
+---
+type: Spec
+id: SPEC-005
+title: "SQSSink and Optional `sqs` Extra"
+description: "SQSSink, the headline production sink, shipping batches to SQS as a durable buffer behind an optional extra."
+spec_status: Completed
+depends_on: [SPEC-004]
+arc: core-logging-pipeline
+arc_order: 5
+---
 
 > **Superseded naming (this spec is a historical record).** The `sqs` extra described below was
 > renamed to **`aws`** by SPEC-010, once `SNSSink`, `KinesisSink`, and `FirehoseSink` joined it;

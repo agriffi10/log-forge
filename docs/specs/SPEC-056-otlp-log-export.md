@@ -1,9 +1,13 @@
-# Spec: OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink
-
-**ID:** SPEC-056
-**Status:** Draft
-**Last Updated:** 2026-11-02
-**Depends On:** SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-057, SPEC-058, SPEC-059
+---
+type: Spec
+id: SPEC-056
+title: "OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink"
+description: "A sink that speaks OTLP/HTTP JSON directly, over a private OpenTelemetry mapping, so OTLP backends receive log-foundry events under the names they already index."
+spec_status: Draft
+depends_on: [SPEC-009, SPEC-017, SPEC-026, SPEC-027, SPEC-028, SPEC-029, SPEC-032, SPEC-036, SPEC-038, SPEC-041, SPEC-048, SPEC-049, SPEC-051, SPEC-055, SPEC-057, SPEC-058, SPEC-059]
+arc: opentelemetry-shaped-output
+arc_order: 1
+---
 
 ## Overview
 
@@ -15,12 +19,12 @@ OpenTelemetry names those backends already index — severity, trace and span id
 `exception.type` — and with the library's own fields alongside under a `log_foundry.` prefix.
 
 It is the first slice of a direction Andrew decided on 2026-10-05 (the entry in
-`docs/decisions/public-api.md`): what goes outward standardizes on the OpenTelemetry data model and
+`docs/decisions/public-api/`): what goes outward standardizes on the OpenTelemetry data model and
 semantic-convention names, while the transports stay plural — OTLP is one more sink, not the only
 way out, because Astra ingests through an OpenSearch-compatible `_bulk` API and has no OTLP
 ingestion at all. OTLP is produced natively; no OpenTelemetry SDK or API enters the runtime. The
 native JSON field names do not change. The mapping this spec builds is **private** until a second
-consumer has proven its shape, and the arc recorded in `docs/specs/INDEX.md` lists what is built
+consumer has proven its shape, and the arc recorded in `docs/specs/ARCS.md` lists what is built
 on it after this.
 
 ## Scope
@@ -37,7 +41,7 @@ on it after this.
 - Partial success: a `2xx` that rejects some or all of the records, or that this sink cannot read
   (FR-004).
 - Registration of the new public path — README, frozen-path baseline, typed-consumer probe, every
-  roster the suite lists or derives for the HTTP family, and the register's `Governs` for the
+  roster the suite lists or derives for the HTTP family, and the Public API area's `governs` for the
   private module (FR-005).
 - One dev-only dependency, `opentelemetry-proto`, with its note in `CLAUDE.md`'s Tech Stack Test row,
   a regenerated `poetry.lock`, and the `mypy` accommodation that dependency forces (FR-002).
@@ -53,7 +57,7 @@ on it after this.
   arc, last because it carries the most design risk; nothing here reads a span's lifetime.
 - **Metrics.** In-library metrics stay out; they are derived downstream.
 - **The ClickHouse `otel_logs` layout and the Astra `_bulk` profile.** Planned items of the arc,
-  recorded in `INDEX.md` without numbers; this spec only keeps the mapping reusable by the first.
+  recorded in `docs/specs/ARCS.md` without numbers; this spec only keeps the mapping reusable by the first.
 - **A public mapping API.** `_otel` is private: no name in it is in any `__all__`, documented as an
   API, or promised to a caller. Its *output* is another matter — the attribute names the sink sends
   are documented in the README (FR-005) and are what a consumer's queries rest on.
@@ -559,10 +563,10 @@ headroom left — keeping `azure/` and naming `google/`, the `unused-ignore` cod
 - [ ] `CLAUDE.md`'s "After installing extras locally" paragraph is rewritten in the same change and
       is no longer, in bytes, than the paragraph it replaces — a rewrite of 472 bytes against the
       476 it replaces was measured to fit, and the paragraph is unchanged at `1130461` — and the
-      always-loaded set has room for all three of the build's `CLAUDE.md` edits together: `1130461`
-      alone is 37,489 of 38,000 bytes, and this branch's own Out of Scope edit to `CLAUDE.md` adds
-      127, so the branch is 37,616 and the Tech Stack Test-row note and the `_otel` Layout mention
-      of Phase 5 must add under 384 bytes between them. `sh scripts/docs-lint.sh` exits 0 after the paragraph and the note, and
+      always-loaded set has room for all three of the build's `CLAUDE.md` edits together, as
+      `sh scripts/docs-lint.sh` reports it: the Tech Stack Test-row note and the `_otel` Layout mention
+      of Phase 5 fit that room, or a restatement is cut to make it, never the budget raised.
+      `sh scripts/docs-lint.sh` exits 0 after the paragraph and the note, and
       again after the Layout mention.
 - [ ] Serves invariants 2 and 8.
 
@@ -574,7 +578,7 @@ headroom left — keeping `azure/` and naming `google/`, the `unused-ignore` cod
 `http://localhost:4318/v1/logs`, OTLP/HTTP's default port and logs path) and
 `**http_kwargs: Unpack[HTTPPlatformKwargs]` — every `HTTPSink` keyword but `body_format`, which it
 pins. `endpoint` is OTLP's own word for it, which the vendor-spelling fence in
-`docs/decisions/sink-delivery.md` (SPEC-051) keeps rather than normalizing to the family's `url`,
+`docs/decisions/sink-delivery/` (SPEC-051) keeps rather than normalizing to the family's `url`,
 and it means what the OTLP exporter specification's per-signal endpoint means: a URL used
 **exactly as given**, with no path appended. It overrides `_render` (one `LogRecord` as JSON, the
 mapping of FR-001), `_body` (`_otel.request_body`, content type `application/json`), `_item_size`,
@@ -832,7 +836,7 @@ rejection at all.
 #### Description:
 
 `log_foundry.sinks.otlp.OTLPSink` is a public import path, and invariant 10 and the `1.0.0` fence
-(`docs/decisions/public-api.md`, the import-path entry) make a documented path part of the `1.x`
+(`docs/decisions/public-api/`, the import-path decision) make a documented path part of the `1.x`
 promise. Registering it is the half of the work a green suite does not volunteer, since several
 rosters are hand-listed and one is derived from the source tree, and an unlisted module fails the
 derived one. Six existing tests go red the moment `sinks/otlp.py` exists, measured at `1130461`
@@ -861,8 +865,8 @@ int64 rule, the `code.function.name` limit and the partial-success behaviour. Th
 consumer's queries will rest on once released, which is the reason they are documented, not left to
 the code.
 
-`src/log_foundry/_otel.py` is a new file under the public-API area's tree. `docs/decisions/INDEX.md`
-lists it in that area's *Governs* column and `.claude/rules/decisions-public-api.md` carries the
+`src/log_foundry/_otel.py` is a new file under the public-API area's tree. `docs/decisions/public-api/public-api.md`
+lists it in that area's `governs` and `.claude/rules/decisions-public-api.md` carries the
 glob, so the private-mapping fence fires when the file is opened — in the **same change** that
 creates the file, because `docs-lint` refuses a rule glob that matches no file.
 
@@ -905,7 +909,7 @@ creates the file, because `docs-lint` refuses a rule glob that matches no file.
       passes.
 - [ ] No name from `_otel` appears in any `__all__`; `log_foundry.__all__` and `sinks/__init__.py`
       are unchanged, so the only new public surface is the one documented import path.
-- [ ] `docs/decisions/INDEX.md`'s *Governs* for the Public API surface area and
+- [ ] `governs` in `docs/decisions/public-api/public-api.md` and
       `.claude/rules/decisions-public-api.md` both list `src/log_foundry/_otel.py`, and
       `sh scripts/docs-lint.sh` exits 0 with the file present.
 - [ ] Serves invariant 10.
@@ -1002,9 +1006,9 @@ tests/
 README.md                     # FR-005
 pyproject.toml, poetry.lock   # the dev dependency; the `google.cloud.*` mypy override
 CLAUDE.md                     # Tech Stack Test row; the "After installing extras locally" paragraph
-docs/decisions/INDEX.md       # FR-005: Governs for the Public API area
+docs/decisions/public-api/public-api.md   # FR-005: governs; then sh scripts/gen-index.sh
 .claude/rules/decisions-public-api.md   # FR-005: the matching glob
-docs/decisions/sink-delivery.md         # Phase 5: the sink rules this spec settles
+docs/decisions/sink-delivery/           # Phase 5: the sink rules this spec settles
 ```
 
 ## Implementation Phases
@@ -1019,8 +1023,9 @@ new module makes a derived test demand, and nothing that test does not demand wa
   closes here **except** the one that runs each corpus record through the round-trip helper, which
   cannot close until Phase 2 adds the helper and its dependency; if Phase 1 lands as a PR of its
   own it is named there as owed (`session-rhythm.md`) and settled in Phase 2.
-- In the same change as the new file: `src/log_foundry/_otel.py` in the Public API area's *Governs*
-  column in `docs/decisions/INDEX.md` and in `.claude/rules/decisions-public-api.md`, since
+- In the same change as the new file: `src/log_foundry/_otel.py` in the Public API area's `governs`
+  in `docs/decisions/public-api/public-api.md` and in `.claude/rules/decisions-public-api.md`, then
+  `sh scripts/gen-index.sh`, since
   `docs-lint` refuses a glob that matches no file, and a run of `sh scripts/docs-lint.sh`.
 
 ### Phase 2: The envelope and its proof
@@ -1077,12 +1082,12 @@ new module makes a derived test demand, and nothing that test does not demand wa
 ### Phase 5: The ritual
 
 - The seven steps of `docs/process/completion-ritual.md`. **Step 5 is owed, not skipped:** the sink
-  rules this spec settles get a `###` entry in `docs/decisions/sink-delivery.md`, written before its
-  Contents row and before its fence — OTLP's retry set through a private predicate hook, a partial
+  rules this spec settles are decisions, one file each in `docs/decisions/sink-delivery/`, fence and
+  entry together — OTLP's retry set through a private predicate hook, a partial
   success never retried, every record rejected raising because invariant 7 outranks OTLP's no-retry
   rule, the response read under OTLP's 4 MiB bound, and the envelope charged per record. The
-  direction itself is already in `docs/decisions/public-api.md`.
-- The other steps: the header status and the INDEX row, the delivery doc, the
+  direction itself is already in `docs/decisions/public-api/`.
+- The other steps: `spec_status` and the regenerated indexes, the delivery doc, the
   `component-inventory.md` row, `_otel` added to `CLAUDE.md`'s Layout leaf-helper sentence, the
   `CLAUDE.md` Specs prune, and the pending release notes if `docs/release-notes/<next tag>.md`
   exists.

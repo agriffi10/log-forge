@@ -1,9 +1,13 @@
-# Spec: Supply-Chain Transparency and Dependency Auditing
-
-**ID:** SPEC-023
-**Status:** Completed
-**Last Updated:** 2026-08-02
-**Depends On:** SPEC-012, SPEC-022
+---
+type: Spec
+id: SPEC-023
+title: "Supply-Chain Transparency and Dependency Auditing"
+description: "Adds outward-looking supply-chain transparency: a CycloneDX SBOM per release, scheduled pip-audit and OpenSSF Scorecard."
+spec_status: Completed
+depends_on: [SPEC-012, SPEC-022]
+arc: supply-chain-and-code-security
+arc_order: 2
+---
 
 ## Overview
 
