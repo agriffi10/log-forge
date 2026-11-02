@@ -165,20 +165,26 @@ class ElasticsearchSink(HTTPSink):
         success. An array that cannot be adjudicated is counted and left alone, because the
         request itself succeeded and re-sending would duplicate whatever did land.
 
+        ``RecursionError`` is caught beside the decoding errors because a body nested past the
+        decoder's recursion guard is unparseable in the same sense, and it is not a ``ValueError``.
+        It used to escape through ``emit``, so the worker re-sent a batch the server had already
+        indexed, and any chunk after it in that batch was never sent.
+
         Args:
           payload: The response body.
           sent: How many events were in the request.
 
         Returns:
-          True when every item failed. An unparseable or errors-free body returns False: the
-          request succeeded, and a body this sink cannot read is not evidence against that.
+          True when every item failed. A body that is errors-free or unparseable, by syntax,
+          encoding or depth, returns False: the request succeeded, and a body this sink cannot
+          read is not evidence against that.
 
         Raises:
           None.
         """
         try:
             data = json.loads(payload)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return False
         if not isinstance(data, dict) or not data.get("errors"):
             return False

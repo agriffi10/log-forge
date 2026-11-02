@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from log_foundry.sinks.base import Sink, SinkDeliveryError
+from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from test_sinks_http import FakeOpener, FakeResponse
 
@@ -113,6 +113,50 @@ def test_every_chunk_rejecting_every_item_is_a_total_failure() -> None:
     with pytest.raises(SinkDeliveryError, match="delivered none of 2 chunk"):
         sink.emit([{"n": i} for i in range(4)])
     assert sink.item_errors == 4
+
+
+# --- A 2xx body this sink cannot read: the request succeeded, so nothing raises or re-sends ---
+
+
+_TOO_DEEP = b"[" * 1_000_000
+_UNREADABLE = {"syntax": b"not json", "encoding": b"\xff\xfe\xff", "depth": _TOO_DEEP}
+
+
+def test_the_too_deep_body_really_is_a_recursion_error_not_a_decoding_one() -> None:
+    """The premise of the tests below: without it `depth` would just repeat `syntax`."""
+    with pytest.raises(RecursionError):
+        json.loads(_TOO_DEEP)
+
+
+@pytest.mark.parametrize("sink_type", [ElasticsearchSink, OpenSearchSink])
+@pytest.mark.parametrize("body", _UNREADABLE.values(), ids=_UNREADABLE.keys())
+def test_an_unreadable_2xx_body_settles_the_batch_silently(sink_type, body, capsys) -> None:
+    """Depth takes the path syntax and encoding take, asserted identically for all three."""
+    opener = FakeOpener([FakeResponse(200, body)])
+    sink = sink_type("http://es:9200", index="logs", opener=opener)
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert len(opener.calls) == 1, "the request succeeded, so it is not sent again"
+    assert sink.item_errors == 0
+    assert sink.dropped_unadjudicated == 0
+    assert sink.failed == 0
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "responses",
+    [(_TOO_DEEP, _all_failed(2)), (_all_failed(2), _TOO_DEEP)],
+    ids=["too-deep-first", "too-deep-last"],
+)
+def test_a_too_deep_chunk_leaves_its_siblings_outcome_standing(responses) -> None:
+    """The later chunk is still sent, and the rejected chunk is still counted, in either order."""
+    opener = FakeOpener([FakeResponse(200, body) for body in responses])
+    sink = ElasticsearchSink("http://es:9200", index="logs", max_batch_count=2, opener=opener)
+    sink.emit([{"n": i} for i in range(4)])
+    assert len(opener.calls) == 2, "both chunks sent once, none skipped and none re-sent"
+    assert sink.item_errors == 2, "only the chunk the server rejected is counted"
+    assert sink.dropped_unadjudicated == 0, "the too-deep chunk is not reported as lost"
+    assert sink.losses() == SinkLosses(dropped=0, failed=2)
 
 
 @pytest.mark.parametrize("bad", ["my index", "a\tb", "a\nb", ""])
