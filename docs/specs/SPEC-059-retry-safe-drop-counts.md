@@ -194,6 +194,8 @@ Each criterion below holds for all five sinks unless it names one, and is one pa
 - [ ] Orphan path: one oversized event through `info()` outside a span, with
       `configure(max_value_bytes=…)` raised above the sink's own limit so assembly does not clip
       it first, is counted once with `orphan_lost == 0` (unchanged).
+      **Narrowed by SPEC-057:** `MongoDBSink`'s limit equals the byte budget, so its case also lifts
+      that budget.
 - [ ] `MultiSink(<the sink with a failing client>, MemorySink())` given one oversized and one
       ordinary event reads `dropped == 0` and `failed == <the child's own failed> + 2`; today the
       oversized event is in `dropped` and in `failed`.

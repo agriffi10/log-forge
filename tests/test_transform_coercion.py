@@ -29,6 +29,7 @@ import pytest
 
 import log_foundry
 from log_foundry import sanitize
+from log_foundry.config import Config
 from log_foundry.sanitize import _TypesOnly
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.memory import MemorySink
@@ -395,6 +396,70 @@ def test_the_orphan_path_delivers_the_coerced_event() -> None:
 
 
 # --- AC: nothing public, and the seam between the stand-in and the coercer ----------------
+
+
+def test_a_budget_does_not_clip_a_transforms_output() -> None:
+    """A 20 MiB string past the byte budget stays whole, and the key after it survives."""
+    big = "y" * (20 * 1024 * 1024)
+    assert len(big) > sanitize._MAX_RENDERED_BYTES
+    result, truncated = sanitize._coerce_unbounded({"raw": b"x", "big": big, "after": 1})
+    assert result == {"raw": "x", "big": big, "after": 1}
+    assert truncated is False
+
+
+def test_a_node_budget_does_not_cut_a_transforms_output() -> None:
+    """More values than the node budget all arrive, each coerced."""
+    count = sanitize._MAX_NODES + 1
+    event: dict[str, object] = {f"k{i}": i for i in range(count)}
+    event["raw"] = b"x"
+    result, truncated = sanitize._coerce_unbounded(event)
+    assert len(result) == count + 1
+    assert result["raw"] == "x"
+    assert truncated is False
+
+
+def test_a_transform_delivers_output_past_both_budgets_whole() -> None:
+    """The real path: the check fails on ``bytes``, and the coercion cuts nothing.
+
+    The direct tests above would stay green if ``TransformSink`` stopped calling the unbudgeted pass.
+    """
+    big = "y" * (sanitize._MAX_RENDERED_BYTES + 1)
+    wide = {f"k{i}": i for i in range(sanitize._MAX_NODES + 1)}
+    returned = _one({"raw": b"x", "big": big, **wide}, after=1)
+    sink, inner = _transform(lambda event: returned)
+
+    sink.emit([_one({})])
+
+    delivered = inner.events[0]
+    fields = delivered["fields"]
+    assert fields["raw"] == "x"
+    assert fields["big"] == big
+    assert len(fields) == len(wide) + 2
+    assert delivered["after"] == 1
+    assert "truncated" not in delivered
+
+
+def test_a_transform_is_unbudgeted_and_not_merely_budgeted_higher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Far above small budgets nothing is cut, so a finite lift would redden this."""
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 100)
+    monkeypatch.setattr(sanitize, "_MAX_NODES", 10)
+    event: dict[str, object] = {f"k{i}": "y" * 1_000 for i in range(200)}
+    event["raw"] = b"x"
+
+    result, truncated = sanitize._coerce_unbounded(event)
+
+    assert len(result) == 201
+    assert result["k199"] == "y" * 1_000
+    assert truncated is False
+
+
+def test_the_budgets_still_bind_an_ordinary_pass() -> None:
+    """The exemption is the transform's alone: the same input through ``coerce`` is cut."""
+    big = "y" * (20 * 1024 * 1024)
+    cfg = Config(max_value_bytes=len(big.encode()) + 1)
+    assert sanitize.coerce({"big": big, "after": 1}, cfg=cfg) == {"big": "<size limit>"}
 
 
 def test_sanitize_exports_nothing_new() -> None:

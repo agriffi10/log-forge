@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
-from log_foundry import _diag
+from log_foundry import _diag, sanitize
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.eventhubs import AzureEventHubsSink
 from log_foundry.sinks.firehose import FirehoseSink
@@ -306,9 +306,17 @@ def test_two_oversized_events_each_name_their_own_size(name: str, capsys) -> Non
 
 
 @pytest.mark.parametrize("name", sorted(_SINKS))
-def test_an_orphan_oversized_event_is_counted_once(name: str) -> None:
-    """Unchanged: outside a span the batch is the one event, which never raises and counts once."""
+def test_an_orphan_oversized_event_is_counted_once(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside a span the batch is the one event, which never raises and counts once.
+
+    The byte budget is lifted: ``MongoDBSink``'s limit equals it, so a string over the limit would
+    otherwise be ``<size limit>`` before the sink's check saw it (SPEC-057).
+    """
     case = _SINKS[name]
+    budget = max(sanitize._MAX_RENDERED_BYTES, case.oversized * 2)
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", budget)
     sink = case.build(set(), None)
     log_foundry.configure(service="t", sink=sink, max_value_bytes=case.oversized * 2)
 
@@ -317,6 +325,20 @@ def test_an_orphan_oversized_event_is_counted_once(name: str) -> None:
     assert sink.dropped_oversized == 1
     assert sink.losses().dropped == 1
     assert log_foundry.health().orphan_lost == 0
+
+
+def test_mongodb_oversize_through_assembly_under_the_real_budget() -> None:
+    """One string over the limit is cut and delivered; escaping still reaches the sink's drop."""
+    sink = _mongodb(set(), None)
+    log_foundry.configure(service="t", sink=sink, max_value_bytes=32 * 1024 * 1024)
+
+    log_foundry.info("cut by the budget", big="x" * 17_000_000)
+    assert sink.dropped_oversized == 0
+    assert sink.losses().dropped == 0
+
+    log_foundry.info("escapes past the limit", big="\x01" * (3 * 1024 * 1024))
+    assert sink.dropped_oversized == 1
+    assert sink.losses().dropped == 1
 
 
 @pytest.mark.parametrize("name", sorted(_SINKS))

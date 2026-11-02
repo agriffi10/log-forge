@@ -926,6 +926,60 @@ close it.
   drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
   library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
+- **A mapping key built from a shared sub-structure is rendered whole before any budget applies**
+  (SPEC-057, Accepted Limits; invariants 1 and 8). `_Coercer._key` renders a key that is not a
+  `str`, `int` or `float` by `str(key)`, so a `tuple` or `frozenset` key — or any key a caller
+  `Mapping` yields, which need not even hash — is rendered by the builtin `repr`, which recurses
+  through a shared member once per path. The DAG SPEC-057 FR-001 bounds as a value is unbounded as
+  a key: SPEC-057's budgets charge the text only once it exists, turning a long one into
+  `<size limit>` afterwards, so the work is unchanged rather than regressed. Measured on the
+  caller's thread with `f = frozenset({f, (f, i)})` applied 16, 18, 20 and 22 times, one key costs
+  0.04, 0.17, 0.69 and 2.83 s of CPU at `324936e` and 0.04, 0.16, 0.63 and 2.61 s at `b282c1d`,
+  doubling per level, which extrapolates to days at forty. **Closed by** pre-counting a
+  builtin-container key against the node budget before rendering it, a node per member per path
+  as the pass counts a value, or by rendering such a key as the `<unserializable key: T>`
+  placeholder.
+- **An object that only claims a scalar type is routed as that type and reaches the event as itself**
+  (SPEC-057 sweep; invariant 8). `isinstance` and `kind in _PLAIN_SCALARS` consult `__class__`,
+  `__hash__` and `__eq__`, which a caller's object controls. Three routes in `_dispatch`, none
+  guarded: an object whose `__class__` claims `bool` takes the `isinstance(value, bool)` branch and
+  is returned as it is; one claiming `float` has its own `__float__` decide `isfinite()` in
+  `real()` and is then returned itself; and a class whose metaclass defines `__hash__` and `__eq__`
+  to match `int` passes `kind in _PLAIN_SCALARS`. Each puts a non-JSON object in the event, so a
+  sink's bare `json.dumps` raises. Pre-existing and not regressed: the same three branches stand at
+  `324936e`, and a probe of each returns the object itself there and on the SPEC-057 tree. SPEC-057
+  closed the sibling routes for the types its own reads depend on (`int`, `str`, `bytes`,
+  `bytearray`, `memoryview`) and left these, which no budget depends on. **Closed by** a
+  spec that replaces every spoofable type routing on the assembly path (`sanitize.py`, `model.py`
+  and `api.py`) with an exact-type identity test or an unbound builtin accessor.
+- **`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded nor
+  total** (SPEC-057 system-frame review; invariants 1 and 6). `context.format_baggage_header` writes
+  `quote(str(v), safe='')` for each value and `current_baggage_header()` calls it on the live
+  baggage. Measured inside a span at `b282c1d`, on the main thread under a 5 s `setitimer` with a
+  null sink: (a) a baggage value that is a shared-sublist DAG (`y = 0`, then `y = [y] * 16` seven
+  times) does not return, because `str` of it recurses through the shared member once per path; and
+  (b) a value whose `__str__` raises makes the call raise that `RuntimeError` into the caller,
+  although the docstring says `Raises: None.`. A short string returns at once in the same run, and
+  the same two values go through assembly there without hanging or raising, so the library's two
+  text producers for one baggage disagree. Pre-dates SPEC-057: `context.py` is untouched by
+  `324936e..5337fe6`, and the same two outcomes were measured at `324936e` with no span open.
+  **Closed by** rendering header values through a bounded, total path within W3C baggage
+  encoding: `sanitize`'s coercion under its pass budgets, or a type-name placeholder when the
+  render fails.
+- **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
+  invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
+  Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and
+  `max_keys=True` are accepted and stored as given, while a `str` is refused only by the
+  comparison's own `TypeError`, not by a check that names the ceiling. `max_keys=2.5` kept three
+  of four list entries and marked the event, and `True` kept one. A float
+  `max_value_bytes` makes the slice in `truncate_str` raise `TypeError` for any string past it; the
+  per-value guard catches that, so a 200-character string silently becomes
+  `<unserializable: str>`, unmarked, where the ceiling should have clipped it, at `324936e` too.
+  SPEC-057's bounded reads widened it: the bytes-like read slices to `max_value_bytes + 1`, so
+  even a SHORT `bytes` or `bytearray` now becomes `<unserializable: bytes>` or
+  `<unserializable: bytearray>`, where at `324936e` it was written whole. **Closed by**
+  `configure()` refusing a non-`int` ceiling with a `TypeError` at the call, deciding at the same
+  time whether a `bool` or another `int` subclass passes (invariant 13).
 
 ### Resolved
 
@@ -1293,18 +1347,26 @@ and a third copy is a fork with no merge.
   clean afterwards — and measured so the shape is on record (2026-09-04 audit, N10, at `456e9b7`):
   `tracemalloc` peak 5.3 MB at depth 1,000, 69.2 MB at 4,000, 266.5 MB at 8,000. A depth that makes
   this matter has recursed past anything a trace should describe.
-- **The payload ceilings bound each *value*, not the event as a whole.** `max_value_bytes`,
+- **The payload ceilings bound each *value*, and the pass budgets of 131,072 values and 16 MiB
+  of text bound the work, not the event's size at a destination.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event
   can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB — measured at
   `456e9b7` as a 2,060,506-byte event, serializable and marked `truncated` (2026-09-04 audit,
   N11). Acceptable because
   it is *visible* — a sink with a hard limit drops the event and counts `dropped_oversized`, so
-  the loss is signalled where it happens rather than passed downstream silently. A per-event byte
+  the loss is signalled where it happens rather than passed downstream silently. SPEC-057 bounds
+  each coercion pass as a whole: at most 131,072 values visited and 16 MiB of text charged, and
+  the value that crosses either budget becomes a marked `<node limit>` or `<size limit>` after
+  which nothing is visited. A transform's types-only coercion runs outside both. That is a *work* budget on the caller's thread, not a limit tuned to
+  any destination: `json.dumps` escapes a control character as six bytes, so the serialised worst
+  case is about six times the byte budget per pass (96 MiB), and a boundary event takes two
+  passes, `build_event`'s and `backfill_baggage`'s, so about twice that. ~~A per-event byte
   ceiling was deferred by SPEC-017, again by SPEC-020, and deliberately again by SPEC-021: it is a
   feature with real design surface (what happens on breach, which fields are sacrificed first) and
-  belongs in its own spec. Lower `max_value_bytes` / `max_keys` if your destination's limit is
-  tight. Note `max_value_bytes` carries two units — UTF-8 bytes for a string, rendered decimal
-  length for an integer (SPEC-020, SPEC-021).
+  belongs in its own spec.~~ Reversed by SPEC-057: a breach is a placeholder and a stop, and walk
+  order decides what is sacrificed. Lower `max_value_bytes` / `max_keys` if your destination's
+  limit is tight; that, not the budgets, is what meets it. Note `max_value_bytes` carries two
+  units — UTF-8 bytes for a string, rendered decimal length for an integer (SPEC-020, SPEC-021).
 
 - **Backpressure is drop-newest, and is not configurable.** When the worker's bounded queue is
   full a submission is discarded rather than blocking the caller (§9): `health().dropped` counts

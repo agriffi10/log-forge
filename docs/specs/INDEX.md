@@ -62,6 +62,7 @@ to status only — no prose.
 | [SPEC-055](SPEC-055-assembly-decoration-and-echo-residue.md) | Assembly, Decoration and Echo Residue | Completed | SPEC-017, SPEC-020, SPEC-025, SPEC-029, SPEC-037 |
 | [SPEC-058](SPEC-058-one-bad-event-costs-only-itself.md) | One Bad Event Costs Only Itself | Completed | SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036 |
 | [SPEC-059](SPEC-059-retry-safe-drop-counts.md) | Retry-Safe Drop Counts in Every Sink | Completed | SPEC-026, SPEC-036, SPEC-038, SPEC-058 |
+| [SPEC-057](SPEC-057-assembly-work-budget.md) | Assembly Work Budget — Node and Byte Budgets per Pass, and Reads Bounded by the Ceiling | Completed | SPEC-017, SPEC-020, SPEC-055 |
 
 ## Arcs (build order)
 
@@ -318,7 +319,14 @@ Group related specs and record the order to build them in. Keep this section: a 
   while a wrap shipped first freezes its semantics at 1.0. If wrapping is chosen it is a spec of
   its own, SPEC-056, built after SPEC-055 and replacing its FR-003.
 
-- **Coercer and invariant 8 (SPEC-057, SPEC-058):** SPEC-057 (in progress on a peer branch) and
-  SPEC-058 both edit `sanitize.py`'s coercer and `docs/invariants.md` §8. Neither depends on the
-  other and neither relies on the other's behaviour. Whichever lands second rebases onto the first,
-  and re-runs SPEC-058 FR-001's criteria and `tests/test_sanitize_corpus.py` before it pushes.
+- **Coercer and invariant 8 (SPEC-057, SPEC-058):** both edit `sanitize.py`'s coercer and
+  `docs/invariants.md` §8. SPEC-058 landed first and SPEC-057 rebased onto it. They did interact:
+  SPEC-057's budgets would have cut the output SPEC-058 promises not to clip, so a transform's
+  coercion runs outside them.
+- **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
+  all in `sanitize.py`, closing a shared-sublist hang on the caller's thread. It depends on nothing
+  unbuilt and builds first of the two specs it touches: the OTLP log export spec drafted on branch
+  `spec/056-otlp-log-export` specifies an equal budget for its own mapping — one number, one
+  placeholder text, one stop rule. Keeping the two equal is that spec's to settle when it builds
+  (it may import `sanitize`'s private `_MAX_NODES` or pin equality with a test); SPEC-057 defines
+  its own constant and asks for no edit to that spec or to `_otel`.

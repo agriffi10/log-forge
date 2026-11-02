@@ -89,6 +89,7 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
   are unmeasured. The criterion runs in a child interpreter, so a crash there fails that one test
   with the child's return code (a negative signal number) rather than taking an xdist worker down.
 - SPEC-057 also edits the coercer and §8; whichever lands second rebases (`INDEX.md` Arcs).
+  **Superseded:** SPEC-057 landed second, and this coercion runs outside its budgets.
 
 ## Verification
 

@@ -36,8 +36,9 @@ runtime's intent (SPEC-025).
 *Recorded exceptions:* a constructor, `configure()` or `@trace` may refuse an unusable argument
 at the call that supplies it — that is invariant 13, and it is the *opposite* promise for the
 moment of construction.
-*Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`;
-`tests/test_invariants_model.py` asserts it over random interleavings.
+*Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`,
+`tests/test_assembly_budget.py` (a hostile argument returns on both delivery paths before a
+deadline); `tests/test_invariants_model.py` asserts it over random interleavings.
 
 ## 2. Every accepted event is delivered, or counted and announced — exactly once
 
@@ -165,9 +166,11 @@ on.
 ## 8. An event is safe by construction, once, at assembly
 
 `build_event` coerces and bounds every value, so a sink may `json.dumps` bare; the ceilings bound
-each *value*, not the event; an unserializable value becomes a type name, never a `repr`; a
-number too large to render is replaced, never clipped; a reserved word has exactly one route
-through (SPEC-017, SPEC-020, SPEC-025, SPEC-034). The premise holds at assembly **and at a
+each *value*, and each coercion pass is bounded as a whole at 131,072 values visited and 16 MiB
+of text charged, which bounds the work and not the event's size at a destination; an
+unserializable value becomes a type name, never a `repr`; a number too large to render is
+replaced, never clipped; a reserved word has exactly one route through (SPEC-017, SPEC-020,
+SPEC-025, SPEC-034, SPEC-057). The premise holds at assembly **and at a
 transform's coercion**: a `TransformSink` runs its function after assembly, so it checks each
 result with the observable below and replaces one that fails with a coercion by assembly's
 per-type rules (SPEC-058).
@@ -176,17 +179,23 @@ per-type rules (SPEC-058).
 `json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
 substitution (a type-name placeholder is visible on its own and does not set it), and no
 top-level key was overwritten. A lone surrogate is replaced by U+FFFD and marked; a key that
-cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-055).
+cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-055). A pass
+visits at most 131,072 values (`sanitize._MAX_NODES`) and charges at most 16 MiB of text
+(`sanitize._MAX_RENDERED_BYTES`); the value that crosses either budget is a `<node limit>` or
+`<size limit>` that sets `truncated`, and nothing after it is visited (SPEC-057).
 *Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
-(invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). The
+(invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary
+event takes two passes, `build_event`'s and `backfill_baggage`'s, so `span.start` and `span.end`
+can each hold up to twice each budget (SPEC-057). The
 ceilings bound the values of an assembled event and do not bound what a transform adds: a
-transform's coercion is for type only, under no configured ceiling and one fixed depth bound of
-100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
+transform's coercion is for type only, under no configured ceiling, outside the two pass budgets,
+and with one fixed depth bound of 100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
 choosing the size (SPEC-058).
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
-by `tests/test_public_surface.py`, and `tests/test_sanitize_corpus.py`, which holds every
-hostile value to the whole observable on both delivery paths; a transform's output by
+by `tests/test_public_surface.py`, `tests/test_sanitize_corpus.py`, which holds every
+hostile value to the whole observable on both delivery paths, and `tests/test_assembly_budget.py`,
+which holds both budgets exactly and the reads to the ceiling; a transform's output by
 `tests/test_transform_coercion.py` (SPEC-058).
 
 ## 9. Context is scoped, and an adopted context confers nothing

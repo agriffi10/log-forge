@@ -1357,8 +1357,13 @@ there. Any ceiling firing sets `truncated: true` on the event.
 
 `max_value_bytes` therefore carries two units: **UTF-8 bytes** for a string, **rendered decimal
 length** (sign included) for an integer. They coincide for ASCII digits, and one ceiling for "how
-big may a single value get" was preferred to a second config key. Note that all four ceilings
-bound each *value* — an event of many bounded values can still be large; see
+big may a single value get" was preferred to a second config key.
+
+Each coercion pass over an event's fields also has two budgets, 131,072 values visited and
+16 MiB of text: the value past either becomes `<node limit>` or `<size limit>`, the event is
+marked `truncated`, and nothing after it is written. Note that all four ceilings bound each
+*value*, and the 131,072-value and 16 MiB budgets bound the work on your thread, not the event's
+size at a destination, so an event of many bounded values can still be large; see
 [Known constraints](https://github.com/agriffi10/log-forge/blob/main/docs/architecture.md#known-constraints).
 
 ## Development

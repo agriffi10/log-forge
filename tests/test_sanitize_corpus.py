@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import pytest
 
 import log_foundry as lf
+from log_foundry.sanitize import TRUNCATION_MARKER
 from log_foundry.sinks.memory import MemorySink
 
 if TYPE_CHECKING:
@@ -109,6 +110,9 @@ _CYCLE_DICT: dict[str, object] = {}
 _CYCLE_DICT["self"] = _CYCLE_DICT
 _CYCLE_LIST: list[object] = []
 _CYCLE_LIST.append(_CYCLE_LIST)
+
+_NINE_MILLION_DIGITS = Decimal("1" * 9_000_000)
+_TEN_MILLION_X = "x" * 10_000_000
 
 
 def _deep(levels: int) -> dict[str, object]:
@@ -237,6 +241,30 @@ ROWS: list[Row] = [
         True,
         _pinned(lambda v: isinstance(v, dict) and next(iter(v)).startswith("<unserializable key")),
     ),
+    # SPEC-057's additions: a pass visits at most 131,072 values and charges at most 16 MiB
+    Row(
+        "node_budget_over",
+        "value",
+        [[[0, 0]] * 256] * 256,
+        True,
+        _pinned(lambda v: "<node limit>" in set(_walk(v))),
+    ),
+    Row("node_budget_silence_256x256", "value", [[0] * 256] * 256, False, [[0] * 256] * 256),
+    Row(
+        "size_budget_decimal_twice",
+        "value",
+        [_NINE_MILLION_DIGITS, _NINE_MILLION_DIGITS],
+        True,
+        ["1" * 8178 + TRUNCATION_MARKER, "<size limit>"],
+    ),
+    Row(
+        "size_budget_clipped_str_control",
+        "value",
+        [_TEN_MILLION_X] * 100,
+        True,
+        ["x" * 8178 + TRUNCATION_MARKER] * 100,
+    ),
+    Row("size_budget_silence_100x8192", "value", ["x" * 8192] * 100, False, ["x" * 8192] * 100),
     # controls: ordinary values must leave `truncated` absent
     Row("plain_text", "value", "hello", False, "hello"),
     Row("plain_message", "message", "hello", False, "hello"),
