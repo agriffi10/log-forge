@@ -115,32 +115,95 @@ def test_every_chunk_rejecting_every_item_is_a_total_failure() -> None:
     assert sink.item_errors == 4
 
 
-# --- A 2xx body this sink cannot read: the request succeeded, so nothing raises or re-sends ---
+# --- A 2xx body with no readable verdict: counted and announced, never raised or re-sent ------
 
 
 _TOO_DEEP = b"[" * 1_000_000
-_UNREADABLE = {"syntax": b"not json", "encoding": b"\xff\xfe\xff", "depth": _TOO_DEEP}
+_REJECTED_THEN_TOO_DEEP = _all_failed(2)[:-1] + b', "tail": ' + _TOO_DEEP
+_NO_VERDICT = {
+    "empty": b"",
+    "syntax": b"not json",
+    "encoding": b"\xff\xfe\xff",
+    "depth": _TOO_DEEP,
+    "rejected-then-too-deep": _REJECTED_THEN_TOO_DEEP,
+    "array": b"[]",
+    "number": b"5",
+    "string": b'"x"',
+    "null": b"null",
+}
+_NO_VERDICT_LINE = (
+    "lost 2 event(s); {name} could not adjudicate a _bulk response "
+    "(2 event(s) sent, 0 readable item(s), 0 error(s)); not retried"
+)
 
 
-def test_the_too_deep_body_really_is_a_recursion_error_not_a_decoding_one() -> None:
+@pytest.mark.parametrize("body", [_TOO_DEEP, _REJECTED_THEN_TOO_DEEP], ids=["open", "tail"])
+def test_the_too_deep_bodies_really_are_recursion_errors_not_decoding_ones(body) -> None:
     """The premise of the tests below: without it `depth` would just repeat `syntax`."""
     with pytest.raises(RecursionError):
-        json.loads(_TOO_DEEP)
+        json.loads(body)
 
 
 @pytest.mark.parametrize("sink_type", [ElasticsearchSink, OpenSearchSink])
-@pytest.mark.parametrize("body", _UNREADABLE.values(), ids=_UNREADABLE.keys())
-def test_an_unreadable_2xx_body_settles_the_batch_silently(sink_type, body, capsys) -> None:
-    """Depth takes the path syntax and encoding take, asserted identically for all three."""
+@pytest.mark.parametrize("body", _NO_VERDICT.values(), ids=_NO_VERDICT.keys())
+def test_a_2xx_body_with_no_readable_verdict_is_counted_once(sink_type, body, capsys) -> None:
+    """Undecodable and non-object bodies are charged whole, and the request is not re-sent."""
     opener = FakeOpener([FakeResponse(200, body)])
     sink = sink_type("http://es:9200", index="logs", opener=opener)
     sink.emit([{"a": 1}, {"b": 2}])
     assert len(opener.calls) == 1, "the request succeeded, so it is not sent again"
+    assert sink.dropped_unadjudicated == 2
     assert sink.item_errors == 0
-    assert sink.dropped_unadjudicated == 0
     assert sink.failed == 0
+    assert sink.losses() == SinkLosses(dropped=0, failed=2)
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert _NO_VERDICT_LINE.format(name=sink_type.__name__) in lines[0]
+
+
+def test_a_decoder_memory_error_is_counted_rather_than_escaping_emit(monkeypatch, capsys) -> None:
+    """`MemoryError` is no decoding error, so only the wide catch keeps it inside the sink."""
+
+    def out_of_memory(payload: bytes) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr("log_foundry.sinks.elasticsearch.json.loads", out_of_memory)
+    opener = FakeOpener([FakeResponse(200, _ok(2))])
+    sink = ElasticsearchSink("http://es:9200", index="logs", opener=opener)
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert len(opener.calls) == 1
+    assert sink.dropped_unadjudicated == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=2)
+    assert _NO_VERDICT_LINE.format(name="ElasticsearchSink") in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"{}", b'{"errors": false}', b'{"errors": null}', b'{"errors": 0}', b'{"items": []}'],
+)
+def test_an_object_saying_nothing_failed_counts_nothing(body, capsys) -> None:
+    """The silence half: an object with no truthy `errors` is a verdict, not a missing one."""
+    sink = ElasticsearchSink(
+        "http://es:9200", index="logs", opener=FakeOpener([FakeResponse(200, body)])
+    )
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.dropped_unadjudicated == 0
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
     assert capsys.readouterr().err == ""
+
+
+def test_a_short_items_array_and_an_unreadable_body_write_the_same_shape_of_line(capsys) -> None:
+    """One route: the line differs only in the counts the readable array supplies."""
+    short = json.dumps({"errors": True, "items": [{"index": {"error": "nope"}}]}).encode()
+    sink = ElasticsearchSink(
+        "http://es:9200", index="logs", opener=FakeOpener([FakeResponse(200, short)])
+    )
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.dropped_unadjudicated == 2
+    assert (
+        "lost 2 event(s); ElasticsearchSink could not adjudicate a _bulk response "
+        "(2 event(s) sent, 1 readable item(s), 1 error(s)); not retried"
+    ) in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -148,14 +211,26 @@ def test_an_unreadable_2xx_body_settles_the_batch_silently(sink_type, body, caps
     [(_TOO_DEEP, _all_failed(2)), (_all_failed(2), _TOO_DEEP)],
     ids=["too-deep-first", "too-deep-last"],
 )
-def test_a_too_deep_chunk_leaves_its_siblings_outcome_standing(responses) -> None:
-    """The later chunk is still sent, and the rejected chunk is still counted, in either order."""
+def test_a_too_deep_chunk_leaves_its_siblings_outcome_standing(responses, capsys) -> None:
+    """The later chunk is still sent, and each chunk keeps its own outcome, in either order."""
     opener = FakeOpener([FakeResponse(200, body) for body in responses])
     sink = ElasticsearchSink("http://es:9200", index="logs", max_batch_count=2, opener=opener)
     sink.emit([{"n": i} for i in range(4)])
     assert len(opener.calls) == 2, "both chunks sent once, none skipped and none re-sent"
-    assert sink.item_errors == 2, "only the chunk the server rejected is counted"
-    assert sink.dropped_unadjudicated == 0, "the too-deep chunk is not reported as lost"
+    assert sink.item_errors == 2, "only the chunk the server rejected is counted as rejected"
+    assert sink.dropped_unadjudicated == 2, "only the too-deep chunk is counted as unadjudicated"
+    assert sink.losses() == SinkLosses(dropped=0, failed=4)
+    err = capsys.readouterr().err
+    assert "lost 2 bulk item(s)" in err
+    assert _NO_VERDICT_LINE.format(name="ElasticsearchSink") in err
+
+
+def test_a_too_deep_chunk_beside_a_delivered_one_charges_only_itself() -> None:
+    opener = FakeOpener([FakeResponse(200, _ok(2)), FakeResponse(200, _TOO_DEEP)])
+    sink = ElasticsearchSink("http://es:9200", index="logs", max_batch_count=2, opener=opener)
+    sink.emit([{"n": i} for i in range(4)])
+    assert len(opener.calls) == 2
+    assert sink.dropped_unadjudicated == 2
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
 
 
