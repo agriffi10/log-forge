@@ -68,4 +68,10 @@ order agents asked, with `main` settled and green before the next**.
   that a rebase conflict is never resolved by discarding a peer's work. An unbriefed session does the
   reasonable thing for a session working alone, which is exactly what breaks a parallel run.
 
+**A supervisor session** watches the queue, main and where sessions' work meets, relays what git
+will not catch, and archives finished sessions — `/supervise` (`.claude/skills/supervise/SKILL.md`),
+driven by `scripts/supervisor/`. It never pushes, merges or takes a lock for another session; when
+one is running, it is the escalation point a briefing names, and it puts to Andrew what only he can
+decide.
+
 Full protocol, configuration and the stale-entry rules: `scripts/pr-queue/PROTOCOL.md`.
