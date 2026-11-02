@@ -44,8 +44,8 @@ _MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
 
 Not a sink's size limit: a destination's hard limit is met by lowering ``max_value_bytes`` or
 ``max_keys`` (``SQSSink`` sends at most 256 KiB). ``MongoDBSink``'s 16 MiB document limit is the
-same number, so one string over it becomes ``<size limit>`` before that sink's check sees it. And
-reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
+same number, so through assembly one string over it becomes ``<size limit>`` before that sink's
+check sees it; escaping or the envelope can still carry an event past that limit. And reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
 practice it only catches amplification — one ``Decimal`` of ten million digits referenced 256
 times is 2,560,000,000 characters of ``str()``. ``json.dumps`` escapes a control character as
 six bytes, so the serialised worst case is about six times this per pass, and a boundary event
@@ -1077,8 +1077,10 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
     It runs outside SPEC-057's two budgets, which bound work at assembly. A cut here would drop
     the values after it, envelope keys included, from output this pass promises not to clip. The
     cost is accepted: ``json.dumps`` stops at the first fault, so a result that faults early reaches
-    this pass nearly unwalked, and a shared-sublist result then costs its whole expansion here. That
-    is the caller's own code, and the same shape with no fault costs as much in the check.
+    this pass nearly unwalked, and a shared-sublist result then costs its whole expansion here,
+    several times what the same shape costs the check with no fault, because this pass builds the
+    expansion where the check only serializes it. The acceptance rests on that being the caller's
+    own code; the register entry carries the measurement.
 
     **Unlike** :func:`sanitize_fields` **it has no top-level guard.** A mapping that cannot be
     entered — a ``dict`` subclass whose ``items()`` raises — propagates its exception to the

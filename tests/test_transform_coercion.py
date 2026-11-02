@@ -439,6 +439,22 @@ def test_a_transform_delivers_output_past_both_budgets_whole() -> None:
     assert "truncated" not in delivered
 
 
+def test_a_transform_is_unbudgeted_and_not_merely_budgeted_higher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Far above small budgets nothing is cut, so a finite lift would redden this."""
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 100)
+    monkeypatch.setattr(sanitize, "_MAX_NODES", 10)
+    event: dict[str, object] = {f"k{i}": "y" * 1_000 for i in range(200)}
+    event["raw"] = b"x"
+
+    result, truncated = sanitize._coerce_unbounded(event)
+
+    assert len(result) == 201
+    assert result["k199"] == "y" * 1_000
+    assert truncated is False
+
+
 def test_the_budgets_still_bind_an_ordinary_pass() -> None:
     """The exemption is the transform's alone: the same input through ``coerce`` is cut."""
     big = "y" * (20 * 1024 * 1024)

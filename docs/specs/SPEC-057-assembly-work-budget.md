@@ -248,7 +248,8 @@ text did not exist until the pass made it, so its length *is* the work: one `Dec
 digits referenced 256 times is 2,560,000,000 characters of `str()`, which clipping afterwards does
 not undo.
 
-**Why 16 MiB.** No sink here accepts an event near it (SQS: 256 KB), and reaching it legitimately
+**Why 16 MiB.** Almost no sink here accepts an event near it (SQS: 256 KB; `MongoDBSink`'s limit
+is the same 16 MiB), and reaching it legitimately
 takes at least 2,048 full strings at the default 8 KiB ceiling, so in practice it only catches
 amplification. The serialised worst case follows from it: six times the budget per pass
 (*Accepted Limits*).

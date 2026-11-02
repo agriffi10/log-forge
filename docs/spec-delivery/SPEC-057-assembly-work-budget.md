@@ -31,8 +31,10 @@ name was added, and `sanitize.__all__` and `log_foundry.__all__` are unchanged.
 A transform's types-only coercion (SPEC-058) runs outside both budgets, through
 `_Coercer(budgeted=False)`, so a transform's output is still never clipped. That was decided when
 this spec rebased onto SPEC-058: the two passed their tests together while the budgets cut it.
-The cost of the exemption is in the register entry. `MongoDBSink`'s oversize drop can no longer be
-reached by one string over 16 MiB, so SPEC-059's orphan test patches the budget out of its way.
+The cost of the exemption is in the register entry. Through assembly, one string over 16 MiB no
+longer reaches `MongoDBSink`'s oversize drop: it arrives as `<size limit>`, delivered and not counted
+as lost. Escaping, the envelope and a transform can still reach the drop. SPEC-059's orphan test lifts
+the budget, and a new test pins both routes.
 
 The spec's *Accepted Limits* stand as written there and are not restated here.
 
@@ -45,7 +47,7 @@ The spec's *Accepted Limits* stand as written there and are not restated here.
 - SPEC-020's integer ceiling now measures through the unbound `int.bit_length`, not the value's own.
 
 **What a caller can now see.** A release note is owed at the next tag (no `docs/release-notes/` file
-exists yet for it, `v1.0.1` being tagged):
+exists yet for it):
 
 - An event can be cut with `<node limit>` or `<size limit>`, and the siblings after the cut are dropped.
 - A `Decimal` or other produced text over 16 MiB becomes `<size limit>` where it was clipped.
