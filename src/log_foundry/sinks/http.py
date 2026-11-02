@@ -545,10 +545,12 @@ class HTTPSink:
         Raises:
           SinkDeliveryError: When no chunk was **settled**, which is the total failure the
             worker's retry exists for (SPEC-026 FR-001). A chunk is settled when it was
-            delivered *or* when it was permanently discarded, because neither is helped by a
-            retry — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
+            delivered, when it was permanently discarded, *or* when a ``2xx`` gave no readable
+            verdict and :meth:`_handle_response` counted it, because none is helped by a retry
+            — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
             identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
-            already apply). A batch that settled *some* chunks does not raise either: the worker
+            already apply), while re-sending a chunk that may have landed could duplicate it.
+            A batch that settled *some* chunks does not raise either: the worker
             retries whole batches, so raising would re-send what landed. A raise leaves nothing
             from :meth:`_items` or :meth:`_drop_refused` counted, and a batch whose every event
             was unrenderable or oversized makes no request and does not raise.

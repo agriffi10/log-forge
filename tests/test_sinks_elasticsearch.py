@@ -133,7 +133,7 @@ _NO_VERDICT = {
 }
 _NO_VERDICT_LINE = (
     "lost 2 event(s); {name} could not adjudicate a _bulk response "
-    "(2 event(s) sent, 0 readable item(s), 0 error(s)); not retried"
+    "(2 event(s) sent, 0 readable item(s), 0 error(s)); they may have landed; not retried"
 )
 
 
@@ -177,12 +177,44 @@ def test_a_decoder_memory_error_is_counted_rather_than_escaping_emit(monkeypatch
     assert _NO_VERDICT_LINE.format(name="ElasticsearchSink") in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "body",
-    [b"{}", b'{"errors": false}', b'{"errors": null}', b'{"errors": 0}', b'{"items": []}'],
-)
-def test_an_object_saying_nothing_failed_counts_nothing(body, capsys) -> None:
-    """The silence half: an object with no truthy `errors` is a verdict, not a missing one."""
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_a_base_exception_from_the_decoder_propagates_with_nothing_counted(
+    monkeypatch, capsys, raised
+) -> None:
+    """Invariant 1 catches `Exception` and never `BaseException`, so these reach the caller."""
+
+    def interrupted(payload: bytes) -> object:
+        raise raised
+
+    monkeypatch.setattr("log_foundry.sinks.elasticsearch.json.loads", interrupted)
+    sink = ElasticsearchSink(
+        "http://es:9200", index="logs", opener=FakeOpener([FakeResponse(200, _ok(2))])
+    )
+    with pytest.raises(raised):
+        sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.dropped_unadjudicated == 0
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert capsys.readouterr().err == ""
+
+
+_UNVERIFIED = {
+    "empty-object": b"{}",
+    "errors-false": b'{"errors": false}',
+    "errors-null": b'{"errors": null}',
+    "errors-zero": b'{"errors": 0}',
+    "empty-items": b'{"items": []}',
+    "error-document": b'{"error": {"type": "auth"}, "status": 500}',
+    "items-all-errored": b'{"items": [{"index": {"error": "x"}}, {"index": {"error": "x"}}]}',
+}
+
+
+@pytest.mark.parametrize("body", _UNVERIFIED.values(), ids=_UNVERIFIED.keys())
+def test_an_object_without_truthy_errors_is_read_as_success_unverified(body, capsys) -> None:
+    """Pins what the code does, not that it is right: architecture.md §12 holds the exposure.
+
+    The last two bodies report failure and still count nothing. A change that starts charging
+    them has to decide what an endpoint that omits `errors` costs, with the Astra profile.
+    """
     sink = ElasticsearchSink(
         "http://es:9200", index="logs", opener=FakeOpener([FakeResponse(200, body)])
     )
@@ -202,7 +234,7 @@ def test_a_short_items_array_and_an_unreadable_body_write_the_same_shape_of_line
     assert sink.dropped_unadjudicated == 2
     assert (
         "lost 2 event(s); ElasticsearchSink could not adjudicate a _bulk response "
-        "(2 event(s) sent, 1 readable item(s), 1 error(s)); not retried"
+        "(2 event(s) sent, 1 readable item(s), 1 error(s)); they may have landed; not retried"
     ) in capsys.readouterr().err
 
 
