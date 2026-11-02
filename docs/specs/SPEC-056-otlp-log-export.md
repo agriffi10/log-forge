@@ -160,7 +160,13 @@ raise, to loop, or to write something a parser refuses.
    `float.__float__`, `dict.items`, `list.__iter__`, `tuple.__iter__` — the rule `sanitize` already
    follows with `_INT_LT` and `_FLOAT_REPR`. A subclass whose `__str__`, `__repr__`, `__eq__`,
    `__float__` or `items` lies, or raises, therefore cannot change what is written. A `Mapping` or
-   sequence that is not a `dict`, `list` or `tuple` is outside the domain (rule 9).
+   sequence that is not a `dict`, `list` or `tuple` is outside the domain (rule 9). **An object can
+   pass `isinstance` and still not be the type.** `class Claim: __class__ = property(lambda s:
+   str)` makes `isinstance(Claim(), str)` true, and `str.__str__(Claim())` raises `TypeError`
+   (probed at `e8cbd5d`, and the same for `int.__repr__` with a claimed `int`), which is the case
+   `sanitize.key` names. So the `isinstance` test is not the dispatch: the unbound read is, and it
+   runs inside the guard, so an object that fails it is rule 9 as a value, rule 8 as a key, and
+   `None` as a resource stamp.
 3. **Every string written is valid UTF-8.** A lone surrogate, in a value, a key, a message or any
    `error` string, is replaced by U+FFFD and the record is marked `log_foundry.truncated`, the
    SPEC-055 rule. `json.dumps` escapes a lone surrogate happily, and `json_format.Parse` then
@@ -197,6 +203,16 @@ raise, to loop, or to write something a parser refuses.
    containers around it end there, and the record is marked. The placeholder is the one value
    written past the budget, as in `sanitize`, so a cut record holds `MAX_NODES` values plus
    `<node limit>`. The budget is checked before `MAX_NEST`, so a value past both is `<node limit>`.
+   **The walk order is fixed: the library attributes are charged first, then `body`, then the
+   user's `fields` in event order.** A hostile `message` can spend the whole budget and cut itself
+   and every field after it, but it cannot remove `code.function.name`, `log.record.uid`,
+   `log_foundry.status`, `exception.type`, `exception.message`, `exception.stacktrace` or any other
+   library attribute, which cost fewer than a dozen values and are charged before it is read. The
+   values of an attribute that is dropped (a collision or a reserved-prefix key, rule 8) are never
+   walked and cost nothing. **The `log_foundry.truncated` mark is not a counted value.** It is
+   decided after the walk, written in its place in the table's order, and written even when the
+   budget is already spent, so a cut record is always marked and the count of `MAX_NODES` values
+   plus the placeholder excludes it.
    **The number, the placeholder text, the stop and the order of checks are SPEC-057's**, which
    gives `sanitize` a private `_MAX_NODES = 131_072`, a `<node limit>` placeholder and the same
    stop rule for an assembly pass (`e8cbd5d`), and they are equal on purpose: one hostile shape
@@ -214,16 +230,39 @@ raise, to loop, or to write something a parser refuses.
    took 0.58 s; not re-measured at `1130461` — which is what a hostile record may hold the drain
    thread for, or on the orphan path the caller's, invariant 4. The constant's docstring says this beside the number. A smaller budget
    would cut legitimate events; a larger one makes the hostile one cost seconds.
-8. **Keys are rendered, non-empty and unique.** A `str` key is used as it is (rule 3 applies); any
-   other key becomes `<unserializable key: T>` and marks the record, the one placeholder invariant 8
-   says marks. A key that is **empty**, or that renders to one already written — two non-`str` keys
-   of one type both become `<unserializable key: int>` — is dropped, at any level of nesting, and its
-   record's `droppedAttributesCount` counts it; the first of a repeated key stands. OTLP requires
-   unique keys and OpenTelemetry non-empty ones, `json_format.Parse` accepts duplicates and
-   `MessageToDict` writes an empty key back as no key at all, so neither would say so. Assembly does
-   produce an empty key: `lf.info("m", fields={"": 1})` carries one.
+8. **Keys are rendered as `sanitize` renders them, and are non-empty and unique.** Assembly has
+   already made every key a `str`, so this rule is reached by a `TransformSink`, which passes the
+   `int`, `float`, `bool` and `None` keys `json.dumps` accepts (probed at `e8cbd5d`), and by a
+   direct `emit`. The trigger is `sanitize._Coercer.key`'s: a key is replaced by a placeholder
+   only when it cannot be rendered, because invariant 8 says "a key that cannot be rendered", and
+   a key that renders is not a substitution. A `str` key is used as it is, read through
+   `str.__str__` (rule 3 applies); a `bool` is `"True"` or `"False"`, tested before `int`; any
+   other `int` is its digits through `int.__repr__`, and one too long for
+   `sys.get_int_max_str_digits()` is `<int: ~N digits>` and marks (rule 5); a finite `float` is
+   `float.__repr__`; a non-finite float is `<float: nan>`, `<float: inf>` or `<float: -inf>` and
+   marks, as in `sanitize`; `None` is `"None"`. Anything else — a `tuple`, a `Decimal`, any object —
+   and any key whose unbound read raises, an object that claims `str` or `int` only through
+   `__class__` included, becomes `<unserializable key: T>`, `T` being the type name as rule 9
+   reads it, and marks the record, the one placeholder invariant 8 says marks. Two differences from
+   `sanitize` are deliberate. `sanitize` renders those other types with the key's own `str()`
+   (probed at `e8cbd5d`: a `tuple` key becomes `"(1, 2)"`, a `Decimal("1.5")` key `"1.5"`, an `int`
+   subclass whose `__str__` returns `"evil"` becomes `"evil"`), and `_otel` calls no code of a key
+   it was handed (rule 2), so those are a placeholder here, and an `int` subclass is its digits;
+   only a direct `emit` reaches either, since `json.dumps` refuses a `tuple` or `Decimal` key
+   before a transform returns. And where two keys render to one string `sanitize` keeps the later
+   silently, while here the first stands and the drop is counted. A key that is **empty**, or that
+   renders to one already written — `1` and `"1"`, or two unrenderable keys of one type, which
+   share one `<unserializable key: T>` — is dropped, at any level of nesting, and its record's
+   `droppedAttributesCount` counts it. OTLP requires unique keys and OpenTelemetry non-empty ones,
+   `json_format.Parse` accepts duplicates and `MessageToDict` writes an empty key back as no key at
+   all, so neither would say so. Assembly does produce an empty key: `lf.info("m", fields={"": 1})`
+   carries one.
 9. **Anything else** — a value outside the domain assembly produces — becomes the `stringValue`
    `<unserializable: T>` naming only its type, never a `repr` (arch §6); a key outside it is rule 8.
+   `T` is read the way `sanitize._type_name` reads it: `str(type(value).__name__)`, which goes
+   through rule 3 like any string written, and `"?"` when that raises, as it does for a metaclass
+   whose `__name__` is a raising property. `type()` ignores `__class__`, so `Claim` above is
+   `Claim`.
 
 **The timestamp is converted with integer arithmetic, and `_otel` does not reuse
 `sinks/_time.epoch_nanos`.** At `68caacf` that function went through a float and was inexact — it
@@ -238,9 +277,13 @@ number, where the mapping accepts one shape and a `uint64` range. And it lives i
 while `_otel` is a leaf that imports nothing from the package at runtime. The mapping accepts exactly
 the library's own shape: UTC, three fractional digits and a trailing `Z`, as in
 `2026-10-05T12:34:56.789Z`. Anything else is unusable, and an unusable timestamp omits both time
-fields rather than reading a clock. `epoch_nanos` is the independent oracle for the shape both
-accept: a test asserts the mapping's `timeUnixNano` equals `str(epoch_nanos(ts))` for the library's
-own shape, so two exact conversions are held to agree.
+fields rather than reading a clock. **A timestamp at or before the epoch is unusable too.**
+`"1970-01-01T00:00:00.000Z"` would give `timeUnixNano "0"`, which OTLP defines as unknown, and a
+zero `fixed64` is a proto3 default that `MessageToDict` omits, so the round trip in FR-002 would
+fail on it (probed at `e8cbd5d` with `opentelemetry-proto` 1.45.0). `epoch_nanos` is the independent
+oracle for the shape both accept after the epoch: a test asserts the mapping's `timeUnixNano`
+equals `str(epoch_nanos(ts))` for the library's own shape, so two exact conversions are held to
+agree.
 
 **`exception.type` is module-qualified**: `module.Type`, except that a `builtins` exception, and one
 with no recorded module, uses the bare name — so an `OSError` reads `OSError`, as the convention's
@@ -258,8 +301,9 @@ through untouched.
 
 **What is marked and what is counted.** `log_foundry.truncated` is set by: the event's own
 `truncated: True`; a lone surrogate replaced (rule 3); an integer too long to render (rule 5); the
-depth cut and the node cut (rules 6 and 7); and a non-`str` key written as a placeholder (rule 8).
-It is **not** set by `<circular>` or by a value `<unserializable: T>`, which like any type-name
+depth cut and the node cut (rules 6 and 7); and a key written as a placeholder, a non-finite
+`float` key or an over-long `int` key (rule 8). A key that renders — an `int`, `bool`, finite
+`float` or `None` — marks nothing. It is **not** set by `<circular>` or by a value `<unserializable: T>`, which like any type-name
 placeholder are visible on their own (invariant 8); by an integer beyond int64 written as its
 digits, which loses nothing; or by a non-finite float spelled `"NaN"`, which is how OTLP/JSON
 writes one. Everything *dropped* — a collision, a reserved-prefix key, a repeated or empty key — is
@@ -271,8 +315,8 @@ counted in `droppedAttributesCount` and is not marked.
       `observedTimeUnixNano` the same string; `"1970-01-01T00:00:00.001Z"` maps to `"1000000"`; and
       for each of those and three more library-shaped timestamps `timeUnixNano` equals
       `str(sinks._time.epoch_nanos(ts))`.
-- [ ] A timestamp that is absent, not a `str`, lacks the `Z`, is before 1970, is past the largest
-      `uint64` nanosecond, or names an impossible date (`"2026-02-30T00:00:00.000Z"`) omits both
+- [ ] A timestamp that is absent, not a `str`, lacks the `Z`, is at or before the epoch (`"1970-01-01T00:00:00.000Z"`
+      and `"1969-12-31T23:59:59.999Z"` both), is past the largest `uint64` nanosecond, or names an impossible date (`"2026-02-30T00:00:00.000Z"`) omits both
       time fields, and the call returns; no clock is read, asserted by patching `time.time_ns` and
       `time.time` to raise, which `epoch_nanos` fails on the impossible date.
 - [ ] The five levels map to 5, 9, 13, 17 and 21; `"TRACE"` and `"info"` carry no `severityNumber`
@@ -317,7 +361,14 @@ counted in `droppedAttributesCount` and is not marked.
       `__iter__` lies, each map exactly as their base value would, and `"evil"` and `99.0` appear
       nowhere in the output; a `Mapping` that is not a `dict` maps to `<unserializable: T>` both
       when its `items` raises and when it does not (`types.MappingProxyType({"a": 1})` gives
-      `<unserializable: mappingproxy>`).
+      `<unserializable: mappingproxy>`). These call `log_record` directly: assembly coerces all of
+      them first.
+- [ ] A `Claim` object (`__class__` returns `str`, so `isinstance(Claim(), str)` is true and
+      `str.__str__` raises) as a message, a field value and an `error.message` gives
+      `<unserializable: Claim>` (or omits the `error` string), an `IntClaim` likewise, and neither
+      raises; as a key each gives `<unserializable key: Claim>`, marked. An instance of a class
+      whose metaclass has a raising `__name__` property gives `<unserializable: ?>` as a value and
+      `<unserializable key: ?>` as a key, marked, and neither raises.
 - [ ] Nested lists around a scalar `1`: 23 and 24 deep render whole, the innermost leaf an
       `{"intValue": "1"}`, with no mark; 25 deep renders 24 containers and the 25th is the
       `stringValue` `<depth limit>`, marked. A list nested 2,000 deep is cut the same way at the
@@ -325,16 +376,31 @@ counted in `droppedAttributesCount` and is not marked.
 - [ ] `x = []; x.append(x); x.append(x)` as a field value returns in under a second, written as an
       `arrayValue` of two `<circular>` strings, unmarked.
 - [ ] `y = []` rebuilt 24 times as `y = [y, y]` — shared subtrees, not a cycle — returns within ten
-      seconds, holds exactly `MAX_NODES` values plus the one `<node limit>` placeholder, and is
-      marked; a field holding 256 lists of 256 integers (65,793 values counting the lists and the
-      field) is written whole and unmarked.
+      seconds, holds exactly `MAX_NODES` values plus the one `<node limit>` placeholder, counting
+      every value the record holds (library attributes, body and fields) and not the
+      `log_foundry.truncated` mark, and is marked; a field holding 256 lists of 256 integers (65,793
+      values counting the lists and the field) is written whole and unmarked.
+- [ ] The walk order holds: on a `span.end` event with a function, a log id, a status, an error and
+      `fields={"k": 1}`, a `message` that is the 24-level shared `[y, y]` structure returns within
+      ten seconds, its body contains `<node limit>`, every library attribute is present with its own
+      value, `k` is absent with no `droppedAttributesCount`, and `log_foundry.truncated` is `true`
+      although the budget was spent before it was written.
 - [ ] `_otel.MAX_NODES == sanitize._MAX_NODES` and the `<node limit>` text written equals
       `sanitize._NODE_LIMIT`, so SPEC-057's budget and this one cannot drift apart unseen.
-- [ ] `fields={1: "a", 2: "b"}` gives one `<unserializable key: int>` attribute holding `"a"`,
-      `droppedAttributesCount == 1`, and a marked record; `fields={"": 1}` gives no attribute,
-      `droppedAttributesCount == 1` and no mark; `{"a": {"": 1, "b": 2}}` and the same pair of
-      non-`str` keys nested in a field value are cleaned the same way and counted in the record's
-      `droppedAttributesCount`.
+- [ ] Keys, through `log_record` called directly, since assembly has already made every key a
+      `str`: `fields={1: "a", 2: "b"}` gives attributes `"1"` holding `"a"` and `"2"` holding
+      `"b"`, with no `droppedAttributesCount` and no mark, and the same `fields` returned by a
+      `TransformSink` ahead of an `OTLPSink` arrive as both attributes; `{True: 1, None: 2, 1.5: 3}`
+      gives `"True"`, `"None"` and `"1.5"` unmarked; `{float("nan"): 1}` gives `"<float: nan>"` and
+      `{10**5000: 1}` gives `"<int: ~5001 digits>"`, each marked; an `int` subclass key whose
+      `__str__` returns `"evil"` gives its digits; `{(1, 2): 1}`, a `Decimal` key, a key whose
+      `__str__` raises, a `Claim` and a `?`-named type give `<unserializable key: T>` with the
+      right `T`, each marked. `{1: "a", "1": "b"}` gives one attribute `"1"` holding `"a"`,
+      `droppedAttributesCount == 1` and no mark, and two keys that raise on render give the first's
+      value under one placeholder, `droppedAttributesCount == 1` and a marked record.
+      `fields={"": 1}` gives no attribute, `droppedAttributesCount == 1` and no mark; `{"a": {"": 1,
+      "b": 2}}` and each case above nested in a field value are cleaned the same way and counted in
+      the record's `droppedAttributesCount`.
 - [ ] On a `span.end` event with an error, user `fields` named `log_foundry.status`,
       `code.function.name` and `exception.type` are all absent from the attributes, the library's
       values stand, and `droppedAttributesCount == 3`. On an ordinary `info` event the same three
@@ -345,8 +411,8 @@ counted in `droppedAttributesCount` and is not marked.
       `<unserializable: object>`, `2**63` written as digits, `float("nan")`, and each drop that
       leaves nothing else behind — a collision, the reserved prefix, an empty key — carries no
       `log_foundry.truncated`; a record built from each of `<depth limit>`, `<node limit>`,
-      `10**5000`, a lone surrogate, a non-`str` key and an event with `truncated: True` carries it,
-      one record per case.
+      `10**5000`, a lone surrogate, a key that cannot be rendered and an event with
+      `truncated: True` carries it, one record per case; an `int` key marks nothing.
 - [ ] Every record produced by the criteria above, wrapped by FR-002's envelope, passes FR-002's
       round-trip helper — parsed, re-serialized equal, ids intact — and has no repeated key in its
       attributes or in any `kvlistValue`, asserted separately because `Parse` accepts duplicates;
@@ -376,7 +442,8 @@ and `_body` both call it from inside `emit`. `_items` guards `_item_size` per ev
 FR-005, so a raise there costs that one event, but `_body` is called from `_deliver` and
 `_known_refused` outside any guard, so a raise there fails the batch. Each stamp is read
 as FR-001 reads any string: a `str`, or a subclass of one through `str.__str__`, with a lone
-surrogate replaced by U+FFFD (rule 3); anything else is `None`, and so is every stamp of an event
+surrogate replaced by U+FFFD (rule 3); anything else is `None`, an object that claims to be a `str`
+only through `__class__` included (rule 2), and so is every stamp of an event
 that is not a `dict`, which is read through `dict.get`, unbound. The key is therefore always a
 tuple of exact `str`s and `None`s — hashable, and valid UTF-8. The build review's repro, at `68caacf`, was a `str`
 subclass whose `__hash__` raises, set on a stamp through a `TransformSink`: a `RuntimeError`
@@ -399,7 +466,10 @@ canonical throughout: a field at its proto3 default is omitted and an empty list
 so an empty `scope_version` leaves `version` out and an event with no usable stamp leaves `resource`
 an empty object — which `MessageToDict` writes back identically, and the comparison below depends
 on it. `_otel.framing(key, scope_version)` is what one group costs around its records,
-`len(request_body([(key, "")], v)) - len(request_body([], v))`; FR-003's `_item_size` charges it.
+`len(request_body([(key, "")], v).encode("utf-8")) - len(request_body([], v).encode("utf-8"))`, in
+UTF-8 bytes, the unit `_item_size` charges; whether `request_body` escapes non-ASCII or writes it
+raw, the encoded length is the one that counts, since `ensure_ascii=False` makes a stamp such as
+`café` longer in bytes than in characters (probed: 22 characters, 27 bytes).
 
 **The proof is a round trip through the generated classes.** Everything above is JSON that could be
 shaped wrongly and still look right, and a dev-only `opentelemetry-proto` is what can say so. The
@@ -449,15 +519,18 @@ headroom left — keeping `azure/` and naming `google/`, the `unused-ignore` cod
       share a group; two events differing only in `version` do not.
 - [ ] `resource_key` never raises: a stamp that is a `str` subclass whose `__hash__` raises, and
       one whose `__eq__` and `__str__` lie, are read as their plain text; a stamp holding a lone
-      surrogate is read with U+FFFD in its place; a stamp of any other type, and every stamp of an
-      event that is not a `dict`, are `None`. `request_body` over five pairs, one keyed by such a
+      surrogate is read with U+FFFD in its place; a `Claim` stamp (`isinstance` true,
+      `str.__str__` raises), a stamp of any other type, and every stamp of an event that is not a
+      `dict`, are `None`. `request_body` over five pairs, one keyed by such a
       stamp, returns one document holding all five records, each in its own key's group, and it
       passes the round-trip helper (invariants 1 and 2).
 - [ ] An empty `scope_version` leaves the `version` key out, and an event with all three stamps
       unusable gives a `resource` that is `{}`; both round-trip.
-- [ ] `framing(key, v)` equals `len(request_body([(key, "")], v)) - len(request_body([], v))`, in
-      bytes, for three different keys, and a document holding `n` records of one key is exactly
-      `len(request_body([], v)) + framing(key, v) + n * record_length + (n - 1)` bytes long.
+- [ ] `framing(key, v)` equals `len(request_body([(key, "")], v).encode("utf-8")) -
+      len(request_body([], v).encode("utf-8"))` for three different keys, one of them with a
+      non-ASCII stamp (`service="café-世界"`), and a document holding `n` records of one key is
+      exactly `len(request_body([], v).encode("utf-8")) + framing(key, v) + n * record_length +
+      (n - 1)` bytes long, `record_length` being the record's UTF-8 length.
 - [ ] Patching `_otel.SEMCONV_VERSION` to `"9.9.9"` changes both schema URLs in the next
       `request_body` and nothing else, and the module has no URL constant of its own.
 - [ ] The round trip over a corpus — every level, `span.start`, `span.end` with and without an
@@ -541,7 +614,7 @@ resource adds a `resource`, a `scopeLogs` wrapper and two schema URLs, and a `co
 can put several resources in one chunk. `_item_size` therefore charges each record
 `_otel.framing(key, version)` — the framing its own resource's group costs — plus the separator that
 joins it to its neighbour, and `_body_reserve` withholds the `{"resourceLogs":[…]}` wrapper
-(`len(request_body([], v))`) — the `LokiSink` method, over-counting when events share a resource,
+(`len(request_body([], v).encode("utf-8"))`) — the `LokiSink` method, over-counting when events share a resource,
 which is the safe direction: it makes more requests than strictly needed and never one the
 destination rejects. The cost is real and stated: a chunk of one resource is charged an envelope per
 record, so it carries fewer records than the budget alone would allow. `max_batch_bytes` is measured
@@ -624,11 +697,13 @@ by an answer that exists only in an ancestor's docstring.
       as a mutant, fails the **three-resource** half on the length assertion; the one-resource half
       is not asked to catch it, because there the slack left by greedy filling can absorb the single
       uncharged envelope (measured in the build review).
-- [ ] A batch of five events, one of them carrying a stamp that is a `str` subclass whose
-      `__hash__` raises (set through a `TransformSink`, which passes it unchanged) and another a
-      stamp with a lone surrogate (passed to `emit` directly, since a `TransformSink` now replaces
-      it), makes one request holding all five records, parseable, with `losses().dropped == 0`
-      and no exception out of `emit` (invariants 1 and 2).
+- [ ] A batch of five events, one carrying a stamp that is a `str` subclass whose `__hash__`
+      raises and another a stamp with a lone surrogate, both passed to `emit` directly, makes one
+      request holding all five records, parseable, with `losses().dropped == 0` and no exception
+      out of `emit`. Separately, a batch of five whose only hostile event carries the `__hash__`
+      stamp, returned by a `TransformSink` ahead of an `OTLPSink`, also delivers all five in one
+      request, since that stamp passes the transform unchanged; the surrogate stamp cannot take
+      that route, which replaces it before the sink sees it (invariants 1 and 2).
 - [ ] An event whose record plus framing exceeds the budget is dropped and counted in
       `losses().dropped`, with one stderr line naming `OTLPSink` and a byte count and no event
       content, and the events beside it are delivered (invariants 2 and 11).
@@ -658,12 +733,25 @@ OTLP answers `200` for full success, and for partial success too: the body carri
 `partialSuccess` with `rejectedLogRecords` (an `int64`, which OTLP/JSON writes as a decimal string
 and accepts as a number) and an `errorMessage`. **`OTLPSink._handle_response` never raises**, on any
 bytes: an exception escaping it escapes `emit`, and the worker then re-sends chunks that already
-landed. It follows `ElasticsearchSink._parse_bulk_response` and sorts a body into three outcomes.
+landed. It follows `ElasticsearchSink._parse_bulk_response` in shape and sorts a body into three
+outcomes, **but the builder must not copy that method's `except`**: it catches only
+`(ValueError, TypeError)`, so a `RecursionError` from a deeply nested body escapes it (probed at
+`e8cbd5d`: `json.loads(b"[" * 1_000_000)` raises `RecursionError`, which is not a `ValueError`),
+and this method's never-raises criterion demands more. The Elasticsearch sink is not changed.
 
 - **Full success.** A body that is empty, not JSON, not an object, or without a `partialSuccess`
   (absent or `null`) — which is what a server MUST send on success — and a `partialSuccess` whose
   count is `0`, absent or `null`, which OTLP uses to carry a warning in `errorMessage`. The chunk is
-  settled; nothing is counted or written.
+  settled; nothing is counted or written. "Not JSON" is a body `json.loads` rejects as malformed or
+  too deep, a `RecursionError` included: a proxy's page or a protobuf body is not this sink's to
+  adjudicate (Out of Scope), and the request succeeded. **The one parse failure that is not "no
+  content" is an over-long bare integer.** A bare 5,000-digit `rejectedLogRecords` makes
+  `json.loads` raise `ValueError` ("Exceeds the limit (4300 digits)"), which would read as not-JSON
+  and settle as full success while its string twin, `"1" * 5000`, is unadjudicated. The body is
+  therefore parsed with `parse_int=str`, which hands every bare integer over as its digit string
+  and never converts it (probed at `e8cbd5d`: a 5,000-digit integer arrives as a 5,000-character
+  `str`, `-1` as `"-1"`, `true` and `1.5` unchanged), so a bare integer takes the same digit rule as
+  a string: `2` and `"2"` are two rejected, and the over-long one is unadjudicated.
 - **Rejected.** A `partialSuccess` object whose `rejectedLogRecords` is an integer, or a string of
   ASCII decimal digits, in `1 … 2**63 - 1`. It is added to a new `rejected_records` counter, clamped
   to the chunk's size so a hostile or confused server cannot inflate `failed` past what was sent.
@@ -713,7 +801,9 @@ rejection at all.
       (invariant 11).
 - [ ] `rejectedLogRecords` of `"9"` against a five-record chunk counts `5`, never `9` (and, as that
       rejects the whole chunk, raises as in the criterion below).
-- [ ] Each of `"-1"`, `"x"`, `true`, `1.5`, `[]`, `"1" * 5000` and `10**30` as the count, and each of
+- [ ] Each of `"-1"`, `"x"`, `true`, `1.5`, `[]`, `"1" * 5000`, `10**30`, the bare number `-1`
+      and 5,000 digits written as a bare number (which a default `json.loads` rejects, so a parse
+      that read it as not-JSON would settle it as full success), as the count, and each of
       `5`, `[]` and `"x"` as the whole `partialSuccess`, against a five-record chunk makes exactly
       one request, raises nothing, leaves `dropped_unadjudicated == 5` and `losses().failed == 5`,
       and writes one stderr line naming `OTLPSink` and the noun `log record(s)` and carrying no
@@ -840,7 +930,7 @@ def resource_key(event: Mapping[str, object]) -> ResourceKey
 def request_body(records: Sequence[tuple[ResourceKey, str]], scope_version: str) -> str
     # ExportLogsServiceRequest JSON; one resourceLogs per distinct key, first-seen order
 def framing(key: ResourceKey, scope_version: str) -> int
-    # len(request_body([(key, "")], v)) - len(request_body([], v)): one group around its records
+    # the same difference in UTF-8 bytes of request_body([(key, "")], v) and request_body([], v)
 
 # src/log_foundry/sinks/http.py
 class HTTPSink:
@@ -980,7 +1070,7 @@ new module makes a derived test demand, and nothing that test does not demand wa
 ### Phase 4: The rest of the registration
 
 - The README subsection and the amended retry sentence, the exact-set attribute test,
-  `_FORWARDING_SINKS` with its floor, the two builder lists with their tie assertions and
+  `_FORWARDING_SINKS` with its exact count raised to 8, the two builder lists with their tie assertions and
   `OpenSearchSink`'s entries, the typed-consumer probe; each roster entry removed once to see it
   fail.
 
@@ -1022,3 +1112,11 @@ new module makes a derived test demand, and nothing that test does not demand wa
   cap-20 cycle figures in rule 6. Re-measured at `1130461` against `opentelemetry-proto` 1.45.0 and
   `protobuf` 7.36.2: the `Parse` properties and the 31-versus-32 `kvlistValue` depth in FR-002, and
   the `mypy` failure and its fix on `mypy` 2.4.0.
+- **2026-11-02 — pre-push review, nine findings accepted, at `e8cbd5d`.** Rule 8 now renders keys
+  as `sanitize` does and replaces only a key that cannot be rendered; rule 7 fixes the walk order
+  (library attributes, body, fields) and leaves the mark uncounted; the FR-003 batch of five no
+  longer describes a route no transform can take; the `__class__` impostor and the raising
+  `__name__` metaclass are criteria; `framing` is in UTF-8 bytes; a timestamp at or before the
+  epoch is unusable; a bare over-long `rejectedLogRecords` is unadjudicated, by `parse_int=str`; the
+  `_FORWARDING_SINKS` and `INDEX.md` wording is corrected; and FR-004 warns the builder off
+  `ElasticsearchSink._parse_bulk_response`'s narrow `except`.
