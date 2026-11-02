@@ -967,7 +967,8 @@ class HTTPSink:
           items: The chunk to send, known non-empty.
 
         Returns:
-          True when the chunk was delivered, False for a failure a retry might yet fix.
+          True when the chunk is settled as ``emit`` defines it, False for a failure a retry might
+          yet fix.
 
         Raises:
           _PayloadTooLarge: When the destination refused the request as too large.
