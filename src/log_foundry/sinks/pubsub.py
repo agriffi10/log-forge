@@ -137,7 +137,7 @@ class GooglePubSubSink:
           ImportError: If the ``gcp-pubsub`` extra is not installed.
         """
         if client is None:
-            from google.cloud import pubsub_v1  # type: ignore[import-not-found]
+            from google.cloud import pubsub_v1  # type: ignore[import-not-found, unused-ignore]
 
             client = pubsub_v1.PublisherClient()
         self.topic = topic

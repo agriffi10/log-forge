@@ -784,7 +784,7 @@ def test_five_events_map_independently_and_none_is_mutated() -> None:
     events: list[dict[str, object]] = [
         _event(),
         _event(level="INFO", message="m", fields={"a": [1, 2], "b": {"c": None}}),
-        _event(fields={10**5000: 1, "": 2, Lying(3): 4, "log_foundry.x": 5, "k": SENTINEL}),
+        _event(fields={10**5000: 1, "": 2, Lying(3): 4, "log_foundry.x": 5, "k": "plain"}),
         _event(message={"deep": _nested(30)}),
         _event(trace_id="0" * 32, fields={}),
     ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sys
@@ -9,7 +10,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 SEMCONV_VERSION = "1.44.0"
 """The semantic-conventions release the attribute names follow (SPEC-056 FR-002).
@@ -682,3 +683,148 @@ def _user_attributes(
         seen.add(key)
         pairs.append((key, walker.value(raw_value, 1, [])))
     return pairs
+
+
+def resource_key(event: Mapping[str, object]) -> ResourceKey:
+    """Reads an event's three resource stamps as the key its ``resourceLogs`` group is formed on.
+
+    Total, because ``HTTPSink._body`` calls it outside any guard, so a raise here fails the whole
+    ``emit`` (SPEC-056 FR-002). Each stamp is read as any string target is: an exact ``str``, or a
+    subclass through ``str.__str__``, with a lone surrogate replaced by U+FFFD; anything else is
+    ``None``, an object claiming ``str`` through ``__class__`` included, and so is every stamp
+    of an event that is not a ``dict``. The repair is not marked: a stamp is configuration, not
+    record data, and ``configure()`` already refuses one that cannot encode.
+
+    Args:
+      event: The event, or whatever a caller handed the sink.
+
+    Returns:
+      ``(service, version, env)``, each an exact ``str`` or ``None`` — hashable, valid UTF-8.
+
+    Raises:
+      None.
+    """
+    if not isinstance(event, dict):
+        return (None, None, None)
+    try:
+        stamps = [_text(_read(event, name)) for name in ("service", "version", "env")]
+    except Exception:
+        return (None, None, None)
+    service, version, env = (None if read is None else read[0] for read in stamps)
+    return (service, version, env)
+
+
+_RESOURCE_ATTRIBUTES = ("service.name", "service.version", "deployment.environment.name")
+
+
+def _dumps(value: object) -> str:
+    """Serializes one envelope part compactly, non-ASCII raw, refusing a non-finite number.
+
+    Args:
+      value: A dict or string built here, never a caller's value.
+
+    Returns:
+      The JSON text.
+
+    Raises:
+      None.
+    """
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _group(key: ResourceKey, records: Sequence[str], scope: str, schema_url: str) -> str:
+    """Assembles one ``resourceLogs`` entry around its records, in canonical form.
+
+    A field at its proto3 default is omitted and an empty list is never written: a stamp that is
+    ``None`` leaves its attribute out, and all three leave ``resource`` an empty object, which is
+    what ``MessageToDict`` writes back, so the round trip can compare.
+
+    Args:
+      key: The group's resource key.
+      records: The rendered records, already JSON.
+      scope: The ``scope`` object, already JSON.
+      schema_url: The schema URL, already JSON.
+
+    Returns:
+      The entry's JSON text.
+
+    Raises:
+      None.
+    """
+    attributes = [
+        {"key": name, "value": {"stringValue": stamp}}
+        for name, stamp in zip(_RESOURCE_ATTRIBUTES, key, strict=True)
+        if stamp is not None
+    ]
+    resource = _dumps({"attributes": attributes}) if attributes else "{}"
+    return (
+        '{"resource":'
+        + resource
+        + ',"scopeLogs":[{"scope":'
+        + scope
+        + ',"logRecords":['
+        + ",".join(records)
+        + '],"schemaUrl":'
+        + schema_url
+        + '}],"schemaUrl":'
+        + schema_url
+        + "}"
+    )
+
+
+def request_body(records: Sequence[tuple[ResourceKey, str]], scope_version: str) -> str:
+    """Builds the ``ExportLogsServiceRequest`` JSON for rendered records (SPEC-056 FR-002).
+
+    One ``resourceLogs`` per distinct key, in first-seen order, because ``configure()`` mid-run
+    changes a stamp for events not yet built and one batch can hold both; within a group the
+    records keep event order. The schema URL is derived from :data:`SEMCONV_VERSION` here, at
+    call time. Records are joined with a single comma and no whitespace, which is the separator
+    byte :func:`framing`'s arithmetic and ``OTLPSink._item_size`` count.
+
+    Args:
+      records: ``(resource_key, rendered_record)`` pairs in event order, each record already
+        serialized by ``json.dumps``.
+      scope_version: The library version for ``scope.version``; empty leaves the key out.
+
+    Returns:
+      The request document as a string; ``{"resourceLogs":[]}`` for no records.
+
+    Raises:
+      None.
+    """
+    groups: dict[ResourceKey, list[str]] = {}
+    for key, rendered in records:
+        groups.setdefault(key, []).append(rendered)
+    scope: dict[str, str] = {"name": SCOPE_NAME}
+    if scope_version:
+        scope["version"] = scope_version
+    scope_json = _dumps(scope)
+    schema_url = _dumps(f"https://opentelemetry.io/schemas/{SEMCONV_VERSION}")
+    return (
+        '{"resourceLogs":['
+        + ",".join(_group(key, items, scope_json, schema_url) for key, items in groups.items())
+        + "]}"
+    )
+
+
+def framing(key: ResourceKey, scope_version: str) -> int:
+    """Returns what one resource group costs around its records, in UTF-8 bytes.
+
+    The unit ``HTTPSink._item_size`` charges: a ``resource``, a ``scopeLogs`` wrapper and two
+    schema URLs. Computed as the difference between a request holding one empty record under
+    this key and an empty request, so it can never disagree with :func:`request_body`, and in
+    bytes rather than characters because ``ensure_ascii=False`` makes a stamp such as ``café``
+    longer in bytes than in characters.
+
+    Args:
+      key: The resource key.
+      scope_version: The library version the scope carries.
+
+    Returns:
+      The group's framing in bytes.
+
+    Raises:
+      None.
+    """
+    with_one = len(request_body([(key, "")], scope_version).encode("utf-8"))
+    return with_one - len(request_body([], scope_version).encode("utf-8"))
