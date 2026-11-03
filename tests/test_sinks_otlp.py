@@ -6,10 +6,12 @@ from __future__ import annotations
 import ast
 import gzip
 import json
+import socketserver
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -26,6 +28,9 @@ from test_otel_envelope import roundtrip
 from test_sink_concurrency import PER_THREAD, THREADS, SlowCounter
 from test_sinks_http import FakeOpener, FakeResponse
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 STAMP = "2026-10-05T12:34:56.789Z"
 MIB = 1024 * 1024
@@ -785,3 +790,90 @@ def test_a_subclass_refusal_names_the_subclass() -> None:
         _MyOTLP(method="PUT")
     with pytest.raises(ValueError, match=r"^_MyOTLP timeout"):
         _MyOTLP(timeout=-1)
+
+
+# --- the bounded read inside #283's guard, through a real socket --------------------------
+
+
+class _TruncatingServer(socketserver.TCPServer):
+    """A loopback server answering every POST with a ``200`` whose body ends early.
+
+    ``mode`` is ``"content-length"`` — a complete ``partialSuccess`` rejecting every record, under a
+    ``Content-Length`` that promises more, then a close — or ``"chunked"`` — the same verdict as
+    one chunk and then a close with no terminating chunk.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, mode: str) -> None:
+        super().__init__(("127.0.0.1", 0), _TruncatingHandler)
+        self.mode = mode
+        self.posts = 0
+
+
+_VERDICT = b'{"partialSuccess":{"rejectedLogRecords":"5"}}'
+
+
+class _TruncatingHandler(socketserver.StreamRequestHandler):
+    server: _TruncatingServer
+
+    def handle(self) -> None:
+        self.rfile.readline()
+        length = 0
+        while True:
+            line = self.rfile.readline()
+            if not line.strip():
+                break
+            name, _, value = line.decode("latin-1").partition(":")
+            if name.strip().lower() == "content-length":
+                length = int(value)
+        self.rfile.read(length)
+        self.server.posts += 1
+        if self.server.mode == "content-length":
+            head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n"
+            self.wfile.write(head + _VERDICT)
+        else:
+            head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            self.wfile.write(head + b"%x\r\n" % len(_VERDICT) + _VERDICT + b"\r\n")
+        self.wfile.flush()
+
+
+@contextmanager
+def _truncating(mode: str) -> Iterator[_TruncatingServer]:
+    server = _TruncatingServer(mode)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("mode", ["content-length", "chunked"])
+def test_a_truncated_2xx_reaches_the_sink_as_empty_and_is_full_success(mode: str) -> None:
+    """The bounded read matches the unbounded one: a short body is ``b""``, never short bytes.
+
+    The verdict on the wire is complete and rejects every record, so a bounded read that handed
+    the short bytes on — ``read(amt)`` returns them silently on a ``Content-Length`` body,
+    with ``response.length`` still owing — would parse it and raise; the ``response.length``
+    check turns it into ``b""``, which FR-004 reads as full success, uncounted (#283's rule).
+    """
+    seen: list[bytes] = []
+    with _truncating(mode) as server:
+        sink = OTLPSink(f"http://127.0.0.1:{server.server_address[1]}/v1/logs", timeout=5.0)
+        original = sink._handle_response
+
+        def spy(payload: bytes, items: list[Any]) -> bool:
+            seen.append(payload)
+            return original(payload, items)
+
+        sink._handle_response = spy  # type: ignore[method-assign]
+        sink.emit([_event(i) for i in range(5)])
+        posts = server.posts
+    assert posts == 1
+    assert seen == [b""]
+    assert (sink.rejected_records, sink.dropped_unadjudicated) == (0, 0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)

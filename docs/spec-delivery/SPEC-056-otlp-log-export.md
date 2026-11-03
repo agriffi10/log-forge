@@ -38,15 +38,19 @@ must be tagged before this lands.
 ## What changed from earlier specs?
 
 - `HTTPSink._send` reads the retry predicate from a hook and `_attempt`'s read takes a bound when a
-  subclass names one; with the default `None` every existing sink runs the literal same call. The
-  base class's behaviour on a failed `2xx` body read (an `IncompleteRead` escaping `emit`, an
-  `OSError` mid-body re-sent) is **unchanged** and filed separately; the probe-D sweep holds every
-  subclass to it. What the bounded read changes on `OTLPSink` alone is recorded in the
-  sink-delivery decision *A 2xx this sink cannot read is counted*: measured at `7641de1`, a `200`
-  with `Content-Length: 100` and 20 bytes on the wire gives `read()` → `IncompleteRead` and
-  `read(4194305)` → the 20 bytes, so a truncated body settles as full success there.
-- `tests/test_sinks_http.py::FakeResponse.read` and `_IncompleteResponse.read` take an optional
-  size; `test_sinks_http_refused.py`'s events carry their size under `fields`.
+  subclass names one, inside the guard #283 put around the body read; with the default `None` every
+  existing sink runs the literal same call. Because `read(amt)` returns a short `Content-Length`
+  body silently where `read()` raises, the bounded read checks `response.length` and turns a short
+  body with bytes still owed into the same `b""` a raise gives, so the bounded path matches the
+  unbounded one (*After a status line the status decides*, #283). For `OTLPSink` that `b""` is full
+  success, uncounted, by FR-004's reading of an empty body — proved through a real socket in
+  `tests/test_sinks_otlp.py` on every gate run, for a truncated `Content-Length` body and a
+  truncated chunked one. Built first on `ba3bd7d`, before #283, when the base class's read was
+  unguarded; rebased onto `3b1f294` and reconciled in place.
+- `tests/test_sinks_http.py::FakeResponse.read` and `test_sinks_http_body_read.py`'s
+  `_UnreadableResponse.read` take an optional size, so a bounded read reaches the planted error and
+  not a `TypeError`; `test_sinks_http_refused.py`'s events carry their size under `fields`;
+  `OTLPSink` is in `_BODY_READERS`, with `_COUNTS_UNREADABLE` recording which readers count `b""`.
 - `sinks/pubsub.py:140` carries `# type: ignore[import-not-found, unused-ignore]` and
   `pyproject.toml` a `google.cloud.*` mypy override, because the dev group now installs `protobuf`.
 - SPEC-049's `_valid_url` message names the argument it is given (`url` by default).

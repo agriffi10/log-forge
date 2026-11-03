@@ -601,7 +601,13 @@ oversized body is to answer `413`, which is exactly the answer that search exist
 (RECOMMENDED 4 MiB) and treat an oversized one as a non-retryable error. A second private hook,
 `HTTPSink._response_limit() -> int | None`, defaults to `None` — the unbounded read every HTTP sink
 has today, with `_attempt` still calling a bare `read()` — and `OTLPSink` returns 4 MiB
-(4,194,304). With a limit set, `_attempt` reads at most one byte past it. A non-`2xx` response
+(4,194,304). With a limit set, `_attempt` reads at most one byte past it. **The bounded read sits
+inside the guard #283 put around the body read, and checks `response.length` itself**: CPython's
+`read(amt)` returns a short `Content-Length` body silently, with `response.length` still above
+zero, where the bare `read()` raises `IncompleteRead`, so fewer bytes than asked for with bytes
+still owed is handed on as `b""`, exactly as a raise is (`docs/decisions/sink-delivery/`, *After a
+status line the status decides*); a truncated chunked body raises from `read(amt)` and takes the
+same guard. A non-`2xx` response
 longer than the limit is **abandoned on the spot as non-retryable**, whatever its status: counted,
 announced, raised. A `2xx` response reaches FR-004 as it was read, and **`_handle_response` itself
 tests `len(payload) > self._response_limit()`** — a body of exactly the limit is adjudicated, one
@@ -687,9 +693,11 @@ by an answer that exists only in an ancestor's docstring.
       their existing tests pass unchanged, each still reads a 5 MiB response body whole, a response
       object whose `read` takes no argument still works with every one of them (the base keeps
       calling a bare `read()`), and the AST roster names `OTLPSink` as the only subclass defining
-      `_retryable_status` or `_response_limit`. `test_sinks_http_refused.py`'s
-      `_IncompleteResponse.read` takes the same optional size, so that suite's sweep over `OTLPSink`
-      fails on `IncompleteRead` and not on a `TypeError` from a size argument it cannot take.
+      `_retryable_status` or `_response_limit`. `test_sinks_http_body_read.py`'s
+      `_UnreadableResponse.read` takes the same optional size, so its sweep over `OTLPSink`
+      reaches the planted read error and not a `TypeError` from a size argument it cannot take;
+      `test_sinks_http_refused.py`'s Probe D sweep, whose opener raises a `RuntimeError` for the
+      second request (#283), holds `OTLPSink` to eight requests and no drop like every sibling.
 - [ ] A `503` whose body is 4 MiB plus one byte makes exactly one request, raises
       `SinkDeliveryError` and leaves `losses().failed == 1`, where the same `503` with a one-byte
       body is retried and a `503` whose body is exactly 4 MiB is retried too; the fake is asked for
@@ -729,7 +737,7 @@ by an answer that exists only in an ancestor's docstring.
       post-close lints each include `otlp.OTLPSink` in their population and pass for it.
 - [ ] Serves invariants 1, 2, 3, 6, 7, 11 and 13.
 
-### FR-004: A `2xx` that rejects records is counted and never retried, one that rejects them all raises, and one that cannot be read is counted too
+### FR-004: A `2xx` that rejects records is counted and never retried, one that rejects them all raises, and a `partialSuccess` that is present but unreadable is counted too
 
 #### Description:
 
@@ -749,7 +757,13 @@ needs, since a `RecursionError` from a deeply nested body is not a `ValueError`.
   count is `0`, absent or `null`, which OTLP uses to carry a warning in `errorMessage`. The chunk is
   settled; nothing is counted or written. "Not JSON" is a body `json.loads` rejects as malformed or
   too deep, a `RecursionError` included: a proxy's page or a protobuf body is not this sink's to
-  adjudicate (Out of Scope), and the request succeeded. **The one parse failure that is not "no
+  adjudicate (Out of Scope), and the request succeeded. **A body that cannot be read at all
+  reaches the sink as `b""`** — `HTTPSink._attempt` reads it under a guard once the status line is
+  in hand, and a short, stalled or reset body is `b""` (#283, *After a status line the status
+  decides; a 2xx whose body cannot be read is never re-sent*) — and `b""` is this bucket: full
+  success, uncounted, because a `2xx` is the verdict and an empty body is a success with nothing
+  to say. Only a `partialSuccess` that is *present* but unreadable is counted, below. **The one
+  parse failure that is not "no
   content" is an over-long bare integer.** A bare 5,000-digit `rejectedLogRecords` makes
   `json.loads` raise `ValueError` ("Exceeds the limit (4300 digits)"), which would read as not-JSON
   and settle as full success while its string twin, `"1" * 5000`, is unadjudicated. The body is
@@ -1002,7 +1016,8 @@ tests/
 ├── test_sinks_otlp.py        # FR-003, FR-004
 ├── test_sinks_http.py        # FR-003: FakeResponse.read(self, n=-1); the roster and builders (FR-005)
 ├── test_sinks_http_render.py # FR-005: the OTLPSink recipe; the fold sweep plants a raising _render
-├── test_sinks_http_refused.py # FR-003, FR-005: _IncompleteResponse.read(self, n=-1); the probe-D sweep
+├── test_sinks_http_refused.py # FR-005: the probe-D sweep, its events sized under `fields`
+├── test_sinks_http_body_read.py # FR-003: _UnreadableResponse.read(self, n=-1); OTLPSink in _BODY_READERS
 ├── data/frozen_sink_paths.txt   # FR-005
 └── typed_consumer/{accepts,rejects}.py   # FR-003, FR-005
 README.md                     # FR-005
@@ -1052,10 +1067,13 @@ new module makes a derived test demand, and nothing that test does not demand wa
   import it at `1130461`** (`test_sink_losses`, `test_sink_retry`, `test_sinks_elasticsearch`,
   `test_sinks_saas`, `test_sinks_http_refused`, `test_sinks_http_render`, `test_wrapper_failures`),
   so it becomes `read(self, n=-1)`, returning at most `n` bytes when `n` is not negative.
-  `test_sinks_http_refused.py:37`'s `_IncompleteResponse.read(self)` overrides it and takes the same
-  `n=-1`, or the probe-D sweep reaches `OTLPSink` as a `TypeError` that happens to raise too. The
-  base class keeps calling a bare `read()` while `_response_limit()` is `None`, which is what keeps
-  every other sink's behaviour unchanged.
+  `test_sinks_http_body_read.py`'s `_UnreadableResponse.read(self)` (#283) overrides it and takes
+  the same `n=-1`, or that sweep reaches `OTLPSink` as a `TypeError` that happens to be caught too;
+  `OTLPSink` joins its `_BODY_READERS`, with what it reads `b""` as recorded beside the `_bulk`
+  sinks' answer. The base class keeps calling a bare `read()` while `_response_limit()` is `None`,
+  which is what keeps every other sink's behaviour unchanged, and the bounded read sits inside the
+  same guard with its `response.length` check (FR-003), proved through a real socket for a
+  truncated `Content-Length` body and a truncated chunked one.
 - `OTLPSink` with `_render`, `_body`, `_item_size`, `_body_reserve`; the budget, response-bound and
   `method` criteria across one and three resources.
 - `_handle_response`, `rejected_records`, `dropped_unadjudicated`, `losses()`; the partial-success

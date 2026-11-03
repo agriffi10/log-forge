@@ -19,25 +19,31 @@ the protocols do: a `_bulk` verdict can only come from the body, so no body is n
 OTLP success needs no `partialSuccess` at all and a proxy's page or a protobuf body is not this
 sink's to adjudicate. **`_bulk`'s counted reading is `_bulk`'s, not the family's**: `HTTPSink`'s
 default `_handle_response` still reads any `2xx` as delivered, and a new subclass copies neither
-reading without arguing for it. **The bounded read, and what it changes.** `OTLPSink` is the first
-sink to bound the response it reads (`_response_limit`, 4 MiB; `_attempt` reads one byte past it),
-and CPython's `HTTPResponse.read(amt)` on a Content-Length body that arrives short returns the short
-bytes rather than raising `IncompleteRead` — only the unbounded `read()` goes through `_safe_read` —
-so on this sink a truncated `2xx` lands in the full-success bucket as "not JSON", where every other
-sink's unbounded read raises out of `emit`; a chunked body still raises either way. Measured at
-`7641de1` against a local server (`probe_truncated.py` in the build's scratchpad): a `200` with
-`Content-Length: 100` and 20 bytes on the wire gives `read()` → `IncompleteRead(20 bytes)` and
-`read(4194305)` → the 20 bytes; one chunk then a close gives `IncompleteRead` from both reads. So
-`OTLPSink` settles a Content-Length-truncated `2xx` as full success, silently, where the `_bulk`
-sinks count it and every other sink raises. Accepted and recorded rather than guarded, because
-the base class's own behaviour on a failed `2xx` read — an `IncompleteRead` escaping `emit`, an
-`OSError` mid-body re-POSTed by the loop — is a pre-existing defect filed separately, and this spec
-neither widens nor fixes it: the read stays at its one statement under no new guard, and the probe-D
-sweep in `tests/test_sinks_http_refused.py` holds every subclass, `OTLPSink` included, to the escape.
-(SPEC-056 FR-003, FR-004)
+reading without arguing for it. **A body that cannot be read at all is `b""`, and `b""` is full
+success here.** *After a status line the status decides; a 2xx whose body cannot be read is never
+re-sent* (#283) reads the body under a guard once the status is in hand and hands
+`_handle_response` `b""` for a read that failed, so an override cannot tell an empty body from an
+unreadable one and must read both the same way. OTLP's reading is the one that decision names as
+correct for it: a `2xx` is the verdict, an empty body is a success with nothing to say, so a body
+cut short, stalled or reset after the status line settles its chunk as delivered, uncounted — where
+the `_bulk` sinks count the same `b""` unadjudicated, because their only verdict is in the body. The
+bounded read keeps that rule rather than escaping it: CPython's `read(amt)` returns a short
+`Content-Length` body silently with `response.length` still above zero, where the bare `read()`
+raises `IncompleteRead`, so `HTTPSink._attempt` checks `response.length` after a bounded read and
+turns fewer bytes than it asked for, with bytes still owed, into the same `b""` a raise gives; a
+truncated chunked body raises from `read(amt)` and takes the guard. Proved through a real socket
+on every gate run (`tests/test_sinks_otlp.py`, the truncated-`2xx` cases): a `200` declaring
+`Content-Length: 100` that delivers a complete `partialSuccess` rejecting every record and then
+closes reaches `OTLPSink` as `b""` and is full success, one POST, nothing counted, nothing raised —
+which is also what makes the `response.length` check a mutation target, since without it the same
+bytes parse and raise; the chunked twin raises inside `read(amt)` and arrives the same way. A `2xx`
+over the bound is a different case: the read returns one byte past it and `_handle_response` counts
+the chunk unadjudicated. (SPEC-056 FR-003, FR-004; #283)
 
 ## History
 
 ### 2026-11-03
 
-- **Settled.** Shipped with `OTLPSink`; the `_bulk` contrast was drawn after #276 landed.
+- **Settled.** Shipped with `OTLPSink`; the `_bulk` contrast was drawn after #276 landed, and the
+  unreadable-body paragraph was rewritten onto #283's guard when the branch was rebased over it —
+  before #283, a Content-Length-truncated `2xx` reached this sink as short bytes.
