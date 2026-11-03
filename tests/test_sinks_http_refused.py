@@ -50,8 +50,14 @@ def _once() -> list[FakeResponse | Exception]:
 
 
 def _event(**fields: object) -> dict[str, object]:
-    """An event every platform subclass can render: it carries a message and a timestamp."""
-    return {"message": "m", "timestamp": _STAMP, **fields}
+    """An event every platform subclass can render: it carries a message and a timestamp.
+
+    The size-bearing keys sit under ``fields``, the shape assembly produces, rather than at the
+    top level: a mapping that carries only the keys it knows — ``OTLPSink``'s — would otherwise
+    render Probe D's two events to the same length, and ``_known_refused`` would discard the
+    second without offering it (SPEC-056 FR-005).
+    """
+    return {"message": "m", "timestamp": _STAMP, "fields": dict(fields)}
 
 
 def _probe_d() -> list[dict[str, object]]:

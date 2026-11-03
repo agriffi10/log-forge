@@ -267,6 +267,7 @@ def test_the_http_subclass_roster_holds_every_shipped_platform_sink() -> None:
         "honeycomb.HoneycombSink",
         "loki.LokiSink",
         "newrelic.NewRelicSink",
+        "otlp.OTLPSink",
         "splunk.SplunkHECSink",
     }
 

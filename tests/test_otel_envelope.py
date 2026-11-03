@@ -483,7 +483,7 @@ def test_every_record_the_mapping_criteria_build_round_trips() -> None:
 
 
 def test_the_dependency_is_dev_only_and_the_library_never_imports_it() -> None:
-    """AC-11. The ``sinks.otlp`` half of the import check lives with the sink (Phase 3)."""
+    """AC-11. Importing the library and the sink leaves neither ``google`` nor ``opentelemetry``."""
     with (_ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)
     dev = project["tool"]["poetry"]["group"]["dev"]["dependencies"]
@@ -498,7 +498,7 @@ def test_the_dependency_is_dev_only_and_the_library_never_imports_it() -> None:
             name in group for group in project["tool"]["poetry"]["group"] if group != "dev"
         ), name
     probe = (
-        "import sys, log_foundry; "
+        "import sys, log_foundry, log_foundry.sinks.otlp; "
         "print(sorted(m for m in sys.modules if m.startswith(('google.protobuf', 'opentelemetry'))))"
     )
     result = subprocess.run(  # noqa: S603

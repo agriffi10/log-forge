@@ -154,6 +154,7 @@ _RECIPES = {
     "LokiSink": lambda **kw: LokiSink("http://loki", **kw),
     "NewRelicSink": lambda **kw: log_foundry.sinks.newrelic.NewRelicSink("key", **kw),
     "OpenSearchSink": lambda **kw: OpenSearchSink("http://os", index="i", **kw),
+    "OTLPSink": lambda **kw: log_foundry.sinks.otlp.OTLPSink(**kw),
     "SplunkHECSink": lambda **kw: log_foundry.sinks.splunk.SplunkHECSink(
         "http://splunk", "tok", **kw
     ),
@@ -186,15 +187,43 @@ def test_the_subclass_sweep_found_the_family() -> None:
     assert len(names) >= 7, names
 
 
+def _raising_render(event: dict[str, object]) -> str:
+    raise TypeError("planted: render failed")
+
+
+def _assert_folds_unrenderable(sink: HTTPSink) -> None:
+    """One event whose render raises is a counted drop in ``losses().dropped``.
+
+    The raise is planted on the instance rather than carried by a value ``json.dumps`` cannot
+    encode, because a total mapping — ``OTLPSink``'s — renders any value and would deliver it;
+    the opener keeps the sweep off the network for the same sink (SPEC-056 FR-005).
+    """
+    sink._render = _raising_render  # type: ignore[method-assign]
+    sink.emit([_ev(0)])
+    assert sink.losses().dropped == 1, f"{type(sink).__name__} did not fold _unrenderable in"
+
+
 @pytest.mark.parametrize("cls", _shipped_http_subclasses(), ids=lambda cls: cls.__name__)
 def test_every_http_subclass_folds_unrenderable_into_losses(cls: type[HTTPSink]) -> None:
     assert cls.__name__ in _RECIPES, f"{cls.__name__} has no recipe; add one to _RECIPES"
-    sink = _RECIPES[cls.__name__]()
+    sink = _RECIPES[cls.__name__](opener=FakeOpener())
     assert type(sink) is cls
 
-    sink.emit([_ev(0, raw=_Opaque())])
+    _assert_folds_unrenderable(sink)
 
-    assert sink.losses().dropped == 1
+
+class _Forgetful(HTTPSink):
+    """A subclass whose ``losses()`` leaves ``_unrenderable`` out — what the sweep must catch."""
+
+    def losses(self) -> SinkLosses:
+        with self._counter_lock:
+            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+
+
+def test_the_fold_sweep_bites_a_losses_that_forgets_unrenderable() -> None:
+    """The amended sweep, run against the defect it exists to find, fails for that reason."""
+    with pytest.raises(AssertionError, match="did not fold _unrenderable in"):
+        _assert_folds_unrenderable(_Forgetful("http://h", opener=FakeOpener()))
 
 
 def _oversized_span() -> None:

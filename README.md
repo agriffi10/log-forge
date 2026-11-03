@@ -708,6 +708,7 @@ too large to be sent on its own is dropped and counted in `health().sink.dropped
 | `LokiSink` | 1,000 | 4,000,000 | chosen; Loki's own cap is an operator-tunable server setting |
 | `SplunkHECSink` | 1,000 | 1,000,000 | chosen; Splunk publishes no fixed HEC payload limit |
 | `LogstashSink` (HTTP mode) | 1,000 | 5,000,000 | inherits the generic defaults |
+| `OTLPSink` | 1,000 | 5,000,000 | inherits the generic defaults, well under the 64 MiB OTLP recommends a server accept; the envelope is charged per record |
 | `HTTPSink` (generic) | 1,000 | 5,000,000 | chosen, for an endpoint the library knows nothing about |
 
 A count of 1,000 is Datadog's published array limit and a conservative default elsewhere — no
@@ -727,6 +728,7 @@ completed, not that every chunk of it landed.
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`). A `2xx` it cannot adjudicate, unreadable bodies included, is counted on `.dropped_unadjudicated` and not retried; those events may have landed, and a non-zero value can mean a proxy answered rather than the cluster |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
+| `OTLPSink` | `log_foundry.sinks.otlp` | `OTLPSink(endpoint="http://localhost:4318/v1/logs", **http_kwargs)` — OTLP/HTTP JSON logs, for a Collector or any OTLP backend; `endpoint` is used exactly as given, `method` must be `"POST"`, `body_format` is pinned. Retries `429`/`502`/`503`/`504` only, bounds the response it reads at 4 MiB, and counts a `2xx` partial success on `.rejected_records` (never retried) or, when it cannot read the verdict, on `.dropped_unadjudicated`. What it sends: *OTLPSink* below |
 | `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per element; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
 | `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
 
