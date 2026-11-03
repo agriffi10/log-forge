@@ -87,9 +87,19 @@ def test_newrelic_invalid_region_raises() -> None:
 # --- FR-010: Honeycomb ------------------------------------------------------------------
 
 
+class _HoneycombAccepts(FakeOpener):
+    """Answers each request with Honeycomb's per-event array, accepting every event it carried."""
+
+    def __call__(self, request, timeout=None):
+        super().__call__(request, timeout)
+        return FakeResponse(200, json.dumps([{"status": 202}] * len(json.loads(request.data))).encode())
+
+
 def test_honeycomb_batch_shape_and_header() -> None:
-    opener = FakeOpener()
-    HoneycombSink("hckey", "mydataset", opener=opener).emit([{"a": 1}, {"b": 2}])
+    opener = FakeOpener([FakeResponse(200, b'[{"status": 202}, {"status": 202}]')])
+    sink = HoneycombSink("hckey", "mydataset", opener=opener)
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert sink.dropped_unadjudicated == 0, "a Honeycomb-shaped success, not a body it cannot read"
     call = opener.calls[0]
     assert call["url"] == "https://api.honeycomb.io/1/batch/mydataset"
     assert call["headers"]["x-honeycomb-team"] == "hckey"
@@ -196,8 +206,10 @@ def test_newrelic_splits_a_batch_over_its_one_megabyte_post_limit() -> None:
 
 
 def test_honeycomb_splits_a_batch_and_keeps_its_data_envelope() -> None:
-    opener = FakeOpener()
-    HoneycombSink("key", "dataset", opener=opener).emit([{"pad": "x" * 2000} for _ in range(1000)])
+    opener = _HoneycombAccepts()
+    sink = HoneycombSink("key", "dataset", opener=opener)
+    sink.emit([{"pad": "x" * 2000} for _ in range(1000)])
+    assert sink.dropped_unadjudicated == 0, "every chunk read against its own verdict"
     assert len(opener.calls) > 1
     assert all(len(call["body"]) <= HoneycombSink.MAX_BATCH_BYTES for call in opener.calls)
     entries = [entry for call in opener.calls for entry in json.loads(call["body"])]

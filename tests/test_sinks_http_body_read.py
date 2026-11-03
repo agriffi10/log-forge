@@ -30,6 +30,7 @@ import pytest
 import log_foundry
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+from log_foundry.sinks.honeycomb import HoneycombSink
 from log_foundry.sinks.http import HTTPSink, _no_redirect_opener
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.otlp import OTLPSink
@@ -419,17 +420,17 @@ _READ_ERRORS = [
 ]
 """One ``HTTPException``, one ``OSError`` and one that is neither, so narrowing the guard fails."""
 
-_BODY_READERS = {ElasticsearchSink, OpenSearchSink, OTLPSink}
+_BODY_READERS = {ElasticsearchSink, OpenSearchSink, HoneycombSink, OTLPSink}
 """The shipped subclasses whose ``_handle_response`` reads the body.
 
 A new body reader must be added here, and must decide what ``b""`` means for it: an override
 cannot tell an empty ``2xx`` body from one that could not be read. The decision is recorded in
-``_COUNTS_UNREADABLE``: the ``_bulk`` sinks count it, since their only verdict is in the body;
-``OTLPSink`` reads it as full success, since an OTLP success needs no ``partialSuccess`` at all
+``_COUNTS_UNREADABLE``: the ``_bulk`` sinks and ``HoneycombSink`` count it, since their only
+verdict is in the body; ``OTLPSink`` reads it as full success, since an OTLP success needs no ``partialSuccess`` at all
 (SPEC-056 FR-004).
 """
 
-_COUNTS_UNREADABLE = {ElasticsearchSink, OpenSearchSink}
+_COUNTS_UNREADABLE = {ElasticsearchSink, OpenSearchSink, HoneycombSink}
 """The body readers for which ``b""`` is an unadjudicated chunk rather than a delivered one."""
 
 

@@ -1127,10 +1127,9 @@ class HTTPSink:
         """Reports whether a ``2xx`` response means the chunk was actually accepted.
 
         The hook for a destination whose ``2xx`` can still describe per-record failures —
-        Elasticsearch's ``_bulk`` items. The default ignores the body and reads a status in the
-        success range as delivery; that is the whole answer only where the destination's ``2xx``
-        carries no per-record outcome, which ``HoneycombSink``'s per-event array does
-        (``docs/architecture.md`` §12).
+        Elasticsearch's ``_bulk`` items, Honeycomb's per-event array, OTLP's partial success. The
+        default ignores the body and reads a status in the success range as delivery; that is the
+        whole answer only where the destination's ``2xx`` carries no per-record outcome.
 
         The payload is ``b""`` both for an empty body and for one that could not be read after
         the status line — cut short, stalled past ``timeout`` or reset (:meth:`_attempt`). An
@@ -1421,7 +1420,7 @@ class HTTPSink:
         documented extension hook, exactly as it was. The cost is that an override cannot tell an
         empty body from an unreadable one, so each must read an empty ``2xx`` body the way it
         wants an unreadable one read: the base settles both as delivered, and
-        ``ElasticsearchSink`` counts both as unadjudicated.
+        ``ElasticsearchSink`` and ``HoneycombSink`` count both as unadjudicated.
 
         The guard catches ``Exception``, not the read's documented errors, for the reason
         ``ElasticsearchSink._parse_bulk_response`` gives for its own: anything escaping here
