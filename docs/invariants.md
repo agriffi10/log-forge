@@ -38,7 +38,9 @@ at the call that supplies it — that is invariant 13, and it is the *opposite* 
 moment of construction.
 *Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`,
 `tests/test_assembly_budget.py` (a hostile argument returns on both delivery paths before a
-deadline); `tests/test_invariants_model.py` asserts it over random interleavings.
+deadline), `tests/test_baggage_header.py` (a hostile baggage value, on either intake route, leaves
+`current_baggage_header()` returning before a deadline, SPEC-064);
+`tests/test_invariants_model.py` asserts it over random interleavings.
 
 ## 2. Every accepted event is delivered, or counted and announced — exactly once
 
