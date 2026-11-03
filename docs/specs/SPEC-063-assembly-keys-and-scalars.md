@@ -93,8 +93,9 @@ key and no public name is added.
   a `bytes` or `bytearray` key priced before it is rendered (FR-001).
 - Every `_dispatch`, Enum and key route that returns the caller's object, or lets its method decide
   a measurement, admitting it by exact type or an unbound conversion; a value of a builtin text,
-  bytes or container type routed by its real type, not by a claim; `_type_name` reading the stored
-  type name as an exact `str` (FR-002).
+  bytes or container type routed by its real type ahead of every branch that renders through
+  `str()`, the Enum branch included; a container key tested ahead of `_key`'s claim-based scalar
+  tests; `_type_name` reading the stored type name as an exact `str` (FR-002).
 - The `fields=` truthiness test inside `_merge`'s absorb and the `echo` test inside the echo guard
   (FR-003).
 - The `error` sub-document, the stack fallback and `_diag.absorbed` reading a type's stored name
@@ -368,15 +369,27 @@ fallback text (`str(value)`, library-produced), unless it claims `float` or `str
 or `text()`'s unbound read raises, and the placeholder names the Enum class, because the Enum member
 is the node. The `str` claim is existing behaviour. A genuine
 `int` subclass *key* keeps its own `str()`, so `class Color(int, Enum)` as a key still reads
-`Color.RED`; a genuine `float` subclass key renders as its exact float.
+`Color.RED`; a genuine `float` subclass key renders as its exact float, except a `(float, Enum)`
+member, which keeps `str()` (`FE.A`) as a `(int, Enum)` member does.
+
+**The Enum branch is entered only by a real `Enum`, or by an object whose real type is no builtin
+text, bytes, container or number.** Its fallback is `str(value)`, so a real builtin that claims
+`Enum` through `__class__` and answers `.value` with an object reached the builtin `repr`, found by
+the diff review and pre-existing: measured at `71e42dd`, a real `tuple` subclass so claiming wrote
+`'(SECRET,)'`, did not return around the frozenset DAG applied 40 times, a `bytes` subclass of 16
+MiB peaked at 64 MiB, and a `dict` subclass wrote `"{'a': SECRET}"`. A proxy of an `Enum` keeps the
+branch, its real type being no builtin, as do `StrEnum`, `IntEnum` and `(tuple, Enum)` members. In
+`_key` the container test runs ahead of the claim-based `str`, `int` and `float` tests on the same
+reasoning, so a real `tuple` claiming one of them is walked; a real `str` subclass, a `StrEnum`
+included, is no container and still reaches `text()` first.
 
 **Real-type routing for builtin text, bytes and containers.** `isinstance` also chooses *which*
 branch renders a value, and a claim can send a real container or bytes object to a branch that
 calls `str()` on it. Measured at `71e42dd`: a real `tuple` subclass claiming `UUID` or `Decimal` as a
 field value hangs on the frozenset DAG applied 40 times and writes `'(SECRET,)'` for an object whose
 `repr` is `SECRET`; a real `bytes` subclass claiming `Decimal` and holding 64 MiB of zero bytes costs
-a 256 MiB peak. So in `_dispatch`, after the Enum branch and the int, float and bool handling and
-before the render-through block (`datetime`, `UUID`, `Decimal`), a value whose real type subclasses
+a 256 MiB peak. So in `_dispatch`, after the int, float and bool handling and before the
+render-through block (`datetime`, `UUID`, `Decimal`), a value whose real type subclasses
 `str` goes to `text()`, one whose real type subclasses `bytes` or `bytearray` goes to the bytes
 route, one that subclasses `dict` goes to `mapping()`, and one that subclasses `tuple`, `list`,
 `set` or `frozenset` goes to `members()`. That is an `issubclass(type(value), ...)` test, which
@@ -439,7 +452,16 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       object whose `__class__` returns `bool` as a key is `<unserializable key: T>`, marked —
       `type(key) is not bool` sends it to the unbound integer read, which refuses it, where
       `71e42dd` wrote its own `str()`. The first two and the last fail at `71e42dd`; the `int`
-      subclass rows are silence rows.
+      subclass rows are silence rows. A `(float, Enum)` member key reads as its name (`FE.A`) and a
+      `(int, Enum)` member key as its name (`IE.A`), as at `71e42dd` (silence: the float-key
+      conversion excludes an `Enum`), and a `StrEnum` key is its value's text.
+- [ ] A real `tuple` and a real `dict` subclass that claim `Enum` through `__class__` and answer
+      `.value` with an object are walked as what they are on both delivery paths, `SECRET` written
+      nowhere; the `tuple` around the frozenset DAG applied 40 times returns in under 2 s of
+      `process_time()`, alarm-guarded, marked; and a `bytes` subclass of 16 MiB so claiming is read
+      to its ceiling with a `tracemalloc` peak under 8 MiB. At `71e42dd` they write `'(SECRET,)'`
+      and `"{'a': SECRET}"`, the DAG does not return, and the peak is 64 MiB. A real `tuple` key
+      claiming `str`, `int` or `float` is the key `"[1, 2]"`, where it was the key placeholder.
 - [ ] A class whose metaclass defines `__name__` as a property that raises, or returns `42`, or
       returns `"renamed"`, gives `<unserializable: Stored>` as a value and
       `<unserializable key: Stored>` as a key, `Stored` being its stored name; each fails at

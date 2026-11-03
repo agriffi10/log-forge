@@ -1017,7 +1017,11 @@ close it.
   `kind in _PLAIN_SCALARS` is `kind is bool` and the `isinstance(value, bool)` branch is gone; the
   Enum member routes and the float key branch follow the same rules; a real `str`, `bytes`,
   `dict`, `tuple`, `list`, `set` or `frozenset` subclass is routed by `issubclass(type(value), ...)`
-  ahead of every `isinstance` branch; and `_key` admits an `int` key by `type(key) is not bool`.
+  ahead of the render-through `isinstance` branches, and the `Enum` branch, whose fallback is
+  `str()`, is entered only by a real `Enum` or by a non-builtin such as a proxy (a real `tuple`
+  claiming `Enum` wrote `(SECRET,)` before that test); a container key is tested ahead of `_key`'s
+  claim-based `str`, `int` and `float` tests; and `_key` admits an `int` key by
+  `type(key) is not bool`.
   Measured at `71e42dd`, the three routes the entry named each put the object itself in the event, as
   did an `Enum` member whose `.value` was a `float` impostor, a route it had not named. `isinstance`
   stays only on the render-through routes, so a transparent proxy of a `dict` or `datetime` still

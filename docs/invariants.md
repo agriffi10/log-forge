@@ -192,7 +192,10 @@ unserializable value becomes a type name, never a `repr`; a number too large to 
 replaced, never clipped; a reserved word has exactly one route through (SPEC-017, SPEC-020,
 SPEC-025, SPEC-034, SPEC-057). A route that returns the caller's object, or lets its method decide
 a measurement, admits it only by exact type or through an unbound builtin accessor, and builtin
-text, bytes and containers are routed by their real type, never by a `__class__` claim; a container
+text, bytes and containers are routed by their real type, ahead of every branch that renders through
+`str()`: an `Enum`, `UUID` or `Decimal` claim through `__class__` cannot send one there, though an
+`int` or `float` claim makes it the type-name placeholder, since those branches refuse what they
+cannot convert; a container
 mapping key is coerced as a value and written as the JSON of the result, not as its `repr`
 (SPEC-063). The premise holds at assembly **and at a
 transform's coercion**: a `TransformSink` runs its function after assembly, so it checks each
