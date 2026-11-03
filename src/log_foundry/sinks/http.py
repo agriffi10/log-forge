@@ -12,7 +12,7 @@ from base64 import b64encode
 from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypedDict
-from urllib.parse import urlparse
+from urllib.parse import unwrap, urlparse
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
@@ -254,8 +254,36 @@ _BODY_FORMATS = ("ndjson", "json_array")
 
 _CRLF = ("\r", "\n")
 
+_MAX_PORT = 65535
 
-def _valid_url(url: str, owner: str) -> str:
+
+def _started_request(host: str, method: str, selector: str) -> http.client.HTTPConnection:
+    """Starts a request head the way ``urllib`` does, without opening a socket.
+
+    ``urllib`` sends its own ``Host`` header, so ``http.client`` skips the one it would otherwise
+    write — and with it the IDNA encoding and port handling of that header. The head started here
+    skips it too, so a caller then writes ``Host`` as ``urllib`` does: the raw host, through
+    ``putheader``'s Latin-1 encoding. Nothing is sent: ``putrequest`` and ``putheader`` only
+    validate, encode and buffer, and the connection is discarded unopened.
+
+    Args:
+      host: The host the connection is built for, port included.
+      method: The request method.
+      selector: The request target.
+
+    Returns:
+      A connection whose request line has been validated and buffered.
+
+    Raises:
+      ValueError: If ``http.client`` cannot encode or accept the request line.
+      http.client.InvalidURL: If the host names a port ``http.client`` cannot read.
+    """
+    connection = http.client.HTTPConnection(host)
+    connection.putrequest(method, selector, skip_host=True, skip_accept_encoding=True)
+    return connection
+
+
+def _valid_url(url: str, owner: str, name: str = "url") -> str:
     """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
 
     A scheme ``urllib`` will open but this sink cannot use is a configuration error that surfaced
@@ -264,27 +292,89 @@ def _valid_url(url: str, owner: str) -> str:
     :class:`HTTPSink` receives, which is the URL every subclass has finished building, so no
     subclass can smuggle one past.
 
+    Surrounding whitespace is **floored**, not refused: ``urllib`` passes every URL through
+    :func:`urllib.parse.unwrap`, which strips it and a ``<URL:…>`` wrapper, before it parses, so
+    such a URL already delivered. The floor is that same call, so the stored URL is exactly the one
+    that went on the wire. Anything ``http.client`` cannot carry is **refused**, because it never
+    delivered once. A lone surrogate or any other non-ASCII character outside the host raised
+    ``UnicodeEncodeError`` out of every ``emit`` with ``failed == 0`` and no stderr line; a space or
+    control character, or a ``user:password@`` with no port, which the connection reads as one,
+    raises ``InvalidURL``, which :meth:`HTTPSink._send` counts as a connection error — on every
+    request, for the life of the process. Rather than list those characters, the check builds the
+    request line the way ``urllib`` would — the connection ``do_open`` builds for the request's
+    host, then ``putrequest`` and the ``Host`` header ``urllib`` writes itself
+    (:func:`_started_request`), which encode and validate without opening a socket — so the refusal
+    tracks ``http.client``'s own rules instead of a copy of them. That header is why a host
+    ``http.client`` would IDNA-encode is refused anyway when it is not Latin-1: ``urllib`` sends the
+    raw host, and ``http://例.example/x`` raised ``UnicodeEncodeError`` out of every ``emit``. The
+    host and the port are read from those same objects rather than from :func:`urlparse`, which
+    drops a tab or newline that ``urllib`` keeps and parses a port more strictly than
+    ``http.client`` does. A missing host, or a port of ``0`` or past ``65535``, is refused because
+    every request fails, counted, for the life of the process, and that is knowable here.
+
     Args:
       url: The endpoint as constructed.
       owner: The class refusing it, for the message.
+      name: The argument the message names — ``url`` here, the argument a subclass built the URL
+        from where it checks that argument itself first.
 
     Returns:
-      The URL unchanged.
+      The URL as ``urllib`` unwraps it, without surrounding whitespace.
 
     Raises:
-      ValueError: If the scheme is not ``http`` or ``https``, or the URL names no host — every
+      ValueError: If the scheme is not ``http`` or ``https``, the URL names no host — every
         request to ``http:///x`` fails with a counted ``URLError`` for the life of the process,
-        which is knowable here (SPEC-049, system-frame review).
+        which is knowable here (SPEC-049, system-frame review) — its port is not one a socket can
+        reach, or ``http.client`` cannot build a request line for it.
     """
-    parsed = urlparse(url)
+    url = unwrap(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as err:
+        raise ValueError(f"{owner} {name} is not a URL ({err}): {url!r}") from err
     scheme = parsed.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(
-            f"{owner} url must use http or https, not {scheme or 'no'} scheme: {url!r}"
+            f"{owner} {name} must use http or https, not {scheme or 'no'} scheme: {url!r}"
         )
-    if not parsed.netloc:
-        raise ValueError(f"{owner} url names no host: {url!r}")
+    request = urllib.request.Request(url)  # noqa: S310
+    if request.type.lower() != scheme:
+        raise ValueError(f"{owner} {name} must use http or https, not {request.type!r}: {url!r}")
+    if not parsed.netloc or not request.host:
+        raise ValueError(f"{owner} {name} names no host: {url!r}")
+    try:
+        connection = _started_request(request.host, "POST", request.selector)
+        connection.putheader("Host", request.host)
+    except (ValueError, http.client.InvalidURL) as err:
+        raise ValueError(f"{owner} {name} cannot be sent over HTTP ({err}): {url!r}") from err
+    if not 0 < connection.port <= _MAX_PORT:
+        raise ValueError(f"{owner} {name} names no usable port: {url!r}")
     return url
+
+
+def _valid_method(method: str, owner: str) -> str:
+    """Returns a method ``http.client`` can send, or raises (SPEC-049 FR-001).
+
+    A control character or a non-ASCII character in the method made ``putrequest`` raise
+    ``ValueError`` or ``UnicodeEncodeError`` out of every ``emit``, uncounted — the same gap
+    :func:`_valid_url` closes, refused here by the same means: ``putrequest`` itself, with no
+    socket opened.
+
+    Args:
+      method: The HTTP method as constructed.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The method unchanged.
+
+    Raises:
+      ValueError: If ``http.client`` cannot put the method on a request line.
+    """
+    try:
+        _started_request("localhost", method, "/")
+    except ValueError as err:
+        raise ValueError(f"{owner} method cannot be sent over HTTP ({err}): {method!r}") from err
+    return method
 
 
 def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
@@ -292,7 +382,12 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
 
     A ``CR`` or ``LF`` in a name or a value makes ``http.client`` raise from inside ``emit``, on
     every batch, uncounted. Rejecting it here also means the sink cannot be used to smuggle a
-    header a caller did not intend, which is why the check covers names as well as values.
+    header a caller did not intend, which is why the check covers names as well as values. Every
+    other header ``putheader`` refuses — a value outside Latin-1, a name that is not a token — is
+    the same uncounted raise, so each header is then put on a started head, under the name
+    ``urllib`` sends: ``capitalize`` in ``Request.add_header``, then ``title`` in ``do_open``,
+    which together turn ``x-ß`` into the ASCII ``X-Ss`` that delivered. The message names the
+    header and never echoes its value, which is as likely to be a credential as not.
 
     Args:
       headers: The caller's headers.
@@ -302,7 +397,8 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
       The headers unchanged.
 
     Raises:
-      ValueError: If any name or value contains ``CR`` or ``LF``.
+      ValueError: If any name or value contains ``CR`` or ``LF``, or ``http.client`` cannot send
+        the header.
     """
     for name, value in headers.items():
         for text, part in ((name, "name"), (str(value), "value")):
@@ -310,32 +406,118 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
                 raise ValueError(
                     f"{owner} header {part} must not contain CR or LF: {name!r}"
                 )
+        failure = _unsendable_header(name.capitalize().title(), value)
+        if failure:
+            raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
     return headers
 
 
+def _unsendable_header(name: str, value: str) -> str | None:
+    """Names why ``http.client`` cannot send one header, or returns ``None`` when it can.
+
+    It returns the exception's type name rather than raising, so a caller's refusal is raised
+    outside the ``except`` with neither ``__cause__`` nor ``__context__`` set: the exception
+    ``putheader`` raises carries the whole value — a ``UnicodeEncodeError``'s ``object``, a
+    ``ValueError``'s message — and a header value is as likely to be a credential as not.
+
+    Args:
+      name: The header name, as it goes on the wire.
+      value: The header value.
+
+    Returns:
+      The type name of the exception ``putheader`` raised, or ``None``.
+
+    Raises:
+      None.
+    """
+    try:
+        _started_request("localhost", "POST", "/").putheader(name, value)
+    except (ValueError, TypeError) as err:
+        return type(err).__name__
+    return None
+
+
 def _valid_auth(
-    auth: str | tuple[str, str] | None, owner: str
+    auth: str | tuple[str, str] | None, owner: str, headers: dict[str, str]
 ) -> str | tuple[str, str] | None:
     """Returns credentials that cannot inject a header, or raises (SPEC-049 FR-001).
 
-    Only the **bearer-token** form is checked, and the asymmetry is deliberate rather than an
-    oversight: a token is written into ``Authorization`` verbatim, so a ``CR`` in it is the same
-    injection :func:`_valid_headers` refuses, in the argument with the highest consequence. The
-    ``(user, password)`` form is base64-encoded before it reaches the header and cannot carry one.
+    Only the **bearer-token** form is checked for ``CR`` and ``LF``, and the asymmetry is
+    deliberate rather than an oversight: a token is written into ``Authorization`` verbatim, so a
+    ``CR`` in it is the same injection :func:`_valid_headers` refuses, in the argument with the
+    highest consequence. The ``(user, password)`` form is base64-encoded before it reaches the
+    header and cannot carry one. Both forms are then built into the header by
+    :func:`_authorization`, the function ``emit`` uses, and put on a started head: a token
+    outside Latin-1, or a lone surrogate in either half of the pair, raised
+    ``UnicodeEncodeError`` out of every ``emit``, uncounted, and a value that is neither raised
+    ``TypeError``. The message names neither, and chains nothing that would. Credentials an
+    ``Authorization`` header overrides are never sent — :meth:`HTTPSink._apply_auth` defers to
+    that header, matched by the same exact-case test — so they are not checked here either.
 
     Args:
       auth: The bearer token, the user/password pair, or ``None``.
       owner: The class refusing it, for the message.
+      headers: The caller's headers, whose ``Authorization`` would override ``auth``.
 
     Returns:
       The credentials unchanged.
 
     Raises:
-      ValueError: If a bearer token contains ``CR`` or ``LF``.
+      ValueError: If a bearer token contains ``CR`` or ``LF``, or ``http.client`` cannot send the
+        ``Authorization`` header either form builds.
     """
     if isinstance(auth, str) and any(bad in auth for bad in _CRLF):
         raise ValueError(f"{owner} auth token must not contain CR or LF")
+    if auth is not None and "Authorization" not in headers:
+        failure = _unsendable_auth(auth)
+        if failure:
+            raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
     return auth
+
+
+def _unsendable_auth(auth: str | tuple[str, str]) -> str | None:
+    """Names why the ``Authorization`` value these credentials build cannot be sent, or ``None``.
+
+    Building the value is inside the check, since a lone surrogate in a pair fails the UTF-8
+    encode ahead of base64 and a value that is neither form fails to unpack; both are returned as
+    a type name, like :func:`_unsendable_header`, so nothing chained carries the credential.
+
+    Args:
+      auth: The bearer token or the user/password pair.
+
+    Returns:
+      The type name of the exception building or sending the value raised, or ``None``.
+
+    Raises:
+      None.
+    """
+    try:
+        value = _authorization(auth)
+    except (ValueError, TypeError) as err:
+        return type(err).__name__
+    return _unsendable_header("Authorization", value)
+
+
+def _authorization(auth: str | tuple[str, str]) -> str:
+    """Builds the ``Authorization`` value for a bearer token or a ``(user, password)`` pair.
+
+    One builder for :meth:`HTTPSink._apply_auth` and :func:`_valid_auth`, so the construction-time
+    check puts on the head exactly the value ``emit`` sends.
+
+    Args:
+      auth: The bearer token or the user/password pair.
+
+    Returns:
+      The header value.
+
+    Raises:
+      UnicodeEncodeError: If the pair cannot be encoded as UTF-8 for base64.
+    """
+    if isinstance(auth, str):
+        return f"Bearer {auth}"
+    user, password = auth
+    token = b64encode(f"{user}:{password}".encode()).decode("ascii")
+    return f"Basic {token}"
 
 
 def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
@@ -450,7 +632,8 @@ class HTTPSink:
         """Configures the endpoint, encoding, credentials and retry bounds.
 
         Args:
-          url: The endpoint to POST to.
+          url: The endpoint to POST to. Surrounding whitespace is stripped, as ``urllib``
+            already stripped it before sending, so :attr:`url` reads back what goes on the wire.
           method: The HTTP method.
           headers: Headers that override the sink's own defaults.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth.
@@ -481,8 +664,9 @@ class HTTPSink:
           None.
 
         Raises:
-          ValueError: If the URL's scheme is not ``http`` or ``https`` or it names no host, a
-            header name or value or a bearer token contains CR or LF, the timeout cannot bound
+          ValueError: If the URL's scheme is not ``http`` or ``https``, it names no host or no
+            usable port, or ``http.client`` cannot build a request line for it or for the method,
+            a header name or value or a bearer token contains CR or LF, the timeout cannot bound
             anything, ``body_format`` is neither of the two this class renders, or
             ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
@@ -494,9 +678,9 @@ class HTTPSink:
                 f"{type(self).__name__} body_format must be one of {sorted(_BODY_FORMATS)}, "
                 f"not {body_format!r}"
             )
-        self.method = method
+        self.method = _valid_method(method, type(self).__name__)
         self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
-        self._auth = _valid_auth(auth, type(self).__name__)
+        self._auth = _valid_auth(auth, type(self).__name__, self._headers)
         self.body_format = body_format
         self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip
@@ -1167,12 +1351,7 @@ class HTTPSink:
         """
         if self._auth is None or "Authorization" in headers:
             return
-        if isinstance(self._auth, str):
-            headers["Authorization"] = f"Bearer {self._auth}"
-        else:
-            user, password = self._auth
-            token = b64encode(f"{user}:{password}".encode()).decode("ascii")
-            headers["Authorization"] = f"Basic {token}"
+        headers["Authorization"] = _authorization(self._auth)
 
     def _attempt(self, request: urllib.request.Request) -> tuple[int, bytes, float | None]:
         """Performs one request.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Unpack
 
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, merge_headers
+from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _valid_url, merge_headers
 
 __all__ = ["DatadogSink"]
 
@@ -63,13 +63,18 @@ class DatadogSink(HTTPSink):
           None.
 
         Raises:
-          None.
+          ValueError: If the intake URL ``site`` builds cannot be sent — refused here so the
+            message names ``site``, the argument the caller wrote, rather than the ``url`` this
+            class built from it (SPEC-049 FR-001).
         """
+        url = _valid_url(
+            f"https://http-intake.logs.{site}/api/v2/logs", type(self).__name__, name="site"
+        )
         self._service = service
         self._ddtags = ddtags
         headers = merge_headers({"DD-API-KEY": api_key}, http_kwargs)
         super().__init__(
-            f"https://http-intake.logs.{site}/api/v2/logs",
+            url,
             headers=headers,
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]

@@ -31,8 +31,10 @@ one bad event now costs only itself in `TransformSink`, `FilteringSink`, `SQSSin
 sinks; assembly is bounded in work, so a shared-sublist structure that hung the calling thread now
 ends at `<node limit>` (SPEC-057, SPEC-058, SPEC-059); an HTTP sink no longer re-sends, or raises
 over, a `2xx` whose body was cut short, and a status whose body could not be read is decided by its
-status; and `LokiSink` timestamps are exact to the microsecond. `SPEC-056`, the OTLP sink, is a
-Draft and ships nothing here.
+status; and `LokiSink` timestamps are exact to the microsecond. The HTTP family now refuses at
+construction a URL, method, header or credential `http.client` could never send, rather than
+raising uncounted out of every `emit`, and strips surrounding whitespace from a URL. `SPEC-056`,
+the OTLP sink, is a Draft and ships nothing here.
 [**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.0.2/docs/release-notes/v1.0.2.md).
 
 ## 1.0.1 — 2026-09-22
