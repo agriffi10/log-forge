@@ -738,10 +738,11 @@ OTLP answers `200` for full success, and for partial success too: the body carri
 and accepts as a number) and an `errorMessage`. **`OTLPSink._handle_response` never raises**, on any
 bytes: an exception escaping it escapes `emit`, and the worker then re-sends chunks that already
 landed. It follows `ElasticsearchSink._parse_bulk_response` in shape and sorts a body into three
-outcomes, **but the builder must not copy that method's `except`**: it catches only
-`(ValueError, TypeError)`, so a `RecursionError` from a deeply nested body escapes it (probed at
-`e8cbd5d`: `json.loads(b"[" * 1_000_000)` raises `RecursionError`, which is not a `ValueError`),
-and this method's never-raises criterion demands more. The Elasticsearch sink is not changed.
+outcomes, **but the builder must not copy that method's reading of an unreadable body**: it counts
+an undecodable or non-object `2xx` as unadjudicated, because a `_bulk` verdict can only come from
+the body, while a success here needs no `partialSuccess` at all, so the same bytes settle silently
+below. Its `except Exception` around `json.loads` is the form this method's never-raises criterion
+needs, since a `RecursionError` from a deeply nested body is not a `ValueError`.
 
 - **Full success.** A body that is empty, not JSON, not an object, or without a `partialSuccess`
   (absent or `null`) — which is what a server MUST send on success — and a `partialSuccess` whose
@@ -796,7 +797,8 @@ rejection at all.
       `json.loads` answers with `RecursionError`), `{"partialSuccess": null}`,
       `{"partialSuccess": {}}`, `{"partialSuccess": {"rejectedLogRecords": null}}` or
       `{"partialSuccess": {"rejectedLogRecords": "0", "errorMessage": "sampled"}}` settles the chunk
-      with no counter moved and nothing written to stderr, and `emit` returns.
+      with no counter moved and nothing written to stderr, and `emit` returns. This is OTLP's
+      reading only: `ElasticsearchSink` counts the undecodable and non-object bodies in this list.
 - [ ] `{"partialSuccess": {"rejectedLogRecords": "2", "errorMessage": "SECRET-123"}}` against five
       records leaves `rejected_records == 2` and `losses().failed == 2`, makes exactly one request,
       and `emit` returns normally; the number `2` in place of the string `"2"` behaves identically.
@@ -1125,3 +1127,7 @@ new module makes a derived test demand, and nothing that test does not demand wa
   epoch is unusable; a bare over-long `rejectedLogRecords` is unadjudicated, by `parse_int=str`; the
   `_FORWARDING_SINKS` and `INDEX.md` wording is corrected; and FR-004 warns the builder off
   `ElasticsearchSink._parse_bulk_response`'s narrow `except`.
+- **2026-11-02 — FR-004 corrected after a bug fix to the Elasticsearch sink.** That method now
+  catches `Exception` around `json.loads` and counts an undecodable or non-object `2xx` body, so
+  FR-004 no longer says it catches only `(ValueError, TypeError)` or that the sink is unchanged, and
+  it names the silent reading as OTLP's own. OTLP's behaviour and criteria are unchanged.

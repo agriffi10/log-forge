@@ -987,6 +987,15 @@ close it.
   `<unserializable: bytearray>`, where at `324936e` it was written whole. **Closed by**
   `configure()` refusing a non-`int` ceiling with a `TypeError` at the call, deciding at the same
   time whether a `bool` or another `int` subclass passes (invariant 13).
+- **`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, unverified.** It
+  does not check that the object is `_bulk`-shaped, so a server answering every POST with
+  `{"error": {"type": "auth"}, "status": 500}`, or with
+  `{"items": [{"index": {"error": "x"}}, {"index": {"error": "x"}}]}`, leaves `flush()` truthy,
+  `failed_batches` at zero, `health().sink` at `failed=0` and stderr empty (reproduced at
+  `6399298`). Undecodable and non-object bodies are counted; this residue is not, because routing
+  an absent `errors` to `dropped_unadjudicated` would charge every success from an endpoint that
+  omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
+  endpoint's response shape gets settled.
 
 ### Resolved
 

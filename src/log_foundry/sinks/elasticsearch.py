@@ -23,9 +23,11 @@ class ElasticsearchSink(HTTPSink):
     Attributes:
       item_errors: Count of bulk items the server reported as failed, distinct from ``failed``,
         which counts whole requests abandoned past the retry bound.
-      dropped_unadjudicated: Events whose outcome a ``_bulk`` response did not describe, because
-        its ``items`` array did not line up with the batch sent. Abandoned rather than retried,
-        for SPEC-018's reason: the request succeeded, so re-sending would duplicate what landed.
+      dropped_unadjudicated: Events whose outcome a ``_bulk`` response did not settle, which is
+        every route to :meth:`_abandon_unadjudicated`: ``errors`` was truthy while the ``items``
+        array did not line up with the batch sent or no readable item carried an error, or the
+        body could not be decoded or was not an object. Abandoned rather than retried, for
+        SPEC-018's reason: the request succeeded, so re-sending would duplicate what landed.
 
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
@@ -107,7 +109,7 @@ class ElasticsearchSink(HTTPSink):
         return f"{action}\n{json.dumps(event)}"
 
     def _handle_response(self, payload: bytes, items: list[_Item]) -> bool:
-        """Parses the chunk's ``_bulk`` items and reports whether anything was indexed.
+        """Parses the chunk's ``_bulk`` response and reports whether the chunk is settled.
 
         Returning ``False`` rather than raising is what lets a sibling chunk that succeeded
         stand: :meth:`~log_foundry.sinks.http.HTTPSink.emit` raises only when *every* chunk came
@@ -120,7 +122,8 @@ class ElasticsearchSink(HTTPSink):
 
         Returns:
           False when every item in the chunk carried an error, True otherwise — including for a
-          body this sink cannot read, since the request itself succeeded.
+          body this sink cannot read, since the request itself succeeded. Such a body settles the
+          chunk without confirming it, so its events are counted on ``dropped_unadjudicated``.
 
         Raises:
           None.
@@ -137,7 +140,9 @@ class ElasticsearchSink(HTTPSink):
           The counters. All three sources are summed into ``failed`` because each is an event
           the server did not confirm; they stay apart on the instance for anyone who needs to
           tell "the request never landed" from "the request landed and these items bounced" from
-          "the response did not say". ``dropped`` is the oversized events plus those whose
+          "the response did not say". That last one covers a body that could not be read as well
+          as one that could not be adjudicated. On every route those events may have landed, so
+          it is an upper bound on loss. ``dropped`` is the oversized events plus those whose
           render raised, as in the base class this overrides (SPEC-058 FR-005).
 
         Raises:
@@ -165,40 +170,80 @@ class ElasticsearchSink(HTTPSink):
         success. An array that cannot be adjudicated is counted and left alone, because the
         request itself succeeded and re-sending would duplicate whatever did land.
 
+        A body that cannot be decoded, or that decodes to something other than an object, takes
+        that same route. Such a body cannot carry a per-item outcome, so the server has not
+        confirmed these events, and reading that as success is how an all-rejected response
+        with an unreadable tail came back as a clean ``flush()`` with every counter at zero. The
+        catch is ``Exception`` rather than the decoding errors: ``RecursionError`` and
+        ``MemoryError`` are neither ``ValueError`` nor ``TypeError``, and an exception escaping
+        here escapes ``emit``, so the worker re-sends a batch the server may have indexed and
+        any later chunk in that batch is never sent.
+
+        An object without a truthy ``errors`` is read as success, unverified, and counts nothing.
+        This sink does not check that it is ``_bulk``-shaped, so ``{}``, an error document with
+        a ``status`` of 500 and an ``items`` array of failures with no ``errors`` key all pass
+        here. Charging an absent key would charge every success from an endpoint that omits it,
+        which is why ``docs/architecture.md`` §12 leaves that to be decided with the Astra profile.
+
         Args:
           payload: The response body.
           sent: How many events were in the request.
 
         Returns:
-          True when every item failed. An unparseable or errors-free body returns False: the
-          request succeeded, and a body this sink cannot read is not evidence against that.
+          True when every item failed. Every other body returns False, whether it is errors-free
+          or was counted as unadjudicated: the request succeeded, so it is not re-sent.
 
         Raises:
           None.
         """
         try:
             data = json.loads(payload)
-        except (ValueError, TypeError):
+        except Exception:
+            self._abandon_unadjudicated(sent)
             return False
-        if not isinstance(data, dict) or not data.get("errors"):
+        if not isinstance(data, dict):
+            self._abandon_unadjudicated(sent)
+            return False
+        if not data.get("errors"):
             return False
         items = usable_results(data.get("items"))
         errors = sum(1 for item in items if _has_error(item))
         if len(items) != sent or not errors:
-            with self._counter_lock:
-                self.dropped_unadjudicated += sent
-            _diag.lost(
-                "event",
-                sent,
-                f"{type(self).__name__} could not adjudicate a _bulk response "
-                f"({sent} event(s) sent, {len(items)} readable item(s), {errors} error(s)); "
-                f"not retried",
-            )
+            self._abandon_unadjudicated(sent, readable=len(items), errors=errors)
             return False
         with self._counter_lock:
             self.item_errors += errors
         _diag.lost("bulk item", errors, f"{type(self).__name__}, rejected by the server")
         return errors == sent
+
+    def _abandon_unadjudicated(self, sent: int, *, readable: int = 0, errors: int = 0) -> None:
+        """Counts and announces a request whose response did not settle its events' outcome.
+
+        The whole request is charged because this response cannot be relied on to say which events
+        landed: it is unreadable, misaligned, or contradicts its own ``errors`` flag. That makes
+        the count an upper bound, like ``failed``, and the line says the events may have landed.
+        It carries only counts and never the body, which is the server's text.
+
+        Args:
+          sent: How many events were in the request.
+          readable: How many readable items the response carried.
+          errors: How many of those items reported an error.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.dropped_unadjudicated += sent
+        _diag.lost(
+            "event",
+            sent,
+            f"{type(self).__name__} could not adjudicate a _bulk response "
+            f"({sent} event(s) sent, {readable} readable item(s), {errors} error(s)); "
+            f"they may have landed; not retried",
+        )
 
 
 def _has_error(item: dict[str, object]) -> bool:

@@ -159,7 +159,10 @@ with one that fails some calls, nothing raised, `losses()` is non-zero, and no e
 did not deliver was counted — an all-oversized or all-unrenderable HTTP batch, a wrapper batch of
 one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized event
 (SPEC-058). Nothing in such a batch is helped by a retry, which is the test this page's rule turns
-on.
+on. So a `_bulk` server answering every POST with a `2xx` the sink cannot adjudicate — a body it
+cannot read or that is not an object, or a truthy `errors` with a short `items` array — leaves
+`flush()` truthy and `failed_batches` at zero, with the loss in `health().sink`: the events may
+have landed, so a retry could duplicate them.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/integration/` against real services (SPEC-041).
 

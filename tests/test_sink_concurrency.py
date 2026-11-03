@@ -1213,6 +1213,40 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     assert all(isinstance(err, Exception) for err in errors)
 
 
+def test_elasticsearch_dropped_unadjudicated_is_counted_under_the_lock() -> None:
+    """The same counter on the HTTP route, where an unreadable ``2xx`` body is what moves it.
+
+    ``emit`` may take the lock for reasons of its own, so an errors-free run of the same load is
+    the baseline and the assertion is on what the unreadable body adds: one acquisition per emit.
+    """
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    def acquisitions(body: bytes) -> tuple[ElasticsearchSink, int]:
+        """Runs the concurrent load against one body and returns the sink and its lock count."""
+        sink = ElasticsearchSink(
+            "http://es", index="i", opener=FakeOpener([FakeResponse(200, body)])
+        )
+        lock = CountingLock()
+        sink._counter_lock = lock
+        errors = run_concurrently(
+            lambda thread, iteration: sink.emit(
+                [event(thread, iteration), event(thread, iteration)]
+            ),
+            THREADS,
+            per_thread=PER_THREAD,
+        )
+        assert errors == []
+        return sink, lock.acquisitions
+
+    _, baseline = acquisitions(b'{"errors": false}')
+    sink, counted = acquisitions(b"not json")
+
+    assert sink.dropped_unadjudicated == THREADS * PER_THREAD * 2
+    assert counted - baseline == THREADS * PER_THREAD, "a drop was counted outside the lock"
+    assert sink.losses().failed == THREADS * PER_THREAD * 2
+
+
 # The claim a sink makes to opt out of the post-close rule (SPEC-032 FR-003). Like SPEC-028's
 # lock exemption it is a specific assertion about behaviour rather than a mention of the topic,
 # so a docstring that merely discusses close() cannot satisfy it.
