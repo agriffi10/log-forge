@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.http import HTTPSink, _valid_headers, _valid_url
+from log_foundry.sinks.http import HTTPSink, _unsendable_header, _valid_url
 
 __all__ = ["Backend", "SentrySink"]
 
@@ -609,9 +609,15 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
       ValueError: If the DSN lacks a scheme, a host, a public key or a project id, or the ingest
         URL or auth header it derives could not be sent — checked here, under ``dsn``, because
         :class:`HTTPSink` would otherwise refuse a URL the caller never wrote under its own name,
-        and the header only fails at ``emit``. The key is never echoed.
+        and the header only fails at ``emit``. The key is never echoed by those two; a DSN
+        ``urlparse`` cannot read — an unclosed IPv6 bracket, a port past ``65535`` — is refused
+        naming ``dsn`` too, with ``urlparse``'s reason rather than the DSN.
     """
-    parsed = urlparse(dsn)
+    try:
+        parsed = urlparse(dsn)
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError as err:
+        raise ValueError(f"SentrySink dsn is not a URL ({err})") from err
     project = parsed.path.lstrip("/")
     missing = [
         name
@@ -627,12 +633,10 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
         raise ValueError(
             f"SentrySink dsn is missing its {', '.join(missing)}: {dsn!r}"
         )
-    port = f":{parsed.port}" if parsed.port else ""
     ingest_url = f"{parsed.scheme}://{parsed.hostname}{port}/api/{project}/envelope/"
     auth_header = f"Sentry sentry_key={parsed.username}, sentry_version=7, sentry_client=log-foundry"
     _valid_url(ingest_url, "SentrySink", name="dsn")
-    try:
-        _valid_headers({"X-Sentry-Auth": auth_header}, "SentrySink")
-    except ValueError:
-        raise ValueError("SentrySink dsn public key cannot be sent over HTTP") from None
+    failure = _unsendable_header("X-Sentry-Auth", auth_header)
+    if failure:
+        raise ValueError(f"SentrySink dsn public key cannot be sent over HTTP ({failure})")
     return ingest_url, auth_header

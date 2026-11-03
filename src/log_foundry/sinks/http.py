@@ -384,8 +384,9 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     header a caller did not intend, which is why the check covers names as well as values. Every
     other header ``putheader`` refuses — a value outside Latin-1, a name that is not a token — is
     the same uncounted raise, so each header is then put on a started head, under the name
-    ``urllib`` capitalises it to. The message names the header and never echoes its value, which
-    is as likely to be a credential as not.
+    ``urllib`` sends: ``capitalize`` in ``Request.add_header``, then ``title`` in ``do_open``,
+    which together turn ``x-ß`` into the ASCII ``X-Ss`` that delivered. The message names the
+    header and never echoes its value, which is as likely to be a credential as not.
 
     Args:
       headers: The caller's headers.
@@ -404,17 +405,39 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
                 raise ValueError(
                     f"{owner} header {part} must not contain CR or LF: {name!r}"
                 )
-        try:
-            _started_request("localhost", "POST", "/").putheader(name.capitalize(), value)
-        except (ValueError, TypeError) as err:
-            raise ValueError(
-                f"{owner} header cannot be sent over HTTP ({type(err).__name__}): {name!r}"
-            ) from err
+        failure = _unsendable_header(name.capitalize().title(), value)
+        if failure:
+            raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
     return headers
 
 
+def _unsendable_header(name: str, value: str) -> str | None:
+    """Names why ``http.client`` cannot send one header, or returns ``None`` when it can.
+
+    It returns the exception's type name rather than raising, so a caller's refusal is raised
+    outside the ``except`` with neither ``__cause__`` nor ``__context__`` set: the exception
+    ``putheader`` raises carries the whole value — a ``UnicodeEncodeError``'s ``object``, a
+    ``ValueError``'s message — and a header value is as likely to be a credential as not.
+
+    Args:
+      name: The header name, as it goes on the wire.
+      value: The header value.
+
+    Returns:
+      The type name of the exception ``putheader`` raised, or ``None``.
+
+    Raises:
+      None.
+    """
+    try:
+        _started_request("localhost", "POST", "/").putheader(name, value)
+    except (ValueError, TypeError) as err:
+        return type(err).__name__
+    return None
+
+
 def _valid_auth(
-    auth: str | tuple[str, str] | None, owner: str
+    auth: str | tuple[str, str] | None, owner: str, headers: dict[str, str]
 ) -> str | tuple[str, str] | None:
     """Returns credentials that cannot inject a header, or raises (SPEC-049 FR-001).
 
@@ -425,11 +448,15 @@ def _valid_auth(
     header and cannot carry one. Both forms are then built into the header by
     :func:`_authorization`, the function ``emit`` uses, and put on a started head: a token
     outside Latin-1, or a lone surrogate in either half of the pair, raised
-    ``UnicodeEncodeError`` out of every ``emit``, uncounted. The message names neither.
+    ``UnicodeEncodeError`` out of every ``emit``, uncounted, and a value that is neither raised
+    ``TypeError``. The message names neither, and chains nothing that would. Credentials an
+    ``Authorization`` header overrides are never sent — :meth:`HTTPSink._apply_auth` defers to
+    that header, matched by the same exact-case test — so they are not checked here either.
 
     Args:
       auth: The bearer token, the user/password pair, or ``None``.
       owner: The class refusing it, for the message.
+      headers: The caller's headers, whose ``Authorization`` would override ``auth``.
 
     Returns:
       The credentials unchanged.
@@ -440,16 +467,34 @@ def _valid_auth(
     """
     if isinstance(auth, str) and any(bad in auth for bad in _CRLF):
         raise ValueError(f"{owner} auth token must not contain CR or LF")
-    if auth is not None:
-        try:
-            _started_request("localhost", "POST", "/").putheader(
-                "Authorization", _authorization(auth)
-            )
-        except ValueError as err:
-            raise ValueError(
-                f"{owner} auth cannot be sent over HTTP ({type(err).__name__})"
-            ) from None
+    if auth is not None and "Authorization" not in headers:
+        failure = _unsendable_auth(auth)
+        if failure:
+            raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
     return auth
+
+
+def _unsendable_auth(auth: str | tuple[str, str]) -> str | None:
+    """Names why the ``Authorization`` value these credentials build cannot be sent, or ``None``.
+
+    Building the value is inside the check, since a lone surrogate in a pair fails the UTF-8
+    encode ahead of base64 and a value that is neither form fails to unpack; both are returned as
+    a type name, like :func:`_unsendable_header`, so nothing chained carries the credential.
+
+    Args:
+      auth: The bearer token or the user/password pair.
+
+    Returns:
+      The type name of the exception building or sending the value raised, or ``None``.
+
+    Raises:
+      None.
+    """
+    try:
+        value = _authorization(auth)
+    except (ValueError, TypeError) as err:
+        return type(err).__name__
+    return _unsendable_header("Authorization", value)
 
 
 def _authorization(auth: str | tuple[str, str]) -> str:
@@ -634,7 +679,7 @@ class HTTPSink:
             )
         self.method = _valid_method(method, type(self).__name__)
         self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
-        self._auth = _valid_auth(auth, type(self).__name__)
+        self._auth = _valid_auth(auth, type(self).__name__, self._headers)
         self.body_format = body_format
         self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip

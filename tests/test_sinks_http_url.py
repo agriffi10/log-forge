@@ -26,6 +26,12 @@ from test_sinks_http import FakeOpener
 from test_sinks_http_render import _shipped_http_subclasses
 
 
+def _assert_chains_nothing(exc: BaseException) -> None:
+    """The exception ``putheader`` raised carries the whole value, so a refusal must not chain it."""
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
 def _assert_printable(exc: BaseException) -> None:
     """A lone surrogate in a message makes the message itself fail to encode wherever it is shown."""
     assert not any(0xD800 <= ord(char) <= 0xDFFF for char in str(exc)), str(exc).encode(
@@ -225,6 +231,7 @@ def test_an_unsendable_header_is_refused_naming_the_header_not_its_value(headers
         HTTPSink("http://h/x", headers=headers)
 
     assert value not in str(caught.value)
+    _assert_chains_nothing(caught.value)
 
 
 def test_a_latin_1_header_value_constructs() -> None:
@@ -254,8 +261,40 @@ def test_unsendable_credentials_raised_uncounted_out_of_every_emit(auth, capsys)
     "auth", ["\u20ac", ("u", "p\ud800"), ("\ud800", "p")], ids=["token", "password", "user"]
 )
 def test_unsendable_credentials_are_refused_without_echoing_them(auth) -> None:
-    with pytest.raises(ValueError, match=r"^HTTPSink auth cannot be sent over HTTP \(\w+\)$"):
+    with pytest.raises(
+        ValueError, match=r"^HTTPSink auth cannot be sent over HTTP \(\w+\)$"
+    ) as caught:
         HTTPSink("http://h/x", auth=auth)
+
+    _assert_chains_nothing(caught.value)
+
+
+def test_credentials_that_are_neither_form_are_refused_naming_auth() -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink auth cannot be sent over HTTP \(TypeError\)$"):
+        HTTPSink("http://h/x", auth=123)  # type: ignore[arg-type]
+
+
+def test_credentials_an_authorization_header_overrides_are_not_checked() -> None:
+    """``_apply_auth`` never sends them, so they delivered; the lowercase twin is not an override."""
+    opener = FakeOpener()
+    sink = HTTPSink("http://h/x", headers={"Authorization": "x"}, auth="\u20ac", opener=opener)
+    sink.emit([{"i": 1}])
+    assert opener.calls[0]["headers"]["authorization"] == "x"
+
+    with pytest.raises(ValueError, match=r"^HTTPSink auth cannot be sent over HTTP "):
+        HTTPSink("http://h/x", headers={"authorization": "x"}, auth="\u20ac")
+
+
+@pytest.mark.parametrize("name", ["x-\u00df", "x-\ufb01"])
+def test_a_header_name_urllib_folds_to_ascii_constructs(name: str) -> None:
+    """``capitalize`` then ``title`` — urllib's two steps — turn these into ``X-Ss`` and ``X-Fi``."""
+    assert HTTPSink("http://h/x", headers={name: "1"})
+
+
+@pytest.mark.parametrize("dsn", ["https://k@[::1/1", "https://k@h:99999/1"])
+def test_sentry_refuses_a_dsn_urlparse_cannot_read_under_dsn(dsn: str) -> None:
+    with pytest.raises(ValueError, match=r"^SentrySink dsn is not a URL \("):
+        SentrySink(dsn=dsn, backend="http")
 
 
 @pytest.mark.parametrize("auth", ["caf\u00e9", ("\u00fc", "\u20ac")], ids=["token", "pair"])
@@ -275,5 +314,9 @@ def test_sentry_refuses_an_unsendable_dsn_under_dsn() -> None:
 
 
 def test_sentry_refuses_an_unsendable_public_key_without_echoing_it() -> None:
-    with pytest.raises(ValueError, match=r"^SentrySink dsn public key cannot be sent over HTTP$"):
-        SentrySink(dsn="https://\u20ac@h/1", backend="http")
+    with pytest.raises(
+        ValueError, match=r"^SentrySink dsn public key cannot be sent over HTTP \(\w+\)$"
+    ) as caught:
+        SentrySink(dsn="https://k\u20acSECRET@h/1", backend="http")
+
+    _assert_chains_nothing(caught.value)
