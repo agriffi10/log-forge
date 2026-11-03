@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-065
 title: "Integer Arguments Are Exact: configure() Ceilings and the Sink Validators"
 description: "Makes configure() refuse a non-int payload ceiling and store an accepted one as an exact int, and makes the sink-side validators test and return the exact builtin."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-017, SPEC-034, SPEC-047, SPEC-049, SPEC-055, SPEC-057]
 ---
 

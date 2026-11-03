@@ -271,8 +271,10 @@ the Sentry DSN and an argument the selected backend cannot consume, and floored 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
-tests; `tests/test_config.py` for the stamps and `tests/test_decorator_sync.py` for what
+tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
+non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
 `@trace` refuses (SPEC-055); the wider population is SPEC-049's — `tests/test_socket_transport.py`,
-the per-sink refusal tests it added, and the floor-side pins in `tests/test_sink_retry.py` and
+the per-sink refusal tests it added, and the floor-side pins in `tests/test_sink_retry.py`, which
+also holds SPEC-065's spoofed-subclass pins for the three validators, and
 `tests/test_sinks_pubsub.py` — whose spec Overview was the
 measured list of what still constructs and should not.

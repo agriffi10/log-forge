@@ -971,20 +971,6 @@ close it.
   The same class as SPEC-064's header defect, on the diagnostic path rather than the header.
   **Closed by** `rejected` echoing a non-`str` value by type name (`<TypeName>`) and slicing a
   `str` before its `repr`, so the echo is bounded and the line is always written.
-- **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
-  invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
-  Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and
-  `max_keys=True` are accepted and stored as given, while a `str` is refused only by the
-  comparison's own `TypeError`, not by a check that names the ceiling. `max_keys=2.5` kept three
-  of four list entries and marked the event, and `True` kept one. A float
-  `max_value_bytes` makes the slice in `truncate_str` raise `TypeError` for any string past it; the
-  per-value guard catches that, so a 200-character string silently becomes
-  `<unserializable: str>`, unmarked, where the ceiling should have clipped it, at `324936e` too.
-  SPEC-057's bounded reads widened it: the bytes-like read slices to `max_value_bytes + 1`, so
-  even a SHORT `bytes` or `bytearray` now becomes `<unserializable: bytes>` or
-  `<unserializable: bytearray>`, where at `324936e` it was written whole. **Closed by**
-  `configure()` refusing a non-`int` ceiling with a `TypeError` at the call, deciding at the same
-  time whether a `bool` or another `int` subclass passes (invariant 13).
 - **`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, unverified.** It
   does not check that the object is `_bulk`-shaped, so a server answering every POST with
   `{"error": {"type": "auth"}, "status": 500}`, or with
@@ -997,6 +983,15 @@ close it.
 
 ### Resolved
 
+- ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
+  invariant 13) → **closed by SPEC-065**. `config._require_positive` tested only `value < 1`, so a
+  `float`, `nan` or `inf` was stored as given and `sanitize` then did integer arithmetic on it on
+  every event. It now refuses a value that is neither `None` nor an `int` instance with a
+  `TypeError` naming the ceiling and the type, never flooring it, and stores an accepted `bool` or
+  `int` subclass as the exact `int` it holds (`int.__index__`), so a subclass whose comparison lied
+  about a zero can no longer reach `sanitize`. The sink-side twins, `_retry.require_positive`,
+  `require_timeout` and `usable_timeout`, were closed with it: they test and return the exact
+  builtin, and the two callers that discarded the return now use it.
 - ~~**`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded
   nor total**~~ (SPEC-057 system-frame review; invariants 1 and 6) → **closed by SPEC-064**.
   `current_baggage_header()` now renders through `sanitize_fields`, one pass over the whole baggage
