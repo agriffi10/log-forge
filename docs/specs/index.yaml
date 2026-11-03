@@ -429,6 +429,12 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-017", "SPEC-034", "SPEC-047", "SPEC-049", "SPEC-055", "SPEC-057"]
     path: "docs/specs/SPEC-065-configure-int-ceilings.md"
+  - id: "SPEC-067"
+    title: "Total Inbound Trace Context — a Bounded Echo and Parsers That Run No Code of the Value"
+    description: "Makes continue_trace total over any argument it is handed: the rejection echo is bounded and runs no code of the value, and the four parsers accept only an exact str."
+    spec_status: "Draft"
+    depends_on: ["SPEC-014", "SPEC-029", "SPEC-064"]
+    path: "docs/specs/SPEC-067-total-inbound-trace-context.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
