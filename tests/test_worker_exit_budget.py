@@ -23,7 +23,7 @@ import time
 import pytest
 
 import log_foundry
-from conftest import install_worker, retire_process
+from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _lifecycle
 from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
@@ -56,7 +56,7 @@ class _SlowFailSink:
         self.fail_times = fail_times
         self.durations = list(durations or [])
         self.attempts: list[str] = []
-        self.handed: list[list[dict[str, object]]] = []
+        self.handed: list[tuple[str, list[dict[str, object]]]] = []
         self.ends: list[float] = []
         self.delivered: list[dict[str, object]] = []
         self.closes = 0
@@ -67,7 +67,7 @@ class _SlowFailSink:
         with self._lock:
             index = len(self.attempts)
             self.attempts.append(threading.current_thread().name)
-            self.handed.append(list(batch))
+            self.handed.append((threading.current_thread().name, list(batch)))
             seconds = self.durations[index] if index < len(self.durations) else self.seconds
         threading.Event().wait(seconds)
         with self._lock:
@@ -495,8 +495,8 @@ def test_one_count_and_one_line_per_batch_whichever_way_it_ends(ending: str, cap
     lines = _lost_lines(err)
     assert len(lines) == 1 and health.failed_batches == 1, (err, health)
     announced = sum(n for n, what, _ in lines if what == "event")
-    lost_batch = sink.handed[0]
-    assert all(batch == lost_batch for batch in sink.handed), "one batch, retried as itself"
+    lost_batch = sink.handed[0][1]
+    assert all(batch == lost_batch for _, batch in sink.handed), "one batch, retried as itself"
     assert announced == len(lost_batch), f"the line counts the whole batch: {err}"
     lost_ends = sum(1 for e in lost_batch if e.get("message") == "span.end")
     delivered = sum(1 for e in sink.delivered if e.get("message") == "span.end")
@@ -556,3 +556,326 @@ def test_the_decline_line_names_a_type_and_counts_only(capsys) -> None:
 
     assert "lost 3 event(s)" in err
     assert "CANARY" not in err, err
+
+
+# --------------------------------------------------------------------------- FR-003
+
+
+def test_an_unbounded_shutdown_retries_as_before(capsys) -> None:
+    """FR-003 AC-1. `timeout=None` records `None`, which declines nothing."""
+    sink = _SlowFailSink(0.2)
+    worker = _worker(sink)
+    worker.submit(_three_events())
+
+    _shutdown_measured(worker, None)
+
+    assert len(sink.attempts) == worker.max_retries + 1 == 4, sink.attempts
+    assert "abandoned after 4 emit attempts" in capsys.readouterr().err
+
+
+def test_ordinary_draining_records_no_deadline_and_retries_as_before() -> None:
+    """FR-003 AC-2. A drain nobody asked to stop holds no deadline and makes every attempt."""
+    sink = _SlowFailSink(0.0)
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)
+    worker.submit([{"a": 1}])
+
+    deadline = time.monotonic() + 5.0
+    while worker.failed_batches == 0 and time.monotonic() < deadline:
+        assert worker._exit_deadline is None, "no stop was requested, so nothing recorded one"
+        time.sleep(0.005)
+
+    assert worker.failed_batches == 1, "the premise: the batch ran out of attempts"
+    assert worker._exit_deadline is None
+    assert len(sink.attempts) == 4, sink.attempts
+    worker.stop(5.0)
+
+
+def test_flush_is_not_budgeted() -> None:
+    """FR-003 AC-3. `flush(timeout=0.5)` times out on its own clock and the drain retries on."""
+    sink = _SlowFailSink(0.4)
+    worker = _worker(sink)
+    worker.submit(_three_events())
+
+    started = time.monotonic()
+    result = worker.flush(timeout=0.5)
+    elapsed = time.monotonic() - started
+
+    assert result.reason == "timed-out", result
+    assert 0.4 < elapsed < 0.5 + _SLACK, f"flush returned on its own timeout: {elapsed:.2f}"
+    deadline = time.monotonic() + 5.0
+    while worker.failed_batches == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(sink.attempts) == 4, f"the drain retried on after flush returned: {sink.attempts}"
+    assert worker._exit_deadline is None, "a flush records no deadline"
+    worker.stop(5.0)
+
+
+def test_a_swap_mid_retry_declines_nothing(capsys) -> None:
+    """FR-003 AC-4. `retarget`'s own deadline is a different thing and records none here.
+
+    `retarget` reassigns `self.sink` whether or not the fence is confirmed, so the retries of
+    the batch in flight reach the **new** sink after the swap: what this pins is that every one
+    of them is made, across the two sinks, and that the exhausted line is the one written.
+    """
+    old = _SlowFailSink(0.3)
+    new = _SlowFailSink(0.0)
+    worker = Worker(old, batch_size=1, flush_interval=60.0)
+    worker.submit([{"a": 1}])
+    deadline = time.monotonic() + 5.0
+    while not old.attempts and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert old.attempts, "the premise: the old sink is mid-retry"
+
+    outcome = worker.retarget(new, deadline=time.monotonic() + 0.2)
+
+    assert outcome.verdict == "unfenced", outcome
+    assert worker._exit_deadline is None, "a swap records no exit deadline"
+    settle = time.monotonic() + 5.0
+    while worker.failed_batches == 0 and time.monotonic() < settle:
+        time.sleep(0.01)
+    attempts = len(old.attempts) + len(new.attempts)
+    assert attempts == 4, f"no retry of that batch was declined: {old.attempts} {new.attempts}"
+    err = capsys.readouterr().err
+    assert "abandoned after 4 emit attempts" in err and "deadline" not in err, err
+    assert any(held is old for held in worker._held), "the old sink is left for a later shutdown"
+    assert worker.incomplete_swaps == 1
+    worker.stop(5.0)
+
+
+# --------------------------------------------------------------------------- FR-004
+
+
+class _ParkedCloseSink:
+    """An orphan-path sink whose first `close()` parks until released.
+
+    The injected preemption point for the late-worker case: a `shutdown()` that found no
+    worker is provably inside this close, past its first critical section, when the late
+    worker is built. It declares `log_foundry_stop_signal` because `offer_stop_signal` probes
+    for it with `hasattr`.
+    """
+
+    log_foundry_stop_signal: threading.Event | None = None
+
+    def __init__(self) -> None:
+        self.in_close = threading.Event()
+        self.may_finish = threading.Event()
+        self.closes = 0
+        self._lock = threading.Lock()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Keeps nothing; this sink is here to be closed."""
+
+    def close(self) -> None:
+        """Parks the first close until the test releases it."""
+        with self._lock:
+            self.closes += 1
+            first = self.closes == 1
+        self.in_close.set()
+        if first:
+            self.may_finish.wait(10.0)
+
+
+def _stop_mid_drain(timeout: float) -> tuple[_GatedSink, Worker, float]:
+    """Lands a `shutdown(timeout)` while attempt 1 is in flight in `_drain`, then releases.
+
+    `batch_size=1` so `_drain` emits by count; the stop is called 0.1 s after attempt 1
+    starts, and the gate is released to fail at t_rec + 0.2, where t_rec is when the record was
+    observed through the `_RecordingEvent` hook — so the decline margin does not depend on
+    thread-start latency. Returns the sink, the worker and the shutdown's elapsed time.
+    """
+    event = _install_recording_event()
+    sink = _GatedSink()
+    worker = _worker(sink, batch_size=1)
+    install_worker(worker)
+    event.worker = worker
+    worker.submit([{"a": 1}])
+    assert sink.in_emit.wait(5.0)
+    attempt_started = time.monotonic()
+    threading.Event().wait(max(0.0, attempt_started + 0.1 - time.monotonic()))
+
+    elapsed: list[float] = []
+
+    def stop() -> None:
+        started = time.monotonic()
+        retire_process(worker, timeout)
+        elapsed.append(time.monotonic() - started)
+
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    assert event.recorded.wait(5.0), "the stop recorded its deadline before setting the event"
+    recorded_at = time.monotonic()
+    assert isinstance(event.seen[0], float), event.seen
+    threading.Event().wait(max(0.0, recorded_at + 0.2 - time.monotonic()))
+    sink.release.set()
+    stopper.join(timeout + 10.0)
+    assert elapsed, "shutdown returned"
+    worker._thread.join(5.0)
+    return sink, worker, elapsed[0]
+
+
+def test_a_stop_landing_mid_sequence_in_drain_declines_the_retry() -> None:
+    """FR-004 AC-1. One retry site serves `_drain` too: `0.3 + 0.3 + 0.1 > 0.6` declines."""
+    sink, worker, elapsed = _stop_mid_drain(0.5)
+
+    assert len(sink.attempts) == 1, sink.attempts
+    assert elapsed < 0.5 + _SLACK, f"shutdown returned at {elapsed:.2f}"
+    assert sink.closes == 1
+    assert worker.stopped_reason is None
+
+
+def test_the_same_ordering_with_a_wide_budget_makes_every_attempt() -> None:
+    """FR-004 AC-2. The same stop with T=30 permits every attempt: the gate stays open."""
+    sink, worker, _ = _stop_mid_drain(30.0)
+
+    assert len(sink.attempts) == worker.max_retries + 1 == 4, sink.attempts
+    assert sink.closes == 1
+
+
+def test_a_late_worker_declines_against_the_remaining_budget() -> None:
+    """FR-004 AC-3. A worker built during a `shutdown()` is stopped with what is left of T.
+
+    The shutdown is parked inside the orphan sink's `close()`, past its first critical section,
+    and the late worker is built over a 0.5 s failing sink. The orphan close is released at
+    once, so the remaining budget is within a few ms of 1.5: decision 1 permits by at least 0.3,
+    decision 2 declines by at least 0.1.
+    """
+    orphan = _ParkedCloseSink()
+    log_foundry.configure(service="t", sink=orphan)
+    log_foundry.info("arm the orphan record")
+
+    elapsed: list[float] = []
+
+    def timed_shutdown() -> None:
+        started = time.monotonic()
+        log_foundry.shutdown(timeout=1.5)
+        elapsed.append(time.monotonic() - started)
+
+    shutdown = threading.Thread(target=timed_shutdown)
+    shutdown.start()
+    assert orphan.in_close.wait(5.0), "the shutdown is inside the orphan close, past its latch"
+
+    late_sink = _SlowFailSink(0.5)
+    log_foundry.configure(sink=late_sink)
+
+    @log_foundry.trace
+    def work() -> int:
+        return 1
+
+    work()
+    late = _lifecycle._state._late_worker
+    assert late is not None, "the late worker was registered for the running shutdown"
+    event = _RecordingEvent()
+    event.worker = late
+    late._stop = event
+    with _lifecycle._state._lock:
+        _lifecycle._state._stop = event
+
+    orphan.may_finish.set()
+    shutdown.join(30.0)
+    late._thread.join(5.0)
+
+    assert elapsed, "the shutdown returned"
+    assert elapsed[0] < 1.5 + _SLACK, f"shutdown(timeout=1.5) returned at {elapsed[0]:.2f}"
+    assert isinstance(event.seen[0], float), f"recorded before the late worker's set: {event.seen}"
+    assert len(late_sink.attempts) == 2, (
+        f"declined against the remaining budget: {late_sink.attempts}"
+    )
+    assert late_sink.closes == 1, "the second pass closed the late worker's sink"
+
+
+def test_two_concurrent_shutdowns_follow_the_recorded_deadline() -> None:
+    """FR-004 AC-4. Whichever caller wins the gate, the attempts match the deadline recorded.
+
+    The two candidates are 0.9 and 1.8 s, decided by the nearer one rather than by "the first
+    caller": `_stopped` and the record are one decision, so the recorded deadline is the joining
+    caller's and `close()` runs once whichever wins.
+    """
+    sink = _SlowFailSink(0.5)
+    worker = _worker(sink)
+    install_worker(worker)
+    worker.submit(_three_events())
+
+    def work(index: int, _iteration: int) -> None:
+        log_foundry.shutdown(timeout=(0.9, 1.8)[index])
+
+    started = time.monotonic()
+    errors = run_concurrently(work, threads=2)
+    worker._thread.join(5.0)
+
+    assert not errors, errors
+    recorded = worker._exit_deadline
+    assert isinstance(recorded, float)
+    budget = recorded - started
+    expected = 1 if budget < 1.35 else 3
+    assert len(sink.attempts) == expected, (
+        f"recorded budget {budget:.2f}s predicts {expected} attempt(s): {sink.attempts}"
+    )
+    assert sink.closes == 1, f"close() ran once, by the caller whose join matched: {sink.closes}"
+    assert worker.stopped_reason is None, "and the recording caller's join did not expire"
+
+
+def test_shutdown_flush_and_health_together_leave_no_thread_blocked() -> None:
+    """FR-004 AC-5. The new lock nesting deadlocks nowhere `run_concurrently` can reach."""
+    sink = _SlowFailSink(0.2)
+    worker = _worker(sink)
+    install_worker(worker)
+    worker.submit(_three_events())
+
+    def work(index: int, _iteration: int) -> None:
+        if index == 0:
+            log_foundry.shutdown(timeout=1.0)
+        elif index == 1:
+            log_foundry.flush(timeout=1.0)
+        else:
+            log_foundry.health()
+
+    errors = run_concurrently(work, threads=3)
+
+    assert not errors, errors
+    worker._thread.join(5.0)
+    assert not worker._thread.is_alive()
+
+
+def test_both_delivery_paths_under_one_shutdown_balance_the_ledger() -> None:
+    """FR-004 AC-6. The worker path is budgeted; the orphan path keeps its single attempt.
+
+    One always-failing 0.5 s sink serves both: an in-span `info()` reaches it through the
+    worker, an out-of-span `info()` on a second thread reaches it directly. Attempts are tagged
+    by thread name with a list append, never a shared counter.
+    """
+    sink = _SlowFailSink(0.5)
+    log_foundry.configure(service="t", sink=sink)
+    worker = _worker(sink)
+    install_worker(worker)
+
+    @log_foundry.trace
+    def span() -> None:
+        log_foundry.info("in span")
+
+    span()
+    orphan_elapsed: list[float] = []
+
+    def orphan() -> None:
+        started = time.monotonic()
+        log_foundry.info("orphan")
+        orphan_elapsed.append(time.monotonic() - started)
+
+    caller = threading.Thread(target=orphan, name="orphan-caller")
+    caller.start()
+    elapsed = _shutdown_measured(worker, 1.2)
+    caller.join(1.2 + _SLACK)
+    assert not caller.is_alive(), "the orphan call ended within T plus slack"
+    worker._thread.join(5.0)
+    health = log_foundry.health()
+
+    assert elapsed < 1.2 + _SLACK, f"shutdown returned at {elapsed:.2f}"
+    by_thread = {name: sink.attempts.count(name) for name in set(sink.attempts)}
+    assert by_thread == {"log-foundry-worker": 2, "orphan-caller": 1}, by_thread
+    orphan_delivered = sum(1 for e in sink.delivered if e.get("message") == "orphan")
+    assert orphan_delivered + health.orphan_lost == 1, health
+    worker_batch = next(batch for name, batch in sink.handed if name == "log-foundry-worker")
+    lost_ends = sum(1 for e in worker_batch if e.get("message") == "span.end")
+    delivered_ends = sum(1 for e in sink.delivered if e.get("message") == "span.end")
+    assert delivered_ends + health.queued + health.dropped + lost_ends == 1, health
+    assert health.failed_batches == 1
+    assert sink.closes == 1
