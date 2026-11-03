@@ -1,10 +1,10 @@
 ---
 type: Spec
 id: SPEC-065
-title: "configure() Refuses a Ceiling That Is Not an int"
-description: "Makes configure() refuse a non-int payload ceiling at the call and store an accepted one as an exact int, so no float, bool or spoofing subclass reaches sanitize."
+title: "Integer Arguments Are Exact: configure() Ceilings and the Sink Validators"
+description: "Makes configure() refuse a non-int payload ceiling and store an accepted one as an exact int, and makes the sink-side validators test and return the exact builtin."
 spec_status: Draft
-depends_on: [SPEC-017, SPEC-034, SPEC-049, SPEC-055, SPEC-057]
+depends_on: [SPEC-017, SPEC-034, SPEC-047, SPEC-049, SPEC-055, SPEC-057]
 ---
 
 ## Overview
@@ -15,7 +15,8 @@ depends_on: [SPEC-017, SPEC-034, SPEC-049, SPEC-055, SPEC-057]
 and `sanitize` then does integer arithmetic on it on every event. `docs/architecture.md` §12 records
 the defect (*`configure()` accepts a ceiling that is not an `int`*) and defers its closing to this
 spec; invariant 13 is the promise it breaks, and invariant 8's *every configured ceiling holds
-exactly* is the one it breaks downstream.
+exactly* is the one it breaks downstream. The same class of defect sits at the twin door, the
+validators the sinks share in `sinks/_retry.py`, which this spec closes with it (invariant 6).
 
 Every figure below is anchored to `71e42dd`, the tree this spec was drafted on, and was read by
 running `configure()` and then `info("x", s="a" * 200, b=b"ab", l=[1, 2, 3, 4],
@@ -41,7 +42,17 @@ named.
   `{}` for `max_value_bytes`.
 - **The unbound accessor reads the int's own storage.** `int.__index__(x)` returns an exact `int`
   for any `int` instance and ignores a subclass's `__index__` and `__int__`: `int.__index__(Spoof(7))`
-  is `7` of type `int`, and `int.__index__(True)` is `1` of type `int`.
+  is `7` of type `int`, and `int.__index__(True)` is `1` of type `int`. For a float,
+  `float.__float__(F(0.0))` returns an exact `0.0` for a `class F(float)` overriding `__float__`,
+  `__gt__` and `__lt__`.
+- **The sink validators test the caller's object and return it unchanged.** `_retry.require_positive`
+  tests `value <= 0` on the argument. A `class LeSpoof(int)` overriding `__le__` to return `False`,
+  with value 0, passes: `MemorySink(maxlen=LeSpoof(0))` kept 0 of 2 events and `flush()` returned
+  `ok=True`, which is invariant 13's observable broken — an accepted argument that delivers
+  nothing. `require_timeout` and `usable_timeout` test `0 < value < inf` on the caller's object
+  the same way, and `sinks/_chunk.py` and `sinks/file.py` call `require_positive` and then
+  discard its return value, using the caller's original object in `range`, `start + size` and
+  `unit * interval`. The reviewing session measured the `LeSpoof` case on this tree.
 
 The rule applied is the settled one in
 `docs/decisions/sink-delivery/a-bad-argument-is-floored-if-it-works-and-refused-if-it-is-already-broken-a-new-one-is-refused.md`,
@@ -56,6 +67,13 @@ hide a caller's mistake behind a ceiling they never chose. A `bool` or other `in
 the declared type and works like the int it holds, so it is accepted and stored as that exact
 `int`, mirroring `_require_text`.
 
+That decision also says *do NOT convert the floor-side callers into refusals … that is a breaking
+change at 1.0 for a configuration that works*, and `max_keys=inf` or `2.5` do "work" today. They do
+not engage that clause: the declared type is `int | None`, so under invariant 10's typed-consumer
+observable every float is already a `mypy` error, and no type-checked caller breaks. The
+floor-side protection covers values *of the declared type* — `True`, `Sub(3)` and an `IntEnum`
+member keep working, as 1, 3 and the int they hold.
+
 ## Scope
 
 ### In Scope
@@ -65,19 +83,26 @@ the declared type and works like the int it holds, so it is accepted and stored 
 - An accepted `int` instance — `bool` or subclass — is stored as an exact `int`, and the `< 1`
   test runs on that value (FR-002).
 - Every new refusal precedes every assignment and the ownership stamp (FR-003).
+- The sink-side validators `_retry.require_positive`, `require_timeout` and `usable_timeout` test
+  and return the exact builtin, and the two callers that discarded the return use it (FR-004).
 
 ### Out of Scope
 
-- **Any file but `src/log_foundry/config.py` and `tests/test_config.py`, besides docs.**
-  `sanitize.py`, `model.py` and `api.py` belong to SPEC-063, building in a parallel session; the
-  fix needs none of them, because a ceiling that is an exact `int` on arrival is what they already
-  assume.
-- **The sink-side siblings, swept and unchanged.** `_retry.require_positive` already refuses `2.5`,
-  `nan` and `inf` with a named `TypeError` and accepts `True` and `Sub(3)`, which work as 1 and 3;
-  `_retry.require_timeout` accepts `2.5` (a valid duration) and refuses `nan` and `inf` with
-  `ValueError`; `usable_timeout` floors `nan` and `inf` to the default. Those are the decision's
-  settled behaviour on the floor side, and the pins in `tests/test_sink_retry.py` exist to fail a
-  change to them.
+- **Any file but `config.py`, `sinks/_retry.py`, `sinks/_chunk.py`, `sinks/file.py` and their
+  tests, besides docs.** `sanitize.py`, `model.py` and `api.py` belong to SPEC-063, building in a
+  parallel session; the fix needs none of them, because a ceiling that is an exact `int` on arrival
+  is what they already assume.
+- **`sanitize.py`'s docstring on `_TypesOnly` says a `Config` "validates its ceilings"**, which is
+  false: `Config` has no `__post_init__`. SPEC-063, which owns that file, has taken it and corrects
+  it in its own diff to "configure() validates the ceilings; a hand-built Config does not".
+- **What the sink-side validators keep doing.** Their verdicts on values of the declared type are
+  settled by the decision and unchanged: `require_positive` refuses `2.5`, `nan` and `inf` with a
+  named `TypeError` and accepts `True` and `Sub(3)` as 1 and 3; `require_timeout` accepts `2.5` (a
+  valid duration) and refuses `nan` and `inf` with `ValueError`; `usable_timeout` floors `nan`,
+  `inf`, zero and negatives to the default and still raises the comparison's own error for a
+  non-number. The pins in `tests/test_sink_retry.py` stay green. **What does change** is FR-004:
+  the exact builtin is tested and returned, so a subclass overriding a comparison or conversion is
+  judged by the number it holds.
 - **`flush(timeout=)` and `shutdown(timeout=)`.** They are not constructors and validate nothing;
   nothing here adds a check to them.
 - **Validating `Config` on direct construction.** `Config` is a frozen dataclass with no
@@ -97,6 +122,8 @@ the declared type and works like the int it holds, so it is accepted and stored 
   fifth ceiling cannot be left on the old check.
 - **`_require_text` and the ceiling helper.** Both refuse a wrong type with the same message shape
   and store the exact builtin; a stamp and a ceiling are the same promise at the same door.
+- **The `configure()` door and the sink-validator door.** Both normalise an `int` instance with
+  `int.__index__` before testing it, so a subclass cannot pass one and fail the other (FR-004).
 - **Worker and orphan paths.** Both read the stored config through `_live_config`, so a ceiling
   that is an exact `int` on arrival serves both with no change to either.
 
@@ -146,9 +173,10 @@ subclass that overrides arithmetic or comparison never reaches `sanitize`.
       `type(getattr(get_config(), <ceiling>)) is int` holds, so `True` is not stored as a `bool`.
 - [ ] For each ceiling, a `class Sub(int)` instance with value 3 is stored as an exact `int` equal
       to 3, and an `IntEnum` member is stored as the exact `int` it holds.
-- [ ] A `Spoof(3)` whose `__lt__`, `__add__` and `__sub__` are overridden to misbehave, passed as
-      `max_value_bytes`, produces the same `MemorySink` event for the probe in the Overview as
-      `max_value_bytes=3` does — where at `71e42dd` its `fields` came out `{}`.
+- [ ] `class Spoof(int)` with `__lt__` returning `False` and `__add__` and `__sub__` returning
+      `"x"`, as `Spoof(3)` passed for `max_value_bytes`, produces the same `MemorySink` event for
+      the probe in the Overview as `max_value_bytes=3` does — where at `71e42dd` its `fields` came
+      out `{}`.
 - [ ] `False`, `Sub(0)` and a `Spoof(0)` whose `__lt__` returns `False` each raise `ValueError`
       naming the ceiling and reporting `0`, and the ceiling is unchanged. The message is built from
       the exact `int`, so a subclass whose `__repr__` raises still yields the `ValueError` and no
@@ -184,6 +212,38 @@ assignment, with the order of the existing checks otherwise unchanged.
 - [ ] Serves invariant 13 and invariant 5, whose *ownership is recorded when the library is handed
       a sink* must not record a sink the call then refuses.
 
+### FR-004: The sink validators test and return the exact builtin
+
+#### Description:
+
+`_retry.require_positive` normalises an `int` instance with `int.__index__` after its `isinstance`
+check, tests `<= 0` on the exact `int` and returns it. `_retry.require_timeout` normalises an `int`
+instance with `int.__index__` and a `float` instance with `float.__float__`, tests
+`0 < value < inf` on the exact value and returns it. `_retry.usable_timeout` does the same
+normalisation for an `int` or `float` instance before its test and returns the exact builtin or the
+default; its floor semantics, and its behaviour for a non-number, are otherwise unchanged. The two
+callers that discarded `require_positive`'s return value — `chunk_list` in `sinks/_chunk.py`, which
+then used `size` in `range` and `start + size`, and `file.py`'s interval, which then did
+`unit * interval` — use the returned value. `True` and `Sub(3)` keep working as 1 and 3.
+
+#### Acceptance Criteria:
+
+- [ ] `LeSpoof(0)`, for `class LeSpoof(int)` whose `__le__` returns `False`, raises `ValueError`
+      naming the argument at `MemorySink(maxlen=)`, at `RotatingFileSink(interval=)`, at
+      `chunk_list(items, size)` (on the first `next()`) and at a direct `require_positive` call.
+- [ ] A spoofed zero timeout — an `int` subclass and a `float` subclass with value 0 whose
+      comparisons and `__float__` are overridden to look positive — is refused by `require_timeout`
+      with `ValueError` naming the argument, and `usable_timeout` returns the default for it.
+- [ ] `type(require_positive(Sub(3), ...)) is int`, `type(require_timeout(Sub(3), ...)) is int`,
+      `type(require_timeout(F(2.5), ...)) is float` and `type(usable_timeout(F(2.5), d)) is float`,
+      each with the value it held; `True` is returned as `1`.
+- [ ] `chunk_list([1, 2, 3, 4], Sub(2))` yields `[[1, 2], [3, 4]]` and `RotatingFileSink` given
+      `interval=Sub(2)` computes the period from `2` — the returned value is the one used.
+- [ ] Every pin in `tests/test_sink_retry.py` is unchanged and green, including the floor-side
+      pins for `usable_timeout` and the message check that names the value received.
+- [ ] Serves invariant 13 and invariant 6, whose twin doors — `configure()` and the sink
+      validators — must give the same verdict on the same subclass.
+
 ---
 
 ## Data Model
@@ -198,14 +258,29 @@ def _require_positive(name: str, value: object) -> int | None
     //                    else      -> exact          (type(exact) is int)
 ```
 
+```
+// src/log_foundry/sinks/_retry.py
+require_positive(value, name, owner) -> int
+    // not an int -> TypeError; exact = int.__index__(value); exact <= 0 -> ValueError; else exact
+require_timeout(value, name, owner) -> int | float
+    // not int|float -> TypeError; exact = int.__index__(v) or float.__float__(v);
+    // not (0 < exact < inf) -> ValueError; else exact
+usable_timeout(value, default) -> int | float
+    // int|float -> exact as above, then exact if 0 < exact < inf else default; non-number unchanged
+```
+
 `Config`'s fields keep their annotations, `int`. `configure()`'s signature is unchanged
 (`max_*: int | None = None`), so no public name moves (invariant 10).
 
 ## File & Folder Structure
 
 ```
-src/log_foundry/config.py     # _require_positive returns the exact int; configure() uses it
-tests/test_config.py          # the matrix and pins for FR-001 to FR-003
+src/log_foundry/config.py          # _require_positive returns the exact int; configure() uses it
+src/log_foundry/sinks/_retry.py    # the three validators normalise, test and return the exact value
+src/log_foundry/sinks/_chunk.py    # chunk_list uses require_positive's return
+src/log_foundry/sinks/file.py      # the interval uses require_positive's return
+tests/test_config.py               # the matrix and pins for FR-001 to FR-003
+tests/test_sink_retry.py           # the spoof pins for FR-004; existing pins unchanged
 ```
 
 ## Implementation Phases
@@ -220,7 +295,15 @@ tests/test_config.py          # the matrix and pins for FR-001 to FR-003
   `IntEnum` storage pins, the `Spoof` probe (run against `71e42dd`'s `_require_positive` first, to
   watch it redden), and the atomicity pins beside `test_a_rejected_call_leaves_the_config_untouched`.
 
-### Phase 2: Documentation
+### Phase 2: The sink validators
+
+- Normalise in `require_positive`, `require_timeout` and `usable_timeout` as in the Data Model,
+  and make `chunk_list` and `file.py` use `require_positive`'s return.
+- Add the `LeSpoof` and float-subclass pins to `tests/test_sink_retry.py`, run first against the
+  unchanged helpers to watch them redden, and `MemorySink`, `RotatingFileSink` and `chunk_list`
+  construction pins.
+
+### Phase 3: Documentation
 
 - `configure()`'s `Raises:` names the new `TypeError` for a non-`int` ceiling, and its `Args:` say
   an `int` subclass is stored as the exact `int`.
@@ -229,7 +312,10 @@ tests/test_config.py          # the matrix and pins for FR-001 to FR-003
 - Refine the decision file named in the Overview with a dated History entry (2026-11-03): the
   floor-or-refuse test is asked of values of the declared type, a value outside it is refused at
   the door and never floored, and a `bool` or other `int` subclass is floor-side and stored as an
-  exact `int`.
+  exact `int`, and the argument of the Overview that no type-checked caller breaks, so the
+  "do NOT convert the floor-side callers" clause is answered where it is stated.
+- The three validators' `Raises:` and `Returns:` docstrings say the exact builtin is tested and
+  returned.
 - Add a section to `docs/release-notes/v1.1.0.md`: a non-`int` ceiling is now a `TypeError` at
   `configure()` — a visible behaviour change for a caller who passed `2.5`, `100.0` or `inf`, which
   previously ran with the damage measured above.
