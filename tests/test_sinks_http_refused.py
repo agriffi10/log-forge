@@ -2,18 +2,23 @@
 
 A lone item the destination answers ``413``, and a lone item ``_known_refused`` discards without
 offering it, were counted at once. Once a drop has settled a chunk, ``emit`` raises only through a
-later chunk's exception ``_deliver`` does not catch — Probe D's ``http.client.IncompleteRead``, an
-``HTTPException`` and not an ``OSError`` — and the worker's retry then counted the drop once per
-attempt. ``_drop_refused`` now takes ``emit``'s ledger, so that raise discards it.
+later chunk's exception ``_deliver`` does not catch, and the worker's retry then counted the drop
+once per attempt. ``_drop_refused`` now takes ``emit``'s ledger, so that raise discards it.
 
 Probe D: ``max_batch_count=1, max_retries=0``, an opener answering ``413`` to the 2,000-byte
-event's lone request (sent first) and, for the ordinary event's request, ``200`` with a ``read()``
-that raises ``IncompleteRead``. Down repeats that on every attempt; once serves the second.
+event's lone request (sent first) and, for the ordinary event's request, raising a
+``RuntimeError`` — what a caller-injected opener can raise, and none of the ``URLError``,
+``OSError`` and ``http.client.HTTPException`` that ``_send`` catches. Down repeats that on every
+attempt; once serves the second.
+
+Probe D used to be a ``200`` whose ``read()`` raised ``IncompleteRead``. That no longer raises:
+after a status line a failed body read is ``b""`` and the ``2xx`` settles its chunk, so it could
+no longer stand for "an exception after a drop" (``docs/decisions/sink-delivery/``, *After a status
+line the status decides*).
 """
 
 from __future__ import annotations
 
-import http.client
 from typing import Any
 
 import pytest
@@ -31,23 +36,16 @@ _STAMP = "2026-08-10T00:00:00.000Z"
 _MARKER = "refused at the smallest request this sink can build"
 
 
-class _IncompleteResponse(FakeResponse):
-    """A ``200`` whose body read fails part-way, as a dropped connection does."""
-
-    def read(self) -> bytes:
-        raise http.client.IncompleteRead(b"")
+def _attempt() -> list[FakeResponse | Exception]:
+    """One Probe D attempt: ``413`` for the oversized event, then an opener that raises."""
+    return [FakeResponse(413, b""), RuntimeError("injected opener")]
 
 
-def _attempt() -> list[FakeResponse]:
-    """One Probe D attempt: ``413`` for the oversized event, then a read that raises."""
-    return [FakeResponse(413, b""), _IncompleteResponse(200, b"")]
-
-
-def _down() -> list[FakeResponse]:
+def _down() -> list[FakeResponse | Exception]:
     return _attempt() * 4
 
 
-def _once() -> list[FakeResponse]:
+def _once() -> list[FakeResponse | Exception]:
     return [*_attempt(), FakeResponse(413, b""), FakeResponse(200, b"")]
 
 
@@ -89,7 +87,7 @@ def test_probe_d_down_counts_no_413_drop(capsys) -> None:
 
     err = capsys.readouterr().err
     assert not delivered and failed_batches == 1
-    assert len(opener.calls) == 8, "the premise: the 413 and the failed read on every attempt"
+    assert len(opener.calls) == 8, "the premise: the 413 and the raising opener on every attempt"
     assert sink.dropped_oversized == 0
     assert sink.losses().dropped == 0
     assert _drop_lines(err) == [], "no 413 line from an emit that raised"
@@ -168,7 +166,7 @@ def test_every_http_subclass_counts_no_413_drop_when_down(cls: type[HTTPSink]) -
     delivered, failed_batches = _through_the_worker(sink, _probe_d())
 
     assert not delivered and failed_batches == 1
-    assert len(opener.calls) == 8, "the premise: the 413 and the failed read on every attempt"
+    assert len(opener.calls) == 8, "the premise: the 413 and the raising opener on every attempt"
     assert sink.losses().dropped == 0
 
 

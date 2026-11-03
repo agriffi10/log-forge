@@ -26,7 +26,8 @@ class ElasticsearchSink(HTTPSink):
       dropped_unadjudicated: Events whose outcome a ``_bulk`` response did not settle, which is
         every route to :meth:`_abandon_unadjudicated`: ``errors`` was truthy while the ``items``
         array did not line up with the batch sent or no readable item carried an error, or the
-        body could not be decoded or was not an object. Abandoned rather than retried, for
+        body could not be decoded or was not an object — an empty body, and one that could not
+        be read off the connection at all, among them. Abandoned rather than retried, for
         SPEC-018's reason: the request succeeded, so re-sending would duplicate what landed.
 
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
@@ -116,8 +117,16 @@ class ElasticsearchSink(HTTPSink):
         back empty-handed, which is the total failure the worker's retry exists for, while a
         batch that indexed some of its chunks must not be re-sent whole (SPEC-026 FR-001).
 
+        A ``2xx`` body that could not be read — cut short, stalled or reset after the status line
+        — arrives as ``b""`` (``HTTPSink._attempt``), and needs no branch of its own:
+        ``json.loads(b"")`` raises, so it takes the same unadjudicated route as any undecodable
+        body, counted on ``dropped_unadjudicated`` with the line saying the events may have
+        landed. That is also why reading an empty ``2xx`` as unadjudicated is the right reading
+        for ``_bulk``: this hook cannot tell an empty body from an unreadable one, and a reading
+        of empty as success would settle an unreadable body silently.
+
         Args:
-          payload: The response body.
+          payload: The response body, or ``b""`` when it could not be read.
           items: The chunk the response describes.
 
         Returns:

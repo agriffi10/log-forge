@@ -887,13 +887,15 @@ class _RaisingOpener:
         return FakeResponse(200, b"{}")
 
 
-def test_sentry_absorbs_a_response_error_http_sink_does_not_retry() -> None:
-    """``HTTPSink`` catches (URLError, OSError); ``IncompleteRead`` is neither."""
-    import http.client
+def test_sentry_absorbs_an_exception_http_sink_does_not_catch() -> None:
+    """``HTTPSink`` catches URLError, OSError and HTTPException; an opener's RuntimeError is none.
 
+    This used to raise ``IncompleteRead`` from the opener, which ``HTTPSink`` now catches as a
+    pre-status protocol error, so it no longer reaches ``SentrySink``'s own guard.
+    """
     from log_foundry.sinks.sentry import SentrySink
 
-    opener = _RaisingOpener(3, http.client.IncompleteRead(b""))
+    opener = _RaisingOpener(3, RuntimeError("injected opener"))
     sink = SentrySink(
         "http://k@sentry.local/1", backend="http", max_retries=0, opener=opener
     )
@@ -902,6 +904,45 @@ def test_sentry_absorbs_a_response_error_http_sink_does_not_retry() -> None:
 
     assert (sink.sent, sink.transport_errors) == (4, 1)
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+def test_sentry_counts_a_pre_status_protocol_error_as_abandoned(capsys) -> None:
+    """A garbage status line is ``HTTPSink``'s connection error now: counted there, not here."""
+    import http.client
+
+    from log_foundry.sinks.sentry import SentrySink
+
+    opener = _RaisingOpener(3, http.client.BadStatusLine("garbage"))
+    sink = SentrySink("http://k@sentry.local/1", backend="http", max_retries=0, opener=opener)
+
+    sink.emit([{"level": "ERROR"}] * 5)
+
+    assert (sink.sent, sink.transport_errors) == (4, 0)
+    assert sink.failed == 1
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+    assert "connection error, BadStatusLine" in capsys.readouterr().err
+
+
+def test_sentry_counts_an_unreadable_2xx_envelope_as_sent() -> None:
+    """Sentry's status is its whole answer, so a 2xx whose body cannot be read was accepted."""
+    import http.client
+
+    from log_foundry.sinks.sentry import SentrySink
+    from test_sinks_http import FakeOpener, FakeResponse
+
+    class _Unreadable(FakeResponse):
+        def read(self) -> bytes:
+            raise http.client.IncompleteRead(b"")
+
+    ok = FakeResponse(200, b"{}")
+    opener = FakeOpener([ok, ok, _Unreadable(200, b""), ok, ok])
+    sink = SentrySink("http://k@sentry.local/1", backend="http", max_retries=0, opener=opener)
+
+    sink.emit([{"level": "ERROR"}] * 5)
+
+    assert len(opener.calls) == 5
+    assert (sink.sent, sink.transport_errors) == (5, 0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
 def test_a_longer_items_array_does_not_turn_a_partial_success_into_a_raise() -> None:

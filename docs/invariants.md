@@ -162,9 +162,13 @@ one failure and otherwise deliberate drops, an SQS batch of an id failure and an
 on. So a `_bulk` server answering every POST with a `2xx` the sink cannot adjudicate — a body it
 cannot read or that is not an object, or a truthy `errors` with a short `items` array — leaves
 `flush()` truthy and `failed_batches` at zero, with the loss in `health().sink`: the events may
-have landed, so a retry could duplicate them.
+have landed, so a retry could duplicate them. An HTTP `2xx` is a verdict however its body ends: a
+body cut short, stalled or reset after the status line settles its chunk — delivered for a sink
+that ignores the body, unadjudicated for the `_bulk` sinks that read it — and is never re-sent; before
+any status line, a protocol error is retried and counted like a connection error.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
-`tests/integration/` against real services (SPEC-041).
+`tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass), `tests/integration/`
+against real services (SPEC-041).
 
 ## 8. An event is safe by construction, once, at assembly
 

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A 2xx _bulk response with no readable verdict is counted, never retried"
-description: "an undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
+description: "an unreadable, undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
 ---
 
 **A 2xx `_bulk` response with no readable verdict is counted, never retried** — when
@@ -13,7 +13,10 @@ landed. It is also **counted**: the chunk's `sent` goes to `dropped_unadjudicate
 `_diag.lost` line saying the events may have landed. This extends *A positional response
 adjudicates all of a chunk or none of it* from a misaligned array to a body with no array at all,
 for the same reason: the per-item verdict lives in the body, so without one the server has not
-confirmed these events, and invariant 2 forbids losing them silently.
+confirmed these events, and invariant 2 forbids losing them silently. A body that could not be read
+off the connection at all — cut short, stalled or reset after the status line — takes the same
+route: `HTTPSink._attempt` hands it over as `b""`, which `json.loads` refuses (*After a status line
+the status decides; a 2xx whose body cannot be read is never re-sent*).
 
 **Rejected: settling silently.** Before this decision an undecodable body returned with every counter
 at zero, and a too-deep one raised `RecursionError` out of `emit`, so the worker re-sent a batch the
@@ -38,5 +41,7 @@ into the other sink.
 
 ### 2026-11-03
 
+- **Refined.** A body read that fails after a `2xx` status line now reaches this route as `b""`,
+  where it used to raise `IncompleteRead` out of `emit` or be retried as a connection error.
 - **Settled.** A too-deep body raised out of `emit` and was retried; the fix routes every unreadable
   or non-object 2xx body to the unadjudicated count.

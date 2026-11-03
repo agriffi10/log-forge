@@ -820,6 +820,13 @@ close it.
 
 ### Open
 
+- **`HoneycombSink` never reads its per-event verdict.** `/1/batch/<dataset>` answers `200`
+  with one status per event, and an event rejected inside it (`{"status": 400, ...}`) is counted
+  nowhere and announced nowhere, against invariant 2. The sink inherits `HTTPSink`'s default
+  `_handle_response`, which ignores the body. Found by the system-frame review of the 2xx
+  body-read fix. **Closed by** a `_handle_response` override that counts the rejected events,
+  decides what an empty or unreadable (`b""`) body means for this destination, and adds the class
+  to the body-reader roster in `tests/test_sinks_http_body_read.py`.
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it

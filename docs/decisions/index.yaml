@@ -151,7 +151,7 @@ areas:
     governs: ["src/log_foundry/sinks/**"]
     decisions:
       - title: "A 2xx _bulk response with no readable verdict is counted, never retried"
-        fence: "an undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
+        fence: "an unreadable, undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
         status: "stable"
         path: "docs/decisions/sink-delivery/a-2xx-bulk-response-with-no-readable-verdict-is-counted-never-retried.md"
       - title: "A bad argument is floored if it works and refused if it is already broken; a new one is refused"
@@ -198,6 +198,10 @@ areas:
         fence: "`servers`, `queue_url` and `bootstrap_servers` are the vendors' own words, so the names are frozen rather than normalised; the forwarded HTTP keywords are typed instead. (SPEC-051)"
         status: "stable"
         path: "docs/decisions/sink-delivery/a-sinks-constructor-keeps-the-vendors-own-spelling-and-types-what-it-forwards.md"
+      - title: "After a status line the status decides; a 2xx whose body cannot be read is never re-sent"
+        fence: "before a status line, `URLError`, `OSError` and `http.client.HTTPException` are retried, then counted in `failed`; after one, a body read that fails is `b\"\"` and the status decides as it always did — a `2xx` settles its chunk (`_bulk` counts it unadjudicated), a `503` retries, a `413` splits, a `400` is abandoned. `_handle_response` keeps `bytes`, so it cannot tell an empty body from an unreadable one."
+        status: "stable"
+        path: "docs/decisions/sink-delivery/after-a-status-line-the-status-decides-a-2xx-whose-body-cannot-be-read-is-never-re-sent.md"
       - title: "Caller code that fails for one event costs only that event; a batch of nothing but failures re-raises"
         fence: "`TransformSink`'s function, `FilteringSink`'s predicate and `SQSSink`'s FIFO id callables drop the one event, counted once the inner `emit` returned and announced once per batch by exception *type*; when every event failed the first exception is re-raised unchanged and nothing is counted. An all-unrenderable HTTP batch settles instead, counted — re-rendering identical input fails identically. (SPEC-058)"
         status: "stable"
