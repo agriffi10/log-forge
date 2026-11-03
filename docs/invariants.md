@@ -93,8 +93,9 @@ what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 `tests/test_sink_retry.py` and `tests/test_worker_exit_budget.py` (the exit drain's retries fit
 the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight) and
-`tests/test_worker_exit_budget.py` (every `shutdown()` over the exit drain) — `flush()` has no
-CPU-time assertion, listed so the gap is visible.
+`tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,
+through one measuring helper) — `flush()` has no CPU-time assertion, listed so the gap is
+visible.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
