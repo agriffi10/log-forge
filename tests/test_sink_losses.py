@@ -597,13 +597,19 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
 
 
 def test_every_platform_subclass_inherits_the_raise() -> None:
-    """Each builds its own body and calls ``_send``, so the rule lives there, not in each emit."""
+    """Each builds its own body and calls ``_send``, so the rule lives there, not in each emit.
+
+    The list is tied to the derived HTTP-subclass population (SPEC-056 FR-005): a sink missing
+    from it used to fail nothing, which is how `OpenSearchSink` went unbuilt here.
+    """
     from log_foundry.sinks.datadog import DatadogSink
-    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
     from log_foundry.sinks.honeycomb import HoneycombSink
     from log_foundry.sinks.loki import LokiSink
     from log_foundry.sinks.newrelic import NewRelicSink
+    from log_foundry.sinks.otlp import OTLPSink
     from log_foundry.sinks.splunk import SplunkHECSink
+    from test_public_surface import _http_sink_subclasses
     from test_sinks_http import FakeOpener, FakeResponse
 
     builders = [
@@ -614,12 +620,19 @@ def test_every_platform_subclass_inherits_the_raise() -> None:
         lambda opener: HoneycombSink("k", "d", max_retries=0, opener=opener),
         lambda opener: LokiSink("http://x", max_retries=0, opener=opener),
         lambda opener: ElasticsearchSink("http://x", index="i", max_retries=0, opener=opener),
+        lambda opener: OpenSearchSink("http://x", index="i", max_retries=0, opener=opener),
+        lambda opener: OTLPSink(max_retries=0, opener=opener),
     ]
+    built: set[str] = set()
     for build in builders:
         sink = build(FakeOpener([FakeResponse(503, b"down")]))
         with pytest.raises(SinkDeliveryError):
             sink.emit([{"a": 1}])
         assert sink.losses().failed == 1, type(sink).__name__
+        built.add(type(sink).__name__)
+    derived = {cls.name for _, cls in _http_sink_subclasses()}
+    listed = built - {"HTTPSink"}
+    assert listed == derived, f"the list and the population differ: {listed ^ derived}"
 
 
 def test_http_losses_report_oversized_drops_separately() -> None:

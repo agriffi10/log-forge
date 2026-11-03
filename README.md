@@ -689,7 +689,8 @@ lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup
 #### HTTP & self-hosted platforms (zero-dependency)
 
 All build on `HTTPSink` (stdlib `urllib`): they POST batches with bounded `429`/`5xx` retry
-(honoring `Retry-After`) and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
+(honoring `Retry-After`) — `OTLPSink` alone retries OTLP's own set, `429`/`502`/`503`/`504`, and
+abandons a `500` on the first request — and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
 to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`, `max_retry_after=`,
 `max_batch_count=`, `max_batch_bytes=`, `opener=`).
 
@@ -736,6 +737,42 @@ completed, not that every chunk of it landed.
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
 lf.configure(sink=ElasticsearchSink("https://es.internal:9200", index="app-logs",
                                      auth=("elastic", "…")))
+```
+
+##### OTLPSink: what it sends
+
+`OTLPSink` speaks OTLP/HTTP JSON to a Collector or to any backend that ingests OTLP, so your logs
+arrive under the OpenTelemetry names those backends already index. The mapping is private — the
+output is the contract, and these are the names a query can rest on. Each event is one
+`LogRecord`: `timeUnixNano` and `observedTimeUnixNano` from `timestamp`; `severityNumber` for the
+five levels (`DEBUG` 5, `INFO` 9, `WARNING` 13, `ERROR` 17, `CRITICAL` 21) with `severityText`
+verbatim; `body` from `message`; `traceId` and `spanId` as lowercase hex with the sampled `flags`;
+and `eventName` for `span.start` and `span.end`. Each distinct `(service, version, env)` is one
+`resourceLogs` carrying `service.name`, `service.version` and `deployment.environment.name`, under
+the `log_foundry` scope and the schema URL for semantic conventions **1.44.0**.
+
+Record attributes: `code.function.name`, `log.record.uid`, `log_foundry.parent_span_id`,
+`log_foundry.truncated`, `log_foundry.duration_ms`, `log_foundry.status`, `exception.type`,
+`exception.message`, `exception.stacktrace` — each present only when the event carries it —
+followed by one attribute per key of `fields`, in order. The `log_foundry.` prefix is reserved: a
+field named with it is dropped, as is a field colliding with a library attribute set on that
+record, and every drop is counted in `droppedAttributesCount`. An integer within int64 is an
+`intValue`; beyond it, its digits as a `stringValue`. `exception.type` is `module.Type`, bare for
+a builtin. `code.function.name` carries the name the span recorded — the function's
+`__qualname__` or your `name=` — not a module-qualified one.
+
+A `2xx` carrying `partialSuccess` is counted on `.rejected_records` and never retried, because a
+retry would re-send what landed; a `2xx` whose verdict cannot be read — a count that is not a
+usable integer, a body over the 4 MiB bound — is counted on `.dropped_unadjudicated`, also never
+retried. Both feed `health().sink.failed`. A chunk whose every record was rejected raises, so the
+worker's retry and `failed_batches` show a permanent rejection. A `413` still halves the byte
+budget and re-sends in smaller requests, since nothing landed.
+
+```python
+from log_foundry.sinks.otlp import OTLPSink
+lf.configure(service="payments", version="2.14", env="prod",
+             sink=OTLPSink("https://collector.internal:4318/v1/logs",
+                           headers={"x-api-key": "…"}, gzip=True))
 ```
 
 #### SaaS platforms

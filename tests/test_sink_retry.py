@@ -103,12 +103,15 @@ def test_max_retry_after_is_a_keyword_with_a_documented_default() -> None:
 
 
 def test_every_platform_subclass_inherits_the_ceiling() -> None:
+    """Tied to the derived HTTP-subclass population (SPEC-056 FR-005), so nothing is left out."""
     from log_foundry.sinks.datadog import DatadogSink
-    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
     from log_foundry.sinks.honeycomb import HoneycombSink
     from log_foundry.sinks.loki import LokiSink
     from log_foundry.sinks.newrelic import NewRelicSink
+    from log_foundry.sinks.otlp import OTLPSink
     from log_foundry.sinks.splunk import SplunkHECSink
+    from test_public_surface import _http_sink_subclasses
 
     built = [
         DatadogSink("k", max_retry_after=7.0),
@@ -117,9 +120,14 @@ def test_every_platform_subclass_inherits_the_ceiling() -> None:
         HoneycombSink("k", "d", max_retry_after=7.0),
         LokiSink("http://x", max_retry_after=7.0),
         ElasticsearchSink("http://x", index="i", max_retry_after=7.0),
+        OpenSearchSink("http://x", index="i", max_retry_after=7.0),
+        OTLPSink(max_retry_after=7.0),
     ]
     for sink in built:
         assert sink.max_retry_after == 7.0, type(sink).__name__
+    names = {type(sink).__name__ for sink in built}
+    derived = {cls.name for _, cls in _http_sink_subclasses()}
+    assert names == derived, f"the list and the population differ: {names ^ derived}"
 
 
 # --- FR-002: a wait is interruptible --------------------------------------------------------

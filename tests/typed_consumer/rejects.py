@@ -14,6 +14,7 @@ from log_foundry import Config, ContinueResult, FlushResult, Health, SinkLosses,
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
 from log_foundry.sinks.logstash import LogstashSink
+from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.splunk import SplunkHECSink
 
 # FR-001: field order is not a contract any more, so a positional form is refused.
@@ -38,4 +39,5 @@ _i = SplunkHECSink("u", "tok", nonsense=1)     # want: Unexpected keyword argume
 # ...and the two that were already wrong at runtime: a duplicate argument, and a keyword socket
 # mode discards in silence.
 _j = DatadogSink("k", body_format="ndjson")    # want: Unexpected keyword argument "body_format" for "DatadogSink"
+_l = OTLPSink("u", body_format="ndjson")       # want: Unexpected keyword argument "body_format" for "OTLPSink"
 _k = LogstashSink(host="h", port=1, unknown=2) # want: Unexpected keyword argument "unknown" for "LogstashSink"

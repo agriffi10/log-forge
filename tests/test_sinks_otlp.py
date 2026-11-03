@@ -717,3 +717,55 @@ def test_handle_response_never_raises_on_hostile_bytes() -> None:
         b'"s"',
     ):
         assert sink._handle_response(payload, []) is True
+
+
+# --- FR-005: the README's attribute list, and the surface that did not grow ------------------
+
+
+def _readme_attribute_list() -> list[str]:
+    """The backticked keys on the README subsection's ``Record attributes:`` sentence."""
+    import re
+
+    text = (Path(log_foundry.__file__).parent.parent.parent / "README.md").read_text("utf-8")
+    start = text.index("##### OTLPSink: what it sends")
+    section = text[start : text.index("#### SaaS platforms", start)]
+    sentence = section[section.index("Record attributes:") :]
+    sentence = sentence[: sentence.index("followed by")]
+    return re.findall(r"`([a-z_]+(?:\.[a-z_]+)+)`", sentence)
+
+
+def test_the_readme_lists_exactly_the_attribute_keys_a_maximal_event_emits() -> None:
+    """FR-005 AC-3 (invariant 10): the documented names are what a consumer's queries rest on."""
+    maximal = _event(
+        message="span.end",
+        parent_span_id="00f067aa0ba902b7",
+        truncated=True,
+        duration_ms=1.5,
+        status="error",
+        error={"type": "Boom", "module": "m", "message": "x", "stack": "tb"},
+        fields={},
+    )
+    emitted = [a["key"] for a in _otel.log_record(maximal)["attributes"]]
+    documented = _readme_attribute_list()
+    assert documented == emitted, f"README {documented} != emitted {emitted}"
+    assert len(documented) == 9
+
+
+def test_nothing_from_otel_is_public_and_the_surface_grew_by_one_path_only() -> None:
+    """FR-005 AC-8 (invariant 10)."""
+    import importlib
+    import pkgutil
+
+    import log_foundry.sinks
+
+    otel_names = {name for name in vars(_otel) if not name.startswith("__")}
+    assert not hasattr(_otel, "__all__")
+    assert not otel_names & set(log_foundry.__all__)
+    for module in pkgutil.iter_modules(log_foundry.sinks.__path__):
+        exported = getattr(
+            importlib.import_module(f"log_foundry.sinks.{module.name}"), "__all__", ()
+        )
+        assert not otel_names & set(exported), module.name
+    assert len(log_foundry.__all__) == 30, "the top-level surface is the 30 names of 1.0.2"
+    assert not hasattr(log_foundry.sinks, "__all__")
+    assert log_foundry.sinks.otlp.__all__ == ["OTLPSink"]
