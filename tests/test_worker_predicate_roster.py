@@ -242,6 +242,18 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
         ),
     ),
+    ("_shutdown_worker", "worker.claim_stop(deadline)", 0): (
+        MOMENT,
+        (
+            "whether this caller is the one stopping the worker right now, and therefore "
+            "whose deadline the exit drain declines against (SPEC-062 FR-001). The once-only "
+            "gate and the deadline record are one decision under Worker._lock, taken inside "
+            "the same critical section that moves the count, so a backoff the owner's set "
+            "wakes finds the deadline of the caller whose join follows. Moment rather than "
+            "liveness: a worker that lost its gate is still live, and the question is only "
+            "whether a stop is already under way on it."
+        ),
+    ),
     ("_shutdown_worker", "worker is None", 0): (
         EXISTENCE,
         (

@@ -1833,6 +1833,15 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     The closer grace is granted **once**, at the end, on every path. Two functions arranged that
     between them before, and granting it twice measured 4.01 s against a 2 s grace.
 
+    **A live worker's stop is claimed here, before** ``_state._stop`` **is set** (SPEC-062
+    FR-001). That event is the worker's own, and setting it is what cuts a backoff short, so the
+    drain thread may wake and decide its next retry at once; :meth:`Worker.claim_stop` records
+    this caller's deadline in the same decision that wins the once-only gate, inside this same
+    critical section, so the wake finds the deadline and the join that follows belongs to the
+    caller who recorded it. The verdict is passed to :meth:`Worker.stop`, which then joins or
+    waits against this caller's own timeout. A late worker is stopped through ``stop`` without a
+    verdict and claims for itself, before it sets the different event it holds.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
@@ -1843,15 +1852,18 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
       None.
     """
     deadline = None if timeout is None else monotonic() + timeout
+    claimed = False
     with _state._lock:
         _state.retirements += 1
-        _state._stop.set()
         worker = _state.worker_exists()
         if worker is None:
             _state._shutdown_running += 1
+        else:
+            claimed = worker.claim_stop(deadline)
+        _state._stop.set()
     late_worker: Worker | None = None
     if worker is not None:
-        worker.stop(timeout)
+        worker.stop(timeout, claimed=claimed)
         waited = _close_owed(deadline)
     else:
         try:

@@ -68,6 +68,20 @@ DEFAULT_SWAP_TIMEOUT = _lifecycle.DEFAULT_SWAP_TIMEOUT
 Moved and re-exported for the reason :data:`DEFAULT_SHUTDOWN_TIMEOUT` was.
 """
 
+_JOIN_MARGIN: float = 0.1
+"""Seconds the drain thread needs after its last attempt returns to be seen to end (SPEC-062).
+
+After ``sink.emit`` returns from the last attempt the drain thread still counts the batch,
+writes the ``_diag`` line, answers the flush markers and leaves :meth:`Worker._run`, and
+``Thread.join`` must observe that end inside the caller's timeout. :meth:`Worker._emit` adds
+this to its prediction of when a retry would end, so a retry permitted by the rule leaves the
+join time to return. It is that window and nothing more: it reserves no time for ``close()``,
+which the lifecycle owner runs inline after the join whatever the budget, and it is a module
+constant rather than a parameter because a knob would let a caller recreate the overrun the
+budget exists to remove. ``_emit`` reads it at each decision rather than binding it at
+definition, so a test can patch it to prove it is added.
+"""
+
 
 def _bounded_seconds(timeout: float | None) -> str:
     """Renders a shutdown timeout for a diagnostic without trusting its ``__str__``.
@@ -341,6 +355,18 @@ class Worker:
         shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
         and user code.
 
+        **The exit drain fits the caller's budget** (SPEC-062 FR-001). ``_exit_deadline`` is
+        the ``shutdown()`` caller's deadline as a ``time.monotonic()`` instant, ``None`` for an
+        unbounded one, and it is written exactly once, by :meth:`claim_stop`, in the same
+        decision that wins the once-only gate — so the caller whose timeout the join uses is
+        always the caller whose deadline the drain declines against. Until a stop is claimed it
+        is ``None``, which declines nothing, so ordinary draining, ``flush()`` and a swap retry
+        exactly as before. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
+        before its first attempt until it returns, so an expired join can say how many events
+        are inside the emit it gave up waiting on (FR-005). It is written by the drain thread
+        and read without the lock by the stopper, as :attr:`draining` is read: a single
+        assignment, so a reader sees one of two answers, both true at the instant.
+
         ``sink_released=`` used to sit here and is retired (SPEC-054 FR-002). It made a worker
         built during a ``shutdown()`` inherit a discharged close for a sink that shutdown's orphan
         branch had just closed. Under one owed-close record the flag has no work to do: this
@@ -357,7 +383,10 @@ class Worker:
           batch_size: How many submissions accumulate before an emit is triggered.
           flush_interval: Seconds before a partial batch is emitted anyway.
           max_queue: Ceiling on buffered submissions, past which the newest is dropped.
-          max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`.
+          max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`. On the
+            exit drain a retry is declined when it is predicted to end after the ``shutdown()``
+            deadline (SPEC-062), so the retries a failing batch sees there are bounded by the
+            caller's budget as well as by this count; the first attempt is always made.
 
         Returns:
           None.
@@ -381,6 +410,8 @@ class Worker:
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
         self._stopped = False
+        self._exit_deadline: float | None = None
+        self._in_flight = 0
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
@@ -415,6 +446,15 @@ class Worker:
         ``stopped_reason`` is cleared rather than set to ``"Forked"`` (AC-6). SPEC-019 defines
         that field as "the drain thread died", and this child's drain thread is about to be
         running — the alternative reads as the more honest one and is not.
+
+        ``_in_flight`` is reset on both branches beside the other per-drain fields, because a
+        child inherits the parent's value for a drain thread that does not exist in it
+        (SPEC-062 FR-005). ``_exit_deadline`` is reset only where a drain thread is started: a
+        worker whose ``stop()`` was called directly rather than through ``shutdown()`` never
+        moved the retirement count, so :func:`_lifecycle._rebuild_worker_after_fork` still
+        resumes it, and without the reset every retry in that child would be declined against
+        a deadline the parent's caller set, forever. A retired parent forks a retired child, and
+        that child's record is left as it stands.
 
         ``_held`` is reset to the live sink alone. A child stranded nothing, and ``releasable()``
         refuses the parent's sinks on the pid stamp anyway — so keeping a superseded one buys no
@@ -482,12 +522,14 @@ class Worker:
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
         self.stopped_reason = None
+        self._in_flight = 0
         self._taken_markers = []
         self._held = [self.sink]
         if not resume:
             self._drain_finished.set()
             self._drain_settled.set()
             return
+        self._exit_deadline = None
         self._drain_finished.clear()
         self._drain_settled.clear()
         _lifecycle.offer_stop_signal(self.sink, self._stop)
@@ -1061,7 +1103,45 @@ class Worker:
             f"reach the new sink instead",
         )
 
-    def stop(self, timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
+    def claim_stop(self, deadline: float | None) -> bool:
+        """Wins or loses the once-only stop gate, recording the winner's deadline (SPEC-062).
+
+        The gate and the record are **one decision under the lock**, and that is the whole
+        point of the method. A first draft recorded the deadline in one critical section and
+        decided ``_stopped`` in another, and under two concurrent ``shutdown()`` calls with
+        timeouts 0.9 and 1.8 the drain was measured declining against 1.8 while the 0.9 caller
+        did the join: that join expired, the 1.8 caller returned as a second caller, and the
+        sink was never closed. Here whoever sets ``_stopped`` is whoever's deadline is written,
+        so the drain always declines against the deadline the joining caller is holding, and a
+        later caller's deadline is refused along with its claim, which is what makes the record
+        write-once without a second flag.
+
+        It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
+        order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
+        nesting ``_state._lock`` then ``Worker._lock`` is the order the closer already
+        documents at ``_closing_now_lock``.
+
+        Args:
+          deadline: The caller's deadline as a ``time.monotonic()`` instant, or ``None`` for
+            an unbounded stop.
+
+        Returns:
+          Whether this caller won the gate. ``True`` means it must do the first caller's work
+          in :meth:`stop`; ``False`` means a stop is already under way and its deadline stands.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            if self._stopped:
+                return False
+            self._stopped = True
+            self._exit_deadline = deadline
+            return True
+
+    def stop(
+        self, timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT, *, claimed: bool | None = None
+    ) -> None:
         """Ends this worker's drain thread, and nothing else (SPEC-054 FR-003).
 
         What remains of ``shutdown()`` once the closes moved to the lifecycle owner: set the event
@@ -1075,21 +1155,36 @@ class Worker:
         after one does, so the owner's ``set`` at the top of the call never reaches it. Measured
         without this: a 3 s backoff bounded the stop at 3.01 s, against 0.06 s with it.
 
-        **The once-only gate is** ``_stopped``, **decided under the lock.** A second caller waits
-        for the drain to settle within its own budget rather than joining again: today's shape,
-        kept, and it is not the retirement latch FR-001 deleted — "this worker's stop has been
-        entered" is a fact about one thread, with no counterpart on the orphan path, which is why
-        it stays here beside :attr:`draining` and :meth:`may_be_inside`. Gating on
+        **The once-only gate is** ``_stopped``, **decided under the lock by** :meth:`claim_stop`,
+        which records the winner's deadline in the same decision (SPEC-062 FR-001). A second
+        caller waits for the drain to settle within its own budget rather than joining again:
+        today's shape, kept, and it is not the retirement latch FR-001 deleted — "this worker's
+        stop has been entered" is a fact about one thread, with no counterpart on the orphan path,
+        which is why it stays here beside :attr:`draining` and :meth:`may_be_inside`. Gating on
         ``_drain_settled`` instead was tried and is wrong: two concurrent first callers both see it
         clear, both run the expiry branch, and a wedged sink produces two "shutdown timed out"
         lines with ``queued`` counted twice.
 
+        **The claim is made before any stop event this worker holds is set**, on both routes.
+        :func:`_lifecycle._shutdown_worker` claims for a live worker inside the critical section
+        that moves the retirement count, before it sets ``_state._stop`` — which is this worker's
+        own event — and passes the verdict in as ``claimed``. A direct caller, and the late-worker
+        route, pass nothing and claim here, before ``self._stop.set()``. Either way a backoff cut
+        short by the stop wakes to find the deadline already recorded. Each caller joins or waits
+        against **its own** timeout, never another caller's: a second caller is bounded by the
+        budget it asked for whichever deadline the drain is declining against.
+
         An expired join leaves the sink **open**, because the thread is still inside it
         (SPEC-027 FR-004). The closer sees that through :meth:`may_be_inside` and leaves the sink
-        in the owner's record for a later call.
+        in the owner's record for a later call. The expiry line then also reports how many events
+        are inside the emit the thread is still running (SPEC-062 FR-005), separately from the
+        queued count and not as lost: their future is still open, and :meth:`_emit` counts them
+        when it returns.
 
         Args:
           timeout: Seconds to wait for the drain thread, or ``None`` to wait indefinitely.
+          claimed: The verdict of a :meth:`claim_stop` the caller already made under its own
+            lock, or ``None`` to claim here.
 
         Returns:
           None.
@@ -1098,9 +1193,7 @@ class Worker:
           None.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._lock:
-            first = not self._stopped
-            self._stopped = True
+        first = self.claim_stop(deadline) if claimed is None else claimed
         if not first:
             if self.draining:
                 self._drain_settled.wait(
@@ -1116,16 +1209,18 @@ class Worker:
         self._thread.join(timeout)
         if self._thread.is_alive():
             queued = self._queued_or_unknown()
+            in_flight = self._in_flight
             with self._lock:
                 if self.stopped_reason is None:
                     self.stopped_reason = "ShutdownTimeout"
             self._drain_settled.set()
-            _diag.lost(
-                "item",
-                queued,
+            detail = (
                 f"shutdown timed out after {_bounded_seconds(timeout)}; the sink is left open "
-                f"because the worker thread is still using it",
+                f"because the worker thread is still using it"
             )
+            if in_flight:
+                detail += f"; {in_flight} event(s) in flight, counted when the emit returns"
+            _diag.lost("item", queued, detail)
             self._release_waiters()
             return
         self._release_waiters()
@@ -1498,6 +1593,30 @@ class Worker:
         attempt, no counter and nothing on stderr — reachable only by misconfiguration, but
         reachable.
 
+        **On the exit drain a retry fits the caller's budget or is not made** (SPEC-062 FR-001).
+        Each attempt is timed, ``time.monotonic()`` around ``sink.emit`` only and never the
+        backoff, and immediately before each retry, after its backoff wait has returned, the
+        retry is declined when ``now + longest attempt of this batch + _JOIN_MARGIN`` is past
+        ``_exit_deadline``. The first attempt of a batch is never declined, a deadline of
+        ``None`` declines nothing, and "longest" is per batch. The estimator is the longest
+        attempt rather than the last or the mean because a sink whose attempts vary — 0.1 s,
+        0.8 s, 0.3 s — can run the next for as long as it ever has, and a prediction from a
+        shorter one lets the join expire with the sink left open, which is the outcome the
+        budget exists to prevent. The deadline is read without the lock, as :attr:`draining` is
+        read: it is written once by :meth:`claim_stop` and a stale read costs at most one
+        attempt, which invariant 3's observable already allows. Measured without the rule, a
+        0.5 s failing sink under ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and
+        ``close()`` ran 0 times; with it, 2 attempts and one close.
+
+        A declined retry is counted once in ``failed_batches`` and announced once, with a reason
+        distinct from the exhausted wording so a reader can tell "the sink stayed broken" from
+        "the shutdown ran out of time" (FR-002). The abandon line is not written as well.
+
+        ``_in_flight`` holds the batch size from before the first attempt until this method
+        returns by any route — delivered, abandoned, declined, or a ``BaseException`` escaping
+        the sink — so the stopper's expiry line can name the events inside an emit it gave up
+        waiting on (FR-005). It is reset in a ``finally`` for exactly the escaping case.
+
         Args:
           event_lists: The accumulated per-span event-lists to flatten and emit.
 
@@ -1513,16 +1632,36 @@ class Worker:
         if not batch:
             return
         retries = max(self.max_retries, 0)
-        for attempt in range(retries + 1):
-            try:
-                self.sink.emit(batch)
-                return
-            except Exception:
-                if attempt >= retries:
+        longest = 0.0
+        self._in_flight = len(batch)
+        try:
+            for attempt in range(retries + 1):
+                started = time.monotonic()
+                try:
+                    self.sink.emit(batch)
+                    return
+                except Exception:
+                    longest = max(longest, time.monotonic() - started)
+                    if attempt >= retries:
+                        with self._lock:
+                            self.failed_batches += 1
+                        _diag.lost(
+                            "event",
+                            len(batch),
+                            f"batch abandoned after {retries + 1} emit attempts",
+                        )
+                        return
+                self._stop.wait(min(0.01 * (2**attempt), 0.5))
+                deadline = self._exit_deadline
+                if deadline is not None and time.monotonic() + longest + _JOIN_MARGIN > deadline:
                     with self._lock:
                         self.failed_batches += 1
                     _diag.lost(
-                        "event", len(batch), f"batch abandoned after {retries + 1} emit attempts"
+                        "event",
+                        len(batch),
+                        f"retry declined after {attempt + 1} emit attempt(s); the next was "
+                        f"predicted to end after the shutdown() deadline",
                     )
                     return
-                self._stop.wait(min(0.01 * (2**attempt), 0.5))
+        finally:
+            self._in_flight = 0
