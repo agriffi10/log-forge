@@ -239,7 +239,7 @@ then used `size` in `range` and `start + size`, and `file.py`'s interval, which 
       each with the value it held; `True` is returned as `1`.
 - [ ] With `class Arith(int)` whose `__radd__` and `__rmul__` return `0`,
       `list(chunk_list([1, 2, 3, 4], Arith(2)))` is `[[1, 2], [3, 4]]` (at `71e42dd`,
-      `[[1], []]`) and `RotatingFileSink` given `interval=Arith(2)` computes the period as twice
+      `[[], []]`) and `RotatingFileSink` given `interval=Arith(2)` computes the period as twice
       the unit (at `71e42dd`, `0`) — the returned value is the one used. A plain subclass cannot
       discriminate: CPython passes it through `range` and slicing as the int it holds.
 - [ ] Every pin in `tests/test_sink_retry.py` is unchanged and green, including the floor-side

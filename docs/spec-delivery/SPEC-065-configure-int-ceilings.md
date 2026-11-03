@@ -17,8 +17,9 @@ it holds**, so a float is refused at the door and a subclass cannot lie about a 
   ahead of the stamps, before any assignment and before the sink is stamped into the ownership
   record.
 - **The sink validators return the exact builtin** (FR-004): `_retry.require_positive`,
-  `require_timeout` and `usable_timeout` test and return the value through the new private
-  `_exact_number` (`int.__index__` / `float.__float__`), and `chunk_list` and `RotatingFileSink`'s
+  `require_timeout` and `usable_timeout` test and return the exact builtin — `require_positive`
+  through `int.__index__`, the two timeout validators through the new private `_exact_number`
+  (`int.__index__` / `float.__float__`) — and `chunk_list` and `RotatingFileSink`'s
   interval use `require_positive`'s return, which they used to discard.
 
 Deviation, one line: the source diff also carries four formatting-only reflows (a `raise` in

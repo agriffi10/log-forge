@@ -1149,7 +1149,7 @@ def test_the_validators_return_the_exact_builtin() -> None:
 
 
 def test_chunk_list_uses_the_count_the_validator_returned() -> None:
-    """FR-004 AC-4: at `71e42dd` `Arith(2)` gave `[[1], []]` because `start + size` was 0."""
+    """FR-004 AC-4: at `71e42dd` `Arith(2)` gave `[[], []]` because `start + size` was 0."""
     from log_foundry.sinks._chunk import chunk_list
 
     assert list(chunk_list([1, 2, 3, 4], Arith(2))) == [[1, 2], [3, 4]]
@@ -1168,5 +1168,5 @@ def test_the_rotation_interval_uses_the_count_the_validator_returned(tmp_path) -
 
 def test_usable_timeout_still_raises_the_comparisons_error_for_a_non_number() -> None:
     """FR-004 description: a non-number is passed through unchanged and the `<` still raises."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="not supported between instances"):
         usable_timeout("5", 7.0)  # type: ignore[arg-type]

@@ -1100,6 +1100,9 @@ def test_a_refused_ceiling_does_not_swap_a_running_worker() -> None:
         assert config.get_config().sink is a
         assert worker.sink is a
         assert a.closed == 0
+        worker.submit(_span("after"))
+        assert log_foundry.flush(timeout=5.0)
+        assert a.messages == ["after"]
         assert b.batches == []
     finally:
         retire_process(worker)
