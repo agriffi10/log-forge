@@ -410,6 +410,12 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-014", "SPEC-057"]
     path: "docs/specs/SPEC-064-bounded-baggage-header.md"
+  - id: "SPEC-065"
+    title: "configure() Refuses a Ceiling That Is Not an int"
+    description: "Makes configure() refuse a non-int payload ceiling at the call and store an accepted one as an exact int, so no float, bool or spoofing subclass reaches sanitize."
+    spec_status: "Draft"
+    depends_on: ["SPEC-017", "SPEC-034", "SPEC-049", "SPEC-055", "SPEC-057"]
+    path: "docs/specs/SPEC-065-configure-int-ceilings.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
