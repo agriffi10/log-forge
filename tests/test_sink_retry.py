@@ -89,7 +89,9 @@ def test_an_http_date_retry_after_still_falls_back(monkeypatch) -> None:
     sink = HTTPSink(
         "http://x",
         max_retries=1,
-        opener=FakeOpener([FakeResponse(503, b"", {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})]),
+        opener=FakeOpener(
+            [FakeResponse(503, b"", {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})]
+        ),
     )
     with pytest.raises(Exception):  # noqa: B017
         sink.emit([{"a": 1}])
@@ -395,9 +397,7 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
         RedisStreamsSink("s", client=FakeRedis()),
         PostgresSink("logs", connection=FakePG()),
         ClickHouseSink("logs", client=FakeClickHouse()),
-        MongoDBSink(
-            client=FakeMongoClient(FakeCollection()), database="d", collection="c"
-        ),
+        MongoDBSink(client=FakeMongoClient(FakeCollection()), database="d", collection="c"),
         RabbitMQSink(exchange="e", routing_key="r", connection=FakeAMQP()),
         AzureEventHubsSink(producer=FakeProducer()),
         SQSSink("https://q/x", client=FakeSQSClient()),
@@ -544,9 +544,7 @@ def test_the_sqs_backoff_is_interruptible() -> None:
     original = sqs_mod._BACKOFF_BASE
     sqs_mod._BACKOFF_BASE = 20.0
     try:
-        sink = SQSSink(
-            "https://q/x", client=FaultingClient(sender_fault=False), max_retries=3
-        )
+        sink = SQSSink("https://q/x", client=FaultingClient(sender_fault=False), max_retries=3)
         assert _drain_one(sink) < 6.0
     finally:
         sqs_mod._BACKOFF_BASE = original
@@ -818,7 +816,7 @@ def test_a_deferred_close_does_not_re_drain() -> None:
 
 
 def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
-    """"item(s)", not "event(s)": the queue holds one entry per span, plus internal markers."""
+    """ "item(s)", not "event(s)": the queue holds one entry per span, plus internal markers."""
     sink = _WedgedSink()
     worker = Worker(sink, batch_size=1)
     worker.submit([{"a": 1}, {"a": 2}])  # one item, two events
@@ -876,10 +874,14 @@ def test_the_three_aws_stream_sinks_back_off_between_attempts(monkeypatch) -> No
     kinesis_body = json.dumps({"trace_id": "t", "a": 1}).encode("utf-8")
     firehose_body = json.dumps({"a": 1}).encode("utf-8") + b"\n"  # FR-005 delimiter
     cases = (
-        (KinesisSink("s", client=FakeKinesis(always_fail={kinesis_body}), max_retries=3),
-         [{"trace_id": "t", "a": 1}]),
-        (FirehoseSink("s", client=FakeFirehose(always_fail={firehose_body}), max_retries=3),
-         [{"a": 1}]),
+        (
+            KinesisSink("s", client=FakeKinesis(always_fail={kinesis_body}), max_retries=3),
+            [{"trace_id": "t", "a": 1}],
+        ),
+        (
+            FirehoseSink("s", client=FakeFirehose(always_fail={firehose_body}), max_retries=3),
+            [{"a": 1}],
+        ),
         (SNSSink("arn", client=FakeSNS(always_fail={"0"}), max_retries=3), [{"a": 1}]),
     )
     for sink, batch in cases:
@@ -1048,3 +1050,123 @@ def test_a_non_number_is_a_type_error_naming_the_argument(bad: object) -> None:
         require_timeout(bad, "timeout", "OwnerSink")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="OwnerSink chunk_size must be an integer, not"):
         require_positive(bad, "chunk_size", "OwnerSink")  # type: ignore[arg-type]
+
+
+# --- SPEC-065 FR-004: the validators test and return the exact builtin -------------------------
+
+
+class Sub(int):
+    """A plain int subclass: works as the int it holds, and is returned as that int."""
+
+
+class LeSpoof(int):
+    """An int subclass whose `<=` lies, so `value <= 0` reads False for a 0."""
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+
+class GtSpoof(int):
+    """An int subclass whose comparisons say it is positive and finite whatever it holds."""
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+    def __lt__(self, other: object) -> bool:
+        return True
+
+
+class F(float):
+    """A float subclass whose comparisons and `__float__` all look positive and finite."""
+
+    def __float__(self) -> float:
+        return 5.0
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+    def __lt__(self, other: object) -> bool:
+        return True
+
+
+class Arith(int):
+    """An int subclass whose reflected `+` and `*` return 0, so a discarded return is visible."""
+
+    def __radd__(self, other: object) -> int:  # type: ignore[override]
+        return 0
+
+    def __rmul__(self, other: object) -> int:  # type: ignore[override]
+        return 0
+
+
+def test_a_count_that_spoofs_its_comparison_is_refused_at_every_door(tmp_path) -> None:
+    """FR-004 AC-1: at `71e42dd` `MemorySink(maxlen=LeSpoof(0))` kept nothing and flushed ok."""
+    from log_foundry.sinks._chunk import chunk_list
+    from log_foundry.sinks._retry import require_positive
+    from log_foundry.sinks.file import RotatingFileSink
+    from log_foundry.sinks.memory import MemorySink
+
+    with pytest.raises(ValueError, match="OwnerSink n must be a positive integer, not 0"):
+        require_positive(LeSpoof(0), "n", "OwnerSink")
+    with pytest.raises(ValueError, match="MemorySink maxlen"):
+        MemorySink(maxlen=LeSpoof(0))
+    with pytest.raises(ValueError, match="RotatingFileSink interval"):
+        RotatingFileSink(str(tmp_path / "a.log"), when="S", interval=LeSpoof(0))
+    with pytest.raises(ValueError, match="chunk_list size"):
+        next(chunk_list([1], LeSpoof(0)))
+
+
+@pytest.mark.parametrize(
+    ("bad", "held"), [(GtSpoof(0), "0"), (F(0.0), "0.0")], ids=["GtSpoof(0)", "F(0.0)"]
+)
+def test_a_timeout_that_spoofs_its_comparisons_is_refused_and_floored(
+    bad: float, held: str
+) -> None:
+    """FR-004 AC-2: at `71e42dd` both validators returned the spoofed zero as given."""
+    from log_foundry.sinks._retry import require_timeout, usable_timeout
+
+    with pytest.raises(ValueError, match="OwnerSink timeout must be a positive, finite") as info:
+        require_timeout(bad, "timeout", "OwnerSink")
+    assert str(info.value).endswith(f"not {held}"), "the message names the number held"
+    assert usable_timeout(bad, 7.0) == 7.0
+
+
+def test_the_validators_return_the_exact_builtin() -> None:
+    """FR-004 AC-3: what the caller gets back is `int` or `float`, never the subclass."""
+    from log_foundry.sinks._retry import require_positive, require_timeout, usable_timeout
+
+    for returned, expected in (
+        (require_positive(Sub(3), "n", "O"), 3),
+        (require_positive(True, "n", "O"), 1),
+        (require_timeout(Sub(3), "timeout", "O"), 3),
+        (require_timeout(True, "timeout", "O"), 1),
+    ):
+        assert returned == expected
+        assert type(returned) is int
+    for returned in (require_timeout(F(2.5), "timeout", "O"), usable_timeout(F(2.5), 7.0)):
+        assert returned == 2.5
+        assert type(returned) is float
+
+
+def test_chunk_list_uses_the_count_the_validator_returned() -> None:
+    """FR-004 AC-4: at `71e42dd` `Arith(2)` gave `[[], []]` because `start + size` was 0."""
+    from log_foundry.sinks._chunk import chunk_list
+
+    assert list(chunk_list([1, 2, 3, 4], Arith(2))) == [[1, 2], [3, 4]]
+
+
+def test_the_rotation_interval_uses_the_count_the_validator_returned(tmp_path) -> None:
+    """FR-004 AC-4: at `71e42dd` `interval=Arith(2)` gave a period of 0 because `1 * Arith(2)` was 0."""
+    from log_foundry.sinks.file import RotatingFileSink
+
+    sink = RotatingFileSink(str(tmp_path / "a.log"), when="S", interval=Arith(2))
+    try:
+        assert sink._interval_seconds == 2
+    finally:
+        sink.close()
+
+
+def test_usable_timeout_still_raises_the_comparisons_error_for_a_non_number() -> None:
+    """FR-004 description: a non-number is passed through unchanged and the `<` still raises."""
+    with pytest.raises(TypeError, match="not supported between instances"):
+        usable_timeout("5", 7.0)  # type: ignore[arg-type]

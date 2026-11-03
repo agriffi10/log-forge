@@ -971,20 +971,6 @@ close it.
   The same class as SPEC-064's header defect, on the diagnostic path rather than the header.
   **Closed by** `rejected` echoing a non-`str` value by type name (`<TypeName>`) and slicing a
   `str` before its `repr`, so the echo is bounded and the line is always written.
-- **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
-  invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
-  Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and
-  `max_keys=True` are accepted and stored as given, while a `str` is refused only by the
-  comparison's own `TypeError`, not by a check that names the ceiling. `max_keys=2.5` kept three
-  of four list entries and marked the event, and `True` kept one. A float
-  `max_value_bytes` makes the slice in `truncate_str` raise `TypeError` for any string past it; the
-  per-value guard catches that, so a 200-character string silently becomes
-  `<unserializable: str>`, unmarked, where the ceiling should have clipped it, at `324936e` too.
-  SPEC-057's bounded reads widened it: the bytes-like read slices to `max_value_bytes + 1`, so
-  even a SHORT `bytes` or `bytearray` now becomes `<unserializable: bytes>` or
-  `<unserializable: bytearray>`, where at `324936e` it was written whole. **Closed by**
-  `configure()` refusing a non-`int` ceiling with a `TypeError` at the call, deciding at the same
-  time whether a `bool` or another `int` subclass passes (invariant 13).
 - **`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, unverified.** It
   does not check that the object is `_bulk`-shaped, so a server answering every POST with
   `{"error": {"type": "auth"}, "status": 500}`, or with
@@ -995,8 +981,44 @@ close it.
   omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
   endpoint's response shape gets settled.
 
+- **A float passes the `max(x, 0)` floor on `max_retries` and `backup_count`, and breaks every
+  `emit`** (SPEC-065 system-frame review; invariant 13). Thirteen constructors floor `max_retries`
+  with `max(max_retries, 0)` — `HTTPSink`, `SocketTransport`, `SQSSink`, the Redis, Kinesis,
+  Firehose, SNS, Event Hubs, MongoDB, Postgres, ClickHouse and RabbitMQ sinks, and the worker — and
+  `max()` passes a float through to `range(retries + 1)`. Measured at `13318d4`:
+  `HTTPSink(url, max_retries=2.5).emit([e])` raises `TypeError: 'float' object cannot be interpreted
+  as an integer` with `failed=0`, as do `nan` and `inf`, and `SyslogSink(max_retries=2.5)` the same.
+  `RotatingFileSink(backup_count=2.5)` (or `inf`) raises from `range(...)` on the first rollover
+  *after* `_rotate` has closed the stream, so every later `emit` and `close()` raise
+  `ValueError: I/O operation on closed file` — the sink is dead for the life of the process.
+  **Closed by** refusing a non-`int` there with a named `TypeError` and flooring only the exact
+  `int`, as SPEC-065 did for `configure()`'s ceilings.
+- **`flush(timeout=)` and `shutdown(timeout=)` take `inf` and `nan` unchecked** (SPEC-065
+  system-frame review; invariants 1 and 13). Measured at `13318d4`, one process per value, with a
+  worker draining to a 0.4 s sink: `shutdown(timeout=math.inf)` and `shutdown(timeout=1e300)` raise
+  `OverflowError: timestamp out of range for platform time_t` into the caller and
+  `shutdown(timeout=math.nan)` raises `ValueError`, against `Raises: None`;
+  `flush(timeout=math.inf)` returns at once with reason `thread-died` while the thread is alive,
+  having delivered nothing, and `flush(timeout=math.nan)` reports `timed-out` at 0.00 s. **Closed
+  by** deciding, beside the SPEC-062 exit-drain budget, what each of the two degenerate values
+  means for a bounded wait, and refusing or flooring it by the sink-delivery rule.
+- **`SocketTransport(port=2.5)` is accepted and raises out of every `emit`** (SPEC-065
+  system-frame review; invariant 13). `_socket.py` checks `0 <= port <= 65535`, which a float
+  passes; measured at `13318d4`, UDP `sendto` then raises a raw `TypeError` on every batch — the
+  SPEC-049 port finding's shape, for a float. **Closed by** an `isinstance(port, int)` check with
+  the exact `int` stored, beside the range check.
+
 ### Resolved
 
+- ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
+  invariant 13) → **closed by SPEC-065**. `config._require_positive` tested only `value < 1`, so a
+  `float`, `nan` or `inf` was stored as given and `sanitize` then did integer arithmetic on it on
+  every event. It now refuses a value that is neither `None` nor an `int` instance with a
+  `TypeError` naming the ceiling and the type, never flooring it, and stores an accepted `bool` or
+  `int` subclass as the exact `int` it holds (`int.__index__`), so a subclass whose comparison lied
+  about a zero can no longer reach `sanitize`. The sink-side twins, `_retry.require_positive`,
+  `require_timeout` and `usable_timeout`, were closed with it: they test and return the exact
+  builtin, and the two callers that discarded the return now use it.
 - ~~**`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded
   nor total**~~ (SPEC-057 system-frame review; invariants 1 and 6) → **closed by SPEC-064**.
   `current_baggage_header()` now renders through `sanitize_fields`, one pass over the whole baggage

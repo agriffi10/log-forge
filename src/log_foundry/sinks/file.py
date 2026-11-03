@@ -28,20 +28,25 @@ def _rollover_seconds(when: str | None, interval: int) -> float | None:
     A module-level function rather than a ``@staticmethod``, which ``python.md`` §9 forbids and
     which this was the only instance of in the package (SPEC-049 FR-007).
 
+    The interval ``unit * interval`` multiplies is the exact ``int`` :func:`require_positive`
+    returns (SPEC-065 FR-004), not the caller's object: a subclass whose ``__rmul__`` returned
+    ``0`` gave a period of ``0`` when the return was discarded, measured at ``71e42dd``.
+
     Args:
       when: The unit code, or ``None`` for no time trigger.
-      interval: How many units make up one period.
+      interval: How many units make up one period, a positive ``int``.
 
     Returns:
       The period in seconds, or ``None`` when there is no time trigger.
 
     Raises:
+      TypeError: If the interval is not an ``int``.
       ValueError: If the unit code is unrecognized, so a typo fails loudly at construction rather
         than silently at runtime, or if the interval is not positive. The interval is checked even
         when there is no time trigger, because an interval that means nothing is a caller who
         believes one is armed (SPEC-049 FR-003).
     """
-    require_positive(interval, "interval", "RotatingFileSink")
+    interval = require_positive(interval, "interval", "RotatingFileSink")
     if when is None:
         return None
     try:
@@ -412,7 +417,6 @@ class RotatingFileSink:
             self._stream.flush()
             self._stream.close()
 
-
     def _schedule_next(self) -> float | None:
         """Returns the monotonic-clock deadline for the next time-based rotation (SPEC-031).
 
@@ -451,11 +455,7 @@ class RotatingFileSink:
         Raises:
           None.
         """
-        if (
-            self._max_bytes > 0
-            and self._size > 0
-            and self._size + incoming > self._max_bytes
-        ):
+        if self._max_bytes > 0 and self._size > 0 and self._size + incoming > self._max_bytes:
             return True
         return self._next_rollover is not None and time.monotonic() >= self._next_rollover
 
