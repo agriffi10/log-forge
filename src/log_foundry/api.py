@@ -97,6 +97,11 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     in-span branch can only fail at the data.
 
     The echo runs after the emit, so a closed or redirected stream never costs the event itself.
+    The ``echo`` argument's own truth is read **inside** that guard (SPEC-063 FR-003): it is the
+    caller's object, and measured at ``71e42dd`` an ``echo=`` whose ``__bool__`` raised propagated
+    its ``RuntimeError`` to the caller on both paths, and inside a span the decorator then recorded
+    ``status=error`` for an exception the caller never raised. Now the event is delivered, nothing
+    is echoed, and the fault is announced "echoing to the console" by type.
 
     Args:
       level: The severity label to stamp on the event.
@@ -137,11 +142,11 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
         except Exception as exc:
             _note_orphan_loss()
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")
-    if echo and event is not None:
-        try:
+    try:
+        if echo and event is not None:
             _console.write(event)
-        except Exception as exc:
-            _diag.absorbed("echoing to the console", exc)
+    except Exception as exc:
+        _diag.absorbed("echoing to the console", exc)
 
 
 def _merge(fields: Mapping[str, object] | None, kv: dict[str, object]) -> dict[str, object]:
@@ -167,6 +172,12 @@ def _merge(fields: Mapping[str, object] | None, kv: dict[str, object]) -> dict[s
     ignored while ``fields=["x"]`` crashed. The library coerces rather than validates (SPEC-017),
     so the tolerant half is the one that matches, and the fault is announced by type.
 
+    The truthiness test is inside the same ``try`` (SPEC-063 FR-003). ``if not fields`` calls the
+    caller's ``__bool__`` or ``__len__``, and measured at ``71e42dd`` a ``Mapping`` whose either
+    one raised propagated the ``RuntimeError`` into the application on the orphan path and inside
+    a traced function, the decorator then recording ``status=error``. Such a ``fields=`` is now
+    ignored and announced like a non-mapping, and the event is delivered with the keyword fields.
+
     Args:
       fields: The explicit mapping, or ``None``.
       kv: The keyword-collected fields.
@@ -178,9 +189,9 @@ def _merge(fields: Mapping[str, object] | None, kv: dict[str, object]) -> dict[s
     Raises:
       None.
     """
-    if not fields:
-        return kv
     try:
+        if not fields:
+            return kv
         return {**fields, **kv}
     except Exception as exc:
         _diag.absorbed("merging the fields= argument", exc, "the fields= argument was ignored")
