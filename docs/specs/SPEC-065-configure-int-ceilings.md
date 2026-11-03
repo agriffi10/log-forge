@@ -179,8 +179,8 @@ subclass that overrides arithmetic or comparison never reaches `sanitize`.
       out `{}`.
 - [ ] `False`, `Sub(0)` and a `Spoof(0)` whose `__lt__` returns `False` each raise `ValueError`
       naming the ceiling and reporting `0`, and the ceiling is unchanged. The message is built from
-      the exact `int`, so a subclass whose `__repr__` raises still yields the `ValueError` and no
-      other exception.
+      the exact `int`, so `NoRepr(0)` — a `class NoRepr(int)` whose `__repr__` and `__str__` raise
+      and whose comparisons are native — still yields the `ValueError` and no other exception.
 - [ ] `True` as `max_keys` produces the same event as `max_keys=1` for the probe in the Overview —
       the floor side is protected, not turned into a refusal.
 - [ ] Serves invariant 13 and invariant 8, whose *every configured ceiling holds exactly* is
@@ -237,8 +237,11 @@ then used `size` in `range` and `start + size`, and `file.py`'s interval, which 
 - [ ] `type(require_positive(Sub(3), ...)) is int`, `type(require_timeout(Sub(3), ...)) is int`,
       `type(require_timeout(F(2.5), ...)) is float` and `type(usable_timeout(F(2.5), d)) is float`,
       each with the value it held; `True` is returned as `1`.
-- [ ] `chunk_list([1, 2, 3, 4], Sub(2))` yields `[[1, 2], [3, 4]]` and `RotatingFileSink` given
-      `interval=Sub(2)` computes the period from `2` — the returned value is the one used.
+- [ ] With `class Arith(int)` whose `__radd__` and `__rmul__` return `0`,
+      `list(chunk_list([1, 2, 3, 4], Arith(2)))` is `[[1, 2], [3, 4]]` (at `71e42dd`,
+      `[[1], []]`) and `RotatingFileSink` given `interval=Arith(2)` computes the period as twice
+      the unit (at `71e42dd`, `0`) — the returned value is the one used. A plain subclass cannot
+      discriminate: CPython passes it through `range` and slicing as the int it holds.
 - [ ] Every pin in `tests/test_sink_retry.py` is unchanged and green, including the floor-side
       pins for `usable_timeout` and the message check that names the value received.
 - [ ] Serves invariant 13 and invariant 6, whose twin doors — `configure()` and the sink
@@ -262,10 +265,10 @@ def _require_positive(name: str, value: object) -> int | None
 // src/log_foundry/sinks/_retry.py
 require_positive(value, name, owner) -> int
     // not an int -> TypeError; exact = int.__index__(value); exact <= 0 -> ValueError; else exact
-require_timeout(value, name, owner) -> int | float
+require_timeout(value, name, owner) -> float    // annotated float (ruff PYI041); returns exact int or float
     // not int|float -> TypeError; exact = int.__index__(v) or float.__float__(v);
     // not (0 < exact < inf) -> ValueError; else exact
-usable_timeout(value, default) -> int | float
+usable_timeout(value, default) -> float          // likewise
     // int|float -> exact as above, then exact if 0 < exact < inf else default; non-number unchanged
 ```
 
