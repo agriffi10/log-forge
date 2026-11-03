@@ -633,6 +633,11 @@ def test_a_shared_subtree_spends_the_node_budget_exactly_once() -> None:
     assert len(values) == MAX_NODES + 1
     assert _strings(record).count("<node limit>") == 1
     assert _marked(record)
+    within = _record("shared-20", _event(fields={"y": _shared(20)}, truncated=False))
+    assert "<depth limit>" not in _strings(within), "21 containers deep: the depth cap never fires"
+    assert _strings(within).count("<node limit>") == 1
+    assert len(_record_values(within)) == MAX_NODES + 1
+    assert _marked(within), "the node cut alone marks the record"
     wide = {"m": [list(range(256)) for _ in range(256)]}
     record = _record("wide-256", _event(fields=wide, truncated=False))
     assert len(list(_values(_attrs(record)["m"]))) == 1 + 256 + 256 * 256
@@ -766,7 +771,7 @@ def test_the_mark_is_exactly_the_listed_set() -> None:
         assert not _marked(_record(f"unmarked-{name}", event)), name
     marked: dict[str, dict[str, object]] = {
         "depth": {"fields": {"v": _nested(25)}},
-        "node": {"fields": {"y": _shared(24)}},
+        "node": {"fields": {"y": _shared(20)}},
         "bigint": {"fields": {"i": 10**5000}},
         "surrogate": {"message": "a\ud800b"},
         "bad-key": {"fields": {(1, 2): 1}},

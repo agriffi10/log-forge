@@ -222,6 +222,12 @@ class _Claim:
     __class__ = property(lambda self: str)  # type: ignore[assignment]
 
 
+class _DictClaim:
+    """Passes ``isinstance(_, dict)`` and fails ``dict.get``: the guard's one reachable case."""
+
+    __class__ = property(lambda self: dict)  # type: ignore[assignment]
+
+
 def test_resource_key_never_raises_and_five_hostile_pairs_round_trip() -> None:
     """AC-4 (invariants 1 and 2)."""
     assert resource_key(_event(service=_HashRaises("svc"))) == ("svc", "1.2", "prod")
@@ -231,6 +237,7 @@ def test_resource_key_never_raises_and_five_hostile_pairs_round_trip() -> None:
     assert resource_key(_event(service=5, version=None, env=["x"])) == (None, None, None)
     assert resource_key("not a dict") == (None, None, None)  # type: ignore[arg-type]
     assert resource_key(None) == (None, None, None)  # type: ignore[arg-type]
+    assert resource_key(_DictClaim()) == (None, None, None)  # type: ignore[arg-type]
     for key in (resource_key(_event(service=_HashRaises("svc"))),):
         assert all(type(part) is str or part is None for part in key)
         hash(key)

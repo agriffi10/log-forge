@@ -110,9 +110,7 @@ class OTLPSink(HTTPSink):
             (invariant 13). Every other refusal is inherited.
         """
         if not isinstance(endpoint, str):
-            raise TypeError(
-                f"OTLPSink endpoint must be a str, not {type(endpoint).__name__}"
-            )
+            raise TypeError(f"OTLPSink endpoint must be a str, not {type(endpoint).__name__}")
         _valid_url(endpoint, "OTLPSink", name="endpoint")
         method = http_kwargs.get("method", "POST")
         if method != "POST":
@@ -185,11 +183,7 @@ class OTLPSink(HTTPSink):
         Raises:
           None.
         """
-        return (
-            len(rendered.encode("utf-8"))
-            + 1
-            + framing(resource_key(event), self._scope_version)
-        )
+        return len(rendered.encode("utf-8")) + 1 + framing(resource_key(event), self._scope_version)
 
     def _body_reserve(self) -> int:
         """Withholds the ``{"resourceLogs":[]}`` wrapper no record is charged for.
