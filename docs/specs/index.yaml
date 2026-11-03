@@ -404,6 +404,12 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-026", "SPEC-036", "SPEC-038", "SPEC-058"]
     path: "docs/specs/SPEC-059-retry-safe-drop-counts.md"
+  - id: "SPEC-062"
+    title: "The Exit Drain's Retries Fit the Caller's Budget"
+    description: "Makes Worker._emit decline a retry predicted to end after shutdown()'s deadline, so the join returns on time and the sink is closed rather than left open."
+    spec_status: "Completed"
+    depends_on: ["SPEC-027", "SPEC-038", "SPEC-047", "SPEC-054"]
+    path: "docs/specs/SPEC-062-exit-drain-budget.md"
   - id: "SPEC-064"
     title: "Bounded, Total Baggage Header — Rendered Through Assembly's Coercion and Capped by Whole Members"
     description: "Renders the outbound baggage header through assembly's bounded coercion and caps it at 8192 bytes by whole members, so current_baggage_header() always returns and its output always parses."

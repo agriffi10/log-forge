@@ -711,7 +711,10 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
     seen: list[float | None] = []
 
     class SpyWorker:
-        def stop(self, timeout: float | None = None) -> None:
+        def claim_stop(self, deadline: float | None) -> bool:
+            return True
+
+        def stop(self, timeout: float | None = None, *, claimed: bool | None = None) -> None:
             seen.append(timeout)
 
     monkeypatch.setattr(_lifecycle._state, "_worker", SpyWorker())
@@ -833,7 +836,10 @@ def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
     # 2 submissions still queued + the _SHUTDOWN sentinel. Asserted exactly, because a count
     # nobody checks is how "lost 1 drain(s)" survived the first round of tests.
     assert "lost 3 item(s)" in err
-    assert "event(s)" not in err, "the queue counts spans, not the events inside them"
+    # The batch inside the wedged emit is reported separately as in flight (SPEC-062 FR-005),
+    # so the narrowing is to the figure this test is about: the lost count is items, never
+    # the events inside them.
+    assert "lost 2 event(s)" not in err, "the queue counts spans, not the events inside them"
     assert "shutdown timed out after 0.2s" in err
 
 

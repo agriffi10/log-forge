@@ -89,9 +89,13 @@ Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdow
 *Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths;
 what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
-*Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink) and
-`tests/test_sink_retry.py`; the CPU half only by `tests/test_sinks_pubsub.py` — `flush()` and
-`shutdown()` have no CPU-time assertion, listed so the gap is visible.
+*Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
+`tests/test_sink_retry.py` and `tests/test_worker_exit_budget.py` (the exit drain's retries fit
+the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
+`tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight) and
+`tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,
+through one measuring helper) — `flush()` has no CPU-time assertion, listed so the gap is
+visible.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 

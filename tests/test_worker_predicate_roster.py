@@ -96,7 +96,9 @@ MOMENT = (
     "moment — is anything using this sink right now. **Two predicates**, because an abandoned "
     "drain answers them oppositely: `in_flight` reads `draining`, for the signal refresh, where "
     "an abandoned drain counts as over; `held` reads thread liveness, for the close, where it "
-    "counts as still inside"
+    "counts as still inside. `worker.claim_stop(deadline)` is the same question asked as a "
+    "transition (sets `_stopped`, records the deadline, takes `Worker._lock`), not a third "
+    "predicate"
 )
 
 # One row per site: (enclosing function, the expression as `ast.unparse` renders it) -> why.
@@ -240,6 +242,18 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         (
             "the test the binding above feeds, filed separately because the binding can be "
             "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
+        ),
+    ),
+    ("_shutdown_worker", "worker.claim_stop(deadline)", 0): (
+        MOMENT,
+        (
+            "whether this caller is the one stopping the worker right now, and therefore "
+            "whose deadline the exit drain declines against (SPEC-062 FR-001). The once-only "
+            "gate and the deadline record are one decision under Worker._lock, taken inside "
+            "the same critical section that moves the count, so a backoff the owner's set "
+            "wakes finds the deadline of the caller whose join follows. Moment rather than "
+            "liveness: a worker that lost its gate is still live, and the question is only "
+            "whether a stop is already under way on it."
         ),
     ),
     ("_shutdown_worker", "worker is None", 0): (
