@@ -407,7 +407,7 @@ specs:
   - id: "SPEC-062"
     title: "The Exit Drain's Retries Fit the Caller's Budget"
     description: "Makes Worker._emit decline a retry predicted to end after shutdown()'s deadline, so the join returns on time and the sink is closed rather than left open."
-    spec_status: "In Progress"
+    spec_status: "Completed"
     depends_on: ["SPEC-027", "SPEC-038", "SPEC-047", "SPEC-054"]
     path: "docs/specs/SPEC-062-exit-drain-budget.md"
   - id: "SPEC-064"

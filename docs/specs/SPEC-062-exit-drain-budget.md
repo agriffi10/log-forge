@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-062
 title: "The Exit Drain's Retries Fit the Caller's Budget"
 description: "Makes Worker._emit decline a retry predicted to end after shutdown()'s deadline, so the join returns on time and the sink is closed rather than left open."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-027, SPEC-038, SPEC-047, SPEC-054]
 ---
 
@@ -120,6 +120,14 @@ overrun.*
   it is a docs question for completion (FR-002 states the ledger it tests).
 - **Any public API change.** No new parameter on `configure()`, `shutdown()`, `Worker` or any sink.
   The budget is the caller's `timeout`; a knob would let a caller recreate the overrun.
+- **Queued items announced twice.** The expiry line counts the queue as lost, and the decline or
+  abandon line counts them again once `_final_drain` takes them; their future is still open, the
+  shape FR-005 closed for in-flight events (`architecture.md` §12).
+- **A second `shutdown()` after an expired one.** It returns at once whatever its budget with the
+  sink still open, because its `claimed=False` branch waits on `_drain_settled`, which the expiry
+  already set (`architecture.md` §12).
+- **`_reinit_after_fork(resume=True)` not resetting `_stopped`.** A worker stopped directly and then
+  forked resumes a drain that a later stop cannot claim (`architecture.md` §12).
 
 ---
 

@@ -690,7 +690,7 @@ one rather than composing a predicate. The state and the guards live in `_lifecy
 |---|---|---|
 | **Existence** | `_state.worker_exists()` | is there anything to do, or a worker to build |
 | **Liveness** | `_state.live_worker()` — the worker while its `_epoch` is the current retirement count | who **performs** an action; a retired worker performs nothing. Reading the count to *report* it is the same question, not a fourth |
-| **Moment** | `_state.in_flight(sink)` for the signal refresh, `_state.held(sink)` for the close | is anything using this sink **now**. Two predicates in one category, because an abandoned drain answers them oppositely |
+| **Moment** | `_state.in_flight(sink)` for the signal refresh, `_state.held(sink)` for the close; `worker.claim_stop(deadline)` for the stop | is anything using this sink **now**, or is a stop already under way. Two predicates in one category, because an abandoned drain answers them oppositely; `claim_stop` is the same question asked as a transition |
 
 **None of the three takes the lifecycle lock.** Several guards ask a question with it already
 held (`_get_worker`'s inner check, `_close_owed`, `_swap_sink`, and `_offer_orphan_signal`
@@ -702,8 +702,8 @@ moment predicates do take the leaf `_closing_now_lock`, which is the order the s
 already established — `_offer_orphan_signal` reached that lock under the lifecycle lock before
 SPEC-054 folded the read into the question — and nothing acquires the lifecycle lock beneath it.
 
-**The moment is one category with two predicates**, and that is stated here rather than left to
-be rediscovered at a site. `in_flight(sink)` asks whether the worker is *draining* into it, so
+**The moment is one category with two predicates, and a transition**, and that is stated here rather than left to
+be rediscovered at a site. The transition is `worker.claim_stop(deadline)` (SPEC-062): it asks the moment as an act, setting `_stopped`, recording the deadline and taking `Worker._lock`, so it is not a third predicate. `in_flight(sink)` asks whether the worker is *draining* into it, so
 an abandoned drain counts as **over** and the sink gets a fresh stop event rather than SPEC-033
 FR-004's tight retry loop. `held(sink)` asks whether the worker's thread is *alive* and may be
 inside it, so the same state counts as **still inside** and the sink is left open (SPEC-027
@@ -997,6 +997,22 @@ close it.
   passes; measured at `13318d4`, UDP `sendto` then raises a raw `TypeError` on every batch — the
   SPEC-049 port finding's shape, for a float. **Closed by** an `isinstance(port, int)` check with
   the exact `int` stored, beside the range check.
+- **Queued items are announced twice on an expired exit drain** (SPEC-062 frame-2 review;
+  invariant 2). The `ShutdownTimeout` line reports the queue as lost, and the decline or abandon
+  line reports the same items again once `_final_drain` takes them, while their future is still
+  open — the shape SPEC-062 FR-005 closed for the events *in flight*, left open for the events
+  still queued. **Closed by** a line that reports the queue as pending, counted when the drain
+  takes it, as FR-005 does for the batch.
+- **A second `shutdown()` after an expired one returns at once, whatever its budget, with the sink
+  still open** (SPEC-062 frame-2 review; invariants 3 and 5). Its `claimed=False` branch waits on
+  `_drain_settled`, which the expiry has already set. A third call after the thread ends closes the
+  sink. **Closed by** a second caller that waits on the drain thread rather than on the settled
+  event, or by deciding the expired state is final.
+- **`_reinit_after_fork(resume=True)` does not reset `_stopped`** (SPEC-062 frame-2 review;
+  invariant 12). A worker stopped directly, which never moved the retirement count, and then forked
+  resumes a drain that a later `Worker.claim_stop` cannot win, so its deadline is never recorded
+  and its stop takes the second caller's branch. **Closed by** resetting `_stopped` beside
+  `_exit_deadline` on the resume branch.
 
 ### Resolved
 

@@ -96,7 +96,9 @@ MOMENT = (
     "moment — is anything using this sink right now. **Two predicates**, because an abandoned "
     "drain answers them oppositely: `in_flight` reads `draining`, for the signal refresh, where "
     "an abandoned drain counts as over; `held` reads thread liveness, for the close, where it "
-    "counts as still inside"
+    "counts as still inside. `worker.claim_stop(deadline)` is the same question asked as a "
+    "transition (sets `_stopped`, records the deadline, takes `Worker._lock`), not a third "
+    "predicate"
 )
 
 # One row per site: (enclosing function, the expression as `ast.unparse` renders it) -> why.
