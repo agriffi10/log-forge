@@ -818,3 +818,33 @@ def test_a_non_dict_event_is_an_empty_record() -> None:
 def test_the_placeholder_text_assumes_the_default_digit_limit() -> None:
     """AC-10 names ``<int: ~5001 digits>``, which is the interpreter default of 4300 at work."""
     assert sys.get_int_max_str_digits() == 4300
+
+
+class DictClaim:
+    """Passes ``isinstance(_, dict)`` and fails every unbound ``dict`` read."""
+
+    __class__ = property(lambda self: dict)  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("slot", ["fields", "error"])
+def test_a_dict_impostor_in_a_slot_costs_only_that_slot(slot: str) -> None:
+    """Rules 1 and 2 at the slot: a ``fields`` or ``error`` claiming ``dict`` is omitted alone.
+
+    Without a guard on the slot's own unbound read, the raise reached ``log_record``'s outer
+    guard and the whole record collapsed to ``{}`` (pre-push review, MINOR-1).
+    """
+    assert isinstance(DictClaim(), dict)
+    record = _record(f"dict-claim-{slot}", _event(**{slot: DictClaim()}, truncated=False))
+    assert record["timeUnixNano"] == "1791203696789000000"
+    assert record["body"] == {"stringValue": "span.end"}
+    assert record["severityText"] == "ERROR" and record["severityNumber"] == 17
+    attrs = _attrs(record)
+    assert attrs["code.function.name"] == {"stringValue": "pkg.work"}
+    assert attrs["log.record.uid"] == {"stringValue": "log-1"}
+    if slot == "fields":
+        assert "k" not in attrs
+        assert attrs["exception.type"] == {"stringValue": "mypkg.errors.Boom"}
+    else:
+        assert not any(key.startswith("exception.") for key in attrs)
+        assert attrs["k"] == {"intValue": "1"}
+    assert "droppedAttributesCount" not in record and not _marked(record)

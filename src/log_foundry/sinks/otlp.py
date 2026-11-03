@@ -63,7 +63,9 @@ class OTLPSink(HTTPSink):
 
     It takes **no** transport lock (SPEC-028 FR-002) and **adds no post-close guard**
     (SPEC-032 FR-003), for the reasons :class:`~log_foundry.sinks.http.HTTPSink` records: there
-    is no transport held and ``close()`` releases nothing.
+    is no transport held and ``close()`` releases nothing. It keeps **no** client buffer
+    (SPEC-036 FR-002): each ``emit`` is a request that has completed by the time it returns, and
+    no client object outlives it holding data.
 
     Attributes:
       MAX_BATCH_COUNT: 1,000 — the inherited generic default; OTLP publishes no record count.
@@ -77,10 +79,6 @@ class OTLPSink(HTTPSink):
         ``partialSuccess`` that is not an object, a count that is not a usable integer, a body
         over the response bound. Counted as an upper bound, like ``failed``, and never retried,
         for SPEC-018's reason: the request succeeded, so they may have landed.
-
-
-    It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` is a request that has
-    completed by the time it returns, and no client object outlives it holding data.
     """
 
     MAX_RESPONSE_BYTES = 4 * 1024 * 1024

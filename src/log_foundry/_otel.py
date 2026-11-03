@@ -48,9 +48,9 @@ walked; a test pins the two together, since this module imports nothing from the
 twice a fully populated two-level structure at the default ``max_keys`` (256 by 256, 65,536
 values), so a wide but ordinary event is not cut, and small enough that the worst record is a
 fraction of a second on the drain thread, or the caller's on the orphan path (invariant 4):
-measured at ``ba3bd7d`` on the authoring machine, a 24-level shared ``[y, y]`` record cost 0.13 s
-through :func:`log_record` and ``json.dumps``, and a 256-by-256 field 0.02 s. A smaller budget would cut legitimate events; a
-larger one makes the hostile record cost seconds.
+measured at ``6ac6b3d`` on the authoring machine, a 24-level shared ``[y, y]`` record cost 0.13 s
+through :func:`log_record` and ``json.dumps``, and a 256-by-256 field 0.02 s. A smaller budget
+would cut legitimate events; a larger one makes the hostile record cost seconds.
 """
 
 type ResourceKey = tuple[str | None, str | None, str | None]
@@ -619,7 +619,8 @@ def _library_attributes(
       The ``(key, AnyValue)`` pairs, in order.
 
     Raises:
-      TypeError: If the event or its ``error`` only claims to be a ``dict``.
+      TypeError: If the event only claims to be a ``dict``; an ``error`` that does costs only
+        its three attributes, through :func:`_exception_reads`.
     """
     pairs: list[tuple[str, dict[str, object]]] = []
     for name, key in (("function", "code.function.name"), ("log_id", "log.record.uid")):
@@ -638,13 +639,41 @@ def _library_attributes(
         pairs.append((_RESERVED_PREFIX + "status", walker.value(status[0], 1, [])))
     error = _read(event, "error")
     if isinstance(error, dict):
+        for key, text in _exception_reads(error):
+            pairs.append((key, walker.value(text, 1, [])))
+    return pairs
+
+
+def _exception_reads(error: dict[str, object]) -> list[tuple[str, str]]:
+    """Reads the three ``exception.*`` strings an ``error`` dict carries, under their own guard.
+
+    An ``error`` that only claims ``dict`` through ``__class__`` passes ``isinstance`` and fails
+    the unbound ``dict.get`` (rule 2); guarded here, that costs the three exception attributes and
+    nothing else, where a raise reaching :func:`log_record`'s outer guard would cost the whole
+    record (rule 1: a key read at the wrong type is omitted, not fatal).
+
+    Args:
+      error: The event's ``error`` value, known to pass ``isinstance(error, dict)``.
+
+    Returns:
+      ``(attribute key, text)`` pairs in table order, empty when the dict cannot be read.
+
+    Raises:
+      None.
+    """
+    try:
         exception_type = _exception_type(error)
-        if exception_type is not None:
-            pairs.append(("exception.type", walker.value(exception_type, 1, [])))
-        for name, key in (("message", "exception.message"), ("stack", "exception.stacktrace")):
-            read = _text(_read(error, name))
-            if read is not None:
-                pairs.append((key, walker.value(read[0], 1, [])))
+        message = _text(_read(error, "message"))
+        stack = _text(_read(error, "stack"))
+    except Exception:
+        return []
+    pairs: list[tuple[str, str]] = []
+    if exception_type is not None:
+        pairs.append(("exception.type", exception_type))
+    if message is not None:
+        pairs.append(("exception.message", message[0]))
+    if stack is not None:
+        pairs.append(("exception.stacktrace", stack[0]))
     return pairs
 
 
@@ -667,13 +696,19 @@ def _user_attributes(
       The ``(key, AnyValue)`` pairs, in order.
 
     Raises:
-      TypeError: If ``fields`` only claims to be a ``dict``.
+      None. A ``fields`` that only claims ``dict`` through ``__class__`` fails the unbound
+        ``dict.items`` under its own guard and contributes nothing, so the record keeps its
+        timestamp, body and library attributes (rules 1 and 2).
     """
     pairs: list[tuple[str, dict[str, object]]] = []
     if not isinstance(fields, dict):
         return pairs
+    try:
+        items = list(_DICT_ITEMS(fields))
+    except Exception:
+        return pairs
     seen: set[str] = set()
-    for raw_key, raw_value in _DICT_ITEMS(fields):
+    for raw_key, raw_value in items:
         if walker.stopped:
             break
         key = walker.key(raw_key)

@@ -28,7 +28,9 @@ over a private mapping, with no OpenTelemetry SDK in the runtime.
 Deviations, one line each: the pre-push review's additions (an AST leaf test instead of a
 `sys.modules` one; `scope.version` asserted through `emit`; a lone-surrogate `level` in the corpus;
 the counter lock observed under an injected preemption point) were built in; `docs-lint`'s
-byte budget took three `CLAUDE.md` edits at 37,755/38,000 with the paragraph at 470 bytes; the
+byte budget took the three `CLAUDE.md` edits without being raised — the paragraph at 470 bytes
+against the 476 it replaced, the always-loaded set at 37,755/38,000 at `cb75551` and 37,718 at
+`6ac6b3d`, re-measurable with `sh scripts/docs-lint.sh` at either commit; the
 release notes went to a new `docs/release-notes/v1.1.0.md` — a step the ritual words as "top up the
 pending notes", which `v1.0.2.md` cannot be since it says there is no OTLP sink in it — so `v1.0.2`
 must be tagged before this lands.
@@ -53,8 +55,10 @@ must be tagged before this lands.
 
 - **The frozen-path baseline cannot see a missing line.** Removing `OTLPSink log_foundry.sinks.otlp`
   from `tests/data/frozen_sink_paths.txt` leaves `test_every_frozen_sink_import_path_still_resolves`
-  green: it checks frozen → resolves and frozen → documented, not shipped → frozen. By the file's
-  own design ("ADD a line when a new sink ships"); recorded, not chased.
+  green: it checks that every frozen path resolves and is documented, and that every shipped sink
+  is documented, but not `shipped ⊆ frozen` — a shipped sink absent from the baseline is outside
+  the freeze by omission. By the file's own design ("ADD a line when a new sink ships"); recorded,
+  not chased, out of this spec's scope.
 - **The typed-consumer corpus is the file itself**, so removing a planted `rejects.py` line removes
   its expectation; the floor is 13 and the count is otherwise exact.
 - **A Collector is not run in CI**; `UNVERIFIED["otlp"]` says so and the round trip is the proof.

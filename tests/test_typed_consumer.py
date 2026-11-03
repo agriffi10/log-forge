@@ -101,7 +101,7 @@ def test_the_probe_can_fail(tmp_path: pathlib.Path) -> None:
     would otherwise satisfy a "it was rejected" assertion on its own.
     """
     wants = _wants()
-    assert len(wants) >= 13, f"the planted corpus shrank to {len(wants)} -- it cannot bite"
+    assert len(wants) >= 14, f"the planted corpus shrank to {len(wants)} -- it cannot bite"
 
     result = _mypy(_CONSUMER / "rejects.py", tmp_path / "cache")
     assert result.returncode != 0, "every planted error has stopped being an error"
