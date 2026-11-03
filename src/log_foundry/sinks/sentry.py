@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from typing import Any, Final, Literal, get_args
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
@@ -28,6 +29,9 @@ _Selected = Literal["sdk", "http"]
 
 _ABSENT: Final = object()
 """Sentinel telling an absent member from one whose value is ``None`` (SPEC-043 FR-001)."""
+
+_PROJECT_ID = re.compile(r"[0-9]+")
+"""A project id sent as written; any other the SDK's ``int`` reads is sent as ``int`` reads it."""
 
 _LEVEL_RANK = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _SENTRY_LEVEL = {
@@ -599,6 +603,23 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
     reading ``sentry_key=None``, and the sink then posted every event to a URL that cannot exist,
     for the life of the process. All four parts are required here instead.
 
+    **The URL is the one Sentry's SDKs build** (``sentry_sdk.utils.Dsn``): the path's last
+    segment is the project id and whatever precedes it is a prefix placed before ``api/``, so
+    ``https://k@h/prefix/1`` posts to ``/prefix/api/1/envelope/``. This sink built
+    ``/api/prefix/1/envelope/`` before, a path the SDKs never use. A DSN with no prefix builds the
+    URL it always did, ``//1`` included, which the SDK would send to ``//api/1/envelope/`` and
+    this sink keeps at ``/api/1/envelope/``, so a prefix made only of slashes is no prefix. The
+    DSN is split with ``urlsplit``, as the SDK splits it, rather than ``urlparse``, which cut
+    ``;x`` from the last segment and sent project ``1;x``'s events to project ``1``. A project id
+    is refused exactly where the SDK refuses it, where ``int`` cannot read it: ``..`` reached
+    ``/api/../envelope/``. Refusing more than that would refuse, under the default ``auto``
+    backend, a DSN whose events the SDK delivers, since this fallback is built whenever a ``dsn``
+    is given. ASCII digits are sent as written, so ``01`` keeps the URL it had where the SDK
+    sends ``1``; any other id ``int`` reads — ``+1``, `` 1``, ``1_0``, non-ASCII digits — is sent
+    as the SDK sends it, ``str(int(id))``. An IPv6 host is put back in brackets, which ``hostname``
+    strips: ``[2001:db8::1]`` otherwise reached ``http.client`` as host ``2001:db8:`` on port
+    ``1``. The SDK has that defect too, and it is not copied.
+
     Args:
       dsn: The Sentry DSN.
 
@@ -606,26 +627,26 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
       The envelope ingest URL and the ``X-Sentry-Auth`` header value.
 
     Raises:
-      ValueError: If the DSN lacks a scheme, a host, a public key or a project id, or the ingest
-        URL or auth header it derives could not be sent — checked here, under ``dsn``, because
-        :class:`HTTPSink` would otherwise refuse a URL the caller never wrote under its own name,
-        and the header only fails at ``emit``. The key is never echoed by those two; a DSN
-        ``urlparse`` cannot read — an unclosed IPv6 bracket, a port past ``65535`` — is refused
-        naming ``dsn`` too, with ``urlparse``'s reason rather than the DSN.
+      ValueError: If the DSN lacks a scheme, a host, a public key or a project id, the project
+        id is not an integer ``int`` can read, or the ingest URL or auth header it derives could not be sent —
+        checked here, under ``dsn``, because :class:`HTTPSink` would otherwise refuse a URL the
+        caller never wrote under its own name, and the header only fails at ``emit``. The key is
+        never echoed by those three; a DSN ``urlsplit`` cannot read — an unclosed IPv6 bracket,
+        a port past ``65535`` — is refused naming ``dsn`` too, with ``urlsplit``'s reason rather
+        than the DSN.
     """
     try:
-        parsed = urlparse(dsn)
+        parsed = urlsplit(dsn)
         port = f":{parsed.port}" if parsed.port else ""
     except ValueError as err:
         raise ValueError(f"SentrySink dsn is not a URL ({err})") from err
-    project = parsed.path.lstrip("/")
     missing = [
         name
         for name, value in (
             ("scheme", parsed.scheme),
             ("host", parsed.hostname),
             ("public key", parsed.username),
-            ("project id", project),
+            ("project id", parsed.path.lstrip("/")),
         )
         if not value
     ]
@@ -633,7 +654,19 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
         raise ValueError(
             f"SentrySink dsn is missing its {', '.join(missing)}: {dsn!r}"
         )
-    ingest_url = f"{parsed.scheme}://{parsed.hostname}{port}/api/{project}/envelope/"
+    head, _, project = parsed.path.rpartition("/")
+    if not _PROJECT_ID.fullmatch(project):
+        try:
+            project = str(int(project))
+        except ValueError:
+            raise ValueError(
+                "SentrySink dsn project id must be an integer, the last segment of the DSN's path"
+            ) from None
+    prefix = f"{head}/" if head.strip("/") else "/"
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    ingest_url = f"{parsed.scheme}://{host}{port}{prefix}api/{project}/envelope/"
     auth_header = f"Sentry sentry_key={parsed.username}, sentry_version=7, sentry_client=log-foundry"
     _valid_url(ingest_url, "SentrySink", name="dsn")
     failure = _unsendable_header("X-Sentry-Auth", auth_header)

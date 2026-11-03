@@ -8,7 +8,14 @@ from typing import Any, Unpack
 from log_foundry import _diag
 from log_foundry.sinks._batch import usable_results
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _Item, _valid_url, merge_headers
+from log_foundry.sinks.http import (
+    HTTPPlatformKwargs,
+    HTTPSink,
+    _Item,
+    _valid_base_url,
+    _valid_url,
+    merge_headers,
+)
 
 __all__ = ["HoneycombSink"]
 
@@ -116,7 +123,7 @@ class HoneycombSink(HTTPSink):
             placed in the path as written: ``my%20data`` reaches the dataset ``my data``, and a
             literal ``%`` is written ``%25``. Trailing whitespace is floored, as ``urllib`` floors
             it on every URL.
-          url: The API base URL.
+          url: The API base URL, to which ``/1/batch/<dataset>`` is appended.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
             ``HTTPPlatformKwargs`` (SPEC-051 FR-005) — every keyword it takes except
             ``body_format``, which this sink pins to Honeycomb's JSON array.
@@ -128,10 +135,12 @@ class HoneycombSink(HTTPSink):
           ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), or cannot
             be carried in a request path — checked against a fixed base so the message names
             ``dataset`` rather than the ``url`` this class builds from both, whose own check
-            names ``url`` (SPEC-049 FR-001).
+            names ``url`` (SPEC-049 FR-001); or if ``url`` carries a query or fragment, which
+            the appended path would land inside (:func:`_valid_base_url`).
         """
         _one_segment(dataset, type(self).__name__)
         _valid_url(f"http://localhost/1/batch/{dataset}", type(self).__name__, name="dataset")
+        _valid_base_url(url, type(self).__name__, f"/1/batch/{dataset}")
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",

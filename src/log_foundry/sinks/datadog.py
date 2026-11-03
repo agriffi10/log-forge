@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Unpack
 
 from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _valid_url, merge_headers
@@ -10,6 +11,18 @@ from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _valid_url, mer
 __all__ = ["DatadogSink"]
 
 _DDSOURCE = "log-foundry"
+
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+"""One LDH label: letters, digits and inner hyphens, at most 63 characters."""
+
+_SITE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+"""A host name of dot-separated LDH labels, which every site Datadog names is.
+
+``site`` is placed into the intake host, so anything else in it moved the request: ``#`` emptied
+the path, ``?`` and ``/`` moved it, ``@`` put the batch on a host with an ``@`` in it, which
+resolves nowhere, and ``""``, ``..`` and ``%2e`` named no host Datadog serves. A port and a trailing
+dot are refused with them, as not a Datadog site, though either reached the intake.
+"""
 
 
 class DatadogSink(HTTPSink):
@@ -63,10 +76,16 @@ class DatadogSink(HTTPSink):
           None.
 
         Raises:
-          ValueError: If the intake URL ``site`` builds cannot be sent — refused here so the
-            message names ``site``, the argument the caller wrote, rather than the ``url`` this
-            class built from it (SPEC-049 FR-001).
+          ValueError: If ``site`` is not a host name of dot-separated LDH labels (:data:`_SITE`),
+            or the intake URL it builds cannot be sent — refused here so the message names
+            ``site``, the argument the caller wrote, rather than the ``url`` this class built from
+            it (SPEC-049 FR-001).
         """
+        if not _SITE.fullmatch(site):
+            raise ValueError(
+                f"{type(self).__name__} site must be a Datadog site's host name, such as "
+                f"'datadoghq.com' or 'us5.datadoghq.com': {site!r}"
+            )
         url = _valid_url(
             f"https://http-intake.logs.{site}/api/v2/logs", type(self).__name__, name="site"
         )

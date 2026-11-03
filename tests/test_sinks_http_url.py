@@ -336,7 +336,7 @@ def test_a_wrapper_refuses_the_url_under_its_own_name() -> None:
 
 def test_sentry_refuses_an_unsendable_dsn_under_dsn() -> None:
     with pytest.raises(ValueError, match=r"^SentrySink dsn cannot be sent over HTTP "):
-        SentrySink(dsn="https://k@h/1 2", backend="http")
+        SentrySink(dsn="https://k@h/a b/1", backend="http")
 
 
 def test_sentry_refuses_an_unsendable_public_key_without_echoing_it() -> None:
@@ -346,3 +346,167 @@ def test_sentry_refuses_an_unsendable_public_key_without_echoing_it() -> None:
         SentrySink(dsn="https://k\u20acSECRET@h/1", backend="http")
 
     _assert_chains_nothing(caught.value)
+
+
+_APPENDS = {
+    "ElasticsearchSink": ("/_bulk", lambda url: ElasticsearchSink(url, index="i")),
+    "HoneycombSink": ("/1/batch/d", lambda url: HoneycombSink("k", "d", url=url)),
+    "LokiSink": ("/loki/api/v1/push", lambda url: LokiSink(url)),
+    "OpenSearchSink": ("/_bulk", lambda url: OpenSearchSink(url, index="i")),
+}
+"""Each shipped subclass that appends a path to the caller's base URL: the path, and a builder."""
+
+_VERBATIM = {
+    "OTLPSink": lambda url: OTLPSink(url),
+    "SplunkHECSink": lambda url: SplunkHECSink(url, "tok"),
+}
+"""Each shipped subclass that sends to the caller's URL as written, so a query is the caller's."""
+
+_NO_CALLER_BASE = {
+    "DatadogSink": "builds its host from site, checked as a host name below",
+    "NewRelicSink": "builds its host from a fixed table keyed by region",
+}
+"""Each shipped subclass that takes no URL from the caller, and what it builds its host from."""
+
+_MISDIRECTING_BASES = [
+    "http://h?x=1",
+    "http://h?",
+    "http://h/base?x",
+    "http://h#f",
+    "http://h/#",
+    "http://u?x@h",
+    "http://h?api_key=SECRET",
+]
+"""Bases whose ``?`` or ``#`` moved the appended path out of the request path."""
+
+
+def test_every_http_subclass_declares_how_its_url_is_built() -> None:
+    """Swept over the derived roster, so a new subclass with no entry fails rather than passing.
+
+    ``SentrySink`` and ``LogstashSink`` wrap an ``HTTPSink`` rather than subclassing one, so this
+    roster cannot see them; the DSN's path is tested in ``test_sentry_backend.py``, and
+    ``LogstashSink`` sends to its ``url`` as written.
+    """
+    shipped = [cls.__name__ for cls in _shipped_http_subclasses()]
+    declared = [*_APPENDS, *_VERBATIM, *_NO_CALLER_BASE]
+
+    assert sorted(declared) == sorted(shipped)
+    assert len(set(declared)) == len(declared), "a class is declared twice"
+
+
+@pytest.mark.parametrize("base", _MISDIRECTING_BASES)
+@pytest.mark.parametrize("name", sorted(_APPENDS))
+def test_the_appended_path_never_reached_the_request_path(name: str, base: str) -> None:
+    """The premise, on the composition each class performed at 2e790e9: the suffix left the path."""
+    suffix, _build = _APPENDS[name]
+    composed = urllib.request.Request(base.rstrip("/") + suffix)  # noqa: S310
+
+    path, _, _query = composed.selector.partition("?")
+    assert not path.endswith(suffix), composed.selector
+
+
+@pytest.mark.parametrize("base", _MISDIRECTING_BASES)
+@pytest.mark.parametrize("name", sorted(_APPENDS))
+def test_a_base_with_a_query_or_fragment_is_refused_without_echoing_it(
+    name: str, base: str
+) -> None:
+    _suffix, build = _APPENDS[name]
+
+    with pytest.raises(
+        ValueError, match=rf"^{name} url cannot carry a query or fragment: "
+    ) as caught:
+        build(base)
+
+    assert "SECRET" not in str(caught.value)
+    assert "api_key" not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", sorted(_APPENDS))
+def test_a_base_with_a_path_still_composes_under_it(name: str) -> None:
+    suffix, build = _APPENDS[name]
+
+    assert build("https://h/base/").url == f"https://h/base{suffix}"
+
+
+@pytest.mark.parametrize("name", sorted(_VERBATIM))
+def test_a_url_sent_as_written_keeps_its_query(name: str) -> None:
+    url = "https://h/collector?channel=c1"
+
+    sink = _VERBATIM[name](url)
+
+    assert sink.url == url
+    assert urllib.request.Request(sink.url).selector == "/collector?channel=c1"  # noqa: S310
+
+
+def test_the_wrappers_send_a_query_as_written() -> None:
+    sink = LogstashSink(url="http://h/x?y=1")
+
+    assert sink._http.url == "http://h/x?y=1"  # type: ignore[union-attr]
+
+
+_DATADOG_SITES = [
+    "datadoghq.com",
+    "us3.datadoghq.com",
+    "us5.datadoghq.com",
+    "datadoghq.eu",
+    "ap1.datadoghq.com",
+    "ap2.datadoghq.com",
+    "ddog-gov.com",
+]
+"""Every site Datadog's documentation names."""
+
+
+@pytest.mark.parametrize("site", _DATADOG_SITES)
+def test_every_datadog_site_reaches_its_intake(site: str) -> None:
+    sink = DatadogSink("k", site=site)
+
+    request = urllib.request.Request(sink.url)  # noqa: S310
+    assert (request.host, request.selector) == (f"http-intake.logs.{site}", "/api/v2/logs")
+
+
+@pytest.mark.parametrize(
+    ("site", "host", "selector"),
+    [
+        ("datadoghq.com#", "http-intake.logs.datadoghq.com", ""),
+        ("datadoghq.com?x", "http-intake.logs.datadoghq.com", "/?x/api/v2/logs"),
+        ("datadoghq.com/x", "http-intake.logs.datadoghq.com", "/x/api/v2/logs"),
+        ("datadoghq.com@evil.example", "http-intake.logs.datadoghq.com@evil.example", None),
+        ("..", "http-intake.logs...", "/api/v2/logs"),
+    ],
+)
+def test_a_site_moved_the_request(site: str, host: str, selector: str | None) -> None:
+    """The premise, on the composition the class performed at 2e790e9: the request moved."""
+    request = urllib.request.Request(f"https://http-intake.logs.{site}/api/v2/logs")
+
+    assert request.host == host
+    if selector is not None:
+        assert request.selector == selector
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "",
+        ".",
+        "..",
+        "%2e",
+        "a..b",
+        "-a.com",
+        "a-.com",
+        "datadoghq.com.",
+        "datadoghq.com#",
+        "datadoghq.com?x",
+        "datadoghq.com/x",
+        "us5/x.datadoghq.com",
+        "datadoghq.com@evil.example",
+        "datadoghq.com:443",
+        "datadoghq.com\\x",
+        "dat adog.com",
+        " datadoghq.com",
+        "b\u00fccher.com",
+        "a" * 64 + ".com",
+    ],
+)
+def test_a_site_that_is_not_a_host_name_is_refused_naming_site(site: str) -> None:
+    with pytest.raises(ValueError, match=r"^DatadogSink site must be a Datadog site's host name"):
+        DatadogSink("k", site=site)

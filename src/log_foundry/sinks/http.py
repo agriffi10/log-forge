@@ -352,6 +352,44 @@ def _valid_url(url: str, owner: str, name: str = "url") -> str:
     return url
 
 
+def _valid_base_url(url: str, owner: str, suffix: str, name: str = "url") -> str:
+    """Returns a base URL a sink can append its own path to, or raises.
+
+    A subclass that appends a path to the caller's base — ``/_bulk``, Loki's push path,
+    Honeycomb's ``/1/batch/<dataset>`` — sent every event somewhere other than that path when the
+    base carried a query or a fragment: ``http://h?x`` became ``/?x/loki/api/v1/push``, the path
+    swallowed into the query string, and ``https://h#f`` became ``''``, the suffix dropped with
+    the fragment, and whatever the server answered there was taken as the outcome (invariant 2).
+    The test is a character test rather than a parse because ``urlsplit`` ends the path at the
+    first ``?`` or ``#`` and ``urllib`` splits the fragment at a ``#``, so **any**
+    occurrence moves the suffix out of the path — an empty query (``http://h?``), ``/#``, and a
+    ``?`` in what reads as userinfo (``http://u?x@h``, whose netloc is ``u``) included — and
+    ``urlsplit`` reports an empty query and an absent one identically. A sink that sends to its
+    URL as written appends nothing, so its query goes where the caller put it and is not checked
+    here. The URL is not echoed, since a query is where a credential most plausibly sits; the
+    message names the argument and the reason instead. Splicing the suffix in front of the query
+    was rejected: it sends a request the caller never wrote.
+
+    Args:
+      url: The base URL as the caller wrote it.
+      owner: The class refusing it, for the message.
+      suffix: The path the class appends, for the message.
+      name: The argument the message names.
+
+    Returns:
+      The URL unchanged; the composed URL is still checked by :func:`_valid_url`.
+
+    Raises:
+      ValueError: If the URL contains ``?`` or ``#``.
+    """
+    if "?" in url or "#" in url:
+        raise ValueError(
+            f"{owner} {name} cannot carry a query or fragment: the {suffix!r} this sink appends "
+            f"would land inside it rather than in the path; pass the base URL alone"
+        )
+    return url
+
+
 def _valid_method(method: str, owner: str) -> str:
     """Returns a method ``http.client`` can send, or raises (SPEC-049 FR-001).
 
