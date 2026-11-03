@@ -163,8 +163,8 @@ on. So a `_bulk` server answering every POST with a `2xx` the sink cannot adjudi
 cannot read or that is not an object, or a truthy `errors` with a short `items` array — leaves
 `flush()` truthy and `failed_batches` at zero, with the loss in `health().sink`: the events may
 have landed, so a retry could duplicate them. An HTTP `2xx` is a verdict however its body ends: a
-body cut short, stalled or reset after the status line settles its chunk — delivered where the
-status is the whole answer, unadjudicated where the body carries it — and is never re-sent; before
+body cut short, stalled or reset after the status line settles its chunk — delivered for a sink
+that ignores the body, unadjudicated for the `_bulk` sinks that read it — and is never re-sent; before
 any status line, a protocol error is retried and counted like a connection error.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass), `tests/integration/`

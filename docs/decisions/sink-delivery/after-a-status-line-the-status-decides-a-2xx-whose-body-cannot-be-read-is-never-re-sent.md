@@ -35,9 +35,11 @@ type could be widened freely.
 
 **The residue: an override cannot tell an empty `2xx` body from an unreadable one.** It is handed
 `b""` for both, so the way a subclass reads an empty body is the way it reads an unreadable one. A
-subclass that reads an empty body as success settles an unreadable one silently. That is correct for
-the base class, whose status is the whole answer, and for OTLP's reading of an empty body as success,
-since the status there is the verdict too. It is also why `ElasticsearchSink` reading an empty `2xx`
+subclass that reads an empty body as success settles an unreadable one silently. That is what the base
+class does, since it ignores the body, and it is correct for OTLP's reading of an empty body as
+success, since the status there is the verdict. It is not a claim that every body-ignoring subclass
+is right to ignore the body: `HoneycombSink`'s `2xx` carries a per-event array it never reads, which
+`docs/architecture.md` §12 records as open. It is also why `ElasticsearchSink` reading an empty `2xx`
 as unadjudicated is the right reading for `_bulk`: `json.loads(b"")` raises, so an unreadable body
 takes *A 2xx _bulk response with no readable verdict is counted, never retried* with no branch of its
 own.

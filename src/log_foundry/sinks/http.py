@@ -943,8 +943,10 @@ class HTTPSink:
         """Reports whether a ``2xx`` response means the chunk was actually accepted.
 
         The hook for a destination whose ``2xx`` can still describe per-record failures —
-        Elasticsearch's ``_bulk`` items. A status in the success range is the whole answer
-        everywhere else, so the default ignores the body.
+        Elasticsearch's ``_bulk`` items. The default ignores the body and reads a status in the
+        success range as delivery; that is the whole answer only where the destination's ``2xx``
+        carries no per-record outcome, which ``HoneycombSink``'s per-event array does
+        (``docs/architecture.md`` §12).
 
         The payload is ``b""`` both for an empty body and for one that could not be read after
         the status line — cut short, stalled past ``timeout`` or reset (:meth:`_attempt`). An
