@@ -1,9 +1,13 @@
-# Spec: Bounded, Interruptible Retry
-
-**ID:** SPEC-027  
-**Status:** Completed  
-**Last Updated:** 2026-08-06  
-**Depends On:** SPEC-004, SPEC-009, SPEC-013
+---
+type: Spec
+id: SPEC-027
+title: "Bounded, Interruptible Retry"
+description: "Bounds a server-supplied Retry-After and makes every sink's retry wait interruptible by shutdown."
+spec_status: Completed
+depends_on: [SPEC-004, SPEC-009, SPEC-013]
+arc: audit-remediation
+arc_order: 5
+---
 
 ## Overview
 

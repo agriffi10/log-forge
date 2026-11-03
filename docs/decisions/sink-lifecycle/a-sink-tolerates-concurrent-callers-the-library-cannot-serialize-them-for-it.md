@@ -1,0 +1,13 @@
+---
+type: Decision
+title: "A sink tolerates concurrent callers; the library cannot serialize them for it"
+description: "a level call with no active span emits on the *caller's* thread, so `emit`/`close` are called concurrently against one sink object. It is a requirement on implementations, not a promise the library can keep. (SPEC-028)"
+---
+
+**A sink tolerates concurrent callers; the library cannot serialize them for it** — the worker drains on one thread, but a level call with no active span emits on the *caller's* thread, so `emit`/`close` are called concurrently against one sink object and `sinks/base.py` states that as a requirement on implementations. It cannot be a promise: the library does not own that thread. The lock is held for the **whole** operation assuming exclusivity, `threading.Lock` not `RLock` (a sink re-entering its own `emit` is a bug an `RLock` would hide), and `close()` takes it too, so it waits rather than releasing under a writer. Per driver, not per family: Postgres locks (one connection, one transaction), ClickHouse locks (per-session state, not published as shareable), **Mongo does not** (`pymongo` is thread-safe with its own pool, and the goal is correctness under concurrency, not the removal of parallelism) — each says which requirement it satisfies, Mongo included, or its bare emit reads as an oversight. Counters take a **second, dedicated** lock, ordered transport → counter: sharing one would make `health()` block behind an in-flight insert and its backoff, contradicting SPEC-026's "safe to call during an emit". The accepted cost is that an orphan log can now wait on the lock (arch §13) — bounded by SPEC-027, and the alternative is measured: unlocked `SQLiteSink` does not lose rows, it kills the interpreter with a bus error. The counter race is **not reproducible without injecting a preemption point** — a bare `+=` lost zero across 1.6M concurrent increments, though a property on the counter's storage does reproduce real loss — so the tests assert the increment happens *inside* the lock, the property that survives free-threading. **Which sinks lock is decided per driver and recorded in each sink's docstring, enforced by a lint**, because the first pass worked from the spec's hand-written file list and missed three sinks — `NATSSink` re-entering its own event loop could hang an application thread permanently. That is SPEC-027's roster lesson repeated; a roster in prose is not a roster the tests check. (SPEC-028, arch §9, §13)
+
+## History
+
+### 2026-08-06
+
+- **Settled.**

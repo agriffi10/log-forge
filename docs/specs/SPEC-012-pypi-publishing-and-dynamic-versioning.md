@@ -1,9 +1,13 @@
-# Spec: PyPI Publishing and Dynamic Versioning
-
-**ID:** SPEC-012
-**Status:** Completed
-**Last Updated:** 2026-07-22
-**Depends On:** None
+---
+type: Spec
+id: SPEC-012
+title: "PyPI Publishing and Dynamic Versioning"
+description: "An automated release pipeline that makes log-foundry pip-installable and derives its version from Git tags."
+spec_status: Completed
+depends_on: []
+arc: release-and-distribution
+arc_order: 1
+---
 
 ## Overview
 

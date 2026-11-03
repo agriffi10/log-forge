@@ -15,9 +15,15 @@ text
 
 text
 @@@ file docs/specs/SPEC-001-x.md
-# Spec: X
+---
+type: Spec
+id: SPEC-001
+title: X
+description: A spec.
+spec_status: Draft
+depends_on: []
+---
 
-**ID:** SPEC-001
 
 ```
 **Status:** Completed

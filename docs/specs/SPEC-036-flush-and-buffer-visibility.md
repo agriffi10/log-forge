@@ -1,9 +1,13 @@
-# Spec: Flush and Buffer Visibility
-
-**ID:** SPEC-036  
-**Status:** Completed  
-**Last Updated:** 2026-08-30  
-**Depends On:** SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037
+---
+type: Spec
+id: SPEC-036
+title: "Flush and Buffer Visibility"
+description: "Makes flush() stop reporting success over undelivered events, with the buffer visibility that requires."
+spec_status: Completed
+depends_on: [SPEC-013, SPEC-021, SPEC-026, SPEC-030, SPEC-034, SPEC-037]
+arc: audit-2026-08-07
+arc_order: 5
+---
 
 Every spec this one depends on has shipped. From SPEC-034 it takes `Health` as a frozen dataclass —
 so FR-003's two counters are plain appends with no index to prove — and `FlushResult`, so a new

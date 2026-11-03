@@ -1,9 +1,11 @@
-# Spec: Bounded Delivery for `KafkaSink` and `NATSSink`
-
-**ID:** SPEC-047
-**Status:** Completed
-**Last Updated:** 2026-09-01
-**Depends On:** SPEC-026, SPEC-027, SPEC-032, SPEC-038, SPEC-041
+---
+type: Spec
+id: SPEC-047
+title: "Bounded Delivery for `KafkaSink` and `NATSSink`"
+description: "Bounds KafkaSink and NATSSink delivery, making the README's within-a-bound claim true for both."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-027, SPEC-032, SPEC-038, SPEC-041]
+---
 
 ## Overview
 

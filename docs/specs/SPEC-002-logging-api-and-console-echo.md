@@ -1,9 +1,13 @@
-# Spec: Logging API and Console Echo
-
-**ID:** SPEC-002
-**Status:** Completed
-**Last Updated:** 2026-07-09
-**Depends On:** SPEC-001
+---
+type: Spec
+id: SPEC-002
+title: "Logging API and Console Echo"
+description: "Level methods that append structured events inside a decorated call, set_baggage for trace-scoped context, and a synchronous console echo path."
+spec_status: Completed
+depends_on: [SPEC-001]
+arc: core-logging-pipeline
+arc_order: 2
+---
 
 ## Overview
 

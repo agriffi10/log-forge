@@ -23,8 +23,8 @@ The report:
 - Run this repo's gates against the branch: `poetry run ruff check .`, `poetry run mypy`,
   `poetry run pytest`, `sh scripts/spec-lint.sh` on any spec touched,
   `poetry run python scripts/docstring-lint.py` on any change under `src/`, and `sh scripts/docs-lint.sh`
-  on any change touching `CLAUDE.md`, `docs/process/`, `docs/decisions/`, `.claude/rules/`,
-  `.claude/agents/` or a delivery doc. That list is a floor: also run whatever CI will run on the
+  on any change touching `CLAUDE.md`, `docs/process/`, `docs/decisions/`, `docs/specs/`,
+  `docs/best-practices/`, `.claude/rules/`, `.claude/agents/` or a delivery doc. That list is a floor: also run whatever CI will run on the
   branch (`.github/workflows/`), which may be a gate no document names. Report exit codes, not
   summary lines.
 - In the system frame, start from `docs/invariants.md`: for each numbered invariant the change

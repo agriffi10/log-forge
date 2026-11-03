@@ -1,9 +1,13 @@
-# Spec: Sink Integration Verification
-
-**ID:** SPEC-041  
-**Status:** Completed  
-**Last Updated:** 2026-08-30  
-**Depends On:** SPEC-026, SPEC-027, SPEC-038
+---
+type: Spec
+id: SPEC-041
+title: "Sink Integration Verification"
+description: "Executes the third-party sinks against real services, since no-extras CI runs none of them."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-027, SPEC-038]
+arc: audit-2026-08-07
+arc_order: 7
+---
 
 ## Overview
 

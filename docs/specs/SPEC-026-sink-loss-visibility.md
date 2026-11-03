@@ -1,9 +1,13 @@
-# Spec: Sink Loss Visibility
-
-**ID:** SPEC-026  
-**Status:** Completed  
-**Last Updated:** 2026-08-06  
-**Depends On:** SPEC-017, SPEC-018, SPEC-019, SPEC-021
+---
+type: Spec
+id: SPEC-026
+title: "Sink Loss Visibility"
+description: "Makes remote sinks raise on total failure and exposes their counters, so a down destination is visible to retry, health() and flush()."
+spec_status: Completed
+depends_on: [SPEC-017, SPEC-018, SPEC-019, SPEC-021]
+arc: audit-remediation
+arc_order: 4
+---
 
 ## Overview
 

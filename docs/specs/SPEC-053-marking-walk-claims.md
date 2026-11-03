@@ -1,9 +1,11 @@
-# Spec: The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them
-
-**ID:** SPEC-053
-**Status:** Completed
-**Last Updated:** 2026-09-05
-**Depends On:** SPEC-042, SPEC-052
+---
+type: Spec
+id: SPEC-053
+title: "The Marking Walk's Restated Claims, and the Gate That Would Have Caught Them"
+description: "Corrects the restated claims about what the marking walk stamps, and adds the docs-lint check that would have caught them."
+spec_status: Completed
+depends_on: [SPEC-042, SPEC-052]
+---
 
 ## Overview
 

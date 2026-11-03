@@ -1,9 +1,13 @@
-# Spec: One Lifecycle Owner for Both Delivery Paths
-
-**ID:** SPEC-054
-**Status:** Completed
-**Last Updated:** 2026-09-04
-**Depends On:** SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050
+---
+type: Spec
+id: SPEC-054
+title: "One Lifecycle Owner for Both Delivery Paths"
+description: "Merges the twin lifecycle bookkeeping of the worker and orphan paths into one owner, leaving the two emit paths as they are."
+spec_status: Completed
+depends_on: [SPEC-030, SPEC-033, SPEC-035, SPEC-040, SPEC-044, SPEC-045, SPEC-046, SPEC-050]
+arc: one-lifecycle-owner
+arc_order: 1
+---
 
 ## Overview
 

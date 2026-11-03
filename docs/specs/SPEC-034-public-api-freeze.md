@@ -1,9 +1,13 @@
-# Spec: The Public API Freeze
-
-**ID:** SPEC-034  
-**Status:** Completed  
-**Last Updated:** 2026-08-09  
-**Depends On:** SPEC-026, SPEC-030, SPEC-033
+---
+type: Spec
+id: SPEC-034
+title: "The Public API Freeze"
+description: "Fixes the public-surface shapes that stop being free to change once 1.0.0 puts them under semantic versioning."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-030, SPEC-033]
+arc: audit-2026-08-07
+arc_order: 2
+---
 
 ~~**Depends On:** … SPEC-036, SPEC-037 — FR-008 converts `Health` to a dataclass, and both 036
 (FR-003, `orphan_lost`) and 037 (FR-001 AC-5, `in_span_lost`) append a field to it as a

@@ -1,9 +1,13 @@
-# Spec: Concurrent Owed Closes
-
-**ID:** SPEC-046
-**Status:** Completed
-**Last Updated:** 2026-09-01
-**Depends On:** SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045
+---
+type: Spec
+id: SPEC-046
+title: "Concurrent Owed Closes"
+description: "Runs owed closes concurrently and joins each one, so shutdown() costs the slowest close rather than their sum."
+spec_status: Completed
+depends_on: [SPEC-027, SPEC-030, SPEC-031, SPEC-033, SPEC-045]
+arc: concurrent-owed-closes
+arc_order: 1
+---
 
 ## Overview
 

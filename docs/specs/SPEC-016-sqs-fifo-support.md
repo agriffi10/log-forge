@@ -1,9 +1,11 @@
-# Spec: FIFO Queue Support for `SQSSink`
-
-**ID:** SPEC-016
-**Status:** Completed
-**Last Updated:** 2026-07-23
-**Depends On:** SPEC-005 (`SQSSink`, chunking + `Failed`-list retry)
+---
+type: Spec
+id: SPEC-016
+title: "FIFO Queue Support for `SQSSink`"
+description: "Lets SQSSink ship to FIFO queues by giving each entry the MessageGroupId such a queue requires."
+spec_status: Completed
+depends_on: [SPEC-005]
+---
 
 ## Overview
 

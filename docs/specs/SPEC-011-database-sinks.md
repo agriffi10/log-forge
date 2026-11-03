@@ -1,9 +1,13 @@
-# Spec: Database Sinks
-
-**ID:** SPEC-011
-**Status:** Completed
-**Last Updated:** 2026-07-11
-**Depends On:** SPEC-001, SPEC-005
+---
+type: Spec
+id: SPEC-011
+title: "Database Sinks"
+description: "External database sinks for ClickHouse, MongoDB and Postgres, each behind an optional extra."
+spec_status: Completed
+depends_on: [SPEC-001, SPEC-005]
+arc: sink-expansion
+arc_order: 6
+---
 
 ## Overview
 

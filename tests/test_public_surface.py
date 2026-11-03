@@ -1642,7 +1642,7 @@ def test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_other
     the isinstance check fails before the sub-pattern count is ever consulted, and
     `health().sink` being `None` makes that the common case at the very call site a reader is
     most likely to write. A keyword pattern still matches. Asserted rather than documented
-    because `sinks/base.py`, `docs/decisions/public-api.md`, `docs/spec-delivery/`'s SPEC-051
+    because `sinks/base.py`, `docs/decisions/public-api/`, `docs/spec-delivery/`'s SPEC-051
     doc and the `v1.0.0` release notes all state this, and prose is not checkable.
     """
     losses = log_foundry.SinkLosses(dropped=1, failed=2)
@@ -1806,7 +1806,7 @@ def _resolution_fault(cls: str, mod: str, module: object, exc: ImportError | Non
 def test_every_frozen_sink_import_path_still_resolves() -> None:
     """The `1.x` freeze covers the sink class *at its documented import path* -- so gate the path.
 
-    `docs/decisions/public-api.md` -> *The frozen surface is the import path, not just the class*
+    `docs/decisions/public-api/` -> *The frozen surface is the import path, not just the class*
     promises the dotted path, not merely the class: no concrete sink is exported from the top
     level, so the path is the only route to one and a class pinned at a movable path is pinned to
     nothing.

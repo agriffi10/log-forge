@@ -1,9 +1,13 @@
-# Spec: Worker Liveness and Terminal-Failure Reporting
-
-**ID:** SPEC-019  
-**Status:** Completed  
-**Last Updated:** 2026-07-29  
-**Depends On:** SPEC-004, SPEC-017
+---
+type: Spec
+id: SPEC-019
+title: "Worker Liveness and Terminal-Failure Reporting"
+description: "Gives the drain thread a terminal-failure path, so a stopped worker is recorded and health() reports it."
+spec_status: Completed
+depends_on: [SPEC-004, SPEC-017]
+arc: robustness
+arc_order: 3
+---
 
 ## Overview
 

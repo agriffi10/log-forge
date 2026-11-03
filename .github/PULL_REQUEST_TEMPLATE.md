@@ -37,8 +37,10 @@ Closes #<!-- issue number -->
 ## Checklist
 - [ ] Code follows the project's style and conventions
 - [ ] `ruff`, `mypy`, `pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh` and `poetry run python scripts/docstring-lint.py` pass
-- [ ] The matching `-test.sh` corpus passes (only if you changed that linter, the PR queue or its
-      installer — `sh scripts/pr-queue-test.sh`, `sh scripts/pr-queue/install-test.sh`)
+- [ ] The matching `-test.sh` corpus passes (only if you changed that linter, the frontmatter reader,
+      the index generator, the PR queue or its installer — `sh scripts/pr-queue-test.sh`,
+      `sh scripts/pr-queue/install-test.sh`)
+- [ ] The generated indexes are fresh — `sh scripts/gen-index.sh` leaves no diff (docs-lint checks this)
 - [ ] Every CI job that *can* run locally was run locally first — the gate list above is a floor,
       not the set (name any job that cannot, rather than ticking it)
 - [ ] Any gate this PR adds ships fixtures asserting its failure text, including a silence case

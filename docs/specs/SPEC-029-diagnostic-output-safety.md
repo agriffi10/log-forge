@@ -1,9 +1,13 @@
-# Spec: Diagnostic Output Safety
-
-**ID:** SPEC-029  
-**Status:** Completed  
-**Last Updated:** 2026-08-06  
-**Depends On:** SPEC-017, SPEC-019
+---
+type: Spec
+id: SPEC-029
+title: "Diagnostic Output Safety"
+description: "Makes diagnostic output report exception types rather than text, and guards stderr writes that could kill the drain thread."
+spec_status: Completed
+depends_on: [SPEC-017, SPEC-019]
+arc: audit-remediation
+arc_order: 3
+---
 
 ## Overview
 

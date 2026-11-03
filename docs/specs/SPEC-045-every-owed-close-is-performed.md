@@ -1,9 +1,13 @@
-# Spec: Every Owed Close Is Performed
-
-**ID:** SPEC-045
-**Status:** Completed
-**Last Updated:** 2026-09-01
-**Depends On:** SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044
+---
+type: Spec
+id: SPEC-045
+title: "Every Owed Close Is Performed"
+description: "Makes the orphan path's owed-close record hold every sink owed one, so the live sink is never left unclosed."
+spec_status: Completed
+depends_on: [SPEC-030, SPEC-032, SPEC-033, SPEC-042, SPEC-044]
+arc: every-owed-close-is-performed
+arc_order: 1
+---
 
 ## Overview
 

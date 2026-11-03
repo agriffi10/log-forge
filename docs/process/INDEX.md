@@ -36,6 +36,7 @@ target in at launch too, through recursion, which is the cost this layout exists
 | `docs/process/completion-ritual.md` | the seven steps at spec completion, and the anti-regrowth & doc-hygiene rules | at spec completion, and before any edit to a file in the table above |
 | `docs/process/operational-traps.md` | traps that pass locally and bite in CI or on deploy — this repo's, seeded as they bit | before the first build step **in a new worktree**, and before any CI- or deploy-dependent step |
 | `docs/process/ground-rules.md` | the project's load-bearing constraints | when adding a dependency or a constraint |
+| `docs/process/knowledge-layout.md` | frontmatter, the generated indexes, the decision register's rules, rulebook sources; migrating to them | when writing frontmatter, adding a decision or area, editing a rulebook, or when a lint names an old path |
 
 Every `*.md` in this directory other than the router is a row in one of the two tables above, and
 every row is a file — an unrouted part is where the next paragraph of process accretes unread, so
@@ -49,9 +50,9 @@ is deliberately small and **must not regrow**.
 | Tier | File(s) | Loaded | Authoritative for |
 |---|---|---|---|
 | Always | `CLAUDE.md` + its two imports (the table above) | every session | conventions, the key-decisions **areas**, the session rhythm, what loads when |
-| Decisions | `docs/decisions/<area>.md` | the *fences* of your area, then the entry you need | the settled decisions **in full** — reasoning, rejected alternatives, every "do NOT build" fence |
+| Decisions | `docs/decisions/index.yaml` (generated) → `<area>/<decision>.md` | your area's *fences*, then the decision you need | the settled decisions **in full** — reasoning, rejected alternatives, every "do NOT build" fence |
 | Invariants | `docs/invariants.md` | before writing a spec or reviewing a diff | the promises as **observables**, numbered; what every mechanism must keep |
-| Status | `docs/specs/INDEX.md` + each spec header | on demand | spec **status** (one row per spec) |
+| Status | each spec's frontmatter → `docs/specs/index.yaml` (generated) | on demand | spec **status** |
 | The work | `docs/specs/SPEC-XXX-*.md` | the one you're building | requirements + phases |
 | Why | `docs/architecture.md` | the *section* you need | design rationale + Known Constraints |
 | Reuse | `docs/component-inventory.md` | skim for reuse | modules/services/components already built |
@@ -61,14 +62,14 @@ is deliberately small and **must not regrow**.
 
 **Context discipline (session-start token cost matters):**
 - Read **only the current spec** in full.
-- **Never** read `architecture.md`, a `docs/decisions/` area file or a delivery doc whole — pull the
-  one section, fence or entry you need. Each is built so that is possible.
+- **Never** read `architecture.md`, the decisions index or a delivery doc whole — pull the
+  one section, area block or decision you need. Each is built so that is possible.
 - Delegate *dependency* delivery-doc reading to a subagent brief rather than loading it into the main
   loop.
 
 **Path-scoped rules are a backstop, not the mechanism.** `.claude/rules/*.md` carries one pointer per
 governed tree — the process kind (specs, the invariants page, delivery docs, the register, this
-directory, the PR queue, the agents) and the `decisions-<area>` kind, one per decision area that
+directory, the PR queue, the agents, the rulebooks, the architecture doc and inventory) and the `decisions-<area>` kind, one per decision area that
 declares what it governs —
 each firing when a matching file is opened **with the Read tool**, not when it is read through the
 shell, so a session working in `cat` and `grep` never sees one, and only for a path under the

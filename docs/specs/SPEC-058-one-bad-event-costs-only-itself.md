@@ -1,9 +1,13 @@
-# Spec: One Bad Event Costs Only Itself — Transform Output, Per-Event Callables and Retry-Safe Drop Counts
-
-**ID:** SPEC-058
-**Status:** Completed
-**Last Updated:** 2026-10-21
-**Depends On:** SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036
+---
+type: Spec
+id: SPEC-058
+title: "One Bad Event Costs Only Itself — Transform Output, Per-Event Callables and Retry-Safe Drop Counts"
+description: "Closes five places where one bad event could take its whole batch down or be counted nowhere."
+spec_status: Completed
+depends_on: [SPEC-006, SPEC-016, SPEC-017, SPEC-026, SPEC-036]
+arc: coercer-and-invariant-8
+arc_order: 1
+---
 
 ## Overview
 

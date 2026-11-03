@@ -9,11 +9,11 @@ restating it.
   dependency-free**: a new runtime dependency goes behind an optional extra, as `aws`/`boto3` does.
   A spec that needs one has a scope question to settle before it has a plan.
 - **The supported Python set has one authority — the CI matrix.** Every other statement of it is a
-  restatement bound to that matrix, not to its neighbours (`docs/decisions/working-rules.md`). A spec
+  restatement bound to that matrix, not to its neighbours (`docs/decisions/working-rules/`). A spec
   that moves the floor moves the matrix first.
 - **Two of this repo's gates run nowhere but locally** — `scripts/docs-lint.sh` and
   `scripts/docstring-lint.py`, plus each one's `-test.sh` corpus. Nothing in CI runs either, so a
   session that skips them pushes a branch that is red on a gate no job will ever report
   (`session-rhythm.md` holds the full pre-push list).
 - **The public surface is frozen ahead of 1.0** — a change to it is a decision, not an
-  implementation detail, and belongs in `docs/decisions/public-api.md` before it belongs in code.
+  implementation detail, and belongs in `docs/decisions/public-api/` before it belongs in code.

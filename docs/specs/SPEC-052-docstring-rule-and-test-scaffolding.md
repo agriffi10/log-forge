@@ -1,9 +1,11 @@
-# Spec: The Ungated Docstring Rule, and the Scaffolding It Left Behind
-
-**ID:** SPEC-052
-**Status:** Completed
-**Last Updated:** 2026-09-02
-**Depends On:** None
+---
+type: Spec
+id: SPEC-052
+title: "The Ungated Docstring Rule, and the Scaffolding It Left Behind"
+description: "Replaces a docstring rule practice had abandoned with one docstring-lint.py gates, and clears the scaffolding it left."
+spec_status: Completed
+depends_on: []
+---
 
 ## Overview
 

@@ -1,9 +1,11 @@
-# Spec: Lifecycle Residue — Stranded Waiters, Unfinished Closes and Uncounted Loss
-
-**ID:** SPEC-050  
-**Status:** Completed  
-**Last Updated:** 2026-09-02  
-**Depends On:** SPEC-013, SPEC-021, SPEC-027, SPEC-030, SPEC-031, SPEC-036, SPEC-039, SPEC-042, SPEC-045, SPEC-046
+---
+type: Spec
+id: SPEC-050
+title: "Lifecycle Residue — Stranded Waiters, Unfinished Closes and Uncounted Loss"
+description: "Closes five places where the shutdown path stops short of what it already knows how to do."
+spec_status: Completed
+depends_on: [SPEC-013, SPEC-021, SPEC-027, SPEC-030, SPEC-031, SPEC-036, SPEC-039, SPEC-042, SPEC-045, SPEC-046]
+---
 
 ## Overview
 

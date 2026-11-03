@@ -1,9 +1,13 @@
-# Spec: Audit Small Corrections
-
-**ID:** SPEC-031  
-**Status:** Completed  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032
+---
+type: Spec
+id: SPEC-031
+title: "Audit Small Corrections"
+description: "Six audit items too small for a spec each, every one fixed, settled or recorded as a constraint."
+spec_status: Completed
+depends_on: [SPEC-002, SPEC-004, SPEC-008, SPEC-009, SPEC-020, SPEC-025, SPEC-030, SPEC-032]
+arc: audit-remediation
+arc_order: 8
+---
 
 ## Overview
 

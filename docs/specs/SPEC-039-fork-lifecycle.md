@@ -1,9 +1,13 @@
-# Spec: Fork Lifecycle
-
-**ID:** SPEC-039  
-**Status:** Completed  
-**Last Updated:** 2026-08-11  
-**Depends On:** SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035
+---
+type: Spec
+id: SPEC-039
+title: "Fork Lifecycle"
+description: "Handles os.fork(), so a child gets a working worker and repaired sink locks rather than a dead thread and a permanent hang."
+spec_status: Completed
+depends_on: [SPEC-027, SPEC-028, SPEC-030, SPEC-033, SPEC-035]
+arc: audit-2026-08-07
+arc_order: 6
+---
 
 ## Overview
 

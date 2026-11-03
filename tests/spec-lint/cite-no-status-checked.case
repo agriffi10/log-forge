@@ -15,9 +15,13 @@ text
 
 text
 @@@ file docs/specs/SPEC-001-x.md
-# Spec: X
-
-**ID:** SPEC-001
+---
+type: Spec
+id: SPEC-001
+title: X
+description: A spec.
+depends_on: []
+---
 
 ## Overview
 

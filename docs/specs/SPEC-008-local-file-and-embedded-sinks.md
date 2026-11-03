@@ -1,9 +1,13 @@
-# Spec: Local File and Embedded Sinks
-
-**ID:** SPEC-008
-**Status:** Completed
-**Last Updated:** 2026-07-11
-**Depends On:** SPEC-001
+---
+type: Spec
+id: SPEC-008
+title: "Local File and Embedded Sinks"
+description: "Zero-dependency local sinks for disk and embedded databases, including FileSink, RotatingFileSink and SQLiteSink."
+spec_status: Completed
+depends_on: [SPEC-001]
+arc: sink-expansion
+arc_order: 3
+---
 
 ## Overview
 

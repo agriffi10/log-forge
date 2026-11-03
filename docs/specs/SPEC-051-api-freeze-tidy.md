@@ -1,9 +1,11 @@
-# Spec: API Freeze Tidy
-
-**ID:** SPEC-051  
-**Status:** Completed  
-**Last Updated:** 2026-09-02  
-**Depends On:** SPEC-034, SPEC-036, SPEC-040, SPEC-042
+---
+type: Spec
+id: SPEC-051
+title: "API Freeze Tidy"
+description: "Settles six public shapes the 2026-09-02 audit found free to change now and breaking to change after the tag."
+spec_status: Completed
+depends_on: [SPEC-034, SPEC-036, SPEC-040, SPEC-042]
+---
 
 ## Overview
 

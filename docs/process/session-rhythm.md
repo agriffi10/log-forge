@@ -11,8 +11,8 @@ same session you notice it (two hand-synced copies of one procedure is how numbe
 2. Skim `component-inventory.md` for reuse; pull only the `architecture.md` section / dependency
    delivery-doc you actually need.
 3. Confirm CI is green on `main`. Investigate failures before building.
-4. **Branch from fresh `main`**, and set the spec header's `Status: In Progress` plus its `INDEX.md`
-   row in the same commit — that transition is what makes "exactly one spec in flight" (`spec-lifecycle.md`) legible
+4. **Branch from fresh `main`**, and set the spec's frontmatter `spec_status: In Progress` and
+   regenerate the index in the same commit — that transition is what makes "exactly one spec in flight" (`spec-lifecycle.md`) legible
    to the next session, and nothing gates it, so it is missed by being skipped rather than by failing.
 5. **Generate and validate a plan before writing code.** Turn the spec's Implementation Phases into a
    concrete implementation plan, then validate it against the spec — every FR + acceptance criterion is
@@ -56,7 +56,7 @@ gate has run (*A replaced artifact restarts its gate*, in `reviewer-contract.md`
 - Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
   `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
-  linter — plus `sh scripts/pr-queue-test.sh` if you touched the queue or its hook, and
+  linter, the shared frontmatter reader or the index generator — plus `sh scripts/pr-queue-test.sh` if you touched the queue or its hook, and
   `sh scripts/pr-queue/install-test.sh` if you touched its installer.
   **The last two are in that set and nothing in CI runs either.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo

@@ -1,9 +1,13 @@
-# Spec: AWS Lambda Compatibility — Python 3.12 Support and a Repeatable `flush()`
-
-**ID:** SPEC-013
-**Status:** Completed
-**Last Updated:** 2026-07-22
-**Depends On:** SPEC-004 (background worker + `shutdown`), SPEC-012 (release pipeline)
+---
+type: Spec
+id: SPEC-013
+title: "AWS Lambda Compatibility — Python 3.12 Support and a Repeatable `flush()`"
+description: "Makes the library usable from AWS Lambda by lowering the floor to Python 3.12 and adding a repeatable flush()."
+spec_status: Completed
+depends_on: [SPEC-004, SPEC-012]
+arc: serverless-usability
+arc_order: 1
+---
 
 ## Overview
 

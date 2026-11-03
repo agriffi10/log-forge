@@ -1,9 +1,13 @@
-# Spec: Batch Response Adjudication
-
-**ID:** SPEC-018  
-**Status:** Completed  
-**Last Updated:** 2026-07-28  
-**Depends On:** SPEC-010, SPEC-017
+---
+type: Spec
+id: SPEC-018
+title: "Batch Response Adjudication"
+description: "Refuses a positional batch response from Kinesis or Firehose whose arrays do not line up, rather than pairing them silently."
+spec_status: Completed
+depends_on: [SPEC-010, SPEC-017]
+arc: robustness
+arc_order: 2
+---
 
 ## Overview
 

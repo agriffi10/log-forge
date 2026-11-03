@@ -1,9 +1,13 @@
-# Spec: Queue and Stream Buffer Sinks
-
-**ID:** SPEC-010
-**Status:** Completed
-**Last Updated:** 2026-07-11
-**Depends On:** SPEC-005
+---
+type: Spec
+id: SPEC-010
+title: "Queue and Stream Buffer Sinks"
+description: "Extends the durable-buffer path to Kafka, Kinesis, Firehose, Redis, RabbitMQ, NATS, Pub/Sub, Event Hubs and SNS sinks."
+spec_status: Completed
+depends_on: [SPEC-005]
+arc: sink-expansion
+arc_order: 5
+---
 
 ## Overview
 

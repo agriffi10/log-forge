@@ -20,7 +20,7 @@ OTLP is one sink among several, never the only way out.
 
 > **Superseded in part, 2026-10-05.** This section said the library "does **not** (yet) ship
 > metrics or traces" and stays logs-only. The direction is reversed for traces and for the
-> data model; in-library metrics stay out. Full entry: `docs/decisions/public-api.md`; first
+> data model; in-library metrics stay out. Full entry: `docs/decisions/public-api/`; first
 > slice: SPEC-056.
 
 The unit of work is a **decorated function call**. Each call:
@@ -349,7 +349,7 @@ that a leaked resource in a running process beats a close raced against a write.
 > gets. An expired `shutdown()` still leaves it open, because the thread is still live, and the
 > next call performs the close instead. What changed the decision was measuring the cost: for a
 > sink whose `close()` *is* the delivery, "left open" is nine events lost, not a leaked handle.
-> Full entry in `docs/decisions/sink-lifecycle.md`.
+> Full entry in `docs/decisions/sink-lifecycle/`.
 
 Passing the sink already live is a no-op. After `shutdown()` the worker swaps nothing: it is retired, so the config is
 updated and the retirement signals (§9) continue to apply — but the sink adopted by that call is
@@ -671,7 +671,7 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
 > longer a question a call site can get wrong, so **ownership** and **ownership ∧ moment** are
 > gone and what remains of the conjunction is the moment on its own — carrying **two**
 > predicates, because an abandoned drain answers them oppositely. The full entry is
-> `docs/decisions/pipeline.md` → *A worker guard asks one of three questions*.
+> `docs/decisions/pipeline/` → *A worker guard asks one of three questions*.
 
 Every guard that mentions the worker is classified as exactly one of three categories, and
 answering with the wrong one is this codebase's most repeated defect: three reviewers told
@@ -1026,7 +1026,7 @@ close it.
   exact `str` measured through `str.__str__`, which reaches `function`, `message`, `fields`
   (keys and values), baggage, `defaults` and the `error` sub-document on both paths, and so
   every sink the entry listed. The four prose sites that asserted the pass-through were
-  reworded with the fix. Full reasoning: `docs/decisions/event-assembly.md` ("An event is safe by construction").
+  reworded with the fix. Full reasoning: `docs/decisions/event-assembly/` ("An event is safe by construction").
 - ~~**`service`, `version` and `env` reach the event without passing through `sanitize`**~~
   (invariant 8) → **half fixed in SPEC-055 FR-001, half recorded**. `configure()` now refuses a
   stamp that is not a `str` (`TypeError`) or does not encode as UTF-8 (`ValueError`), naming the
@@ -1094,7 +1094,7 @@ close it.
 - ~~Emitting metrics or OpenTelemetry-native traces (we stay logs-only, but ID-compatible).~~ —
   **superseded in part, 2026-10-05.** In-library metrics stay a non-goal: they are derived
   downstream. OpenTelemetry-native traces are no longer one — OTLP spans built from `span.end`
-  are a planned arc item, not yet built. Full entry: `docs/decisions/public-api.md`.
+  are a planned arc item, not yet built. Full entry: `docs/decisions/public-api/`.
 - Querying, dashboards, or alerting — that's ELK / downstream.
 - Log *routing* logic beyond a single configured sink per process.
 
@@ -1104,7 +1104,7 @@ close it.
 alternative was built and measured worse, or because fixing it would change a published contract.
 It is **not** a backlog: something genuinely unfinished belongs in §12, which names what would
 close it. A closed item is struck in place with the spec that closed it (SPEC-021's rule) and its
-reasoning is *not* repeated here — that lives in `docs/decisions/` (its area file opens with the fence, and CLAUDE.md's Key
+reasoning is *not* repeated here — that lives in `docs/decisions/` (the generated index lists its fence, and CLAUDE.md's Key
 Decisions table names the area) and the delivery doc,
 and a third copy is a fork with no merge.
 
@@ -1173,8 +1173,8 @@ and a third copy is a fork with no merge.
 
 - ~~**A process that only ever used the orphan path never closes its sink**, and a sink
   adopted after `shutdown()` is closed by nothing.~~ — **fixed by SPEC-031 FR-006 and
-  SPEC-033.** The reasoning is in `docs/decisions/pipeline.md` ("The close is once-only across
-  both delivery paths" and "A sink handoff is owned by whoever is delivering") and in
+  SPEC-033.** The reasoning is in `docs/decisions/pipeline/` ("The close is once-only across
+  both delivery paths"), `docs/decisions/sink-lifecycle/` ("A sink handoff is owned by whoever is delivering") and in
   [SPEC-031](spec-delivery/SPEC-031-audit-small-corrections.md) and
   [SPEC-033](spec-delivery/SPEC-033-orphan-path-sink-handoff.md); it is not repeated here.
 
@@ -1601,8 +1601,8 @@ and a third copy is a fork with no merge.
   reproduced byte-identically on the pre-SPEC-040 tree, so the refactor caused none of them.
   The sixth is the `shutdown(timeout=…)` limit stated above and is not repeated here. What each
   race was, and the depth counter, close registry and latch that closed them, is in
-  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and `docs/decisions/pipeline.md` →
-  "A worker guard asks one of four questions". It is not in CLAUDE.md: the fence for that
+  [SPEC-044](spec-delivery/SPEC-044-lifecycle-races.md) and `docs/decisions/pipeline/` →
+  "A worker guard asks one of three questions". It is not in CLAUDE.md: the fence for that
   entry names none of the three.
 
 - **On macOS a forked child dies of `SIGSEGV` if it finalizes an inherited, unclosed
@@ -1666,5 +1666,5 @@ and a third copy is a fork with no merge.
 | Correlation ID journey | Two-tier IDs + parent/child hierarchy across nested calls (§3), continued across processes via W3C `traceparent` + `baggage` (SPEC-014). |
 | Head vs tail sampling | Neither is built. Span-outcome sampling has a natural call site; true tail sampling needs a trace-scoped buffer we don't have (§10). |
 | Cardinality explosion | High-cardinality fields allowed in logs; never auto-promoted to metric labels (§6). |
-| One event, three views | Logs first; `trace_id`/`span_id` make traces derivable, and OTLP traces from `span.end` are a planned arc item, not built (§13; superseded 2026-10-05 — `docs/decisions/public-api.md`). |
+| One event, three views | Logs first; `trace_id`/`span_id` make traces derivable, and OTLP traces from `span.end` are a planned arc item, not built (§13; superseded 2026-10-05 — `docs/decisions/public-api/`). |
 | Symptom vs cause alerting | We stamp `duration_ms` / `status` / `error.type` — the fields alerts key off (§6). |

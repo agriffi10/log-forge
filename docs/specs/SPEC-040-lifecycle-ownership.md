@@ -1,9 +1,13 @@
-# Spec: Lifecycle Ownership — One Owner for the Worker and the Sink
-
-**ID:** SPEC-040  
-**Status:** Completed  
-**Last Updated:** 2026-08-11  
-**Depends On:** SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039
+---
+type: Spec
+id: SPEC-040
+title: "Lifecycle Ownership — One Owner for the Worker and the Sink"
+description: "A behaviour-preserving refactor giving the worker and the sink one lifecycle owner in place of seven loose globals."
+spec_status: Completed
+depends_on: [SPEC-030, SPEC-031, SPEC-033, SPEC-035, SPEC-039]
+arc: audit-2026-08-07
+arc_order: 8
+---
 
 ## Overview
 

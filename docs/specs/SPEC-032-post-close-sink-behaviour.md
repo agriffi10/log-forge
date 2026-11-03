@@ -1,9 +1,13 @@
-# Spec: Post-Close Sink Behaviour
-
-**ID:** SPEC-032  
-**Status:** Completed  
-**Last Updated:** 2026-08-07  
-**Depends On:** SPEC-026, SPEC-028, SPEC-030
+---
+type: Spec
+id: SPEC-032
+title: "Post-Close Sink Behaviour"
+description: "Makes a closed sink refuse work rather than accept events nothing will ever deliver."
+spec_status: Completed
+depends_on: [SPEC-026, SPEC-028, SPEC-030]
+arc: post-close-sink-behaviour
+arc_order: 1
+---
 
 ## Overview
 

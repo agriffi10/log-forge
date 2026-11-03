@@ -1,9 +1,13 @@
-# Spec: Forked-Child Sink Ownership
-
-**ID:** SPEC-042  
-**Status:** Completed  
-**Last Updated:** 2026-08-11  
-**Depends On:** SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039
+---
+type: Spec
+id: SPEC-042
+title: "Forked-Child Sink Ownership"
+description: "Stops a forked child closing transports it never opened, by recording which process owns a sink."
+spec_status: Completed
+depends_on: [SPEC-027, SPEC-030, SPEC-032, SPEC-033, SPEC-034, SPEC-039]
+arc: forked-child-sink-ownership
+arc_order: 1
+---
 
 ## Overview
 

@@ -1,9 +1,13 @@
-# Spec: Async `@trace` Support
-
-**ID:** SPEC-003
-**Status:** Completed
-**Last Updated:** 2026-07-09
-**Depends On:** SPEC-001, SPEC-002
+---
+type: Spec
+id: SPEC-003
+title: "Async `@trace` Support"
+description: "Makes @trace work on async def functions, so a span closes when the coroutine finishes rather than when it is created."
+spec_status: Completed
+depends_on: [SPEC-001, SPEC-002]
+arc: core-logging-pipeline
+arc_order: 3
+---
 
 ## Overview
 
