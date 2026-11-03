@@ -39,9 +39,9 @@ implementation against the design in `architecture.md`.
   which PyPI rejects as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}` — shipped across SPEC-001–005 (`docs/spec-delivery/`
-  says which; `sinks/sqs` is the optional `aws` extra). Plus three leaf helpers the map did not
-  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag` and `results` —
-  and two non-leaves that do: `_lifecycle` and `_fork` (which spec: `docs/component-inventory.md`).
+  says which; `sinks/sqs` is the optional `aws` extra). Plus four leaf helpers the map did not
+  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag`, `results` and
+  `_otel` — and two non-leaves that do: `_lifecycle` and `_fork` (see `docs/component-inventory.md`).
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -125,7 +125,7 @@ carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@do
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
-**Current work:** SPEC-056 (OTLP log export), In Progress.
+**Current work:** none in flight.
 
 ## Key Decisions (settled — don't re-litigate)
 

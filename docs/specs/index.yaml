@@ -380,7 +380,7 @@ specs:
   - id: "SPEC-056"
     title: "OTLP Log Export — a Private OpenTelemetry Mapping and an OTLP/HTTP JSON Sink"
     description: "A sink that speaks OTLP/HTTP JSON directly, over a private OpenTelemetry mapping, so OTLP backends receive log-foundry events under the names they already index."
-    spec_status: "In Progress"
+    spec_status: "Completed"
     depends_on: ["SPEC-009", "SPEC-017", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-029", "SPEC-032", "SPEC-036", "SPEC-038", "SPEC-041", "SPEC-048", "SPEC-049", "SPEC-051", "SPEC-055", "SPEC-057", "SPEC-058", "SPEC-059"]
     arc: "opentelemetry-shaped-output"
     path: "docs/specs/SPEC-056-otlp-log-export.md"
