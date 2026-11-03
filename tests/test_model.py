@@ -94,17 +94,22 @@ class _HijackName(str):
 
 
 def _traced_failure(lf, exc_cls: type[BaseException]):
-    """Runs a traced function that logs once and raises ``exc_cls``; returns what it re-raised."""
+    """Runs a traced function that logs once and raises an ``exc_cls``; returns both exceptions.
+
+    The first is the instance the function raised and the second what reached the caller, so a
+    test can hold the re-raise to identity, not only to type.
+    """
+    instance = exc_cls()
 
     @lf.trace(name="work")
     def work() -> None:
         lf.info("before")
-        raise exc_cls()
+        raise instance
 
     try:
         contextvars.copy_context().run(work)
     except BaseException as exc:
-        return exc
+        return instance, exc
     raise AssertionError("the traced function did not raise")
 
 
@@ -124,8 +129,8 @@ def test_a_hostile_exception_class_keeps_its_spans_events(
 ) -> None:
     """FR-004 AC1: re-raised ``is``-identical, events delivered, ``error.type`` the stored name."""
     exc_cls = _exception_class(__name__=metaclass_name)
-    raised = _traced_failure(lf, exc_cls)
-    assert type(raised) is exc_cls
+    instance, raised = _traced_failure(lf, exc_cls)
+    assert raised is instance, "the user's exception was not re-raised unchanged"
     assert [e["message"] for e in fake_sink.events] == ["span.start", "before", "span.end"]
     end = _end(fake_sink)
     assert end["status"] == "error"
@@ -134,7 +139,7 @@ def test_a_hostile_exception_class_keeps_its_spans_events(
 
 
 def test_a_str_subclass_stored_name_is_exact_text_in_the_error(lf, fake_sink) -> None:
-    """FR-004 AC2 (silence): ``truncate_str`` already returns the stored text as an exact ``str``."""
+    """FR-004 AC2 (silence): ``truncate_str`` already returns the stored text, an exact ``str``."""
     exc_cls = _exception_class()
     exc_cls.__name__ = _HijackName("Stored")
     _traced_failure(lf, exc_cls)

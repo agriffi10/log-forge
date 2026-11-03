@@ -159,6 +159,27 @@ because ``type.__name__``'s setter accepts a ``str`` subclass.
 _CONTAINER_KEYS: tuple[type, ...] = (tuple, list, dict, set, frozenset)
 """The builtin containers a mapping key is coerced as, tested on the key's real type (SPEC-063)."""
 
+_REAL_ROUTED: tuple[type, ...] = (
+    str,
+    bytes,
+    bytearray,
+    dict,
+    tuple,
+    list,
+    set,
+    frozenset,
+    int,
+    float,
+)
+"""The builtins :meth:`_Coercer._dispatch` routes by real type, so a claim of ``Enum`` cannot.
+
+An object whose real type subclasses one of these is routed by that type, never by an ``Enum``
+claim made through ``__class__``, unless its real type is an ``Enum`` as well: the ``Enum``
+branch's fallback is ``str(value)``, the builtin ``repr`` for a real container (SPEC-063 FR-002).
+``int`` and ``float`` are here too, because their own branches bound and convert them, where the
+``Enum`` fallback would render a real ``int`` subclass by ``str()`` whatever its digit count.
+"""
+
 _BYTES_LEN = bytes.__len__
 """The unbound lengths that price a bytes-like key before it is rendered (SPEC-063 FR-001).
 
@@ -484,18 +505,29 @@ class _Coercer:
         it is not falls to the enum's own text, unless it claims ``float`` or ``str``, whose
         conversion or unbound read raises and names the ``Enum`` class, the node.
 
+        **The ``Enum`` branch is entered only by a real ``Enum``, or by an object whose real type
+        is none of the builtins in** :data:`_REAL_ROUTED`. Its fallback is ``str(value)``, so a
+        real container claiming ``Enum`` through ``__class__`` reached the builtin ``repr``:
+        measured at ``71e42dd``, and unchanged until this test, a real ``tuple`` subclass
+        claiming ``Enum`` wrote ``(SECRET,)`` for an object whose ``__repr__`` returned
+        ``"SECRET"``, did not return around the shared ``frozenset`` DAG, and a ``bytes`` subclass
+        of 16 MiB peaked at 64 MiB. A proxy of an ``Enum`` keeps the branch, its real type being
+        no builtin, and so does every ``StrEnum``, ``IntEnum`` and ``(tuple, Enum)`` member.
+
         **Then the real type routes the containers and the text.** A ``str``, ``bytes`` or
         ``bytearray`` subclass, the exact ``memoryview``, a ``dict`` subclass and a ``tuple``,
         ``list``, ``set`` or ``frozenset`` subclass are routed by ``issubclass(type(value), …)``,
-        ahead of every ``isinstance`` branch, because a real container that claims ``UUID`` or
-        ``Decimal`` through ``__class__`` otherwise reached their ``str()``, the builtin
-        ``repr``: measured at ``e66ab6c`` by the plan review, a real ``tuple`` subclass claiming
-        ``UUID`` around a shared ``frozenset`` DAG did not return, one holding an object whose
-        ``__repr__`` returned ``"SECRET"`` wrote ``SECRET``, and a real ``bytes`` subclass
-        claiming ``Decimal`` was rendered whole by ``str()``. **``isinstance`` stays, on purpose,
-        for the render-through routes** — ``isoformat()``, ``str()`` of a ``UUID`` or
-        ``Decimal``, ``Mapping``, ``set`` and ``Sequence`` iteration, the ``Enum`` branch — whose
-        output is the library's own text and containers: a transparent proxy
+        ahead of every render-through ``isinstance`` branch and after the ``int`` and ``float``
+        branches, which convert or refuse what they admit. A real container that claims ``UUID``
+        or ``Decimal`` through ``__class__`` otherwise reached their ``str()``, the builtin
+        ``repr``: measured at ``71e42dd``, a real ``tuple`` subclass claiming ``UUID`` around a
+        shared ``frozenset`` DAG did not return, one holding an object whose ``__repr__``
+        returned ``"SECRET"`` wrote ``SECRET``, and a real ``bytes`` subclass claiming
+        ``Decimal`` was rendered whole by ``str()``. **``isinstance`` stays, on purpose, for the
+        render-through routes** — ``isoformat()``, ``str()`` of a ``UUID`` or ``Decimal``,
+        ``Mapping``, ``set`` and ``Sequence`` iteration, and the ``Enum`` branch for an object
+        that is no builtin — whose output is the library's own text and containers: a
+        transparent proxy
         (``wrapt.ObjectProxy``, Django's ``SimpleLazyObject``) sets ``__class__`` legitimately and
         renders correctly through them. An object that only claims ``str`` or a bytes-like type
         falls through to the placeholder, the ``Sequence`` branch excluding the text-like types.
@@ -531,7 +563,9 @@ class _Coercer:
         if kind is list:
             return self.members(value, depth)  # type: ignore[arg-type]
 
-        if isinstance(value, Enum):
+        if isinstance(value, Enum) and (
+            issubclass(kind, Enum) or not issubclass(kind, _REAL_ROUTED)
+        ):
             member = value.value
             if type(member) is int:
                 return self.integer(member)
@@ -818,21 +852,27 @@ class _Coercer:
 
         The integer branch admits by ``type(key) is not bool`` rather than
         ``not isinstance(key, bool)``, because ``isinstance`` consults ``__class__``: a real ``int``
-        subclass claiming ``bool`` skipped the bound and was rendered by ``str()`` whole — measured
-        by the plan review at ``e66ab6c``, three million digits under
-        ``sys.set_int_max_str_digits(0)``. An object that only claims ``bool`` or ``int`` reaches
-        :meth:`_bounded_int`, whose unbound reads refuse it, and becomes the key placeholder.
+        subclass claiming ``bool`` skipped the bound and was rendered by ``str()`` whole —
+        measured at ``71e42dd``, three million digits under ``sys.set_int_max_str_digits(0)``.
+        An object that only claims ``bool`` or ``int`` reaches :meth:`_bounded_int`, whose
+        unbound reads refuse it, and becomes the key placeholder.
 
         A float key goes through :meth:`real` for the same reason, converted first through
         :data:`_FLOAT_FLOAT`, so a ``float`` subclass key renders as its exact float rather than
         through its own ``__str__``, and an impostor becomes the key placeholder (SPEC-063
-        FR-002). Its rendered form is short — ``real`` computes its placeholder through
+        FR-002). A ``(float, Enum)`` member is excluded and keeps ``str()``, as a ``(int, Enum)``
+        member does through its own branch: an ``Enum`` key reads as its name, ``FE.A``, as it
+        did at ``71e42dd``. Its rendered form is short — ``real`` computes its placeholder through
         :data:`_FLOAT_REPR` — but it is still text this pass produced, so it is charged as such.
         A ``str`` key is the caller's own text and goes to :meth:`text`.
 
         **A container key is coerced, not rendered** (SPEC-063 FR-001). A key whose *real* type
         subclasses ``tuple``, ``list``, ``dict``, ``set`` or ``frozenset`` and not ``Enum`` is
-        handed to :meth:`_container_key`, whose docstring carries the rule; the real type, because
+        handed to :meth:`_container_key`, whose docstring carries the rule, ahead of the
+        claim-based ``str``, ``int`` and ``float`` tests, so a real container claiming one of
+        those is still walked rather than refused by that type's unbound read; a real ``str``
+        subclass, a ``StrEnum`` included, is no container and reaches :meth:`text`. The real type,
+        because
         an object that only claims through ``__class__`` to be a ``tuple`` is not walked and keeps
         its own ``str()``, and not an ``Enum``, because a ``(tuple, Enum)`` member keeps
         ``str()`` as ``Color(int, Enum)`` does, the value route sending an ``Enum`` to its own
@@ -852,6 +892,9 @@ class _Coercer:
           Exception: Whatever the key's own ``__str__`` or iteration raises, or the
             ``TypeError`` an unbound accessor raises for an impostor; :meth:`key` is the guard.
         """
+        kind = type(key)
+        if issubclass(kind, _CONTAINER_KEYS) and not issubclass(kind, Enum):
+            return self._container_key(key, kind, depth)
         if isinstance(key, str):
             return self.text(key)
         if isinstance(key, int) and type(key) is not bool:
@@ -860,12 +903,9 @@ class _Coercer:
                 self._halt(_SIZE_LIMIT)
                 return _SIZE_LIMIT
             return self.produced(rendered if isinstance(rendered, str) else str(rendered))
-        if isinstance(key, float):
+        if isinstance(key, float) and not issubclass(kind, Enum):
             replaced = self.real(_FLOAT_FLOAT(key))
             return self.produced(replaced if isinstance(replaced, str) else str(replaced))
-        kind = type(key)
-        if issubclass(kind, _CONTAINER_KEYS) and not issubclass(kind, Enum):
-            return self._container_key(key, kind, depth)
         if issubclass(kind, (bytes, bytearray)) and not self._bytes_key_fits(key, kind):
             self._halt(_SIZE_LIMIT)
             return _SIZE_LIMIT
@@ -889,9 +929,10 @@ class _Coercer:
         :meth:`members` otherwise, never through :meth:`_dispatch` or :meth:`value`. Not
         ``_dispatch``, because its render-through ``isinstance`` branches would hand a real
         ``tuple`` subclass claiming ``UUID`` or ``Decimal`` to ``str()`` — the builtin ``repr``
-        again, which the plan review measured at ``e66ab6c`` hanging on the DAG and writing a
-        member's ``repr``. Not ``value``, because its guard would turn the key's own failure into
-        a value placeholder where :meth:`key` must see it.
+        again, which hung on the DAG and wrote a member's ``repr`` when measured at ``71e42dd``
+        through the value route — and its ``int`` and ``float`` branches would refuse a real
+        container claiming either. Not ``value``, because its guard would turn the key's own
+        failure into a value placeholder where :meth:`key` must see it.
 
         The text is ``json.dumps`` of the coerced form with the default separators, so ``(1, 2)``
         is the key ``"[1, 2]"`` and a key whose coerced form is a string, ``<depth limit>`` or
@@ -1180,8 +1221,8 @@ def _type_name(value: object) -> str:
     metaclass whose ``__name__`` property raised made every placeholder ``?``, one returning
     ``42`` or ``"renamed"`` named the type that, and in ``model`` the first two cost a span its
     events. The ``str.__str__`` is needed because ``type.__name__``'s setter accepts a ``str``
-    subclass, which the descriptor then returns: measured by the plan review at ``e66ab6c`` with
-    the read alone, a subclass whose ``__format__`` returned ``"HIJACK"`` renamed the placeholder
+    subclass, which the descriptor then returns: measured on ``71e42dd``'s code with the read
+    alone in place, a subclass whose ``__format__`` returned ``"HIJACK"`` renamed the placeholder
     through the f-string that embeds it, and one whose ``__str__`` raised took every sibling in
     ``fields`` with it. The fallback ``"?"`` stays as a guard.
 

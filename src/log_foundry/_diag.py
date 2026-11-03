@@ -60,9 +60,10 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     from the event that provoked it, and arch §6 keeps user data out of anything the library
     emits about itself. The type is named by the name it stores, read through
     :data:`_STORED_NAME` and :data:`_STR_STR` rather than ``type(exc).__name__``, so a metaclass
-    property can neither silence the line nor rename it (SPEC-063 FR-004). A stream fault is swallowed because these writers are called from the
-    ``except`` and ``finally`` blocks that exist to stop an exception reaching the caller,
-    though a ``BaseException`` from the write still propagates.
+    property can neither silence the line nor rename it (SPEC-063 FR-004). A stream fault is
+    swallowed because these writers are called from the ``except`` and ``finally`` blocks that
+    exist to stop an exception reaching the caller, though a ``BaseException`` from the write
+    still propagates.
 
     Args:
       where: What was being attempted, as a participle phrase that reads after "while", such

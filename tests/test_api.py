@@ -1208,7 +1208,10 @@ def test_a_fields_truth_failure_from_a_hostile_class_names_its_stored_name(
         def __bool__(self) -> bool:
             raise hostile_exc()
 
-    lf.info("m", fields=_Fields(), a=1)
+    try:
+        lf.info("m", fields=_Fields(), a=1)
+    except BaseException:
+        pytest.fail("the hostile class's exception escaped lf.info: the fields= guard regressed")
     assert [e["fields"] for e in fake_sink.events if e["message"] == "m"] == [{"a": 1}]
     assert "merging the fields= argument (Stored)" in capsys.readouterr().err
 
@@ -1216,7 +1219,7 @@ def test_a_fields_truth_failure_from_a_hostile_class_names_its_stored_name(
 def test_ordinary_fields_and_echo_arguments_behave_as_before(
     lf, fake_sink, capsys, monkeypatch
 ) -> None:
-    """FR-003 AC5 (silence): empty and ordinary arguments, and every ordinary ``echo``, unchanged."""
+    """FR-003 AC5 (silence): an empty or plain ``fields=`` and any plain ``echo``, unchanged."""
     from log_foundry import console as console_mod
 
     for empty in ([], None, {}):

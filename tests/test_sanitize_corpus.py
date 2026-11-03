@@ -268,7 +268,7 @@ class _ProxiedInt:
 
 
 class _TupleClaimsUUID(tuple):  # type: ignore[type-arg]
-    """A real ``tuple`` subclass claiming ``UUID``: it is walked by its real type, never ``str()``-ed."""
+    """A real ``tuple`` subclass claiming ``UUID``: walked by its real type, never rendered."""
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:  # type: ignore[override]
@@ -285,6 +285,31 @@ class _BytesClaimsDecimal(bytes):
     @property  # type: ignore[misc]
     def __class__(self) -> type:  # type: ignore[override]
         return Decimal
+
+
+class _ClaimsEnumWithValue:
+    """Mixed into a real builtin: claims ``Enum`` and answers ``.value`` with a bare object."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Enum
+
+    @property
+    def value(self) -> object:
+        return object()
+
+
+class _TupleClaimsEnum(_ClaimsEnumWithValue, tuple):  # type: ignore[misc, type-arg]
+    pass
+
+
+class _DictClaimsEnum(_ClaimsEnumWithValue, dict):  # type: ignore[misc, type-arg]
+    pass
+
+
+class _CorpusSecret:
+    def __repr__(self) -> str:
+        return "SECRET"
 
 
 def _exact_bools(expected: list[bool]) -> Callable[[object], bool]:
@@ -551,6 +576,20 @@ ROWS: list[Row] = [
     Row("real_tuple_claiming_uuid", "value", _TupleClaimsUUID((1, "a")), False, [1, "a"]),
     Row("real_tuple_claiming_decimal", "value", _TupleClaimsDecimal((1, "a")), False, [1, "a"]),
     Row("real_bytes_claiming_decimal", "value", _BytesClaimsDecimal(b"ab"), False, "ab"),
+    Row(
+        "real_tuple_claiming_enum",
+        "value",
+        _TupleClaimsEnum((1, _CorpusSecret())),
+        False,
+        [1, "<unserializable: _CorpusSecret>"],
+    ),
+    Row(
+        "real_dict_claiming_enum",
+        "value",
+        _DictClaimsEnum(a=_CorpusSecret()),
+        False,
+        {"a": "<unserializable: _CorpusSecret>"},
+    ),
 ]
 
 _ROUTES = ("in_span", "orphan")

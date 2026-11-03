@@ -623,6 +623,9 @@ def test_an_orphan_loss_from_a_hostile_exception_class_is_counted_and_announced(
 
     lf.configure(service="diag", sink=_RaisingSink())  # type: ignore[arg-type]
     before = lf.health().orphan_lost
-    lf.info("m")
+    try:
+        lf.info("m")
+    except BaseException:
+        pytest.fail("the hostile class's exception escaped lf.info: the orphan guard regressed")
     assert lf.health().orphan_lost == before + 1
     assert "absorbed a failure while emitting an orphan log (Stored)" in err.getvalue()

@@ -23,7 +23,7 @@ import time
 import tracemalloc
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import NamedTuple
 from uuid import UUID
 
@@ -66,7 +66,7 @@ class _Pairs(Mapping[object, object]):
 
 
 def _dag(levels: int) -> frozenset[object]:
-    """``f = frozenset({f, (f, i)})`` applied ``levels`` times: a DAG whose ``repr`` doubles per level."""
+    """``f = frozenset({f, (f, i)})`` applied ``levels`` times: its ``repr`` doubles per level."""
     f: frozenset[object] = frozenset()
     for i in range(levels):
         f = frozenset({f, (f, i)})
@@ -131,14 +131,14 @@ def test_container_keys_are_written_as_the_json_of_their_coerced_form(
 
 
 def test_distinct_container_keys_stay_distinct() -> None:
-    """FR-001 AC1: ``(1, "2")`` and ``(1, 2)`` give two keys, where a type-name key would give one."""
+    """FR-001 AC1: ``(1, "2")`` and ``(1, 2)`` give two keys; a type-name key would give one."""
     fields, flag = sanitize_fields({"k": {(1, "2"): "a", (1, 2): "b"}}, cfg=Config())
     assert fields == {"k": {'[1, "2"]': "a", "[1, 2]": "b"}}
     assert flag is False
 
 
 def test_an_enum_container_mixin_key_keeps_its_str() -> None:
-    """FR-001 AC1 (silence): a ``(tuple, Enum)`` member is not a container key; it keeps ``str()``."""
+    """FR-001 AC1 (silence): a ``(tuple, Enum)`` member is no container key; it keeps ``str()``."""
     fields, flag = sanitize_fields({"k": {_TupleEnum.A: 1}}, cfg=Config())
     assert fields == {"k": {"_TupleEnum.A": 1}}
     assert flag is False
@@ -333,14 +333,40 @@ class _HashableBytearray(bytearray):
 def test_a_bytes_like_key_is_priced_through_its_unbound_length(
     monkeypatch: pytest.MonkeyPatch, kind: type
 ) -> None:
-    """FR-001 AC9: 101 bytes at a budget of 100 is refused unrendered, whatever ``__len__`` says.
+    """FR-001 AC9: 25 bytes price at 103, over a budget of 100, whatever ``__len__`` says.
 
     ``__str__`` raises, not ``__repr__``: ``str()`` of a bytes-like subclass calls the C repr and
     never the subclass's ``__repr__``, so a raising ``__repr__`` renders fine and crosses the
     budget anyway. A rendered key here would be the key placeholder.
     """
     monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 100)
-    fields, flag = sanitize_fields(_Pairs([(kind(b"\x00" * 101), 1)]), cfg=Config())  # type: ignore[arg-type]
+    pairs = _Pairs([(kind(b"\x00" * 25), 1)])
+    fields, flag = sanitize_fields(pairs, cfg=Config())  # type: ignore[arg-type]
+    assert fields == {_SIZE: _SIZE}
+    assert flag is True
+
+
+def test_a_bytes_key_priced_exactly_at_the_budget_is_rendered_and_charged_its_repr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001 AC9: 24 zero bytes price at 99 and fit 99; the charge is the repr's actual 99."""
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 99)
+    key = b"\x00" * 24
+    assert len(str(key)) == 99, "the premise: four characters a byte plus b''"
+    coercer = _Coercer(Config())
+    out = coercer.mapping({key: None}, -1)
+    assert out == {str(key): None}
+    assert coercer._charged == 99
+    assert coercer.truncated is False
+
+
+def test_a_short_bytes_key_whose_repr_would_fit_is_refused_by_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001 AC9: ``b"a" * 25`` renders in 28 characters but prices at 103, so it is refused."""
+    monkeypatch.setattr(sanitize, "_MAX_RENDERED_BYTES", 100)
+    assert len(str(b"a" * 25)) == 28, "the premise: its repr would fit"
+    fields, flag = sanitize_fields({b"a" * 25: None}, cfg=Config())
     assert fields == {_SIZE: _SIZE}
     assert flag is True
 
@@ -369,10 +395,11 @@ def test_a_bytes_like_key_is_priced_at_its_repr_upper_bound(
     assert fields == expected
 
 
+@pytest.mark.parametrize("size", [64 << 20, 16 << 20], ids=["64MiB", "16MiB"])
 @pytest.mark.parametrize("kind", [bytes, _HashableBytearray], ids=["bytes", "bytearray"])
-def test_a_huge_bytes_like_key_is_never_rendered(kind: type) -> None:
-    """FR-001 AC9: 64 MiB of zero bytes as a key is refused unrendered; a repr would be 256 MiB."""
-    key = kind(b"\x00" * (64 << 20))
+def test_a_huge_bytes_like_key_is_never_rendered(kind: type, size: int) -> None:
+    """FR-001 AC9: 64 or 16 MiB of zero bytes as a key is refused unrendered (repr: four times)."""
+    key = kind(b"\x00" * size)
     tracemalloc.start()
     started = time.process_time()
     try:
@@ -505,13 +532,17 @@ def test_a_container_key_claiming_a_rendered_type_is_still_walked(route: str, ki
     event = _emit(route, {"v": {kind((_DAG_40,)): 1}}, sink, deadline=5)
     assert time.process_time() - started < 2, route
     assert event.get("truncated") is True, route
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    (text,) = fields["v"]
+    assert text.startswith("[") and "<depth limit>" in text, f"{route}: not the walked text"
     secret = _emit(route, {"v": {kind((_Secret(),)): 1}}, sink)
     assert secret["fields"] == {"v": {'["<unserializable: _Secret>"]': 1}}
     assert "SECRET" not in json.dumps(secret)
 
 
 def test_a_real_bytes_subclass_claiming_decimal_is_read_to_the_ceiling() -> None:
-    """FR-002: a real ``bytes`` subclass claiming ``Decimal`` is read to its ceiling, not ``str()``-ed."""
+    """FR-002: a real ``bytes`` subclass claiming ``Decimal`` is read to its ceiling only."""
     value = _BytesClaimsDecimal(b"\x00" * (64 << 20))
     tracemalloc.start()
     try:
@@ -696,7 +727,7 @@ class _PInt(int):
 
 
 def test_float_keys_are_converted_and_int_subclass_keys_keep_their_str() -> None:
-    """FR-002 AC4: a float key is its exact float or the placeholder; an int subclass keeps ``str()``.
+    """FR-002 AC4: a float key is its exact float or the placeholder; an int subclass keeps str().
 
     An object claiming ``bool`` as a key is the key placeholder: the integer branch admits by
     ``type(key) is not bool``, so the claim reaches the unbound reads, which refuse it.
@@ -782,7 +813,7 @@ class _HijackName(str):
 
 
 def test_a_str_subclass_stored_name_is_read_as_exact_text() -> None:
-    """FR-002 AC6: a ``str`` subclass stored as the name neither raises nor renames the placeholder."""
+    """FR-002 AC6: a ``str`` subclass stored as the name neither raises nor renames anything."""
 
     def _raise(self: object) -> str:
         raise RuntimeError("str")
@@ -798,7 +829,7 @@ def test_a_str_subclass_stored_name_is_read_as_exact_text() -> None:
 
 
 def _spoofable_memberships(source: str) -> list[str]:
-    """Every ``in``/``not in`` test of ``type(...)`` or ``kind``, and every ``_PLAIN_SCALARS`` name."""
+    """Every ``in``/``not in`` test of ``type(...)`` or ``kind``, and each ``_PLAIN_SCALARS``."""
     found = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Compare) and any(
@@ -853,7 +884,7 @@ def test_the_module_imports_only_names_older_than_spec_063() -> None:
 
 
 class _TupleClaimsEnum(tuple):  # type: ignore[type-arg]
-    """A real ``tuple`` subclass claiming ``Enum``, which the value route's ``Enum`` branch reads."""
+    """A real ``tuple`` subclass claiming ``Enum``, with no ``.value`` of its own."""
 
     @property  # type: ignore[misc]
     def __class__(self) -> type:  # type: ignore[override]
@@ -861,14 +892,11 @@ class _TupleClaimsEnum(tuple):  # type: ignore[type-arg]
 
 
 def test_a_container_key_claiming_enum_is_still_walked() -> None:
-    """FR-001: the key is walked by its real type, even under a claim the value route believes.
+    """FR-001: the key is walked by its real type, even under an ``Enum`` claim (silence-shaped).
 
-    Through ``_dispatch``, ``isinstance`` believes the ``Enum`` claim and reads the tuple's
-    ``.value``, which it has not, so the key would be the key placeholder. It is the shape that
-    tells the key's own real-type routing from a route through ``_dispatch``, whose real-type
-    block now walks a tuple claiming ``UUID`` or ``Decimal`` too. A claim of ``int`` or ``float``
-    cannot tell them apart: ``_key`` tests those before the container rule, as ``_dispatch``
-    does, and both refuse the claim with the key placeholder.
+    ``_dispatch`` enters its ``Enum`` branch only for a real ``Enum`` or a non-builtin, so a route
+    through it would walk this key too; it no longer tells the two routings apart. The ``int``
+    and ``float`` claims of ``test_a_container_key_claiming_a_scalar_is_still_walked`` do.
     """
     fields, flag = sanitize_fields({"k": {_TupleClaimsEnum((1, 2)): 1}}, cfg=Config())
     assert fields == {"k": {"[1, 2]": 1}}
@@ -886,3 +914,124 @@ def test_a_real_bytearray_claiming_bytes_is_read_through_its_own_slice() -> None
     fields, flag = sanitize_fields({"v": _BytearrayClaimsBytes(b"ab")}, cfg=Config())
     assert fields == {"v": "ab"}
     assert flag is False
+
+
+class _ClaimsAs(tuple):  # type: ignore[type-arg]
+    """A real ``tuple`` subclass whose ``__class__`` is set per subclass by ``claimed``."""
+
+    claimed: type = object
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return self.claimed
+
+
+@pytest.mark.parametrize("claimed", [str, int, float], ids=["str", "int", "float"])
+def test_a_container_key_claiming_a_scalar_is_still_walked(claimed: type) -> None:
+    """FR-001: the container rule runs ahead of ``_key``'s claim-based ``str``, ``int``, ``float``.
+
+    Behind them, ``isinstance`` believed the claim and the claimed type's unbound read refused the
+    tuple, so the key was the key placeholder rather than the JSON of its members. The ``int`` and
+    ``float`` claims are also what tells this route from one through ``_dispatch``, whose ``int``
+    and ``float`` branches refuse the claim the same way.
+    """
+    kind = type(f"_TupleClaims{claimed.__name__}", (_ClaimsAs,), {"claimed": claimed})
+    fields, flag = sanitize_fields({"k": {kind((1, 2)): 1}}, cfg=Config())
+    assert fields == {"k": {"[1, 2]": 1}}
+    assert flag is False
+
+
+class _StrEnum(StrEnum):
+    A = "a"
+
+
+class _FloatEnum(float, Enum):
+    A = 1.5
+
+
+class _IntEnumKey(int, Enum):
+    A = 1
+
+
+def test_enum_keys_keep_their_text() -> None:
+    """FR-002: a ``StrEnum`` key is its value; a ``(float, Enum)`` or ``(int, Enum)`` key its name.
+
+    ``(float, Enum)`` is excluded from the float-key conversion, so it reads ``_FloatEnum.A`` as at
+    ``71e42dd`` rather than ``1.5``, exactly as ``(int, Enum)`` keeps ``_IntEnumKey.A``.
+    """
+    keys = {_StrEnum.A: 1, _FloatEnum.A: 2, _IntEnumKey.A: 3}
+    fields, flag = sanitize_fields({"k": keys}, cfg=Config())
+    assert fields == {"k": {"a": 1, "_FloatEnum.A": 2, "_IntEnumKey.A": 3}}
+    assert flag is False
+
+
+class _ClaimsEnumWithValue:
+    """Mixed into a real builtin: claims ``Enum`` and answers ``.value`` with a bare object."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Enum
+
+    @property
+    def value(self) -> object:
+        return object()
+
+
+class _TupleClaimsEnumValue(_ClaimsEnumWithValue, tuple):  # type: ignore[misc, type-arg]
+    pass
+
+
+class _DictClaimsEnumValue(_ClaimsEnumWithValue, dict):  # type: ignore[misc, type-arg]
+    pass
+
+
+class _BytesClaimsEnumValue(_ClaimsEnumWithValue, bytes):  # type: ignore[misc]
+    pass
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (_TupleClaimsEnumValue((_Secret(),)), ["<unserializable: _Secret>"]),
+        (_DictClaimsEnumValue(a=_Secret()), {"a": "<unserializable: _Secret>"}),
+    ],
+    ids=["tuple", "dict"],
+)
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_real_builtin_claiming_enum_is_routed_by_its_real_type(
+    route: str, value: object, expected: object
+) -> None:
+    """FR-002: the ``Enum`` branch's ``str()`` fallback never sees a real builtin container.
+
+    The branch admits a real ``Enum`` or a non-builtin only; before that test a real ``tuple``
+    claiming ``Enum`` was written ``(SECRET,)`` and a ``dict`` ``{'a': SECRET}``.
+    """
+    sink = _configure()
+    event = _emit(route, {"v": value}, sink)
+    assert event["fields"] == {"v": expected}
+    assert "SECRET" not in json.dumps(event)
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_real_tuple_claiming_enum_around_a_dag_returns(route: str) -> None:
+    """FR-002: walked by its real type, a shared DAG inside it is cut, where ``str()`` hung."""
+    sink = _configure()
+    started = time.process_time()
+    event = _emit(route, {"v": _TupleClaimsEnumValue((_DAG_40,))}, sink, deadline=5)
+    cpu = time.process_time() - started
+    assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
+    assert event.get("truncated") is True, route
+
+
+def test_a_real_bytes_claiming_enum_is_read_to_the_ceiling() -> None:
+    """FR-002: 16 MiB of bytes claiming ``Enum`` is read to its ceiling, never rendered by repr."""
+    value = _BytesClaimsEnumValue(b"\x00" * (16 << 20))
+    tracemalloc.start()
+    try:
+        fields, flag = sanitize_fields({"v": value}, cfg=Config())
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert fields == {"v": "\x00" * 8178 + TRUNCATION_MARKER}
+    assert flag is True
+    assert peak < 8 << 20, f"peak {peak >> 20} MiB"
