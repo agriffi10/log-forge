@@ -186,7 +186,9 @@ def handle_request(req):
   fields.
 - Baggage crosses a process boundary **only when the caller carries it** (SPEC-014, §13):
   `current_baggage_header()` publishes it in W3C `baggage` format, `continue_trace(baggage=...)`
-  adopts it. Nothing is auto-instrumented.
+  adopts it. Nothing is auto-instrumented. The header is rendered from the same coercion an
+  event's fields pass through and is capped at the 8192 bytes the receiving parser accepts, by
+  whole members (SPEC-064).
 
 ---
 
@@ -959,20 +961,6 @@ close it.
   `bytearray`, `memoryview`) and left these, which no budget depends on. **Closed by** a
   spec that replaces every spoofable type routing on the assembly path (`sanitize.py`, `model.py`
   and `api.py`) with an exact-type identity test or an unbound builtin accessor.
-- **`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded nor
-  total** (SPEC-057 system-frame review; invariants 1 and 6). `context.format_baggage_header` writes
-  `quote(str(v), safe='')` for each value and `current_baggage_header()` calls it on the live
-  baggage. Measured inside a span at `b282c1d`, on the main thread under a 5 s `setitimer` with a
-  null sink: (a) a baggage value that is a shared-sublist DAG (`y = 0`, then `y = [y] * 16` seven
-  times) does not return, because `str` of it recurses through the shared member once per path; and
-  (b) a value whose `__str__` raises makes the call raise that `RuntimeError` into the caller,
-  although the docstring says `Raises: None.`. A short string returns at once in the same run, and
-  the same two values go through assembly there without hanging or raising, so the library's two
-  text producers for one baggage disagree. Pre-dates SPEC-057: `context.py` is untouched by
-  `324936e..5337fe6`, and the same two outcomes were measured at `324936e` with no span open.
-  **Closed by** rendering header values through a bounded, total path within W3C baggage
-  encoding: `sanitize`'s coercion under its pass budgets, or a type-name placeholder when the
-  render fails.
 - **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
   invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
   Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and
@@ -999,6 +987,22 @@ close it.
 
 ### Resolved
 
+- ~~**`format_baggage_header` renders every baggage value with `str()`, so it is neither bounded
+  nor total**~~ (SPEC-057 system-frame review; invariants 1 and 6) → **closed by SPEC-064**.
+  `current_baggage_header()` now renders through `sanitize_fields`, one pass over the whole baggage
+  under assembly's ceilings and budgets, so a shared-sublist DAG returns and a value whose
+  `__str__` raises becomes `<unserializable: T>`; the guard wraps the whole per-member render and
+  names the type through `sanitize._type_name`. Two further failures the entry did not list are
+  closed with it: a lone surrogate, reachable from `set_baggage` and from an inbound header through
+  `continue_trace`, made `quote` raise `UnicodeEncodeError`, and an integer past CPython's
+  4,300-digit limit made `str` raise `ValueError`. The header is also capped at
+  `BAGGAGE_MAX_BYTES` by whole members, as a prefix, because a value at the default ceiling alone
+  exceeded the size the next process's `parse_baggage_header` accepts and had it refuse the whole
+  header; a member with an empty key is skipped for the same reason, and a drop is announced on
+  stderr as a count. What stays open is the spoofed-scalar route above: an object that survives
+  coercion can still reach `str()` in the header with assembly's exposure, and the guard only makes
+  that raise a placeholder. The reasoning and its rejected alternatives: *The outbound baggage
+  header renders through assembly's coercion and is capped by whole members*.
 - ~~**`HoneycombSink` never reads its per-event verdict**~~ (found by the system-frame review of
   #283; invariant 2) → **closed by the fix that overrides `HoneycombSink._handle_response`**.
   `/1/batch/<dataset>` answers `200` with one `{"status": ...}` per event, and the sink inherited

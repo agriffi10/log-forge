@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-064
 title: "Bounded, Total Baggage Header — Rendered Through Assembly's Coercion and Capped by Whole Members"
 description: "Renders the outbound baggage header through assembly's bounded coercion and caps it at 8192 bytes by whole members, so current_baggage_header() always returns and its output always parses."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-014, SPEC-057]
 ---
 
