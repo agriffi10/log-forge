@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
+from uuid import UUID
 
 import pytest
 
@@ -105,6 +106,193 @@ _HUGE_NAME = type("N" * 20_000, (), {})
 _HUGE_NAME_HOSTILE = type(
     "H" * 20_000, (), {"__str__": lambda self: (_ for _ in ()).throw(RuntimeError("no"))}
 )
+
+
+def _raise(*args: object) -> str:
+    raise RuntimeError("hostile")
+
+
+# -- SPEC-063 FR-002: objects that claim a type they are not, and their real-type twins ---------
+
+
+class _ClaimsBool:
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return bool
+
+
+class _ClaimsFloat:
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return 1.0
+
+
+class _ClaimsStr:
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return str
+
+
+class _IntLikeMeta(type):
+    """A metaclass that hashes and compares equal to ``int``, which a type-set lookup believes."""
+
+    def __hash__(cls) -> int:
+        return hash(int)
+
+    def __eq__(cls, other: object) -> bool:
+        return True
+
+
+class _MetaInt(metaclass=_IntLikeMeta):
+    pass
+
+
+class _EnumFloatImpostor(Enum):
+    M = _ClaimsFloat()
+
+
+class _EnumMetaImpostor(Enum):
+    M = _MetaInt()
+
+
+class _EnumBoolImpostor(Enum):
+    M = _ClaimsBool()
+
+
+class _EnumStrClaim(Enum):
+    M = _ClaimsStr()
+
+
+class _LyingFloat(float):
+    def __float__(self) -> float:
+        return 9.0
+
+    def __repr__(self) -> str:
+        return "LIE"
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+
+class _LyingInt(int):
+    def __int__(self) -> int:
+        return 9
+
+    def __index__(self) -> int:
+        return 9
+
+    def __repr__(self) -> str:
+        return "LIE"
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+
+class _EnumFloatSubclass(Enum):
+    R = _LyingFloat(1.5)
+
+
+class _StrLyingFloat(float):
+    def __str__(self) -> str:
+        return "LIE"
+
+
+class _IntColor(int, Enum):
+    RED = 1
+
+
+class _PInt(int):
+    def __str__(self) -> str:
+        return "P"
+
+
+class _BoolEnum(Enum):
+    T = True
+    F = False
+
+
+def _stored_named(metaclass_name: property) -> type:
+    """A class stored as ``Stored`` whose metaclass answers ``__name__`` with ``metaclass_name``."""
+    meta = type("_Meta", (type,), {"__name__": metaclass_name})
+    return meta("Stored", (), {"__str__": _raise})  # type: ignore[no-any-return]
+
+
+_STORED_NAME_RAISES = _stored_named(property(_raise))
+_STORED_NAME_42 = _stored_named(property(lambda cls: 42))
+_STORED_NAME_RENAMED = _stored_named(property(lambda cls: "renamed"))
+
+
+class _HijackName(str):
+    """A ``str`` subclass for a stored ``__name__``: ``str()`` raises and formatting renames."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+    def __format__(self, spec: str) -> str:
+        return "HIJACK"
+
+
+_STORED_HIJACK = type("Stored", (), {"__str__": _raise})
+_STORED_HIJACK.__name__ = _HijackName("Stored")
+
+
+class _DictProxy:
+    """A transparent proxy of a ``dict``: it claims the type and renders through ``items()``."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return dict
+
+    def items(self) -> object:
+        return {"a": 1}.items()
+
+
+class _DatetimeProxy:
+    """A transparent proxy of a ``datetime``, rendered through its ``isoformat()``."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return datetime
+
+    def isoformat(self) -> str:
+        return "2026-01-01T00:00:00"
+
+
+class _ProxiedInt:
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return int
+
+
+class _TupleClaimsUUID(tuple):  # type: ignore[type-arg]
+    """A real ``tuple`` subclass claiming ``UUID``: it is walked by its real type, never ``str()``-ed."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return UUID
+
+
+class _TupleClaimsDecimal(tuple):  # type: ignore[type-arg]
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Decimal
+
+
+class _BytesClaimsDecimal(bytes):
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Decimal
+
+
+def _exact_bools(expected: list[bool]) -> Callable[[object], bool]:
+    """Pins a list of booleans by type as well as value, since ``1 == True``."""
+    return _pinned(
+        lambda v: v == expected and isinstance(v, list) and all(type(x) is bool for x in v)
+    )
+
 
 _CYCLE_DICT: dict[str, object] = {}
 _CYCLE_DICT["self"] = _CYCLE_DICT
@@ -197,7 +385,7 @@ ROWS: list[Row] = [
         True,
         {
             "1": "a",
-            "(1, 2)": "b",
+            "[1, 2]": "b",
             "None": "c",
             "2.5": "d",
             "<unserializable key: _KeyBoom>": "f",
@@ -271,6 +459,98 @@ ROWS: list[Row] = [
     Row("plain_span", "span", "work", False, "work"),
     Row("plain_int", "value", 7, False, 7),
     Row("plain_nested", "value", {"a": [1, {"b": "c"}]}, False, {"a": [1, {"b": "c"}]}),
+    # SPEC-063 FR-002: a route that returns the caller's object admits it by exact type
+    Row("impostor_bool", "value", _ClaimsBool(), False, "<unserializable: _ClaimsBool>"),
+    Row("impostor_float", "value", _ClaimsFloat(), False, "<unserializable: _ClaimsFloat>"),
+    Row("impostor_metaclass_int", "value", _MetaInt(), False, "<unserializable: _MetaInt>"),
+    Row(
+        "enum_float_impostor",
+        "value",
+        _EnumFloatImpostor.M,
+        False,
+        "<unserializable: _EnumFloatImpostor>",
+    ),
+    Row("enum_metaclass_impostor", "value", _EnumMetaImpostor.M, False, "_EnumMetaImpostor.M"),
+    Row("enum_bool_impostor", "value", _EnumBoolImpostor.M, False, "_EnumBoolImpostor.M"),
+    Row("enum_str_claim", "value", _EnumStrClaim.M, False, "<unserializable: _EnumStrClaim>"),
+    Row("float_subclass_lying", "value", _LyingFloat(1.5), False, 1.5),
+    Row("int_subclass_lying", "value", _LyingInt(7), False, 7),
+    Row("float_subclass_nan", "value", _LyingFloat("nan"), True, "<float: nan>"),
+    Row("enum_float_subclass", "value", _EnumFloatSubclass.R, False, 1.5),
+    Row(
+        "exact_bools_and_bool_enum_values",
+        "value",
+        [True, False, _BoolEnum.T, _BoolEnum.F],
+        False,
+        _exact_bools([True, False, True, False]),
+    ),
+    Row(
+        "float_impostor_key",
+        "value",
+        {_ClaimsFloat(): 1, "sib": 2},
+        True,
+        {"<unserializable key: _ClaimsFloat>": 1, "sib": 2},
+    ),
+    Row("float_subclass_key_lying_str", "key", _StrLyingFloat(1.5), False, {"1.5": 1}),
+    Row("int_enum_key", "key", _IntColor.RED, False, {"_IntColor.RED": 1}),
+    Row("int_subclass_key_own_str", "key", _PInt(3), False, {"P": 1}),
+    Row(
+        "bool_impostor_key",
+        "value",
+        {_ClaimsBool(): 1, "sib": 2},
+        True,
+        {"<unserializable key: _ClaimsBool>": 1, "sib": 2},
+    ),
+    Row(
+        "stored_name_raises_value",
+        "value",
+        _STORED_NAME_RAISES(),
+        False,
+        "<unserializable: Stored>",
+    ),
+    Row(
+        "stored_name_raises_key",
+        "key",
+        _STORED_NAME_RAISES(),
+        True,
+        {"<unserializable key: Stored>": 1},
+    ),
+    Row("stored_name_42_value", "value", _STORED_NAME_42(), False, "<unserializable: Stored>"),
+    Row("stored_name_42_key", "key", _STORED_NAME_42(), True, {"<unserializable key: Stored>": 1}),
+    Row(
+        "stored_name_renamed_value",
+        "value",
+        _STORED_NAME_RENAMED(),
+        False,
+        "<unserializable: Stored>",
+    ),
+    Row(
+        "stored_name_renamed_key",
+        "key",
+        _STORED_NAME_RENAMED(),
+        True,
+        {"<unserializable key: Stored>": 1},
+    ),
+    Row(
+        "stored_name_str_subclass_value",
+        "value",
+        {"sib": 1, "x": _STORED_HIJACK(), "z": 2},
+        False,
+        {"sib": 1, "x": "<unserializable: Stored>", "z": 2},
+    ),
+    Row(
+        "stored_name_str_subclass_key",
+        "value",
+        {_STORED_HIJACK(): 1, "sib": 2},
+        True,
+        {"<unserializable key: Stored>": 1, "sib": 2},
+    ),
+    Row("proxy_dict", "value", _DictProxy(), False, {"a": 1}),
+    Row("proxy_datetime", "value", _DatetimeProxy(), False, "2026-01-01T00:00:00"),
+    Row("proxied_int", "value", _ProxiedInt(), False, "<unserializable: _ProxiedInt>"),
+    Row("real_tuple_claiming_uuid", "value", _TupleClaimsUUID((1, "a")), False, [1, "a"]),
+    Row("real_tuple_claiming_decimal", "value", _TupleClaimsDecimal((1, "a")), False, [1, "a"]),
+    Row("real_bytes_claiming_decimal", "value", _BytesClaimsDecimal(b"ab"), False, "ab"),
 ]
 
 _ROUTES = ("in_span", "orphan")
@@ -322,6 +602,7 @@ def _assert_safe(
             pytest.fail(f"{row.id}: a string left assembly unencodable: {ascii(text)[:80]}")
     for text in _walk(event):
         assert type(text) is str, f"{row.id}: a str subclass reached the event: {type(text)}"
+    _assert_exact_types(event, row=row)
     json.dumps(event, allow_nan=False)
     for path, text in _strings_with_paths(event):
         size = len(text.encode("utf-8"))
@@ -338,6 +619,28 @@ def _assert_safe(
         assert row.expect(actual), f"{row.id}: pin failed on {ascii(actual)[:120]}"
     else:
         assert actual == row.expect, f"{row.id}: {ascii(actual)[:120]} != {ascii(row.expect)[:120]}"
+
+
+_EXACT_LEAVES = (str, int, float, bool, type(None))
+
+
+def _assert_exact_types(obj: object, *, row: Row, path: str = "") -> None:
+    """SPEC-063 FR-002: every leaf is an exact JSON scalar, every container an exact dict or list.
+
+    Exact, by ``type() is``, because a subclass instance or an impostor that reached the event is
+    what this observable rules out, and ``isinstance`` would admit both. The message names the
+    path and the type's qualified name, never the leaf itself, whose ``repr`` may be hostile.
+    """
+    kind = type(obj)
+    if kind is dict:
+        for key, value in obj.items():  # type: ignore[attr-defined]
+            assert type(key) is str, f"{row.id}: {path}<key> is a {type(key).__qualname__}"
+            _assert_exact_types(value, row=row, path=f"{path}.{key}" if path else key)
+    elif kind is list:
+        for item in obj:  # type: ignore[attr-defined]
+            _assert_exact_types(item, row=row, path=f"{path}[]")
+    else:
+        assert kind in _EXACT_LEAVES, f"{row.id}: {path} is a {kind.__qualname__}"
 
 
 def _actual(event: dict[str, object], slot: str) -> object:
@@ -450,6 +753,12 @@ def test_the_assertion_function_rejects_an_unsafe_event() -> None:
         _assert_safe(marked, control_keys=keys, row=Row("t", "value", "hello", False, "hello"))
     with pytest.raises(AssertionError, match="pin failed"):
         _assert_safe(good, control_keys=keys, row=Row("p", "value", "x", False, lambda v: False))
+    with pytest.raises(AssertionError, match=r"\.v is a _LyingFloat"):
+        sub_float = {**good, "fields": {"v": _LyingFloat(1.5)}}
+        _assert_safe(sub_float, control_keys=keys, row=Row("f", "value", 1.5, False, 1.5))
+    with pytest.raises(AssertionError, match=r"\.v is a tuple"):
+        tupled = {**good, "fields": {"v": (1,)}}
+        _assert_safe(tupled, control_keys=keys, row=Row("t", "value", (1,), False, (1,)))
 
 
 def test_the_control_row_reflects_config_defaults(sink: MemorySink) -> None:
