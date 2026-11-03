@@ -1049,3 +1049,17 @@ def test_a_real_bytes_claiming_enum_is_read_to_the_ceiling() -> None:
     assert fields == {"v": "\x00" * 8178 + TRUNCATION_MARKER}
     assert flag is True
     assert peak < 8 << 20, f"peak {peak >> 20} MiB"
+
+
+def test_enum_members_of_builtin_mixins_keep_the_enum_route() -> None:
+    """FR-002 (silence): a real ``Enum`` mixed into a builtin still takes the ``Enum`` branch.
+
+    The branch admits ``issubclass(kind, Enum)`` ahead of the builtin exclusion, so a
+    ``(tuple, Enum)`` member is its enum text as at ``71e42dd`` rather than its walked members,
+    and the ``str``, ``int`` and ``float`` mixins are their exact values.
+    """
+    values = {"te": _TupleEnum.A, "se": _StrEnum.A, "ie": _IntEnumKey.A, "fe": _FloatEnum.A}
+    fields, flag = sanitize_fields(values, cfg=Config())
+    assert fields == {"te": "_TupleEnum.A", "se": "a", "ie": 1, "fe": 1.5}
+    assert [type(fields[k]) for k in ("te", "se", "ie", "fe")] == [str, str, int, float]
+    assert flag is False
