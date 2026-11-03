@@ -12,7 +12,7 @@ from log_foundry import _lifecycle
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink
+from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink, _valid_url
 
 __all__ = ["LogstashSink"]
 
@@ -134,7 +134,9 @@ class LogstashSink:
             constructor used to discard in HTTP mode, and every ``**http_kwargs`` key, which
             ``SocketTransport`` takes none of, so a caller who meant one backend and selected the
             other is told rather than left to wonder. ``body_format`` is outside the second set: it
-            is a documented no-effect switch in socket mode, validated there on purpose.
+            is a documented no-effect switch in socket mode, validated there on purpose. A
+            ``url`` the wrapped :class:`HTTPSink` would refuse is refused here first, so the
+            message names this class rather than the one it wraps.
         """
         if body_format not in _BODY_FORMATS:
             raise ValueError(
@@ -154,6 +156,7 @@ class LogstashSink:
                     f"LogstashSink cannot apply {', '.join(unusable)} to the HTTP backend that "
                     "url= selects; drop them, or drop url= to use the socket backend"
                 )
+            _valid_url(url, type(self).__name__)
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
                 **http_kwargs,

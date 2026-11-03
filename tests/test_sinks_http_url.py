@@ -17,8 +17,10 @@ from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from log_foundry.sinks.honeycomb import HoneycombSink
 from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
+from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
 from test_sinks_http_render import _shipped_http_subclasses
@@ -42,8 +44,16 @@ _UNSENDABLE = [
     "http://h :8/x",
     "http://u:p@h/x",
     "http://h:abc/x",
+    "http://\u4f8b.example/x",
+    "http://h:\u0668\u0660/x",
+    "http://h:8\n/x",
 ]
-"""URLs that pass the scheme and host checks but that ``http.client`` cannot put on the wire."""
+"""URLs that pass the scheme and host checks but that ``http.client`` cannot put on the wire.
+
+The last three fail only in the ``Host`` header ``urllib`` writes itself, as the raw host in
+Latin-1: a CJK host ``http.client`` would have IDNA-encoded, a port in Arabic-Indic digits that
+``int`` reads, and a newline ``int`` strips from the port.
+"""
 
 
 @pytest.mark.parametrize("url", _UNSENDABLE)
@@ -85,6 +95,11 @@ def test_a_host_only_urlparse_finds_is_refused(url: str) -> None:
         HTTPSink(url)
 
 
+def test_a_url_urlparse_cannot_parse_is_refused_naming_the_argument() -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink url is not a URL \(Invalid IPv6 URL\)"):
+        HTTPSink("http://[::1/x")
+
+
 def test_a_scheme_only_urlparse_strips_is_refused() -> None:
     """``urlparse`` drops a leading NUL and reads ``http``; ``urllib`` reads ``\\x00http``."""
     with pytest.raises(ValueError, match=r"^HTTPSink url must use http or https, not '\\x00http'"):
@@ -95,7 +110,8 @@ def test_a_scheme_only_urlparse_strips_is_refused() -> None:
     "url", ["http://b\u00fccher.example/x", "http://h/x?q=%zz", "https://h/x#f", "http://h:+80/x"]
 )
 def test_a_url_http_client_can_send_constructs(url: str) -> None:
-    """An internationalised host is IDNA-encoded on the wire, so it is not refused with the path.
+    """A Latin-1 host is not refused with the path: the connection resolves it through IDNA, and
+    the ``Host`` header carries it as Latin-1.
 
     ``http://h:+80/x`` delivers: ``http.client`` reads ``+80`` as port 80, where ``urlparse``
     refuses it, which is why the port is read from the connection.
@@ -177,3 +193,87 @@ def test_every_http_subclass_entry_builds_with_a_good_value(cls: type[HTTPSink])
     _argument, build = _URL_ARGUMENTS[cls.__name__]
 
     assert type(build("")) is cls
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"X-A": "\u20ac"}, {"X:A": "secret-value"}, {"X-A": "\ud800"}],
+    ids=["euro", "colon", "surrogate"],
+)
+def test_an_unsendable_header_raised_uncounted_out_of_every_emit(headers, capsys) -> None:
+    sink = HTTPSink("http://h/x", max_retries=0)
+    sink._headers = headers
+
+    with pytest.raises(ValueError):
+        sink.emit([{"i": 1}])
+
+    assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"X-A": "\u20ac"}, {"X:A": "secret-value"}, {"X-A": "\ud800"}],
+    ids=["euro", "colon", "surrogate"],
+)
+def test_an_unsendable_header_is_refused_naming_the_header_not_its_value(headers) -> None:
+    [(name, value)] = headers.items()
+
+    with pytest.raises(
+        ValueError, match=rf"^HTTPSink header cannot be sent over HTTP .*{name!r}$"
+    ) as caught:
+        HTTPSink("http://h/x", headers=headers)
+
+    assert value not in str(caught.value)
+
+
+def test_a_latin_1_header_value_constructs() -> None:
+    assert HTTPSink("http://h/x", headers={"X-A": "caf\u00e9"})
+
+
+def test_a_platform_key_reaches_the_header_check_through_the_subclass() -> None:
+    with pytest.raises(ValueError, match=r"^DatadogSink header cannot be sent over HTTP "):
+        DatadogSink("\u20ac")
+
+
+@pytest.mark.parametrize(
+    "auth", ["\u20ac", ("u", "p\ud800"), ("\ud800", "p")], ids=["token", "password", "user"]
+)
+def test_unsendable_credentials_raised_uncounted_out_of_every_emit(auth, capsys) -> None:
+    sink = HTTPSink("http://h/x", max_retries=0)
+    sink._auth = auth
+
+    with pytest.raises(ValueError):
+        sink.emit([{"i": 1}])
+
+    assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "auth", ["\u20ac", ("u", "p\ud800"), ("\ud800", "p")], ids=["token", "password", "user"]
+)
+def test_unsendable_credentials_are_refused_without_echoing_them(auth) -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink auth cannot be sent over HTTP \(\w+\)$"):
+        HTTPSink("http://h/x", auth=auth)
+
+
+@pytest.mark.parametrize("auth", ["caf\u00e9", ("\u00fc", "\u20ac")], ids=["token", "pair"])
+def test_sendable_credentials_construct(auth) -> None:
+    """A Latin-1 token goes on the wire as is; a pair is base64 of UTF-8, so any text sends."""
+    assert HTTPSink("http://h/x", auth=auth)
+
+
+def test_a_wrapper_refuses_the_url_under_its_own_name() -> None:
+    with pytest.raises(ValueError, match=r"^LogstashSink url cannot be sent over HTTP "):
+        LogstashSink(url="http://h/a b")
+
+
+def test_sentry_refuses_an_unsendable_dsn_under_dsn() -> None:
+    with pytest.raises(ValueError, match=r"^SentrySink dsn cannot be sent over HTTP "):
+        SentrySink(dsn="https://k@h/1 2", backend="http")
+
+
+def test_sentry_refuses_an_unsendable_public_key_without_echoing_it() -> None:
+    with pytest.raises(ValueError, match=r"^SentrySink dsn public key cannot be sent over HTTP$"):
+        SentrySink(dsn="https://\u20ac@h/1", backend="http")
