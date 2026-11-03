@@ -936,6 +936,7 @@ def test_every_probe_carries_the_constant_timeout_and_no_private_name_is_used(
     # FR-002 AC-8.
     sink, fake, _ = _build(monkeypatch)
     sink.emit([{"n": 1}])
+    sink.flush()
     sink.close()
     source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
 
@@ -1035,7 +1036,8 @@ def test_a_flush_that_returns_without_a_pong_is_not_an_answer(monkeypatch, facto
     sink, fake, _ = _build(monkeypatch, factory=factory, publish_timeout=0.3)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"n": 1}])
-    sink.close()
+    with contextlib.suppress(TimeoutError):
+        sink.close()
     assert "publish" not in fake.calls
     assert fake.calls.count("flush") >= 1
 
@@ -1370,3 +1372,220 @@ def test_deferral_gates_need_no_allowlist_entry_for_nats() -> None:
     source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
     assert "Deferral" not in source
     assert "self.dropped" not in source
+
+
+# --- FR-004: close() and flush() are bounded by the sink, not by the driver's drain ------------
+
+
+def test_close_never_drains_and_is_bounded_where_drain_is_not(monkeypatch) -> None:
+    """FR-004 AC-1, both halves against the same fake shape.
+
+    The sink's ``close()`` under a stall: a JetStream publish first, so the client holds its
+    response-inbox subscription (M7's precondition), then the server stops answering. ``close()``
+    raises ``TimeoutError`` inside ``D + LOOP_JOIN_TIMEOUT`` and never calls ``drain``. The
+    driver's ``drain()`` under the same ``wait_for(D)`` on a throwaway loop runs its swallowed
+    cancel and then its ``finally`` flush to that flush's own timeout, compressed here from the
+    driver's 10 s to 2 s so the test costs 3 s rather than 11; M7 measured the real driver at
+    12.00 s against a 2 s ``wait_for``.
+    """
+    sink, fake, _ = _build(monkeypatch, jetstream=True, drain_timeout=1.0)
+    sink.emit([{"n": 1}])
+    assert fake.subs == 1
+    fake.answering = False
+    began = time.monotonic()
+    with pytest.raises(TimeoutError):
+        sink.close()
+    elapsed = time.monotonic() - began
+
+    assert elapsed <= 1.0 + LOOP_JOIN_TIMEOUT + MARGIN, f"{elapsed:.2f}s"
+    assert "drain" not in fake.calls and "close" in fake.calls
+    assert not sink._thread.is_alive()
+
+    stalled = LiveFakeNATS()
+    stalled.subs = 1
+    stalled.answering = False
+    stalled.drain_flush_timeout = 2.0
+    began = time.monotonic()
+    with pytest.raises(FlushTimeoutError):
+        asyncio.run(asyncio.wait_for(stalled.drain(), 1.0))
+    drained = time.monotonic() - began
+    assert drained >= 1.0 + 2.0 - 0.1, (
+        f"drain's finally flush must run to its own bound: {drained:.2f}s"
+    )
+    assert stalled.calls == ["drain", "flush"], "the swallowed cancel let the finally flush run"
+
+
+def test_close_raises_timeout_when_its_probe_is_unanswered(monkeypatch) -> None:
+    # FR-004 AC-2.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS)
+    began = time.monotonic()
+    with pytest.raises(TimeoutError, match="PING"):
+        sink.close()
+    elapsed = time.monotonic() - began
+
+    assert elapsed <= DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT + MARGIN, f"{elapsed:.2f}s"
+    assert "close" in fake.calls
+    assert not sink._thread.is_alive()
+
+
+def test_a_client_close_that_never_returns_is_cancelled_at_the_deadline(monkeypatch) -> None:
+    # FR-004 AC-3 (M8: `client.close()` still running at 8 s with 20 MB pending).
+    sink, fake, _ = _build(monkeypatch, drain_timeout=0.5)
+    fake.close_gate = asyncio.Event()
+    began = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - began
+
+    assert elapsed <= 0.5 + LOOP_JOIN_TIMEOUT + MARGIN, f"{elapsed:.2f}s"
+    assert "close" in fake.calls
+    assert not sink._thread.is_alive()
+    assert sink._loop.is_closed()
+
+
+def test_a_failing_client_close_is_absorbed_and_the_loop_still_stops(monkeypatch, capsys) -> None:
+    # FR-004 AC-4.
+    sink, fake, _ = _build(monkeypatch)
+    fake.close_raises = TypeError
+    sink.close()
+    err = capsys.readouterr().err
+
+    assert not sink._thread.is_alive() and sink._loop.is_closed()
+    lines = [line for line in err.splitlines() if "absorbed" in line]
+    assert len(lines) == 1, err
+    assert "TypeError" in lines[0] and "closing the NATS client" in lines[0]
+    assert "NoneType" not in lines[0], "only the type is written, never the message"
+
+
+@pytest.mark.parametrize("value", [0.3, None, 0, -1, float("inf"), float("nan")])
+def test_drain_timeout_sets_the_close_deadline_and_is_still_forwarded(monkeypatch, value) -> None:
+    # FR-004 AC-5.
+    kwargs = {} if value is None else {"drain_timeout": value}
+    sink, _, module = _build(monkeypatch, factory=StalledFakeNATS, **kwargs)
+    _, connect_kwargs = module.calls[0]
+    if value is None:
+        assert "drain_timeout" not in connect_kwargs
+    else:
+        assert connect_kwargs["drain_timeout"] is value, "the raw value is forwarded unchanged"
+    expected = 0.3 if value == 0.3 else DEFAULT_CLOSE_TIMEOUT
+    assert sink._drain_timeout == expected
+
+    began = time.monotonic()
+    with pytest.raises(TimeoutError):
+        sink.close()
+    elapsed = time.monotonic() - began
+    assert expected <= elapsed <= expected + LOOP_JOIN_TIMEOUT + MARGIN, f"{elapsed:.2f}s"
+
+
+def test_the_close_bound_fits_the_closer_grace() -> None:
+    # FR-004 AC-6.
+    from log_foundry import _lifecycle
+
+    assert DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT <= _lifecycle.DEFAULT_CLOSER_GRACE
+
+
+def test_flush_goes_through_the_probe(monkeypatch) -> None:
+    # FR-004 AC-8, three fakes.
+    sink, fake, _ = _build(monkeypatch)
+    sink.flush()
+    assert fake.calls == ["flush"] and fake.flush_timeouts == [PROBE_FLUSH_TIMEOUT]
+    sink.close()
+
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.3)
+    elapsed, error = _timed(sink.flush)
+    losses = sink.losses()
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+    assert isinstance(error, SinkDeliveryError) and "PONG" in str(error)
+    assert 0.3 <= elapsed <= 0.3 + CALL_SLACK + MARGIN, f"{elapsed:.2f}s"
+    assert losses == SinkLosses(dropped=0, failed=0)
+
+    sink, fake, _ = _build(monkeypatch)
+    fake.is_connected = False
+    with pytest.raises(SinkDeliveryError, match="disconnected"):
+        sink.flush()
+    assert "flush" not in fake.calls
+    sink.close()
+
+
+def test_a_late_pong_after_a_stalled_flush_leaves_the_reader_alive(monkeypatch) -> None:
+    # FR-004 AC-9, the M3 regression for `flush()`.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.flush()
+    _pong(sink, fake)
+    fake.answering = True
+    sink.flush()
+    fake.answering = False
+    second = _timed(sink.flush)
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert fake.reader_dead is False
+    assert isinstance(second[1], SinkDeliveryError), "a second stalled flush must be refused"
+
+
+class CloselessFakeNATS:
+    """A client with ``publish`` and ``flush`` but no ``close``."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.is_connected = True
+
+    async def publish(self, subject: str, payload: bytes) -> None:
+        self.calls.append("publish")
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        self.calls.append("flush")
+
+
+def test_an_injected_client_is_closed_under_the_deadline_and_never_flushed_or_drained() -> None:
+    # FR-004 AC-10, first and third clauses.
+    client = LiveFakeNATS()
+    sink = NATSSink("logs", client=client)
+    sink.flush()
+    assert client.calls == ["flush"] and client.flush_timeouts == [10], "today's bare driver call"
+    sink.close()
+    assert client.calls == ["flush", "close"]
+
+    client = LiveFakeNATS()
+    client.close_gate = asyncio.Event()
+    sink = NATSSink("logs", client=client)
+    began = time.monotonic()
+    sink.close()
+    assert time.monotonic() - began <= DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT + MARGIN
+    assert client.calls == ["close"]
+
+
+def test_a_client_without_close_does_not_make_close_raise(monkeypatch) -> None:
+    # FR-004 AC-10, second clause, for a sink-connected client and an injected one.
+    sink, fake, _ = _build(monkeypatch, factory=CloselessFakeNATS)
+    sink.emit([{"n": 1}])
+    sink.close()
+    assert "close" not in fake.calls and not sink._thread.is_alive()
+
+    sink = NATSSink("logs", client=CloselessFakeNATS())
+    sink.close()
+    assert not sink._thread.is_alive()
+
+
+@pytest.mark.parametrize("reason", ["disconnected", "latched"])
+def test_a_skipped_close_probe_raises_nothing(monkeypatch, reason: str) -> None:
+    # FR-004 AC-12. Told apart from AC-2's `TimeoutError` by the fake's flush count: AC-2's probe
+    # ran (one flush), these send none beyond what the latched emit already sent.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    if reason == "disconnected":
+        fake.is_connected = False
+        flushes_before_close = 0
+    else:
+        with pytest.raises(SinkDeliveryError):
+            sink.emit([{"n": 1}])
+        assert sink._latched()
+        flushes_before_close = 1
+    began = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - began
+
+    assert fake.calls.count("flush") == flushes_before_close, "a skipped step one sends no PING"
+    assert "close" in fake.calls
+    assert not sink._thread.is_alive() and sink._loop.is_closed()
+    assert elapsed <= DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT + MARGIN

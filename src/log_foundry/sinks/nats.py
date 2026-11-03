@@ -797,35 +797,23 @@ class NATSSink:
         Returns:
           None.
 
-        Raises:
-          TimeoutError: The backstop bound expired on a wedged loop; the sink is closed anyway.
-        """
-        if os.getpid() != self._pid:
-            return
-        self._closing = True
-        with self._lock:
-            if self._closed:
-                return
-            try:
-                self._run(self._close_on_loop(), self._drain_timeout + CALL_SLACK)
-            except _LoopWedged as err:
-                raise TimeoutError(
-                    f"NATSSink close: the loop did not answer within "
-                    f"{self._drain_timeout + CALL_SLACK}s and was abandoned"
-                ) from err
-            self._closed = True
-            self._stop_loop()
+        **The sequence is the sink's own, not the driver's ``drain()``** (SPEC-061 FR-004).
+        ``drain()`` cannot be bounded from outside: it swallows a cancellation and its ``finally``
+        flush runs to the driver's own 10 s, measured at 12.00 s under a 2 s ``wait_for`` once a
+        JetStream client holds its response-inbox subscription (M7). So under one deadline, the
+        ``drain_timeout`` the caller passed or :data:`DEFAULT_CLOSE_TIMEOUT`, the loop thread runs
+        a round trip through the FR-002 probe to push and confirm the outbound buffer, then
+        ``client.close()`` as a task cancelled on expiry, then stops the loop. The round trip is
+        skipped when the client is injected, has no ``flush``, reports itself disconnected, or has
+        a probe latched as unanswered, and a skipped round trip raises nothing: emits were refused
+        throughout, so nothing uncounted rides on it. One that **ran** and went unanswered raises
+        ``TimeoutError`` after the loop is stopped, keeping the contract that the loop is closed
+        regardless of what the flush raised; the probe's own exception is re-raised the same way.
+        A failure of ``client.close()``, including the ``TypeError`` M8 measured while
+        reconnecting, is absorbed rather than raised.
 
-    async def _close_on_loop(self) -> None:
-        """The coroutine behind :meth:`close`, run on the loop thread (SPEC-061 FR-004).
-
-        Runs ``client.close()`` as a task under what remains of the deadline, cancelling it on
-        expiry and absorbing any failure from it, then cancels every task still pending on the
-        loop and gives the cancellations half the join budget to run, so the loop is stopped with
-        nothing "destroyed but pending". A client without a ``close`` attribute skips the step.
-        The task's first step runs even when the deadline is already spent: ``create_task``
-        schedules it before ``asyncio.wait`` arms its timer, and both land in the same loop
-        iteration.
+        An injected client is not drained: its subscriptions are closed rather than drained, and
+        whatever its own ``close()`` flushes is all that is flushed (M10).
 
         Args:
           None.
@@ -834,9 +822,73 @@ class NATSSink:
           None.
 
         Raises:
+          TimeoutError: The round trip ran and went unanswered within the deadline, or the
+            backstop bound expired on a wedged loop; the sink is closed either way.
+          Exception: The round trip's own exception, when the driver's ``flush`` raised.
+        """
+        if os.getpid() != self._pid:
+            return
+        self._closing = True
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                answered, failure = self._run(
+                    self._close_on_loop(), self._drain_timeout + CALL_SLACK
+                )
+            except _LoopWedged as err:
+                raise TimeoutError(
+                    f"NATSSink close: the loop did not answer within "
+                    f"{self._drain_timeout + CALL_SLACK}s and was abandoned"
+                ) from err
+            self._closed = True
+            self._stop_loop()
+        if failure is not None:
+            raise failure
+        if answered is False:
+            raise TimeoutError(
+                f"NATSSink close: the server did not answer the closing PING within "
+                f"{self._drain_timeout}s; the client is closed and the loop stopped"
+            )
+
+    async def _close_on_loop(self) -> tuple[bool | None, BaseException | None]:
+        """The coroutine behind :meth:`close`, run on the loop thread (SPEC-061 FR-004).
+
+        Step one is the round trip, when it applies (see :meth:`close`), waited for at most the
+        whole deadline. Step two runs ``client.close()`` as a task under what remains of the
+        deadline, cancelling it on expiry and absorbing any failure from it; a client without a
+        ``close`` attribute skips it. The task's first step runs even when the deadline is already
+        spent, because ``create_task`` schedules it before ``asyncio.wait`` arms its timer and
+        both land in the same loop iteration. Step three cancels every task still pending on the
+        loop, the probe among them now that no PONG can arrive, and gives the cancellations half
+        the join budget to run, so the loop is stopped with nothing "destroyed but pending". The
+        driver's own ``_close`` swallows one cancellation of its own while it waits on its
+        reconnection task, which is why step three cancels again rather than trusting step two's.
+
+        Neither an expired nor a failed step two skips step three, and the outcome is returned
+        rather than raised so :meth:`close` decides the raise after the loop is stopped.
+
+        Args:
+          None.
+
+        Returns:
+          A pair: whether the round trip was answered (``None`` when it was skipped), and the
+          round trip's own exception if it raised.
+
+        Raises:
           None.
         """
         end = time.monotonic() + self._drain_timeout
+        answered: bool | None = None
+        failure: BaseException | None = None
+        if self._probing() and not self._latched() and self._is_connected():
+            try:
+                answered = await self._await_probe(end)
+            except Exception as err:
+                failure = err
+            probe = self._probe
+            if probe is not None and probe[0].done() and not probe[0].cancelled():
+                failure = probe[0].exception() or failure
         close = getattr(self._client, "close", None)
         if close is not None:
             task = self._loop.create_task(close())
@@ -844,10 +896,11 @@ class NATSSink:
             if not done:
                 task.cancel()
             elif not task.cancelled():
-                failure = task.exception()
-                if failure is not None:
-                    _diag.absorbed("closing the NATS client", failure)
+                close_failure = task.exception()
+                if close_failure is not None:
+                    _diag.absorbed("closing the NATS client", close_failure)
         await self._settle_pending_tasks()
+        return answered, failure
 
     async def _settle_pending_tasks(self) -> None:
         """Cancels every other task on the loop and lets the cancellations run (SPEC-061 FR-001).
@@ -986,6 +1039,14 @@ class NATSSink:
         reach a published-but-unwritten event before this hook. Under JetStream ``publish()``
         awaits an ack, so there is nothing pending and this costs a round trip at worst.
 
+        For a client the sink connected itself this is the FR-002 probe, bounded by
+        ``publish_timeout`` and by the latch, and it raises ``SinkDeliveryError`` when the round
+        trip goes unanswered or the client reports itself disconnected (SPEC-061 FR-004). The
+        driver's 10 s ``FlushTimeoutError`` can no longer escape from it, and this never cancels a
+        PONG wait; the driver still cancels futures of its own, so this is narrower than the claim
+        that the M3 hazard is gone. It counts nothing. An injected client, or one with no
+        ``flush``, keeps the bare driver call and whatever it raises.
+
         Takes the same lock :meth:`emit` does and runs the same guards in the same order, for the
         reasons recorded there.
 
@@ -996,9 +1057,9 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink is closed or closing, this is a forked child, or the
-            backstop bound expired.
-          Exception: Whatever the driver raises while flushing.
+          SinkDeliveryError: The sink is closed or closing, this is a forked child, the round
+            trip went unanswered or the client is disconnected, or the backstop bound expired.
+          Exception: Whatever an injected client's driver raises while flushing.
         """
         self._refuse_outside_the_lock("NATSSink cannot flush")
         with self._lock:
@@ -1021,9 +1082,18 @@ class NATSSink:
           None.
 
         Raises:
-          Exception: Whatever the driver raises while flushing.
+          SinkDeliveryError: A probed client is disconnected or did not answer the round trip.
+          Exception: Whatever an injected client's driver raises while flushing.
         """
-        await self._flush_client()
+        if not self._probing():
+            await self._flush_client()
+            return
+        if not self._is_connected():
+            raise SinkDeliveryError("NATSSink cannot flush: the client is disconnected")
+        if not await self._await_probe(time.monotonic() + self.publish_timeout):
+            raise SinkDeliveryError(
+                f"NATSSink cannot flush: no PONG from the server within {self.publish_timeout}s"
+            )
 
     async def _flush_client(self) -> None:
         """Flushes the client if the driver offers a flush, probed by name.
