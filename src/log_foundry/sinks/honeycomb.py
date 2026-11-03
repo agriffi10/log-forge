@@ -12,6 +12,51 @@ from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _Item, _valid_u
 
 __all__ = ["HoneycombSink"]
 
+_SEGMENT_BREAKERS = "/?#\\"
+"""What ends a path segment or starts another URL part, or what a WHATWG parser reads as ``/``."""
+
+_DOT_SEGMENTS = (".", "..")
+"""The two segments a normalizing hop removes from a path (RFC 3986 §5.2.4)."""
+
+
+def _one_segment(dataset: str, owner: str) -> None:
+    """Refuses a dataset that would not reach Honeycomb as the one path segment it names.
+
+    The dataset is placed in ``/1/batch/<dataset>`` as written, so a character with meaning in a
+    URL moved the events somewhere the caller never named, with nothing counted: ``urllib`` drops
+    ``#x`` as a fragment, ``?x`` starts a query and ``/`` starts another segment, all three
+    delivering to ``d`` or to a different path. ``\\`` is not a URI character, and the WHATWG
+    parser a proxy may use reads it as ``/``. A dataset that is ``.`` or ``..`` is a dot-segment,
+    which a normalizing hop removes, and so is its percent-encoded form (``%2e``, ``.%2E``), which
+    RFC 3986 §6.2.2.2 and the WHATWG parser decode before removing it. An empty dataset, or one
+    that is only whitespace, names no dataset at all. Each of these was already broken, so each
+    is refused rather than encoded, and no dataset that delivered before goes anywhere new.
+
+    What stays is what delivered as written: ``%`` escapes, which are how a caller names a
+    dataset ``http.client`` cannot carry raw; the sub-delimiters, ``:`` and ``@``, which have no
+    meaning inside a segment; and trailing whitespace, which ``urllib.parse.unwrap`` floors on
+    every URL, so the dot and empty checks read the dataset after that same strip.
+
+    Args:
+      dataset: The dataset as the caller gave it.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: If ``dataset`` holds ``/``, ``?``, ``#`` or a backslash, is ``.`` or ``..``
+        once stripped and its ``%2e`` decoded, or is empty once stripped. The message echoes
+        the dataset and nothing else.
+    """
+    segment = dataset.strip()
+    dots = segment.lower().replace("%2e", ".")
+    if not segment or dots in _DOT_SEGMENTS or any(c in dataset for c in _SEGMENT_BREAKERS):
+        raise ValueError(
+            f"{owner} dataset must be one path segment: not empty, '.' or '..', and without "
+            f"'/', '?', '#' or a backslash: {dataset!r}"
+        )
+
 
 class HoneycombSink(HTTPSink):
     """POSTs events to Honeycomb's batch API for a dataset (FR-010).
@@ -64,7 +109,10 @@ class HoneycombSink(HTTPSink):
 
         Args:
           api_key: The key sent as ``X-Honeycomb-Team``.
-          dataset: The target dataset, which forms part of the path.
+          dataset: The target dataset, taken as one already percent-encoded path segment and
+            placed in the path as written: ``my%20data`` reaches the dataset ``my data``, and a
+            literal ``%`` is written ``%25``. Trailing whitespace is floored, as ``urllib`` floors
+            it on every URL.
           url: The API base URL.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink`, typed as
             ``HTTPPlatformKwargs`` (SPEC-051 FR-005) — every keyword it takes except
@@ -74,10 +122,12 @@ class HoneycombSink(HTTPSink):
           None.
 
         Raises:
-          ValueError: If ``dataset`` cannot be carried in a request path — checked against a
-            fixed base so the message names ``dataset`` rather than the ``url`` this class
-            builds from both, whose own check names ``url`` (SPEC-049 FR-001).
+          ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), or cannot
+            be carried in a request path — checked against a fixed base so the message names
+            ``dataset`` rather than the ``url`` this class builds from both, whose own check
+            names ``url`` (SPEC-049 FR-001).
         """
+        _one_segment(dataset, type(self).__name__)
         _valid_url(f"http://localhost/1/batch/{dataset}", type(self).__name__, name="dataset")
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(

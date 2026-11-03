@@ -219,3 +219,65 @@ def test_on_the_orphan_path_an_unadjudicated_event_is_the_sinks_loss_alone() -> 
     log_foundry.info("outside a span")
     assert log_foundry.health().orphan_lost == 0
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+_KEY = "hc-secret-key"
+"""A distinctive API key, so a refusal that echoed it would be visible."""
+
+_REFUSED_DATASETS = [
+    "d#x",
+    "d?x",
+    "a/b",
+    "/d",
+    "d/",
+    "d\\x",
+    ".",
+    "..",
+    ".. ",
+    "%2e",
+    ".%2E",
+    "%2e.",
+    "%2E%2e",
+    "",
+    " ",
+    "\n",
+]
+"""Each dataset that constructed and then sent its events somewhere other than the one named."""
+
+
+@pytest.mark.parametrize("dataset", _REFUSED_DATASETS)
+def test_a_dataset_that_is_not_one_path_segment_is_refused_at_construction(dataset: str) -> None:
+    with pytest.raises(
+        ValueError, match=r"^HoneycombSink dataset must be one path segment: "
+    ) as caught:
+        HoneycombSink(_KEY, dataset)
+
+    assert _KEY not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "url"),
+    [
+        ("d", "https://api.honeycomb.io/1/batch/d"),
+        ("d.x", "https://api.honeycomb.io/1/batch/d.x"),
+        (".d", "https://api.honeycomb.io/1/batch/.d"),
+        ("...", "https://api.honeycomb.io/1/batch/..."),
+        ("%2e%2e%2e", "https://api.honeycomb.io/1/batch/%2e%2e%2e"),
+        ("d%20x", "https://api.honeycomb.io/1/batch/d%20x"),
+        ("d%2Fx", "https://api.honeycomb.io/1/batch/d%2Fx"),
+        ("d;x", "https://api.honeycomb.io/1/batch/d;x"),
+        ("d:x", "https://api.honeycomb.io/1/batch/d:x"),
+        ("d@x", "https://api.honeycomb.io/1/batch/d@x"),
+        ("d-x_1", "https://api.honeycomb.io/1/batch/d-x_1"),
+        ("d\n", "https://api.honeycomb.io/1/batch/d"),
+    ],
+)
+def test_a_dataset_that_delivered_before_still_goes_where_it_went(dataset: str, url: str) -> None:
+    """The positive control: every working dataset constructs, and its URL is unchanged."""
+    opener = FakeOpener([_verdict(202)])
+    sink = HoneycombSink(_KEY, dataset, opener=opener, max_retries=0)
+
+    sink.emit(_batch(1))
+
+    assert sink.url == url
+    assert opener.calls[0]["url"] == url
