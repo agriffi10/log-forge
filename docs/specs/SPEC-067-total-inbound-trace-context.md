@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-067
 title: "Total Inbound Trace Context — a Bounded Echo and Parsers That Run No Code of the Value"
 description: "Makes continue_trace total over any argument it is handed: the rejection echo is bounded and runs no code of the value, and the four parsers accept only an exact str."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-014, SPEC-029, SPEC-064]
 ---
 
@@ -12,18 +12,21 @@ depends_on: [SPEC-014, SPEC-029, SPEC-064]
 `continue_trace` is the library's one inbound path. It takes a caller's `traceparent`, `trace_id`,
 `parent_span_id` and `baggage`: values that come off the wire and are typed `str` only by
 annotation, which a caller not running mypy is free to ignore. Two things make it neither bounded
-nor total today. The rejection echo, `_diag.rejected`, calls `repr` on the value and only then cuts
+nor total today, and a third route hands a hostile value on instead of refusing it. The rejection echo, `_diag.rejected`, calls `repr` on the value and only then cuts
 the result to 64 characters, so a hostile value can hang the caller's thread, or make the
 announcement fail silently while `reason="rejected"` says it was made. And the parsers call the
 value's own methods, so a `str` subclass or an object with a hostile `__class__` makes
 `continue_trace` raise into the caller. This spec closes both halves in one change, because the
 second is the same promise as the first: **no code of an inbound value runs inside the library,
 and a refusal is always announced, in bounded form.** A well-behaved `str` subclass carrying a
-valid header is still adopted, as today.
+valid header is still adopted, as today, and from now on is adopted as the exact `str` it holds.
 
-Every figure below is anchored to `2e790e9`, the tree this spec was drafted on, and was measured by
-the orchestrating session through `continue_trace`, each probe under a 3 s `setitimer` whose handler
-raises a `BaseException`. The deadline must be a `BaseException`: an alarm that raises an
+Probes A to F were measured at `2e790e9`, the tree this spec was drafted on, by the orchestrating
+session through `continue_trace`, each under a 3 s `setitimer` whose handler raises a
+`BaseException`. Probe G was measured at `7dc881f` by the drafting session. In this spec "base" is
+`7dc881f`, the tree the branch is rebased onto: `_diag.py`, `ids.py` and `decorator.py` are identical
+at the two commits, and `context.py` differs only by SPEC-064's baggage render, which leaves
+`parse_baggage_header` as it was. The deadline must be a `BaseException`: an alarm that raises an
 `Exception` subclass is swallowed by `rejected`'s own `except Exception`, and the call "returns"
 `reason="rejected"` with no line, a false pass.
 
@@ -47,6 +50,13 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
   but `AttributeError`). A raising property raises out of `continue_trace` for `traceparent`,
   `trace_id` and `baggage`. One returning `str` passes `isinstance`, and the parser then calls
   `.strip()` or `len()` on a non-`str`, so an `AttributeError` or `TypeError` escapes.
+- **Probe G: an adopted `str` subclass is stored as it is, and detonates later.** At `7dc881f`,
+  `continue_trace(trace_id=S(valid), parent_span_id=S(valid))`, where `S` is a `str` subclass
+  whose `__format__`, `__str__`, `encode` and `__repr__` raise, returns `ok=True` and adopts the
+  two objects themselves. The next span's events then carry a `trace_id` of type `S`, and the
+  public `current_traceparent()`, called inside that span, raises `S`'s `RuntimeError` into the
+  caller from `format_traceparent`'s f-string (invariant 1). Validation does not stop it, because
+  a valid subclass is valid.
 - `parent_span_id` alone was total on the Probe E and F values at `2e790e9`; this spec still tests
   it, because its totality was an accident of which methods it happens to call.
 
@@ -62,7 +72,8 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
   input and keeps its verdict true (FR-004).
 - The prose that stated the old behaviour, and the release notes (FR-005). The change is
   caller-visible on stderr (a `bytes` or any other non-`str` value is now echoed by type name, and a
-  long `str` can differ in its quote character), so it goes in `docs/release-notes/v1.1.0.md`.
+  long `str`'s quoting can differ, and an adopted `str` subclass is stored as an exact `str`), so it
+  goes in `docs/release-notes/v1.1.0.md`.
   `architecture.md` §12 carries an item SPEC-064 added, "`_diag.rejected` echoes an inbound value
   through an unbounded `repr()`", which this spec closes; striking it is the completion ritual's
   step, not an FR.
@@ -75,8 +86,10 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
   every combination.
 - **The parsers' own linear cost on a very long exact `str`.** They run no code of the value and
   return; this spec bounds the echo, not the parse. No figure is claimed for it.
-- **`ids.format_traceparent`**, which formats the library's own ids, and the outbound baggage render
-  SPEC-064 changed (PR #288).
+- **`ids.format_traceparent`'s own code.** It formats whatever ids it is handed, and at base that
+  includes an adopted inbound `str` subclass (Probe G). What changes is the id it is handed,
+  because `continue_trace` stores an exact `str` (FR-004), not the formatter. The outbound baggage
+  render SPEC-064 changed is likewise untouched.
 - **Every other `_diag` writer** (`absorbed`, `lost`). Their inputs are an exception's type and a
   library-controlled detail, not an inbound value.
 - **Assembly's coercion of event fields** (`sanitize.py`, `model.py`), which has its own work
@@ -87,8 +100,11 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
 ### Twin paths (invariant 6)
 
 - **The four inbound arguments of `continue_trace`.** Each is normalised by the same step and each
-  reaches `rejected` by the same route. FR-004's table crosses every probe with every argument, so
-  a fifth argument added later without the step fails a row.
+  reaches `rejected` by the same route. The rejection table cannot guard the normalisation: once
+  FR-001 and FR-003 land, an argument that skips it is merely refused, which the table accepts
+  (a mutation removing it for `parent_span_id` and `baggage` left every cell green). The guard is
+  FR-004's **adoption** criterion, which states a `str` subclass for each of the four arguments
+  separately and asserts it was adopted.
 - **The four parsers.** The two id validators are what `parse_traceparent` calls on its fields, and
   `parse_baggage_header` is the baggage twin of `parse_traceparent`. FR-003 tests all four from one
   table.
@@ -108,7 +124,8 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
 
 `rejected(reason, value)` decides what the value is from its real type and reads it only through
 `str`'s and `type`'s own slots, so no `__repr__`, `__class__`, `__getattribute__`, `__len__`,
-`__getitem__`, `__name__` property or metaclass method of the value is ever called.
+`__getitem__`, `__name__` property or metaclass method of the value is ever called. The echo is
+computed by a private helper, `_echo(value)`, inside the guard that already covers the write.
 
 - **Is it a `str`.** `issubclass(type(value), str)`, a check over the real type's MRO. Never
   `isinstance`, which reads `__class__`.
@@ -118,33 +135,40 @@ raises a `BaseException`. The deadline must be a `BaseException`: an alarm that 
   `"…"` exactly as today.
 - **Anything else.** Echoed as `<TypeName>`. The name is read with
   `type.__dict__["__name__"].__get__(type(value))`, which bypasses a metaclass `__name__` property.
-  It goes through the same `str` path (first 64 characters by the slot, escaped, cut to 64 plus
-  `"…"`, no quotes) because a class's `__name__` may be set to a `str` subclass instance, may be any
+  It goes through the same `str` path (first 64 characters by the slot, escaped, the escaped text
+  cut to 64 characters plus `"…"` when longer, no quotes) because a class's `__name__` may be set to a `str` subclass instance, may be any
   length and may contain a newline. The result is wrapped in `<` and `>`.
 
 So the echo is at most `_MAX_REJECTED_ECHO + 3` characters whatever the value. For an exact `str`
-of at most 64 characters the line is byte-identical to today's. For a longer one it may differ only
-in which quote character `repr` chose, because today's choice depends on characters past the cut.
-`bytes` is now `<bytes>`, which names the caller's actual mistake. A stream fault is still
-swallowed and a `BaseException` from the write still propagates (SPEC-029).
+of at most 64 characters the line is byte-identical to today's. For a longer one the quoting may
+differ, because today's choice of quote, and so of which quote is escaped, depends on characters
+past the cut. `bytes` is now `<bytes>`, which names the caller's actual mistake.
+
+If computing the echo raises an `Exception` (a `MemoryError`, or a C type whose name will not
+render), the line is still written, with the constant echo `<?>`. So the line is written on every
+input bar a fault of the stream itself, which is still swallowed, and a `BaseException` from
+computing the echo or from the write still propagates (SPEC-029).
 
 #### Acceptance Criteria:
 
-Tests are in `tests/test_diag.py`. Every criterion marked *fails at base* fails against `2e790e9`.
+Tests are in `tests/test_diag.py`. Every criterion marked *fails at base* fails against `7dc881f`.
 A "spy" is a value whose every method, property and metaclass hook appends to a list, then asserts
-the list is empty after the call.
+the list is empty after the call. A hook that raises is armed only around the `rejected` call, as
+`_NamelessMeta` is in `tests/test_baggage_header.py`, because pytest's `saferepr` reads
+`cls.__name__` and an always-raising metaclass turns any failure into an INTERNALERROR.
 
 - [ ] A value whose `__repr__` raises writes one line ending `: <_Hostile>` and returns. *Fails at
       base: nothing is written (Probe B).*
 - [ ] A value whose `__repr__` returns a raw newline writes exactly one line, and a spy on
       `__repr__` records no call. *Fails at base.*
-- [ ] An instance of a class whose metaclass raises from `__getattribute__`, `__subclasscheck__` and
-      a `__name__` property, and which has a raising `__class__` property, is echoed `<C>` using its
-      real name, with the spy empty. *Fails at base.*
+- [ ] An instance of a class whose metaclass raises from `__getattribute__` and a `__name__`
+      property, and which has a raising `__class__` property, is echoed `<C>` using its real name,
+      with the spy empty. *Fails at base.* (`__subclasscheck__` is not a hook here:
+      `issubclass(type(v), str)` consults `str`'s metaclass, never the value's.)
 - [ ] An instance of a class whose `__name__` was set to a `str` subclass instance, 500 characters
       long, beginning `"a\nlog-foundry: forged"` and with every method of the subclass raising,
-      writes one line, and the part after `: ` equals `<`, the escaped first 64 characters of the
-      name, `…` and `>`, written out as a literal. The spy on the subclass is empty. *Fails at
+      writes one line, and the part after `: ` equals `<`, the first 64 characters of the name
+      escaped and then cut to 64 characters, `…` and `>`, written out as a literal. The spy on the subclass is empty. *Fails at
       base, which echoes the default object `repr` and not the name.*
 - [ ] `b"00-bad"` is echoed `<bytes>`, an `int` `<int>` and a `list` `<list>`. *Fails at base for
       the first two (`b'00-bad'`, `123`).*
@@ -153,11 +177,15 @@ the list is empty after the call.
       base.*
 - [ ] Output for an exact `str` of at most 64 characters equals these literals, written out in the
       test and not computed by the production expression: `'nope'`, `''`, `"it's"`, `'say "hi"'`,
-      `'a\'b"c'` (both quotes), `'a\nb'`, `'a\tb'`, `'\x85'`, `' '`, and a 64-character string.
+      `'a\'b"c'` (both quotes), `'a\nb'`, `'a\tb'`, `'\x85'`, `'\u2028'`, and a 64-character string.
       *Passes at base by design: it pins the unchanged half.*
-- [ ] `"0" * 500` is echoed as a quote, 63 zeros and `…`; `"x" * 100 + "'"` opens with `'` (today
-      `repr` of the whole string opens with `"`). *Second assertion fails at base.*
+- [ ] `"0" * 500` is echoed as a quote, 63 zeros and `…`. `"x" * 100 + "'"` opens with `'` (today
+      `repr` of the whole string opens with `"`), and `"it's" + "x" * 100 + '"'` opens with `"it's`
+      (today `'it\'s`, because the apostrophe is escaped too). *The last two fail at base.*
 - [ ] A raw newline in `reason` is still escaped and `reason` is not cut (unchanged).
+- [ ] With `_diag._echo` replaced by a function raising `MemoryError`, `rejected` writes one line
+      ending `: <?>`; with it raising `KeyboardInterrupt`, that propagates and nothing is written.
+      *Fails at base, which has no such helper and so cannot pass for the right reason.*
 - [ ] A stream whose `write` raises `OSError` makes `rejected` return normally, and one raising
       `KeyboardInterrupt` propagates it (the existing SPEC-029 tests stay green, unchanged).
 - [ ] `test_a_hostile_value_cannot_break_rejected` asserts a line is written (it asserts the
@@ -170,10 +198,13 @@ the list is empty after the call.
 #### Description:
 
 FR-001's route takes 64 characters and a type name, so the work done is independent of the size or
-shape of the value. This FR is the measurable half of that promise: the cost, in CPU time, does
-not follow the value, for the three shapes at `2e790e9` that made it follow (Probes A and C, and the
-`bytes` analogue). No absolute number is pinned; the test compares `rejected` with `repr` of the
-same value in the same test, so a slow or loaded machine moves both.
+shape of the value. This FR is the measurable half of that promise, for the shapes that made the
+cost follow the value (Probes A and C, and the `bytes` analogue). Two instruments, because neither
+sees all of it. CPU time against `repr` of the same value in the same test catches a pass over the
+value without pinning an absolute number, so a slow or loaded machine moves both; but it passes a
+full O(n) copy followed by a slice, which costs 0.02 to 0.03 of a `repr`. Peak allocation under
+`tracemalloc` is deterministic and catches that copy: measured at `7dc881f` on a 10^8-character
+`str` subclass, the slot slice peaks at 105 bytes and a full copy at 100,000,085.
 
 #### Acceptance Criteria:
 
@@ -184,9 +215,15 @@ on SPEC-064's in `tests/test_baggage_header.py` (a `SIGALRM`/`setitimer` alarm r
 - [ ] For a `"0" * 10**8` string, `time.process_time` across `rejected` is under a tenth of the
       `time.process_time` across `repr` of the same string in the same test. *Fails at base: the
       ratio is about one.*
-- [ ] The same ratio holds for a `str` subclass of the same length, so the slice is the C slot and
-      not an overridden `__getitem__`. *Fails at base.*
 - [ ] The same ratio holds for `b"0" * 10**8`, echoed `<bytes>`. *Fails at base.*
+- [ ] With the value built before tracing starts and `tracemalloc.reset_peak()` called just before,
+      the peak traced memory across `rejected` is under 65,536 bytes for a `"0" * 10**8` exact
+      `str`, for a `str` subclass of the same length that overrides nothing (one whose `__repr__` raises would
+      make `repr` fail early at base and pass vacuously), and for `b"0" * 10**8`. The bound is 64 KiB
+      because it sits some 600 times above the measured 105 bytes, which leaves room for the
+      write, the capture buffer and interpreter noise, and some 1,500 times below a copy of the
+      value, so only an O(n) copy can fail it. *Fails at base, where `repr` of the value peaks at
+      about its size.*
 - [ ] The shared-sublist DAG (Probe A) passed to `rejected` returns inside a 5 s deadline and writes
       `<list>`. *Fails at base: the deadline fires.*
 - [ ] The measurement is taken with the stream accepting writes, and each ratio test asserts the
@@ -229,12 +266,14 @@ valid exact `str` and its expected result.
 On entry `continue_trace` replaces each of `traceparent`, `trace_id`, `parent_span_id` and
 `baggage`: a value whose real type is a `str` subclass (tested as in FR-001) becomes an exact
 `str` through `str.__str__(value)`, a C-level copy that runs no method of the subclass; any other
-value is passed through unchanged. The rest of the function, the parsers and `_diag.rejected` therefore see only an exact `str` or a
-non-`str` of which no code is ever run. So a `str` subclass carrying a valid
-header is still adopted as today, an argument of any other type is refused and announced, and the
-echo is of the normalised value. After this change no code of any inbound value runs: the
-`str(trace_id)` fallback in the swept-span refusal now sees only an exact `str`, because a
-`trace_id` that reaches it has been validated.
+value is passed through unchanged. The implementation binds new local names (or uses `cast`) rather
+than assigning back to the `str | None` parameters, which `mypy --strict` refuses. The rest of the
+function, the parsers and `_diag.rejected` therefore see only an exact `str` or a non-`str` of
+which no code is ever run. So a `str` subclass carrying a valid header is still adopted as today,
+and what is adopted, stored and later formatted by `current_traceparent()` is the exact `str` it
+holds (Probe G), while an argument of any other type is refused and announced. After this change no
+code of any inbound value runs: the `str(trace_id)` fallback in the swept-span refusal now sees only
+an exact `str`, because a `trace_id` that reaches it has been validated.
 
 The verdict holds: on any input `continue_trace` returns normally, bar a `BaseException` raised by
 the stderr write (SPEC-029), and when the result is falsy `reason == "rejected"` exactly when a
@@ -260,15 +299,34 @@ property, and one whose `__class__` returns `str`.
       `__repr__` cell writes a line ending `: <_Hostile>`. *The second half fails at base (Probe B).*
 - [ ] `parent_span_id` beside a valid `trace_id` adopts that trace as a root (`ok` is true) and
       writes one `invalid parent_span_id; joining as a root` line, for every probe.
-- [ ] A `str` subclass with every overridden method raising and a **valid** `traceparent`, and again
-      a valid `trace_id` (with and without a valid `parent_span_id`), is adopted: `ok` is true, and
-      the next root span's events carry those ids as exact `str` (`type(...) is str`). The same
-      subclass as a valid `baggage` is merged. *Fails at base.*
+- [ ] **Adoption, one argument at a time.** Let `S` be a `str` subclass with every method it
+      overrides raising (`strip`, `__len__`, `__iter__`, `__ne__`, `__eq__`, `split`, `encode`,
+      `__repr__`, `__str__`, `__format__`, `__getitem__`), and every other argument an exact `str`
+      or absent. Each of these is its own test, and each fails if normalisation is removed for that
+      argument alone, which is what the rejection table cannot do. *Each fails at base.*
+      - `traceparent=S(valid)`: `ok` is true, and the next root span's events carry the header's
+        trace id and parent span id, each `type(...) is str`.
+      - `trace_id=S(valid)` with an exact valid `parent_span_id`: the same, with those ids.
+      - `trace_id=` an exact valid id and `parent_span_id=S(valid)`: `ok` is true, no line is
+        written, and the root span's events carry that `parent_span_id`. An unnormalised one is
+        refused as invalid, joins as a root and still reports `ok=True`, so `ok` alone cannot show
+        it.
+      - `baggage=S("k=v")`: `context.get_baggage()` equals `{"k": "v"}`, and `ok` is false with
+        `reason == "nothing-supplied"` (the verdict describes the trace context only).
+- [ ] **Probe G.** `trace_id=S(valid)` and `parent_span_id=S(valid)`, where `S` raises from
+      `__format__`, `__str__`, `encode` and `__repr__`, are adopted; inside the next span
+      `current_traceparent()` returns an exact `str` that matches
+      `00-<that trace id>-<16 lowercase hex>-01`, raises nothing, and the span's events carry a
+      `trace_id` with `type(...) is str`. *Fails at base: `current_traceparent()` raises `S`'s
+      `RuntimeError`.* Serves invariants 1, 8 and 9 (the id type is the assembly half; what is
+      adopted stays a correlation id and confers nothing).
 - [ ] A valid exact-`str` `traceparent`, `trace_id`+`parent_span_id` and `baggage` are adopted
       exactly as before, and a call with nothing supplied gives `reason == "nothing-supplied"` with
       nothing on stderr (unchanged; passes at base).
-- [ ] The echo is of the normalised value: a long `str` subclass with a raising `__repr__` is echoed
-      as the same bounded, quoted text an exact `str` of the same characters gets.
+- [ ] End to end through `continue_trace(traceparent=...)`, a `str` subclass of 100 `"x"` characters
+      whose `__repr__` raises, and an exact `str` of the same characters, each write one line
+      whose echo equals the literal quote, 63 `x` characters and `…`. *The subclass case fails at
+      base: no line is written.*
 - [ ] With the span already swept as `tests/test_span_sweep.py` arranges it, a valid `trace_id`
       that is a `str` subclass with `__str__` raising is refused with one line and `reason ==
       "rejected"`, and nothing raises. *Fails at base: `str(trace_id)` runs the subclass.*
@@ -282,7 +340,12 @@ property, and one whose `__class__` returns `str`.
 
 Several documents state what this spec replaces. `rejected`'s docstring calls it "the one place in
 the library where a `repr` is correct" and says the value is echoed as a bounded `repr`. The
-failure-paths decision says "The one bounded `repr` is `rejected`". The four parsers' docstrings say
+failure-paths decision says "The one bounded `repr` is `rejected`". `SPEC-029`'s spec wraps the same
+claim across lines 107 to 109, its delivery doc says "SPEC-014's bounded `repr`", and
+`tests/test_diag.py:195`'s section comment says `rejected` "keeps SPEC-014's bounded repr exactly".
+A completed spec and a delivery doc are history, so those two get a superseded marker (the
+completion ritual's step for every other site that states the old claim, and `SPEC-036` and
+`SPEC-005` already carry such markers) and are not rewritten. The four parsers' docstrings say
 their argument is "of any type" without saying a subclass is refused. `continue_trace`'s docstring
 documents the verdict but not the normalisation. The caller-visible stderr change has no release
 note. None of this has behaviour to test, which is why this FR keeps no invariant.
@@ -296,13 +359,27 @@ note. None of this has behaviour to test, which is why this FR keeps no invarian
       argument is normalised on entry and what its verdict means for a stream fault.
 - [ ] The decision file under `docs/decisions/failure-paths/` named
       `one-module-writes-every-diagnostic-...` has its "one bounded `repr`" sentence rewritten in
-      place with a dated History entry, and `docs/spec-delivery/SPEC-029-diagnostic-output-safety.md`
-      carries a superseded marker where it says "SPEC-014's bounded `repr`".
-      `grep -rn "one bounded .repr." docs src` finds no statement of the old claim without a marker.
-- [ ] `docs/release-notes/v1.1.0.md` has a *Fixed* entry that names the three caller-visible
-      changes: a non-`str` value is echoed by type name, a long `str`'s quote may differ, and the
-      parsers refuse a `str` subclass called directly while `continue_trace` still adopts a valid
-      one.
+      place with a dated History entry. `docs/specs/SPEC-029-diagnostic-output-safety.md` (at its
+      FR-002's last criterion) and `docs/spec-delivery/SPEC-029-diagnostic-output-safety.md` each
+      carry a short superseded blockquote naming SPEC-067, and the comment at
+      `tests/test_diag.py:195` is reworded.
+- [ ] A sweep over `docs/`, `src/` and `tests/` that **reassembles wrapped sentences** (it joins
+      each paragraph or list item before matching, because the SPEC-029 claim is split across three
+      lines and a line-by-line `grep` cannot see it) finds no statement that `rejected` echoes a
+      bounded `repr`, that a `repr` is correct there, or that the one bounded `repr` is
+      `rejected`, except under a superseded marker.
+- [ ] `docs/release-notes/v1.1.0.md` has a new subsection at the end of `## Fixed`, after the
+      Honeycomb, SPEC-064 and SPEC-065 entries, that names the caller-visible changes: a non-`str`
+      value is echoed by type name, a long `str`'s quoting may differ, the parsers refuse a `str`
+      subclass called directly while `continue_trace` still adopts a valid one, and an adopted
+      `str` subclass is now stored as the exact `str` it holds, which stops
+      `current_traceparent()` raising the subclass's own exception (Probe G). It ends with a
+      "Who must change code" line saying no caller must, as SPEC-065's does.
+- [ ] The lead paragraph of that file is unchanged. Its claim that a `>=1,<2` pin takes the release
+      "without a code change" unless a caller passes a `float` ceiling stays true: this change is
+      on stderr and in a module the frozen surface does not list, and a stderr format change is
+      not a code change. `CHANGELOG.md`, `docs/spec-delivery/RELEASES.md` and the notes' title are
+      not touched.
 - [ ] `sh scripts/docs-lint.sh` and `sh scripts/spec-lint.sh` are clean.
 - [ ] Serves no invariant: prose and release-notes hygiene, which `docs/process/completion-ritual.md`
       judges by its own rules.
@@ -317,11 +394,15 @@ No signature changes and no new public name.
 # src/log_foundry/decorator.py: the normalisation, a private helper applied once on entry
 def _exact(value: object) -> object:
     # str subclass -> str.__str__(value); anything else -> value, untouched
+    # callers bind new names (or cast); they do not assign back to the `str | None` parameters
 
 # src/log_foundry/_diag.py: rejected(reason: str, value: object) -> None   (unchanged signature)
-#   str route:      first 64 chars via str.__getitem__, str.__repr__, _escape, cut to 64 + "…"
-#   non-str route:  "<" + name (same str path, no quotes) + ">",
-#                   name = type.__dict__["__name__"].__get__(type(value))
+def _echo(value: object) -> str:
+    # str route:      first 64 chars via str.__getitem__, str.__repr__, _escape, cut to 64 + "…"
+    # non-str route:  "<" + name (same str path, no quotes) + ">",
+    #                 name = type.__dict__["__name__"].__get__(type(value))
+# rejected calls _echo inside its guard; an Exception from it writes the line with "<?>"
+
 ```
 
 ## File & Folder Structure
