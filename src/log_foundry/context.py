@@ -358,9 +358,10 @@ def current_baggage_header() -> str:
     The baggage store holds arbitrary objects but the wire format is text, so each value is
     first coerced as an event's fields are, under the same ceilings and work budgets (SPEC-064),
     and the coerced value is then rendered with ``str()``. A dict still arrives at the next
-    process as its repr, not as a dict; a ``datetime`` arrives in ISO form, a tuple as a list,
-    and a value nothing can render as an ``<unserializable: Type>`` placeholder. A string is
-    sent as it is unless it is past ``max_value_bytes``.
+    process as its repr, with its contents coerced, not as a dict; a ``datetime`` arrives in ISO
+    form, a tuple as a list, and a value nothing can render as an ``<unserializable: Type>``
+    placeholder. A string is sent as it is unless it is past ``max_value_bytes`` or carries a
+    lone surrogate, which becomes U+FFFD.
 
     The header is capped at :data:`BAGGAGE_MAX_BYTES`, the size the next process's
     :func:`parse_baggage_header` accepts, by whole members in baggage order: the first member

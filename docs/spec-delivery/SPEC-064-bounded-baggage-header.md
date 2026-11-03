@@ -43,9 +43,14 @@ name or signature changed.
 
 ## Verification
 
-Six gates green at `8bd4504` (3,667 passed). Against the unfixed `context.py`, 55 of the 66 new tests
-in `tests/test_baggage_header.py` fail, each for its stated reason: the DAG is killed by the alarm,
-the raising `__str__` raises `RuntimeError`, the surrogate raises `UnicodeEncodeError` on both intake
-routes, 4,300 digits raise `ValueError`, and an over-cap header is refused by the parser. Four mutants
-were planted and each reddened a test: the guard removed, a guard around `str()` alone, `except
-BaseException`, and the key written into the diagnostic detail.
+Six gates green at `8bd4504` (3,667 passed) and again after the diff review's fixes. Against the
+unfixed `context.py` (a scratch worktree at `8a0df59`, `context.__file__` asserted under it), run
+with the suite's default flags from `pyproject.toml` (`-n 12 --dist worksteal`), 57 of the 68 tests in
+`tests/test_baggage_header.py` fail, each for its stated reason: the five DAG tests are killed by the
+alarm, the raising `__str__` raises `RuntimeError`, the surrogate raises `UnicodeEncodeError` on both
+intake routes, 4,300 digits raise `ValueError`, and an over-cap header is refused by the parser. The
+11 that pass are the harness control, the rows the spec marks unchanged, and cases the old render
+already got right. Five mutants were planted and each reddened a test: the guard removed, a guard
+around `str()` alone, `except BaseException`, the key written into the diagnostic detail, and the
+throttle checking only a call's last total. The guard-removed mutant exits 1 with every test reported
+and no `INTERNALERROR`, under both `-n 12` and `-n 0`.

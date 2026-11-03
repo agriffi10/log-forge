@@ -477,7 +477,7 @@ with every counter clean.
 | `continue_trace(traceparent=None, *, trace_id=None, parent_span_id=None, baggage=None)` | Adopt an inbound context. Returns a `ContinueResult`: truthy if adopted, else falsy with `reason` of `"nothing-supplied"` or `"rejected"`. The verdict is about the **trace context** — `baggage=` is merged independently and does not make it truthy. Never raises. |
 | `current_traceparent()` | This span as a W3C `traceparent` string, or `None` if no span is active. |
 | `current_trace_context()` | `(trace_id, span_id)`, for when moving two fields beats moving a string. |
-| `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). Each value is coerced as an event's fields are, then rendered as text, so a `datetime` arrives in ISO form, a dict as its repr, and a value nothing can render as `<unserializable: Type>`. The header is capped at 8192 bytes, the size the receiving parser accepts, by whole members in order: the first member that does not fit ends it, a member with an empty key is left out, and a drop is announced on stderr as a count. Never raises. |
+| `current_baggage_header()` | Current baggage in W3C `baggage` format (`""` when empty). Each value is coerced as an event's fields are, then rendered as text, so a `datetime` arrives in ISO form, a dict as its repr with its contents coerced, and a value nothing can render as `<unserializable: Type>`. The header is capped at 8192 bytes, the size the receiving parser accepts, by whole members in order: the first member that does not fit ends it, a member with an empty key is left out, and a drop is announced on stderr as a count. Never raises. |
 | `get_baggage()` | Current baggage as a `dict`. A shallow copy — rebinding a key does not reach the library, but a nested mutable value is shared. |
 | `reset_context()` | Clear baggage and any adopted context. `@trace` users do not need it. Never raises. |
 
@@ -502,8 +502,9 @@ Details worth knowing:
 - **Baggage fails independently of the trace.** A malformed `baggage` header is skipped with a
   warning while the trace is still adopted: losing correlating fields is bad, losing the trace
   join because one field was malformed is worse. Headers over 8192 bytes are rejected. Values
-  are percent-encoded, so `,` `=` and non-ASCII round-trip; non-string values are serialized
-  with `str()`, so a dict arrives as its repr.
+  are percent-encoded, so `,` `=` and non-ASCII round-trip; non-string values are coerced as an
+  event's fields are and then serialized with `str()`, so a dict arrives as its repr with its
+  contents coerced. The outbound header is capped at 8192 bytes by whole members.
 - **An adopted context is consumed by one root span.** It applies to the next root span opened
   and does not survive it, so the invocation after it starts a fresh trace unless it adopts
   again. That is what stops a warm container from logging every later invocation into the first

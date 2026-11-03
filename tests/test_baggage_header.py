@@ -113,11 +113,30 @@ class _RaisingEncode(str):
 
 
 class _NamelessMeta(type):
-    """A metaclass whose `__name__` raises, so even naming the type fails."""
+    """A metaclass whose `__name__` raises while armed, so even naming the type fails.
+
+    Armed only around the render by `_nameless()`. Raising unconditionally breaks pytest itself:
+    when a test holding such an object fails, `saferepr` reads `cls.__name__` and the run ends in
+    INTERNALERROR instead of a failure that names the test.
+    """
+
+    armed = False
 
     @property
     def __name__(cls) -> str:  # type: ignore[override]
-        raise RuntimeError("name-secret")
+        if _NamelessMeta.armed:
+            raise RuntimeError("name-secret")
+        return type.__dict__["__name__"].__get__(cls)  # type: ignore[no-any-return]
+
+
+@contextlib.contextmanager
+def _nameless() -> Iterator[None]:
+    """Arms `_NamelessMeta` for the body only, and always disarms it before any assertion."""
+    _NamelessMeta.armed = True
+    try:
+        yield
+    finally:
+        _NamelessMeta.armed = False
 
 
 class _ClaimsBoolRaises:
@@ -457,16 +476,18 @@ def test_an_unreadable_type_name_becomes_a_question_mark() -> None:
     """Measured escape 2, coercion route: naming the type raises too, so it is `?`."""
     spoof = _ClaimsBoolNameless()
     _assert_survives_coercion(spoof)
-    assert _header(a="1", v=spoof, z="2") == "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
+    with _nameless():
+        header = _header(a="1", v=spoof, z="2")
+    assert header == "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
 
 
 def test_an_unreadable_type_name_becomes_a_question_mark_on_any_coercer(
     bypass_coercion: None,
 ) -> None:
     """Measured escape 2, route-independent."""
-    assert _header(a="1", v=_ClaimsBoolNameless(), z="2") == (
-        "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
-    )
+    with _nameless():
+        header = _header(a="1", v=_ClaimsBoolNameless(), z="2")
+    assert header == "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
 
 
 def _quote_refusing(refused: Callable[[object], bool]) -> Callable[..., str]:
@@ -540,7 +561,9 @@ def test_no_placeholder_carries_the_message_or_a_repr(
         monkeypatch.setattr(
             sanitize, "sanitize_fields", lambda fields, *, cfg: (dict(fields), False)
         )
-    shown = unquote(_header(v=make()))
+    with _nameless():
+        header = _header(v=make())
+    shown = unquote(header)
     assert shown.startswith("v=<unserializable: ")
     for leaked in ("secret", "object at 0x", "Error"):
         assert leaked not in shown, leaked
@@ -664,6 +687,31 @@ def test_the_throttle_writes_at_one_and_every_thousandth(
         context.format_baggage_header({"": "x"})
     lines = _lines(capsys.readouterr().err)
     assert [line.split()[2] for line in lines] == ["1", "1000"]
+
+
+def test_a_first_call_dropping_several_members_announces_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The first-ever drop is a prefix drop of two members: it draws 1 and 2, and 1 crosses.
+
+    The rule is "any value this call drew crosses", not "the last value crosses": checked on the
+    last value alone, this call ends on 2 and the first loss of the process is never announced.
+    """
+    assert _header(a="1", b="x" * 8190, c="2") == "a=1"
+    lines = _lines(capsys.readouterr().err)
+    assert len(lines) == 1
+    assert lines[0].startswith("log-foundry: lost 2 baggage member(s)")
+
+
+def test_a_crossing_inside_one_call_is_announced_with_the_call_s_last_total(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Three drops drawn as 999, 1000 and 1001: the crossing at 1000 is announced, as 1001."""
+    monkeypatch.setattr(context, "_dropped_members", itertools.count(999), raising=False)
+    assert context.format_baggage_header({"": "x", "b": "x" * 8192, "c": "1"}) == ""
+    lines = _lines(capsys.readouterr().err)
+    assert len(lines) == 1
+    assert lines[0].startswith("log-foundry: lost 1001 baggage member(s)")
 
 
 def test_the_drop_line_names_no_key_or_value(capsys: pytest.CaptureFixture[str]) -> None:
