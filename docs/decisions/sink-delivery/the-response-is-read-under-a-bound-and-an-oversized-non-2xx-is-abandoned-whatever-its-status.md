@@ -32,5 +32,5 @@ What `b""` means to this sink is recorded in *A 2xx this sink cannot read is cou
 
 ### 2026-11-03
 
-- **Settled.** Shipped with `OTLPSink`; `FakeResponse.read` and `_IncompleteResponse.read` took the
+- **Settled.** Shipped with `OTLPSink`; `FakeResponse.read` and `_UnreadableResponse.read` took the
   optional size with it.

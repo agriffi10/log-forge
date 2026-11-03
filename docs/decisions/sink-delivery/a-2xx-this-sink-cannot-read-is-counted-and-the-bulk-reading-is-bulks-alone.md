@@ -38,7 +38,10 @@ closes reaches `OTLPSink` as `b""` and is full success, one POST, nothing counte
 which is also what makes the `response.length` check a mutation target, since without it the same
 bytes parse and raise; the chunked twin raises inside `read(amt)` and arrives the same way. A `2xx`
 over the bound is a different case: the read returns one byte past it and `_handle_response` counts
-the chunk unadjudicated. (SPEC-056 FR-003, FR-004; #283)
+the chunk unadjudicated. "Over the bound" is measured on the bytes read, not on the length declared:
+a body declared at 10 MiB that is cut after 5 MiB is over the bound and counted, while one cut after
+2 MiB returns fewer bytes than asked with bytes still owed, so it is truncated, reaches the sink as
+`b""` and is full success. Both settle the chunk without a re-send. (SPEC-056 FR-003, FR-004; #283)
 
 ## History
 
