@@ -409,8 +409,10 @@ which on the orphan path is the application's own (invariant 4). M4's prototype 
 against 0.04 ms for one event and 1.26 ms against 0.90 ms for 500. The cost is accepted and
 FR-005 records it as an exception under invariant 4.
 
-`failed` is a sink's own upper-bound counter, so an unconfirmed batch that later turns out to have
-landed stays counted. It is outside SPEC-059's `Deferral` rule, which governs `dropped`: the count
+A core publish the deadline abandons (FR-001) is one of the published events this step counts
+when the confirmation goes unanswered, which it normally does, since an abandoned publish has
+spent the deadline. `failed` is a sink's own upper-bound counter, so an unconfirmed batch that
+later turns out to have landed stays counted. It is outside SPEC-059's `Deferral` rule, which governs `dropped`: the count
 is made on a path that returns, and nothing after it raises, so no retry can count it again.
 
 #### Acceptance Criteria:
@@ -446,6 +448,13 @@ is made on a path that returns, and nothing after it raises, so no retry can cou
       counted and announced, invariant 4 because FR-005 records the two-round-trip cost on the
       orphan path, invariant 6 because core and JetStream are twins and differ only here, and
       invariant 7 because FR-005 records this case as an exception.
+- [ ] AC-13 (FR-001's core publish bound, seen from here): in core mode with `publish_timeout=1.0`,
+      a batch over 2 MiB, and a fake whose `publish` blocks after the pre-publish probe answered
+      (the server pausing just then), `emit` returns rather than raises in about 1.0 s plus a
+      stated margin, `failed` equals the batch size (the blocked publish abandoned and counted as
+      unconfirmed, the rest unattempted), one `_diag.lost` line names each, the loop thread is
+      still alive and the sink still open (the backstop did not fire), and the abandoned task
+      completes once the fake's publish is released.
 
 ### FR-004: `close()` and `flush()` are bounded by the sink, not by the driver's drain
 

@@ -87,6 +87,7 @@ class LiveFakeNATS:
       close_gate: When set, ``close`` parks on it until it is set.
       close_raises: An exception type ``close`` raises, or ``None``.
       publish_raises: Raise from every publish when set, modelling "no responders".
+      publish_delay: Seconds each publish sleeps on the loop, so a batch can spend its budget.
       subs: The driver's subscription count; one after the first JetStream publish (M7).
       in_flight: Sink calls currently inside the fake; ``max_in_flight`` is its high-water mark.
     """
@@ -107,6 +108,7 @@ class LiveFakeNATS:
         self.close_gate: asyncio.Event | None = None
         self.close_raises: type[BaseException] | None = None
         self.publish_raises = False
+        self.publish_delay = 0.0
         self.publish_entered = threading.Event()
         self.subs = 0
         self.in_flight = 0
@@ -134,7 +136,7 @@ class LiveFakeNATS:
             if self.publish_gate is not None:
                 await self.publish_gate.wait()
             else:
-                await asyncio.sleep(0)
+                await asyncio.sleep(self.publish_delay)
             if self.publish_raises:
                 raise RuntimeError("no responders")
             self.published.append(payload)
@@ -917,7 +919,9 @@ def test_a_reconnect_discards_the_orphaned_probe_and_its_outcome_is_retrieved(
     finally:
         logging.getLogger("asyncio").removeHandler(handler)
 
-    assert fake.calls.count("flush") == 2, "the reconnect must make the next emit send afresh"
+    assert fake.calls[:3] == ["flush", "flush", "publish"], (
+        "the reconnect must make the next emit send afresh rather than wait on the orphan"
+    )
     assert fake.published == [b'{"n": 2}']
     assert not [r for r in records if "never retrieved" in r.getMessage()], records
 
@@ -1139,3 +1143,230 @@ def test_an_injected_client_is_never_probed(monkeypatch) -> None:
         sink.emit([{"n": 3}])
     sink.close()
     assert "flush" not in client.calls
+
+
+# --- FR-003: a core batch is confirmed, or counted ---------------------------------------------
+
+
+class StallsAfterFirstPublishNATS(LiveFakeNATS):
+    """Answers the pre-publish PING, then the server pauses: no later PING is ever answered.
+
+    The one batch that straddles the onset of a stall, which is the case FR-003 is about.
+    """
+
+    async def _enter_publish(self, payload: bytes) -> None:
+        self.answering = False
+        await super()._enter_publish(payload)
+
+
+def test_a_core_batch_is_confirmed_by_a_second_ping_after_the_last_publish(monkeypatch) -> None:
+    # FR-003 AC-1.
+    sink, fake, _ = _build(monkeypatch)
+    sink.emit([{"n": 1}, {"n": 2}, {"n": 3}])
+    sink.close()
+    assert fake.calls[:5] == ["flush", "publish", "publish", "publish", "flush"], fake.calls
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_an_unconfirmed_core_batch_is_counted_and_announced_once(monkeypatch, capsys) -> None:
+    # FR-003 AC-2.
+    sink, _, _ = _build(monkeypatch, factory=StallsAfterFirstPublishNATS, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
+    losses = sink.losses()
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+    err = capsys.readouterr().err
+
+    assert error is None, "an unconfirmed batch returns, because the bytes may yet land"
+    assert elapsed <= 0.3 + MARGIN
+    assert losses == SinkLosses(dropped=0, failed=3)
+    lines = [line for line in err.splitlines() if "lost" in line]
+    assert len(lines) == 1, err
+    assert "lost 3 event(s)" in lines[0] and "unconfirmed" in lines[0] and "PONG" in lines[0]
+
+
+class SlowStallingNATS(StallsAfterFirstPublishNATS):
+    """Each publish costs real loop time, so the deadline is spent before the confirmation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.publish_delay = 0.15
+
+
+def test_a_spent_deadline_counts_without_waiting_and_leaves_the_probe_for_reuse(
+    monkeypatch, capsys
+) -> None:
+    # FR-003 AC-3. Two publishes at 0.15 s each against a 0.2 s budget: the second is abandoned at
+    # the deadline (plan finding M-2) and the confirmation has nothing left to wait, so the emit
+    # returns at about the deadline with both counted; the PING it sent is still pending for the
+    # next call, which reuses it rather than sending another.
+    sink, fake, _ = _build(monkeypatch, factory=SlowStallingNATS, publish_timeout=0.2)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
+    assert error is None
+    assert elapsed < 0.2 + 0.2, f"the spent deadline must not wait on the PING: {elapsed:.2f}s"
+    assert sink.losses() == SinkLosses(dropped=0, failed=3)
+    assert sink._probe is not None and not sink._probe[0].done(), "the probe is left for reuse"
+    flushes = fake.calls.count("flush")
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 4}])
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert fake.calls.count("flush") == flushes == 2, "the next call reused the pending PING"
+    err = capsys.readouterr().err
+    assert "unconfirmed" in err and "publish_timeout" in err
+
+
+class SecondPublishRaisesNATS(StallsAfterFirstPublishNATS):
+    """The second publish raises; the first and third land unconfirmed."""
+
+    async def _enter_publish(self, payload: bytes) -> None:
+        if self.calls.count("publish") == 1:
+            self._record("publish")
+            raise RuntimeError("no responders")
+        await super()._enter_publish(payload)
+
+
+def test_a_raised_publish_and_two_unconfirmed_events_count_three_not_four(monkeypatch) -> None:
+    # FR-003 AC-4.
+    sink, fake, _ = _build(monkeypatch, factory=SecondPublishRaisesNATS, publish_timeout=0.3)
+    sink.emit([{"n": 1}, {"n": 2}, {"n": 3}])
+    losses = sink.losses()
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+    assert losses == SinkLosses(dropped=0, failed=3)
+    assert len(fake.published) == 2
+
+
+def test_a_batch_where_every_publish_raised_raises_without_a_second_ping(monkeypatch) -> None:
+    # FR-003 AC-5.
+    sink, fake, _ = _build(monkeypatch)
+    fake.publish_raises = True
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}, {"n": 2}])
+    losses = sink.losses()
+    flushes = fake.calls.count("flush")
+    sink.close()
+    assert flushes == 1, "the pre-publish PING and no confirmation of a batch nothing left"
+    assert fake.calls[:3] == ["flush", "publish", "publish"]
+    assert losses == SinkLosses(dropped=0, failed=2)
+
+
+def test_jetstream_mode_probes_once_only(monkeypatch) -> None:
+    # FR-003 AC-6: each JetStream publish awaited its ack, so there is nothing to confirm.
+    sink, fake, _ = _build(monkeypatch, jetstream=True)
+    sink.emit([{"n": 1}, {"n": 2}, {"n": 3}])
+    assert fake.calls.count("flush") == 1
+    sink.close()
+
+
+def test_the_emit_after_an_unconfirmed_batch_is_refused_while_the_stall_continues(
+    monkeypatch,
+) -> None:
+    # FR-003 AC-7: the sustained stall is reported, not absorbed.
+    sink, fake, _ = _build(monkeypatch, factory=StallsAfterFirstPublishNATS, publish_timeout=0.2)
+    sink.emit([{"n": 1}])
+    with pytest.raises(SinkDeliveryError, match=r"PING|PONG"):
+        sink.emit([{"n": 2}])
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+    assert fake.published == [b'{"n": 1}']
+
+
+class DisconnectsAfterPublishNATS(LiveFakeNATS):
+    """Answers the pre-publish PING, then the client reports itself disconnected."""
+
+    async def _enter_publish(self, payload: bytes) -> None:
+        await super()._enter_publish(payload)
+        self.is_connected = False
+
+
+class ConfirmReturnsWhileDisconnectedNATS(LiveFakeNATS):
+    """The second ``flush`` flips the flag and returns at once, the reconnecting fallback (M9)."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        if self.calls.count("flush") == 0:
+            await super().flush(timeout)
+            return
+        self._record("flush")
+        self.flush_timeouts.append(timeout)
+        self.is_connected = False
+
+
+def test_a_client_that_disconnects_after_the_publishes_is_counted_without_a_wait(
+    monkeypatch,
+) -> None:
+    # FR-003 AC-10 (plan finding M-6): no second PING is sent to a client that reports itself
+    # disconnected, since the driver's flush would return without one; and a confirmation flush
+    # that does return at once while disconnected is not an answer.
+    sink, fake, _ = _build(monkeypatch, factory=DisconnectsAfterPublishNATS, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}]))
+    losses = sink.losses()
+    sink.close()
+    assert error is None and elapsed < 0.3
+    assert losses == SinkLosses(dropped=0, failed=2)
+    assert fake.calls.count("flush") == 1, fake.calls
+    assert fake._pongs == []
+
+    sink, fake, _ = _build(
+        monkeypatch, factory=ConfirmReturnsWhileDisconnectedNATS, publish_timeout=0.3
+    )
+    sink.emit([{"n": 1}])
+    losses = sink.losses()
+    sink.close()
+    assert losses == SinkLosses(dropped=0, failed=1)
+
+
+def test_an_injected_core_batch_has_no_second_round_trip_and_no_count() -> None:
+    # FR-003 AC-11.
+    client = LiveFakeNATS()
+    client.answering = False
+    sink = NATSSink("logs", client=client, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}]))
+    sink.close()
+    assert error is None and elapsed < 0.3
+    assert "flush" not in client.calls
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_a_core_publish_that_blocks_is_abandoned_inside_the_deadline_and_the_sink_stays_open(
+    monkeypatch, capsys
+) -> None:
+    """FR-003 AC-13 (plan finding M-2): the driver's unbounded force-flush cannot reach the backstop.
+
+    ``Client.publish`` force-flushes once 2 MiB is pending, under a flush timeout that defaults to
+    ``None``, so against a peer that stopped reading the await never returns. Bounded by the sink,
+    the emit returns at its deadline with the blocked event counted as unconfirmed and the rest
+    unattempted, the loop thread still alive and the sink still open; unbounded, the backstop
+    would fire a second later and close the sink for good.
+    """
+    sink, fake, _ = _build(monkeypatch, publish_timeout=1.0)
+    gate = asyncio.Event()
+    fake.publish_gate = gate
+    batch = [{"blob": "x" * (1024 * 1024)} for _ in range(3)]
+    elapsed, error = _timed(lambda: sink.emit(batch))
+    losses = sink.losses()
+    alive = sink._thread.is_alive() and not sink._closed
+    abandoned = len(sink._abandoned)
+    _open(sink, gate)
+    sink.close()
+    err = capsys.readouterr().err
+
+    assert error is None, error
+    assert 1.0 <= elapsed <= 1.0 + MARGIN, f"{elapsed:.2f}s"
+    assert losses == SinkLosses(dropped=0, failed=3)
+    assert alive, "the backstop must not have fired"
+    assert abandoned == 1
+    assert "lost 1 event(s)" in err and "unconfirmed" in err
+    assert "lost 2 event(s)" in err and "publish_timeout" in err
+    assert sink._abandoned == set(), "the abandoned publish completed once the gate opened"
+
+
+def test_deferral_gates_need_no_allowlist_entry_for_nats() -> None:
+    # FR-003 AC-9: `nats.py` enters no `Deferral` and writes no `dropped`-named store, so the
+    # tree-wide gates in `tests/test_deferral.py` pass unmodified; asserted here on the source so
+    # the premise is checked rather than assumed.
+    source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
+    assert "Deferral" not in source
+    assert "self.dropped" not in source

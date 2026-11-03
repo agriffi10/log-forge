@@ -568,6 +568,22 @@ class NATSSink:
         means a refusal with nothing published and no counter moved (SPEC-032's rule: a failure
         reported to the worker is not also counted).
 
+        **A core batch is then confirmed, or counted** (SPEC-061 FR-003). A core ``publish``
+        returns once its bytes are in the driver's buffer, so after the last one a second round
+        trip is sent within what remains of the deadline: a single connection is processed in
+        order, so an answered PONG means the server processed every publish before it. No answer,
+        including when the deadline is already spent or the client has become disconnected, adds
+        every event published and not otherwise counted to ``failed`` and announces it once, and
+        **this returns rather than raises**: the bytes are in flight to a server that may yet
+        process them (M6: five publishes written to a paused server all landed after it resumed),
+        so a worker retry could deliver them twice, which is SPEC-018's rule for an unadjudicable
+        batch. The stall is still reported, because the next call is refused by the probe or its
+        latch; only the one batch that straddles the onset of a stall is counted rather than
+        raised. JetStream mode has no such step, since each publish already awaited its ack, and
+        an injected client has none either. The second round trip is sent only while the client
+        still reports itself connected, because the driver's ``flush`` returns without a PONG
+        otherwise and the next call would wait on nothing.
+
         Args:
           batch: The events to publish.
 
@@ -582,14 +598,21 @@ class NATSSink:
         refusal = f"NATSSink published none of {len(batch)} event(s)"
         if not self._is_connected():
             raise SinkDeliveryError(f"{refusal}: the client is disconnected")
-        if self._probing():
+        probing = self._probing()
+        if probing:
             if not await self._await_probe(deadline):
                 raise SinkDeliveryError(
                     f"{refusal}: no PONG from the server within {self.publish_timeout}s"
                 )
             if not self._is_connected():
                 raise SinkDeliveryError(f"{refusal}: the client is disconnected")
-        await self._publish_all(batch, deadline)
+        published = await self._publish_all(batch, deadline)
+        if probing and not self._jetstream and published:
+            confirmed = self._is_connected() and await self._await_probe(deadline)
+            if not confirmed:
+                with self._counter_lock:
+                    self.failed += published
+                _diag.lost("event", published, "NATSSink unconfirmed, no PONG after the batch")
 
     def _probing(self) -> bool:
         """Reports whether this client is one the sink asks the server about (SPEC-061 FR-002).
