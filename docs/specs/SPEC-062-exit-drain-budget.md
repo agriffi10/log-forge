@@ -225,9 +225,10 @@ were made and that another was predicted to end after the shutdown's deadline. A
 answered by that drain reports falsy through `_nothing_lost_since`, because `failed_batches` moved.
 The abandon line the exhausted path writes is not written as well.
 
-The ledger these criteria test: with spans that emit only their `span.end` event, **delivered
-`span.end` + `queued` + `dropped` + events announced lost by the abandon or decline line = spans
-started**. Invariant 2's span ledger states no failed-batch term, and
+The ledger these criteria test: a `@trace`d span emits its `span.start` and its `span.end`, so the
+abandon or decline line counts the whole batch and is held to the size of the batch the sink was
+handed; the ledger is **delivered `span.end` + `queued` + `dropped` + the `span.end` events inside
+the batch that line announced = spans started**. Invariant 2's span ledger states no failed-batch term, and
 `tests/test_invariants_model.py` balances without one only because `failed_batches == 0` there.
 
 #### Acceptance Criteria:
@@ -357,8 +358,9 @@ still deliver them), and counting them now would double-count when the abandon l
 ```
 # src/log_foundry/worker.py
 _JOIN_MARGIN: float = 0.1             # module constant: the drain thread's moments after its last attempt
-Worker._exit_deadline: float | None   # monotonic instant; written only by claim_stop, in the
-                                      # decision that wins the _stopped gate, under Worker._lock;
+Worker._exit_deadline: float | None   # monotonic instant; written by claim_stop, in the
+                                      # decision that wins the _stopped gate, under Worker._lock,
+                                      # and reset to None only by _reinit_after_fork's resume branch;
                                       # reached from _shutdown_worker (live worker, first critical
                                       # section) and Worker.stop (direct and late-worker routes),
                                       # before any stop event the worker holds is set

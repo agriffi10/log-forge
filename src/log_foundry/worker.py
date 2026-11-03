@@ -359,11 +359,12 @@ class Worker:
 
         **The exit drain fits the caller's budget** (SPEC-062 FR-001). ``_exit_deadline`` is
         the ``shutdown()`` caller's deadline as a ``time.monotonic()`` instant, ``None`` for an
-        unbounded one, and it is written exactly once, by :meth:`claim_stop`, in the same
-        decision that wins the once-only gate — so the caller whose timeout the join uses is
-        always the caller whose deadline the drain declines against. Until a stop is claimed it
-        is ``None``, which declines nothing, so ordinary draining, ``flush()`` and a swap retry
-        exactly as before. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
+        unbounded one, and it is written by :meth:`claim_stop` in the same decision that wins
+        the once-only gate — so the caller whose timeout the join uses is always the caller
+        whose deadline the drain declines against — and cleared only by
+        :meth:`_reinit_after_fork` where that method starts a drain thread. Until a stop is
+        claimed it is ``None``, which declines nothing, so ordinary draining, ``flush()`` and a
+        swap retry exactly as before. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
         before its first attempt until it returns, so an expired join can say how many events
         are inside the emit it gave up waiting on (FR-005). It is written by the drain thread
         and read without the lock by the stopper, as :attr:`draining` is read: a single
@@ -1116,7 +1117,8 @@ class Worker:
         sink was never closed. Here whoever sets ``_stopped`` is whoever's deadline is written,
         so the drain always declines against the deadline the joining caller is holding, and a
         later caller's deadline is refused along with its claim, which is what makes the record
-        write-once without a second flag.
+        write-once across concurrent stoppers without a second flag. Only
+        :meth:`_reinit_after_fork` writes it otherwise, clearing it for a child that resumes.
 
         It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
         order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
@@ -1605,10 +1607,11 @@ class Worker:
         0.8 s, 0.3 s — can run the next for as long as it ever has, and a prediction from a
         shorter one lets the join expire with the sink left open, which is the outcome the
         budget exists to prevent. The deadline is read without the lock, as :attr:`draining` is
-        read: it is written once by :meth:`claim_stop` and a stale read costs at most one
-        attempt, which invariant 3's observable already allows. Measured without the rule, a
-        0.5 s failing sink under ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and
-        ``close()`` ran 0 times; with it, 2 attempts and one close.
+        read: it is written by :meth:`claim_stop` in the decision that wins the stop gate, and
+        a stale read costs at most one attempt, which invariant 3's observable already allows.
+        Measured at ``71e42dd``, before the rule, a 0.5 s failing sink under
+        ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and ``close()`` ran 0 times;
+        with it, 2 attempts and one close.
 
         A declined retry is counted once in ``failed_batches`` and announced once, with a reason
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from
@@ -1628,7 +1631,8 @@ class Worker:
           with the counter a waiting ``flush()`` is compared against (SPEC-021 FR-001).
 
         Raises:
-          None.
+          BaseException: Whatever ``sink.emit`` raises that is not an ``Exception``;
+            :meth:`_run` is the guard.
         """
         batch = [event for events in event_lists for event in events]
         if not batch:

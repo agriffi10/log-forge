@@ -1050,8 +1050,9 @@ close it.
   declines a retry predicted to end after the `shutdown()` deadline — the batch's longest attempt
   so far plus a 0.1 s join margin past it. The first attempt is always made and no knob is added,
   the budget being the caller's `timeout`. At NATS's defaults the third attempt is declined at
-  20 s and the close runs; the exit drain's worst case is the join plus the one in-flight
-  `publish_timeout`, which is invariant 3's observable. Measured at `71e42dd` with a 0.5 s failing
+  20 s and the close runs; the exit drain's worst case is the join plus up to two emits — the
+  one in flight when the budget runs out, and the first attempt of a tail batch, which is never
+  declined (SPEC-062 FR-004's residual). Measured at `71e42dd` with a 0.5 s failing
   sink under `shutdown(timeout=1.2)`: 3 attempts, the join expired and `close()` ran 0 times;
   after, 2 attempts and one close, pinned by `tests/test_worker_exit_budget.py`.
 

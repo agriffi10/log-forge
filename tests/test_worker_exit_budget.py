@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -27,6 +28,9 @@ from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _lifecycle
 from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _LOST_LINE = re.compile(r"^log-foundry: lost (\d+) (\w+)\(s\)(.*)$", re.MULTILINE)
 _SLACK = 0.3
@@ -161,8 +165,8 @@ def _three_events() -> list[dict[str, object]]:
     return [{"message": "CANARY-value", "n": n} for n in range(3)]
 
 
-def _shutdown_measured(worker: Worker, timeout: float | None) -> float:
-    """Runs the real `shutdown()` path and returns its wall time, asserting its CPU time.
+def _measured(call: Callable[[], object]) -> float:
+    """Runs a shutdown call and returns its wall time, asserting its CPU time.
 
     `time.process_time()` is process-wide across threads, which is deliberate: the busy-spin
     invariant 3 guards against would be in the drain thread's retry loop, and `thread_time()`
@@ -170,16 +174,49 @@ def _shutdown_measured(worker: Worker, timeout: float | None) -> float:
     test's — the caller in `join`, the drain thread inside the sink's `Event.wait` — so the
     bound is a property of the process and needs no load allowance.
     """
-    if _lifecycle._state.worker_exists() is not worker:
-        install_worker(worker)
     cpu = time.process_time()
     wall = time.monotonic()
-    _lifecycle._shutdown_worker(timeout)
+    call()
     elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
-    assert spent < _CPU_BOUND, (
-        f"shutdown(timeout={timeout}) spent {spent:.3f}s of CPU: the wait is not idle"
-    )
+    assert spent < _CPU_BOUND, f"the shutdown spent {spent:.3f}s of CPU: the wait is not idle"
     return elapsed
+
+
+def _shutdown_measured(worker: Worker, timeout: float | None) -> float:
+    """Runs the real `shutdown()` path over `worker` through `_measured`."""
+    if _lifecycle._state.worker_exists() is not worker:
+        install_worker(worker)
+    return _measured(lambda: _lifecycle._shutdown_worker(timeout))
+
+
+class _MeasuredThread(threading.Thread):
+    """Runs a shutdown call through `_measured` on a thread, keeping its wall time or failure.
+
+    An assertion that fails on a worker thread is otherwise discarded with the thread, which
+    would turn the CPU bound into decoration; `finish` re-raises it on the test's thread.
+    """
+
+    def __init__(self, call: Callable[[], object], name: str = "stopper") -> None:
+        super().__init__(name=name)
+        self.call = call
+        self.elapsed: float | None = None
+        self.failure: BaseException | None = None
+
+    def run(self) -> None:
+        """Measures the call, keeping whatever it raised."""
+        try:
+            self.elapsed = _measured(self.call)
+        except BaseException as exc:
+            self.failure = exc
+
+    def finish(self, timeout: float) -> float:
+        """Joins, re-raises a failure from the thread, and returns the call's wall time."""
+        self.join(timeout)
+        assert not self.is_alive(), f"{self.name} did not return within {timeout}s"
+        if self.failure is not None:
+            raise self.failure
+        assert self.elapsed is not None
+        return self.elapsed
 
 
 def _lost_lines(err: str) -> list[tuple[int, str, str]]:
@@ -524,7 +561,7 @@ def test_a_flush_marker_answered_by_a_declined_drain_reports_abandoned() -> None
         taken = list(worker._taken_markers)
     assert taken, "the premise: the marker was taken by _drain and its emit is in flight"
 
-    stopper = threading.Thread(target=lambda: retire_process(worker, 0.5))
+    stopper = _MeasuredThread(lambda: retire_process(worker, 0.5))
     stopper.start()
     deadline = time.monotonic() + 5.0
     while worker._exit_deadline is None and time.monotonic() < deadline:
@@ -535,7 +572,7 @@ def test_a_flush_marker_answered_by_a_declined_drain_reports_abandoned() -> None
     sink.release.set()
 
     flusher.join(10.0)
-    stopper.join(10.0)
+    stopper.finish(10.0)
     worker._thread.join(5.0)
     assert results, "flush() returned"
     result = results[0]
@@ -693,24 +730,16 @@ def _stop_mid_drain(timeout: float) -> tuple[_GatedSink, Worker, float]:
     attempt_started = time.monotonic()
     threading.Event().wait(max(0.0, attempt_started + 0.1 - time.monotonic()))
 
-    elapsed: list[float] = []
-
-    def stop() -> None:
-        started = time.monotonic()
-        retire_process(worker, timeout)
-        elapsed.append(time.monotonic() - started)
-
-    stopper = threading.Thread(target=stop)
+    stopper = _MeasuredThread(lambda: retire_process(worker, timeout))
     stopper.start()
     assert event.recorded.wait(5.0), "the stop recorded its deadline before setting the event"
     recorded_at = time.monotonic()
     assert isinstance(event.seen[0], float), event.seen
     threading.Event().wait(max(0.0, recorded_at + 0.2 - time.monotonic()))
     sink.release.set()
-    stopper.join(timeout + 10.0)
-    assert elapsed, "shutdown returned"
+    elapsed = stopper.finish(timeout + 10.0)
     worker._thread.join(5.0)
-    return sink, worker, elapsed[0]
+    return sink, worker, elapsed
 
 
 def test_a_stop_landing_mid_sequence_in_drain_declines_the_retry() -> None:
@@ -743,14 +772,7 @@ def test_a_late_worker_declines_against_the_remaining_budget() -> None:
     log_foundry.configure(service="t", sink=orphan)
     log_foundry.info("arm the orphan record")
 
-    elapsed: list[float] = []
-
-    def timed_shutdown() -> None:
-        started = time.monotonic()
-        log_foundry.shutdown(timeout=1.5)
-        elapsed.append(time.monotonic() - started)
-
-    shutdown = threading.Thread(target=timed_shutdown)
+    shutdown = _MeasuredThread(lambda: log_foundry.shutdown(timeout=1.5))
     shutdown.start()
     assert orphan.in_close.wait(5.0), "the shutdown is inside the orphan close, past its latch"
 
@@ -771,11 +793,10 @@ def test_a_late_worker_declines_against_the_remaining_budget() -> None:
         _lifecycle._state._stop = event
 
     orphan.may_finish.set()
-    shutdown.join(30.0)
+    elapsed = shutdown.finish(30.0)
     late._thread.join(5.0)
 
-    assert elapsed, "the shutdown returned"
-    assert elapsed[0] < 1.5 + _SLACK, f"shutdown(timeout=1.5) returned at {elapsed[0]:.2f}"
+    assert elapsed < 1.5 + _SLACK, f"shutdown(timeout=1.5) returned at {elapsed:.2f}"
     assert isinstance(event.seen[0], float), f"recorded before the late worker's set: {event.seen}"
     assert len(late_sink.attempts) == 2, (
         f"declined against the remaining budget: {late_sink.attempts}"
@@ -812,6 +833,57 @@ def test_two_concurrent_shutdowns_follow_the_recorded_deadline() -> None:
     )
     assert sink.closes == 1, f"close() ran once, by the caller whose join matched: {sink.closes}"
     assert worker.stopped_reason is None, "and the recording caller's join did not expire"
+
+
+def test_the_recording_caller_is_the_joining_caller_whichever_arrives_first(
+    monkeypatch,
+) -> None:
+    """FR-004 AC-4 made deterministic: the gate and the record cannot go to different callers.
+
+    Thread A claims `shutdown(timeout=1.8)` and is parked before its `stop`; the main thread's
+    `shutdown(timeout=0.9)` then arrives, loses the claim, waits its own budget and returns; A is
+    released and joins against 1.8. Against a mutant that records the deadline first-writer-wins
+    but lets `stop` decide the gate on its own, the 0.9 caller does the join while the drain
+    declines against 1.8: its join expires at 0.9 as attempt 2 ends at 1.0, `stopped_reason`
+    reads `ShutdownTimeout` and `close()` never runs. `run_concurrently` reaches that
+    interleaving about one time in twenty; the park reaches it every time.
+    """
+    sink = _SlowFailSink(0.5)
+    worker = _worker(sink)
+    install_worker(worker)
+    worker.submit(_three_events())
+    parked = threading.Event()
+    release = threading.Event()
+    real_stop = Worker.stop
+
+    def parking_stop(
+        self: Worker,
+        timeout: float | None = worker_mod.DEFAULT_SHUTDOWN_TIMEOUT,
+        *,
+        claimed: bool | None = None,
+    ) -> None:
+        if threading.current_thread().name == "A":
+            parked.set()
+            assert release.wait(10.0)
+        real_stop(self, timeout, claimed=claimed)
+
+    monkeypatch.setattr(Worker, "stop", parking_stop)
+    first = _MeasuredThread(lambda: _lifecycle._shutdown_worker(1.8), name="A")
+    started = time.monotonic()
+    first.start()
+    assert parked.wait(5.0), "A claimed its stop and is parked before performing it"
+
+    second = _measured(lambda: _lifecycle._shutdown_worker(0.9))
+    release.set()
+    elapsed = first.finish(10.0)
+    worker._thread.join(5.0)
+
+    recorded = worker._exit_deadline
+    assert isinstance(recorded, float) and recorded - started > 1.5, "A's deadline governs"
+    assert second < 0.9 + _SLACK, f"the losing caller returned within its own budget: {second:.2f}"
+    assert elapsed < 1.8 + _SLACK, f"A returned within its own budget: {elapsed:.2f}"
+    assert worker.stopped_reason is None, "the join belonged to the caller whose deadline governs"
+    assert sink.closes == 1, f"and that caller closed the sink: {sink.closes}"
 
 
 def test_shutdown_flush_and_health_together_leave_no_thread_blocked() -> None:
@@ -863,12 +935,15 @@ def test_both_delivery_paths_under_one_shutdown_balance_the_ledger() -> None:
     caller = threading.Thread(target=orphan, name="orphan-caller")
     caller.start()
     elapsed = _shutdown_measured(worker, 1.2)
-    caller.join(1.2 + _SLACK)
-    assert not caller.is_alive(), "the orphan call ended within T plus slack"
+    caller.join(5.0)
+    assert not caller.is_alive()
     worker._thread.join(5.0)
     health = log_foundry.health()
 
     assert elapsed < 1.2 + _SLACK, f"shutdown returned at {elapsed:.2f}"
+    assert orphan_elapsed and orphan_elapsed[0] < 1.2 + _SLACK, (
+        f"the orphan call ended within T plus slack: {orphan_elapsed}"
+    )
     by_thread = {name: sink.attempts.count(name) for name in set(sink.attempts)}
     assert by_thread == {"log-foundry-worker": 2, "orphan-caller": 1}, by_thread
     orphan_delivered = sum(1 for e in sink.delivered if e.get("message") == "orphan")
@@ -895,7 +970,7 @@ def _expire_on_a_wedged_batch(capsys) -> tuple[_GatedSink, Worker, str]:
     worker = _worker(sink)
     worker.submit(_three_events())
 
-    retire_process(worker, 0.5)
+    _shutdown_measured(worker, 0.5)
 
     assert sink.in_emit.is_set(), "the premise: the drain thread is inside the first emit"
     assert worker.stopped_reason == "ShutdownTimeout", "the premise: the join expired"
@@ -1031,6 +1106,8 @@ def test_in_flight_is_reset_in_the_forked_child(resume: bool) -> None:
     child's record is left as it stands.
     """
     worker = _worker(_SlowFailSink(0.0, fail_times=0))
+    worker.stop(5.0)
+    assert not worker._thread.is_alive(), "the premise: the parent's drain thread has ended"
     worker._in_flight = 3
     worker._exit_deadline = 1.0
 
@@ -1039,5 +1116,8 @@ def test_in_flight_is_reset_in_the_forked_child(resume: bool) -> None:
         assert worker._in_flight == 0
         assert worker._exit_deadline == (None if resume else 1.0)
     finally:
-        worker._exit_deadline = None
-        worker.stop(5.0)
+        # A resumed thread here inherits the stop event the parent's stop() set — a real fork
+        # replaces that event before this handler runs — so its drain loop exits at once;
+        # joining it is what proves nothing is leaked, on either branch.
+        worker._thread.join(5.0)
+        assert not worker._thread.is_alive(), "no drain thread outlives the test"

@@ -34,8 +34,9 @@ of the exit drain. This deadline deliberately does not consult that event (a shu
 wait and never skips work), so on its own the sequence would cost ``(max_retries + 1) x
 publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker declines a retry predicted to
 end after the ``shutdown()`` deadline, so the exit drain's worst case is bounded by the
-``shutdown()`` budget plus one in-flight ``publish_timeout`` -- the first attempt is always made --
-and at these defaults the third attempt is declined at 20 s and ``close()`` runs. Ten is chosen on
+``shutdown()`` budget plus up to two ``publish_timeout``s -- the emit in flight when the budget
+runs out, and the first attempt of a tail batch, which is never declined -- and at these defaults
+the third attempt is declined at 20 s and ``close()`` runs. Ten is chosen on
 the size of the improvement: the same path was *unbounded* before this bound, 8.3 hours for a
 5,980-event backlog at 5 s an event.
 """
@@ -74,9 +75,10 @@ class NATSSink:
     > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
 
     The worst case is therefore ``publish_timeout`` per emit, plus one in-flight ack — and across
-    the exit drain the ``shutdown()`` budget plus one in-flight ``publish_timeout``, since
-    ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and the
-    first attempt is always made. Before that it was ``(max_retries + 1) x publish_timeout``,
+    the exit drain the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in
+    flight when the budget runs out and the first attempt of a tail batch — since
+    ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and a
+    batch's first attempt is always made. Before that it was ``(max_retries + 1) x publish_timeout``,
     which exceeded the join at the defaults; ``architecture.md`` section 12 records the closure.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
