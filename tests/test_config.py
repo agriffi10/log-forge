@@ -58,9 +58,7 @@ def test_ceilings_are_configurable() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "name", ["max_value_bytes", "max_stack_bytes", "max_keys", "max_depth"]
-)
+@pytest.mark.parametrize("name", ["max_value_bytes", "max_stack_bytes", "max_keys", "max_depth"])
 @pytest.mark.parametrize("bad", [0, -1])
 def test_a_non_positive_ceiling_is_rejected(name: str, bad: int) -> None:
     with pytest.raises(ValueError, match=name):
@@ -77,26 +75,24 @@ def test_a_rejected_call_leaves_the_config_untouched() -> None:
 
 def test_max_keys_configured_through_configure_takes_effect() -> None:
     from log_foundry import model
+
     config.configure(max_keys=2)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
     )
-    event = model.build_event(
-        span, "INFO", "m", fields={str(i): i for i in range(10)}, baggage={}
-    )
+    event = model.build_event(span, "INFO", "m", fields={str(i): i for i in range(10)}, baggage={})
     assert len(event["fields"]) == 2
     assert event["truncated"] is True
 
 
 def test_max_depth_configured_through_configure_takes_effect() -> None:
     from log_foundry import model
+
     config.configure(max_depth=2)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
     )
-    event = model.build_event(
-        span, "INFO", "m", fields={"a": {"b": {"c": {"d": 1}}}}, baggage={}
-    )
+    event = model.build_event(span, "INFO", "m", fields={"a": {"b": {"c": {"d": 1}}}}, baggage={})
     assert "<depth limit>" in str(event["fields"])
     assert event["truncated"] is True
 
@@ -105,6 +101,7 @@ def test_max_depth_of_one_still_keeps_scalar_field_values() -> None:
     """`fields` is the payload container, not a nesting level the caller chose — so the
     smallest legal max_depth must still emit scalar values rather than an empty event."""
     from log_foundry import model
+
     config.configure(max_depth=1)
     span = model.Span(
         trace_id="a" * 32, span_id="b" * 16, parent_span_id=None, name="fn", start_ts=0.0
@@ -342,7 +339,9 @@ def test_configure_before_any_logging_creates_no_worker(capsys) -> None:
 
     config.configure(sink=SwapSink())
 
-    assert _lifecycle._state._worker is None, "a swap must not build a worker to have nothing to drain"
+    assert _lifecycle._state._worker is None, (
+        "a swap must not build a worker to have nothing to drain"
+    )
     assert capsys.readouterr().err == "", "and must not absorb a fault it caused itself"
 
 
@@ -512,7 +511,9 @@ def test_the_swap_waits_for_a_close_that_fits_inside_the_budget() -> None:
     elapsed = time.monotonic() - start
 
     assert old.closed == 1, "a close that fits in the budget has completed on return"
-    assert elapsed >= close_seconds, "and configure() waited for it rather than firing and forgetting"
+    assert elapsed >= close_seconds, (
+        "and configure() waited for it rather than firing and forgetting"
+    )
 
 
 def test_shutdown_gives_an_outstanding_close_a_bounded_grace_to_finish() -> None:
@@ -565,7 +566,9 @@ def test_the_grace_is_capped_rather_than_taking_the_whole_shutdown_budget(monkey
             f"the patched 0.3 s grace must be the bound, not the shipped "
             f"{worker_mod.DEFAULT_SHUTDOWN_TIMEOUT}s budget — took {elapsed:.2f}s"
         )
-        assert elapsed < 5.0, f"the grace must be capped, not the whole budget — took {elapsed:.2f}s"
+        assert elapsed < 5.0, (
+            f"the grace must be capped, not the whole budget — took {elapsed:.2f}s"
+        )
         assert hung.closed == 0, "and the hung close is abandoned"
     finally:
         hung.release.set()
@@ -713,9 +716,7 @@ def test_health_does_not_block_behind_the_grace() -> None:
         _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
-        joining = threading.Thread(
-            target=_lifecycle.join_closers, args=(time.monotonic() + 2.0,)
-        )
+        joining = threading.Thread(target=_lifecycle.join_closers, args=(time.monotonic() + 2.0,))
         joining.start()
         try:
             start = time.monotonic()
@@ -896,3 +897,209 @@ def test_a_str_enum_stamp_is_accepted_and_stored_plain() -> None:
     config.configure(env=Env.PROD)
     assert config.get_config().env == "prod"
     assert type(config.get_config().env) is str
+
+
+# -- SPEC-065: integer arguments are exact — the four ceilings are refused or stored as int ------
+
+import dataclasses  # noqa: E402
+import sys  # noqa: E402
+from enum import IntEnum  # noqa: E402
+
+from log_foundry.sinks.memory import MemorySink  # noqa: E402
+
+_CEILINGS = [f.name for f in dataclasses.fields(config.Config) if f.name.startswith("max_")]
+
+
+def test_the_ceiling_sweep_covers_every_max_field() -> None:
+    """Derived from ``Config``, so a fifth ceiling joins every sweep below or fails here."""
+    assert _CEILINGS == ["max_value_bytes", "max_stack_bytes", "max_keys", "max_depth"]
+    assert len(_CEILINGS) == 4
+
+
+class Sub(int):
+    """A plain int subclass: of the declared type, and works as the int it holds."""
+
+
+class Spoof(int):
+    """An int subclass that lies to the comparison and to arithmetic."""
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __add__(self, other: object) -> str:  # type: ignore[override]
+        return "x"
+
+    def __sub__(self, other: object) -> str:  # type: ignore[override]
+        return "x"
+
+
+class NoRepr(int):
+    """An int subclass that cannot be rendered; its comparisons are native."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("no repr")
+
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+
+class Ceiling(IntEnum):
+    FIVE = 5
+
+
+def _probe_fields(**ceiling: object) -> dict:
+    """The Overview probe: one orphan event into a MemorySink under one ceiling.
+
+    The config is reset first, as the autouse fixture does between tests, so two probes in one
+    test start from the same defaults.
+    """
+    config._config = config.Config()
+    sink = MemorySink()
+    config.configure(sink=sink, **ceiling)  # type: ignore[arg-type]
+    log_foundry.info("x", s="a" * 200, b=b"ab", l=[1, 2, 3, 4], d={"a": {"b": {"c": 1}}})
+    assert len(sink.events) == 1, "the probe emits exactly one event"
+    fields = sink.events[0]["fields"]
+    assert isinstance(fields, dict)
+    return fields
+
+
+_NOT_AN_INT = [2.5, 100.0, float("nan"), float("inf"), "5", object()]
+
+
+@pytest.mark.parametrize("name", _CEILINGS)
+@pytest.mark.parametrize("bad", _NOT_AN_INT, ids=["2.5", "100.0", "nan", "inf", "str", "object"])
+def test_a_non_int_ceiling_is_refused_naming_it_and_its_type(name: str, bad: object) -> None:
+    """FR-001 AC-1: the message names the ceiling and the type, which the bare `<` did not."""
+    with pytest.raises(TypeError) as info:
+        config.configure(**{name: bad})
+    message = str(info.value)
+    assert name in message
+    assert type(bad).__name__ in message
+    assert getattr(config.get_config(), name) == getattr(config.Config(), name)
+
+
+def test_an_integral_float_is_refused_not_floored() -> None:
+    """FR-001 AC-2: `100.0` is outside the declared type, so it is not quietly `100`."""
+    config.configure(max_keys=7)
+    with pytest.raises(TypeError, match="max_keys must be an int, got float"):
+        config.configure(max_keys=100.0)  # type: ignore[arg-type]
+    assert config.get_config().max_keys == 7
+
+
+def test_none_and_an_absent_ceiling_leave_every_ceiling_as_it_was() -> None:
+    """FR-001 AC-3: `None` still means not supplied."""
+    chosen = {name: 10 + i for i, name in enumerate(_CEILINGS)}
+    config.configure(**chosen)
+    config.configure(max_keys=None)
+    config.configure()
+    assert {name: getattr(config.get_config(), name) for name in _CEILINGS} == chosen
+
+
+@pytest.mark.parametrize("name", _CEILINGS)
+@pytest.mark.parametrize("good", [1, sys.maxsize], ids=["1", "maxsize"])
+def test_one_and_maxsize_are_accepted_and_stored_equal(name: str, good: int) -> None:
+    """FR-001 AC-3: the floor is 1 inclusive and there is no cap."""
+    config.configure(**{name: good})
+    assert getattr(config.get_config(), name) == good
+
+
+@pytest.mark.parametrize("name", _CEILINGS)
+def test_a_bool_ceiling_is_stored_as_the_exact_int(name: str) -> None:
+    """FR-002 AC-1: `True` works as 1 and is stored as `1`, never as a `bool`."""
+    config.configure(**{name: True})
+    stored = getattr(config.get_config(), name)
+    assert stored == 1
+    assert type(stored) is int
+
+
+@pytest.mark.parametrize("name", _CEILINGS)
+def test_an_int_subclass_and_an_int_enum_are_stored_as_the_exact_int(name: str) -> None:
+    """FR-002 AC-2: `int.__index__` reads the int's storage, so no subclass reaches sanitize."""
+    config.configure(**{name: Sub(3)})
+    stored = getattr(config.get_config(), name)
+    assert stored == 3
+    assert type(stored) is int
+
+    config.configure(**{name: Ceiling.FIVE})
+    stored = getattr(config.get_config(), name)
+    assert stored == 5
+    assert type(stored) is int
+
+
+def test_a_spoofing_subclass_produces_the_same_event_as_the_int_it_holds() -> None:
+    """FR-002 AC-3: at `71e42dd` `Spoof(3)` as max_value_bytes emptied `fields`."""
+    plain = _probe_fields(max_value_bytes=3)
+    spoofed = _probe_fields(max_value_bytes=Spoof(3))
+    assert plain != {}, "the probe's fields survive a ceiling of 3, truncated"
+    assert spoofed == plain
+
+
+@pytest.mark.parametrize("name", _CEILINGS)
+@pytest.mark.parametrize("zero", [False, Sub(0), Spoof(0)], ids=["False", "Sub(0)", "Spoof(0)"])
+def test_a_spoofed_zero_is_refused_reporting_the_value_it_holds(name: str, zero: int) -> None:
+    """FR-002 AC-4: the `< 1` test runs on the exact int, so a lying `__lt__` cannot pass a 0."""
+    before = getattr(config.get_config(), name)
+    with pytest.raises(ValueError, match=name) as info:
+        config.configure(**{name: zero})
+    assert "got 0" in str(info.value)
+    assert getattr(config.get_config(), name) == before
+
+
+def test_the_refusal_message_is_built_from_the_exact_int() -> None:
+    """FR-002 AC-4: a subclass whose repr raises still yields the ValueError, nothing else."""
+    with pytest.raises(ValueError, match="max_keys must be >= 1, got 0"):
+        config.configure(max_keys=NoRepr(0))
+
+
+def test_true_as_max_keys_produces_the_same_event_as_one() -> None:
+    """FR-002 AC-5: the floor side is protected, not turned into a refusal."""
+    assert _probe_fields(max_keys=True) == _probe_fields(max_keys=1)
+
+
+def test_a_refused_ceiling_leaves_every_field_as_it_was() -> None:
+    """FR-003 AC-1: the TypeError precedes every assignment, so `service` is not applied."""
+    config.configure(service="before", max_keys=7)
+    snapshot = config.get_config()
+    with pytest.raises(TypeError):
+        config.configure(service="new", max_keys=2.5)  # type: ignore[arg-type]
+    after = config.get_config()
+    assert after == snapshot
+    assert (after.service, after.max_keys) == ("before", 7)
+
+
+def test_a_refused_ceiling_leaves_the_sink_unstamped() -> None:
+    """FR-003 AC-2: the refusal precedes the ownership stamp, as it does for a stamp."""
+    from log_foundry.sinks.null import NullSink
+
+    sink = NullSink()
+    with pytest.raises(TypeError):
+        config.configure(sink=sink, max_depth=float("nan"))  # type: ignore[arg-type]
+    assert config.get_config().sink is None
+    with _lifecycle._owned_lock:
+        assert id(sink) not in _lifecycle._owned, "a refused call must not stamp the sink"
+
+
+def test_two_bad_ceilings_raise_once_and_change_nothing() -> None:
+    """FR-003 AC-3: the first ceiling validated raises; the good one is never stored."""
+    with pytest.raises(TypeError, match="max_value_bytes"):
+        config.configure(max_value_bytes=2.5, max_keys=0)  # type: ignore[arg-type]
+    assert config.get_config() == config.Config()
+    with pytest.raises(ValueError, match="max_value_bytes"):
+        config.configure(max_value_bytes=0, max_keys=2.5)  # type: ignore[arg-type]
+    assert config.get_config() == config.Config()
+
+
+def test_a_refused_ceiling_does_not_swap_a_running_worker() -> None:
+    """FR-003 AC-4: the refusal precedes the swap, so sink `a` stays live and unclosed."""
+    a, b = SwapSink(), SwapSink()
+    config.configure(sink=a)
+    worker = _worker_with(a)
+    try:
+        with pytest.raises(TypeError):
+            config.configure(sink=b, max_keys=2.5)  # type: ignore[arg-type]
+        assert config.get_config().sink is a
+        assert worker.sink is a
+        assert a.closed == 0
+        assert b.batches == []
+    finally:
+        retire_process(worker)

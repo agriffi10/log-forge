@@ -71,23 +71,46 @@ the lifecycle lock underneath this.
 """
 
 
-def _require_positive(name: str, value: int | None) -> None:
-    """Rejects a non-positive ceiling.
+def _require_positive(name: str, value: object) -> int | None:
+    """Returns a ceiling as an exact ``int``, or raises (SPEC-065 FR-001, FR-002).
 
-    A ceiling of zero would empty every event it touched.
+    A ceiling of zero would empty every event it touched, and one that is not an ``int`` does
+    integer arithmetic in ``sanitize`` on every event with whatever it is: measured at
+    ``71e42dd``, ``max_value_bytes=2.5`` emptied ``fields``, ``nan`` lost the event and ``inf``
+    wrote values unbounded, while ``"5"`` raised the comparison's own ``TypeError`` naming
+    neither the ceiling nor the type. So the ``isinstance`` test comes first and names both. A
+    value outside ``int | None`` is refused rather than floored, because ``math.ceil(2.5)`` would
+    hide the caller's mistake behind a ceiling they never chose, and under invariant 10 a float
+    was already a ``mypy`` error for every type-checked caller.
+
+    An ``int`` instance — a ``bool``, an ``IntEnum`` member or any subclass — is of the declared
+    type and works as the int it holds, so it is accepted; what is stored is
+    ``int.__index__(value)``, which reads the integer from the int's own storage and ignores a
+    subclass's ``__index__``, ``__int__``, ``__lt__`` and arithmetic. That is the same move
+    :func:`_require_text` makes with ``str.__str__``, and it is what closes the zero ceiling
+    SPEC-034 shut: a ``class Spoof(int)`` whose ``__lt__`` returned ``False`` passed the old
+    ``value < 1`` test holding ``0``. The ``< 1`` test and the message are both built from the
+    exact ``int``, so a subclass whose ``__repr__`` raises still yields the ``ValueError``.
 
     Args:
       name: The setting's name, used in the error message.
       value: The proposed ceiling, or ``None`` to skip the check.
 
     Returns:
-      None.
+      The ceiling as an exact ``int``, or ``None`` when it was not supplied.
 
     Raises:
+      TypeError: If the value is present and not an ``int`` instance.
       ValueError: If the value is present and less than 1.
     """
-    if value is not None and value < 1:
-        raise ValueError(f"{name} must be >= 1, got {value}")
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    exact = int.__index__(value)
+    if exact < 1:
+        raise ValueError(f"{name} must be >= 1, got {exact}")
+    return exact
 
 
 def _require_text(name: str, value: object) -> str | None:
@@ -120,7 +143,9 @@ def _require_text(name: str, value: object) -> str | None:
     try:
         plain.encode("utf-8")
     except UnicodeEncodeError:
-        raise ValueError(f"{name} must be encodable as UTF-8; it carries a lone surrogate") from None
+        raise ValueError(
+            f"{name} must be encodable as UTF-8; it carries a lone surrogate"
+        ) from None
     return plain
 
 
@@ -189,22 +214,26 @@ def configure(
       defaults: Fields merged into every event at the lowest precedence. Any ``Mapping`` is
         accepted and a copy is stored, so a later edit to the caller's own object does not
         reach the config (SPEC-051 FR-002).
-      max_value_bytes: Per-value ceiling, in UTF-8 bytes or rendered digits.
-      max_stack_bytes: Ceiling for ``error.stack`` alone.
-      max_keys: Ceiling on the entries of one mapping or sequence.
-      max_depth: Ceiling on nesting levels.
+      max_value_bytes: Per-value ceiling, in UTF-8 bytes or rendered digits. An ``int``; a
+        ``bool`` or other ``int`` subclass is stored as the exact ``int`` it holds, and a
+        ``float`` is refused rather than floored (SPEC-065).
+      max_stack_bytes: Ceiling for ``error.stack`` alone. An ``int``, as ``max_value_bytes``.
+      max_keys: Ceiling on the entries of one mapping or sequence. An ``int``, as
+        ``max_value_bytes``.
+      max_depth: Ceiling on nesting levels. An ``int``, as ``max_value_bytes``.
 
     Returns:
       None.
 
     Raises:
       ValueError: If any ceiling is less than 1, or a stamp does not encode as UTF-8.
-      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001).
+      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001), or
+        a ceiling is not an ``int`` (SPEC-065 FR-001).
     """
-    _require_positive("max_value_bytes", max_value_bytes)
-    _require_positive("max_stack_bytes", max_stack_bytes)
-    _require_positive("max_keys", max_keys)
-    _require_positive("max_depth", max_depth)
+    max_value_bytes = _require_positive("max_value_bytes", max_value_bytes)
+    max_stack_bytes = _require_positive("max_stack_bytes", max_stack_bytes)
+    max_keys = _require_positive("max_keys", max_keys)
+    max_depth = _require_positive("max_depth", max_depth)
     service = _require_text("service", service)
     version = _require_text("version", version)
     env = _require_text("env", env)

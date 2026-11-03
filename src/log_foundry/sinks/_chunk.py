@@ -20,19 +20,25 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def chunk_list(items: list[_T], size: int) -> Iterator[list[_T]]:
     """Yields the items in successive slices of at most the given size.
 
+    The size ``range`` and the slice arithmetic use is the exact ``int`` :func:`require_positive`
+    returns (SPEC-065 FR-004), not the caller's object: a subclass whose ``__radd__`` returned
+    ``0`` made ``start + size`` collapse every slice when the return was discarded.
+
     Args:
       items: The items to split.
-      size: The maximum slice length, which must be positive.
+      size: The maximum slice length, which must be a positive ``int``.
 
     Returns:
       An iterator over the slices.
 
     Raises:
+      TypeError: If the size is not an ``int``, raised at the first ``next()`` as the
+        ``ValueError`` is.
       ValueError: If the size is not positive, raised at the first ``next()`` because this is a
         generator (SPEC-049 FR-002) — ``range`` used to raise its own for ``0`` and yield nothing
         for a negative.
     """
-    require_positive(size, "size", "chunk_list")
+    size = require_positive(size, "size", "chunk_list")
     for start in range(0, len(items), size):
         yield items[start : start + size]
 

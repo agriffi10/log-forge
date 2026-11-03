@@ -89,6 +89,35 @@ def clamp_server_delay(value: float | None, ceiling: float) -> float | None:
     return min(value, ceiling)
 
 
+def _exact_number(value: float) -> float:
+    """Returns an ``int`` or ``float`` instance as the exact builtin it holds (SPEC-065 FR-004).
+
+    ``int.__index__`` and ``float.__float__`` are the unbound builtin accessors: each reads the
+    number from the instance's own storage and ignores anything a subclass overrides —
+    ``__index__``, ``__int__``, ``__float__`` and every comparison. The validators here used to
+    test the caller's object itself, so a subclass whose ``__le__`` or ``__gt__`` lied passed the
+    test holding a zero; measured at ``71e42dd``, ``MemorySink(maxlen=LeSpoof(0))`` kept nothing
+    and ``flush()`` reported ``ok=True``. A ``bool`` is an ``int`` and takes the ``int`` branch,
+    so ``True`` becomes ``1``. Anything that is neither is returned unchanged, so a caller that
+    has already refused a non-number never sees this branch and one that has not keeps the
+    comparison's own ``TypeError``, which :func:`usable_timeout` documents as unchanged.
+
+    Args:
+      value: The caller's number, possibly a subclass instance.
+
+    Returns:
+      The exact ``int`` or ``float`` the value holds, or the value itself when it is neither.
+
+    Raises:
+      None.
+    """
+    if isinstance(value, int):
+        return int.__index__(value)
+    if isinstance(value, float):
+        return float.__float__(value)
+    return value
+
+
 def usable_timeout(value: float, default: float) -> float:
     """Returns a timeout that actually bounds something, or the caller's default (SPEC-047).
 
@@ -98,6 +127,11 @@ def usable_timeout(value: float, default: float) -> float:
     through — :func:`clamp_server_delay`'s reasoning for ``Retry-After``, applied to a value the
     caller supplies rather than one a destination does.
 
+    The test runs on the exact builtin (SPEC-065 FR-004), through :func:`_exact_number`, so an
+    ``int`` or ``float`` subclass is judged by the number it holds rather than by what its
+    comparisons say, and what is returned is that exact ``int`` or ``float``. A non-number is
+    passed to the comparison unchanged and raises its own ``TypeError``, as before.
+
     Args:
       value: The caller's timeout.
       default: The fallback, passed in rather than named here because each sink's default is its
@@ -105,12 +139,14 @@ def usable_timeout(value: float, default: float) -> float:
         constant baked in here would silently give one sink the other's.
 
     Returns:
-      The value if it bounds anything, else the default.
+      The value as the exact ``int`` or ``float`` it holds if it bounds anything, else the
+      default.
 
     Raises:
       None.
     """
-    return value if 0 < value < float("inf") else default
+    exact = _exact_number(value)
+    return exact if 0 < exact < float("inf") else default
 
 
 def require_timeout(value: float, name: str, owner: str) -> float:
@@ -127,30 +163,33 @@ def require_timeout(value: float, name: str, owner: str) -> float:
 
     The test is ``not (0 < value < inf)``, identical to ``usable_timeout``'s and for its reason:
     ``NaN`` compares ``False`` to everything, so the obvious pair of comparisons lets it through.
+    It runs on the exact builtin (SPEC-065 FR-004), through :func:`_exact_number` after the
+    ``isinstance`` check, so an ``int`` or ``float`` subclass whose comparisons or ``__float__``
+    are overridden to look positive is judged by the number it holds, and the message names that
+    number. What is returned is that exact ``int`` or ``float``; ``True`` is returned as ``1``.
 
     Args:
-      value: The caller's timeout.
+      value: The caller's timeout, an ``int`` or a ``float``.
       name: The argument's name, for the message.
       owner: The class or function refusing it, for the message.
 
     Returns:
-      The value unchanged, when it bounds something.
+      The timeout as the exact ``int`` or ``float`` it holds, when it bounds something.
 
     Raises:
       TypeError: When the value is not a number — ``None`` was a runtime-working, ``mypy``-invalid
         0.x spelling of "no bound", and the bare comparison would have raised an unnamed
         ``TypeError`` from inside ``<`` (SPEC-049, system-frame review).
-      ValueError: When the value is zero, negative, infinite or ``NaN``.
+      ValueError: When the exact value is zero, negative, infinite or ``NaN``.
     """
     if not isinstance(value, int | float):
-        raise TypeError(
-            f"{owner} {name} must be a number of seconds, not {type(value).__name__}"
-        )
-    if not 0 < value < float("inf"):
+        raise TypeError(f"{owner} {name} must be a number of seconds, not {type(value).__name__}")
+    exact = _exact_number(value)
+    if not 0 < exact < float("inf"):
         raise ValueError(
-            f"{owner} {name} must be a positive, finite number of seconds, not {value!r}"
+            f"{owner} {name} must be a positive, finite number of seconds, not {exact!r}"
         )
-    return value
+    return exact
 
 
 def require_positive(value: int, name: str, owner: str) -> int:
@@ -161,21 +200,30 @@ def require_positive(value: int, name: str, owner: str) -> int:
     made the chunker yield nothing, so ``emit`` returned having inserted no rows with ``losses()``
     at zero — silent total loss — and ``chunk_size=0`` raised out of ``range()`` on every batch.
 
+    The test runs on the exact ``int`` (SPEC-065 FR-004): ``int.__index__(value)`` reads the
+    integer from the instance's own storage, so an ``int`` subclass whose ``__le__`` lies is
+    judged by the number it holds — a ``LeSpoof(0)`` used to pass and ``MemorySink`` kept
+    nothing — and the message names that number. The exact ``int`` is what is returned, so a
+    caller that uses the return in ``range`` or arithmetic never sees the subclass's operators;
+    ``True`` is returned as ``1``. This is the sink-side twin of ``config._require_positive``
+    (invariant 6): both doors give the same verdict on the same subclass.
+
     Args:
-      value: The caller's count.
+      value: The caller's count, an ``int``.
       name: The argument's name, for the message.
       owner: The class refusing it, for the message.
 
     Returns:
-      The value unchanged, when it is positive.
+      The count as the exact ``int`` it holds, when it is positive.
 
     Raises:
       TypeError: When the value is not an integer, so the argument is named rather than the
         comparison raising an unnamed one.
-      ValueError: When the value is zero or negative.
+      ValueError: When the exact value is zero or negative.
     """
     if not isinstance(value, int):
         raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
-    if value <= 0:
-        raise ValueError(f"{owner} {name} must be a positive integer, not {value!r}")
-    return value
+    exact = int.__index__(value)
+    if exact <= 0:
+        raise ValueError(f"{owner} {name} must be a positive integer, not {exact!r}")
+    return exact
