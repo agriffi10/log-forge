@@ -628,8 +628,10 @@ def _assert_exact_types(obj: object, *, row: Row, path: str = "") -> None:
     """SPEC-063 FR-002: every leaf is an exact JSON scalar, every container an exact dict or list.
 
     Exact, by ``type() is``, because a subclass instance or an impostor that reached the event is
-    what this observable rules out, and ``isinstance`` would admit both. The message names the
-    path and the type's qualified name, never the leaf itself, whose ``repr`` may be hostile.
+    what this observable rules out, and ``isinstance`` would admit both. Identity, never ``in``: a
+    class whose metaclass compares equal to everything is ``in`` any tuple of types, which is the
+    very impostor this walks for. The message names the path and the type's qualified name, never
+    the leaf itself, whose ``repr`` may be hostile.
     """
     kind = type(obj)
     if kind is dict:
@@ -640,7 +642,8 @@ def _assert_exact_types(obj: object, *, row: Row, path: str = "") -> None:
         for item in obj:  # type: ignore[attr-defined]
             _assert_exact_types(item, row=row, path=f"{path}[]")
     else:
-        assert kind in _EXACT_LEAVES, f"{row.id}: {path} is a {kind.__qualname__}"
+        exact = any(kind is leaf for leaf in _EXACT_LEAVES)
+        assert exact, f"{row.id}: {path} is a {kind.__qualname__}"
 
 
 def _actual(event: dict[str, object], slot: str) -> object:

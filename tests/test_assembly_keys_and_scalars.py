@@ -169,6 +169,7 @@ def test_a_container_key_obeys_max_keys() -> None:
     """FR-001 AC2: a 300-member key is capped at the default 256 members, and marked."""
     fields, flag = sanitize_fields({"k": {tuple(range(300)): 1}}, cfg=Config())
     (text,) = fields["k"]
+    assert text.startswith("["), "the key is not the JSON of its members"
     assert json.loads(text) == list(range(256))
     assert flag is True
 

@@ -200,8 +200,10 @@ class _K:
         return "K"
 
 
-def _m_events(fake_sink) -> list[dict]:
-    return [e for e in fake_sink.events if e["message"] == "m"]
+def _one_m(fake_sink) -> dict:
+    events = [e for e in fake_sink.events if e["message"] == "m"]
+    assert len(events) == 1, f"{len(events)} events for the level call: the event was lost"
+    return events[0]
 
 
 def _run(lf, route: str, call, *, span_defaults: dict | None = None) -> None:
@@ -230,7 +232,7 @@ def test_a_hostile_default_key_costs_only_itself(lf, fake_sink, route: str, sour
         lambda: lf.info("m", svc=3),
         span_defaults={_K(): 1} if source == "trace" else None,
     )
-    (event,) = _m_events(fake_sink)
+    event = _one_m(fake_sink)
     assert event["fields"] == {"svc": 3}
     assert event.get("truncated") is True
 
@@ -242,7 +244,7 @@ def test_a_hostile_per_call_key_drops_the_lower_precedence_default(
     """FR-004 AC7: the per-call ``K`` is kept and the default ``svc`` is the one dropped."""
     lf.configure(defaults={"svc": 1})
     _run(lf, route, lambda: lf.info("m", fields={_K(): 2}))
-    (event,) = _m_events(fake_sink)
+    event = _one_m(fake_sink)
     assert event["fields"] == {"K": 2}
     assert event.get("truncated") is True
 
@@ -256,11 +258,11 @@ def test_the_rebuilt_merge_keeps_precedence_and_orders_highest_source_first(lf, 
 
     lf.configure(defaults={"a": 1, "x": 1})
     _run(lf, "in_span", call, span_defaults={"y": "span"})
-    (plain,) = _m_events(fake_sink)
+    plain = _one_m(fake_sink)
     fake_sink.batches.clear()
     lf.configure(defaults={_K(): 1, "a": 1, "x": 1})
     _run(lf, "in_span", call, span_defaults={"y": "span"})
-    (rebuilt,) = _m_events(fake_sink)
+    rebuilt = _one_m(fake_sink)
     assert rebuilt["fields"] == plain["fields"] == {"a": 1, "x": 2, "y": "baggage", "svc": 3}
     assert list(rebuilt["fields"]) == ["svc", "x", "y", "a"]
     assert rebuilt.get("truncated") is True
@@ -275,6 +277,6 @@ def test_an_event_with_no_colliding_key_is_unchanged(lf, fake_sink) -> None:
 
     lf.configure(defaults={"a": 1, "x": 1})
     _run(lf, "in_span", call, span_defaults={"y": "span"})
-    (event,) = _m_events(fake_sink)
+    event = _one_m(fake_sink)
     assert list(event["fields"]) == ["a", "x", "y", "svc"]
     assert "truncated" not in event
