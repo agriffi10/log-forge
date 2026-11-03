@@ -981,6 +981,33 @@ close it.
   omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
   endpoint's response shape gets settled.
 
+- **A float passes the `max(x, 0)` floor on `max_retries` and `backup_count`, and breaks every
+  `emit`** (SPEC-065 system-frame review; invariant 13). Thirteen constructors floor `max_retries`
+  with `max(max_retries, 0)` — `HTTPSink`, `SocketTransport`, `SQSSink`, the Redis, Kinesis,
+  Firehose, SNS, Event Hubs, MongoDB, Postgres, ClickHouse and RabbitMQ sinks, and the worker — and
+  `max()` passes a float through to `range(retries + 1)`. Measured at `13318d4`:
+  `HTTPSink(url, max_retries=2.5).emit([e])` raises `TypeError: 'float' object cannot be interpreted
+  as an integer` with `failed=0`, as do `nan` and `inf`, and `SyslogSink(max_retries=2.5)` the same.
+  `RotatingFileSink(backup_count=2.5)` (or `inf`) raises from `range(...)` on the first rollover
+  *after* `_rotate` has closed the stream, so every later `emit` and `close()` raise
+  `ValueError: I/O operation on closed file` — the sink is dead for the life of the process.
+  **Closed by** refusing a non-`int` there with a named `TypeError` and flooring only the exact
+  `int`, as SPEC-065 did for `configure()`'s ceilings.
+- **`flush(timeout=)` and `shutdown(timeout=)` take `inf` and `nan` unchecked** (SPEC-065
+  system-frame review; invariants 1 and 13). Measured at `13318d4`, one process per value, with a
+  worker draining to a 0.4 s sink: `shutdown(timeout=math.inf)` and `shutdown(timeout=1e300)` raise
+  `OverflowError: timestamp out of range for platform time_t` into the caller and
+  `shutdown(timeout=math.nan)` raises `ValueError`, against `Raises: None`;
+  `flush(timeout=math.inf)` returns at once with reason `thread-died` while the thread is alive,
+  having delivered nothing, and `flush(timeout=math.nan)` reports `timed-out` at 0.00 s. **Closed
+  by** deciding, beside the SPEC-062 exit-drain budget, what each of the two degenerate values
+  means for a bounded wait, and refusing or flooring it by the sink-delivery rule.
+- **`SocketTransport(port=2.5)` is accepted and raises out of every `emit`** (SPEC-065
+  system-frame review; invariant 13). `_socket.py` checks `0 <= port <= 65535`, which a float
+  passes; measured at `13318d4`, UDP `sendto` then raises a raw `TypeError` on every batch — the
+  SPEC-049 port finding's shape, for a float. **Closed by** an `isinstance(port, int)` check with
+  the exact `int` stored, beside the range check.
+
 ### Resolved
 
 - ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
