@@ -135,6 +135,10 @@ Stated here rather than left to be found.
   keep that source's own order. Precedence is exactly the unpack's: the higher-precedence key of a
   colliding pair is always present first, so the key that cannot be tested, and is dropped, is
   always the lower-precedence one, and a per-call field is never dropped by a hostile default.
+  Precedence holds for values, not for the key *object* kept when keys are equal but distinct, such
+  as `1`, `1.0` and `True`: the unpack keeps the lowest source's key object with the highest
+  source's value, while the rebuild keeps the highest source's key object, so on the marked slow
+  path such a key can render `"1.0"` where the unpack wrote `"1"`.
 - **An object key keeps `str()`, which for a default object is its `repr`.** The no-repr rule holds
   inside a container key and for a value; a key that is an arbitrary object renders as its own
   `str()`, the caller's code (*Out of Scope*), and the eighth invariant's page records that
@@ -261,18 +265,29 @@ container key's old text and re-derives it the same way.
       usable `__iter__`, is written `"S"` (silence: passes at `71e42dd`). `b"ab"`, `None`, `True`, `Decimal`, a float and
       an `int` key render exactly as at `71e42dd` (silence).
 - [ ] With `_MAX_RENDERED_BYTES` patched to 100, a `bytes` subclass key of 101 zero bytes whose
-      `__repr__` raises and whose `__len__` returns 0 gives `{"<size limit>": "<size limit>"}`,
-      marked: it was priced through the unbound length and never rendered (a rendered key would be
-      `<unserializable key: T>`). A plain `b"\x00" * (64 << 20)` key (allocated before tracing)
+      `__str__` raises and whose `__len__` returns 0 gives `{"<size limit>": "<size limit>"}`,
+      marked: it was priced through the unbound length and never rendered (a rendered key is
+      `<unserializable key: T>` at `71e42dd`). It is `__str__` that raises, not `__repr__`, because
+      `str()` of a `bytes` or `bytearray` subclass calls the C repr directly and never the
+      subclass's `__repr__`; a raising `__repr__` row gives the same result with or without the
+      pricing and catches nothing. A plain `b"\x00" * (64 << 20)` key (allocated before tracing)
       returns in under 2 s of `process_time()` with a `tracemalloc` peak under 8 MiB and the same
-      result; at `71e42dd` its peak is 256 MiB. A `bytearray` key is held to the same two results.
+      result; at `71e42dd` its peak is 256 MiB. A `bytearray` key is held to the same two results,
+      as a `bytearray` subclass that defines `__hash__` (a plain `bytearray` is unhashable and
+      cannot be a dict key) or as a key yielded by a caller `Mapping`.
 - [ ] `_coerce_unbounded` renders `{"fields": {(1, 2): 3}}` with the key `"[1, 2]"`, and a key of
       `("x" * 100_000,)` whole, unclipped.
 - [ ] `f = frozenset()`, then `f = frozenset({f, (f, i)})` applied 40 times, as the single key of a
       field, returns on both delivery paths (inside a `@trace` and with no span open) in under 2 s
       of `time.process_time()`, with `truncated` set; the test's failure messages never render the
       key. It is alarm-guarded on SPEC-057 FR-001's terms and run once against `71e42dd`'s
-      `sanitize.py` from a scratch worktree, where it fails by the alarm.
+      `sanitize.py` from a scratch worktree, where it fails by the alarm. At the default
+      `max_depth` of 8 the depth limit cuts this key before the node budget does, so the row
+      exercises the depth rule through a key, not the budget.
+- [ ] The same key with `configure(max_depth=64)`, which is deep enough that the node budget is what
+      stops the walk, returns on both delivery paths in under 2 s of `process_time()` as
+      `{"<node limit>": "<node limit>"}`, marked, and is alarm-guarded and run against `71e42dd`'s
+      `sanitize.py` on the same terms.
 - [ ] A tuple key of 64 references to one 1 MiB string (allocated before tracing starts) returns in
       under 2 s of `process_time()`, with a `tracemalloc` peak under 8 MiB, and its text is
       `'["' + "x" * 8176 + TRUNCATION_MARKER`, marked; at `71e42dd` the peak is above 64 MiB. A tuple
@@ -377,6 +392,10 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
 - [ ] `tests/test_sanitize_corpus.py` holds a row for each case above and a walker asserting the
       leaf and container types over every row of the corpus on both paths, so the existing rows are
       held to the new observable too.
+- [ ] An exact `True` and `False` as a field value and as an `Enum` member's `.value` stay exact
+      `bool`s (`type(leaf) is bool`, not `1` and `0`). It is a separate row because planting out
+      `kind is bool` is otherwise silent: `int.__int__(True)` is `1`, `1 == True`, and the leaf walker
+      admits an `int`.
 - [ ] A test parses `sanitize.py` and finds no `in` or `not in` comparison whose left side is a
       call to `type` or the local name `kind`, nor the name `_PLAIN_SCALARS`; it is run against a
       fixture holding the old shape and reddens.
@@ -468,14 +487,22 @@ yielding both is dropped whole by `_merge`, announced and leaving the event.
       reads `Renamed`.
 - [ ] A class whose stored `__name__` is a `str` subclass with a raising `__str__` and a hijacking
       `__format__` gives `error.type == "Stored"`, an exact `str`, with the span's events
-      delivered; at `71e42dd` the events are lost. Dropping the `_STR_STR` fails it.
+      delivered (silence: it passes at `71e42dd`, because `truncate_str` already applies
+      `_STR_STR`, and must keep passing). It does not discriminate the `_STR_STR` read; the next two
+      criteria do.
+- [ ] The same class with a metaclass `__module__` property that raises, so `format_exception` fails
+      and the f-string fallback is reached, has `error.stack == "<unformattable traceback: Stored>"`;
+      at `71e42dd` the hijacking `__format__` renames it. Dropping the `_STR_STR` in `model.py`'s
+      read fails it.
 - [ ] The same with a metaclass `__module__` property that raises: `error.type` and `error.module`
       are the stored name and module, and `error.stack` is `<unformattable traceback: Boom>` naming
       the stored name.
 - [ ] An exception class with `__module__ = 5` has `error.module == "5"`; one whose `__module__` is
       an object with a raising `__str__` has `error.module == "?"`.
-- [ ] `_diag.absorbed("x", exc)` for an exception of a class whose metaclass `__name__` property
-      raises writes a line ending `(Stored)` instead of nothing; on the orphan path a sink whose
+- [ ] `_diag.absorbed("x", exc)` for an exception of a class whose stored `__name__` is the
+      hijacking `str` subclass writes a line ending `(Stored)`, where `71e42dd` writes `(HIJACK)`.
+      For an exception of a class whose metaclass `__name__` property raises it writes a line ending
+      `(Stored)` instead of nothing; on the orphan path a sink whose
       `emit` raises such an exception is counted in `orphan_lost` and announced, with stderr naming
       `Stored`. At `71e42dd` the count is made and stderr is empty.
 - [ ] With `configure(defaults={K(): 1})`, `info("m", svc=3)` delivers, with no span open and
@@ -492,9 +519,10 @@ yielding both is dropped whole by `_merge`, announced and leaving the event.
       stated cost.
 - [ ] An event with no colliding key is identical to `71e42dd`'s, truncation flag and key order
       included (silence).
-- [ ] Planted out once each — the stored-name read, the `_STR_STR`, the stored-module read, the stack
-      fallback, the `_diag` read, and the rebuild's highest-first order (walking lowest first
-      reddens the `svc=3` criterion) — a named test reddens.
+- [ ] Planted out once each — the stored-name read, the stored-module read, the stack fallback, the
+      `_STR_STR` in `model.py`'s read (the stack-fallback criterion reddens, not the `error.type`
+      one), the `_diag` read and its `_STR_STR`, and the rebuild's highest-first order (walking
+      lowest first reddens the `svc=3` criterion) — a named test reddens.
 - [ ] Serves invariants 1, 2, 8 and 11: the user's exception is untouched, the events are delivered
       rather than lost, the loss is announced naming a type, and the event is built for a hostile
       class and key.
@@ -514,7 +542,9 @@ node"), `_Coercer.value`'s docstring (which says only that every value counts, a
 clause), `mapping()`'s docstring (its paragraph ending "since a key visits no value", false once a
 container key visits values), the `key`, `_key` and `produced` docstrings that call every key that
 is not a `str` produced text, and SPEC-057 itself at its FR-001 description and its *Accepted
-Limits* entry, each struck through with a one-line pointer to this spec rather than deleted. One
+Limits* entry, and its charge-table row (the one near line 495 that says a "non-`str` key" is
+charged as produced text), each struck through with a one-line pointer to this spec rather than
+deleted. One
 further docstring is corrected in passing: `_TypesOnly`'s says "a ``Config`` validates its
 ceilings", which is false (`Config` is a plain frozen dataclass and `configure()` validates), and
 becomes "``configure()`` validates the ceilings; a hand-built ``Config`` does not".
@@ -542,8 +572,12 @@ exact number and a `float` subclass key no longer uses its own `__str__`; a rais
 `echo=` no longer reaches the caller; a hostile exception class no longer costs its span's events
 or silences its announcement; and a colliding key no longer costs its event, the lower-precedence
 key being the one dropped. `CHANGELOG.md`, `docs/spec-delivery/RELEASES.md` and the notes' title are
-not touched, and any sentence of the file that the change makes false is corrected: at `0005dd4`
-none is, since the file describes the OTLP sink, which maps an already assembled event.
+not touched, and any sentence of the file that the change makes false is corrected. The build
+re-judges the file's headline sentence that a `>=1,<2` pin takes the release "without a code
+change": container keys now read as JSON, so a downstream query or alert on the old key text would
+notice, and the sentence is either qualified or followed by a note saying so. (At `0005dd4`, before
+this change was specified, no other sentence of the file was false, since it describes the OTLP
+sink, which maps an already assembled event.)
 
 **Written at completion, not by this FR** (`docs/process/completion-ritual.md`): the delivery doc,
 the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
@@ -558,10 +592,15 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
       own `str()` as an exception to the no-`repr` rule, and lists the new test module under
       *Guarded*; `tests/test_invariants_model.py`'s
       `test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do` passes.
-- [ ] A search of `src/` and `docs/architecture.md` for "keys are not values", "spend no node",
-      "are not counted" and "a key visits no value" finds none stating the old claim, and
-      `_TypesOnly`'s docstring no longer says a `Config` validates its ceilings; each remaining hit in `docs/specs/` is
-      struck through with a pointer to SPEC-063. `docs/spec-delivery/` is excluded: those are frozen
+- [ ] A whitespace-collapsed search of `src/`, `docs/architecture.md` and `docs/specs/` (this spec
+      excepted, which quotes the phrases) for "keys
+      are not values", "spend no node", "are not counted" and "a key visits no value" finds none
+      stating the old claim outside a hit struck through with a pointer to SPEC-063, and
+      `_TypesOnly`'s docstring no longer says a `Config` validates its ceilings. The search is
+      collapsed because "a key visits no value" wraps across two lines in `mapping()`'s docstring,
+      so a line-based search passes before any edit is made; it is piped over `git ls-files`
+      (`tr -s ' \n' '  ' < "$f" | grep -oE "..."`), never `for f in $VAR`, which zsh does not
+      word-split. `docs/spec-delivery/` is excluded: those are frozen
       records of what their specs shipped.
 - [ ] The decision file exists in `docs/decisions/event-assembly/` with its fence, entry and a dated
       History, names both rejected alternatives, and `sh scripts/gen-index.sh` leaves
@@ -572,7 +611,8 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
 - [ ] `docs/release-notes/v1.1.0.md` has the `### ... (SPEC-063)` subsection under `## Fixed`,
       between `## New: OTLPSink (SPEC-056)` and `## What did not change`, listing each
       caller-visible change named above, and `git diff` shows `CHANGELOG.md` and
-      `docs/spec-delivery/RELEASES.md` untouched.
+      `docs/spec-delivery/RELEASES.md` untouched. The headline sentence "without a code change"
+      is qualified, or a note follows it, to say that container-key text changed.
 - [ ] `sh scripts/docs-lint.sh`, `sh scripts/spec-lint.sh` and
       `poetry run python scripts/docstring-lint.py` pass.
 - [ ] Serves no invariant on its own: it records the promises the other four FRs keep, in the
