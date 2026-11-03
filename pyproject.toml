@@ -144,6 +144,11 @@ pytest-xdist = "^3.8"
 # deliberate, the select makes the set ours.
 ruff = ">=0.16,<0.17"
 mypy = "^2.3"
+# The generated OTLP classes, so a test can prove the JSON `_otel` builds parses as OTLP rather
+# than merely looking like it (SPEC-056 FR-002). Dev-only: the library never imports it. It brings
+# `protobuf`, whose `google/` namespace package is what the `google.cloud.*` mypy override below
+# accommodates.
+opentelemetry-proto = "^1.45"
 
 # Supply-chain tooling (SPEC-023 FR-007). `optional = true` keeps it OUT of the
 # `poetry install --with dev` that every CI matrix leg runs — neither tool is needed to lint,
@@ -316,3 +321,12 @@ files = ["src"]
 # API would type-check clean on a 3.12 floor and fail as an AttributeError in a consumer's runtime.
 python_version = "3.12"
 strict = true
+
+# The dev group's `protobuf` creates a `google/` namespace package, so `from google.cloud import
+# pubsub_v1` stops being a missing module and becomes an installed, untyped one — an
+# `import-untyped` error beside the `unused-ignore` the comment on that line now also names
+# (SPEC-056 FR-002). Measured on mypy 2.4.0: exactly those two errors, at the one site. This
+# override keeps `sinks/pubsub.py` clean whether or not the `gcp-pubsub` extra is installed.
+[[tool.mypy.overrides]]
+module = "google.cloud.*"
+ignore_missing_imports = true

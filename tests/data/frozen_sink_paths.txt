@@ -36,6 +36,7 @@ MultiSink log_foundry.sinks.multi
 NATSSink log_foundry.sinks.nats
 NewRelicSink log_foundry.sinks.newrelic
 NullSink log_foundry.sinks.null
+OTLPSink log_foundry.sinks.otlp
 OpenSearchSink log_foundry.sinks.elasticsearch
 PostgresSink log_foundry.sinks.postgres
 RabbitMQSink log_foundry.sinks.rabbitmq

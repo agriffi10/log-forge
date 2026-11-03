@@ -29,9 +29,16 @@ class FakeResponse:
         self.status = status
         self._body = body
         self.headers = headers or {}
+        self.read_sizes: list[int] = []
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int = -1) -> bytes:
+        """Returns the body, or at most ``n`` bytes of it, recording what was asked for.
+
+        The optional size is what ``HTTPSink._attempt`` passes once a subclass bounds its
+        response (SPEC-056 FR-003); the base class keeps calling it bare.
+        """
+        self.read_sizes.append(n)
+        return self._body if n < 0 else self._body[:n]
 
     def getcode(self) -> int:
         return self.status
@@ -862,6 +869,7 @@ def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
         "honeycomb.HoneycombSink",
         "loki.LokiSink",
         "newrelic.NewRelicSink",
+        "otlp.OTLPSink",
         "splunk.SplunkHECSink",
     }, f"the subclass population moved: {sorted(derived)}"
 
@@ -870,6 +878,7 @@ def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
     from log_foundry.sinks.honeycomb import HoneycombSink
     from log_foundry.sinks.loki import LokiSink
     from log_foundry.sinks.newrelic import NewRelicSink
+    from log_foundry.sinks.otlp import OTLPSink
     from log_foundry.sinks.splunk import SplunkHECSink
 
     builders = (
@@ -879,6 +888,7 @@ def test_every_shipped_http_subclass_inherits_the_refusal() -> None:
         lambda: HoneycombSink("k", dataset="d", timeout=-1),
         lambda: LokiSink("http://h", timeout=-1),
         lambda: NewRelicSink("k", timeout=-1),
+        lambda: OTLPSink(timeout=-1),
         lambda: SplunkHECSink("http://h", token="t", timeout=-1),
     )
     assert len(builders) == len(derived), "every named subclass is built, not a sample of them"

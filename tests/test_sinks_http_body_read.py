@@ -32,6 +32,7 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from log_foundry.sinks.http import HTTPSink, _no_redirect_opener
 from log_foundry.sinks.logstash import LogstashSink
+from log_foundry.sinks.otlp import OTLPSink
 from test_sinks_http import FakeOpener, FakeResponse
 from test_sinks_http_refused import _through_the_worker
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
@@ -407,7 +408,7 @@ class _UnreadableResponse(FakeResponse):
         super().__init__(status, b"", headers)
         self._exc = exc
 
-    def read(self) -> bytes:
+    def read(self, n: int = -1) -> bytes:
         raise self._exc
 
 
@@ -418,12 +419,18 @@ _READ_ERRORS = [
 ]
 """One ``HTTPException``, one ``OSError`` and one that is neither, so narrowing the guard fails."""
 
-_BODY_READERS = {ElasticsearchSink, OpenSearchSink}
-"""The shipped subclasses whose ``_handle_response`` reads the body, and so count an unreadable one.
+_BODY_READERS = {ElasticsearchSink, OpenSearchSink, OTLPSink}
+"""The shipped subclasses whose ``_handle_response`` reads the body.
 
 A new body reader must be added here, and must decide what ``b""`` means for it: an override
-cannot tell an empty ``2xx`` body from one that could not be read.
+cannot tell an empty ``2xx`` body from one that could not be read. The decision is recorded in
+``_COUNTS_UNREADABLE``: the ``_bulk`` sinks count it, since their only verdict is in the body;
+``OTLPSink`` reads it as full success, since an OTLP success needs no ``partialSuccess`` at all
+(SPEC-056 FR-004).
 """
+
+_COUNTS_UNREADABLE = {ElasticsearchSink, OpenSearchSink}
+"""The body readers for which ``b""`` is an unadjudicated chunk rather than a delivered one."""
 
 
 def test_the_body_readers_are_exactly_the_listed_set() -> None:
@@ -447,7 +454,7 @@ def test_every_http_subclass_settles_an_unreadable_2xx(cls: type[HTTPSink], exc:
     sink.emit(_batch(4))
 
     assert len(opener.calls) == 2, "one request per chunk, none re-sent"
-    expected = SinkLosses(dropped=0, failed=4 if cls in _BODY_READERS else 0)
+    expected = SinkLosses(dropped=0, failed=4 if cls in _COUNTS_UNREADABLE else 0)
     assert sink.losses() == expected
 
 

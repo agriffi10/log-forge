@@ -58,6 +58,7 @@ from log_foundry.sinks.http import (
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
+from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.sentry import Backend, SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
 from log_foundry.sinks.sqs import DedupIdSource, GroupIdSource, SQSSink
@@ -202,6 +203,8 @@ def _sinks() -> list[object]:
         NewRelicSink("key", opener=None, max_retry_after=1.0),
         LokiSink("https://example.invalid", **forward),
         ElasticsearchSink("https://example.invalid", index="logs", **retry),
+        OTLPSink("https://example.invalid/v1/logs", **platform),
+        OTLPSink(),
         SentrySink("https://public@example.invalid/1", backend=_BACKEND),
         SQSSink("https://sqs.invalid/q", message_group_id=_GROUP, message_deduplication_id=_DEDUP),
     ]

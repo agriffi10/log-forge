@@ -336,9 +336,9 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 
 - **Assembly work budget:** SPEC-057 — a node budget, a byte budget and reads bounded by the ceiling,
   all in `sanitize.py`, closing a shared-sublist hang on the caller's thread. It depends on nothing
-  unbuilt and builds first of the two specs it touches: SPEC-056, the OTLP log export spec (Draft),
+  unbuilt and built first of the two specs it touches: SPEC-056, the OTLP log export spec,
   specifies an equal budget for its own mapping — one number, one placeholder text, one stop rule.
-  Keeping the two equal is SPEC-056's to settle when it builds, and it settles it with a test that
+  Keeping the two equal was SPEC-056's to settle, and it settled it with a test that
   pins `_otel.MAX_NODES` to `sanitize`'s private `_MAX_NODES` and imports nothing from `sanitize`;
   SPEC-057 defines its own constant and asks for no edit to that spec or to `_otel`.
 

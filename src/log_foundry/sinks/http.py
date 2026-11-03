@@ -1150,6 +1150,48 @@ class HTTPSink:
         """
         return True
 
+    def _retryable_status(self, status: int) -> bool:
+        """Reports whether a status is worth another attempt (SPEC-056 FR-003).
+
+        The family's default is ``429`` and every ``5xx``. It is a hook, read at one site in
+        :meth:`_send`, so a subclass whose protocol names its own retryable set — OTLP's is
+        ``429``, ``502``, ``503`` and ``504``, with a ``500`` abandoned on the first request —
+        narrows it without touching the loop, and every other sink is unchanged by construction.
+
+        Args:
+          status: The HTTP status of the response.
+
+        Returns:
+          True when the request may be retried.
+
+        Raises:
+          None.
+        """
+        return status == 429 or 500 <= status < 600
+
+    def _response_limit(self) -> int | None:
+        """The most response bytes :meth:`_attempt` reads, or ``None`` for the unbounded read.
+
+        ``None`` is the family's default and keeps :meth:`_attempt` calling a bare ``read()``,
+        which is what every existing sink and every test double of a response relies on. A
+        subclass returning a bound makes :meth:`_attempt` read at most one byte past it; a
+        non-``2xx`` response longer than the bound is then abandoned in :meth:`_send` as
+        non-retryable, whatever its status — a ``413`` included, which is read literally rather
+        than as a request to split, since a server answering a refusal with megabytes is not
+        describing the request — and a ``2xx`` reaches :meth:`_handle_response` as it was read,
+        for that method to judge against the same bound (SPEC-056 FR-003).
+
+        Args:
+          None.
+
+        Returns:
+          The bound in bytes, or ``None``.
+
+        Raises:
+          None.
+        """
+        return None
+
     def _deliver(self, items: list[_Item]) -> bool:
         """Sends one chunk and reports whether it needs no further attention.
 
@@ -1269,6 +1311,7 @@ class HTTPSink:
         """
         headers, data = self._prepare(body, content_type, extra_headers)
         retries = self.max_retries
+        limit = self._response_limit()
         for attempt in range(retries + 1):
             request = urllib.request.Request(  # noqa: S310
                 self.url, data=data, method=self.method, headers=headers
@@ -1285,7 +1328,9 @@ class HTTPSink:
                 )
             if 200 <= status < 300:
                 return payload
-            if (status == 429 or 500 <= status < 600) and attempt < retries:
+            if limit is not None and len(payload) > limit:
+                self._abandon(f"HTTP {status}, response over {limit} bytes", attempt + 1)
+            if self._retryable_status(status) and attempt < retries:
                 self._sleep_backoff(attempt, retry_after)
                 continue
             if status == 413 and splittable:
@@ -1383,12 +1428,19 @@ class HTTPSink:
         escapes ``emit``, and the worker re-sends a batch the destination may have accepted. It
         never catches ``BaseException``.
 
-        The read takes no size argument, and that is load-bearing. CPython's ``read()`` raises
-        ``IncompleteRead`` for a ``Content-Length`` body that arrives short and for a truncated
-        chunked body, but ``read(amt)`` returns a short ``Content-Length`` body **silently**,
-        leaving ``response.length`` above zero (measured on 3.12 and 3.13). A body with neither
-        length nor chunking is read to EOF, where truncation cannot be detected at all. A bounded
-        read must therefore check ``response.length`` itself to see a short body.
+        The read takes no size argument unless :meth:`_response_limit` names a bound, and the
+        bare form is load-bearing. CPython's ``read()`` raises ``IncompleteRead`` for a
+        ``Content-Length`` body that arrives short and for a truncated chunked body, but
+        ``read(amt)`` returns a short ``Content-Length`` body **silently**, leaving
+        ``response.length`` above zero (measured on 3.12 and 3.13). So the bounded read, which
+        asks for one byte past the bound so :meth:`_send` and :meth:`_handle_response` can tell
+        "exactly the bound" from "over it", sits inside the same guard and checks
+        ``response.length`` itself: fewer bytes than it asked for while the response still owes
+        some is a body nobody can read, and becomes ``b""`` exactly as a raise does. A truncated
+        chunked body raises from ``read(amt)`` too and takes the guard. A body with neither
+        length nor chunking is read to EOF, where truncation cannot be detected at all. With the
+        default ``None`` every other sink runs the bare ``read()`` under the guard, unchanged
+        (SPEC-056 FR-003).
 
         Args:
           request: The prepared request.
@@ -1410,8 +1462,14 @@ class HTTPSink:
         status = getattr(response, "status", None)
         if status is None:
             status = response.getcode()
+        limit = self._response_limit()
         try:
-            payload = response.read()
+            if limit is None:
+                payload = response.read()
+            else:
+                payload = response.read(limit + 1)
+                if len(payload) <= limit and (getattr(response, "length", None) or 0) > 0:
+                    payload = b""
         except Exception:
             payload = b""
         return int(status), payload, _parse_retry_after(getattr(response, "headers", None))

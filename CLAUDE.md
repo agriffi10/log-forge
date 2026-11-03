@@ -39,9 +39,9 @@ implementation against the design in `architecture.md`.
   which PyPI rejects as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}` — shipped across SPEC-001–005 (`docs/spec-delivery/`
-  says which; `sinks/sqs` is the optional `aws` extra). Plus three leaf helpers the map did not
-  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag` and `results` —
-  and two non-leaves that do: `_lifecycle` and `_fork` (which spec: `docs/component-inventory.md`).
+  says which; `sinks/sqs` is the optional `aws` extra). Plus four leaf helpers the map did not
+  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag`, `results` and
+  `_otel` — and two non-leaves that do: `_lifecycle` and `_fork` (see `docs/component-inventory.md`).
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
@@ -54,7 +54,7 @@ implementation against the design in `architecture.md`.
 | Publishing | PyPI as **`log-foundry`** via `release.yml` — Trusted Publishing (OIDC), no stored token |
 | Runtime deps | **none**; optional extras — `aws` (boto3), `sentry` (sentry-sdk), queue/stream: `kafka`, `redis`, `amqp`, `nats`, `gcp-pubsub`, `azure-eventhubs`, and database: `clickhouse`, `mongo`, `postgres` |
 | Concurrency | `contextvars` (threads + asyncio); background flush worker thread |
-| Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov` |
+| Test | `pytest` (`asyncio_mode=auto`, `--strict-markers`), `pytest-asyncio`, `pytest-cov`; `opentelemetry-proto` (dev-only: the OTLP round-trip proof) |
 | Supply chain | optional `security` group: `cyclonedx-bom` (SBOM), `pip-audit` (advisories) — SPEC-023 |
 | Lint / types | `ruff` (line-length 100), `mypy --strict` over `src` |
 
@@ -105,9 +105,9 @@ poetry run cyclonedx-py environment "$(poetry env info --path)" -o sbom.cdx.json
 
 **After installing extras locally, recreate the venv before trusting `mypy`.** With the optional
 deps present the `type: ignore[import-not-found]` comments in `sinks/` become "unused" and
-`mypy --strict` fails — CI never installs extras, so its no-extras environment is the contract.
-Uninstalling is not enough: `azure/` and `google/` leave namespace directories behind that mypy
-still reads as installed. `poetry env remove --all && poetry install --with dev` is the fix.
+`mypy --strict` fails. The `dev` group's `protobuf` puts `google/` in CI too, which is why
+`pubsub.py` adds `unused-ignore` and `pyproject.toml` ignores `google.cloud.*`; `azure/` leaves a
+dir behind on uninstall. `poetry env remove --all && poetry install --with dev` is the fix.
 
 **Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
 Merges to `main` publish no `.devN` for now (`publish-dev` disabled in `release.yml`, which says

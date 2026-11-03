@@ -116,6 +116,10 @@ UNVERIFIED: dict[str, str] = {
     "elasticsearch": "An official image exists upstream; none is run here. Not in AC-1's minimum.",
     "loki": "An official image exists upstream; none is run here. Not in AC-1's minimum.",
     "syslog": "No container is run; the socket transport is covered by a local listener fake.",
+    "otlp": (
+        "No Collector is run in the job. The generated-class round trip in "
+        "tests/test_otel_envelope.py is the verification this sink carries (SPEC-056)."
+    ),
 }
 """Sink modules NOT executed against a real service, each with the reason.
 

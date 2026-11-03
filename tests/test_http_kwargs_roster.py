@@ -40,6 +40,7 @@ _FORWARDING_SINKS = (
     "logstash",
     "loki",
     "newrelic",
+    "otlp",
     "splunk",
 )
 
@@ -213,4 +214,4 @@ def test_no_forwarding_call_still_suppresses_arg_type() -> None:
         if "type: ignore[arg-type]" in (_SINK_PKG / f"{name}.py").read_text(encoding="utf-8")
     ]
     assert not offenders, f"the total suppression survives in: {offenders}"
-    assert len(_FORWARDING_SINKS) == 7, "the roster shrank -- an absence it cannot see"
+    assert len(_FORWARDING_SINKS) == 8, "the roster shrank -- an absence it cannot see"

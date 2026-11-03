@@ -689,7 +689,8 @@ lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup
 #### HTTP & self-hosted platforms (zero-dependency)
 
 All build on `HTTPSink` (stdlib `urllib`): they POST batches with bounded `429`/`5xx` retry
-(honoring `Retry-After`) and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
+(honoring `Retry-After`) — `OTLPSink` alone retries OTLP's own set, `429`/`502`/`503`/`504`, and
+abandons a `500` on the first request — and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
 to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`, `max_retry_after=`,
 `max_batch_count=`, `max_batch_bytes=`, `opener=`).
 
@@ -708,6 +709,7 @@ too large to be sent on its own is dropped and counted in `health().sink.dropped
 | `LokiSink` | 1,000 | 4,000,000 | chosen; Loki's own cap is an operator-tunable server setting |
 | `SplunkHECSink` | 1,000 | 1,000,000 | chosen; Splunk publishes no fixed HEC payload limit |
 | `LogstashSink` (HTTP mode) | 1,000 | 5,000,000 | inherits the generic defaults |
+| `OTLPSink` | 1,000 | 5,000,000 | inherits the generic defaults, well under the 64 MiB OTLP recommends a server accept; the envelope is charged per record |
 | `HTTPSink` (generic) | 1,000 | 5,000,000 | chosen, for an endpoint the library knows nothing about |
 
 A count of 1,000 is Datadog's published array limit and a conservative default elsewhere — no
@@ -727,6 +729,7 @@ completed, not that every chunk of it landed.
 | `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`). A `2xx` it cannot adjudicate, unreadable bodies included, is counted on `.dropped_unadjudicated` and not retried; those events may have landed, and a non-zero value can mean a proxy answered rather than the cluster |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
+| `OTLPSink` | `log_foundry.sinks.otlp` | `OTLPSink(endpoint="http://localhost:4318/v1/logs", **http_kwargs)` — OTLP/HTTP JSON logs, for a Collector or any OTLP backend; `endpoint` is used exactly as given, `method` must be `"POST"`, `body_format` is pinned. Retries `429`/`502`/`503`/`504` only, bounds the response it reads at 4 MiB, and counts a `2xx` partial success on `.rejected_records` (never retried) or, when it cannot read the verdict, on `.dropped_unadjudicated`. What it sends: *OTLPSink* below |
 | `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per element; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
 | `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
 
@@ -734,6 +737,42 @@ completed, not that every chunk of it landed.
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
 lf.configure(sink=ElasticsearchSink("https://es.internal:9200", index="app-logs",
                                      auth=("elastic", "…")))
+```
+
+##### OTLPSink: what it sends
+
+`OTLPSink` speaks OTLP/HTTP JSON to a Collector or to any backend that ingests OTLP, so your logs
+arrive under the OpenTelemetry names those backends already index. The mapping is private — the
+output is the contract, and these are the names a query can rest on. Each event is one
+`LogRecord`: `timeUnixNano` and `observedTimeUnixNano` from `timestamp`; `severityNumber` for the
+five levels (`DEBUG` 5, `INFO` 9, `WARNING` 13, `ERROR` 17, `CRITICAL` 21) with `severityText`
+verbatim; `body` from `message`; `traceId` and `spanId` as lowercase hex with the sampled `flags`;
+and `eventName` for `span.start` and `span.end`. Each distinct `(service, version, env)` is one
+`resourceLogs` carrying `service.name`, `service.version` and `deployment.environment.name`, under
+the `log_foundry` scope and the schema URL for semantic conventions **1.44.0**.
+
+Record attributes: `code.function.name`, `log.record.uid`, `log_foundry.parent_span_id`,
+`log_foundry.truncated`, `log_foundry.duration_ms`, `log_foundry.status`, `exception.type`,
+`exception.message`, `exception.stacktrace` — each present only when the event carries it —
+followed by one attribute per key of `fields`, in order. The `log_foundry.` prefix is reserved: a
+field named with it is dropped, as is a field colliding with a library attribute set on that
+record, and every drop is counted in `droppedAttributesCount`. An integer within int64 is an
+`intValue`; beyond it, its digits as a `stringValue`. `exception.type` is `module.Type`, bare for
+a builtin. `code.function.name` carries the name the span recorded — the function's
+`__qualname__` or your `name=` — not a module-qualified one.
+
+A `2xx` carrying `partialSuccess` is counted on `.rejected_records` and never retried, because a
+retry would re-send what landed; a `2xx` whose verdict cannot be read — a count that is not a
+usable integer, a body over the 4 MiB bound — is counted on `.dropped_unadjudicated`, also never
+retried. Both feed `health().sink.failed`. A chunk whose every record was rejected raises, so the
+worker's retry and `failed_batches` show a permanent rejection. A `413` still halves the byte
+budget and re-sends in smaller requests, since nothing landed.
+
+```python
+from log_foundry.sinks.otlp import OTLPSink
+lf.configure(service="payments", version="2.14", env="prod",
+             sink=OTLPSink("https://collector.internal:4318/v1/logs",
+                           headers={"x-api-key": "…"}, gzip=True))
 ```
 
 #### SaaS platforms

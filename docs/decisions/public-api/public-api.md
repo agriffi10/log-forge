@@ -1,7 +1,7 @@
 ---
 type: Decision Area
 title: "Public API surface"
-governs: [src/log_foundry/__init__.py, src/log_foundry/api.py, src/log_foundry/config.py]
+governs: [src/log_foundry/__init__.py, src/log_foundry/api.py, src/log_foundry/config.py, src/log_foundry/_otel.py]
 ---
 
 The settled decisions about what is public, what it promises, and what it will not grow. Read the

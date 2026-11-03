@@ -21,6 +21,7 @@ from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
+from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
@@ -194,6 +195,7 @@ _URL_ARGUMENTS = {
     "LokiSink": ("url", lambda bad: LokiSink(f"http://h{bad}")),
     "NewRelicSink": ("region", lambda bad: NewRelicSink("k", region=f"US{bad}")),
     "OpenSearchSink": ("url", lambda bad: OpenSearchSink(f"http://h{bad}", index="i")),
+    "OTLPSink": ("endpoint", lambda bad: OTLPSink(f"http://h{bad}/v1/logs")),
     "SplunkHECSink": ("url", lambda bad: SplunkHECSink(f"http://h{bad}", "tok")),
 }
 """Each shipped subclass, the argument its URL is built from, and how to put a bad value in it.

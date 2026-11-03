@@ -164,8 +164,12 @@ cannot read or that is not an object, or a truthy `errors` with a short `items` 
 `flush()` truthy and `failed_batches` at zero, with the loss in `health().sink`: the events may
 have landed, so a retry could duplicate them. An HTTP `2xx` is a verdict however its body ends: a
 body cut short, stalled or reset after the status line settles its chunk — delivered for a sink
-that ignores the body, unadjudicated for the `_bulk` sinks that read it — and is never re-sent; before
-any status line, a protocol error is retried and counted like a connection error.
+that ignores the body or, like OTLP, reads an empty one as success, unadjudicated for the `_bulk`
+sinks that need it — and is never re-sent; before any status line, a protocol error is retried and
+counted like a connection error. An OTLP server answering every POST with a `2xx` whose
+`partialSuccess` is present but cannot be read, or with a `2xx` over the 4 MiB response bound,
+leaves the same three signs for the same reason (SPEC-056); only a `2xx` rejecting every record
+of every chunk raises there, because nothing landed.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass), `tests/integration/`
 against real services (SPEC-041).
