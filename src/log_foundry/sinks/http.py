@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip as _gzip
+import http.client
 import json
 import threading
 import urllib.error
@@ -531,9 +532,11 @@ class HTTPSink:
         :meth:`_known_refused` discards without offering it — is counted and announced only when
         ``emit`` returns as well, through :meth:`_drop_refused` and the same ledger (SPEC-059
         FR-004). Once a drop has settled a chunk, this call raises only through a later chunk's
-        exception :meth:`_deliver` does not catch — an ``http.client.HTTPException`` such as
-        ``IncompleteRead``, which is not an ``OSError`` — or a ``BaseException``, and that raise
-        now discards the drop rather than leaving it counted once per attempt. The abandonment
+        exception :meth:`_deliver` does not catch — one a caller-injected ``opener`` raises that
+        is none of ``URLError``, ``OSError`` and ``http.client.HTTPException``, one any subclass
+        hook raises, since :meth:`_body` and :meth:`_handle_response` run outside
+        :meth:`_send`'s guard, or a ``BaseException`` — and that raise now discards the drop
+        rather than leaving it counted once per attempt. The abandonment
         counter stays immediate: ``failed`` is an upper bound neither spec recounts.
 
         Args:
@@ -546,7 +549,8 @@ class HTTPSink:
           SinkDeliveryError: When no chunk was **settled**, which is the total failure the
             worker's retry exists for (SPEC-026 FR-001). A chunk is settled when it was
             delivered, when it was permanently discarded, *or* when a ``2xx`` gave no readable
-            verdict and :meth:`_handle_response` counted it, because none is helped by a retry
+            verdict — a body that could not be decoded, or could not be read at all — and
+            :meth:`_handle_response` counted it, because none is helped by a retry
             — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
             identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
             already apply), while re-sending a chunk that may have landed could duplicate it.
@@ -710,8 +714,9 @@ class HTTPSink:
         chunk reports *settled*, and the drop goes to ``pending`` against ``dropped_oversized``:
         it is counted and announced only when ``emit`` returns (SPEC-059 FR-004). Permanence
         alone never made ``dropped`` exact. Once a drop has settled a chunk, ``emit`` can still
-        raise through a later chunk's exception :meth:`_deliver` does not catch — an
-        ``http.client.HTTPException`` such as ``IncompleteRead`` — or a ``BaseException``; the
+        raise through a later chunk's exception :meth:`_deliver` does not catch — one a
+        caller-injected ``opener`` raises that :meth:`_send` does not catch, one any subclass
+        hook raises, or a ``BaseException``; the
         worker then retried the batch, re-ran the identical search and re-counted the identical
         drop once per attempt. It is the deferral that keeps ``dropped`` an exact count, while
         ``failed`` stays an upper bound. The line keeps its shape, one per call.
@@ -941,8 +946,14 @@ class HTTPSink:
         Elasticsearch's ``_bulk`` items. A status in the success range is the whole answer
         everywhere else, so the default ignores the body.
 
+        The payload is ``b""`` both for an empty body and for one that could not be read after
+        the status line — cut short, stalled past ``timeout`` or reset (:meth:`_attempt`). An
+        override cannot tell the two apart, so the way it reads an empty ``2xx`` body is the way
+        it reads an unreadable one: the default settles both as delivered, and an override that
+        reads an empty body as success settles an unreadable one silently.
+
         Args:
-          payload: The response body.
+          payload: The response body, or ``b""`` when it could not be read.
           items: The chunk the response describes.
 
         Returns:
@@ -1032,6 +1043,16 @@ class HTTPSink:
         own. The one caller that must not propagate is ``SentrySink``, which sends one envelope
         per event and therefore catches it.
 
+        A failure **before** any status line is a connection error: an ``OSError``, a
+        ``URLError``, and an ``http.client.HTTPException`` such as ``BadStatusLine``, which is
+        neither and used to escape ``emit`` raw, handing the worker a batch to re-send whole,
+        chunks that had already landed included. All three are retried, then abandoned and
+        counted in ``failed``. A header block that fails to parse raises the same class *after* a
+        status line the library never sees, which may have been a ``2xx``; it is retried like a
+        read timeout awaiting the headers, on the expected-cost reasoning SPEC-048 records for
+        those. **After** a status line the status decides, whatever happened to the body
+        (:meth:`_attempt`).
+
         Args:
           body: The serialized batch.
           content_type: The default content type, overridable by caller headers.
@@ -1045,7 +1066,8 @@ class HTTPSink:
 
         Returns:
           The response bytes, which subclasses that must inspect the response — such as
-          Elasticsearch's ``_bulk`` items — read.
+          Elasticsearch's ``_bulk`` items — read. ``b""`` when a ``2xx`` body could not be read,
+          which the caller cannot tell from an empty one.
 
         Raises:
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
@@ -1067,7 +1089,7 @@ class HTTPSink:
             )
             try:
                 status, payload, retry_after = self._attempt(request)
-            except (urllib.error.URLError, OSError) as err:
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
                 if attempt < retries:
                     self._sleep_backoff(attempt, None)
                     continue
@@ -1156,15 +1178,49 @@ class HTTPSink:
         A ``4xx`` or ``5xx`` arrives from ``urlopen`` as an ``HTTPError``, which is itself a
         readable response object, so it is unified here rather than raised.
 
+        **The status line is the dividing line.** Everything before it — the connection, the
+        request, a status line or header block the server garbled — raises, and :meth:`_send`
+        retries it as a connection error. Once a status is in hand the server has answered, so a
+        body read that fails afterwards is not a fault to retry but a body nobody can read: the
+        payload is ``b""`` and the status, with its ``Retry-After``, decides as it always did. A
+        ``2xx`` therefore settles its chunk however its body ends, because a ``2xx`` is not
+        provable non-delivery and a re-send could duplicate what landed (SPEC-018's rule); and a
+        ``503`` or a ``413`` whose body was cut short is still a ``503`` or a ``413``. Measured
+        before this guard: a ``2xx`` with a short body raised ``IncompleteRead`` out of ``emit``,
+        so the worker re-sent the chunks that had landed and never sent the ones after; a stall
+        or a reset mid-body was retried as a connection error, re-POSTing an accepted chunk once
+        per retry and then counting it in ``failed``.
+
+        ``b""`` rather than ``None`` keeps :meth:`_handle_response`'s signature, which is a
+        documented extension hook, exactly as it was. The cost is that an override cannot tell an
+        empty body from an unreadable one, so each must read an empty ``2xx`` body the way it
+        wants an unreadable one read: the base settles both as delivered, and
+        ``ElasticsearchSink`` counts both as unadjudicated.
+
+        The guard catches ``Exception``, not the read's documented errors, for the reason
+        ``ElasticsearchSink._parse_bulk_response`` gives for its own: anything escaping here
+        escapes ``emit``, and the worker re-sends a batch the destination may have accepted. It
+        never catches ``BaseException``.
+
+        The read takes no size argument, and that is load-bearing. CPython's ``read()`` raises
+        ``IncompleteRead`` for a ``Content-Length`` body that arrives short and for a truncated
+        chunked body, but ``read(amt)`` returns a short ``Content-Length`` body **silently**,
+        leaving ``response.length`` above zero (measured on 3.12 and 3.13). A body with neither
+        length nor chunking is read to EOF, where truncation cannot be detected at all. A bounded
+        read must therefore check ``response.length`` itself to see a short body.
+
         Args:
           request: The prepared request.
 
         Returns:
-          The status, the response payload, and any ``Retry-After`` delay.
+          The status, the response payload — ``b""`` when the body could not be read — and any
+          ``Retry-After`` delay.
 
         Raises:
           urllib.error.URLError: On a connection-level failure, for the retry loop to handle.
           OSError: Likewise.
+          http.client.HTTPException: When the status line or headers could not be parsed, such
+            as ``BadStatusLine``, for the retry loop to handle as a connection error.
         """
         try:
             response = self._opener(request, timeout=self.timeout)
@@ -1173,7 +1229,10 @@ class HTTPSink:
         status = getattr(response, "status", None)
         if status is None:
             status = response.getcode()
-        payload = response.read()
+        try:
+            payload = response.read()
+        except Exception:
+            payload = b""
         return int(status), payload, _parse_retry_after(getattr(response, "headers", None))
 
     def _sleep_backoff(self, attempt: int, retry_after: float | None) -> None:

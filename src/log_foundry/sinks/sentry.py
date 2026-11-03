@@ -74,7 +74,8 @@ class SentrySink:
       sent: Events captured or sent to Sentry.
       skipped: Events below the minimum level, or without a usable level, that were not sent.
       transport_errors: Events whose send raised something other than an already-counted
-        abandonment — an SDK fault, or a response error ``HTTPSink`` does not retry.
+        abandonment — an SDK fault, or an exception a caller-injected ``opener`` raises that
+        ``HTTPSink`` does not catch.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. This sink owns no transport: it delegates to a ``sentry_sdk`` built for capture from any
@@ -391,9 +392,11 @@ class SentrySink:
         Anything escaping here propagates mid-batch and hands the worker a batch Sentry has
         already accepted the earlier events of, and the retry duplicates them. Enumerating was
         tried and was wrong twice over: the SDK branch is third-party code that can raise
-        anything, and ``HTTPSink._send`` catches ``(URLError, OSError)``, which does not cover
-        ``http.client.HTTPException`` — an ``IncompleteRead`` off ``response.read()`` came
-        straight through — while a caller-injected ``opener`` widens that further.
+        anything, and ``HTTPSink._send`` once caught only ``(URLError, OSError)``, so an
+        ``IncompleteRead`` off ``response.read()`` came straight through. ``_send`` now catches
+        ``http.client.HTTPException`` before a status line and reads a body after one under its
+        own guard, but a caller-injected ``opener`` can still raise anything, so the guard here
+        stays ``Exception``.
 
         Args:
           event: The event to send.
@@ -540,6 +543,9 @@ class SentrySink:
         transport is set in the constructor whenever the path that reaches here is in use, which
         is true because ``_capture`` refuses a ``None`` backend before reaching this branch and
         ``_select_backend`` only answers ``"http"`` where one was built.
+
+        The response body is never read here: Sentry's status is its whole answer, so a ``2xx``
+        envelope whose body could not be read counts as sent, as any other ``2xx`` does.
 
         Args:
           event: The event to send.
