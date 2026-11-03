@@ -41,11 +41,13 @@ happens; a row claiming **no** SPECs, as `v1.0.1`'s does, is falsified the same 
 visibly, since nothing in the row itself looks like a number to re-check. `v1.0.2`'s row names
 `SPEC-057 – SPEC-059` and says `SPEC-056` ships nothing because it is a Draft, so that spec
 completing before the tag falsifies it. `docs/specs/index.yaml` (generated from each spec's
-frontmatter; the old `INDEX.md` moved there) is where the range actually ends, so re-derive from
+frontmatter; the old `INDEX.md`'s status table moved there, its arcs to `ARCS.md`) is where the range actually ends, so re-derive from
 it either way. **The tag is cut under a different
 number:** the row is wrong, and so is the notes file's name — correct both, and see the paragraph
 below for why the name matters. **The tag is never cut:** the row describes nothing, and should be
-reverted to a "not yet released" note rather than left standing.
+reverted to a "not yet released" note rather than left standing. In every case re-check the
+`CHANGELOG.md` heading too: its date is pre-written with the row, and a tag that slips makes it
+wrong.
 
 **The notes file is coupled to the tag by NAME.** `release.yml` looks for
 `docs/release-notes/<tag>.md`, so cutting a tag with no matching file misses it silently, falls
