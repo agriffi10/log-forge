@@ -124,7 +124,9 @@ class Health:
         ``shutdown()`` is answered and then counted for the life of the process, since
         ``Queue`` offers no way to remove one specific item.
       dropped: Submissions discarded because the queue was full (backpressure).
-      failed_batches: Batches abandoned after the retry budget was spent.
+      failed_batches: Batches abandoned after the retry budget was spent, or whose retry the
+        exit drain declined because it was predicted to end after the ``shutdown()``
+        deadline (SPEC-062).
       stopped_reason: The exception type name that terminated the drain thread, or ``None`` if
         it never died — which is also what a live worker and a process that never logged
         report. Non-``None`` is categorically worse than the two counters above: they measure

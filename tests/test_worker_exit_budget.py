@@ -879,3 +879,165 @@ def test_both_delivery_paths_under_one_shutdown_balance_the_ledger() -> None:
     assert delivered_ends + health.queued + health.dropped + lost_ends == 1, health
     assert health.failed_batches == 1
     assert sink.closes == 1
+
+
+# --------------------------------------------------------------------------- FR-005
+
+
+def _expire_on_a_wedged_batch(capsys) -> tuple[_GatedSink, Worker, str]:
+    """Expires a `shutdown(timeout=0.5)` on a sink wedged in its first `_final_drain` emit.
+
+    `batch_size=10` and a long `flush_interval` so nothing emits before the stop; the three
+    events are inside the sink's first attempt when the join gives up. Returns the sink, the
+    worker and stderr as it stood at the expiry, with the sink still parked.
+    """
+    sink = _GatedSink()
+    worker = _worker(sink)
+    worker.submit(_three_events())
+
+    retire_process(worker, 0.5)
+
+    assert sink.in_emit.is_set(), "the premise: the drain thread is inside the first emit"
+    assert worker.stopped_reason == "ShutdownTimeout", "the premise: the join expired"
+    return sink, worker, capsys.readouterr().err
+
+
+def test_the_expiry_line_counts_the_batch_in_flight(capsys) -> None:
+    """FR-005 AC-1 and AC-2. The queue is still `0 item(s)`; the batch inside the emit is named.
+
+    Releasing the sink to fail then declines the retry, and the `lost` figures across the two
+    lines sum to 3 events: the expiry line counted the batch as in flight, never as lost.
+    """
+    sink, worker, err = _expire_on_a_wedged_batch(capsys)
+
+    lines = _lost_lines(err)
+    assert len(lines) == 1, err
+    count, what, detail = lines[0]
+    assert (count, what) == (0, "item"), "the queue clause still counts the queue, which is empty"
+    assert "3 event(s) in flight" in detail, err
+    assert "counted when the emit returns" in detail, err
+
+    sink.fail = True
+    sink.release.set()
+    worker._thread.join(5.0)
+    later = capsys.readouterr().err
+
+    assert len(sink.attempts) == 1, f"the retry was declined past the deadline: {sink.attempts}"
+    assert worker.failed_batches == 1
+    lost = _lost_lines(later)
+    assert [(n, what) for n, what, _ in lost] == [(3, "event")], later
+    assert "deadline" in lost[0][2], later
+    assert sum(n for n, _, _ in _lost_lines(err + later)) == 3, "3 events, not 6"
+
+
+def test_releasing_the_wedged_emit_to_succeed_announces_no_loss(capsys) -> None:
+    """FR-005 AC-3. A late return can still deliver, which is why the line did not say lost."""
+    sink, worker, err = _expire_on_a_wedged_batch(capsys)
+    assert "3 event(s) in flight" in err
+
+    sink.fail = False
+    sink.release.set()
+    worker._thread.join(5.0)
+
+    assert len(sink.delivered) == 3
+    assert worker.failed_batches == 0
+    assert "lost" not in capsys.readouterr().err
+
+
+def test_the_expiry_line_is_unchanged_when_nothing_is_in_flight(capsys) -> None:
+    """FR-005 AC-4. With no batch inside `_emit`, the line is `71e42dd`'s byte for byte.
+
+    The only deterministic route to "expired with nothing in flight" is to park the drain
+    thread **before** `_emit` writes the count: `_emit_pending` calls `self._emit`, so an
+    instance attribute over the method parks it there. The 1 item is the unconsumed shutdown
+    sentinel, which is existing behaviour of the queued count.
+    """
+    sink = _SlowFailSink(0.0, fail_times=0)
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)
+    parked = threading.Event()
+    release = threading.Event()
+    real_emit = worker._emit
+
+    def gated_emit(event_lists: list[list[dict[str, object]]]) -> None:
+        parked.set()
+        release.wait(30.0)
+        real_emit(event_lists)
+
+    worker._emit = gated_emit  # type: ignore[method-assign]
+    worker.submit([{"a": 1}])
+    assert parked.wait(5.0), "the drain thread is parked before _emit runs"
+    assert worker._in_flight == 0, "the premise: nothing is in flight"
+
+    worker.stop(0.2)
+    err = capsys.readouterr().err
+    release.set()
+    worker._thread.join(5.0)
+
+    assert err == (
+        "log-foundry: lost 1 item(s); shutdown timed out after 0.2s; the sink is left open "
+        "because the worker thread is still using it\n"
+    )
+
+
+class _InterruptingSink:
+    """A sink whose `emit` raises a `BaseException`, which `_emit` does not absorb."""
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Raises straight through `_emit` to `_run`."""
+        raise KeyboardInterrupt
+
+    def close(self) -> None:
+        """Nothing to close."""
+
+
+@pytest.mark.parametrize("route", ["delivered", "abandoned", "declined", "escaping"])
+def test_in_flight_is_zero_after_every_route(route: str) -> None:
+    """FR-005 AC-5. `_in_flight` is reset in a `finally`, so an escaping exception resets it too."""
+    sink: object
+    timeout = 5.0
+    if route == "delivered":
+        sink = _SlowFailSink(0.0, fail_times=0)
+    elif route == "abandoned":
+        sink = _SlowFailSink(0.0)
+    elif route == "declined":
+        sink = _SlowFailSink(0.3)
+        timeout = 0.5
+    else:
+        sink = _InterruptingSink()
+    worker = _worker(sink)
+    worker.submit(_three_events())
+
+    worker.stop(timeout)
+    worker._thread.join(5.0)
+
+    assert not worker._thread.is_alive()
+    assert worker._in_flight == 0, route
+    expected = {
+        "delivered": (0, None),
+        "abandoned": (1, None),
+        "declined": (1, None),
+        "escaping": (0, "KeyboardInterrupt"),
+    }[route]
+    assert (worker.failed_batches, worker.stopped_reason) == expected, "the premise: the route ran"
+
+
+@pytest.mark.parametrize("resume", [True, False])
+def test_in_flight_is_reset_in_the_forked_child(resume: bool) -> None:
+    """FR-005 AC-5, the fork. A child inherits the count for a drain thread it does not have.
+
+    The deadline is reset only where a drain thread is started: a worker stopped by a direct
+    `Worker.stop()` never moved the retirement count, so `_rebuild_worker_after_fork` resumes
+    it, and without the reset every retry in that child would be declined forever. A retired
+    child's record is left as it stands.
+    """
+    worker = _worker(_SlowFailSink(0.0, fail_times=0))
+    worker._in_flight = 3
+    worker._exit_deadline = 1.0
+
+    worker._reinit_after_fork(resume=resume)
+    try:
+        assert worker._in_flight == 0
+        assert worker._exit_deadline == (None if resume else 1.0)
+    finally:
+        worker._exit_deadline = None
+        worker.stop(5.0)

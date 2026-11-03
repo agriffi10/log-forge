@@ -135,16 +135,26 @@ every route that sets one**:
 
 - `_lifecycle._shutdown_worker` sets `_state._stop` under `_state._lock` *before* it calls
   `worker.stop(timeout)`, and a live worker's `_stop` is that same object. So it reads the worker
-  first, records the deadline on it, then sets `_state._stop`, all inside the one critical section
-  that moves the retirement count, so SPEC-044 FR-001's "the count and the worker read are one
-  critical section" is kept.
-- `Worker.stop` records it before its own `self._stop.set()`. This covers a late worker, which holds
-  a different event than `_state._stop`, and a direct caller.
+  first, claims its stop through `Worker.claim_stop(deadline)`, then sets `_state._stop`, all
+  inside the one critical section that moves the retirement count, so SPEC-044 FR-001's "the
+  count and the worker read are one critical section" is kept. It passes the claim's verdict to
+  `worker.stop(timeout, claimed=...)`.
+- `Worker.stop` called without a verdict claims for itself before its own `self._stop.set()`.
+  This covers a late worker (`late_worker.stop(remaining)`), which holds a different event than
+  `_state._stop`, and a direct caller.
 
-The record is **write-once**: the first recorded deadline governs, and it is written under
-`Worker._lock` by a method that takes only that lock and calls nothing while holding it. That adds
-the nesting `_state._lock` then `Worker._lock`; `worker.py` takes `_state._lock` nowhere (grep at
-`71e42dd`), so there is no reverse nesting.
+**The claim and the record are one decision.** `Worker.claim_stop(deadline) -> bool` sets the
+once-only `_stopped` gate and records the deadline only if it wins, under `Worker._lock`, and
+calls nothing while holding it. A caller that won does the first caller's work in `stop` —
+sentinel, set, join against **its own** timeout, expiry; a caller that lost does the second
+caller's wait, also against its own timeout, so each `shutdown()` still returns within what it
+asked for. The record is therefore **write-once** without a second flag: a losing claim writes
+nothing, and the deadline the drain declines against is always that of the caller whose join
+follows. Deciding the gate in one critical section and recording in another was measured (plan
+review, 1 run in 60) handing the 0.9 s caller the join while the drain declined against 1.8 s:
+that join expired, the 1.8 s caller returned as second, and `close()` was never called. The
+nesting `_state._lock` then `Worker._lock` is added; `worker.py` takes `_state._lock` nowhere
+(grep at `71e42dd`), so there is no reverse nesting.
 
 **The rule.** `_emit` times each attempt (monotonic around `sink.emit` only, never the backoff) and,
 **immediately before each retry attempt and after its backoff wait has returned**, declines that
@@ -242,7 +252,8 @@ started**. Invariant 2's span ledger states no failed-batch term, and
 
 #### Description:
 
-Only `_shutdown_worker` and `Worker.stop` record a deadline, so every other drain is unaffected:
+Only a claimed stop records a deadline — `Worker.claim_stop`, reached from `_shutdown_worker`
+and `Worker.stop` — so every other drain is unaffected:
 `shutdown(timeout=None)`, ordinary draining with no stop requested, `flush(timeout)` and a sink swap
 (`Worker.retarget`) retry and back off exactly as before. `flush()` and the swap are deliberately
 not budgeted (see Out of Scope), which this requirement pins rather than leaves implicit.
@@ -268,10 +279,12 @@ not budgeted (see Out of Scope), which this requirement pins rather than leaves 
 
 One retry site serves both `_drain` and `_final_drain`, so the rule holds when the stop arrives while
 a retry sequence is already under way in `_drain`, and for a late worker (`_shutdown_worker` calls
-`late_worker.stop(remaining)`; its deadline is the one `Worker.stop` records, before it sets the
+`late_worker.stop(remaining)`; its deadline is the one `Worker.stop` claims, before it sets the
 late worker's own event). Two concurrent `shutdown()` callers share one worker: the deadline that
-governs is whatever the worker holds, because the write-once record decides it, not a particular
-caller. The orphan path keeps its single attempt and needs no mechanism.
+governs is the one recorded by the caller that won the once-only gate, because the gate and the
+record are one decision (FR-001); that caller's join follows, so the drain ends inside the join it
+is measured against and `close()` runs once on every interleaving, while the caller that lost
+waits against its own timeout. The orphan path keeps its single attempt and needs no mechanism.
 
 **The residual, stated rather than hidden.** A backoff cut short by the stop always sees the
 deadline, because it was recorded before the event was set. A retry check that read no deadline
@@ -285,18 +298,21 @@ and neither is new.
 
 - [ ] **Stop mid-sequence in `_drain`.** `batch_size=1`, nothing queued behind the batch. A sink whose
       `emit` blocks on an event the test controls and then fails. `shutdown(timeout=0.5)` is called
-      0.1 s after attempt 1 starts, and the event is released only after the stop has recorded its
-      deadline (observed through FR-001's hook), 0.3 s after attempt 1 started. Exactly 1 attempt is
-      made (`0.3 + 0.3 + 0.1 > 0.6`), `shutdown` returns within 0.5 s plus slack, and `close()` is
-      called once.
+      0.1 s after attempt 1 starts, and the event is released 0.2 s after the record is observed
+      through FR-001's hook (t_rec + 0.2), never on wall time from the call: with δ the latency
+      from the call to the record, attempt 1 has then run for at least `0.3 + δ`, the prediction
+      is at least `0.6 + 2δ` past the call against a deadline 0.5 past it, so the decline margin is
+      at least 0.1 s and grows with thread-start latency under `-n 12`. Exactly 1 attempt is made,
+      `shutdown` returns within 0.5 s plus slack, and `close()` is called once.
 - [ ] The same ordering with `shutdown(timeout=30.0)` makes all `max_retries + 1` attempts.
 - [ ] A late worker (built during a `shutdown()`, stopped by `late_worker.stop(remaining)`) has its
       deadline recorded before its own event is set, declines against the remaining budget it was
       given, and the overall `shutdown` returns within the original T plus slack.
 - [ ] Two concurrent `shutdown()` calls through `tests/conftest.py::run_concurrently`, with different
       timeouts: the attempts made match the deadline the worker recorded (asserted against that
-      recorded value, not against "the first caller"), both calls return, and `close()` is called
-      once.
+      recorded value, not against "the first caller"), both calls return, the recording caller's
+      join does not expire, and `close()` is called once — on every interleaving, because the
+      recording caller is the joining caller.
 - [ ] A `run_concurrently` run of `shutdown()`, `flush()` and `health()` completes with no thread
       left blocked past a bound, so the new lock nesting deadlocks nowhere.
 - [ ] One test drives both delivery paths, an in-span `info()` through the worker and an out-of-span
@@ -341,14 +357,23 @@ still deliver them), and counting them now would double-count when the abandon l
 ```
 # src/log_foundry/worker.py
 _JOIN_MARGIN: float = 0.1             # module constant: the drain thread's moments after its last attempt
-Worker._exit_deadline: float | None   # monotonic instant; write-once, under Worker._lock; set by
-                                      # _shutdown_worker (live worker) and Worker.stop, before any
-                                      # stop event it holds is set
+Worker._exit_deadline: float | None   # monotonic instant; written only by claim_stop, in the
+                                      # decision that wins the _stopped gate, under Worker._lock;
+                                      # reached from _shutdown_worker (live worker, first critical
+                                      # section) and Worker.stop (direct and late-worker routes),
+                                      # before any stop event the worker holds is set
+Worker.claim_stop(deadline) -> bool   # the gate and the record as one decision; True = this caller
+                                      # does the first caller's work in stop()
+Worker.stop(timeout, *, claimed=None) # claimed: a verdict already taken under _state._lock, or
+                                      # None to claim here
 Worker._in_flight: int                # events in the batch _emit is holding; 0 when none
 ```
 
-`_exit_deadline` is not reset in `_reinit_after_fork`: a stopped worker is never resumed there (a
-fork does not undo a `shutdown()`). `_in_flight` is reset in `_reinit_after_fork` beside the other
+`_exit_deadline` is reset on the **resume** branch of `_reinit_after_fork` and left alone on the
+retired one: a worker stopped by a direct `Worker.stop()` never moved the retirement count, so
+`_lifecycle._rebuild_worker_after_fork` still resumes it, and without the reset every retry in that
+child would be declined against the parent's deadline forever; a retired parent forks a retired
+child, whose record nothing reads. `_in_flight` is reset on both branches beside the other
 per-drain fields (`dropped`, `failed_batches`, `stopped_reason`, `_taken_markers`), because a child
 inherits the parent's value for a drain thread that does not exist in it (invariant 12). It is
 written by the drain thread and read without the lock by the stopper, as `draining` is read: a single
@@ -364,7 +389,7 @@ predicted to end after the `shutdown()` deadline.
 
 ```
 src/log_foundry/worker.py                 # _JOIN_MARGIN, stop(), _emit(), the ShutdownTimeout line, docstrings
-src/log_foundry/_lifecycle.py             # _shutdown_worker: record before _state._stop.set()
+src/log_foundry/_lifecycle.py             # _shutdown_worker: claim_stop before _state._stop.set()
 tests/test_worker_exit_budget.py          # new: FR-001 through FR-005
 docs/architecture.md                      # §12 item moved to Resolved
 docs/invariants.md                        # invariant 3 Guarded line

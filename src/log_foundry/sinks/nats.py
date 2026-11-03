@@ -27,16 +27,17 @@ drain thread against that deadline and ``_final_drain``'s single emit runs on th
 expired join leaves the sink **open** by SPEC-027 FR-004, so ``close()`` never drains the client's
 outbound buffer.
 
-**It does not fit inside that join, and the arithmetic is stated rather than assumed.**
-``Worker._emit`` retries a failing batch ``max_retries + 1`` times -- four at the default -- and its
-inter-attempt wait returns immediately once the stop event is set, which it is for the whole of the
-exit drain. This deadline deliberately does not consult that event (a shutdown shortens a wait and
-never skips work), so the exit drain's worst case is ``(max_retries + 1) x publish_timeout``. Ten is
-chosen on the size of the improvement rather than on fitting the sequence inside the join: the same
-path is *unbounded* today, 8.3 hours for a 5,980-event backlog at 5 s an event. A caller who needs
-the whole sequence to fit lowers this to 7.0 or below. Recorded as an open item in
-``architecture.md`` section 12, since closing it means bounding the worker's retry of an
-already-bounded batch -- every sink's question rather than this sink's.
+**The exit drain fits the join, and the arithmetic is stated rather than assumed.**
+``Worker._emit`` retries a failing batch up to ``max_retries + 1`` times -- four at the default --
+and its inter-attempt wait returns immediately once the stop event is set, which it is for the whole
+of the exit drain. This deadline deliberately does not consult that event (a shutdown shortens a
+wait and never skips work), so on its own the sequence would cost ``(max_retries + 1) x
+publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker declines a retry predicted to
+end after the ``shutdown()`` deadline, so the exit drain's worst case is bounded by the
+``shutdown()`` budget plus one in-flight ``publish_timeout`` -- the first attempt is always made --
+and at these defaults the third attempt is declined at 20 s and ``close()`` runs. Ten is chosen on
+the size of the improvement: the same path was *unbounded* before this bound, 8.3 hours for a
+5,980-event backlog at 5 s an event.
 """
 
 DEFAULT_ACK_TIMEOUT = 5.0
@@ -73,9 +74,10 @@ class NATSSink:
     > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
 
     The worst case is therefore ``publish_timeout`` per emit, plus one in-flight ack — and across
-    the exit drain ``(max_retries + 1) x publish_timeout``, since ``Worker._emit`` retries a failing
-    batch and its inter-attempt wait returns immediately during a shutdown. That exceeds
-    ``shutdown()``'s join at the defaults and is recorded in ``architecture.md`` section 12.
+    the exit drain the ``shutdown()`` budget plus one in-flight ``publish_timeout``, since
+    ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and the
+    first attempt is always made. Before that it was ``(max_retries + 1) x publish_timeout``,
+    which exceeded the join at the defaults; ``architecture.md`` section 12 records the closure.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with

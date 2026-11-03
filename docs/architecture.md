@@ -859,16 +859,6 @@ close it.
   SPEC-035 FR-002 drew the roster's module boundary where it did. Neither is a defect; both are
   recorded so the next reader knows the split was considered. **Closed by** a spec that does it,
   or by a decision that the shape is right.
-- **`NATSSink`'s exit drain can still exceed `shutdown()`'s join** (SPEC-047 FR-001).
-  `publish_timeout` bounds one `emit`, but `Worker._emit` retries a failing batch
-  `max_retries + 1` times — four at the default — and its inter-attempt wait returns immediately
-  once the stop event is set, which it is for the whole of `_final_drain`. So the exit drain's
-  worst case is `(max_retries + 1) x publish_timeout`: 40 s at the defaults against a 30 s join,
-  measured at **8.01 s against an 8.00 s prediction** with `publish_timeout=2.0`. An expired join
-  leaves the sink open (SPEC-027 FR-004). It is recorded rather than fixed because closing it
-  means bounding the worker's retry of an *already-bounded* batch, which is every sink's question
-  and not this sink's. **Closed by** a spec that gives `Worker._emit` a total budget, or by the
-  caller lowering `publish_timeout` to 7.0 or below.
 - **`NATSSink.close()`'s real bound is the driver's, and it is not reachable** (SPEC-047 FR-002).
   `Client.drain` is `wait_for(drain_is_done, drain_timeout)` followed by `self.flush()`, whose 10 s
   default is not a `connect()` option. `drain_timeout` is therefore forwarded but is **not** what
@@ -1046,6 +1036,25 @@ close it.
   event was rejected is undelivered, so it raises (invariant 7). The reading and its rejected
   alternatives: *A Honeycomb batch response is a per-event verdict, read all of a chunk or none of
   it*.
+- ~~**`NATSSink`'s exit drain can still exceed `shutdown()`'s join** (SPEC-047 FR-001).
+  `publish_timeout` bounds one `emit`, but `Worker._emit` retries a failing batch
+  `max_retries + 1` times — four at the default — and its inter-attempt wait returns immediately
+  once the stop event is set, which it is for the whole of `_final_drain`. So the exit drain's
+  worst case is `(max_retries + 1) x publish_timeout`: 40 s at the defaults against a 30 s join,
+  measured at **8.01 s against an 8.00 s prediction** with `publish_timeout=2.0`. An expired join
+  leaves the sink open (SPEC-027 FR-004). It is recorded rather than fixed because closing it
+  means bounding the worker's retry of an *already-bounded* batch, which is every sink's question
+  and not this sink's. **Closed by** a spec that gives `Worker._emit` a total budget, or by the
+  caller lowering `publish_timeout` to 7.0 or below.~~ → **closed by SPEC-062 FR-001**. It was
+  every sink's question, and it is answered at the worker: `Worker._emit` times each attempt and
+  declines a retry predicted to end after the `shutdown()` deadline — the batch's longest attempt
+  so far plus a 0.1 s join margin past it. The first attempt is always made and no knob is added,
+  the budget being the caller's `timeout`. At NATS's defaults the third attempt is declined at
+  20 s and the close runs; the exit drain's worst case is the join plus the one in-flight
+  `publish_timeout`, which is invariant 3's observable. Measured at `71e42dd` with a 0.5 s failing
+  sink under `shutdown(timeout=1.2)`: 3 attempts, the join expired and `close()` ran 0 times;
+  after, 2 attempts and one close, pinned by `tests/test_worker_exit_budget.py`.
+
 - ~~**`health().inherited_sink` reads the owed record's last entry**~~ (SPEC-045; invariant 12) →
   **closed by SPEC-054 FR-005**. Arming order does not make a sink the installed one: `_swap_sink`
   seeds the record with the new sink and a preempted emit then appends the superseded one, so the
