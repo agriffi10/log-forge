@@ -19,7 +19,10 @@ over a private mapping, with no OpenTelemetry SDK in the runtime.
 - **The sink** (FR-003, FR-004, `src/log_foundry/sinks/otlp.py`): `OTLPSink(endpoint=…,
   **HTTPPlatformKwargs)`; two private hooks on `HTTPSink`, `_retryable_status` and
   `_response_limit`, defaulting to the family's behaviour; partial success on `rejected_records`
-  and `dropped_unadjudicated`, never retried, all-rejected raising. `_valid_url` gained `name=`.
+  and `dropped_unadjudicated`, never retried, all-rejected raising. `OTLPSink` checks `endpoint`
+  through the family's shared `_valid_url(..., name="endpoint")` — the parameter this build added
+  and #284 landed too, with the `http.client`-backed refusals every sink now gets — before
+  `HTTPSink.__init__` checks it again as `url`, so the message names the subclass and `endpoint`.
 - **Registration** (FR-005): README rows, retry sentence and the *what it sends* subsection with an
   exact-set test; the frozen-path line; every HTTP roster, with the losses and retry builder lists
   now tied to the derived population (which brought `OpenSearchSink` into both); the two
@@ -53,7 +56,10 @@ must be tagged before this lands.
   `OTLPSink` is in `_BODY_READERS`, with `_COUNTS_UNREADABLE` recording which readers count `b""`.
 - `sinks/pubsub.py:140` carries `# type: ignore[import-not-found, unused-ignore]` and
   `pyproject.toml` a `google.cloud.*` mypy override, because the dev group now installs `protobuf`.
-- SPEC-049's `_valid_url` message names the argument it is given (`url` by default).
+- SPEC-049's `_valid_url` message names the argument it is given (`url` by default); #284 carries
+  the same `name` parameter, so the rebase kept its version whole and `OTLPSink`'s call
+  unchanged. `tests/test_sinks_http_url.py` (#284) sweeps every subclass through
+  `_URL_ARGUMENTS`; `OTLPSink`'s entry names `endpoint`.
 
 ## Follow-ups and open limits
 
