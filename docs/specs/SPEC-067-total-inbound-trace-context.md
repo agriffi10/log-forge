@@ -135,9 +135,14 @@ computed by a private helper, `_echo(value)`, inside the guard that already cove
   `"…"` exactly as today.
 - **Anything else.** Echoed as `<TypeName>`. The name is read with
   `type.__dict__["__name__"].__get__(type(value))`, which bypasses a metaclass `__name__` property.
-  It goes through the same `str` path (first 64 characters by the slot, escaped, the escaped text
-  cut to 64 characters plus `"…"` when longer, no quotes) because a class's `__name__` may be set to a `str` subclass instance, may be any
-  length and may contain a newline. The result is wrapped in `<` and `>`.
+  It goes through the same `str` path, except that the slice is the first **65** characters (then
+  escaped, the escaped text cut to 64 characters plus `"…"` when longer, no quotes), because a
+  class's `__name__` may be set to a `str` subclass instance, may be any length and may contain a
+  newline. The result is wrapped in `<` and `>`. The slice is 65, not 64, because a printable name
+  longer than 64 characters escapes to exactly 64 from a 64-character slice and would be cut with
+  no `…`; with 65 every name over 64 characters is cut and marked, and the output is unchanged for
+  every name of 64 or fewer. The `str` route keeps its 64-character slice, because `repr`'s quotes
+  always push a 64-character slice past the cut.
 
 So the echo is at most `_MAX_REJECTED_ECHO + 3` characters whatever the value. For an exact `str`
 of at most 64 characters the line is byte-identical to today's. For a longer one the quoting may
@@ -167,11 +172,14 @@ the list is empty after the call. A hook that raises is armed only around the `r
       `issubclass(type(v), str)` consults `str`'s metaclass, never the value's.)
 - [ ] An instance of a class whose `__name__` was set to a `str` subclass instance, 500 characters
       long, beginning `"a\nlog-foundry: forged"` and with every method of the subclass raising,
-      writes one line, and the part after `: ` equals `<`, the first 64 characters of the name
-      escaped and then cut to 64 characters, `…` and `>`, written out as a literal. The spy on the subclass is empty. *Fails at
-      base, which echoes the default object `repr` and not the name.*
+      writes one line, and the part after `: ` equals `<`, the first 65 characters of the name
+      escaped and then cut to 64 characters, `…` and `>`, written out as a literal. The spy on the
+      subclass is empty. *Fails at base, which echoes the default object `repr` and not the name.*
+- [ ] A class named by 64 printable characters is echoed `<` and that name and `>`, and one named by
+      65 printable characters is echoed `<`, its first 64 characters, `…` and `>`. *The second fails
+      at base, which echoes the default object `repr`.*
 - [ ] `b"00-bad"` is echoed `<bytes>`, an `int` `<int>` and a `list` `<list>`. *Fails at base for
-      the first two (`b'00-bad'`, `123`).*
+      all three (`b'00-bad'`, `123` and the `repr` of the list).*
 - [ ] A `str` subclass with `__repr__`, `__getitem__`, `__len__`, `__str__`, `__iter__` and `__eq__`
       all raising is echoed as a `str` (quoted, escaped, bounded) and the spy is empty. *Fails at
       base.*
@@ -266,8 +274,9 @@ valid exact `str` and its expected result.
 On entry `continue_trace` replaces each of `traceparent`, `trace_id`, `parent_span_id` and
 `baggage`: a value whose real type is a `str` subclass (tested as in FR-001) becomes an exact
 `str` through `str.__str__(value)`, a C-level copy that runs no method of the subclass; any other
-value is passed through unchanged. The implementation binds new local names (or uses `cast`) rather
-than assigning back to the `str | None` parameters, which `mypy --strict` refuses. The rest of the
+value is passed through unchanged. The implementation either binds new local names or assigns back
+through `cast("str | None", ...)`, and either is fine; a plain assignment of an `object` back to the
+`str | None` parameters is what `mypy --strict` refuses. The rest of the
 function, the parsers and `_diag.rejected` therefore see only an exact `str` or a non-`str` of
 which no code is ever run. So a `str` subclass carrying a valid header is still adopted as today,
 and what is adopted, stored and later formatted by `current_traceparent()` is the exact `str` it
@@ -292,8 +301,9 @@ argument (`traceparent`, `trace_id`, `parent_span_id` alone, `parent_span_id` be
 property, and one whose `__class__` returns `str`.
 
 - [ ] Every cell returns a `ContinueResult` without raising and inside the deadline. A spy on each
-      non-`str` probe records no call, and the overridden method of each subclass probe was never
-      called. *Fails at base in the cells Probes A, E and F name.*
+      probe that is a user-defined object records no call, and the overridden method of each
+      subclass probe was never called. The DAG and `bytes` are builtins and cannot carry a spy, so
+      those cells rely on the deadline and the echo literal (`<list>`, `<bytes>`) instead. *Fails at base in the cells Probes A, E and F name.*
 - [ ] In every cell where the result is falsy, `reason == "rejected"` and at least one line
       beginning `log-foundry: ignoring inbound trace context` is on stderr; and the raising
       `__repr__` cell writes a line ending `: <_Hostile>`. *The second half fails at base (Probe B).*
@@ -340,8 +350,9 @@ property, and one whose `__class__` returns `str`.
 
 Several documents state what this spec replaces. `rejected`'s docstring calls it "the one place in
 the library where a `repr` is correct" and says the value is echoed as a bounded `repr`. The
-failure-paths decision says "The one bounded `repr` is `rejected`". `SPEC-029`'s spec wraps the same
-claim across lines 107 to 109, its delivery doc says "SPEC-014's bounded `repr`", and
+failure-paths decision says "The one bounded `repr` is `rejected`". `SPEC-029`'s spec states the same
+claim at three sites (lines 57 to 59, where `_warn_rejected` "already bounds and `repr`-escapes",
+lines 107 to 109, wrapped across lines, and line 165, a docstring sketch), its delivery doc says "SPEC-014's bounded `repr`", and
 `tests/test_diag.py:195`'s section comment says `rejected` "keeps SPEC-014's bounded repr exactly".
 A completed spec and a delivery doc are history, so those two get a superseded marker (the
 completion ritual's step for every other site that states the old claim, and `SPEC-036` and
@@ -359,15 +370,17 @@ note. None of this has behaviour to test, which is why this FR keeps no invarian
       argument is normalised on entry and what its verdict means for a stream fault.
 - [ ] The decision file under `docs/decisions/failure-paths/` named
       `one-module-writes-every-diagnostic-...` has its "one bounded `repr`" sentence rewritten in
-      place with a dated History entry. `docs/specs/SPEC-029-diagnostic-output-safety.md` (at its
-      FR-002's last criterion) and `docs/spec-delivery/SPEC-029-diagnostic-output-safety.md` each
-      carry a short superseded blockquote naming SPEC-067, and the comment at
+      place with a dated History entry. `docs/specs/SPEC-029-diagnostic-output-safety.md` carries a
+      short superseded blockquote naming SPEC-067 at each of its three sites (the out-of-scope
+      bullet near line 57, FR-002's last criterion near line 107 and the docstring sketch near
+      line 165), `docs/spec-delivery/SPEC-029-diagnostic-output-safety.md` carries one where it
+      says "SPEC-014's bounded `repr`", and the comment at
       `tests/test_diag.py:195` is reworded.
 - [ ] A sweep over `docs/`, `src/` and `tests/` that **reassembles wrapped sentences** (it joins
       each paragraph or list item before matching, because the SPEC-029 claim is split across three
-      lines and a line-by-line `grep` cannot see it) finds no statement that `rejected` echoes a
-      bounded `repr`, that a `repr` is correct there, or that the one bounded `repr` is
-      `rejected`, except under a superseded marker.
+      lines and a line-by-line `grep` cannot see it) finds no statement that `rejected` (or `_warn_rejected`) echoes a
+      bounded or `repr`-escaped `repr`, that a `repr` is correct there, or that the one bounded
+      `repr` is `rejected`, except under a superseded marker.
 - [ ] `docs/release-notes/v1.1.0.md` has a new subsection at the end of `## Fixed`, after the
       Honeycomb, SPEC-064 and SPEC-065 entries, that names the caller-visible changes: a non-`str`
       value is echoed by type name, a long `str`'s quoting may differ, the parsers refuse a `str`
@@ -375,6 +388,12 @@ note. None of this has behaviour to test, which is why this FR keeps no invarian
       `str` subclass is now stored as the exact `str` it holds, which stops
       `current_traceparent()` raising the subclass's own exception (Probe G). It ends with a
       "Who must change code" line saying no caller must, as SPEC-065's does.
+- [ ] The SPEC-064 entry in that file says "`set_baggage`, `get_baggage`, `continue_trace` and
+      `parse_baggage_header` are unchanged", which this spec makes false in the same release for
+      the last two. The sentence is qualified in place to read: `set_baggage` and `get_baggage` are
+      unchanged, and so are `continue_trace` and `parse_baggage_header` for an exact `str` header; what
+      they do with a value that is not an exact `str` is in the SPEC-067 entry below. The rest of
+      the sentence (`get_baggage()` still returns what you stored, surrogate included) stays.
 - [ ] The lead paragraph of that file is unchanged. Its claim that a `>=1,<2` pin takes the release
       "without a code change" unless a caller passes a `float` ceiling stays true: this change is
       on stderr and in a module the frozen surface does not list, and a stderr format change is
@@ -394,12 +413,13 @@ No signature changes and no new public name.
 # src/log_foundry/decorator.py: the normalisation, a private helper applied once on entry
 def _exact(value: object) -> object:
     # str subclass -> str.__str__(value); anything else -> value, untouched
-    # callers bind new names (or cast); they do not assign back to the `str | None` parameters
+    # callers bind new names, or assign back through cast("str | None", ...); a plain assignment
+    # back to the `str | None` parameters does not type-check
 
 # src/log_foundry/_diag.py: rejected(reason: str, value: object) -> None   (unchanged signature)
 def _echo(value: object) -> str:
     # str route:      first 64 chars via str.__getitem__, str.__repr__, _escape, cut to 64 + "…"
-    # non-str route:  "<" + name (same str path, no quotes) + ">",
+    # non-str route:  "<" + name (first 65 chars, escaped, cut to 64 + "…", no quotes) + ">",
     #                 name = type.__dict__["__name__"].__get__(type(value))
 # rejected calls _echo inside its guard; an Exception from it writes the line with "<?>"
 
