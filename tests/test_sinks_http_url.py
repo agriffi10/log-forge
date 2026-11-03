@@ -23,6 +23,14 @@ from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
 from test_sinks_http_render import _shipped_http_subclasses
 
+
+def _assert_printable(exc: BaseException) -> None:
+    """A lone surrogate in a message makes the message itself fail to encode wherever it is shown."""
+    assert not any(0xD800 <= ord(char) <= 0xDFFF for char in str(exc)), str(exc).encode(
+        "utf-8", "backslashreplace"
+    )
+
+
 _UNSENDABLE = [
     "http://h\ud800/x",
     "http://h/x\ud800",
@@ -33,12 +41,13 @@ _UNSENDABLE = [
     "http://h/x\x00",
     "http://h :8/x",
     "http://u:p@h/x",
+    "http://h:abc/x",
 ]
 """URLs that pass the scheme and host checks but that ``http.client`` cannot put on the wire."""
 
 
 @pytest.mark.parametrize("url", _UNSENDABLE)
-def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str) -> None:
+def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str, capsys) -> None:
     """The premise, against the real default opener: no request, no count, no stderr line.
 
     The sink is built on a good URL and pointed at the bad one afterwards, which is the only way
@@ -52,6 +61,7 @@ def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str) -> None:
 
     assert not isinstance(caught.value, OSError), "an OSError would have been counted"
     assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("url", _UNSENDABLE)
@@ -59,12 +69,19 @@ def test_an_unsendable_url_is_refused_at_construction(url: str) -> None:
     with pytest.raises(ValueError, match=r"^HTTPSink url cannot be sent over HTTP \(") as caught:
         HTTPSink(url)
 
-    str(caught.value).encode("utf-8"), "a raw surrogate in the message would fail to print"
+    _assert_printable(caught.value)
 
 
-@pytest.mark.parametrize("url", ["http://h:99999/x", "http://h:0/x", "http://h:abc/x"])
+@pytest.mark.parametrize("url", ["http://h:99999/x", "http://h:0/x"])
 def test_a_url_naming_no_usable_port_is_refused(url: str) -> None:
     with pytest.raises(ValueError, match=r"^HTTPSink url names no usable port: "):
+        HTTPSink(url)
+
+
+@pytest.mark.parametrize("url", ["http:/\t/h/x", "http:\n//h/x"])
+def test_a_host_only_urlparse_finds_is_refused(url: str) -> None:
+    """``urlparse`` drops the tab or newline and finds a host; ``urllib`` keeps it and finds none."""
+    with pytest.raises(ValueError, match=r"^HTTPSink url names no host: "):
         HTTPSink(url)
 
 
@@ -74,9 +91,15 @@ def test_a_scheme_only_urlparse_strips_is_refused() -> None:
         HTTPSink("\x00http://h/x")
 
 
-@pytest.mark.parametrize("url", ["http://b\u00fccher.example/x", "http://h/x?q=%zz", "https://h/x#f"])
+@pytest.mark.parametrize(
+    "url", ["http://b\u00fccher.example/x", "http://h/x?q=%zz", "https://h/x#f", "http://h:+80/x"]
+)
 def test_a_url_http_client_can_send_constructs(url: str) -> None:
-    """An internationalised host is IDNA-encoded on the wire, so it is not refused with the path."""
+    """An internationalised host is IDNA-encoded on the wire, so it is not refused with the path.
+
+    ``http://h:+80/x`` delivers: ``http.client`` reads ``+80`` as port 80, where ``urlparse``
+    refuses it, which is why the port is read from the connection.
+    """
     assert HTTPSink(url).url == url
 
 
@@ -91,6 +114,13 @@ def test_surrounding_whitespace_is_floored_to_what_urllib_sent(pad: str) -> None
 
     assert sink.url == "http://h/x"
     assert opener.calls[0]["url"] == "http://h/x"
+
+
+@pytest.mark.parametrize("url", ["<URL:http://h/x>", "<http://h/x>", " <URL: http://h/x > "])
+def test_a_wrapped_url_is_floored_to_what_urllib_sent(url: str) -> None:
+    assert urllib.request.Request(url).full_url == "http://h/x", "the premise"  # noqa: S310
+
+    assert HTTPSink(url).url == "http://h/x"
 
 
 @pytest.mark.parametrize("method", ["POST\r\n", "PO\x00ST", "P\u00d6ST"])
@@ -138,7 +168,7 @@ def test_every_http_subclass_refuses_a_surrogate_naming_itself_and_the_argument(
     with pytest.raises(ValueError, match=rf"^{cls.__name__} {argument} ") as caught:
         build(_SURROGATE)
 
-    str(caught.value).encode("utf-8"), "a raw surrogate in the message would fail to print"
+    _assert_printable(caught.value)
 
 
 @pytest.mark.parametrize("cls", _shipped_http_subclasses(), ids=lambda cls: cls.__name__)

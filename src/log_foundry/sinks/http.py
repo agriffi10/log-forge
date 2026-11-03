@@ -12,7 +12,7 @@ from base64 import b64encode
 from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypedDict
-from urllib.parse import urlparse
+from urllib.parse import unwrap, urlparse
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
@@ -254,6 +254,8 @@ _BODY_FORMATS = ("ndjson", "json_array")
 
 _CRLF = ("\r", "\n")
 
+_MAX_PORT = 65535
+
 
 def _valid_url(url: str, owner: str, name: str = "url") -> str:
     """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
@@ -264,18 +266,21 @@ def _valid_url(url: str, owner: str, name: str = "url") -> str:
     :class:`HTTPSink` receives, which is the URL every subclass has finished building, so no
     subclass can smuggle one past.
 
-    Surrounding whitespace is **floored**, not refused: ``urllib`` strips it with ``str.strip``
-    before it parses, so such a URL already delivered, and the stripped form is exactly what went
-    on the wire. Anything ``http.client`` cannot carry is **refused**, because it never delivered
+    Surrounding whitespace is **floored**, not refused: ``urllib`` passes every URL through
+    :func:`urllib.parse.unwrap`, which strips it and a ``<URL:…>`` wrapper, before it parses, so
+    such a URL already delivered. The floor is that same call, so the stored URL is exactly the
+    one that went on the wire. Anything ``http.client`` cannot carry is **refused**, because it never delivered
     once: a lone surrogate or any other non-ASCII character outside the host, a space or control
     character, or a ``user:password@`` with no port, which the connection reads as one, all raised
     ``UnicodeEncodeError`` or ``InvalidURL`` out of every ``emit`` with ``failed == 0`` and no
     stderr line. Rather than list those characters, the check builds the request line the way
     ``urllib`` would — the connection ``do_open`` builds for the request's host, then
     ``putrequest``, which encodes and validates without opening a socket — so the refusal tracks
-    ``http.client``'s own rules instead of a copy of them. A port of ``0`` or past ``65535`` is
-    refused for the reason a missing host is: every request fails, counted, for the life of the
-    process, and that is knowable here.
+    ``http.client``'s own rules instead of a copy of them. The host and the port are read from
+    those same objects rather than from :func:`urlparse`, which drops a tab or newline that
+    ``urllib`` keeps and parses a port more strictly than ``http.client`` does. A missing host, or
+    a port of ``0`` or past ``65535``, is refused because every request fails, counted, for the
+    life of the process, and that is knowable here.
 
     Args:
       url: The endpoint as constructed.
@@ -284,7 +289,7 @@ def _valid_url(url: str, owner: str, name: str = "url") -> str:
         from where it checks that argument itself first.
 
     Returns:
-      The URL with surrounding whitespace removed.
+      The URL as ``urllib`` unwraps it, without surrounding whitespace.
 
     Raises:
       ValueError: If the scheme is not ``http`` or ``https``, the URL names no host — every
@@ -292,28 +297,25 @@ def _valid_url(url: str, owner: str, name: str = "url") -> str:
         which is knowable here (SPEC-049, system-frame review) — its port is not one a socket can
         reach, or ``http.client`` cannot build a request line for it.
     """
-    url = url.strip()
+    url = unwrap(url)
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(
             f"{owner} {name} must use http or https, not {scheme or 'no'} scheme: {url!r}"
         )
-    if not parsed.netloc:
-        raise ValueError(f"{owner} {name} names no host: {url!r}")
-    try:
-        port = parsed.port
-    except ValueError:
-        port = 0
-    if port == 0:
-        raise ValueError(f"{owner} {name} names no usable port: {url!r}")
     request = urllib.request.Request(url)  # noqa: S310
     if request.type.lower() != scheme:
         raise ValueError(f"{owner} {name} must use http or https, not {request.type!r}: {url!r}")
+    if not parsed.netloc or not request.host:
+        raise ValueError(f"{owner} {name} names no host: {url!r}")
     try:
-        http.client.HTTPConnection(request.host).putrequest("POST", request.selector)
+        connection = http.client.HTTPConnection(request.host)
+        connection.putrequest("POST", request.selector)
     except (ValueError, http.client.InvalidURL) as err:
         raise ValueError(f"{owner} {name} cannot be sent over HTTP ({err}): {url!r}") from err
+    if not 0 < connection.port <= _MAX_PORT:
+        raise ValueError(f"{owner} {name} names no usable port: {url!r}")
     return url
 
 
