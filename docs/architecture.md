@@ -961,6 +961,16 @@ close it.
   `bytearray`, `memoryview`) and left these, which no budget depends on. **Closed by** a
   spec that replaces every spoofable type routing on the assembly path (`sanitize.py`, `model.py`
   and `api.py`) with an exact-type identity test or an unbound builtin accessor.
+- **`_diag.rejected` echoes an inbound value through an unbounded `repr()`** (SPEC-064
+  system-frame review; invariants 1 and 11). `continue_trace` passes every refused `traceparent`,
+  `trace_id`, `parent_span_id` or `baggage` to `_diag.rejected`, which calls `repr(value)` before
+  it slices the echo to `_MAX_REJECTED_ECHO`. Measured at `7501e5e` under a 3 s `setitimer`: a
+  shared-sublist DAG (the SPEC-064 case (a) value) passed as `traceparent` never returns; a value
+  whose `__repr__` raises returns `ContinueResult(reason="rejected")` with no line written, because
+  `rejected`'s own guard swallows the whole write, although `"rejected"` is documented as announced.
+  The same class as SPEC-064's header defect, on the diagnostic path rather than the header.
+  **Closed by** `rejected` echoing a non-`str` value by type name (`<TypeName>`) and slicing a
+  `str` before its `repr`, so the echo is bounded and the line is always written.
 - **`configure()` accepts a ceiling that is not an `int`** (SPEC-057 system-frame review;
   invariant 13). `config._require_positive` tests only `value < 1`, so a `float` or a `bool` passes.
   Measured by running `configure()` against `b282c1d`: `max_keys=2.5`, `max_value_bytes=100.0` and

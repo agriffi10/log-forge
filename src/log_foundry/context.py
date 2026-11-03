@@ -415,6 +415,8 @@ def format_baggage_header(baggage: dict[str, object]) -> str:
       None. Only a ``BaseException`` from a value's own code passes through, as everywhere else
         in this library (invariant 1).
     """
+    if not baggage:
+        return ""
     coerced, _ = sanitize.sanitize_fields(baggage, cfg=config._live_config())
     members: list[str] = []
     size = 0
