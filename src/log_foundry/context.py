@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextvars
+import itertools
 from typing import TYPE_CHECKING
 from urllib.parse import quote, unquote
 
+from log_foundry import _diag, config, sanitize
 from log_foundry.ids import format_traceparent
 
 if TYPE_CHECKING:
@@ -40,6 +42,18 @@ _adopted: contextvars.ContextVar[tuple[str, str | None] | None] = contextvars.Co
 )
 
 BAGGAGE_MAX_BYTES = 8192
+
+_dropped_members: itertools.count[int] = itertools.count(1)
+"""The running total of baggage members the outbound header has dropped (SPEC-064 FR-003).
+
+Each member dropped by the :data:`BAGGAGE_MAX_BYTES` cap, or skipped for an empty or unrenderable
+key, takes one ``next()``. That is atomic under the GIL, so every value drawn is unique and each
+throttle crossing is announced by exactly one call, even under concurrent calls. A bare ``+=``
+could lose an increment, and then a line's total would not reproduce from the drops behind it
+(invariant 11); a lock here would be a new fork hazard (invariant 12). It is diagnostic throttle
+state only: a forked child holds its own copy, which only shifts which line it writes, so nothing
+is stranded.
+"""
 
 
 def current_span() -> Span | None:
@@ -341,15 +355,24 @@ def current_trace_context() -> tuple[str, str] | None:
 def current_baggage_header() -> str:
     """Returns the current baggage in W3C ``baggage`` header format.
 
-    The baggage store holds arbitrary objects but the wire format is text, so non-string
-    values are serialized with ``str()`` — put a dict in baggage and it arrives at the next
-    process as its repr, not as a dict.
+    The baggage store holds arbitrary objects but the wire format is text, so each value is
+    first coerced as an event's fields are, under the same ceilings and work budgets (SPEC-064),
+    and the coerced value is then rendered with ``str()``. A dict still arrives at the next
+    process as its repr, with its contents coerced, not as a dict; a ``datetime`` arrives in ISO
+    form, a tuple as a list, and a value nothing can render as an ``<unserializable: Type>``
+    placeholder. A string is sent as it is unless it is past ``max_value_bytes`` or carries a
+    lone surrogate, which becomes U+FFFD.
+
+    The header is capped at :data:`BAGGAGE_MAX_BYTES`, the size the next process's
+    :func:`parse_baggage_header` accepts, by whole members in baggage order: the first member
+    that does not fit ends it, and a member with an empty key is left out. Either drop is
+    announced on stderr as a count, never a key or a value. See :func:`format_baggage_header`.
 
     Args:
       None.
 
     Returns:
-      The formatted header value, empty when there is no baggage.
+      The formatted header value, empty when there is no baggage or none of it fits.
 
     Raises:
       None.
@@ -360,20 +383,135 @@ def current_baggage_header() -> str:
 def format_baggage_header(baggage: dict[str, object]) -> str:
     """Serializes a baggage mapping to the W3C ``key1=value1,key2=value2`` format.
 
+    The mapping is coerced by one ``sanitize.sanitize_fields`` pass over the whole of it, under
+    the live config's ``max_keys``, ``max_depth`` and ``max_value_bytes`` and the pass's node and
+    byte budgets (SPEC-057), so the budgets bound the header as a whole as they bound an event.
+    This is what makes the call return on a value whose own ``str()`` never would, such as a
+    shared-sublist DAG, and agree with event assembly on what a hostile value becomes (SPEC-064
+    FR-001). Each coerced value is rendered by :func:`_render_member`, which guards the whole
+    render of one member, so a failure costs that member its value and nothing else (FR-002).
+
     Keys and values are percent-encoded with ``safe=""``, so the separators themselves are
     encoded rather than corrupting the framing — the whole reason a value containing a comma
     survives the hop and round-trips through :func:`parse_baggage_header`.
+
+    Members are kept in the coerced mapping's order while the header, commas included, is at
+    most :data:`BAGGAGE_MAX_BYTES`. The first member that does not fit ends the header, so it and
+    every member after it are dropped even where a later one is small: a prefix, never a packing,
+    and never a partial member, which W3C Baggage permits past 8192 bytes. The length is that of
+    the percent-encoded text, which is ASCII. A member whose encoded key is empty, or whose key
+    or placeholder cannot be encoded, is skipped without ending the header, because the parser
+    refuses an empty key and with it the whole header (FR-003). Everything dropped is counted
+    and announced by :func:`_announce_dropped`; a member dropped by ``max_keys`` or a value
+    clipped by a ceiling is coercion doing what it does for an event, and is not announced.
 
     Args:
       baggage: The mapping to serialize.
 
     Returns:
-      The formatted header value.
+      The formatted header value, at most :data:`BAGGAGE_MAX_BYTES` long.
+
+    Raises:
+      None. Only a ``BaseException`` from a value's own code passes through, as everywhere else
+        in this library (invariant 1).
+    """
+    if not baggage:
+        return ""
+    coerced, _ = sanitize.sanitize_fields(baggage, cfg=config._live_config())
+    members: list[str] = []
+    size = 0
+    dropped = 0
+    ended = False
+    for key, value in coerced.items():
+        if ended:
+            dropped += 1
+            continue
+        member = _render_member(key, value)
+        if member is None:
+            dropped += 1
+            continue
+        grown = size + len(member) + (1 if members else 0)
+        if grown > BAGGAGE_MAX_BYTES:
+            ended = True
+            dropped += 1
+            continue
+        members.append(member)
+        size = grown
+    if dropped:
+        _announce_dropped(dropped)
+    return ",".join(members)
+
+
+def _render_member(key: str, value: object) -> str | None:
+    """Renders one coerced baggage member as ``key=value``, or ``None`` when it must be skipped.
+
+    After coercion a value is a scalar, a list or a dict, so ``str()`` of it cannot raise except
+    for an object that spoofs a scalar type and survives coercion (arch §12). The guard therefore
+    wraps the whole value render, ``str()`` and ``quote`` both, because a ``__str__`` returning a
+    ``str`` subclass with a raising ``encode`` gets past ``str()`` and raises inside ``quote``.
+    Such a value becomes ``<unserializable: TypeName>``, named by ``sanitize._type_name`` so that
+    an unreadable type name is ``"?"`` rather than a second exception, and never by ``repr`` or
+    the exception's text (invariant 11). Only ``Exception`` is caught, so a ``KeyboardInterrupt``
+    still reaches the caller. A coerced key is always a ``str``, so the key's guard is defensive.
+
+    Args:
+      key: The coerced key.
+      value: The coerced value.
+
+    Returns:
+      The percent-encoded member, or ``None`` when the key is empty or cannot be encoded, or
+        when even the placeholder cannot be.
 
     Raises:
       None.
     """
-    return ",".join(f"{quote(k, safe='')}={quote(str(v), safe='')}" for k, v in baggage.items())
+    try:
+        encoded_key = quote(key, safe="")
+    except Exception:
+        return None
+    if not encoded_key:
+        return None
+    try:
+        text = value if type(value) is str else str(value)
+        encoded_value = quote(text, safe="")
+    except Exception:
+        try:
+            encoded_value = quote(f"<unserializable: {sanitize._type_name(value)}>", safe="")
+        except Exception:
+            return None
+    return f"{encoded_key}={encoded_value}"
+
+
+def _announce_dropped(count: int) -> None:
+    """Counts dropped header members and announces the throttle crossings among them.
+
+    Each member takes one value from :data:`_dropped_members`. The call writes one line if any
+    value it drew is 1 or a multiple of ``_diag.WARN_EVERY``, carrying the last value it drew as
+    the running total, the throttle every per-event site in the library uses. Each value is
+    unique, so each crossing is announced by exactly one call even under concurrent calls. The
+    line names a count only; ``_diag.lost`` cannot raise on a stream fault.
+
+    Args:
+      count: How many members this call dropped, at least 1.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    crossed = False
+    total = 0
+    for _ in range(count):
+        total = next(_dropped_members)
+        if total == 1 or total % _diag.WARN_EVERY == 0:
+            crossed = True
+    if crossed:
+        _diag.lost(
+            "baggage member",
+            total,
+            "running total; members dropped from the outbound baggage header",
+        )
 
 
 def parse_baggage_header(header: object) -> dict[str, object] | None:
