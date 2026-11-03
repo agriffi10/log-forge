@@ -190,24 +190,37 @@ each *value*, and each coercion pass is bounded as a whole at 131,072 values vis
 of text charged, which bounds the work and not the event's size at a destination; an
 unserializable value becomes a type name, never a `repr`; a number too large to render is
 replaced, never clipped; a reserved word has exactly one route through (SPEC-017, SPEC-020,
-SPEC-025, SPEC-034, SPEC-057). The premise holds at assembly **and at a
+SPEC-025, SPEC-034, SPEC-057). A route that returns the caller's object, or lets its method decide
+a measurement, admits it only by exact type or through an unbound builtin accessor, and builtin
+text, bytes and containers are routed by their real type, never by a `__class__` claim; a container
+mapping key is coerced as a value and written as the JSON of the result, not as its `repr`
+(SPEC-063). The premise holds at assembly **and at a
 transform's coercion**: a `TransformSink` runs its function after assembly, so it checks each
 result with the observable below and replaces one that fails with a coercion by assembly's
 per-type rules (SPEC-058).
 
 *Observable:* for any value, the call returns, every string in the event encodes as UTF-8 and
-`json.dumps(event, allow_nan=False)` succeeds, every configured ceiling holds exactly, `truncated` marks every cut and every non-finite
+`json.dumps(event, allow_nan=False)` succeeds, every leaf of the event is of type exactly `str`,
+`int`, `float`, `bool` or `NoneType` and every container exactly `dict` or `list`, every configured
+ceiling holds exactly, `truncated` marks every cut and every non-finite
 substitution (a type-name placeholder is visible on its own and does not set it), and no
 top-level key was overwritten. A lone surrogate is replaced by U+FFFD and marked; a key that
 cannot be rendered becomes a marked key placeholder and costs no sibling (SPEC-055). A pass
 visits at most 131,072 values (`sanitize._MAX_NODES`) and charges at most 16 MiB of text
 (`sanitize._MAX_RENDERED_BYTES`); the value that crosses either budget is a `<node limit>` or
-`<size limit>` that sets `truncated`, and nothing after it is visited (SPEC-057).
+`<size limit>` that sets `truncated`, and nothing after it is visited (SPEC-057). A key that is a
+`tuple`, `list`, `dict`, `set` or `frozenset` by its real type (an `Enum` member excepted) spends
+one node and its members' nodes and bytes as a value would, and is written as the JSON text of its
+coerced form, so no member's `repr` is written inside it; a `bytes` or `bytearray` key is priced
+before it is rendered (SPEC-063).
 *Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
 (invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary
 event takes two passes, `build_event`'s and `backfill_baggage`'s, so `span.start` and `span.end`
-can each hold up to twice each budget (SPEC-057). The
+can each hold up to twice each budget (SPEC-057). A key that is an arbitrary object, or any
+`Enum` member, keeps its own `str()`, which for a default object is its `repr`: the no-`repr` rule
+holds for a value and inside a container key, not for such a key, whose `__str__` is the caller's
+code (SPEC-063). The
 ceilings bound the values of an assembled event and do not bound what a transform adds: a
 transform's coercion is for type only, under no configured ceiling, outside the two pass budgets,
 and with one fixed depth bound of 100, marked as assembly marks a depth cut, because what a transform adds is the caller's code
@@ -215,7 +228,9 @@ choosing the size (SPEC-058).
 *Guarded:* `tests/test_sanitize.py`, `tests/test_model.py`, the reserved-word route-through
 by `tests/test_public_surface.py`, `tests/test_sanitize_corpus.py`, which holds every
 hostile value to the whole observable on both delivery paths, and `tests/test_assembly_budget.py`,
-which holds both budgets exactly and the reads to the ceiling; a transform's output by
+which holds both budgets exactly and the reads to the ceiling;
+`tests/test_assembly_keys_and_scalars.py`, which holds the container-key rule, the exact-type
+routes and the real-type routing (SPEC-063); a transform's output by
 `tests/test_transform_coercion.py` (SPEC-058).
 
 ## 9. Context is scoped, and an adopted context confers nothing

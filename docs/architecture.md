@@ -925,32 +925,6 @@ close it.
   drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
   library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
-- **A mapping key built from a shared sub-structure is rendered whole before any budget applies**
-  (SPEC-057, Accepted Limits; invariants 1 and 8). `_Coercer._key` renders a key that is not a
-  `str`, `int` or `float` by `str(key)`, so a `tuple` or `frozenset` key — or any key a caller
-  `Mapping` yields, which need not even hash — is rendered by the builtin `repr`, which recurses
-  through a shared member once per path. The DAG SPEC-057 FR-001 bounds as a value is unbounded as
-  a key: SPEC-057's budgets charge the text only once it exists, turning a long one into
-  `<size limit>` afterwards, so the work is unchanged rather than regressed. Measured on the
-  caller's thread with `f = frozenset({f, (f, i)})` applied 16, 18, 20 and 22 times, one key costs
-  0.04, 0.17, 0.69 and 2.83 s of CPU at `324936e` and 0.04, 0.16, 0.63 and 2.61 s at `b282c1d`,
-  doubling per level, which extrapolates to days at forty. **Closed by** pre-counting a
-  builtin-container key against the node budget before rendering it, a node per member per path
-  as the pass counts a value, or by rendering such a key as the `<unserializable key: T>`
-  placeholder.
-- **An object that only claims a scalar type is routed as that type and reaches the event as itself**
-  (SPEC-057 sweep; invariant 8). `isinstance` and `kind in _PLAIN_SCALARS` consult `__class__`,
-  `__hash__` and `__eq__`, which a caller's object controls. Three routes in `_dispatch`, none
-  guarded: an object whose `__class__` claims `bool` takes the `isinstance(value, bool)` branch and
-  is returned as it is; one claiming `float` has its own `__float__` decide `isfinite()` in
-  `real()` and is then returned itself; and a class whose metaclass defines `__hash__` and `__eq__`
-  to match `int` passes `kind in _PLAIN_SCALARS`. Each puts a non-JSON object in the event, so a
-  sink's bare `json.dumps` raises. Pre-existing and not regressed: the same three branches stand at
-  `324936e`, and a probe of each returns the object itself there and on the SPEC-057 tree. SPEC-057
-  closed the sibling routes for the types its own reads depend on (`int`, `str`, `bytes`,
-  `bytearray`, `memoryview`) and left these, which no budget depends on. **Closed by** a
-  spec that replaces every spoofable type routing on the assembly path (`sanitize.py`, `model.py`
-  and `api.py`) with an exact-type identity test or an unbound builtin accessor.
 - **`_diag.rejected` echoes an inbound value through an unbounded `repr()`** (SPEC-064
   system-frame review; invariants 1 and 11). `continue_trace` passes every refused `traceparent`,
   `trace_id`, `parent_span_id` or `baggage` to `_diag.rejected`, which calls `repr(value)` before
@@ -1016,6 +990,40 @@ close it.
 
 ### Resolved
 
+- ~~**A mapping key built from a shared sub-structure is rendered whole before any budget applies**~~
+  (SPEC-057, Accepted Limits; invariants 1 and 8) → **closed by SPEC-063 FR-001**. A key whose real
+  type subclasses `tuple`, `list`, `dict`, `set` or `frozenset` (and not `Enum`) is no longer
+  rendered by `str(key)`. It is coerced by the pass as a value at the entry's value depth, so it
+  spends a node for itself and one per member per path, its members are charged to the byte budget,
+  and `max_depth`, `max_keys` and the cycle check apply; its text is the JSON of the coerced form,
+  clipped to `max_value_bytes`. Measured at `71e42dd`, `f = frozenset({f, (f, i)})` applied 14, 16,
+  18 and 20 times cost 0.008, 0.034, 0.142 and 0.572 s of CPU as one key, doubling per level, and a
+  tuple key of 64 references to one 1 MiB string rendered 64 MiB before it became `<size limit>`;
+  forty levels now return in milliseconds with `truncated` set. A container key is walked by
+  `members()` or `mapping()` and never through `_dispatch`, whose `isinstance(value, UUID)` branch
+  would hand a real tuple that claims `UUID` through `__class__` to the builtin `repr`. A `bytes` or
+  `bytearray` key is priced at `4 * len + 3` before it is rendered (a 64 MiB `b"\x00"` key peaked
+  at 256 MiB). The remaining cost is stated, not open: an object that is itself the key keeps
+  `str()`, a `(tuple, ReprEnum)` member holding the DAG still hangs through the enum fallback
+  `str()` (the caller chose that `__str__` chain), and `_coerce_unbounded` extends its accepted
+  DAG cost to a DAG key. Decision:
+  `docs/decisions/event-assembly/a-route-that-trusts-the-callers-object-admits-it-by-exact-type-or-an-unbound-accessor.md`.
+
+- ~~**An object that only claims a scalar type is routed as that type and reaches the event as
+  itself**~~ (SPEC-057 sweep; invariant 8) → **closed by SPEC-063 FR-002**. Every route that returns
+  the caller's object, or lets its method decide a measurement, admits it by exact type or after an
+  unbound `int.__int__` or `float.__float__`, which return an exact number for a genuine subclass and
+  raise `TypeError` for an impostor, now a `<unserializable: T>` placeholder naming its real type.
+  `kind in _PLAIN_SCALARS` is `kind is bool` and the `isinstance(value, bool)` branch is gone; the
+  Enum member routes and the float key branch follow the same rules; a real `str`, `bytes`,
+  `dict`, `tuple`, `list`, `set` or `frozenset` subclass is routed by `issubclass(type(value), ...)`
+  ahead of every `isinstance` branch; and `_key` admits an `int` key by `type(key) is not bool`.
+  Measured at `71e42dd`, the three routes the entry named each put the object itself in the event, as
+  did an `Enum` member whose `.value` was a `float` impostor, a route it had not named. `isinstance`
+  stays only on the render-through routes, so a transparent proxy of a `dict` or `datetime` still
+  renders. The same edit made `_type_name` read the stored name through `str.__str__`, and read it
+  in `model` and `_diag` too, where a metaclass `__name__` property had cost a span its events and
+  silenced the announcement of a counted loss.
 - ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
   invariant 13) → **closed by SPEC-065**. `config._require_positive` tested only `value < 1`, so a
   `float`, `nan` or `inf` was stored as given and `sanitize` then did integer arithmetic on it on

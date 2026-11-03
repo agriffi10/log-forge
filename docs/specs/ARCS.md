@@ -329,7 +329,7 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 
 ## Coercer and invariant 8
 
-- **Coercer and invariant 8 (SPEC-057, SPEC-058):** both edit `sanitize.py`'s coercer and
+- **Coercer and invariant 8 (SPEC-057, SPEC-058, SPEC-063):** all edit `sanitize.py`'s coercer and
   `docs/invariants.md` §8. SPEC-058 landed first and SPEC-057 rebased onto it. They did interact:
   SPEC-057's budgets would have cut the output SPEC-058 promises not to clip, so a transform's
   coercion runs outside them.
@@ -341,6 +341,14 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   Keeping the two equal was SPEC-056's to settle, and it settled it with a test that
   pins `_otel.MAX_NODES` to `sanitize`'s private `_MAX_NODES` and imports nothing from `sanitize`;
   SPEC-057 defines its own constant and asks for no edit to that spec or to `_otel`.
+
+- **Assembly keys and scalars:** SPEC-063, third in the arc — the two items SPEC-057 recorded as
+  open in `architecture.md` §12 and left alone because no budget depended on them. A container
+  mapping key is coerced under the pass budgets and written as the JSON of its coerced form, where
+  SPEC-057 charged it only after `repr` had run; and no route trusts a type test the caller's object
+  controls. It edits the same coercer and the same §8 as the other two, after both had landed, and
+  supersedes SPEC-057's statement that keys cost no node. Three siblings of the same
+  shape ride with it in `api.py`, `model.py` and `_diag.py`.
 
 ## OpenTelemetry-shaped output
 
