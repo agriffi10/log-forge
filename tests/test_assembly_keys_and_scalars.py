@@ -850,3 +850,39 @@ def test_the_module_imports_only_names_older_than_spec_063() -> None:
     for name in ("TRUNCATION_MARKER", "_coerce_unbounded", "_Coercer", "sanitize_fields"):
         assert hasattr(sanitize, name), name
     assert lf.info is not None
+
+
+class _TupleClaimsEnum(tuple):  # type: ignore[type-arg]
+    """A real ``tuple`` subclass claiming ``Enum``, which the value route's ``Enum`` branch reads."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Enum
+
+
+def test_a_container_key_claiming_enum_is_still_walked() -> None:
+    """FR-001: the key is walked by its real type, even under a claim the value route believes.
+
+    Through ``_dispatch``, ``isinstance`` believes the ``Enum`` claim and reads the tuple's
+    ``.value``, which it has not, so the key would be the key placeholder. It is the shape that
+    tells the key's own real-type routing from a route through ``_dispatch``, whose real-type
+    block now walks a tuple claiming ``UUID`` or ``Decimal`` too. A claim of ``int`` or ``float``
+    cannot tell them apart: ``_key`` tests those before the container rule, as ``_dispatch``
+    does, and both refuse the claim with the key placeholder.
+    """
+    fields, flag = sanitize_fields({"k": {_TupleClaimsEnum((1, 2)): 1}}, cfg=Config())
+    assert fields == {"k": {"[1, 2]": 1}}
+    assert flag is False
+
+
+class _BytearrayClaimsBytes(bytearray):
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return bytes
+
+
+def test_a_real_bytearray_claiming_bytes_is_read_through_its_own_slice() -> None:
+    """FR-002: the bytes route reads by real type, so the ``bytes`` slice never refuses it."""
+    fields, flag = sanitize_fields({"v": _BytearrayClaimsBytes(b"ab")}, cfg=Config())
+    assert fields == {"v": "ab"}
+    assert flag is False
