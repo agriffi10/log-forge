@@ -23,19 +23,22 @@ def _one_segment(dataset: str, owner: str) -> None:
     """Refuses a dataset that would not reach Honeycomb as the one path segment it names.
 
     The dataset is placed in ``/1/batch/<dataset>`` as written, so a character with meaning in a
-    URL moved the events somewhere the caller never named, with nothing counted: ``urllib`` drops
-    ``#x`` as a fragment, ``?x`` starts a query and ``/`` starts another segment, all three
-    delivering to ``d`` or to a different path. ``\\`` is not a URI character, and the WHATWG
-    parser a proxy may use reads it as ``/``. A dataset that is ``.`` or ``..`` is a dot-segment,
+    URL moved the events somewhere the caller never named: ``urllib`` drops ``#x`` as a fragment
+    and ``?x`` starts a query, so ``d#x`` and ``d?x`` both landed in ``d`` with nothing counted,
+    and ``/`` starts another segment, so ``a/b`` went to a different path. A backslash is not a
+    character RFC 3986 admits in a path, so what a hop makes of it is not this sink's to promise,
+    and the WHATWG parser reads it as ``/``. A dataset that is ``.`` or ``..`` is a dot-segment,
     which a normalizing hop removes, and so is its percent-encoded form (``%2e``, ``.%2E``), which
     RFC 3986 §6.2.2.2 and the WHATWG parser decode before removing it. An empty dataset, or one
-    that is only whitespace, names no dataset at all. Each of these was already broken, so each
-    is refused rather than encoded, and no dataset that delivered before goes anywhere new.
+    that is only whitespace, names no dataset at all. None of these could be relied on to reach
+    the dataset named, so each is refused rather than encoded, and no dataset that delivered
+    before goes anywhere new.
 
     What stays is what delivered as written: ``%`` escapes, which are how a caller names a
-    dataset ``http.client`` cannot carry raw; the sub-delimiters, ``:`` and ``@``, which have no
-    meaning inside a segment; and trailing whitespace, which ``urllib.parse.unwrap`` floors on
-    every URL, so the dot and empty checks read the dataset after that same strip.
+    dataset ``http.client`` cannot carry raw; the sub-delimiters, ``:`` and ``@``, which
+    ``urllib`` and ``http.client`` carry unchanged; and trailing whitespace, which
+    ``urllib.parse.unwrap`` floors on every URL, so the dot and empty checks read the dataset
+    after that same strip.
 
     Args:
       dataset: The dataset as the caller gave it.
