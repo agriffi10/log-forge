@@ -52,7 +52,9 @@ class NewRelicSink(HTTPSink):
         """
         region = region.upper()
         if region not in _HOSTS:
-            raise ValueError(f"invalid region {region!r}; expected one of {sorted(_HOSTS)}")
+            raise ValueError(
+                f"{type(self).__name__} region must be one of {sorted(_HOSTS)}, not {region!r}"
+            )
         headers = merge_headers({"Api-Key": api_key}, http_kwargs)
         super().__init__(
             f"https://{_HOSTS[region]}/log/v1",

@@ -1,0 +1,149 @@
+"""A URL ``http.client`` cannot send is refused at construction; surrounding whitespace is floored.
+
+``_valid_url`` accepted ``"http://h\\ud800/x"``: the lone surrogate surfaced only at ``emit``, as a
+``UnicodeEncodeError`` with ``failed == 0`` and no stderr line. By the bad-argument rule (SPEC-049 FR-001, the
+``sink-delivery`` decision) a value that never delivered is refused and one that delivers is
+floored: surrounding whitespace delivered, because ``urllib`` strips it before parsing.
+"""
+
+from __future__ import annotations
+
+import http.client
+import urllib.request
+
+import pytest
+
+from log_foundry.sinks.datadog import DatadogSink
+from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
+from log_foundry.sinks.honeycomb import HoneycombSink
+from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.loki import LokiSink
+from log_foundry.sinks.newrelic import NewRelicSink
+from log_foundry.sinks.splunk import SplunkHECSink
+from test_sinks_http import FakeOpener
+from test_sinks_http_render import _shipped_http_subclasses
+
+_UNSENDABLE = [
+    "http://h\ud800/x",
+    "http://h/x\ud800",
+    "http://h/x?a=\udc80",
+    "http://h/\u00e9",
+    "http://h/a b",
+    "http://h/a\tb",
+    "http://h/x\x00",
+    "http://h :8/x",
+    "http://u:p@h/x",
+]
+"""URLs that pass the scheme and host checks but that ``http.client`` cannot put on the wire."""
+
+
+@pytest.mark.parametrize("url", _UNSENDABLE)
+def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str) -> None:
+    """The premise, against the real default opener: no request, no count, no stderr line.
+
+    The sink is built on a good URL and pointed at the bad one afterwards, which is the only way
+    to reach ``emit`` with it now that construction refuses it.
+    """
+    sink = HTTPSink("http://h/x", max_retries=0)
+    sink.url = url
+
+    with pytest.raises((ValueError, http.client.InvalidURL, OSError)) as caught:
+        sink.emit([{"i": 1}])
+
+    assert not isinstance(caught.value, OSError), "an OSError would have been counted"
+    assert sink.losses().failed == 0
+
+
+@pytest.mark.parametrize("url", _UNSENDABLE)
+def test_an_unsendable_url_is_refused_at_construction(url: str) -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink url cannot be sent over HTTP \(") as caught:
+        HTTPSink(url)
+
+    str(caught.value).encode("utf-8"), "a raw surrogate in the message would fail to print"
+
+
+@pytest.mark.parametrize("url", ["http://h:99999/x", "http://h:0/x", "http://h:abc/x"])
+def test_a_url_naming_no_usable_port_is_refused(url: str) -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink url names no usable port: "):
+        HTTPSink(url)
+
+
+def test_a_scheme_only_urlparse_strips_is_refused() -> None:
+    """``urlparse`` drops a leading NUL and reads ``http``; ``urllib`` reads ``\\x00http``."""
+    with pytest.raises(ValueError, match=r"^HTTPSink url must use http or https, not '\\x00http'"):
+        HTTPSink("\x00http://h/x")
+
+
+@pytest.mark.parametrize("url", ["http://b\u00fccher.example/x", "http://h/x?q=%zz", "https://h/x#f"])
+def test_a_url_http_client_can_send_constructs(url: str) -> None:
+    """An internationalised host is IDNA-encoded on the wire, so it is not refused with the path."""
+    assert HTTPSink(url).url == url
+
+
+@pytest.mark.parametrize("pad", [" ", "\t", "\n", "\r\n", "\u00a0", " \t\n"])
+def test_surrounding_whitespace_is_floored_to_what_urllib_sent(pad: str) -> None:
+    url = f"{pad}http://h/x{pad}"
+    assert urllib.request.Request(url).full_url == "http://h/x", "the premise"  # noqa: S310
+    opener = FakeOpener()
+
+    sink = HTTPSink(url, opener=opener)
+    sink.emit([{"i": 1}])
+
+    assert sink.url == "http://h/x"
+    assert opener.calls[0]["url"] == "http://h/x"
+
+
+@pytest.mark.parametrize("method", ["POST\r\n", "PO\x00ST", "P\u00d6ST"])
+def test_an_unsendable_method_is_refused_at_construction(method: str) -> None:
+    with pytest.raises(ValueError, match=r"^HTTPSink method cannot be sent over HTTP \("):
+        HTTPSink("http://h/x", method=method)
+
+
+def test_an_unsendable_method_raised_uncounted_out_of_every_emit() -> None:
+    sink = HTTPSink("http://h/x", max_retries=0)
+    sink.method = "POST\r\n"
+
+    with pytest.raises(ValueError, match="method can't contain control characters"):
+        sink.emit([{"i": 1}])
+
+    assert sink.losses().failed == 0
+
+
+_SURROGATE = "\ud800"
+
+_URL_ARGUMENTS = {
+    "DatadogSink": ("site", lambda bad: DatadogSink("k", site=f"h{bad}")),
+    "ElasticsearchSink": ("url", lambda bad: ElasticsearchSink(f"http://h{bad}", index="i")),
+    "HoneycombSink": ("dataset", lambda bad: HoneycombSink("k", f"d{bad}")),
+    "LokiSink": ("url", lambda bad: LokiSink(f"http://h{bad}")),
+    "NewRelicSink": ("region", lambda bad: NewRelicSink("k", region=f"US{bad}")),
+    "OpenSearchSink": ("url", lambda bad: OpenSearchSink(f"http://h{bad}", index="i")),
+    "SplunkHECSink": ("url", lambda bad: SplunkHECSink(f"http://h{bad}", "tok")),
+}
+"""Each shipped subclass, the argument its URL is built from, and how to put a bad value in it.
+
+Keyed by name and swept over the derived roster, so a new subclass with no entry fails the sweep
+rather than going unchecked. ``NewRelicSink`` builds its host from a fixed table, so its region
+is refused by that table before any URL exists.
+"""
+
+
+@pytest.mark.parametrize("cls", _shipped_http_subclasses(), ids=lambda cls: cls.__name__)
+def test_every_http_subclass_refuses_a_surrogate_naming_itself_and_the_argument(
+    cls: type[HTTPSink],
+) -> None:
+    assert cls.__name__ in _URL_ARGUMENTS, f"{cls.__name__} has no entry; add one to _URL_ARGUMENTS"
+    argument, build = _URL_ARGUMENTS[cls.__name__]
+
+    with pytest.raises(ValueError, match=rf"^{cls.__name__} {argument} ") as caught:
+        build(_SURROGATE)
+
+    str(caught.value).encode("utf-8"), "a raw surrogate in the message would fail to print"
+
+
+@pytest.mark.parametrize("cls", _shipped_http_subclasses(), ids=lambda cls: cls.__name__)
+def test_every_http_subclass_entry_builds_with_a_good_value(cls: type[HTTPSink]) -> None:
+    """The positive control: each recipe constructs its class when the value is clean."""
+    _argument, build = _URL_ARGUMENTS[cls.__name__]
+
+    assert type(build("")) is cls

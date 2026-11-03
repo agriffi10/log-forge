@@ -255,7 +255,7 @@ _BODY_FORMATS = ("ndjson", "json_array")
 _CRLF = ("\r", "\n")
 
 
-def _valid_url(url: str, owner: str) -> str:
+def _valid_url(url: str, owner: str, name: str = "url") -> str:
     """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
 
     A scheme ``urllib`` will open but this sink cannot use is a configuration error that surfaced
@@ -264,27 +264,82 @@ def _valid_url(url: str, owner: str) -> str:
     :class:`HTTPSink` receives, which is the URL every subclass has finished building, so no
     subclass can smuggle one past.
 
+    Surrounding whitespace is **floored**, not refused: ``urllib`` strips it with ``str.strip``
+    before it parses, so such a URL already delivered, and the stripped form is exactly what went
+    on the wire. Anything ``http.client`` cannot carry is **refused**, because it never delivered
+    once: a lone surrogate or any other non-ASCII character outside the host, a space or control
+    character, or a ``user:password@`` with no port, which the connection reads as one, all raised
+    ``UnicodeEncodeError`` or ``InvalidURL`` out of every ``emit`` with ``failed == 0`` and no
+    stderr line. Rather than list those characters, the check builds the request line the way
+    ``urllib`` would — the connection ``do_open`` builds for the request's host, then
+    ``putrequest``, which encodes and validates without opening a socket — so the refusal tracks
+    ``http.client``'s own rules instead of a copy of them. A port of ``0`` or past ``65535`` is
+    refused for the reason a missing host is: every request fails, counted, for the life of the
+    process, and that is knowable here.
+
     Args:
       url: The endpoint as constructed.
       owner: The class refusing it, for the message.
+      name: The argument the message names — ``url`` here, the argument a subclass built the URL
+        from where it checks that argument itself first.
 
     Returns:
-      The URL unchanged.
+      The URL with surrounding whitespace removed.
 
     Raises:
-      ValueError: If the scheme is not ``http`` or ``https``, or the URL names no host — every
+      ValueError: If the scheme is not ``http`` or ``https``, the URL names no host — every
         request to ``http:///x`` fails with a counted ``URLError`` for the life of the process,
-        which is knowable here (SPEC-049, system-frame review).
+        which is knowable here (SPEC-049, system-frame review) — its port is not one a socket can
+        reach, or ``http.client`` cannot build a request line for it.
     """
+    url = url.strip()
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(
-            f"{owner} url must use http or https, not {scheme or 'no'} scheme: {url!r}"
+            f"{owner} {name} must use http or https, not {scheme or 'no'} scheme: {url!r}"
         )
     if not parsed.netloc:
-        raise ValueError(f"{owner} url names no host: {url!r}")
+        raise ValueError(f"{owner} {name} names no host: {url!r}")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = 0
+    if port == 0:
+        raise ValueError(f"{owner} {name} names no usable port: {url!r}")
+    request = urllib.request.Request(url)  # noqa: S310
+    if request.type.lower() != scheme:
+        raise ValueError(f"{owner} {name} must use http or https, not {request.type!r}: {url!r}")
+    try:
+        http.client.HTTPConnection(request.host).putrequest("POST", request.selector)
+    except (ValueError, http.client.InvalidURL) as err:
+        raise ValueError(f"{owner} {name} cannot be sent over HTTP ({err}): {url!r}") from err
     return url
+
+
+def _valid_method(method: str, owner: str) -> str:
+    """Returns a method ``http.client`` can send, or raises (SPEC-049 FR-001).
+
+    A control character or a non-ASCII character in the method made ``putrequest`` raise
+    ``ValueError`` or ``UnicodeEncodeError`` out of every ``emit``, uncounted — the same gap
+    :func:`_valid_url` closes, refused here by the same means: ``putrequest`` itself, with no
+    socket opened.
+
+    Args:
+      method: The HTTP method as constructed.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The method unchanged.
+
+    Raises:
+      ValueError: If ``http.client`` cannot put the method on a request line.
+    """
+    try:
+        http.client.HTTPConnection("localhost").putrequest(method, "/")
+    except (ValueError, http.client.InvalidURL) as err:
+        raise ValueError(f"{owner} method cannot be sent over HTTP ({err}): {method!r}") from err
+    return method
 
 
 def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
@@ -450,7 +505,8 @@ class HTTPSink:
         """Configures the endpoint, encoding, credentials and retry bounds.
 
         Args:
-          url: The endpoint to POST to.
+          url: The endpoint to POST to. Surrounding whitespace is stripped, as ``urllib``
+            already stripped it before sending, so :attr:`url` reads back what goes on the wire.
           method: The HTTP method.
           headers: Headers that override the sink's own defaults.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth.
@@ -481,8 +537,9 @@ class HTTPSink:
           None.
 
         Raises:
-          ValueError: If the URL's scheme is not ``http`` or ``https`` or it names no host, a
-            header name or value or a bearer token contains CR or LF, the timeout cannot bound
+          ValueError: If the URL's scheme is not ``http`` or ``https``, it names no host or no
+            usable port, or ``http.client`` cannot build a request line for it or for the method,
+            a header name or value or a bearer token contains CR or LF, the timeout cannot bound
             anything, ``body_format`` is neither of the two this class renders, or
             ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
@@ -494,7 +551,7 @@ class HTTPSink:
                 f"{type(self).__name__} body_format must be one of {sorted(_BODY_FORMATS)}, "
                 f"not {body_format!r}"
             )
-        self.method = method
+        self.method = _valid_method(method, type(self).__name__)
         self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
         self._auth = _valid_auth(auth, type(self).__name__)
         self.body_format = body_format

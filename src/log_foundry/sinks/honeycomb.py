@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Unpack
 
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, merge_headers
+from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _valid_url, merge_headers
 
 __all__ = ["HoneycombSink"]
 
@@ -56,8 +56,11 @@ class HoneycombSink(HTTPSink):
           None.
 
         Raises:
-          None.
+          ValueError: If ``dataset`` cannot be carried in a request path — checked against a
+            fixed base so the message names ``dataset`` rather than the ``url`` this class
+            builds from both, whose own check names ``url`` (SPEC-049 FR-001).
         """
+        _valid_url(f"http://localhost/1/batch/{dataset}", type(self).__name__, name="dataset")
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",
