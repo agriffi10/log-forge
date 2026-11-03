@@ -413,7 +413,7 @@ specs:
   - id: "SPEC-063"
     title: "Assembly Keys and Scalars — Container Keys Under the Pass Budgets, and No Type Routing the Caller's Object Controls"
     description: "Renders a container mapping key from its budgeted coercion, stops routing on a type test a caller's object can spoof, and closes three sibling faults that cost an event or a span's events."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-055", "SPEC-057"]
     arc: "coercer-and-invariant-8"
     path: "docs/specs/SPEC-063-assembly-keys-and-scalars.md"

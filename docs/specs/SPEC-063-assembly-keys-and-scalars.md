@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-063
 title: "Assembly Keys and Scalars — Container Keys Under the Pass Budgets, and No Type Routing the Caller's Object Controls"
 description: "Renders a container mapping key from its budgeted coercion, stops routing on a type test a caller's object can spoof, and closes three sibling faults that cost an event or a span's events."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-055, SPEC-057]
 arc: coercer-and-invariant-8
 arc_order: 3
@@ -14,8 +14,8 @@ arc_order: 3
 `build_event` runs on the caller's thread on both delivery paths. SPEC-057 bounded what a coercion
 pass does to a *value* — nodes visited, bytes charged, reads held to the ceiling — and recorded two
 things it left open in `architecture.md` §12, both pre-existing and not regressed by it. This spec
-closes both and the three siblings found by sweeping `api.py`, `model.py` and `sanitize.py` for the
-same shape: a caller's object or argument consulted outside every guard. Everything below was
+closes both and the siblings found by sweeping `api.py`, `model.py`, `_diag.py` and `sanitize.py`
+for the same shape: a caller's object or argument consulted outside every guard. Everything below was
 measured at `71e42dd` with Python 3.13.
 
 - **A container key is rendered before any budget applies.** `_Coercer._key` renders a key that is
@@ -25,7 +25,9 @@ measured at `71e42dd` with Python 3.13.
   doubling per level (§12 records 2.61 s at level 22 at `b282c1d`), so forty levels never return. A
   node count alone would not close it: a tuple key of 64 references to one 1 MiB string renders
   64 MiB (0.079 s of CPU) before the byte budget turns it into `<size limit>`, and 64 references to
-  that tuple would be 4 GiB.
+  that tuple would be 4 GiB. A `bytes` key is the same shape without sharing: a 64 MiB `b"\x00"` key
+  is rendered to 256 MiB (a `tracemalloc` peak, 0.1 to 0.2 s of CPU) and only then becomes
+  `<size limit>`.
 - **A caller's object can pick the type rule that returns it.** `isinstance` consults `__class__`
   and `kind in _PLAIN_SCALARS` consults the type's `__hash__` and `__eq__`, i.e. the metaclass. Each
   of these, as the value of a field, reaches the assembled event as the object itself, and
@@ -43,40 +45,52 @@ measured at `71e42dd` with Python 3.13.
   `status=error` for an exception the caller never raised: `_merge`'s `if not fields:` sits outside
   its own `try`. `info("m", echo=Y())` with a raising `Y.__bool__` propagates likewise: `_log`'s
   `if echo and event is not None:` sits outside the echo guard.
-- **A hostile exception class loses its span's events, and a colliding key loses its event.** A
-  `@trace`d function raising an exception whose class's metaclass defines `__name__` as a property
-  that raises, or that returns the integer `42`, or whose `__module__` property raises, has its
-  span's events lost ("absorbed a failure while closing a span (RuntimeError|TypeError); the span's
-  events were lost"), because `_error_fields` reads `type(exc).__name__` and `__module__` through
-  the metaclass and `truncate_str` refuses a non-`str`. The user's exception is still re-raised
-  unchanged, so the first invariant holds, but the eighth's "for any value… the call returns" is
-  not kept for the event. And with `configure(defaults={"svc": 1})`, `info("m", fields={K(): 2})`
-  where `K.__hash__` returns `hash("svc")` and `K.__eq__` raises loses the whole event ("absorbed a
-  failure while emitting an orphan log (RuntimeError); the event was lost"), because
-  `build_event`'s `{**cfg.defaults, **span.defaults, **baggage, **fields}` compares the keys —
-  against SPEC-055's promise that a hostile key costs only itself.
+- **A hostile exception class loses its span's events and its announcement, and a colliding key
+  loses its event.** A `@trace`d function raising an exception whose class's metaclass defines
+  `__name__` as a property that raises, or that returns the integer `42`, or whose `__module__`
+  property raises, has its span's events lost ("absorbed a failure while closing a span
+  (RuntimeError|TypeError); the span's events were lost"), because `_error_fields` reads
+  `type(exc).__name__` and `__module__` through the metaclass and `truncate_str` refuses a non-`str`.
+  The user's exception is still re-raised unchanged, so the first invariant holds, but the eighth's
+  "for any value… the call returns" is not kept for the event. `_diag.absorbed` reads
+  `type(exc).__name__` through the metaclass too, inside its own `try`, so with a raising `__name__`
+  the announcement is swallowed: measured, an orphan loss is counted with an empty stderr, which
+  breaks the second invariant's "counted and announced", and the `fields=` and `echo` absorbs FR-003
+  adds receive caller exceptions. And a hostile key loses its event. With `K.__hash__` returning
+  `hash("svc")` and `K.__eq__` raising, `build_event`'s
+  `{**cfg.defaults, **span.defaults, **baggage, **fields}` compares the keys, against SPEC-055's
+  promise that a hostile key costs only itself. Two shapes are reachable, each probed at `71e42dd`: a
+  hostile key in an earlier source, `configure(defaults={K(): 1})` or `@trace(defaults={K(): 1})`,
+  followed by `info("m", svc=3)`; and a hostile per-call key, `info("m", fields={K(): 2})`, against
+  `configure(defaults={"svc": 1})`. Each loses the event on the orphan path ("emitting an orphan
+  log") and the in-span path ("building an in-span log"), while the span's own boundary events
+  survive. The shape `fields={K(): 2, "svc": 3}` cannot be reached: a dict literal raises at
+  construction, a dict cannot be built holding both (the second insertion raises), and a caller
+  `Mapping` yielding both is dropped whole by `_merge`, announced "merging the fields= argument".
 
 The remedy is one rule per class. A container key is coerced by the pass exactly as a value would
-be, and its text is the JSON of the coerced form. A route that returns the caller's object, or lets
+be, and its text is the JSON of the coerced form; a `bytes` key is priced before it is rendered. A route that returns the caller's object, or lets
 its method decide a measurement, admits it only by an exact-type identity test or by first
-converting it through an unbound builtin accessor. A truthiness test on a caller's argument sits
-inside the guard that already absorbs its siblings. No configuration key and no public name is
-added.
+converting it through an unbound builtin accessor, and a type's name is read from where the type
+stores it. A truthiness test on a caller's argument sits inside the guard that already absorbs its
+siblings, and a merge that cannot compare two keys drops the lower-precedence one. No configuration
+key and no public name is added.
 
 ## Scope
 
 ### In Scope
 
 - A container mapping key coerced through the pass at its value depth, so it spends nodes and bytes,
-  obeys the depth, key-count and cycle rules, and is written as the JSON text of its coerced form
-  (FR-001).
+  obeys the depth, key-count and cycle rules, and is written as the JSON text of its coerced form;
+  a `bytes` or `bytearray` key priced before it is rendered (FR-001).
 - Every `_dispatch`, Enum and key route that returns the caller's object, or lets its method decide
   a measurement, admitting it by exact type or an unbound conversion; `_type_name` reading the
-  stored type name (FR-002).
+  stored type name as an exact `str` (FR-002).
 - The `fields=` truthiness test inside `_merge`'s absorb and the `echo` test inside the echo guard
   (FR-003).
-- The `error` sub-document and the stack fallback reading a type's stored name and module, and the
-  defaults/baggage/fields merge dropping only a key whose insertion raises (FR-004).
+- The `error` sub-document, the stack fallback and `_diag.absorbed` reading a type's stored name
+  (and the `error` sub-document its stored module), and the defaults/baggage/fields merge dropping
+  only the lower-precedence key of a pair that cannot be compared (FR-004).
 - The record: both §12 items resolved, the eighth invariant's text, the superseded "keys are not
   counted" claim at every site that states it, a decision, and the pending release notes (FR-005).
 
@@ -93,12 +107,16 @@ added.
   `tests/test_api.py`.
 - **A `fields=` argument whose keys cannot hash**, or whose key collides with a keyword in `_merge`'s
   own `{**fields, **kv}` (measured at `71e42dd`: `fields={K(): 2}` with `svc=3` loses the argument,
-  announced "merging the fields= argument", and keeps the event). `_merge` already drops that
-  argument whole and says so; this spec leaves it.
+  announced "merging the fields= argument", and keeps the event), or a caller `Mapping` that yields
+  two keys which cannot be compared. `_merge` already drops that argument whole and says so; this
+  spec leaves it.
+- **`@trace(name=X())` where `X`'s `__class__` claims `str`.** It passes the `isinstance` test at
+  `decorator.py:849`, is not refused at decoration, and the calls then run untraced, announced. That
+  is `decorator.py` and the thirteenth invariant's decoration-time refusal, not this spec's file.
 - **`_otel.py`.** It maps an already assembled event, which FR-002 now guarantees holds only exact
   types, and keeps its own `_type_name` (`tests/test_otel_mapping.py` pins its `?`).
-- **Keys of any other type** (`bytes`, `Decimal`, `None`, `bool`, an object): they keep today's
-  rendering.
+- **Keys of any other type** (`Decimal`, `None`, `bool`, an object, a `memoryview`): they keep
+  today's rendering. A `bytes` or `bytearray` key keeps it too, once priced (FR-001).
 
 ### Accepted Limits
 
@@ -111,9 +129,16 @@ Stated here rather than left to be found.
   sacrifices the entries after it in walk order, exactly as a huge value does (SPEC-057).
 - **A container key that is not a builtin subclass** — a custom hashable `Sequence` — keeps `str()`,
   which is the caller's code (*Out of Scope*).
-- **The rebuilt merge drops the key whose insertion raises, which is the later of a colliding
-  pair.** With `fields={K(): 2, "svc": 3}` and no default `svc`, inserting `"svc"` is what compares
-  against `K()` and raises, so `"svc"` is the one dropped. The event is marked either way.
+- **The rebuilt merge changes key order.** On the marked slow path, entered only when the unpack
+  raised, the merged mapping is in highest-source-first order (per-call fields, baggage, span
+  defaults, config defaults) rather than the unpack's first-insertion order, and each source's keys
+  keep that source's own order. Precedence is exactly the unpack's: the higher-precedence key of a
+  colliding pair is always present first, so the key that cannot be tested, and is dropped, is
+  always the lower-precedence one, and a per-call field is never dropped by a hostile default.
+- **An object key keeps `str()`, which for a default object is its `repr`.** The no-repr rule holds
+  inside a container key and for a value; a key that is an arbitrary object renders as its own
+  `str()`, the caller's code (*Out of Scope*), and the eighth invariant's page records that
+  exception.
 - **A transform's types-only coercion** (`_coerce_unbounded`, outside both budgets, SPEC-058) renders
   a container key by the same rule, and its accepted cost for a DAG value extends to a DAG key.
 - **The key text is not charged a second time.** The members are charged as values are; the JSON
@@ -124,12 +149,13 @@ Stated here rather than left to be found.
 
 ## Functional Requirements
 
-### FR-001: A container key is rendered from its coerced form
+### FR-001: A container key is rendered from its coerced form, and a bytes key is priced first
 
 #### Description:
 
 A mapping key whose **real** type — `type(key)`, never `__class__` — is a subclass of `tuple`,
-`list`, `dict`, `set` or `frozenset` (a namedtuple included) is coerced through the pass exactly as a
+`list`, `dict`, `set` or `frozenset` (a namedtuple included) and not a subclass of `Enum` is coerced
+through the pass exactly as a
 value at the entry's value depth (`depth + 1`) would be. It therefore spends one node for itself and
 one per member per path from the node budget; its members' text is charged to the byte budget as
 values' is; and `max_depth`, `max_keys`, the cycle check and the per-type rules all apply. Its text
@@ -138,12 +164,16 @@ is `json.dumps(coerced, ensure_ascii=False)` with the default separators, clippe
 becomes the key `"[1, 2]"`, `("a",)` becomes `'["a"]'`, `frozenset({1})` becomes `"[1]"`, a nested
 container the same way, and a member past `max_depth` appears as `"<depth limit>"` inside the text.
 A key whose coerced form is itself a string — `<depth limit>` or `<circular>` — reads as that
-string in quotes, so it cannot collide with a plain `str` key of the same text.
+string in quotes, so it cannot collide with a plain `str` key of the same text. Only the stop and
+failure placeholders — `<node limit>`, `<size limit>` and `<unserializable key: T>` — are written
+bare, because they replace the key whole.
 
 The key is charged where the members are: the JSON punctuation and escapes are not charged again.
 This changes the text of every container key, which is a caller-visible change and deliberate:
 distinct keys stay distinct, and a member object's `repr` is never written, so arch §6's no-repr
-rule now holds inside keys too (today `str(key)` of a tuple writes each member's `repr`). It changes
+rule now holds inside container keys too (today `str(key)` of a tuple writes each member's `repr`).
+An object that is itself the key keeps `str()`, which for a default object is its `repr`
+(*Accepted Limits*). It changes
 SPEC-057 FR-001's statement that "mapping keys are not values and are not counted": a container key
 and its members are counted.
 
@@ -162,23 +192,43 @@ must see that exception, which `_Coercer.value`'s guard would turn into the valu
 the key that cannot be coerced is its `<unserializable: T>` placeholder inside the text, as it would
 be as a value.
 
+**A bytes-like key is priced before it is rendered.** A key whose real type is a subclass of
+`bytes` or `bytearray` is rendered by `str(key)`, whose repr is up to four characters per byte, so
+it costs its repr before the budget sees it (*Overview*). Its length is read
+through the unbound `bytes.__len__` or `bytearray.__len__`, a lower bound of its repr, which the
+caller's `__len__` cannot divert. When the pass's charge plus that length would cross the byte
+budget, the key becomes `<size limit>` unrendered and the pass halts, as for an integer key
+(SPEC-057 FR-002); otherwise it is rendered and charged as today.
+
+**An `Enum` member is not a container key.** A key whose real type subclasses `Enum` keeps `str()`,
+like `Color(int, Enum)`: a `(tuple, Enum)` mixin member `TE.A` stays `"TE.A"`, as the value route
+sends an `Enum` to its own branch ahead of the sequence branch.
+
 **What does not change.** Keys of any other type keep today's rendering, an object that only claims
 through `__class__` to be a tuple is not a container key, and the per-key order SPEC-057 fixed —
 key rendered and charged before the value is visited — holds. `_coerce_unbounded` (SPEC-058) renders
 container keys by the same rule, outside both budgets.
 
-**Tests that move.** Three existing tests in `tests/test_assembly_budget.py` pin the old `repr` text
-and are re-derived under the new charges: the tuple-key probe of
-`test_produced_text_and_integers_are_charged_and_placeholders_are_not` (around lines 679–693),
-which sits at `max_depth=2` where a container key now reaches `<depth limit>` and charges its
-members rather than 10,000; the three-deep `(s, i)`-keyed nest (around line 857), where each key
-now charges its clipped member (8,192) plus its integer's estimate and every key's text clips to
-`'["' + "x" * 8176 + TRUNCATION_MARKER` and collapses to one, the shape `{K: {K: {K: 0,
-"<size limit>": "<size limit>"}}}` unchanged, the crossing key by the charge rules the 247th
-(`k = 246`) of the innermost mapping on its 8th visit; and the `_PRODUCED_SITES` rows `tuple-key`
-and `non-ascii-key-unclipped` (around lines 901–971), whose charge becomes the clipped member's
-(14 and 80) and whose written text becomes the marker and `'["' + "😀" * 20 + '"]'`, and whose
-`str(...)` premise rows go.
+**Tests that move.** Four sites pin the old `repr` text and are re-derived under the new rule.
+Three are in `tests/test_assembly_budget.py`:
+
+- The tuple-key probe of `test_produced_text_and_integers_are_charged_and_placeholders_are_not`
+  (around lines 679–693). At its `max_depth=2` the tuple key sits at value depth 2 and is
+  `"<depth limit>"` whole, one node and no bytes, so the probe no longer exercises a produced-text
+  charge; the test is re-derived with another key whose `str()` is long, and this spec claims no
+  number for it.
+- The three-deep `(s, i)`-keyed nest (around line 857). Each key now charges its clipped member
+  (8,192) plus its integer's estimate and every key's text clips to
+  `'["' + "x" * 8176 + TRUNCATION_MARKER` and collapses to one, so the shape
+  `{K: {K: {K: 0, "<size limit>": "<size limit>"}}}` is unchanged; by the charge rules the crossing
+  key is the 247th (`k = 246`) of the innermost mapping on its 8th visit.
+- The `_PRODUCED_SITES` rows `tuple-key` and `non-ascii-key-unclipped` (around lines 901–971). Their
+  charge becomes the clipped member's (14 and 80), their written text becomes the marker and
+  `'["' + "😀" * 20 + '"]'`, and their `str(...)` premise rows go.
+
+The fourth is the `mixed_keys` row of `tests/test_sanitize_corpus.py` (around lines 193–205), whose
+`"(1, 2)": "b"` becomes `"[1, 2]": "b"`. The implementer searches `tests/` for any other pin on a
+container key's old text and re-derives it the same way.
 
 #### Acceptance Criteria:
 
@@ -186,7 +236,8 @@ and `non-ascii-key-unclipped` (around lines 901–971), whose charge becomes the
       `'["a"]'`, `frozenset({1})` as `"[1]"`, `((1, 2), (3,))` as `"[[1, 2], [3]]"`, a namedtuple
       `P(x=1, y=2)` as `"[1, 2]"`, `(None, True, 1.5, "é")` as `'[null, true, 1.5, "é"]'`, `()` as
       `"[]"`, and a `dict` subclass key yielded by a caller `Mapping` as `'{"a": 1}'`. `(1, "2")`
-      and `(1, 2)` give distinct keys.
+      and `(1, 2)` give distinct keys. A `(tuple, Enum)` mixin member `TE.A` as a key stays
+      `"TE.A"` (silence: passes at `71e42dd`).
 - [ ] `("x" * 100,)` at `max_value_bytes=40` gives the key `'["' + "x" * 24 + TRUNCATION_MARKER`
       with `truncated` set; `tuple(range(300))` at the default `max_keys` gives a key whose
       `json.loads` is `list(range(256))`, marked.
@@ -207,8 +258,14 @@ and `non-ascii-key-unclipped` (around lines 901–971), whose charge becomes the
 - [ ] A caller `Mapping` yielding a `list` subclass whose `__iter__` raises, then a sibling, gives
       `<unserializable key: T>` for the key with the sibling kept, marked, on both delivery paths.
 - [ ] A key object whose `__class__` property returns `tuple`, with `__str__` returning `"S"` and no
-      usable `__iter__`, is written `"S"` (silence: passes at `71e42dd`). `bytes`, `None`, `True`,
-      `Decimal`, a float and an `int` key render exactly as at `71e42dd` (silence).
+      usable `__iter__`, is written `"S"` (silence: passes at `71e42dd`). `b"ab"`, `None`, `True`, `Decimal`, a float and
+      an `int` key render exactly as at `71e42dd` (silence).
+- [ ] With `_MAX_RENDERED_BYTES` patched to 100, a `bytes` subclass key of 101 zero bytes whose
+      `__repr__` raises and whose `__len__` returns 0 gives `{"<size limit>": "<size limit>"}`,
+      marked: it was priced through the unbound length and never rendered (a rendered key would be
+      `<unserializable key: T>`). A plain `b"\x00" * (64 << 20)` key (allocated before tracing)
+      returns in under 2 s of `process_time()` with a `tracemalloc` peak under 8 MiB and the same
+      result; at `71e42dd` its peak is 256 MiB. A `bytearray` key is held to the same two results.
 - [ ] `_coerce_unbounded` renders `{"fields": {(1, 2): 3}}` with the key `"[1, 2]"`, and a key of
       `("x" * 100_000,)` whole, unclipped.
 - [ ] `f = frozenset()`, then `f = frozenset({f, (f, i)})` applied 40 times, as the single key of a
@@ -223,10 +280,11 @@ and `non-ascii-key-unclipped` (around lines 901–971), whose charge becomes the
       under 2 s with `{"<size limit>": "<size limit>"}`, marked, and the pass's charge equals
       `_MAX_RENDERED_BYTES` (2,048 leaves of 8,192 bytes); this shape is not run against `71e42dd`,
       where it allocates 4 GiB.
-- [ ] The three tests named under *Tests that move* are re-derived and pass; no other test
-      changes its expectation.
-- [ ] Planted out once each — the real-type test, the key's node and byte spend, the stop
-      placeholder generalisation, the clip, and the key-specific catch — a named test reddens,
+- [ ] The four sites named under *Tests that move* are re-derived and pass, and the search of
+      `tests/` for any other pin on a container key's old text finds none left.
+- [ ] Planted out once each — the real-type test, the `Enum` exclusion, the key's node and byte
+      spend, the stop placeholder generalisation, the clip, the key-specific catch, and the
+      bytes-like pricing — a named test reddens,
       each built on a shape just over a budget or alarm-guarded; the PR body records each guard and
       the test that caught it.
 - [ ] Serves invariants 1, 6 and 8: the criteria that build an event run on both delivery paths,
@@ -251,8 +309,9 @@ before it is bounded and charged; and every route into the float rule — the su
 Enum member branch and the float key branch — converts through `float.__float__` unless the type is
 exactly `float`. The Enum member routes follow the same rules: `type(member) is bool` replaces
 `type(member) in _PLAIN_SCALARS`. A member that claims a type and is none falls to the enum's own
-fallback text (`str(value)`, library-produced), unless it claims `float`, where the conversion
-raises and the placeholder names the Enum class, because the Enum member is the node. A genuine
+fallback text (`str(value)`, library-produced), unless it claims `float` or `str`: the conversion
+or `text()`'s unbound read raises, and the placeholder names the Enum class, because the Enum member
+is the node. The `str` claim is existing behaviour. A genuine
 `int` subclass *key* keeps its own `str()`, so `class Color(int, Enum)` as a key still reads
 `Color.RED`; a genuine `float` subclass key renders as its exact float.
 
@@ -266,10 +325,15 @@ a scalar never worked: a proxied `int` is already a placeholder (SPEC-057's unbo
 proxied `float` or `bool` reached the event as the proxy.
 
 **The stored name.** `_type_name` reads the stored type name through
-`type.__dict__["__name__"].__get__(type(value))`, so a metaclass `__name__` property can neither
-raise nor rename the placeholder (verified at `71e42dd` on a class whose metaclass property raises:
-the descriptor returns the stored name). `"?"` is no longer reachable for a type, and the fallback
-stays as a guard.
+`_STR_STR(type.__dict__["__name__"].__get__(type(value)))`, so a metaclass `__name__` property can
+neither raise nor rename the placeholder (verified at `71e42dd` on a class whose metaclass property
+raises: the descriptor returns the stored name). The unbound `str.__str__` is needed because
+`type.__name__`'s setter accepts a `str` subclass, so the descriptor can return an object whose
+`__str__` raises or whose `__format__` hijacks the f-string that embeds it. Measured by the review
+with the read as `type.__dict__["__name__"].__get__(type(value))` alone: `{"sib": 1, "v": C(), ...}`
+lost all of `fields`, and a hijacking `__format__` renamed the placeholder; `_STR_STR` returns an
+exact `str`, and was verified on such a class (it returns `Stored`). The fallback `"?"` stays as a
+guard.
 
 The observable is stated on every row of the hostile corpus (`tests/test_sanitize_corpus.py`, which
 this spec extends): on both delivery paths every leaf of the assembled event is of type exactly
@@ -287,7 +351,8 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
 - [ ] An `Enum` member whose `.value` is the `float` impostor is `<unserializable: E>` naming the
       Enum; one whose `.value` is the metaclass impostor is the enum's own text (`E.M`); each fails at
       `71e42dd` with `TypeError`. One whose `.value` is the `bool` impostor is also `E.M` (silence:
-      its real type was never admitted).
+      its real type was never admitted), and one whose `.value` claims `str` is `<unserializable: E>`
+      (silence: existing behaviour).
 - [ ] A `float` subclass and an `int` subclass value, with `__float__`, `__int__`, `__repr__` and
       `__str__` each lying or raising, are written as an exact `float` and an exact `int` equal to
       the stored value, unmarked; a `float` subclass holding `nan` is `<float: nan>`, marked; an
@@ -302,6 +367,10 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       returns `"renamed"`, gives `<unserializable: Stored>` as a value and
       `<unserializable key: Stored>` as a key, `Stored` being its stored name; each fails at
       `71e42dd` (`?`, `42`, `renamed`).
+- [ ] A class whose stored `__name__` is a `str` subclass with a raising `__str__` and a
+      `__format__` returning `"HIJACK"` gives `<unserializable: Stored>` (the stored text) for a
+      value and `<unserializable key: Stored>` for a key, with every sibling in `fields` kept; at
+      `71e42dd` the name is `?`.
 - [ ] A proxy whose `__class__` is `dict` and which implements `items()` renders as the dict, and a
       proxy whose `__class__` is `datetime` renders through its `isoformat()`, exactly as at
       `71e42dd` (silence); a proxied `int` is still a placeholder.
@@ -312,7 +381,8 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       call to `type` or the local name `kind`, nor the name `_PLAIN_SCALARS`; it is run against a
       fixture holding the old shape and reddens.
 - [ ] Planted out once each — `kind is bool`, the int conversion, each of the three float
-      conversions (subclass branch, Enum branch, key branch), and the stored-name read — a named test
+      conversions (subclass branch, Enum branch, key branch), the stored-name read, and the
+      `_STR_STR` around it (dropping it reddens the `str`-subclass criterion) — a named test
       reddens; the PR body records each.
 - [ ] Serves invariants 1, 6 and 8: no input makes a call fail, the corpus rows run on both
       delivery paths, and the event is safe for a bare `json.dumps`.
@@ -342,6 +412,9 @@ names a type).
 - [ ] `info("m", echo=Y())` with a raising `Y.__bool__` returns normally with no span open and inside
       a `@trace`d function; the event is delivered once, nothing is written to the console stream
       (read through `capsys`), and stderr names "echoing to the console". Each fails at `71e42dd`.
+- [ ] When the exception `X.__bool__` raises is of a class whose metaclass `__name__` property
+      raises, the call still returns and stderr still names "merging the fields= argument", with the
+      stored class name (the announcement's read is FR-004's `_diag` change).
 - [ ] `fields=[]`, `fields=None`, `fields={}` and `fields={"x": 1}` with `x=2`, and `echo=True`,
       `False`, `1` and `0`, behave exactly as at `71e42dd` (silence rows): the keyword wins a
       collision, `echo=1` writes the console line and `echo=0` does not.
@@ -354,48 +427,77 @@ names a type).
 #### Description:
 
 **The exception class.** `_error_fields` reads `type(exc).__name__` and `__module__` through the
-metaclass, and `_exception_stack`'s fallback reads `type(exc).__name__` unguarded. The `error`
-sub-document reads the type's stored name through the same unbound accessor as FR-002's
-`_type_name`, and the stored `__module__` through
-`type.__dict__["__module__"].__get__(type(exc))`, taken as `str()` of it under a guard with `"?"` as
-the fallback (a class whose own `__module__` is an object whose `__str__` raises, or whose lookup
-fails). The stack's fallback placeholder `<unformattable traceback: T>` uses the same name.
-`traceback.format_exception` still reads the metaclass's `__module__`, so for that shape it raises
-(measured at `71e42dd`) and the fallback is what the stack holds; the span's events survive.
+metaclass, `_exception_stack`'s fallback reads `type(exc).__name__` unguarded, and
+`_diag.absorbed` reads it inside its own `try`, so with a raising `__name__` the line is swallowed
+and a counted loss goes unannounced. All three read the type's stored name through
+`_STR_STR(type.__dict__["__name__"].__get__(type(exc)))`, FR-002's read and for FR-002's reason: the
+unbound `str.__str__` returns an exact `str` where a `str` subclass name could raise or hijack the
+f-string. `_diag` is a leaf that imports nothing from the package, so it writes that expression
+itself; no other module's reading of a name changes. The `error` sub-document reads the stored
+`__module__` through `type.__dict__["__module__"].__get__(type(exc))`, taken as `str()` of it under a
+guard with `"?"` as the fallback (a class whose own `__module__` is an object whose `__str__` raises,
+or whose lookup fails). The stack's fallback placeholder `<unformattable traceback: T>` uses the
+stored name. `traceback.format_exception` still reads the metaclass's `__module__`, so for that shape
+it raises (measured at `71e42dd`) and the fallback is what the stack holds; the span's events survive.
 
 **The merge.** `build_event`'s `{**cfg.defaults, **span.defaults, **baggage, **fields}` stays on the
-common path, at C speed. Only when it raises is the merged mapping rebuilt key by key, in that source
-order, dropping each key whose insertion raises and marking the event `truncated`. Precedence is
-unchanged: a later source overwrites an earlier key and keeps its first position, as the unpack does.
-Nothing is announced beyond the mark, as for any key placeholder (SPEC-055).
+common path, at C speed. Only when it raises is the merged mapping rebuilt by walking the sources
+**highest precedence first** — per-call fields, baggage, span defaults, config defaults — inserting a
+key only if it is not already present (`if k not in out: out[k] = v`). A key whose test or insertion
+raises is dropped, and the event is marked `truncated`. Because the higher-precedence key of a
+colliding pair is always present first, the one dropped is always the lower-precedence one: precedence
+is exactly that of the unpack, and a per-call field can never be dropped by a hostile default. The
+cost is stated under *Accepted Limits*: on this marked slow path the merged key order is
+highest-source-first. Nothing is announced beyond the mark, as for any key placeholder (SPEC-055).
+
+**How the shapes were checked.** Each reachable shape below was run at `71e42dd` and loses its event
+there: `configure(defaults={K(): 1})` then `info("m", svc=3)` (orphan, and inside a `@trace`d
+function); `@trace(defaults={K(): 1})` then `info("m", svc=3)`; and `configure(defaults={"svc": 1})`
+then `info("m", fields={K(): 2})` (orphan and in-span). The unreachable shape was checked three ways:
+`{K(): 2, "svc": 3}` raises at construction; `d[K()] = 1` then `d["svc"] = 3` raises; and a `Mapping`
+yielding both is dropped whole by `_merge`, announced and leaving the event.
 
 #### Acceptance Criteria:
 
 - [ ] A `@trace`d function raising an exception whose class's metaclass defines `__name__` as a
-      property that raises, one returning `42`, and one returning `"Renamed"`: the original exception
-      is re-raised, `is`-identical; an `lf.info` made earlier in the span is delivered; `span.end` is
-      delivered with `status` `error` and `error.type` equal to the class's stored name; and no
-      "span's events were lost" line is written. Each fails at `71e42dd` with the events lost.
+      property that raises, or one returning `42`, or one returning `"Renamed"`: the original
+      exception is re-raised, `is`-identical; an `lf.info` made earlier in the span is delivered;
+      `span.end` is delivered with `status` `error` and `error.type` equal to the class's stored
+      name; and no "span's events were lost" line is written. The first two fail at `71e42dd` with
+      the events lost; the `"Renamed"` row loses nothing there and fails on `error.type`, which
+      reads `Renamed`.
+- [ ] A class whose stored `__name__` is a `str` subclass with a raising `__str__` and a hijacking
+      `__format__` gives `error.type == "Stored"`, an exact `str`, with the span's events
+      delivered; at `71e42dd` the events are lost. Dropping the `_STR_STR` fails it.
 - [ ] The same with a metaclass `__module__` property that raises: `error.type` and `error.module`
       are the stored name and module, and `error.stack` is `<unformattable traceback: Boom>` naming
       the stored name.
 - [ ] An exception class with `__module__ = 5` has `error.module == "5"`; one whose `__module__` is
       an object with a raising `__str__` has `error.module == "?"`.
-- [ ] With `configure(defaults={"svc": 1})`, `info("m", fields={K(): 2, "other": 3})` — `K.__hash__`
-      returns `hash("svc")` and `K.__eq__` raises — delivers an event whose `fields` holds `svc`
-      and `other` and not `K`'s entry, with `truncated` set, on both delivery paths; at `71e42dd`
-      it is lost and "emitting an orphan log" is announced.
-- [ ] Precedence and order survive the rebuild: with `defaults={"svc": 1, "x": 1}`, a span default
-      `y`, baggage `y`, and `fields={"x": 2, K(): 3}`, the delivered `fields` equal those of the same
-      call without `K()`, key order included.
-- [ ] With no default `svc`, `fields={K(): 2, "svc": 3}` drops `"svc"`, the later of the pair, and
-      marks the event, which pins the limit stated under *Accepted Limits*.
-- [ ] An event with no colliding key is identical to `71e42dd`'s, truncation flag included
-      (silence).
-- [ ] Planted out once each — the stored-name read, the stored-module read, the stack fallback, and
-      the rebuild — a named test reddens.
-- [ ] Serves invariants 1, 2 and 8: the user's exception is untouched, the events are delivered
-      rather than lost, and the event is built for a hostile class and key.
+- [ ] `_diag.absorbed("x", exc)` for an exception of a class whose metaclass `__name__` property
+      raises writes a line ending `(Stored)` instead of nothing; on the orphan path a sink whose
+      `emit` raises such an exception is counted in `orphan_lost` and announced, with stderr naming
+      `Stored`. At `71e42dd` the count is made and stderr is empty.
+- [ ] With `configure(defaults={K(): 1})`, `info("m", svc=3)` delivers, with no span open and
+      inside a `@trace`d function, an event whose `fields["svc"]` is `3` and which holds no entry of
+      `K`'s, with `truncated` set; the same holds for `@trace(defaults={K(): 1})`. Each is lost at
+      `71e42dd`, announced "emitting an orphan log" or "building an in-span log".
+- [ ] With `configure(defaults={"svc": 1})`, `info("m", fields={K(): 2})` delivers, on both paths,
+      an event that holds `K`'s entry and not the default `svc`, with `truncated` set: the
+      lower-precedence key is the one dropped. It is lost at `71e42dd`.
+- [ ] Precedence and order: with `defaults={K(): 1, "a": 1, "x": 1}`, a span default `y`, baggage `y`
+      and `fields={"svc": 3, "x": 2}`, the delivered `fields` equal, as a mapping, those of the same
+      call without `K()` (`x == 2`, baggage's `y` over the span default's), and their key order is
+      per-call fields first, then baggage, span defaults and config defaults, which pins the
+      stated cost.
+- [ ] An event with no colliding key is identical to `71e42dd`'s, truncation flag and key order
+      included (silence).
+- [ ] Planted out once each — the stored-name read, the `_STR_STR`, the stored-module read, the stack
+      fallback, the `_diag` read, and the rebuild's highest-first order (walking lowest first
+      reddens the `svc=3` criterion) — a named test reddens.
+- [ ] Serves invariants 1, 2, 8 and 11: the user's exception is untouched, the events are delivered
+      rather than lost, the loss is announced naming a type, and the event is built for a hostile
+      class and key.
 
 ### FR-005: The record
 
@@ -409,9 +511,13 @@ sentence. SPEC-057 FR-001's claim that keys "are not counted" is superseded at e
 register that states it; the implementer greps for it, and the known sites are `sanitize.py`'s
 `sanitize_fields` docstring ("the top-level mapping and the keys are not values, so they spend no
 node"), `_Coercer.value`'s docstring (which says only that every value counts, and gains the key
-clause), the `key`, `_key` and `produced` docstrings that call every key that is not a `str` produced
-text, and SPEC-057 itself at its FR-001 description and its *Accepted Limits* entry, each struck
-through with a one-line pointer to this spec rather than deleted.
+clause), `mapping()`'s docstring (its paragraph ending "since a key visits no value", false once a
+container key visits values), the `key`, `_key` and `produced` docstrings that call every key that
+is not a `str` produced text, and SPEC-057 itself at its FR-001 description and its *Accepted
+Limits* entry, each struck through with a one-line pointer to this spec rather than deleted. One
+further docstring is corrected in passing: `_TypesOnly`'s says "a ``Config`` validates its
+ceilings", which is false (`Config` is a plain frozen dataclass and `configure()` validates), and
+becomes "``configure()`` validates the ceilings; a hand-built ``Config`` does not".
 
 A decision file in `docs/decisions/event-assembly/` records the rule, fence and entry together,
 ending in its dated History. Its fence is that a route trusting the caller's object admits it by
@@ -424,13 +530,20 @@ by a node and a byte budget" says these two items are "Not closed here, and reco
 architecture.md §12": that line gets a superseded pointer to SPEC-063, and so does its "What is
 charged" clause naming a non-`str` key.
 
-`docs/release-notes/v1.1.0.md` (pending and untagged) gains a section listing the caller-visible
-changes: container keys read as JSON (`(1, 2)` as `[1, 2]`) and no member's `repr` is written; a
-huge container key now spends the pass budgets; an object that claims `bool`, `float` or `int`
-through `__class__` or a metaclass is `<unserializable: T>` where it reached a sink as itself; an
-`int` or `float` subclass is written as an exact number and a `float` subclass key no longer uses
-its own `__str__`; a raising `fields=` or `echo=` no longer reaches the caller; and a hostile
-exception class or colliding key no longer costs its span's events or its event.
+`docs/release-notes/v1.1.0.md` (pending and untagged) gains a `### Keys, impostor scalars and
+hostile classes (SPEC-063)` subsection under a `## Fixed` section placed after
+`## New: OTLPSink (SPEC-056)` and before `## What did not change`; the first spec to land creates
+`## Fixed`, and this one appends beneath it if it exists. It lists the caller-visible changes:
+container keys read as JSON (`(1, 2)` as `[1, 2]`) and no member's `repr` is written inside one; a
+huge container key now spends the pass budgets and a huge `bytes` key is priced before it is
+rendered; an object that claims `bool`, `float` or `int` through `__class__` or a metaclass is
+`<unserializable: T>` where it reached a sink as itself; an `int` or `float` subclass is written as an
+exact number and a `float` subclass key no longer uses its own `__str__`; a raising `fields=` or
+`echo=` no longer reaches the caller; a hostile exception class no longer costs its span's events
+or silences its announcement; and a colliding key no longer costs its event, the lower-precedence
+key being the one dropped. `CHANGELOG.md`, `docs/spec-delivery/RELEASES.md` and the notes' title are
+not touched, and any sentence of the file that the change makes false is corrected: at `0005dd4`
+none is, since the file describes the OTLP sink, which maps an already assembled event.
 
 **Written at completion, not by this FR** (`docs/process/completion-ritual.md`): the delivery doc,
 the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
@@ -441,11 +554,13 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
 - [ ] `docs/architecture.md` §12 has neither item as an open bullet; each stands struck through
       under `### Resolved` with "fixed in SPEC-063" and what closed it.
 - [ ] The page `docs/invariants.md` states, in its section 8, the exact-type rule for a route that
-      trusts a caller's object and the container-key rule, and lists the new test module under
+      trusts a caller's object and the container-key rule, records that an object key keeps its
+      own `str()` as an exception to the no-`repr` rule, and lists the new test module under
       *Guarded*; `tests/test_invariants_model.py`'s
       `test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do` passes.
-- [ ] A search of `src/` and `docs/architecture.md` for "keys are not values", "spend no node" and
-      "are not counted" finds none stating the old claim; each remaining hit in `docs/specs/` is
+- [ ] A search of `src/` and `docs/architecture.md` for "keys are not values", "spend no node",
+      "are not counted" and "a key visits no value" finds none stating the old claim, and
+      `_TypesOnly`'s docstring no longer says a `Config` validates its ceilings; each remaining hit in `docs/specs/` is
       struck through with a pointer to SPEC-063. `docs/spec-delivery/` is excluded: those are frozen
       records of what their specs shipped.
 - [ ] The decision file exists in `docs/decisions/event-assembly/` with its fence, entry and a dated
@@ -454,7 +569,10 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
 - [ ] The "Each coercion pass is bounded…" decision's line "Not closed here, and recorded in
       `architecture.md` §12" and its "What is charged" clause naming a non-`str` key each carry a
       pointer to SPEC-063.
-- [ ] `docs/release-notes/v1.1.0.md` lists each caller-visible change named above.
+- [ ] `docs/release-notes/v1.1.0.md` has the `### ... (SPEC-063)` subsection under `## Fixed`,
+      between `## New: OTLPSink (SPEC-056)` and `## What did not change`, listing each
+      caller-visible change named above, and `git diff` shows `CHANGELOG.md` and
+      `docs/spec-delivery/RELEASES.md` untouched.
 - [ ] `sh scripts/docs-lint.sh`, `sh scripts/spec-lint.sh` and
       `poetry run python scripts/docstring-lint.py` pass.
 - [ ] Serves no invariant on its own: it records the promises the other four FRs keep, in the
@@ -467,20 +585,28 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
 ```
 # src/log_foundry/sanitize.py            (private; __all__ is unchanged; no module-level mutable state)
 _PLAIN_SCALARS                           # removed; `kind is bool` replaces its one use
-_CONTAINER_KEYS = (tuple, list, dict, set, frozenset)    # issubclass(type(key), _CONTAINER_KEYS)
+_CONTAINER_KEYS = (tuple, list, dict, set, frozenset)
+    # a container key: issubclass(type(key), _CONTAINER_KEYS) and not issubclass(type(key), Enum)
 
 _Coercer._key(key, depth) -> str         # gains the entry's value depth; mapping() passes depth + 1
     container key  -> coerced = dispatch at depth + 1 (one node; the pass's guard is NOT applied,
                       so a failure surfaces to key() and becomes <unserializable key: T>)
                       text    = json.dumps(coerced, ensure_ascii=False)   # not charged again
                       return clip(text, max_value_bytes)                  # truncated when clipped
+    bytes-like key -> n = bytes.__len__(key) / bytearray.__len__(key)       # unbound
+                      if self._charged + n > self._max_bytes: halt(_SIZE_LIMIT), return it unrendered
 _Coercer.mapping:  a stop after the key writes {self._stopped: self._stopped}   # was _SIZE_LIMIT
 
-_type_name(value) -> str                 # type.__dict__["__name__"].__get__(type(value))
+_type_name(value) -> str                 # _STR_STR(type.__dict__["__name__"].__get__(type(value)))
 # src/log_foundry/model.py
 _stored_module(cls) -> str               # type.__dict__["__module__"].__get__(cls), str() under a guard, "?"
-_merged(sources..., fields) -> tuple[dict[str, object], bool]
-                                         # {**a, **b, **c, **d}, else key by key; bool = a key dropped
+_merged(fields, baggage, span_defaults, defaults) -> tuple[dict[str, object], bool]
+                                         # {**d, **s, **b, **f}; if that raises, walk f, b, s, d with
+                                         # `if k not in out: out[k] = v`, dropping a key that raises;
+                                         # bool = a key was dropped
+# src/log_foundry/_diag.py
+absorbed(...)                            # names the type by the same stored-name read, written inline:
+                                         # the leaf imports nothing from the package
 ```
 
 What is charged is SPEC-057's table, with one row changed: a container key is charged as the
@@ -508,19 +634,21 @@ None.
 src/log_foundry/
 ├── sanitize.py        # the container-key rule, the exact-type routes, the stored name
 ├── model.py           # the stored name and module, the merge rebuild
+├── _diag.py           # the stored-name read in `absorbed`
 └── api.py             # the two truthiness tests moved inside their guards
 tests/
 ├── test_assembly_keys_and_scalars.py   # new: the CPU-bounded and alarm tests, the key texts, the stops
-├── test_assembly_budget.py             # the three tests under FR-001 re-derived
+├── test_assembly_budget.py             # the three sites under FR-001 re-derived
 ├── test_sanitize.py                    # the exact-type routes
 ├── test_sanitize_corpus.py             # new rows and the leaf-type walker
 ├── test_api.py                         # FR-003
+├── test_diag.py                        # FR-004: the announcement for a hostile class
 └── test_model.py                       # FR-004
 docs/
 ├── architecture.md                     # §12
-├── invariants.md                       # the eighth invariant
+├── invariants.md                       # the eighth invariant (and the object-key exception)
 ├── decisions/event-assembly/           # the new decision; the existing one's pointers
-├── release-notes/v1.1.0.md
+├── release-notes/v1.1.0.md             # `## Fixed` > `### ... (SPEC-063)`
 └── specs/SPEC-057-assembly-work-budget.md   # superseded pointers
 ```
 
@@ -531,7 +659,7 @@ docs/
 - Write the corpus rows and the leaf-type walker first; run them once against `71e42dd`'s module to
   watch each named route redden.
 - Replace `kind in _PLAIN_SCALARS`, the `isinstance(value, bool)` branch, and the int, float, Enum
-  and float-key conversions; read the stored name in `_type_name`. Carry the reasoning in the
+  and float-key conversions; read the stored name, through `_STR_STR`, in `_type_name`. Carry the reasoning in the
   docstrings, the only prose in `src/`.
 
 ### Phase 2: Container keys (FR-001)
@@ -539,16 +667,19 @@ docs/
 - Write the CPU-bounded, allocation and key-text tests with the alarm guard; run the frozenset and
   one-level tuple shapes once against `71e42dd`'s module from a scratch worktree and keep the
   failure reasons for the PR body.
-- Add the container-key rule to `_key`, pass the value depth from `mapping()`, generalise the stop
-  placeholder, and re-derive the three tests under FR-001.
+- Add the container-key rule (with the `Enum` exclusion) and the bytes-like pricing to `_key`, pass
+  the value depth from `mapping()`, generalise the stop placeholder, and re-derive the four sites
+  under FR-001.
 
 ### Phase 3: The siblings (FR-003, FR-004)
 
-- Move the two truthiness tests inside their guards; add the stored name and module reads and the
-  merge rebuild; write the tests and the mutation run each FR names.
+- Move the two truthiness tests inside their guards; add the stored name and module reads (in
+  `model.py` and `_diag.py`) and the highest-first merge rebuild; write the tests and the mutation run
+  each FR names.
 
 ### Phase 4: The record (FR-005)
 
-- The architecture, invariants, decision, release-notes and superseded-pointer edits; regenerate
+- The architecture, invariants, decision, release-notes (`## Fixed`) and superseded-pointer edits,
+  the `_TypesOnly` docstring included; regenerate
   the indexes; then every gate: `ruff`, `mypy`, `pytest`, `spec-lint`, `docs-lint` and
   `docstring-lint`.
