@@ -989,13 +989,23 @@ class _BytesClaimsEnumValue(_ClaimsEnumWithValue, bytes):  # type: ignore[misc]
     pass
 
 
+class _IntClaimsEnumValue(_ClaimsEnumWithValue, int):  # type: ignore[misc]
+    pass
+
+
+class _FloatClaimsEnumValue(_ClaimsEnumWithValue, float):  # type: ignore[misc]
+    pass
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
         (_TupleClaimsEnumValue((_Secret(),)), ["<unserializable: _Secret>"]),
         (_DictClaimsEnumValue(a=_Secret()), {"a": "<unserializable: _Secret>"}),
+        (_IntClaimsEnumValue(7), 7),
+        (_FloatClaimsEnumValue(1.5), 1.5),
     ],
-    ids=["tuple", "dict"],
+    ids=["tuple", "dict", "int", "float"],
 )
 @pytest.mark.parametrize("route", _ROUTES)
 def test_a_real_builtin_claiming_enum_is_routed_by_its_real_type(
@@ -1004,11 +1014,15 @@ def test_a_real_builtin_claiming_enum_is_routed_by_its_real_type(
     """FR-002: the ``Enum`` branch's ``str()`` fallback never sees a real builtin container.
 
     The branch admits a real ``Enum`` or a non-builtin only; before that test a real ``tuple``
-    claiming ``Enum`` was written ``(SECRET,)`` and a ``dict`` ``{'a': SECRET}``.
+    claiming ``Enum`` was written ``(SECRET,)`` and a ``dict`` ``{'a': SECRET}``. A real ``int`` or
+    ``float`` subclass so claiming is its exact number, from its own branch, never its ``str()``.
     """
     sink = _configure()
     event = _emit(route, {"v": value}, sink)
     assert event["fields"] == {"v": expected}
+    fields = event["fields"]
+    assert isinstance(fields, dict)
+    assert type(fields["v"]) is type(expected)
     assert "SECRET" not in json.dumps(event)
 
 
