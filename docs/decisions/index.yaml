@@ -150,6 +150,10 @@ areas:
     path: "docs/decisions/sink-delivery/sink-delivery.md"
     governs: ["src/log_foundry/sinks/**"]
     decisions:
+      - title: "A 2xx _bulk response with no readable verdict is counted, never retried"
+        fence: "an undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
+        status: "stable"
+        path: "docs/decisions/sink-delivery/a-2xx-bulk-response-with-no-readable-verdict-is-counted-never-retried.md"
       - title: "A bad argument is floored if it works and refused if it is already broken; a new one is refused"
         fence: "an unusable timeout, a CRLF header or token, a non-`http` URL, a non-positive chunk size or interval, a bad DSN and an argument the chosen backend cannot use raise at construction; `max_bytes<0`, `overflow_timeout=inf` and the `usable_timeout` callers floor, since those deliver. (SPEC-049)"
         status: "stable"
