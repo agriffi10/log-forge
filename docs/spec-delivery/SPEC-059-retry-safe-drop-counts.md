@@ -60,8 +60,11 @@ The list whoever prepares the next tag draws on (no `docs/release-notes/` file e
 ## Follow-ups and open limits
 
 - **"Partial delivery, then a raise"** is the sibling defect, unwritten as a spec: `LoggingSink`'s
-  per-event handler calls, and `HTTPSink`'s uncaught `http.client.HTTPException`. This spec defers
+  per-event handler calls~~, and `HTTPSink`'s uncaught `http.client.HTTPException`~~. This spec defers
   the drop on that path and does not change what raises. Measured in the spec's *Out of Scope*.
+  > The `HTTPSink` half is closed, by no spec: the decision is `docs/decisions/sink-delivery/`
+  > `after-a-status-line-the-status-decides-a-2xx-whose-body-cannot-be-read-is-never-re-sent.md`.
+  > `LoggingSink`'s half is still open.
 - **The derived check reads syntax.** Its docstring lists what it does not see: a store through an
   alias of `self`, a mutating method call, and a counter reported through a call or a property.
 
