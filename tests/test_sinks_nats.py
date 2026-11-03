@@ -1,4 +1,4 @@
-"""SPEC-010 — NATSSink: sync-driven publish, JetStream path, drain-on-close (fake client)."""
+"""SPEC-010 — NATSSink: sync-driven publish, JetStream path, close-on-close (fake client)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import pytest
 import log_foundry.sinks.nats as nats_sink_module
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
+    CALL_SLACK,
     DEFAULT_ACK_TIMEOUT,
     DEFAULT_PUBLISH_TIMEOUT,
     NATSSink,
@@ -42,6 +43,7 @@ class FakeNATS:
         self.js_published: list[tuple] = []
         self.js_timeouts: list[float | None] = []
         self.drained = False
+        self.closed = False
         self._fail = fail
 
     async def publish(self, subject, payload) -> None:
@@ -54,6 +56,9 @@ class FakeNATS:
 
     async def drain(self) -> None:
         self.drained = True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def test_is_a_sink() -> None:
@@ -92,12 +97,16 @@ def test_publish_errors_counted(capsys) -> None:
     assert capsys.readouterr().err.count("lost 1 event(s)") == 2
 
 
-def test_close_drains_the_connection() -> None:
+def test_close_closes_the_client_and_never_drains() -> None:
+    # SPEC-061 FR-004: `close()` drives `client.close()` itself under its own deadline and never
+    # calls the driver's `drain()`, whose `finally` flush runs to its own 10 s whatever the
+    # caller's timeout (M7). The fake models both so the choice is observable.
     client = FakeNATS()
     sink = NATSSink("logs", client=client)
     sink.close()
-    assert client.drained is True
-    sink.close()  # idempotent (loop already closed)
+    assert client.closed is True
+    assert client.drained is False
+    sink.close()  # idempotent (the sink is already closed)
 
 
 # -- SPEC-041 FR-004 AC-5: a disconnected client is reported, not absorbed --------------------
@@ -115,6 +124,7 @@ def test_a_disconnected_client_makes_emit_report_total_non_delivery() -> None:
 
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"a": 2}])
+    sink.close()
 
     # A core publish would have "succeeded" into the client's outbound buffer and been reported
     # as delivered -- measured against a real server as 1 of 6 events arriving with every counter
@@ -129,6 +139,7 @@ def test_refusing_moves_no_loss_counter() -> None:
 
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
+    sink.close()
 
     assert sink.losses().failed == 0
     assert sink.losses().dropped == 0
@@ -142,6 +153,7 @@ def test_a_client_that_says_nothing_about_connectedness_is_still_published_to() 
     sink = NATSSink("subject", client=client)
 
     sink.emit([{"a": 1}])
+    sink.close()
 
     assert len(client.published) == 1
 
@@ -156,6 +168,7 @@ def test_a_client_whose_probe_raises_is_treated_as_connected() -> None:
     sink = NATSSink("subject", client=client)
 
     sink.emit([{"a": 1}])   # a diagnostic probe must never be the reason a batch fails
+    sink.close()
 
     assert len(client.published) == 1
 
@@ -248,7 +261,13 @@ def test_a_whole_batch_is_bounded_not_each_event_in_it() -> None:
 def test_the_unbounded_implementation_fails_that_bound(monkeypatch) -> None:
     # FR-001 AC-2. The pre-SPEC-047 loop, replanted: no deadline, no per-event timeout argument.
     # A bound whose test passes without the bound is the vacuity this repo keeps measuring.
-    async def unbounded(self, batch):
+    #
+    # Since SPEC-061 FR-001 the mutant can no longer run to its 5 s: a coroutine that ignores its
+    # own deadline is exactly what the backstop exists for, so `emit` is refused at about
+    # `0.3 + CALL_SLACK` and the sink closes itself. The claim is still "the mutant exceeds the
+    # bound": it published something and not everything when the backstop cut it, where the real
+    # loop returns inside 0.3 s and is still open afterwards.
+    async def unbounded(self, batch, deadline):
         target = self._client.jetstream() if self._jetstream else self._client
         for event in batch:
             await target.publish(self._subject, json.dumps(event).encode("utf-8"))
@@ -257,12 +276,15 @@ def test_the_unbounded_implementation_fails_that_bound(monkeypatch) -> None:
     client = SlowNATS(per_event=0.05)
     sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.3)
     began = time.monotonic()
-    sink.emit([{"n": i} for i in range(100)])
+    with pytest.raises(SinkDeliveryError, match="wedged"):
+        sink.emit([{"n": i} for i in range(100)])
     elapsed = time.monotonic() - began
     sink.close()
 
-    assert elapsed > 2.0, "the mutant must exceed the bound the real test asserts"
-    assert len(client.published) == 100
+    assert 0.3 + CALL_SLACK <= elapsed < 0.3 + CALL_SLACK + 2.0, (
+        f"the backstop, not the mutant, must be what ended the emit: {elapsed:.2f}s"
+    )
+    assert 0 < len(client.published) < 100
 
 
 def test_the_per_publish_timeout_is_capped_by_the_ack_ceiling() -> None:
@@ -509,9 +531,11 @@ class FakeNatsModule:
 
     def __init__(self) -> None:
         self.calls: list[tuple[tuple, dict]] = []
+        self.connected_on: threading.Thread | None = None
 
     async def _connect(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+        self.connected_on = threading.current_thread()
         return FakeNATS()
 
     def connect(self, *args, **kwargs):

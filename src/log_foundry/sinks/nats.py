@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from log_foundry import _diag
 from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
+if TYPE_CHECKING:
+    import concurrent.futures
+    from collections.abc import Coroutine
+
 __all__ = ["NATSSink"]
+
+T = TypeVar("T")
 
 DEFAULT_PUBLISH_TIMEOUT = 10.0
 """Seconds one whole :meth:`NATSSink.emit` may spend publishing (SPEC-047 FR-001).
@@ -51,21 +58,91 @@ publish is given ``min(DEFAULT_ACK_TIMEOUT, remaining budget)`` -- so a divergen
 make the per-publish timeout smaller than the driver would have used, never larger.
 """
 
+DEFAULT_CLOSE_TIMEOUT = 1.0
+"""Seconds :meth:`NATSSink.close` gives its own sequence when no ``drain_timeout`` was passed.
+
+Chosen so that this plus :data:`LOOP_JOIN_TIMEOUT` equals ``_lifecycle.DEFAULT_CLOSER_GRACE``
+(2.0): a close that fits the grace is not cut by the exit, and a longer one would be. Nothing
+uncounted rides on the round trip this deadline bounds, because SPEC-061 FR-003 leaves every core
+batch either confirmed or counted before ``emit`` returns, so an expired close loses no event that
+``losses()`` does not already report. A caller who passes a larger ``drain_timeout`` accepts a
+close the exit may cut (SPEC-061 FR-004).
+"""
+
+CALL_SLACK = 1.0
+"""Seconds the backstop adds to a bound the coroutine already enforces on itself (SPEC-061 FR-001).
+
+A caller never waits on the loop without a limit. ``emit`` and ``flush`` wait ``publish_timeout``
+plus this, ``close`` waits its deadline plus this, and each coroutine honours its own deadline well
+inside that, so the margin only has to cover loop scheduling. When it expires the loop is treated
+as wedged by a driver and is not recovered: the sink marks itself closed, stops the loop and joins
+the thread under :data:`LOOP_JOIN_TIMEOUT`, because a hung application thread is the one outcome
+this library must never produce and a duplicate publish is the safer error beside it.
+"""
+
+LOOP_JOIN_TIMEOUT = 1.0
+"""Seconds :meth:`NATSSink.close` and the backstop wait for the loop thread to end (SPEC-061).
+
+Enough for the cancellation callbacks the close scheduled to run and the loop to stop, and no
+more: the close coroutine has already waited for the client under its own deadline, so a join
+that waited longer would defeat FR-004's bound. A thread still alive when the join expires is
+abandoned as a daemon and its loop is left unclosed, since a running loop cannot be closed. The
+stated worst case for a close is its deadline plus :data:`CALL_SLACK` plus this.
+"""
+
+_LOOP_THREAD_NAME = "log-foundry-nats-loop"
+"""The name of the daemon thread that runs a sink's event loop for the sink's whole life."""
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    """Retrieves a finished task's outcome so asyncio never logs it as unretrieved.
+
+    A done callback for every task the sink creates and may not wait for: an abandoned publish
+    and a probe discarded on a reconnect both end on their own, and an exception nobody read
+    would otherwise be logged as "Task exception was never retrieved" at collection.
+
+    Args:
+      task: The task that finished.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+class _LoopWedged(TimeoutError):
+    """The backstop bound expired on a coroutine that had not finished (SPEC-061 FR-001).
+
+    A private subclass so ``emit``, ``flush`` and ``close`` can tell the backstop's expiry from a
+    ``TimeoutError`` a driver raised inside the coroutine, which the future carries and which is
+    not evidence of a wedged loop.
+    """
+
 
 class NATSSink:
     """A :class:`~log_foundry.sinks.base.Sink` that publishes events to a NATS subject.
 
     This is a durable-buffer sink on ``nats-py``, the optional ``nats`` extra, imported lazily.
-    The driver is async, so the sink owns a private event loop and drives each publish to
+    The driver is async, so the sink owns a private event loop ~~and drives each publish to
     completion from the synchronous ``emit``, which therefore returns only after the batch is
-    handed off. With JetStream enabled it publishes through JetStream for durable
+    handed off~~ **superseded by SPEC-061 FR-001**: the loop runs on one daemon thread the sink
+    owns from construction to :meth:`close`, so the driver's reader, ping and reconnect tasks
+    receive CPU between calls, and ``emit``, ``flush`` and ``close`` each submit one coroutine to
+    it and wait under a bound. With JetStream enabled it publishes through JetStream for durable
     acknowledgement.
 
     **Retry and the worst-case delay** (SPEC-041 FR-004, SPEC-047 FR-001). This sink adds no retry
-    loop and needs none: a core ``publish()`` writes into the client's outbound buffer and returns
-    without waiting — measured at 0.00 s for fifty publishes — so it never holds the worker's
-    single drain thread and there is no backoff for a shutdown to cut short. SPEC-027's guarantee
-    is met because there is no wait, not because a wait is bounded.
+    loop and needs none: ~~a core ``publish()`` writes into the client's outbound buffer and
+    returns without waiting — measured at 0.00 s for fifty publishes — so it never holds the
+    worker's single drain thread and there is no backoff for a shutdown to cut short.~~
+    **Superseded by SPEC-061 FR-002 and FR-003**: a core ``emit`` now waits for the server twice,
+    for a round trip before its first publish and for a second one after its last, both inside
+    the one ``publish_timeout``, so the hand-off is no longer free and the wait is bounded rather
+    than absent. SPEC-027's guarantee is met because the wait is bounded.
 
     > ~~Under JetStream ``publish()`` awaits an ack bounded by the driver's own timeout (5 s by
     > default) and does not retry.~~ **Superseded by SPEC-047 FR-001.** True per *event* and false
@@ -90,15 +167,18 @@ class NATSSink:
     ``failed_batches`` never moves. ``emit`` now refuses a batch while the client reports itself
     disconnected.
 
-    The limit is stated rather than overclaimed: ``is_connected`` does not flip the instant the
+    ~~The limit is stated rather than overclaimed: ``is_connected`` does not flip the instant the
     server dies, so a batch in the window before the client notices is still accepted and still
-    buffered. ~~Measured, one of five emits landed in that window.~~ **Corrected by SPEC-047
+    buffered. Measured, one of five emits landed in that window. **Corrected by SPEC-047
     FR-004:** the window is wider than that reading suggests — the flag was still ``True``
     **40 s after the server was stopped**, which is a lower bound on the window rather than the
-    window, because ``nats-py`` notices through a 120 s ping interval or a failed write. It is the same
-    check-then-act window ``MongoDBSink`` and ``KafkaSink`` already document for their own flags;
-    what the guard ends is the far larger case of an outage that has been going on for any
-    appreciable time. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
+    window, because ``nats-py`` notices through a 120 s ping interval or a failed write.~~
+    **Superseded by SPEC-061 FR-002:** the flag is no longer what guards a publish. For a client
+    the sink connected itself, ``emit`` sends a PING and publishes only after the server's PONG
+    arrives, so a stalled server is refused within ``publish_timeout`` rather than after the
+    driver's ping task notices it, which SPEC-061 measured at between 240 and 360 s of loop time
+    and never while the loop ran only inside a call. The flag stays in front of the round trip as
+    the cheap refusal. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
     *reported* to the worker rather than one absorbed, and counting both would report one loss
     twice.
     """
@@ -116,11 +196,20 @@ class NATSSink:
         reconnect_time_wait: float | None = None,
         drain_timeout: float | None = None,
     ) -> None:
-        """Binds the sink to a subject and connects if no client was injected.
+        """Binds the sink to a subject, starts its loop thread, and connects if no client was given.
+
+        The loop thread is started before the connect, so that ``nats.connect`` runs as a coroutine
+        on the loop that will drive the client for its whole life (SPEC-061 M10: a client connected
+        on one loop cannot be flushed from another). Construction waits for the connect with no
+        bound of the sink's own: ``connect_timeout`` and ``max_reconnect_attempts`` govern it, as
+        they did before SPEC-061. A connect that raises stops the thread and closes the loop before
+        the driver's exception is re-raised unchanged, and so does a missing ``nats`` extra.
 
         Args:
           subject: The subject to publish to.
-          client: A ``nats-py``-shaped client to borrow, or ``None`` to connect one.
+          client: A ``nats-py``-shaped client to borrow, or ``None`` to connect one. A borrowed
+            client is never probed, confirmed or drained, because the sink cannot drive a loop it
+            did not connect it on (SPEC-061, M10).
           jetstream: Whether to publish through JetStream.
           servers: The server URL used when connecting.
           publish_timeout: Seconds one whole :meth:`emit` may spend, floored by
@@ -148,12 +237,18 @@ class NATSSink:
             version §12 said the change was waiting for. ``reconnect_time_wait=0`` is untouched:
             it works, and is on the floor side of SPEC-049 FR-001's rule.
           reconnect_time_wait: Seconds between reconnect attempts, or ``None`` to pass nothing.
-          drain_timeout: Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
+          drain_timeout: ~~Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
             forwarded because it does bound the driver's subscription drain, but it is **not**
             what bounds :meth:`close`: ``drain()`` ends with a ``flush()`` carrying the driver's
             own 10 s default, and that is what fired in both measured cases (10.00 s against a
             stalled server, 0.00 s against a stopped one). Recorded in ``architecture.md``
-            section 12.
+            section 12.~~ **Superseded by SPEC-061 FR-004:** this is now the deadline of the
+            sink's own :meth:`close` sequence, :data:`DEFAULT_CLOSE_TIMEOUT` when ``None``, and a
+            value that bounds nothing (zero, negative, ``inf``, ``NaN``) falls back to that default
+            through :func:`~log_foundry.sinks._retry.usable_timeout`. The raw value is still
+            forwarded to ``nats.connect`` exactly as SPEC-047 FR-002 requires, and the driver
+            option it sets no longer bounds anything the sink calls, because the sink no longer
+            calls ``drain()``.
 
         Returns:
           None.
@@ -195,27 +290,188 @@ class NATSSink:
         self._subject = subject
         self._jetstream = jetstream
         self.publish_timeout = usable_timeout(publish_timeout, DEFAULT_PUBLISH_TIMEOUT)
-        self._loop = asyncio.new_event_loop()
+        self._drain_timeout = (
+            DEFAULT_CLOSE_TIMEOUT
+            if drain_timeout is None
+            else usable_timeout(drain_timeout, DEFAULT_CLOSE_TIMEOUT)
+        )
         self.failed = 0
         self._counter_lock = threading.Lock()
         self._lock = threading.Lock()
-        if client is None:
-            import nats  # type: ignore[import-not-found]
+        self._pid = os.getpid()
+        self._closing = False
+        self._closed = False
+        self._owns_client = client is None
+        self._abandoned: set[asyncio.Task[Any]] = set()
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._serve, name=_LOOP_THREAD_NAME, daemon=True)
+        self._thread.start()
+        try:
+            if client is None:
+                import nats  # type: ignore[import-not-found]
 
-            client = self._loop.run_until_complete(
-                nats.connect(servers or "nats://localhost:4222", **supplied)
-            )
+                client = self._submit(
+                    nats.connect(servers or "nats://localhost:4222", **supplied)
+                ).result()
+        except BaseException:
+            self._closed = True
+            self._stop_loop()
+            raise
         self._client = client
 
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """Drives the async publishes to completion on the managed loop (FR-007).
+    def _serve(self) -> None:
+        """Runs the sink's event loop on the loop thread until :meth:`_stop_loop` stops it.
 
-        The driver requirement satisfied (SPEC-028 FR-002): an ``asyncio`` event loop is
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
+        """Schedules one coroutine on the loop thread and returns the future to wait on.
+
+        The single site that hands work to the loop, so ``emit``, ``flush``, ``close`` and the
+        connect all reach it the same way (SPEC-061 FR-001 AC-13).
+
+        Args:
+          coro: The coroutine to run on the loop.
+
+        Returns:
+          The ``concurrent.futures.Future`` that completes with the coroutine's outcome.
+
+        Raises:
+          None.
+        """
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def _run(self, coro: Coroutine[Any, Any, T], bound: float) -> T:
+        """Runs one coroutine on the loop thread and waits for it under a bound (SPEC-061 FR-001).
+
+        Called with ``self._lock`` held, so calls stay serialized across the submit and the wait
+        exactly as SPEC-028 requires. The bound is a backstop over a deadline the coroutine already
+        enforces on itself; **on expiry the loop is treated as wedged and is not recovered**. The
+        future is deliberately not cancelled, because cancelling it would cancel the coroutine on
+        the loop, and a coroutine may be inside a PONG wait the server can still answer (SPEC-061
+        M3). The loop is abandoned instead: the sink marks itself closed, schedules a cancel of
+        every task and a stop, and joins the thread under :data:`LOOP_JOIN_TIMEOUT`.
+
+        A future that completed at the moment the bound expired is not a wedged loop, so the
+        expiry is re-raised without abandoning anything; the caller still reports it, which is the
+        duplicate the spec accepts beside a hung thread.
+
+        Args:
+          coro: The coroutine to run.
+          bound: Seconds to wait for it, the coroutine's own deadline plus :data:`CALL_SLACK`.
+
+        Returns:
+          Whatever the coroutine returned.
+
+        Raises:
+          _LoopWedged: The bound expired; the sink is now closed.
+          Exception: Whatever the coroutine raised, a driver's ``TimeoutError`` included.
+        """
+        future = self._submit(coro)
+        try:
+            return future.result(bound)
+        except TimeoutError as err:
+            if future.done():
+                raise
+            self._abandon_loop()
+            raise _LoopWedged(
+                f"NATSSink: no answer from the loop within {bound}s; the sink is now closed"
+            ) from err
+
+    def _abandon_loop(self) -> None:
+        """Gives up on a loop the backstop found wedged (SPEC-061 FR-001).
+
+        Called with ``self._lock`` held. Marks the sink closed, schedules a cancel of every task
+        and then a stop on the loop, and joins the thread under :data:`LOOP_JOIN_TIMEOUT`. A
+        wedged loop never runs the callbacks, so the thread is normally still alive when the join
+        expires and is abandoned as a daemon with its loop unclosed; if the blocking call ends
+        later, the scheduled callbacks stop the loop and the thread exits on its own.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._closed = True
+        self._stop_loop()
+
+    def _stop_loop(self) -> None:
+        """Stops the loop, joins its thread under a bound, and closes the loop if the thread ended.
+
+        Scheduled through ``call_soon_threadsafe``, the one way a thread may touch a loop it does
+        not run: a callback on the loop thread cancels every task still pending, which lets each
+        one take one cancellation step, then stops the loop. A thread still alive when the join
+        expires is abandoned as a daemon, and its loop is left unclosed because a running loop
+        cannot be closed. Safe to call on a loop already stopped and closed.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if self._loop.is_closed():
+            return
+        self._loop.call_soon_threadsafe(self._cancel_then_stop)
+        self._thread.join(LOOP_JOIN_TIMEOUT)
+        if not self._thread.is_alive():
+            self._loop.close()
+
+    def _cancel_then_stop(self) -> None:
+        """Cancels every task on the loop and stops it after their cancellations have run once.
+
+        Runs on the loop thread. ``cancel()`` schedules each task's next step, and scheduling the
+        stop after them rather than calling it here is what gives those steps one iteration to
+        run before the loop exits, so nothing is left "destroyed but pending" on a loop that is
+        closed next.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for task in asyncio.all_tasks(self._loop):
+            task.cancel()
+        self._loop.call_soon(self._loop.stop)
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Publishes a batch on the loop thread and waits for it under a bound (FR-007, SPEC-061).
+
+        ~~The driver requirement satisfied (SPEC-028 FR-002): an ``asyncio`` event loop is
         single-entry. A second thread calling ``run_until_complete`` on a loop that is already
         running raises ``RuntimeError``, and can leave the loop's task machinery in a state where
-        a thread never returns from ``emit`` at all — measured as a permanently hung application
-        thread on the orphan path, which is the one outcome this library must never produce. The
-        lock makes the loop what the sink already assumed it was: entered by one caller at a time.
+        a thread never returns from ``emit`` at all.~~ **Superseded by SPEC-061 FR-001:** nothing
+        enters the loop any more; each call submits one coroutine and waits on its future. The
+        lock stays, now held across the submit and the wait, so the loop still runs one caller's
+        coroutine at a time and the driver sees publishes in the order callers made them.
+
+        The guards run in a fixed order, and the order is the point. The pid is compared before
+        the lock, because a lock a caller thread held at fork time stays held in the child and the
+        child acquired no thread, loop or connection to run anything on (invariant 12). The
+        closing flag is read before the lock and again after acquiring it, so a ``close()`` queued
+        behind a stream of emits is not starved by a lock that is not FIFO: every call that has
+        not yet taken the lock when the close begins is refused rather than published.
 
         Args:
           batch: The events to publish. An empty batch is a no-op.
@@ -224,30 +480,91 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: When none of the events landed.
+          SinkDeliveryError: When none of the events landed, when the sink is closed or closing,
+            in a forked child, or when the backstop bound expired and the sink closed itself.
         """
         if not batch:
             return
+        self._refuse_outside_the_lock(f"NATSSink published none of {len(batch)} event(s)")
         with self._lock:
-            if self._loop.is_closed():
+            self._refuse_under_the_lock(f"NATSSink published none of {len(batch)} event(s)")
+            try:
+                self._run(self._emit_on_loop(batch), self.publish_timeout + CALL_SLACK)
+            except _LoopWedged as err:
                 raise SinkDeliveryError(
-                    f"NATSSink published none of {len(batch)} event(s): the sink is closed"
-                )
-            if not self._is_connected():
-                raise SinkDeliveryError(
-                    f"NATSSink published none of {len(batch)} event(s): "
-                    "the client is disconnected"
-                )
-            self._loop.run_until_complete(self._publish_all(batch))
+                    f"NATSSink published none of {len(batch)} event(s) within "
+                    f"{self.publish_timeout + CALL_SLACK}s: the loop is wedged and the sink is "
+                    "now closed"
+                ) from err
+
+    def _refuse_outside_the_lock(self, prefix: str) -> None:
+        """Raises for a call that must not even take the lock (SPEC-061 FR-001).
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: In a forked child, or while the sink is closing or closed.
+        """
+        if os.getpid() != self._pid:
+            raise SinkDeliveryError(f"{prefix}: a forked child acquired no connection")
+        if self._closed:
+            raise SinkDeliveryError(f"{prefix}: the sink is closed")
+        if self._closing:
+            raise SinkDeliveryError(f"{prefix}: the sink is closing")
+
+    def _refuse_under_the_lock(self, prefix: str) -> None:
+        """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
+
+        A ``close()`` can set its flag while this call was waiting for the lock, and a call that
+        then published would land after the closer believed the sink quiet.
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The sink closed or began closing while the call waited.
+        """
+        if self._closed:
+            raise SinkDeliveryError(f"{prefix}: the sink is closed")
+        if self._closing:
+            raise SinkDeliveryError(f"{prefix}: the sink is closing")
+
+    async def _emit_on_loop(self, batch: list[dict[str, object]]) -> None:
+        """The coroutine behind :meth:`emit`, run on the loop thread.
+
+        Args:
+          batch: The events to publish.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The client is disconnected, or none of the events landed.
+        """
+        deadline = time.monotonic() + self.publish_timeout
+        if not self._is_connected():
+            raise SinkDeliveryError(
+                f"NATSSink published none of {len(batch)} event(s): the client is disconnected"
+            )
+        await self._publish_all(batch, deadline)
 
     def _is_connected(self) -> bool:
         """Reports whether the client can currently put anything on the wire (FR-004 AC-5).
 
-        Probed by name, as ``drain`` and ``flush`` are, because this sink is written against a
-        driver it does not own and accepts an injected ``client=``. A client that does not
-        publish the attribute is assumed connected: the guard exists to convert a *known*
-        non-delivery into a reported one, and inventing a refusal for a client that never
-        claimed to be disconnected would fail batches that were going to succeed.
+        Probed by name, as ``flush`` is, because this sink is written against a driver it does not
+        own and accepts an injected ``client=``. A client that does not publish the attribute is
+        assumed connected: the guard exists to convert a *known* non-delivery into a reported one,
+        and inventing a refusal for a client that never claimed to be disconnected would fail
+        batches that were going to succeed. Since SPEC-061 FR-002 it is the cheap refusal in front
+        of the server round trip rather than the only guard, and it is read again after the round
+        trip is answered, immediately before the first publish.
 
         Args:
           None.
@@ -266,7 +583,11 @@ class NATSSink:
         return bool(connected)
 
     def losses(self) -> SinkLosses:
-        """Reports events whose publish raised (SPEC-026 FR-002).
+        """Reports events whose publish raised or went unconfirmed (SPEC-026 FR-002).
+
+        Read without the counter lock in a forked child, where a lock a parent thread held at
+        fork time may stay held; the child's counter can only be the inherited value, since the
+        child publishes nothing.
 
         Args:
           None.
@@ -277,11 +598,20 @@ class NATSSink:
         Raises:
           None.
         """
+        if os.getpid() != self._pid:
+            return SinkLosses(dropped=0, failed=self.failed)
         with self._counter_lock:
             return SinkLosses(dropped=0, failed=self.failed)
 
     def close(self) -> None:
-        """Drains and closes the connection, then closes the managed loop (FR-007).
+        """Closes the client under the sink's own deadline, then stops the loop thread (SPEC-061).
+
+        Sets the closing flag **before** taking the lock, so emits queued on the lock are refused
+        rather than served first (``threading.Lock`` is not FIFO, and a closer behind a stream of
+        emits could otherwise wait indefinitely). A call already inside its coroutine finishes
+        under its own bound. In a forked child this returns without touching the client, the loop
+        or the thread, because the child acquired none of them (invariant 12); a second call, or
+        one after the backstop closed the sink, returns without touching anything.
 
         Args:
           None.
@@ -290,17 +620,77 @@ class NATSSink:
           None.
 
         Raises:
-          Exception: Whatever draining raises; the loop is closed regardless.
+          TimeoutError: The backstop bound expired on a wedged loop; the sink is closed anyway.
         """
+        if os.getpid() != self._pid:
+            return
+        self._closing = True
         with self._lock:
-            if self._loop.is_closed():
+            if self._closed:
                 return
             try:
-                self._loop.run_until_complete(self._drain())
-            finally:
-                self._loop.close()
+                self._run(self._close_on_loop(), self._drain_timeout + CALL_SLACK)
+            except _LoopWedged as err:
+                raise TimeoutError(
+                    f"NATSSink close: the loop did not answer within "
+                    f"{self._drain_timeout + CALL_SLACK}s and was abandoned"
+                ) from err
+            self._closed = True
+            self._stop_loop()
 
-    async def _publish_all(self, batch: list[dict[str, object]]) -> None:
+    async def _close_on_loop(self) -> None:
+        """The coroutine behind :meth:`close`, run on the loop thread (SPEC-061 FR-004).
+
+        Runs ``client.close()`` as a task under what remains of the deadline, cancelling it on
+        expiry and absorbing any failure from it, then cancels every task still pending on the
+        loop and gives the cancellations half the join budget to run, so the loop is stopped with
+        nothing "destroyed but pending". A client without a ``close`` attribute skips the step.
+        The task's first step runs even when the deadline is already spent: ``create_task``
+        schedules it before ``asyncio.wait`` arms its timer, and both land in the same loop
+        iteration.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        end = time.monotonic() + self._drain_timeout
+        close = getattr(self._client, "close", None)
+        if close is not None:
+            task = self._loop.create_task(close())
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, end - time.monotonic()))
+            if not done:
+                task.cancel()
+            elif not task.cancelled():
+                failure = task.exception()
+                if failure is not None:
+                    _diag.absorbed("closing the NATS client", failure)
+        await self._settle_pending_tasks()
+
+    async def _settle_pending_tasks(self) -> None:
+        """Cancels every other task on the loop and lets the cancellations run (SPEC-061 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        current = asyncio.current_task()
+        pending = {task for task in asyncio.all_tasks(self._loop) if task is not current}
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=LOOP_JOIN_TIMEOUT / 2)
+
+    async def _publish_all(self, batch: list[dict[str, object]], deadline: float) -> int:
         """Publishes each event under one deadline for the whole batch (SPEC-047 FR-001).
 
         Per-event isolation stays because a partial batch must not be retried wholesale: the
@@ -311,9 +701,19 @@ class NATSSink:
         The two paths take the bound differently because the driver offers different handles. A
         JetStream publish accepts a ``timeout`` and is given ``min(DEFAULT_ACK_TIMEOUT,
         remaining)`` — never the bare remainder, which would hand the first event of a fresh
-        budget a longer ack wait than the driver's own default. A core publish accepts none and
+        budget a longer ack wait than the driver's own default. ~~A core publish accepts none and
         writes into the client's outbound buffer without waiting, so the deadline is checked
-        between events, which is all there is to check.
+        between events, which is all there is to check.~~ **Corrected by SPEC-061 FR-001:** a core
+        publish can block without limit, because the driver force-flushes once its pending buffer
+        passes 2 MiB and its flush timeout defaults to ``None``, so against a stalled peer the
+        await never returns. Each core publish therefore runs as a task waited under what remains
+        of the deadline and **never cancelled** (the driver swallows the cancellation, and bytes
+        already in its buffer may yet land, SPEC-061 M3 and M6). One that outlives the deadline is
+        abandoned with a reference kept until close, counted as published, and the events after it
+        as unattempted; FR-003's confirmation then decides whether the batch is confirmed or
+        counted. A JetStream publish is not wrapped, because its ack wait is bounded by the
+        driver's own timeout and its send can only block once a single payload exceeds the
+        driver's pending size.
 
         Two populations are counted by different rules. An event whose publish **raised** is a
         driver failure and is counted here exactly as before this spec. An event **never
@@ -325,15 +725,15 @@ class NATSSink:
 
         Args:
           batch: The events to publish.
+          deadline: The ``time.monotonic()`` instant the whole emit must finish by.
 
         Returns:
-          None.
+          How many events were published, the abandoned one included.
 
         Raises:
           SinkDeliveryError: When none of them landed (SPEC-026 FR-001).
         """
         target = self._client.jetstream() if self._jetstream else self._client
-        deadline = time.monotonic() + self.publish_timeout
         published = 0
         attempted = 0
         for event in batch:
@@ -347,8 +747,9 @@ class NATSSink:
                     await target.publish(
                         self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)
                     )
-                else:
-                    await target.publish(self._subject, payload)
+                elif not await self._publish_bounded(target, payload, remaining):
+                    published += 1
+                    break
             except Exception as err:
                 with self._counter_lock:
                     self.failed += 1
@@ -359,26 +760,56 @@ class NATSSink:
         if batch and not published:
             raise SinkDeliveryError(
                 f"NATSSink published none of {len(batch)} event(s)"
-                + (f", {unattempted} not attempted within {self.publish_timeout}s" if unattempted
-                   else "")
+                + (
+                    f", {unattempted} not attempted within {self.publish_timeout}s"
+                    if unattempted
+                    else ""
+                )
             )
         if unattempted:
             with self._counter_lock:
                 self.failed += unattempted
             _diag.lost("event", unattempted, f"NATSSink publish_timeout {self.publish_timeout}s")
+        return published
+
+    async def _publish_bounded(self, target: Any, payload: bytes, remaining: float) -> bool:
+        """Runs one core publish as a task and waits for it under the remaining budget.
+
+        The task is never cancelled (see :meth:`_publish_all`); one that outlives the budget is
+        kept in ``self._abandoned`` so it is neither collected mid-flight nor left with an
+        unretrieved exception, and is cancelled at close with every other pending task.
+
+        Args:
+          target: The client to publish on.
+          payload: The encoded event.
+          remaining: Seconds left in the batch's deadline.
+
+        Returns:
+          True when the publish completed within the budget, False when it was abandoned.
+
+        Raises:
+          Exception: Whatever the completed publish raised.
+        """
+        task = self._loop.create_task(target.publish(self._subject, payload))
+        task.add_done_callback(_retrieve)
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+        if not done:
+            self._abandoned.add(task)
+            task.add_done_callback(self._abandoned.discard)
+            return False
+        task.result()
+        return True
 
     def flush(self) -> None:
         """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
 
         Core ``publish()`` writes into the client's own outbound buffer and returns; the network
-        write happens on the driver's flusher task. That is why :meth:`close` drains, and why
-        ``log_foundry.flush()`` could not reach a published-but-unwritten event before this hook.
-        Under JetStream ``publish()`` awaits an ack, so there is nothing pending and this costs a
-        round trip at worst.
+        write happens on the driver's flusher task. That is why ``log_foundry.flush()`` could not
+        reach a published-but-unwritten event before this hook. Under JetStream ``publish()``
+        awaits an ack, so there is nothing pending and this costs a round trip at worst.
 
-        Takes the same lock :meth:`emit` does, for the reason recorded there: an ``asyncio`` loop
-        is single-entry, and a second thread calling ``run_until_complete`` on a running loop can
-        leave a thread never returning at all.
+        Takes the same lock :meth:`emit` does and runs the same guards in the same order, for the
+        reasons recorded there.
 
         Args:
           None.
@@ -387,19 +818,40 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink is closed.
+          SinkDeliveryError: The sink is closed or closing, this is a forked child, or the
+            backstop bound expired.
           Exception: Whatever the driver raises while flushing.
         """
+        self._refuse_outside_the_lock("NATSSink cannot flush")
         with self._lock:
-            if self._loop.is_closed():
-                raise SinkDeliveryError("NATSSink cannot flush: the sink is closed")
-            self._loop.run_until_complete(self._flush_client())
+            self._refuse_under_the_lock("NATSSink cannot flush")
+            try:
+                self._run(self._flush_on_loop(), self.publish_timeout + CALL_SLACK)
+            except _LoopWedged as err:
+                raise SinkDeliveryError(
+                    f"NATSSink cannot flush: no answer within {self.publish_timeout + CALL_SLACK}s,"
+                    " the loop is wedged and the sink is now closed"
+                ) from err
+
+    async def _flush_on_loop(self) -> None:
+        """The coroutine behind :meth:`flush`, run on the loop thread.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the driver raises while flushing.
+        """
+        await self._flush_client()
 
     async def _flush_client(self) -> None:
-        """Flushes the client if the driver offers one, mirroring :meth:`_drain`'s probe.
+        """Flushes the client if the driver offers a flush, probed by name.
 
-        Probed by name for the same reason ``drain`` is: the sink is written against a driver it
-        does not own, and a client without the method has nothing buffered to push.
+        Probed by name because the sink is written against a driver it does not own, and a client
+        without the method has nothing buffered to push.
 
         Args:
           None.
@@ -413,19 +865,3 @@ class NATSSink:
         flush = getattr(self._client, "flush", None)
         if flush is not None:
             await flush()
-
-    async def _drain(self) -> None:
-        """Drains the client if the driver offers a drain.
-
-        Args:
-          None.
-
-        Returns:
-          None.
-
-        Raises:
-          Exception: Whatever the driver raises while draining.
-        """
-        drain = getattr(self._client, "drain", None)
-        if drain is not None:
-            await drain()
