@@ -82,7 +82,7 @@ areas:
   - name: "Public API surface"
     slug: "public-api"
     path: "docs/decisions/public-api/public-api.md"
-    governs: ["src/log_foundry/__init__.py", "src/log_foundry/api.py", "src/log_foundry/config.py"]
+    governs: ["src/log_foundry/__init__.py", "src/log_foundry/api.py", "src/log_foundry/config.py", "src/log_foundry/_otel.py"]
     decisions:
       - title: "A frozen surface is keyword-first, and says what it will not grow"
         fence: "every public dataclass is `kw_only`, `defaults=` takes a `Mapping` (`dict` is invariant), `context.__all__` names only the six re-exported, and the worker tunables stay **unreachable** from `configure()`. Only a typed consumer probe sees any of it — the gate stops at `src`. (SPEC-051)"
