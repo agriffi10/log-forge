@@ -19,6 +19,20 @@ required whenever that version's notes link this file at `blob/<tag>/…`, since
 against the tagged tree. Nothing gates this file against the tags, so it goes stale by being
 forgotten rather than by failing.
 
+## 1.0.2 — 2026-11-03
+
+**Behaviour corrections; no public name, signature or default changed.** A patch under the `1.x`
+freeze: `log_foundry.__all__` is unchanged and so is every sink constructor. Several counters now
+move where they were silent, so read the notes before you bump if you alert on `health().sink`.
+`ElasticsearchSink` and `OpenSearchSink` count a `2xx` `_bulk` response they cannot read in
+`dropped_unadjudicated` rather than ignoring it (and a too-deeply nested one no longer re-sends
+indexed events); a drop is counted once however often the worker retries, in every shipped sink;
+one bad event now costs only itself in `TransformSink`, `FilteringSink`, `SQSSink` and the HTTP
+sinks; assembly is bounded in work, so a shared-sublist structure that hung the calling thread now
+ends at `<node limit>` (SPEC-057, SPEC-058, SPEC-059); and `LokiSink` timestamps are exact to the
+microsecond. `SPEC-056`, the OTLP sink, is a Draft and ships nothing here.
+[**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.0.2/docs/release-notes/v1.0.2.md).
+
 ## 1.0.1 — 2026-09-22
 
 **No library code changed.** Upgrading from `1.0.0` is a no-op for behaviour. This release exists
