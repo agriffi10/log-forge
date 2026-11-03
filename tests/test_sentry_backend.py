@@ -692,3 +692,126 @@ def test_a_malformed_dsn_is_refused_at_construction(dsn: str, missing: str) -> N
     """
     with pytest.raises(ValueError, match=f"dsn is missing its.*{missing}"):
         SentrySink(dsn=dsn, backend="http", opener=FakeOpener())
+
+
+# --- The DSN path: prefix, project id and host, as Sentry's SDKs read them ---------------------
+
+
+def _posted_to(dsn: str) -> str:
+    """The URL the HTTP fallback's one request went to for one qualifying event."""
+    opener = FakeOpener()
+    SentrySink(dsn=dsn, backend="http", opener=opener).emit([dict(ERROR)])
+    [call] = opener.calls
+    return call["url"]
+
+
+_NO_PREFIX = [
+    ("https://k@h/1", "https://h/api/1/envelope/"),
+    ("https://k@h:9000/1", "https://h:9000/api/1/envelope/"),
+    ("https://k@h//1", "https://h/api/1/envelope/"),
+    ("https://k@h/01", "https://h/api/01/envelope/"),
+    ("https://k@h/1?x=1", "https://h/api/1/envelope/"),
+    ("https://k@h/1#f", "https://h/api/1/envelope/"),
+    ("https://k@h:443/1", "https://h:443/api/1/envelope/"),
+    ("http://k@H/1", "http://h/api/1/envelope/"),
+    ("https://k:s@o1.ingest.sentry.io/45", "https://o1.ingest.sentry.io/api/45/envelope/"),
+]
+"""DSNs with no path prefix and the URL each posted to at 2e790e9, measured there, not derived.
+
+``//1`` and ``01`` are where the SDK differs (``//api/1/envelope/``, ``/api/1/envelope/``); a DSN
+with no prefix keeps the URL it always had instead.
+"""
+
+
+@pytest.mark.parametrize(("dsn", "url"), _NO_PREFIX)
+def test_a_dsn_with_no_prefix_posts_where_it_always_did(dsn: str, url: str) -> None:
+    assert _posted_to(dsn) == url
+
+
+@pytest.mark.parametrize(
+    ("dsn", "url"),
+    [
+        ("https://k@h/prefix/1", "https://h/prefix/api/1/envelope/"),
+        ("https://k@h:9000/a/b/12", "https://h:9000/a/b/api/12/envelope/"),
+        ("https://k@h//a/1", "https://h//a/api/1/envelope/"),
+        ("https://k@h/p;x/1", "https://h/p;x/api/1/envelope/"),
+    ],
+)
+def test_a_path_prefix_goes_before_api_as_the_sdks_place_it(dsn: str, url: str) -> None:
+    """Every segment but the last is a prefix; this sink built ``/api/prefix/1/envelope/``."""
+    assert _posted_to(dsn) == url
+
+
+@pytest.mark.parametrize(
+    ("dsn", "host"),
+    [
+        ("https://k@[2001:db8::1]/1", "https://[2001:db8::1]/api/1/envelope/"),
+        ("https://k@[::1]:9000/1", "https://[::1]:9000/api/1/envelope/"),
+    ],
+)
+def test_an_ipv6_host_keeps_its_brackets(dsn: str, host: str) -> None:
+    """``hostname`` strips them, and ``http.client`` read ``2001:db8::1`` as host ``2001:db8:``."""
+    assert _posted_to(dsn) == host
+
+
+_REFUSED_PROJECTS = ["1;x", "1;", "..", "abc", "1/", "%31", "1.0", ""]
+"""Last segments the SDK's ``int`` cannot read; the empty one is ``/1/``'s, not a missing path."""
+
+
+@pytest.mark.parametrize("project", _REFUSED_PROJECTS)
+def test_a_project_id_int_cannot_read_is_refused_without_echoing_the_key(project: str) -> None:
+    """``1;x`` posted to project ``1``, ``..`` to ``/api/../envelope/`` and ``1/`` to ``1//``."""
+    dsn = f"https://SECRETKEY@h/{project}" if project else "https://SECRETKEY@h/1/"
+
+    with pytest.raises(
+        ValueError, match=r"^SentrySink dsn project id must be an integer, the last segment"
+    ) as caught:
+        SentrySink(dsn=dsn, backend="http", opener=FakeOpener())
+
+    assert "SECRETKEY" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("project", "sent"), [("+1", "1"), (" 1", "1"), ("1_0", "10"), ("\u0661", "1")]
+)
+def test_a_project_id_int_reads_leniently_is_sent_as_the_sdk_reads_it(
+    project: str, sent: str
+) -> None:
+    """Refusing these would refuse, under ``auto``, a DSN whose events the SDK delivers."""
+    assert _posted_to(f"https://k@h/{project}") == f"https://h/api/{sent}/envelope/"
+
+
+_SDK_PARITY = [
+    "https://k@h/1",
+    "https://k@h:9000/1",
+    "https://k@h/1?x=1",
+    "https://k@h/1#f",
+    "http://k@H/1",
+    "https://k@h/prefix/1",
+    "https://k@h:9000/a/b/12",
+    "https://k@h//a/1",
+    "https://k@h/p;x/1",
+    "https://k@h/+1",
+    "https://k@h/1_0",
+    "https://k@h/\u0661",
+]
+"""DSNs where this sink and ``sentry_sdk`` agree; default ports, ``//1`` and ``01`` differ."""
+
+
+@pytest.mark.parametrize("dsn", _SDK_PARITY)
+def test_the_ingest_url_is_the_one_the_sdk_builds(dsn: str) -> None:
+    from_sdk = _real_sdk().utils.Dsn(dsn).to_auth().get_api_url(
+        _real_sdk().utils.EndpointType.ENVELOPE
+    )
+
+    assert _posted_to(dsn) == from_sdk
+
+
+@pytest.mark.parametrize("project", _REFUSED_PROJECTS)
+def test_a_project_id_refused_here_is_refused_by_the_sdk(project: str) -> None:
+    sentry_sdk = _real_sdk()
+    dsn = f"https://k@h/{project}" if project else "https://k@h/1/"
+
+    with pytest.raises(sentry_sdk.utils.BadDsn):
+        sentry_sdk.utils.Dsn(dsn)
