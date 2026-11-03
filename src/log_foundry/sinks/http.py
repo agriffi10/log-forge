@@ -294,22 +294,23 @@ def _valid_url(url: str, owner: str, name: str = "url") -> str:
 
     Surrounding whitespace is **floored**, not refused: ``urllib`` passes every URL through
     :func:`urllib.parse.unwrap`, which strips it and a ``<URL:…>`` wrapper, before it parses, so
-    such a URL already delivered. The floor is that same call, so the stored URL is exactly the
-    one that went on the wire. Anything ``http.client`` cannot carry is **refused**, because it never delivered
-    once: a lone surrogate or any other non-ASCII character outside the host, a space or control
-    character, or a ``user:password@`` with no port, which the connection reads as one, all raised
-    ``UnicodeEncodeError`` or ``InvalidURL`` out of every ``emit`` with ``failed == 0`` and no
-    stderr line. Rather than list those characters, the check builds the request line the way
-    ``urllib`` would — the connection ``do_open`` builds for the request's host, then
-    ``putrequest`` and the ``Host`` header ``urllib`` writes itself (:func:`_started_request`),
-    which encode and validate without opening a socket — so the refusal tracks ``http.client``'s
-    own rules instead of a copy of them. That header is why a host ``http.client`` would
-    IDNA-encode is refused anyway when it is not Latin-1: ``urllib`` sends the raw host, and
-    ``http://例.example/x`` raised ``UnicodeEncodeError`` out of every ``emit``. The host and the port are read from
-    those same objects rather than from :func:`urlparse`, which drops a tab or newline that
-    ``urllib`` keeps and parses a port more strictly than ``http.client`` does. A missing host, or
-    a port of ``0`` or past ``65535``, is refused because every request fails, counted, for the
-    life of the process, and that is knowable here.
+    such a URL already delivered. The floor is that same call, so the stored URL is exactly the one
+    that went on the wire. Anything ``http.client`` cannot carry is **refused**, because it never
+    delivered once. A lone surrogate or any other non-ASCII character outside the host raised
+    ``UnicodeEncodeError`` out of every ``emit`` with ``failed == 0`` and no stderr line; a space or
+    control character, or a ``user:password@`` with no port, which the connection reads as one,
+    raises ``InvalidURL``, which :meth:`HTTPSink._send` counts as a connection error — on every
+    request, for the life of the process. Rather than list those characters, the check builds the
+    request line the way ``urllib`` would — the connection ``do_open`` builds for the request's
+    host, then ``putrequest`` and the ``Host`` header ``urllib`` writes itself
+    (:func:`_started_request`), which encode and validate without opening a socket — so the refusal
+    tracks ``http.client``'s own rules instead of a copy of them. That header is why a host
+    ``http.client`` would IDNA-encode is refused anyway when it is not Latin-1: ``urllib`` sends the
+    raw host, and ``http://例.example/x`` raised ``UnicodeEncodeError`` out of every ``emit``. The
+    host and the port are read from those same objects rather than from :func:`urlparse`, which
+    drops a tab or newline that ``urllib`` keeps and parses a port more strictly than
+    ``http.client`` does. A missing host, or a port of ``0`` or past ``65535``, is refused because
+    every request fails, counted, for the life of the process, and that is knowable here.
 
     Args:
       url: The endpoint as constructed.

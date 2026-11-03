@@ -1,18 +1,19 @@
 """A URL ``http.client`` cannot send is refused at construction; surrounding whitespace is floored.
 
 ``_valid_url`` accepted ``"http://h\\ud800/x"``: the lone surrogate surfaced only at ``emit``, as a
-``UnicodeEncodeError`` with ``failed == 0`` and no stderr line. By the bad-argument rule (SPEC-049 FR-001, the
-``sink-delivery`` decision) a value that never delivered is refused and one that delivers is
-floored: surrounding whitespace delivered, because ``urllib`` strips it before parsing.
+``UnicodeEncodeError`` with ``failed == 0`` and no stderr line. By the bad-argument rule
+(SPEC-049 FR-001, the ``sink-delivery`` decision) a value that never delivered is refused and one
+that delivers is floored: surrounding whitespace delivered, because ``urllib`` strips it before
+parsing.
 """
 
 from __future__ import annotations
 
-import http.client
 import urllib.request
 
 import pytest
 
+from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from log_foundry.sinks.honeycomb import HoneycombSink
@@ -27,43 +28,53 @@ from test_sinks_http_render import _shipped_http_subclasses
 
 
 def _assert_chains_nothing(exc: BaseException) -> None:
-    """The exception ``putheader`` raised carries the whole value, so a refusal must not chain it."""
+    """The exception ``putheader`` raised carries the whole value, so a refusal chains nothing."""
     assert exc.__cause__ is None
     assert exc.__context__ is None
 
 
 def _assert_printable(exc: BaseException) -> None:
-    """A lone surrogate in a message makes the message itself fail to encode wherever it is shown."""
+    """A lone surrogate in a message makes the message itself fail to encode where it is shown."""
     assert not any(0xD800 <= ord(char) <= 0xDFFF for char in str(exc)), str(exc).encode(
         "utf-8", "backslashreplace"
     )
 
 
-_UNSENDABLE = [
+_UNCOUNTED = [
     "http://h\ud800/x",
     "http://h/x\ud800",
     "http://h/x?a=\udc80",
     "http://h/\u00e9",
-    "http://h/a b",
-    "http://h/a\tb",
-    "http://h/x\x00",
-    "http://h :8/x",
-    "http://u:p@h/x",
-    "http://h:abc/x",
     "http://\u4f8b.example/x",
     "http://h:\u0668\u0660/x",
     "http://h:8\n/x",
 ]
-"""URLs that pass the scheme and host checks but that ``http.client`` cannot put on the wire.
+"""URLs whose request ``http.client`` cannot encode, so ``emit`` raised them uncounted.
 
 The last three fail only in the ``Host`` header ``urllib`` writes itself, as the raw host in
 Latin-1: a CJK host ``http.client`` would have IDNA-encoded, a port in Arabic-Indic digits that
 ``int`` reads, and a newline ``int`` strips from the port.
 """
 
+_COUNTED = [
+    "http://h/a b",
+    "http://h/a\tb",
+    "http://h/x\x00",
+    "http://h :8/x",
+    "http://u:p@h/x",
+    "http://h:abc/x",
+]
+"""URLs ``http.client`` refuses with ``InvalidURL``, which ``_send`` counts as a connection error.
 
-@pytest.mark.parametrize("url", _UNSENDABLE)
-def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str, capsys) -> None:
+Counted, but on every request for the life of the process, so they never deliver: refused for the
+reason a missing host is.
+"""
+
+_UNSENDABLE = _UNCOUNTED + _COUNTED
+
+
+@pytest.mark.parametrize("url", _UNCOUNTED)
+def test_an_unencodable_url_raised_uncounted_out_of_every_emit(url: str, capsys) -> None:
     """The premise, against the real default opener: no request, no count, no stderr line.
 
     The sink is built on a good URL and pointed at the bad one afterwards, which is the only way
@@ -72,12 +83,25 @@ def test_an_unsendable_url_raised_uncounted_out_of_every_emit(url: str, capsys) 
     sink = HTTPSink("http://h/x", max_retries=0)
     sink.url = url
 
-    with pytest.raises((ValueError, http.client.InvalidURL, OSError)) as caught:
+    with pytest.raises(ValueError):
         sink.emit([{"i": 1}])
 
-    assert not isinstance(caught.value, OSError), "an OSError would have been counted"
     assert sink.losses().failed == 0
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("url", _COUNTED)
+def test_an_invalid_url_failed_every_request_without_a_socket(url: str, capsys) -> None:
+    """The premise: every attempt is abandoned as ``InvalidURL`` before any connection opens."""
+    sink = HTTPSink("http://h/x", max_retries=1)
+    sink._sleep_backoff = lambda attempt, retry_after: None
+
+    sink.url = url
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": 1}])
+
+    assert sink.losses().failed == 1
+    assert "2 attempt(s), connection error, InvalidURL" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("url", _UNSENDABLE)
@@ -96,7 +120,7 @@ def test_a_url_naming_no_usable_port_is_refused(url: str) -> None:
 
 @pytest.mark.parametrize("url", ["http:/\t/h/x", "http:\n//h/x"])
 def test_a_host_only_urlparse_finds_is_refused(url: str) -> None:
-    """``urlparse`` drops the tab or newline and finds a host; ``urllib`` keeps it and finds none."""
+    """``urlparse`` drops the tab or newline and finds a host; ``urllib`` keeps it, finding none."""
     with pytest.raises(ValueError, match=r"^HTTPSink url names no host: "):
         HTTPSink(url)
 
@@ -275,7 +299,7 @@ def test_credentials_that_are_neither_form_are_refused_naming_auth() -> None:
 
 
 def test_credentials_an_authorization_header_overrides_are_not_checked() -> None:
-    """``_apply_auth`` never sends them, so they delivered; the lowercase twin is not an override."""
+    """``_apply_auth`` never sends them, so they delivered; a lowercase twin is not an override."""
     opener = FakeOpener()
     sink = HTTPSink("http://h/x", headers={"Authorization": "x"}, auth="\u20ac", opener=opener)
     sink.emit([{"i": 1}])
@@ -287,7 +311,7 @@ def test_credentials_an_authorization_header_overrides_are_not_checked() -> None
 
 @pytest.mark.parametrize("name", ["x-\u00df", "x-\ufb01"])
 def test_a_header_name_urllib_folds_to_ascii_constructs(name: str) -> None:
-    """``capitalize`` then ``title`` — urllib's two steps — turn these into ``X-Ss`` and ``X-Fi``."""
+    """``capitalize`` then ``title``, urllib's two steps, turn these into ``X-Ss`` and ``X-Fi``."""
     assert HTTPSink("http://h/x", headers={name: "1"})
 
 
