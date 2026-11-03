@@ -406,8 +406,8 @@ specs:
     path: "docs/specs/SPEC-059-retry-safe-drop-counts.md"
   - id: "SPEC-062"
     title: "The Exit Drain's Retries Fit the Caller's Budget"
-    description: "Makes Worker._emit decline a retry that cannot finish inside shutdown()'s timeout, so the exit drain ends in time for the sink to be closed and the loss to be announced."
-    spec_status: "Draft"
+    description: "Makes Worker._emit decline a retry predicted to end after shutdown()'s deadline, so the join returns on time and the sink is closed rather than left open."
+    spec_status: "In Progress"
     depends_on: ["SPEC-027", "SPEC-038", "SPEC-047", "SPEC-054"]
     path: "docs/specs/SPEC-062-exit-drain-budget.md"
   - id: "SPEC-064"
