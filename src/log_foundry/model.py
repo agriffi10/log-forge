@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING
 
 from log_foundry.config import _live_config
 from log_foundry.ids import new_log_id
-from log_foundry.sanitize import sanitize_fields, truncate_str, truncate_tail
+from log_foundry.sanitize import _type_name, sanitize_fields, truncate_str, truncate_tail
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from log_foundry.config import Config
 
 __all__ = ["Span", "backfill_baggage", "build_event", "end_event", "start_event"]
@@ -21,6 +23,14 @@ _START_MESSAGE = "span.start"
 _END_MESSAGE = "span.end"
 
 _TRUNCATED = "truncated"
+
+_STORED_MODULE = type.__dict__["__module__"].__get__
+"""The getter of ``type.__module__``, which reads the module a class stores past its metaclass.
+
+``getattr(type(exc), "__module__", "")`` is resolved through the metaclass, so a metaclass
+``__module__`` property that raised cost the span its events (SPEC-063 FR-004, measured at
+``71e42dd``). For a heap class this reads the ``__module__`` entry of the class's own namespace.
+"""
 
 
 @dataclass
@@ -77,6 +87,66 @@ def _iso_now() -> str:
     return f"{now:%Y-%m-%dT%H:%M:%S}.{now.microsecond // 1000:03d}Z"
 
 
+def _merged(*sources: Mapping[str, object]) -> tuple[dict[str, object], bool]:
+    """Rebuilds the field merge highest precedence first, dropping a key that cannot be compared.
+
+    ``build_event``'s ``{**cfg.defaults, **span.defaults, **baggage, **fields}`` compares keys
+    whose hashes collide, so a key whose ``__eq__`` raises cost the whole event: measured at
+    ``71e42dd``, ``configure(defaults={K(): 1})`` with ``K`` hashing as ``"svc"`` lost the event of
+    ``info("m", svc=3)`` on both paths, against SPEC-055's promise that a hostile key costs only
+    itself (SPEC-063 FR-004). This runs only when the unpack raised. The sources arrive highest
+    precedence first — per-call fields, baggage, span defaults, config defaults — and a key is
+    inserted only if it is not already present, so the higher-precedence key of a colliding pair
+    is always present first, and the one whose test or insertion raises, and is dropped, is
+    always the lower-precedence one: a per-call field is never dropped by a hostile default. The
+    stated cost (SPEC-063, Accepted Limits) is the order: the result is highest-source-first, each
+    source's keys in that source's own order, and for keys equal but distinct, such as ``1`` and
+    ``1.0``, the highest source's key object is the one kept.
+
+    Args:
+      *sources: The field sources, highest precedence first.
+
+    Returns:
+      The merged mapping, and whether a key was dropped, which marks the event ``truncated``.
+
+    Raises:
+      None.
+    """
+    out: dict[str, object] = {}
+    dropped = False
+    for source in sources:
+        for key, value in source.items():
+            try:
+                if key not in out:
+                    out[key] = value
+            except Exception:
+                dropped = True
+    return out, dropped
+
+
+def _stored_module(cls: type) -> str:
+    """Returns the module name a class stores, as text, or ``"?"`` when it cannot be rendered.
+
+    Read through :data:`_STORED_MODULE`, past a metaclass ``__module__`` property, then taken as
+    ``str()`` of whatever the class stores, which need not be a ``str``: a class body may set
+    ``__module__ = 5``, which reads ``"5"``, or an object whose ``__str__`` raises, which reads
+    ``"?"``, as does a class with no stored module (SPEC-063 FR-004).
+
+    Args:
+      cls: The class whose module is named.
+
+    Returns:
+      The stored module as text, or ``"?"``.
+
+    Raises:
+      None.
+    """
+    try:
+        return str(_STORED_MODULE(cls))
+    except Exception:
+        return "?"
+
+
 def build_event(
     span: Span,
     level: str,
@@ -100,6 +170,10 @@ def build_event(
     the reason its docstrings give. This is the hottest path in the library, so resolving them
     once at import is what ``sanitize`` already does with its one-time bindings.
 
+    The unpack stays on the common path, at C speed, inside a ``try`` that costs nothing when it
+    does not raise. Only when two keys cannot be compared is the mapping rebuilt by
+    :func:`_merged`, which drops the lower-precedence key and marks the event (SPEC-063 FR-004).
+
     Args:
       span: The span the event belongs to, supplying identity and defaults.
       level: The severity label, such as ``"INFO"``.
@@ -114,7 +188,11 @@ def build_event(
       None.
     """
     cfg = _live_config()
-    merged: dict[str, object] = {**cfg.defaults, **span.defaults, **baggage, **fields}
+    try:
+        merged: dict[str, object] = {**cfg.defaults, **span.defaults, **baggage, **fields}
+        dropped = False
+    except Exception:
+        merged, dropped = _merged(fields, baggage, span.defaults, cfg.defaults)
     safe, clipped = sanitize_fields(merged, cfg=cfg)
     bounded_message, message_clipped = truncate_str(message, cfg.max_value_bytes)
     bounded_function, function_clipped = truncate_str(span.name, cfg.max_value_bytes)
@@ -131,7 +209,7 @@ def build_event(
         "version": cfg.version,
         "env": cfg.env,
     }
-    if clipped or message_clipped or function_clipped:
+    if clipped or dropped or message_clipped or function_clipped:
         event[_TRUNCATED] = True
     event["fields"] = safe
     return event
@@ -180,7 +258,10 @@ def _exception_stack(exc: BaseException) -> str:
 
     ``traceback.format_exception`` already renders a failing ``__str__`` as
     ``<exception str() failed>`` rather than propagating, so this guard is for the rarer
-    case of a frame that cannot be rendered at all.
+    case of a frame that cannot be rendered at all, or of a class whose metaclass ``__module__``
+    property raises, which ``format_exception`` reads through the metaclass. The fallback names
+    the type by its stored name, through ``sanitize._type_name``, so it cannot itself raise or be
+    renamed by a ``str`` subclass's ``__format__`` (SPEC-063 FR-004).
 
     Args:
       exc: The exception whose traceback is formatted.
@@ -194,7 +275,7 @@ def _exception_stack(exc: BaseException) -> str:
     try:
         return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     except Exception:
-        return f"<unformattable traceback: {type(exc).__name__}>"
+        return f"<unformattable traceback: {_type_name(exc)}>"
 
 
 def _error_fields(exc: BaseException, *, cfg: Config) -> tuple[dict[str, object], bool]:
@@ -206,6 +287,12 @@ def _error_fields(exc: BaseException, *, cfg: Config) -> tuple[dict[str, object]
     query (SPEC-017 FR-003). ``stack`` gets its own larger ceiling and is clipped from the
     head, because ``format_exception`` puts the exception and innermost frames last.
 
+    ``type`` and ``module`` are the names the class stores, read past its metaclass by
+    ``sanitize._type_name`` and :func:`_stored_module` (SPEC-063 FR-004). Read through the
+    metaclass, measured at ``71e42dd``, a ``__name__`` property that raised or returned ``42``, or
+    a ``__module__`` property that raised, cost the span its events, the user's exception still
+    re-raised unchanged.
+
     Args:
       exc: The exception being recorded.
       cfg: The config supplying the ceilings.
@@ -216,8 +303,8 @@ def _error_fields(exc: BaseException, *, cfg: Config) -> tuple[dict[str, object]
     Raises:
       None.
     """
-    type_name, t1 = truncate_str(type(exc).__name__, cfg.max_value_bytes)
-    module, t2 = truncate_str(str(getattr(type(exc), "__module__", "")), cfg.max_value_bytes)
+    type_name, t1 = truncate_str(_type_name(exc), cfg.max_value_bytes)
+    module, t2 = truncate_str(_stored_module(type(exc)), cfg.max_value_bytes)
     message, t3 = truncate_str(_exception_message(exc), cfg.max_value_bytes)
     stack, t4 = truncate_tail(_exception_stack(exc), cfg.max_stack_bytes)
     error: dict[str, object] = {

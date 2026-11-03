@@ -567,3 +567,62 @@ def test_diag_still_has_exactly_the_three_writers_it_documents() -> None:
         f"_diag has {len(writes)} stderr writes, not 3 — if a writer was added, update "
         f"_diag's docstring and architecture.md §6 to match"
     )
+
+
+# -- SPEC-063 FR-004: the announcement names the type's stored name ---------------------------
+
+
+def _stored_exception(**metaclass_attrs: object) -> type[BaseException]:
+    """An exception class stored as ``Stored`` whose metaclass carries the given attributes."""
+    meta = type("_Meta", (type,), dict(metaclass_attrs))
+    return meta("Stored", (Exception,), {})  # type: ignore[no-any-return]
+
+
+def _raising_name(cls: type) -> str:
+    raise RuntimeError("name")
+
+
+class _HijackName(str):
+    """A ``str`` subclass for a stored ``__name__``: ``str()`` raises and formatting renames."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+    def __format__(self, spec: str) -> str:
+        return "HIJACK"
+
+
+def test_absorbed_names_the_stored_name_when_the_metaclass_name_raises(err: _Stderr) -> None:
+    """FR-004 AC6: the line is written, naming ``Stored``, where it was swallowed whole."""
+    _diag.absorbed("x", _stored_exception(__name__=property(_raising_name))())
+    assert err.getvalue() == "log-foundry: absorbed a failure while x (Stored)\n"
+
+
+def test_absorbed_is_not_hijacked_by_a_str_subclass_name(err: _Stderr) -> None:
+    """FR-004 AC6: a ``str`` subclass stored as the name is written as its text, not ``HIJACK``."""
+    exc_cls = type("Stored", (Exception,), {})
+    exc_cls.__name__ = _HijackName("Stored")
+    _diag.absorbed("x", exc_cls())
+    assert err.getvalue() == "log-foundry: absorbed a failure while x (Stored)\n"
+
+
+def test_an_orphan_loss_from_a_hostile_exception_class_is_counted_and_announced(
+    err: _Stderr,
+) -> None:
+    """FR-004 AC6: the loss is counted and the line names ``Stored``; it was counted in silence."""
+    import log_foundry as lf
+
+    hostile = _stored_exception(__name__=property(_raising_name))
+
+    class _RaisingSink:
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            raise hostile()
+
+        def close(self) -> None:
+            return None
+
+    lf.configure(service="diag", sink=_RaisingSink())  # type: ignore[arg-type]
+    before = lf.health().orphan_lost
+    lf.info("m")
+    assert lf.health().orphan_lost == before + 1
+    assert "absorbed a failure while emitting an orphan log (Stored)" in err.getvalue()

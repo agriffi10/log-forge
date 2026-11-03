@@ -40,20 +40,34 @@ _MAX_REJECTED_ECHO = 64
 
 _ESCAPES = {"\t": "\\t", "\n": "\\n", "\r": "\\r"}
 
+_STR_STR = str.__str__
+"""``str.__str__``, unbound, so a ``str`` subclass name writes its stored text (SPEC-063 FR-004).
+
+This module is a leaf and imports nothing from the package, so it binds the two accessors
+``sanitize._type_name`` uses itself rather than importing them. ``_STORED_NAME`` reads the name a
+type stores past a metaclass ``__name__`` property, and this returns it as an exact ``str``:
+measured at ``71e42dd``, a class whose stored name was a ``str`` subclass with a hijacking
+``__format__`` was announced as ``(HIJACK)``, and one whose metaclass ``__name__`` property raised
+was not announced at all, the line swallowed by this module's own guard while its loss was counted.
+"""
+_STORED_NAME = type.__dict__["__name__"].__get__
+
 
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     """Reports a failure the library swallowed rather than propagated.
 
     Only the exception's type is written, never its message: a message can carry a value
     from the event that provoked it, and arch §6 keeps user data out of anything the library
-    emits about itself. A stream fault is swallowed because these writers are called from the
+    emits about itself. The type is named by the name it stores, read through
+    :data:`_STORED_NAME` and :data:`_STR_STR` rather than ``type(exc).__name__``, so a metaclass
+    property can neither silence the line nor rename it (SPEC-063 FR-004). A stream fault is swallowed because these writers are called from the
     ``except`` and ``finally`` blocks that exist to stop an exception reaching the caller,
     though a ``BaseException`` from the write still propagates.
 
     Args:
       where: What was being attempted, as a participle phrase that reads after "while", such
         as ``"closing a span"``. A literal, never a runtime value.
-      exc: The absorbed exception. Only ``type(exc).__name__`` is written.
+      exc: The absorbed exception. Only its type's stored name is written.
       detail: Optional consequence for the reader, appended after a semicolon — most usefully
         what was lost, since an absorbed failure is invisible apart from this line. Escaped
         and truncated to ``_MAX_DETAIL``; must not be derived from the exception's text.
@@ -68,7 +82,7 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     try:
         sys.stderr.write(
             f"log-foundry: absorbed a failure while {_escape(where)} "
-            f"({_escape(type(exc).__name__)}){_suffix(detail)}\n"
+            f"({_escape(_STR_STR(_STORED_NAME(type(exc))))}){_suffix(detail)}\n"
         )
     except Exception:
         pass
