@@ -271,6 +271,26 @@ def test_a_short_2xx_to_bulk_is_counted_unadjudicated(
     assert _lost_lines(capsys.readouterr().err) == [line, line]
 
 
+def test_a_short_2xx_to_honeycomb_is_counted_unadjudicated(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Honeycomb's per-event verdict lives in the body too, so a cut-short ``200`` is counted."""
+    with _serving(["short:200"]) as server:
+        sink = HoneycombSink(
+            "key", "dataset", url=server.url, max_batch_count=2, max_retries=2, timeout=_TIMEOUT
+        )
+        sink.emit(_batch(4))
+
+    assert len(server.posts) == 2, "one POST per chunk"
+    assert (sink.rejected_events, sink.dropped_unadjudicated) == (0, 4)
+    assert sink.losses() == SinkLosses(dropped=0, failed=4)
+    line = (
+        "log-foundry: lost 2 event(s); HoneycombSink could not adjudicate a batch response "
+        "(2 event(s) sent, 0 readable status(es)); they may have landed; not retried"
+    )
+    assert _lost_lines(capsys.readouterr().err) == [line, line]
+
+
 # --- any other status still decides as it always did ------------------------------------------
 
 

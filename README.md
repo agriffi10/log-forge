@@ -785,7 +785,7 @@ Also HTTP-based. All are zero-dependency **except** `SentrySink`, which prefers 
 | `DatadogSink` | `log_foundry.sinks.datadog` | — | `DatadogSink(api_key, *, site="datadoghq.com", service=None, ddtags=None)` |
 | `SplunkHECSink` | `log_foundry.sinks.splunk` | — | `SplunkHECSink(url, token, *, host=None, source="log-foundry")` — HTTP Event Collector |
 | `NewRelicSink` | `log_foundry.sinks.newrelic` | — | `NewRelicSink(api_key, *, region="US")` — `region` is `"US"` or `"EU"` |
-| `HoneycombSink` | `log_foundry.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` |
+| `HoneycombSink` | `log_foundry.sinks.honeycomb` | — | `HoneycombSink(api_key, dataset, *, url="https://api.honeycomb.io")` — reads the per-event `status` array in Honeycomb's `200`, positionally: an event rejected there is counted on `.rejected_events` (never retried); a `200` whose array it cannot read — empty or unreadable, the wrong length, a status that is not an integer — is counted on `.dropped_unadjudicated` and not retried, since those events may have landed |
 | `SentrySink` | `log_foundry.sinks.sentry` | `sentry` | `SentrySink(dsn=None, *, min_level="ERROR", backend="auto")` — sends only `min_level`+ events |
 
 `SentrySink` captures via `sentry_sdk.capture_event` when the SDK can deliver — you initialize it
