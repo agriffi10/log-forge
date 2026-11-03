@@ -769,3 +769,19 @@ def test_nothing_from_otel_is_public_and_the_surface_grew_by_one_path_only() -> 
     assert len(log_foundry.__all__) == 30, "the top-level surface is the 30 names of 1.0.2"
     assert not hasattr(log_foundry.sinks, "__all__")
     assert log_foundry.sinks.otlp.__all__ == ["OTLPSink"]
+
+
+class _MyOTLP(OTLPSink):
+    """A subclass, so a refusal that hard-codes the base class's name is caught by name."""
+
+
+def test_a_subclass_refusal_names_the_subclass() -> None:
+    """System-frame review: the family names `type(self).__name__`, never a literal class name."""
+    with pytest.raises(TypeError, match=r"^_MyOTLP endpoint"):
+        _MyOTLP(5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"^_MyOTLP endpoint"):
+        _MyOTLP("ftp://h/v1/logs")
+    with pytest.raises(ValueError, match=r"^_MyOTLP method"):
+        _MyOTLP(method="PUT")
+    with pytest.raises(ValueError, match=r"^_MyOTLP timeout"):
+        _MyOTLP(timeout=-1)

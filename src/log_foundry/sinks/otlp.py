@@ -107,13 +107,14 @@ class OTLPSink(HTTPSink):
             would send every batch to a server that refuses it for the life of the process
             (invariant 13). Every other refusal is inherited.
         """
+        owner = type(self).__name__
         if not isinstance(endpoint, str):
-            raise TypeError(f"OTLPSink endpoint must be a str, not {type(endpoint).__name__}")
-        _valid_url(endpoint, "OTLPSink", name="endpoint")
+            raise TypeError(f"{owner} endpoint must be a str, not {type(endpoint).__name__}")
+        _valid_url(endpoint, owner, name="endpoint")
         method = http_kwargs.get("method", "POST")
         if method != "POST":
             raise ValueError(
-                f"OTLPSink method must be exactly 'POST', not {method!r}: OTLP/HTTP is POST only"
+                f"{owner} method must be exactly 'POST', not {method!r}: OTLP/HTTP is POST only"
             )
         super().__init__(endpoint, body_format="json_array", **http_kwargs)
         self._scope_version = __version__
