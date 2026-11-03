@@ -127,8 +127,6 @@ The probe, the second round trip and the latch apply **only to a client the sink
   under invariant 5; one the caller built and never closed leaves one parked daemon thread, as any
   connection-holding sink leaves its connection.
 - Probing, confirming or draining an injected client, which the sink cannot drive (M10).
-- Release notes. Whether this ships in the next patch or a later release is not settled here;
-  FR-005 records that an entry is owed.
 
 ---
 
@@ -512,7 +510,9 @@ nothing. An injected client, or one with no `flush` attribute, keeps today's beh
 - [ ] AC-1: With a fake modelling the real `drain` and `close` (M5), the sink's `close()` never
       calls `drain`; with a JetStream publish done first (so the fake holds one subscription) and
       a stalled fake server, `close()` returns within `D + LOOP_JOIN_TIMEOUT` plus a stated margin,
-      where `wait_for(drain(), D)` on the same fake takes about 10 s more (M7).
+      where `wait_for(drain(), D)` on the same fake shape runs its `finally` flush to that flush's
+      own timeout past `D` — the fake's compressed to 2 s so the test costs 3 s rather than 11; the
+      real driver's 10 s is M7's figure, and FR-004 AC-7 measures the real close against the server.
 - [ ] AC-2: With a fake whose `flush` never answers and no `drain_timeout`, `close()` raises
       `TimeoutError` in at most `DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT` plus a stated margin,
       the fake's `close` was called, and no loop thread is alive.
@@ -593,8 +593,12 @@ The integration suite (`tests/integration/test_nats.py`) gains tests using the i
 outage test uses, `docker compose -f tests/integration/docker-compose.yml pause|unpause|stop|start
 nats`, each restoring the server in a `finally`. Unit tests with fakes cover every FR.
 
-The release-notes entry for this change is owed in `docs/release-notes/<next tag>.md`, in the
-completion ritual's step 6, once the tag that carries it is settled; this spec writes none.
+The release-notes entry goes in `docs/release-notes/v1.1.0.md` under a `## Fixed` heading, as a
+`### ... (SPEC-061)` subsection placed after `## New: OTLPSink (SPEC-056)` and before `## What did
+not change`, and that file's sentences the change makes false are corrected in the same edit: the
+claim that no shipped sink's default changed (`close()`'s bound is now the sink's 1 s default), and
+*What did not change*'s claim about every other sink's behaviour. `CHANGELOG.md` and `RELEASES.md`
+are not touched; the tag is the orchestrator's.
 
 #### Acceptance Criteria:
 
@@ -615,8 +619,9 @@ completion ritual's step 6, once the tag that carries it is settled; this spec w
       `stop` and `start` within a stated multiple of `reconnect_time_wait` (M2: never today; M4: 0.50
       s), reader survival after a late PONG (FR-002 AC-5), the close bound under a stall in core and
       in JetStream mode (FR-004 AC-7), and unconfirmed events landing after `unpause` (FR-003 AC-8).
-- [ ] AC-7: `git diff` shows no file under `docs/release-notes/`, and the PR body names the owed
-      entry.
+- [ ] AC-7: `docs/release-notes/v1.1.0.md` carries the `## Fixed` entry above, between the OTLP
+      section and *What did not change*, and neither of the two sentences the change falsifies
+      still reads as it did; `CHANGELOG.md` and `RELEASES.md` are unchanged.
 - [ ] AC-8: Serves invariants 2, 4, 7 and 12 (AC-5) and records the evidence for invariants 3 and 5.
 
 ---

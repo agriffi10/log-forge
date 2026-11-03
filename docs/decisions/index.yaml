@@ -247,6 +247,10 @@ areas:
     path: "docs/decisions/sink-lifecycle/sink-lifecycle.md"
     governs: ["src/log_foundry/sinks/**"]
     decisions:
+      - title: "A driver's liveness flag is not evidence: a sink that cannot see the wire asks the server, and never cancels a wait the server may still answer"
+        fence: "`is_connected` flips only when the driver's own tasks notice, and those tasks need loop time between calls; a sink that reports delivery on the flag reports it for events that never left the process, and a PONG wait the sink cancels kills the driver's reader when the answer arrives late. (SPEC-061)"
+        status: "stable"
+        path: "docs/decisions/sink-lifecycle/a-drivers-liveness-flag-is-not-evidence-a-sink-that-cannot-see-the-wire-asks-the-server-and-never-cancels-a-wait-the-server-may-still-answer.md"
       - title: "A process releases only a transport it acquired *here*, and unrecorded must be unclaimable rather than merely unreleasable"
         fence: "the record is stamped when the library is *handed* a sink, over the whole reachable graph, and every close consults it. Write-once alone defends only a record that already exists. (SPEC-042)"
         status: "stable"

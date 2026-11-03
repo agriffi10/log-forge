@@ -64,6 +64,10 @@ by SPEC-058: five losses are counted but never retried by the sink — an unadju
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or
 an SQS id callable's per-event failure when its siblings were delivered, and an unrenderable HTTP
 event (SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
+A sixth joins them with SPEC-061 FR-003: a core `NATSSink` batch whose confirming round trip went
+unanswered is counted in `failed` and announced once, never retried, because the bytes are in
+flight to a server that may yet process them (five of five did after a `docker unpause`) and a
+retry would duplicate them; the next call is refused instead, so the stall is still reported.
 At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
 that returned; one that raised counts none of them, and whoever caught it — the worker, the
 orphan path or `MultiSink` — owns the batch. The sites are the drops `TransformSink`,
@@ -92,8 +96,9 @@ Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdow
 what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
-`tests/test_sink_retry.py` and `tests/test_worker_exit_budget.py` (the exit drain's retries fit
-the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
+`tests/test_sink_retry.py`, `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
+backstop and the latch, SPEC-061) and `tests/test_worker_exit_budget.py` (the exit drain's
+retries fit the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight) and
 `tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,
 through one measuring helper) — `flush()` has no CPU-time assertion, listed so the gap is
@@ -108,6 +113,11 @@ same sink object the worker drains into — which is why a sink must tolerate co
 
 *Observable:* inside a span, `info()` latency is independent of the sink; outside one, it is the
 sink's.
+*Recorded exceptions:* a core `NATSSink.emit` costs two server round trips on the calling thread,
+one before its first publish and one after its last, which on the orphan path is the application's
+own (SPEC-061 FR-003); measured at `71e42dd` against the prototype, a one-event emit went from
+0.04 ms to 0.47 ms and a 500-event emit from 0.90 ms to 1.26 ms, the price of a publish that is
+confirmed rather than believed.
 *Guarded:* `tests/test_api.py` (which path each call takes), `tests/test_sink_concurrency.py`.
 Not measured as a latency bound by any test — listed so the gap is visible.
 
@@ -126,7 +136,9 @@ and no sink is closed by a process that did not open it.
 later `shutdown()` finds the drain thread ended (SPEC-050); a sink written to after its close is
 owed a second close, which is correct rather than a double (SPEC-045).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
-`tests/test_sink_ownership.py`; `tests/test_invariants_model.py` asserts the first observable.
+`tests/test_sink_ownership.py`; `tests/test_invariants_model.py` asserts the first observable;
+`tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
+lock, its connection released once, and a forked child releases nothing (SPEC-061).
 
 ## 6. Twin paths keep the same promises
 
@@ -180,7 +192,12 @@ line, a protocol error is retried and counted like a connection error. An OTLP s
 every POST with a `2xx` whose `partialSuccess` is present but cannot be read, or with a `2xx` over
 the 4 MiB response bound, leaves the same three signs for the same reason (SPEC-056); only a `2xx`
 rejecting every record of every chunk raises there, because nothing landed — and the same holds for
-a Honeycomb `200` rejecting every event of every chunk.
+a Honeycomb `200` rejecting every event of every chunk. A core `NATSSink` batch whose confirming
+round trip went unanswered leaves them too (SPEC-061 FR-003): `emit` returns having counted the
+batch in `failed` and announced it once, because its bytes are in flight to a server that may yet
+process them, and the next call is refused by the probe or its latch, so a sustained stall is
+still reported as failed batches and only the one batch that straddles its onset is counted
+rather than raised.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass), `tests/integration/`
 against real services (SPEC-041).
@@ -292,7 +309,13 @@ for a C-level fork; a value the child inherits is stranded, not detached (SPEC-0
 
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
-*Guarded:* `tests/test_fork_lifecycle.py`, `tests/test_sink_ownership.py`.
+*Recorded exceptions:* a forked child's `NATSSink` refuses every `emit` and `flush` and its
+`close()` returns without touching anything, because the child acquired no thread, loop or
+connection and `reacquire_after_fork` is not implemented (SPEC-061 FR-001; `architecture.md` §12
+names what would close it). The pid is compared before the sink's lock, since a lock a caller
+held at fork time stays held in the child.
+*Guarded:* `tests/test_fork_lifecycle.py`, `tests/test_sink_ownership.py`,
+`tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`).
 
 ## 13. A bad argument is refused where it is written, never later on the drain thread
 

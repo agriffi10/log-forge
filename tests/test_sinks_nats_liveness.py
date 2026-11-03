@@ -81,6 +81,7 @@ class LiveFakeNATS:
         while ``is_connected`` stays true (M3); ``flush`` then returns at once with no PONG.
       is_connected: The driver's flag, a plain attribute the test flips.
       stats: The driver's counters; ``reconnect()`` bumps ``"reconnects"`` and resets ``_pongs``.
+      timed_out: How many ``flush`` calls expired on the fake's own ``wait_for``.
       wait_override: When set, the seconds the fake's own ``wait_for`` uses instead of the
         ``timeout`` the sink passed, so an orphaned probe can expire inside a test.
       publish_gate: When set, every publish parks on it until it is set.
@@ -103,6 +104,7 @@ class LiveFakeNATS:
         self.reader_dead = False
         self.is_connected = True
         self.stats: dict[str, int] = {"reconnects": 0}
+        self.timed_out = 0
         self.wait_override: float | None = None
         self.publish_gate: asyncio.Event | None = None
         self.close_gate: asyncio.Event | None = None
@@ -168,6 +170,7 @@ class LiveFakeNATS:
                 await asyncio.wait_for(future, wait)
             except TimeoutError:
                 future.cancel()
+                self.timed_out += 1
                 raise FlushTimeoutError from None
         finally:
             self._leave()
@@ -482,7 +485,7 @@ def test_the_backstop_closes_the_sink_when_a_publish_never_returns(monkeypatch) 
             outcome.append(None)
 
     began = time.monotonic()
-    caller = threading.Thread(target=emit)
+    caller = threading.Thread(target=emit, daemon=True)
     caller.start()
     caller.join(0.2 + CALL_SLACK + MARGIN + 5.0)
     elapsed = time.monotonic() - began
@@ -912,7 +915,10 @@ def test_a_reconnect_discards_the_orphaned_probe_and_its_outcome_is_retrieved(
         fake.answering = True
         sink.emit([{"n": 2}])
         _on_loop(sink, asyncio.wait({orphan}, timeout=2.0))
-        assert orphan.done() and isinstance(orphan.exception(), FlushTimeoutError)
+        # Asserted through the fake, never through `orphan.exception()`: reading the exception
+        # here would itself mark it retrieved and hide a sink that never did (mutant 26 survived
+        # exactly that version of this test).
+        assert orphan.done() and not orphan.cancelled() and fake.timed_out == 1
         del orphan
         sink.close()
         gc.collect()

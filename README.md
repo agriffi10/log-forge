@@ -906,11 +906,27 @@ minutes by default (measured: the delivery callback fires at 300.18 s), reachabl
 > backlog over as one batch.
 
 `NATSSink` now bounds a whole `emit` with one `publish_timeout` (10 s by default), giving each
-JetStream publish the lesser of the driver's ack timeout and the budget remaining; a core publish
-takes no timeout and is bounded between events. Its connect, reconnect and drain timeouts are
-reachable from the constructor — at the driver's defaults, construction against an unreachable
-server blocks for a measured 120.17 s. It refuses a batch outright while its client reports itself
-disconnected, so a sustained outage moves `health().failed_batches` instead of being absorbed.
+JetStream publish the lesser of the driver's ack timeout and the budget remaining; ~~a core publish
+takes no timeout and is bounded between events~~ — **superseded by SPEC-061**, below. Its connect,
+reconnect and drain timeouts are reachable from the constructor — at the driver's defaults,
+construction against an unreachable server blocks for a measured 120.17 s. ~~It refuses a batch
+outright while its client reports itself disconnected, so a sustained outage moves
+`health().failed_batches` instead of being absorbed.~~
+
+> **Superseded by SPEC-061.** The driver's `is_connected` flag was the only guard, and it stays
+> true for minutes against a server that has stopped answering, because the driver's ping task
+> only ran while a call was in progress. `NATSSink` now runs its event loop on a thread it owns
+> for its whole life, and for a client it connected itself it asks the **server** before it
+> publishes: `emit` sends a PING and publishes only after the PONG arrives, inside the same
+> `publish_timeout`, so a stalled server is refused within that budget and a sustained outage
+> moves `health().failed_batches`. A core batch is then confirmed by a second round trip after its
+> last publish, or counted in `health().sink.failed` and announced when the server does not answer
+> in time — counted rather than raised, because the bytes may still land and a retry would
+> duplicate them. After an outage the sink resumes on its own once the driver reconnects.
+> `close()` is bounded by the sink: `drain_timeout` is now the deadline of its own close sequence,
+> 1 s by default, and the driver's `drain()` is no longer called. An injected `client=` keeps the
+> flag as its only guard and is never probed, because the sink cannot drive a loop it did not
+> connect on. In a forked child the sink refuses rather than reconnects.
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
