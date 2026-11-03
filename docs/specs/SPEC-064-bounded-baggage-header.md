@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-064
 title: "Bounded, Total Baggage Header — Rendered Through Assembly's Coercion and Capped by Whole Members"
 description: "Renders the outbound baggage header through assembly's bounded coercion and caps it at 8192 bytes by whole members, so current_baggage_header() always returns and its output always parses."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-014, SPEC-057]
 ---
 
@@ -11,7 +11,7 @@ depends_on: [SPEC-014, SPEC-057]
 
 `current_baggage_header()` is what a caller puts on an outbound request so the next process continues
 the trace. It is public and its docstring says `Raises: None.`, but it renders every baggage value
-with `str()` and percent-encodes the result, which is neither bounded nor total. Three failures,
+with `str()` and percent-encodes the result, which is neither bounded nor total. Four failures,
 each reproduced on the tree at `71e42dd` (`context.py` is byte-identical to `b282c1d`, where the
 first two were first measured, `docs/architecture.md` §12):
 
@@ -22,10 +22,14 @@ first two were first measured, `docs/architecture.md` §12):
   inbound route reaches the same state: `continue_trace(baggage="k=\ud800")` stores the parsed value,
   because `parse_baggage_header` passes non-`%` characters through `unquote`, so a raw lone surrogate
   survives into baggage.
+- **(d) It raises on a large integer.** `set_baggage(i=10**4300)` makes `str` raise `ValueError`,
+  because CPython refuses to render an integer of more than 4,300 digits and the coercer's default
+  digit ceiling is the same number, so every integer assembly replaces by a placeholder made the
+  unfixed formatter raise.
 
-Event assembly handles all three values without hanging or raising, so the library's two text
+Event assembly handles all four values without hanging or raising, so the library's two text
 producers for one baggage disagree (invariant 6) and the promise that a public call returns
-(invariant 1) is broken. A fourth defect sits beside them: the formatter has no size bound, and one
+(invariant 1) is broken. A further defect sits beside them: the formatter has no size bound, and one
 value at the default 8 KiB ceiling already makes a header over `BAGGAGE_MAX_BYTES` (8192), which the
 next log-foundry process's `parse_baggage_header` refuses whole. Formatter and parser are twins.
 
@@ -43,8 +47,8 @@ public name.
 - A guard that makes the render total, including the lone-surrogate case reached by both intake
   routes (FR-002).
 - A cap of `BAGGAGE_MAX_BYTES` on the emitted header, kept by whole members in mapping order, a
-  skip of any member the parser would refuse for its key, and a throttled `_diag` announcement of
-  what was dropped (FR-003).
+  skip of any member the parser would refuse for its key or whose key cannot be rendered, and a
+  throttled `_diag` announcement of what was dropped (FR-003).
 - **The guard binds at render, not at intake.** `set_baggage` keeps storing arbitrary objects,
   because the event coerces them at assembly (invariant 8: once, at assembly); coercing at intake
   would change what events carry and would coerce twice. The inbound route (`continue_trace`, then
@@ -92,8 +96,9 @@ value is rendered with `str()`. The text is percent-encoded with `quote(..., saf
 plain dict therefore still renders as it does now (`{'a': 1}`), and today's docstring already
 promises "arrives as its repr". The keys are the coerced keys.
 
-**The consequence a caller can see: a header value now matches the event's rendering.** Measured
-against `coerce` on the tree at `71e42dd`:
+**The consequence a caller can see: the header renders the same *coerced value* the event carries,
+as text with `str()`.** The event carries that value as JSON, so `True` is `true` there and `True`
+here; what changes is which value is rendered. Measured against `coerce` on the tree at `71e42dd`:
 
 | Baggage value | Header text before | Header text now |
 |---|---|---|
@@ -103,8 +108,9 @@ against `coerce` on the tree at `71e42dd`:
 | `(1, 2)`, `{1, 2}` | `(1, 2)`, `{1, 2}` | `[1, 2]` |
 | `b"ab"` | `b'ab'` | `ab` |
 | `float("nan")` | `nan` | `<float: nan>` |
-| an int too large to render | its digits | `<int: ~N digits>` |
-| a string past `max_value_bytes` | the whole string | clipped, ending `…[truncated]` |
+| an int too large to render | raises `ValueError` (case d) | `<int: ~N digits>` |
+| a string past `max_value_bytes` | the whole string | clipped, ending `…[truncated]`; observable only under a small ceiling, since at the default a clipped value plus its key exceeds FR-003's cap |
+| `True`, `None`, `["x"]` | `True`, `None`, `['x']` | unchanged: `True`, `None`, `['x']` (the event carries `true`, `null`, `["x"]`) |
 | a lone surrogate | raises (case c) | U+FFFD |
 | members past `max_keys` (256) | all emitted | dropped, as assembly drops them |
 
@@ -113,7 +119,7 @@ touches: **header render vs event assembly** (both coerce one baggage with one c
 **`current_baggage_header` vs `format_baggage_header`** (the first stays a call of the second on the
 live baggage).
 
-**Test harness.** The tests reproduce (a), (b) and (c) and are run once against the unfixed
+**Test harness.** The tests reproduce (a), (b), (c) and (d) and are run once against the unfixed
 `context.py` (a scratch worktree off `main`, never by switching this branch, with
 `log_foundry.context.__file__` asserted to lie under it) to show each fails for its reason. A test
 whose old behaviour is "never returns" must not hang the suite. Measured at `71e42dd`, a
@@ -134,8 +140,14 @@ the budget and the fixed operation stays tight relative to the unfixed cost.
       an assertion.
 - [ ] Each row of the table above is a test with the literal expected header text, not an expression
       computed from `coerce`: for example `set_baggage(d=datetime(2026, 1, 1))` gives
-      `d=2026-01-01T00%3A00%3A00`, and `set_baggage(m={"a": 1})` gives `m=%7B%27a%27%3A%201%7D`.
-      A baggage of 300 integer members emits 256 of them with the default `max_keys`.
+      `d=2026-01-01T00%3A00%3A00`, and `set_baggage(m={"a": 1})` gives `m=%7B%27a%27%3A%201%7D`;
+      `True` gives `t=True` and `None` gives `n=None`. A baggage of 300 integer members emits 256 of
+      them with the default `max_keys`.
+- [ ] The clipped-string row: with `configure(max_value_bytes=16)` and `set_baggage(s="x" * 40)`, the
+      header is `s=xx%E2%80%A6%5Btruncated%5D`. The test restores the config afterwards, and against
+      the unfixed `context.py` the header carries all 40 characters.
+- [ ] (d) `set_baggage(i=10**4300)` gives `i=%3Cint%3A%20~4301%20digits%3E`; against the unfixed
+      `context.py` the test fails with `ValueError`.
 - [ ] One pass: with `sanitize._MAX_NODES` patched to 4 and a baggage of `a=[1, 2, 3]` then
       `b=[4]`, the header is `a=%5B1%2C%202%2C%203%5D,b=%3Cnode%20limit%3E`, so the second member's
       value is `<node limit>` because the first spent the budget. A per-member pass would render
@@ -147,8 +159,8 @@ the budget and the fixed operation stays tight relative to the unfixed cost.
       tenant="acme")` still gives `request_id=req-123,tenant=acme` and a comma-bearing string still
       round-trips through `parse_baggage_header`.
 - [ ] `context.__all__`, `log_foundry.__all__` and both functions' signatures are unchanged.
-- [ ] Serves invariants 1 and 6: the call returns on a hostile value, and the header agrees with the
-      event on what the same baggage becomes.
+- [ ] Serves invariants 1 and 6: the call returns on a hostile value, and the header renders the same
+      coerced value the event carries.
 
 ### FR-002: The render is total, including a lone surrogate from either intake route
 
@@ -156,11 +168,18 @@ the budget and the fixed operation stays tight relative to the unfixed cost.
 
 Rendering one member's coerced value can still raise. After coercion a value is a scalar, a list or a
 dict, so `str()` of it cannot raise except for an object that spoofs a scalar type and survives
-coercion, which is SPEC-063's open item. The render therefore guards each member: if turning one
-coerced value into text raises an `Exception`, that member's value becomes
-`<unserializable: TypeName>`, named by `type(value).__name__` and never by `repr`, and the other
-members are unaffected. The guard catches `Exception`, never `BaseException`, so a
-`KeyboardInterrupt` or the test harness's alarm reaches the caller (invariant 1).
+coercion, which is SPEC-063's open item. The render therefore guards the **whole per-member render**:
+`str()` and both `quote` calls, key and value. A spoof whose `__str__` returns a `str` subclass with a
+raising `encode` gets past `str()` and then makes `quote` raise, so a guard around `str()` alone is
+not enough. If rendering one member's value raises an `Exception`, that value becomes
+`<unserializable: TypeName>`, and the other members are unaffected. The type is named by
+`sanitize._type_name(value)`, which returns `"?"` when even the name cannot be read, never by
+`type(value).__name__` (a spoofed-`__class__` object whose metaclass has a raising `__name__` property
+would raise inside the handler) and never by `repr`. If the key cannot be rendered, or the
+placeholder itself cannot be encoded, the member is skipped and counted in FR-003's drop total, like
+an empty key. A coerced key is always a `str`, so the key route is defensive. The guard catches
+`Exception`, never `BaseException`, so a `KeyboardInterrupt` or the test harness's alarm reaches the
+caller (invariant 1).
 `current_baggage_header()` keeps `Raises: None.` truthfully. The residual is stated under Out of
 Scope: it is not closed here.
 
@@ -185,7 +204,16 @@ changed: `get_baggage()` still returns the stored value, surrogate included.
 - [ ] The guard itself: a value that survives coercion and raises from `str()` (an object that
       returns itself from coercion through a spoofed `__class__`, built the way SPEC-063's routes
       are) yields `<unserializable: TypeName>` for that member while a sibling member renders
-      normally. The test is mutation-checked once by removing the `try`, which reddens it.
+      normally. The test is mutation-checked once by removing the guard, which reddens it.
+- [ ] Measured escape 1: an object that survives coercion and whose `__str__` returns a `str`
+      subclass with a raising `encode` yields `<unserializable: TypeName>`, a sibling member renders,
+      and nothing raises. A guard around `str()` alone fails it.
+- [ ] Measured escape 2: an object with a spoofed `__class__` whose metaclass has a raising
+      `__name__` property and whose `__str__` raises yields `v=%3Cunserializable%3A%20%3F%3E`, a
+      sibling member renders, and nothing raises.
+- [ ] A key that cannot be rendered (`quote` patched to raise for one key, since a coerced key is
+      always a `str`) skips that member, the siblings on either side render, the header parses, and
+      the skip is in FR-003's total.
 - [ ] A `BaseException` subclass raised from that `__str__` propagates out of
       `current_baggage_header()`; an `Exception` does not.
 - [ ] The placeholder in every case above names the type and contains neither the exception message
@@ -218,13 +246,18 @@ correlating fields it could have kept; an empty key does the same. Formatter and
 (invariant 6): everything the formatter emits must be something the parser accepts.
 
 A drop is announced through `_diag.lost("baggage member", total, detail)` on stderr, written the first
-time and then whenever the running total of dropped members, a skipped empty-key member counted
-with the members dropped by the cap, advancing, crosses a multiple of
-`_diag.WARN_EVERY`, like the library's other per-event sites. The count carried is that running
-total, and the detail says so. The line names a count only, never a key or a value (invariant 11).
-The running total is process-level diagnostic state in `context.py`: after a fork a child inherits a
-count that only shifts which line it writes, so it is not stranded state (invariant 12). The write
-is `_diag.lost`, which cannot raise on a stream fault. `tests/test_diag.py` walks every module under
+time and then at every multiple of `_diag.WARN_EVERY`, like the library's other per-event sites. The
+members counted are those dropped by the cap, a skipped empty-key member and a member skipped for a
+key that cannot be rendered. The total is drawn from a module-level `itertools.count(1)`: each
+dropped member takes one `next()`, which is atomic under the GIL, so it needs no lock. A bare `+=`
+could lose an increment, and then a line's count would not reproduce from the ledger (invariant 11);
+a new lock in `context.py` would be a fork hazard (invariant 12). A call writes the line if any
+value it drew is 1 or a multiple of `WARN_EVERY`, and carries the last value it drew as the total,
+which the detail says is a running total. Each drawn value is unique, so each crossing is announced
+by exactly one call, even under concurrent calls. The line names a count only, never a key or a
+value (invariant 11). The counter is process-level diagnostic state: after a fork a child holds its
+own copy of the count, which only shifts which line it writes, so nothing is stranded (invariant 12).
+The write is `_diag.lost`, which cannot raise on a stream fault. `tests/test_diag.py` walks every module under
 `src/` for bare stderr writes and for a `repr` in a `_diag` call, so `context.py`'s new call is
 covered by it without a hand-kept entry; that file also asserts the call-site floor, which the new
 site only raises.
@@ -257,8 +290,15 @@ site only raises.
       and 1,000 only, and each carries its total. A baggage whose dropped member has key
       `secret-key` and value `secret-value` produces a stderr line containing neither. Planting the
       key into the detail reddens the second test.
-- [ ] Twin: the inbound route into the outbound cap. After `continue_trace(baggage=h)` with `h` an
-      accepted 8192-byte header, `current_baggage_header()` is at most 8192 bytes and parses.
+- [ ] The concurrent total: N threads (8) each make 500 calls that drop one member, released
+      together. The next value drawn afterwards is the number of drops plus one, the lines written
+      number exactly the crossings of the sequence (totals 1, 1000, 2000, 3000 and 4000, five lines),
+      and no two lines carry the same total.
+- [ ] Twin: the inbound route into the outbound cap. With `h = "a=1,b=" + "(" * 8186`, which is exactly
+      8192 bytes and so accepted by `parse_baggage_header`, `continue_trace(baggage=h)` followed by
+      `current_baggage_header()` gives exactly `a=1`: `b` is dropped whole because `quote` encodes
+      each `(` as three bytes. The unfixed `context.py` emits about 24 KB there, which the parser
+      refuses.
 - [ ] Serves invariants 6 and 11: the formatter never emits what the parser refuses, for size or for
       an empty key, and the announcement carries a count and no caller data.
 
@@ -268,8 +308,9 @@ site only raises.
 
 ```
 # src/log_foundry/context.py            (BAGGAGE_MAX_BYTES = 8192 is unchanged)
-_dropped_members: int                   # running total of members dropped by the cap or skipped for an empty key;
-                                        # diagnostic throttle state only (FR-003)
+_dropped_members: itertools.count[int]  # itertools.count(1): one next() per member dropped by the cap
+                                        # or skipped (empty or unrenderable key); no lock, atomic under
+                                        # the GIL; diagnostic throttle state only (FR-003)
 
 # src/log_foundry/sanitize.py           (not edited)
 sanitize_fields(fields: Mapping[str, object], *, cfg: Config) -> tuple[dict[str, object], bool]
@@ -284,8 +325,13 @@ current_baggage_header() -> str                      # Raises: None. now true on
 format_baggage_header(baggage: dict[str, object]) -> str
 
 # the render, per member of sanitize_fields(baggage, cfg=...)[0]
-text = value if type(value) is str else str(value)   # guarded: Exception -> "<unserializable: T>"
-member = f"{quote(key, safe='')}={quote(text, safe='')}"
+k = quote(key, safe='')                               # Exception or k == "" -> member skipped, counted
+try:                                                  # the guard wraps str() AND quote()
+    text = value if type(value) is str else str(value)
+    v = quote(text, safe='')
+except Exception:
+    v = quote(f"<unserializable: {sanitize._type_name(value)}>", safe='')   # "?" if unreadable
+member = f"{k}={v}"
 # members joined by ",", kept while len(header) <= BAGGAGE_MAX_BYTES; first misfit ends the header
 ```
 
@@ -304,7 +350,7 @@ private budgets in `sanitize`; no key is added.
 src/log_foundry/
 └── context.py                  # the render, the guard, the cap, the diagnostic
 tests/
-├── test_baggage_header.py      # new: (a), (b), (c) on both intake routes, the cap, the diagnostic
+├── test_baggage_header.py      # new: (a)-(d) on both intake routes, the cap, the diagnostic
 └── test_diag.py                # unchanged unless the plan finds a hand-kept site list to extend
 docs/
 ├── architecture.md             # §12 item moved to Resolved
@@ -314,9 +360,9 @@ docs/
 
 ## Implementation Phases
 
-### Phase 1: Tests that reproduce (a), (b) and (c) (FR-001, FR-002)
+### Phase 1: Tests that reproduce (a), (b), (c) and (d) (FR-001, FR-002)
 
-- Write the three reproductions with the harness the plan chooses; run them once against the unfixed
+- Write the four reproductions with the harness the plan chooses; run them once against the unfixed
   `context.py` from a scratch worktree and keep the reasons each fails for the PR body.
 
 ### Phase 2: The render, the guard and the cap (FR-001, FR-002, FR-003)
@@ -333,6 +379,6 @@ docs/
   `docs/architecture.md` moves to *Resolved*; one decision file in `docs/decisions/trace-model/`
   records that the baggage header renders through assembly's coercion, bound at render not intake,
   capped at `BAGGAGE_MAX_BYTES` by whole members; one bullet in `docs/release-notes/v1.1.0.md` states
-  the visible change (header values now match the event's rendering, and an over-cap header drops
-  whole members and announces it); regenerate the indexes; prune `CLAUDE.md`'s `## Specs`.
+  the visible change (header values render the coerced value the event carries, and an over-cap header
+  drops whole members and announces it); regenerate the indexes; prune `CLAUDE.md`'s `## Specs`.
 - Then every gate: `ruff`, `mypy`, `pytest`, `spec-lint`, `docs-lint` and `docstring-lint`.
