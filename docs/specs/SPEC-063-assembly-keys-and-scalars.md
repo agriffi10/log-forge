@@ -436,8 +436,10 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
 - [ ] A `float` impostor key is `<unserializable key: T>`, marked, with its sibling kept; a `float`
       subclass key whose `__str__` lies is the key `"1.5"` for `1.5`; an `int` subclass key keeps
       its own `str()` (`Color.RED`, and a subclass whose `__str__` returns `"P"` gives `"P"`); an
-      object whose `__class__` returns `bool` as a key is its own `str()`. The first two fail at
-      `71e42dd`; the rest are silence rows.
+      object whose `__class__` returns `bool` as a key is `<unserializable key: T>`, marked —
+      `type(key) is not bool` sends it to the unbound integer read, which refuses it, where
+      `71e42dd` wrote its own `str()`. The first two and the last fail at `71e42dd`; the `int`
+      subclass rows are silence rows.
 - [ ] A class whose metaclass defines `__name__` as a property that raises, or returns `42`, or
       returns `"renamed"`, gives `<unserializable: Stored>` as a value and
       `<unserializable key: Stored>` as a key, `Stored` being its stored name; each fails at
