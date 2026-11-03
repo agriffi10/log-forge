@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import gc
 import logging
+import os
 import pathlib
 import sys
 import threading
@@ -29,6 +31,7 @@ from log_foundry.sinks.nats import (
     CALL_SLACK,
     DEFAULT_CLOSE_TIMEOUT,
     LOOP_JOIN_TIMEOUT,
+    PROBE_FLUSH_TIMEOUT,
     NATSSink,
 )
 
@@ -719,3 +722,420 @@ def test_every_public_call_reaches_the_loop_through_one_helper() -> None:
     submitters = [name for name, node in methods.items() if calls(node, "run_coroutine_threadsafe")]
     assert submitters == ["_submit"], submitters
     assert source.count("run_coroutine_threadsafe") == 1
+
+
+# --- FR-002: an emit publishes only after the server answers a round trip ---------------------
+
+
+class StalledFakeNATS(LiveFakeNATS):
+    """A client whose server never answers a PING: the connection is open and silent (M1)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.answering = False
+
+
+def _timed(call: Callable[[], object]) -> tuple[float, BaseException | None]:
+    began = time.monotonic()
+    try:
+        call()
+    except BaseException as exc:
+        return time.monotonic() - began, exc
+    return time.monotonic() - began, None
+
+
+@pytest.mark.parametrize("jetstream", [False, True], ids=["core", "jetstream"])
+def test_emit_probes_once_before_its_first_publish(monkeypatch, jetstream: bool) -> None:
+    # FR-002 AC-1.
+    sink, fake, _ = _build(monkeypatch, jetstream=jetstream)
+    sink.emit([{"n": 1}])
+    sink.close()
+
+    assert fake.calls[:2] == ["flush", "publish"], fake.calls
+    assert fake.published
+
+
+@pytest.mark.parametrize("jetstream", [False, True], ids=["core", "jetstream"])
+def test_an_unanswered_probe_refuses_within_the_budget_and_counts_nothing(
+    monkeypatch, capsys, jetstream: bool
+) -> None:
+    # FR-002 AC-2.
+    sink, fake, _ = _build(
+        monkeypatch, factory=StalledFakeNATS, jetstream=jetstream, publish_timeout=0.3
+    )
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}]))
+    losses = sink.losses()
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert isinstance(error, SinkDeliveryError) and "PONG" in str(error)
+    assert 0.3 <= elapsed <= 0.3 + CALL_SLACK + MARGIN, f"{elapsed:.2f}s"
+    assert "publish" not in fake.calls
+    assert losses == SinkLosses(dropped=0, failed=0)
+    assert "lost" not in capsys.readouterr().err
+
+
+class RaisingFlushNATS(LiveFakeNATS):
+    """A client whose ``flush`` raises ``FlushTimeoutError`` at once, before any PING is queued."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        self._record("flush")
+        self.flush_timeouts.append(timeout)
+        raise FlushTimeoutError
+
+
+def test_a_probe_that_raises_is_not_an_answer_and_the_next_call_sends_a_fresh_ping(
+    monkeypatch,
+) -> None:
+    # FR-002 AC-2, the raising variant (plan finding M-4): condition 1 of the answer rule.
+    sink, fake, _ = _build(monkeypatch, factory=RaisingFlushNATS, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}]))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 2}])
+    losses = sink.losses()
+    with contextlib.suppress(Exception):
+        sink.close()
+
+    assert isinstance(error, SinkDeliveryError) and "PONG" in str(error)
+    assert elapsed < 0.3, "a probe that raised is settled at once, not waited for"
+    assert "publish" not in fake.calls
+    assert losses == SinkLosses(dropped=0, failed=0)
+    assert fake.calls[:2] == ["flush", "flush"], "a finished probe is discarded and re-sent"
+
+
+def test_a_stall_sends_one_ping_across_five_refusals(monkeypatch) -> None:
+    # FR-002 AC-3: the first refusal waits, the four after it are latched; one PING in total and
+    # never two futures in the driver's queue.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    pongs_seen: list[int] = []
+    for _ in range(5):
+        with pytest.raises(SinkDeliveryError):
+            sink.emit([{"n": 1}])
+        pongs_seen.append(len(fake._pongs))
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert fake.calls.count("flush") == 1, fake.calls
+    assert max(pongs_seen) <= 1, pongs_seen
+
+
+def test_a_late_pong_does_not_kill_the_reader_and_a_second_stall_is_still_refused(
+    monkeypatch,
+) -> None:
+    """FR-002 AC-4, the M3 regression.
+
+    The driver's reader calls ``set_result`` on the oldest PONG future unguarded; a future the
+    sink cancelled raises ``InvalidStateError`` there and the reader dies while ``is_connected``
+    stays true, after which every ``flush`` returns at once with no round trip and a stall is
+    accepted. The fake models exactly that, so a probe that cancels is caught by the second
+    stall being accepted rather than refused.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    _pong(sink, fake)
+    fake.answering = True
+    sink.emit([{"n": 2}])
+    fake.answering = False
+    second_stall = _timed(lambda: sink.emit([{"n": 3}]))
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert fake.reader_dead is False, "the sink cancelled a PONG wait the server answered"
+    assert fake.published == [b'{"n": 2}']
+    assert isinstance(second_stall[1], SinkDeliveryError)
+
+
+def test_the_cancelling_variant_fails_that_regression(monkeypatch) -> None:
+    # FR-002 AC-4's second half: the same test against a probe that cancels on its own deadline
+    # (`await client.flush(timeout=remaining)`), which must fail it in the stated way. This is
+    # the shape of the vacuity the real test refuses: the reader dies and the second stall is
+    # accepted with nothing refused.
+    async def cancelling(self: NATSSink, deadline: float) -> bool:
+        try:
+            await self._client.flush(timeout=max(0.01, deadline - time.monotonic()))
+        except Exception:
+            return False
+        return True
+
+    monkeypatch.setattr(NATSSink, "_await_probe", cancelling)
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    _pong(sink, fake)
+    fake.answering = True
+    sink.emit([{"n": 2}])
+    fake.answering = False
+    second_stall = _timed(lambda: sink.emit([{"n": 3}]))
+    sink.close()
+
+    assert fake.reader_dead is True, "the cancelling variant must kill the fake's reader"
+    assert second_stall[1] is None, "and the second stall must then be accepted"
+    assert len(fake.published) == 2
+
+
+def test_a_pong_arriving_between_calls_is_not_credited(monkeypatch) -> None:
+    # FR-002 AC-6.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    _pong(sink, fake)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 2}])
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert fake.calls.count("flush") == 2, "the next emit must send its own PING"
+    assert "publish" not in fake.calls
+
+
+def test_a_reconnect_discards_the_orphaned_probe_and_its_outcome_is_retrieved(
+    monkeypatch,
+) -> None:
+    # FR-002 AC-7. `wait_override` compresses the orphan's inner 600 s to 0.2 s so it expires
+    # inside the test; its `FlushTimeoutError` must then be retrieved by the done callback, which
+    # `gc.collect()` with a handler on the asyncio logger is the only way to observe.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logging.getLogger("asyncio").addHandler(handler)
+    try:
+        sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+        fake.wait_override = 0.2
+        with pytest.raises(SinkDeliveryError):
+            sink.emit([{"n": 1}])
+        assert sink._probe is not None
+        orphan = sink._probe[0]
+        _on_loop(sink, _run_sync(fake.reconnect))
+        fake.answering = True
+        sink.emit([{"n": 2}])
+        _on_loop(sink, asyncio.wait({orphan}, timeout=2.0))
+        assert orphan.done() and isinstance(orphan.exception(), FlushTimeoutError)
+        del orphan
+        sink.close()
+        gc.collect()
+    finally:
+        logging.getLogger("asyncio").removeHandler(handler)
+
+    assert fake.calls.count("flush") == 2, "the reconnect must make the next emit send afresh"
+    assert fake.published == [b'{"n": 2}']
+    assert not [r for r in records if "never retrieved" in r.getMessage()], records
+
+
+async def _run_sync(fn: Callable[[], None]) -> None:
+    fn()
+
+
+def test_every_probe_carries_the_constant_timeout_and_no_private_name_is_used(
+    monkeypatch,
+) -> None:
+    # FR-002 AC-8.
+    sink, fake, _ = _build(monkeypatch)
+    sink.emit([{"n": 1}])
+    sink.close()
+    source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
+
+    assert fake.flush_timeouts, "no probe was sent"
+    assert fake.flush_timeouts == [PROBE_FLUSH_TIMEOUT] * len(fake.flush_timeouts)
+    assert "_send_ping" not in source and "_pongs" not in source
+
+
+def test_the_probe_timeout_exceeds_the_drivers_stale_threshold() -> None:
+    # FR-002 AC-9, the idiom of `test_our_ack_ceiling_still_mirrors_the_drivers_own_default`.
+    if os.environ.get("LOG_FOUNDRY_EXTRAS") != "1":
+        pytest.importorskip("nats", reason="the `nats` extra is not installed")
+    from nats.aio.client import DEFAULT_MAX_OUTSTANDING_PINGS, DEFAULT_PING_INTERVAL
+
+    assert PROBE_FLUSH_TIMEOUT > DEFAULT_PING_INTERVAL * (DEFAULT_MAX_OUTSTANDING_PINGS + 1)
+    source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
+    docstring = source.split("PROBE_FLUSH_TIMEOUT = ")[1].split('"""')[1]
+    assert "ping_interval" in docstring and "max_outstanding_pings" in docstring
+
+
+class FlushlessFakeNATS:
+    """A sink-connected client that offers no ``flush``: published to, never probed."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.published: list[bytes] = []
+        self.is_connected = True
+
+    async def publish(self, subject: str, payload: bytes) -> None:
+        self.calls.append("publish")
+        self.published.append(payload)
+
+    async def close(self) -> None:
+        self.calls.append("close")
+
+
+def test_a_sink_connected_client_without_flush_is_not_probed(monkeypatch) -> None:
+    # FR-002 AC-10, first clause.
+    sink, fake, _ = _build(monkeypatch, factory=FlushlessFakeNATS)
+    sink.emit([{"n": 1}, {"n": 2}])
+    sink.close()
+    assert fake.calls == ["publish", "publish", "close"]
+
+
+def test_a_disconnected_client_is_refused_before_any_ping(monkeypatch) -> None:
+    # FR-002 AC-10, second clause.
+    sink, fake, _ = _build(monkeypatch)
+    fake.is_connected = False
+    with pytest.raises(SinkDeliveryError, match="disconnected"):
+        sink.emit([{"n": 1}])
+    sink.close()
+    assert "flush" not in fake.calls[:-1] and "publish" not in fake.calls
+
+
+def test_an_empty_batch_sends_no_ping(monkeypatch) -> None:
+    # FR-002 AC-10, third clause.
+    sink, fake, _ = _build(monkeypatch)
+    sink.emit([])
+    assert fake.calls == []
+    sink.close()
+
+
+class DisconnectsInsideFlushNATS(LiveFakeNATS):
+    """``flush`` flips the flag and returns without a PONG: the reconnecting fallback (M9)."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        self._record("flush")
+        self.flush_timeouts.append(timeout)
+        self.is_connected = False
+
+
+class AnswersThenDisconnectsNATS(LiveFakeNATS):
+    """``flush`` is answered by a real PONG and the client is disconnected before it returns."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        await super().flush(timeout)
+        self.is_connected = False
+
+
+class ReconnectsInsideFlushNATS(LiveFakeNATS):
+    """``flush`` returns at once with the reconnect counter moved: a fresh queue, no PONG."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        self._record("flush")
+        self.flush_timeouts.append(timeout)
+        self.stats["reconnects"] += 1
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [DisconnectsInsideFlushNATS, AnswersThenDisconnectsNATS, ReconnectsInsideFlushNATS],
+    ids=["disconnected", "answers-then-disconnects", "reconnected"],
+)
+def test_a_flush_that_returns_without_a_pong_is_not_an_answer(monkeypatch, factory) -> None:
+    # FR-002 AC-12: the three answer conditions, each flipped INSIDE the fake's flush (plan
+    # finding M-5), so nothing but the condition itself can refuse the emit.
+    sink, fake, _ = _build(monkeypatch, factory=factory, publish_timeout=0.3)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    sink.close()
+    assert "publish" not in fake.calls
+    assert fake.calls.count("flush") >= 1
+
+
+def test_the_latch_refuses_at_once_while_the_lock_is_held(monkeypatch) -> None:
+    # FR-002 AC-13: the latch is read before the lock, so a holder of the lock cannot delay it.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with sink._lock:
+            holding.set()
+            release.wait(5.0)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(2.0)
+    try:
+        timings = [_timed(lambda: sink.emit([{"n": 2}])), _timed(sink.flush)]
+    finally:
+        release.set()
+        holder.join(5.0)
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    for elapsed, error in timings:
+        assert isinstance(error, SinkDeliveryError) and "PING" in str(error)
+        assert elapsed < 0.05, f"the latch must refuse without queueing: {elapsed:.3f}s"
+    assert fake.calls.count("flush") == 1
+
+
+def test_the_latch_clears_on_a_pong_and_on_a_reconnect(monkeypatch) -> None:
+    # FR-002 AC-14, first half.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    _pong(sink, fake)
+    fake.answering = True
+    sink.emit([{"n": 2}])
+    elapsed, error = _timed(lambda: sink.emit([{"n": 3}]))
+    assert error is None and elapsed < 0.05, "a healthy call after the stall must not wait"
+
+    fake.answering = False
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 4}])
+    assert sink._latched()
+    flushes_before = fake.calls.count("flush")
+    _on_loop(sink, _run_sync(fake.reconnect))
+    assert not sink._latched(), "a moved reconnect counter clears the latch"
+    elapsed, error = _timed(lambda: sink.emit([{"n": 5}]))
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert isinstance(error, SinkDeliveryError) and "PONG" in str(error)
+    assert elapsed >= 0.2, "after a reconnect the call waits on a fresh PING, not the latch"
+    assert fake.calls.count("flush") == flushes_before + 1
+    assert fake.published == [b'{"n": 2}', b'{"n": 3}']
+
+
+def test_a_reused_probe_wait_is_capped_by_the_probes_age(monkeypatch) -> None:
+    # FR-002 AC-14, second half: a second caller joining a pending probe waits only what is left
+    # of `publish_timeout` measured from the PING, not a full budget of its own. Timed from the
+    # first caller's start: real, both are refused at about 1.0 s; a mutant giving the second
+    # caller its own full budget refuses it at about 1.4 s.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=1.0)
+    results: dict[str, tuple[float, BaseException | None]] = {}
+    started = time.monotonic()
+
+    def first() -> None:
+        results["first"] = _timed(lambda: sink.emit([{"n": 1}]))
+
+    def second() -> None:
+        time.sleep(0.4)
+        results["second"] = _timed(lambda: sink.emit([{"n": 2}]))
+        results["second_end"] = (time.monotonic() - started, None)
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5.0)
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert isinstance(results["first"][1], SinkDeliveryError)
+    assert isinstance(results["second"][1], SinkDeliveryError)
+    assert results["second"][0] < 1.0, "the second caller must not wait a whole budget"
+    assert results["second_end"][0] < 1.0 + 0.25, f"{results['second_end'][0]:.2f}s from the PING"
+    assert fake.calls.count("flush") == 1
+
+
+def test_an_injected_client_is_never_probed(monkeypatch) -> None:
+    # FR-002 AC-15 (and FR-003 AC-11's no-confirmation half): the sink cannot drive a client it
+    # did not connect on its own loop (M10), so an injected one keeps today's flag guard only.
+    client = LiveFakeNATS()
+    sink = NATSSink("logs", client=client)
+    sink.emit([{"n": 1}, {"n": 2}])
+    assert "flush" not in client.calls
+    assert client.calls.count("publish") == 2
+    client.is_connected = False
+    with pytest.raises(SinkDeliveryError, match="disconnected"):
+        sink.emit([{"n": 3}])
+    sink.close()
+    assert "flush" not in client.calls

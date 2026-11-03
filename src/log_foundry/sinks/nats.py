@@ -69,6 +69,21 @@ batch either confirmed or counted before ``emit`` returns, so an expired close l
 close the exit may cut (SPEC-061 FR-004).
 """
 
+PROBE_FLUSH_TIMEOUT = 600.0
+"""Seconds the driver's own ``wait_for`` inside a probe may run before it cancels the PONG future.
+
+The sink never cancels a PONG wait the server may still answer (SPEC-061 M3): a late PONG landing
+on a cancelled future raises inside the driver's reader and ends it while the status stays
+CONNECTED, after which every ``flush()`` returns without a round trip. The probe runs the driver's
+public ``flush(timeout=...)``, whose only cancellation is its own inner ``wait_for``, so this value
+must **exceed** ``ping_interval x (max_outstanding_pings + 1)``: the loop time by which the
+driver's ping task has declared a silent connection stale and ended it, 120 s x (2 + 1) = 360 s
+at the driver's defaults (M1). A PONG can only arrive on the connection its PING left on, and that
+connection ends no later than 360 s into a stall, so by the time this inner bound could cancel the
+future there is no PONG left that could arrive for it. An injected client built with a longer
+``ping_interval`` falls outside the argument, and an injected client is never probed.
+"""
+
 CALL_SLACK = 1.0
 """Seconds the backstop adds to a bound the coroutine already enforces on itself (SPEC-061 FR-001).
 
@@ -303,6 +318,7 @@ class NATSSink:
         self._closed = False
         self._owns_client = client is None
         self._abandoned: set[asyncio.Task[Any]] = set()
+        self._probe: tuple[asyncio.Task[Any], float, int] | None = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._serve, name=_LOOP_THREAD_NAME, daemon=True)
         self._thread.start()
@@ -507,7 +523,8 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: In a forked child, or while the sink is closing or closed.
+          SinkDeliveryError: In a forked child, while the sink is closing or closed, or while
+            the outstanding probe is known to be unanswered (the latch, SPEC-061 FR-002).
         """
         if os.getpid() != self._pid:
             raise SinkDeliveryError(f"{prefix}: a forked child acquired no connection")
@@ -515,6 +532,11 @@ class NATSSink:
             raise SinkDeliveryError(f"{prefix}: the sink is closed")
         if self._closing:
             raise SinkDeliveryError(f"{prefix}: the sink is closing")
+        if self._latched():
+            raise SinkDeliveryError(
+                f"{prefix}: the server has not answered a PING sent more than "
+                f"{self.publish_timeout}s ago"
+            )
 
     def _refuse_under_the_lock(self, prefix: str) -> None:
         """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
@@ -537,7 +559,14 @@ class NATSSink:
             raise SinkDeliveryError(f"{prefix}: the sink is closing")
 
     async def _emit_on_loop(self, batch: list[dict[str, object]]) -> None:
-        """The coroutine behind :meth:`emit`, run on the loop thread.
+        """The coroutine behind :meth:`emit`, run on the loop thread (SPEC-061 FR-002).
+
+        For a client the sink connected itself, a publish is made only after the server answers a
+        round trip inside the emit's one ``publish_timeout`` deadline, in both core and JetStream
+        modes. The driver's flag stays in front of the round trip as the cheap refusal and is read
+        again once the round trip is answered, immediately before the first publish. No answer
+        means a refusal with nothing published and no counter moved (SPEC-032's rule: a failure
+        reported to the worker is not also counted).
 
         Args:
           batch: The events to publish.
@@ -546,14 +575,140 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: The client is disconnected, or none of the events landed.
+          SinkDeliveryError: The client is disconnected, the round trip went unanswered, or none
+            of the events landed.
         """
         deadline = time.monotonic() + self.publish_timeout
+        refusal = f"NATSSink published none of {len(batch)} event(s)"
         if not self._is_connected():
-            raise SinkDeliveryError(
-                f"NATSSink published none of {len(batch)} event(s): the client is disconnected"
-            )
+            raise SinkDeliveryError(f"{refusal}: the client is disconnected")
+        if self._probing():
+            if not await self._await_probe(deadline):
+                raise SinkDeliveryError(
+                    f"{refusal}: no PONG from the server within {self.publish_timeout}s"
+                )
+            if not self._is_connected():
+                raise SinkDeliveryError(f"{refusal}: the client is disconnected")
         await self._publish_all(batch, deadline)
+
+    def _probing(self) -> bool:
+        """Reports whether this client is one the sink asks the server about (SPEC-061 FR-002).
+
+        Only a client the sink connected itself, because the sink cannot drive a client bound to
+        another loop (M10), and only one that offers ``flush``: the sink does not invent a
+        refusal for a client that never claimed the capability, the reason :meth:`_is_connected`
+        gives for its own default.
+
+        Args:
+          None.
+
+        Returns:
+          True when the probe, the confirmation and the close's round trip apply.
+
+        Raises:
+          None.
+        """
+        return self._owns_client and getattr(self._client, "flush", None) is not None
+
+    def _reconnects(self) -> int:
+        """Reads the driver's reconnect counter, the public sign that its PONG queue was reset.
+
+        Args:
+          None.
+
+        Returns:
+          ``stats["reconnects"]``, or 0 when it cannot be read: an unreadable counter is a
+          constant, so it can never look like a reconnect.
+
+        Raises:
+          None.
+        """
+        try:
+            return int(self._client.stats["reconnects"])
+        except Exception:
+            return 0
+
+    def _latched(self) -> bool:
+        """Reports whether the outstanding probe is known to be unanswered (SPEC-061 FR-002).
+
+        Read by caller threads **before** they take the lock and without one, so a stall costs
+        one caller one ``publish_timeout`` and every later caller is refused at once instead of
+        queueing on the lock for its own ``publish_timeout`` — which on the orphan path is the
+        application's thread (invariant 4). It is a pure function of one reference load:
+        ``self._probe`` is replaced only by whole-tuple assignment on the loop thread, so a load
+        sees the old tuple or the new one and never a mix, and nothing here mutates. A stale load
+        can only refuse a caller whose probe was in fact still pending at the load; it can never
+        let one through, because a caller that passes still runs the full answer check on the
+        loop. The latch clears when the task finishes for any reason, when a reconnect moves the
+        counter, or when the next call discards and re-sends.
+
+        Args:
+          None.
+
+        Returns:
+          True while the outstanding probe has gone unanswered for at least ``publish_timeout``
+          and the driver has not reconnected since it was sent.
+
+        Raises:
+          None.
+        """
+        probe = self._probe
+        if probe is None:
+            return False
+        task, sent_at, reconnects = probe
+        return (
+            not task.done()
+            and time.monotonic() - sent_at >= self.publish_timeout
+            and self._reconnects() == reconnects
+        )
+
+    async def _await_probe(self, deadline: float) -> bool:
+        """Sends or reuses the one outstanding round trip and waits for it (SPEC-061 FR-002).
+
+        The probe is a task running the driver's public ``flush(timeout=PROBE_FLUSH_TIMEOUT)``,
+        and the sink waits on it with ``asyncio.wait`` and **never cancels it**, because a late
+        PONG landing on a cancelled future kills the driver's reader while the status stays
+        CONNECTED (M3). The rules, in the order the code applies them:
+
+        A probe that finished before this call began is not evidence about now: its outcome was
+        retrieved by its done callback, it is discarded, and a fresh PING is sent. A probe still
+        pending is discarded only when the driver has reset its PONG queue, which its reconnect
+        counter shows; the orphaned task is left to end on its own inner timeout, harmlessly,
+        since its future is no longer in the driver's queue. Otherwise the pending probe is
+        **reused**: this call waits on the same task, for at most the lesser of its own remaining
+        deadline and ``publish_timeout`` less the probe's age, and a second PING is never stacked
+        behind it, so at most one probe is outstanding.
+
+        A probe is answered only if all three hold: the task completed without raising, the
+        client reports itself connected when checked, and the reconnect counter still equals the
+        value recorded when the PING was sent. The second and third exist because the driver's
+        ``flush`` returns without a PONG when its reader or flusher task is done, which is the
+        case while it is reconnecting (M9).
+
+        Args:
+          deadline: The ``time.monotonic()`` instant this call's own budget ends.
+
+        Returns:
+          True when the server answered during this call's wait, else False.
+
+        Raises:
+          None.
+        """
+        probe = self._probe
+        if probe is not None and (probe[0].done() or probe[2] != self._reconnects()):
+            self._probe = probe = None
+        if probe is None:
+            task = self._loop.create_task(self._client.flush(timeout=PROBE_FLUSH_TIMEOUT))
+            task.add_done_callback(_retrieve)
+            probe = (task, time.monotonic(), self._reconnects())
+            self._probe = probe
+        task, sent_at, reconnects = probe
+        now = time.monotonic()
+        wait = min(deadline - now, self.publish_timeout - (now - sent_at))
+        await asyncio.wait({task}, timeout=max(0.0, wait))
+        if not task.done() or task.cancelled() or task.exception() is not None:
+            return False
+        return self._is_connected() and self._reconnects() == reconnects
 
     def _is_connected(self) -> bool:
         """Reports whether the client can currently put anything on the wire (FR-004 AC-5).

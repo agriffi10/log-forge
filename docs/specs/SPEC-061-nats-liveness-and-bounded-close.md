@@ -164,8 +164,21 @@ closed, calls `loop.call_soon_threadsafe(loop.stop)` and joins the thread under
 `emit` and `flush` then raise `SinkDeliveryError`; `close()` raises `TimeoutError`, the type its
 own deadline's expiry raises. A later `emit` or `flush` raises `SinkDeliveryError` naming the
 closed sink, and a later `close()` returns without touching anything. The backstop raise can follow
-a publish that already left; it is accepted because the path is unreachable while the coroutine
-honours its own deadline, and a duplicate is the safer error beside a hung application thread.
+a publish that already left; it is accepted because the path is reachable only through a driver
+call that ignores the deadline the coroutine gave it, and a duplicate is the safer error beside a
+hung application thread.
+
+**A core publish is bounded inside the coroutine, so a stalled peer cannot reach the backstop
+through it.** The driver's core `publish()` writes into its pending buffer and, once that buffer
+passes 2 MiB, force-flushes it under a flush timeout that defaults to `None`, so against a peer
+that has stopped reading the await never returns. `_publish_all` therefore runs each core publish
+as a task waited with `asyncio.wait` under what remains of the deadline and **never cancels it**:
+the driver swallows the cancellation and the bytes already in its buffer may yet land (M3, M6). A
+publish that outlives the deadline is abandoned with a reference kept until `close()`, counted as
+published, and the events after it as unattempted, exactly as budget expiry counts them; FR-003's
+confirmation then runs on what remains of the deadline, which is normally nothing, so the batch is
+counted. A JetStream publish is not wrapped: its ack wait is bounded by the driver's own timeout,
+and its send can only block once a single payload exceeds the driver's pending size.
 
 `close()` is FR-004's sequence; its tail stops the loop and joins the thread under
 `LOOP_JOIN_TIMEOUT`. Before stopping it cancels every task still pending on the loop and lets the
@@ -614,8 +627,13 @@ _thread: threading.Thread              # the loop thread, daemon
 _closing: bool                         # set by close() before it takes _lock; read around _lock
 _closed: bool                          # set under _lock by the first close(), or by the backstop
 _owns_client: bool                     # True when the sink connected the client itself
-_probe: tuple[asyncio.Task[None], int] | None   # (task, stats["reconnects"] when sent); loop thread
-_probe_sent_at: float | None           # monotonic; written by the loop thread, read without a lock
+_probe: tuple[asyncio.Task[None], float, int] | None   # (task, monotonic() when sent,
+                                       #  stats["reconnects"] when sent); written by the loop
+                                       #  thread as one tuple, read lock-free by callers: two
+                                       #  fields could tear (a new task with an old send time
+                                       #  would trip the latch on a probe just sent), one tuple
+                                       #  cannot
+_abandoned: set[asyncio.Task[None]]    # core publishes that outlived their deadline, kept until close
 _drain_timeout: float                  # the sink's own close deadline D
 ```
 
