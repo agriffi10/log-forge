@@ -38,7 +38,15 @@ measured at `71e42dd` with Python 3.13.
   `float` impostor, a route §12 did not name (the Enum branch's `isinstance(member, float)` and
   `type(member) in _PLAIN_SCALARS`). A genuine `float` or `int` subclass value also reaches the
   event as the subclass instance: harmless to `json`, which uses the base repr, but the event holds
-  a caller's type.
+  a caller's type. The same `isinstance` also routes by a claim to a branch that renders with the
+  caller's `repr`: a real `tuple` subclass whose `__class__` claims `UUID` or `Decimal` reaches
+  `str(value)`, so as a field value holding the frozenset DAG applied 40 times it hangs, and holding
+  an object whose `repr` is `SECRET` it is written `'(SECRET,)'`; a real `bytes` subclass claiming
+  `Decimal` and holding 64 MiB of zero bytes costs a 256 MiB peak. And `_key`'s
+  `isinstance(key, int) and not isinstance(key, bool)` lets an `int` subclass key whose `__class__`
+  returns `bool` skip SPEC-057's integer-key pricing: with `sys.set_int_max_str_digits(0)` and a
+  3,000,000-digit value, a plain key is `<int: ~3000001 digits>` in 0.0 s of CPU while the impostor
+  costs 0.58 s and is rendered whole.
 - **A caller's argument's truthiness can raise into the application.** `info("m", fields=X())`
   where `X` is a `Mapping` whose `__bool__` or `__len__` raises propagates `RuntimeError` to the
   caller, on the orphan path and inside a `@trace`d function, where the decorator then records
@@ -84,8 +92,9 @@ key and no public name is added.
   obeys the depth, key-count and cycle rules, and is written as the JSON text of its coerced form;
   a `bytes` or `bytearray` key priced before it is rendered (FR-001).
 - Every `_dispatch`, Enum and key route that returns the caller's object, or lets its method decide
-  a measurement, admitting it by exact type or an unbound conversion; `_type_name` reading the
-  stored type name as an exact `str` (FR-002).
+  a measurement, admitting it by exact type or an unbound conversion; a value of a builtin text,
+  bytes or container type routed by its real type, not by a claim; `_type_name` reading the stored
+  type name as an exact `str` (FR-002).
 - The `fields=` truthiness test inside `_merge`'s absorb and the `echo` test inside the echo guard
   (FR-003).
 - The `error` sub-document, the stack fallback and `_diag.absorbed` reading a type's stored name
@@ -129,6 +138,11 @@ Stated here rather than left to be found.
   sacrifices the entries after it in walk order, exactly as a huge value does (SPEC-057).
 - **A container key that is not a builtin subclass** — a custom hashable `Sequence` — keeps `str()`,
   which is the caller's code (*Out of Scope*).
+- **A `ReprEnum` with a container mixin hangs on the DAG.** A `(tuple, ReprEnum)` member holding the
+  frozenset DAG hangs on both delivery paths at `71e42dd`, as a value and as a key, through the Enum
+  fallback `str()`, which for a `ReprEnum` is the mixin's repr. It stays: the caller chose that
+  enum's `__str__` chain, and the `Enum` exclusion keeps it, like every other Enum key, out of the
+  container-key rule.
 - **The rebuilt merge changes key order.** On the marked slow path, entered only when the unpack
   raised, the merged mapping is in highest-source-first order (per-call fields, baggage, span
   defaults, config defaults) rather than the unpack's first-insertion order, and each source's keys
@@ -159,8 +173,8 @@ Stated here rather than left to be found.
 
 A mapping key whose **real** type — `type(key)`, never `__class__` — is a subclass of `tuple`,
 `list`, `dict`, `set` or `frozenset` (a namedtuple included) and not a subclass of `Enum` is coerced
-through the pass exactly as a
-value at the entry's value depth (`depth + 1`) would be. It therefore spends one node for itself and
+through the pass as a value of that real type at the entry's value depth (`depth + 1`) would be. It
+therefore spends one node for itself and
 one per member per path from the node budget; its members' text is charged to the byte budget as
 values' is; and `max_depth`, `max_keys`, the cycle check and the per-type rules all apply. Its text
 is `json.dumps(coerced, ensure_ascii=False)` with the default separators, clipped to
@@ -196,13 +210,27 @@ must see that exception, which `_Coercer.value`'s guard would turn into the valu
 the key that cannot be coerced is its `<unserializable: T>` placeholder inside the text, as it would
 be as a value.
 
+**A container key is routed by its real type, never through `_dispatch`.** `_dispatch` reaches
+`isinstance(value, UUID)` and `isinstance(value, Decimal)`, both of which call `str()`, before its
+sequence branch, so a key whose real type is a `tuple` or `frozenset` subclass with
+`__class__ = property(lambda s: UUID)` would go to the builtin repr. Measured on a prototype that
+routed it through `_dispatch`: that key holding the frozenset DAG applied 40 times hung until a 3 s
+alarm, and holding an object whose `repr` is `SECRET` it was written `'"(SECRET,)"'`. After its
+node check a container key therefore gets the depth check, then `mapping()` if its real type
+subclasses `dict` and `members()` otherwise.
+
 **A bytes-like key is priced before it is rendered.** A key whose real type is a subclass of
-`bytes` or `bytearray` is rendered by `str(key)`, whose repr is up to four characters per byte, so
-it costs its repr before the budget sees it (*Overview*). Its length is read
-through the unbound `bytes.__len__` or `bytearray.__len__`, a lower bound of its repr, which the
-caller's `__len__` cannot divert. When the pass's charge plus that length would cross the byte
-budget, the key becomes `<size limit>` unrendered and the pass halts, as for an integer key
-(SPEC-057 FR-002); otherwise it is rendered and charged as today.
+`bytes` or `bytearray` is rendered by `str(key)`, whose repr is up to four characters per byte
+(`\x00`) plus the `b` and two quotes, so it costs its repr before the budget sees it (*Overview*).
+Its length is read through the unbound `bytes.__len__` or `bytearray.__len__`, which the caller's
+`__len__` cannot divert, and the key is priced at the upper bound of its repr, `4 * len + 3`. When
+the pass's charge plus that bound would cross the byte budget, the key becomes `<size limit>`
+unrendered and the pass halts, as for an integer key (SPEC-057 FR-002); otherwise it is rendered
+and charged its actual rendered length, once. The upper bound, not the length, is what makes the
+render unable to exceed what is left of the budget: priced at the length alone, a 16 MiB `b"\x00"`
+key still rendered a 64 MiB repr before becoming `<size limit>` (measured, 64 MiB peak). The
+consequence is stated: a bytes key longer than about a quarter of the remaining budget becomes
+`<size limit>` unrendered, even a printable one whose repr would have fitted.
 
 **An `Enum` member is not a container key.** A key whose real type subclasses `Enum` keeps `str()`,
 like `Color(int, Enum)`: a `(tuple, Enum)` mixin member `TE.A` stays `"TE.A"`, as the value route
@@ -254,7 +282,9 @@ container key's old text and re-derives it the same way.
 - [ ] With `_MAX_NODES` patched and `{"a": {(1, 2): 0}}` (the inner dict is node 1, the key tuple 2,
       its members 3 and 4, the value 5): at 5 the result is `{"a": {"[1, 2]": 0}}` unmarked; at 4
       it is `{"a": {"[1, 2]": "<node limit>"}}`, marked; at 3 and at 1 it is
-      `{"a": {"<node limit>": "<node limit>"}}`, marked.
+      `{"a": {"<node limit>": "<node limit>"}}`, marked. With `_MAX_NODES=1`, `{"a": {(): 0}}` is
+      likewise `{"a": {"<node limit>": "<node limit>"}}`; without the container key's own node
+      check it would be `{"a": {"[]": "<node limit>"}}`.
 - [ ] With `_MAX_RENDERED_BYTES` patched to 10: `{("x" * 9,): "y"}` is written whole and unmarked
       (the 13-character key text is not charged again); `{("x" * 10,): "y"}` gives
       `{'["xxxxxxxxxx"]': "<size limit>"}`, marked; and `{("x" * 11,): None}` gives
@@ -264,17 +294,26 @@ container key's old text and re-derives it the same way.
 - [ ] A key object whose `__class__` property returns `tuple`, with `__str__` returning `"S"` and no
       usable `__iter__`, is written `"S"` (silence: passes at `71e42dd`). `b"ab"`, `None`, `True`, `Decimal`, a float and
       an `int` key render exactly as at `71e42dd` (silence).
-- [ ] With `_MAX_RENDERED_BYTES` patched to 100, a `bytes` subclass key of 101 zero bytes whose
-      `__str__` raises and whose `__len__` returns 0 gives `{"<size limit>": "<size limit>"}`,
-      marked: it was priced through the unbound length and never rendered (a rendered key is
-      `<unserializable key: T>` at `71e42dd`). It is `__str__` that raises, not `__repr__`, because
+- [ ] With `_MAX_RENDERED_BYTES` patched to 100, a `bytes` subclass key of 25 zero bytes (priced at
+      `4 * 25 + 3 = 103`) whose `__str__` raises and whose `__len__` returns 0 gives
+      `{"<size limit>": "<size limit>"}`, marked: it was priced through the unbound length and never
+      rendered (a rendered key is `<unserializable key: T>` at `71e42dd`). A plain `bytes` key of 24
+      zero bytes (priced at 99) is rendered and written whole, its repr charged at its actual 99
+      characters, unmarked; and `b"a" * 25`, whose repr would fit, is `<size limit>`, which pins the
+      stated consequence. It is `__str__` that raises, not `__repr__`, because
       `str()` of a `bytes` or `bytearray` subclass calls the C repr directly and never the
       subclass's `__repr__`; a raising `__repr__` row gives the same result with or without the
-      pricing and catches nothing. A plain `b"\x00" * (64 << 20)` key (allocated before tracing)
-      returns in under 2 s of `process_time()` with a `tracemalloc` peak under 8 MiB and the same
-      result; at `71e42dd` its peak is 256 MiB. A `bytearray` key is held to the same two results,
+      pricing and catches nothing. A plain `b"\x00" * (64 << 20)` key and a `b"\x00" * (16 << 20)`
+      key (allocated before tracing) return in under 2 s of `process_time()` with a `tracemalloc`
+      peak under 8 MiB and `<size limit>`; at `71e42dd` their peaks are 256 MiB and 64 MiB. A `bytearray` key is held to the same two results,
       as a `bytearray` subclass that defines `__hash__` (a plain `bytearray` is unhashable and
       cannot be a dict key) or as a key yielded by a caller `Mapping`.
+- [ ] A key whose real type is a `tuple` subclass and whose `__class__` property returns `UUID`
+      (and one returning `Decimal`), holding the frozenset DAG applied 40 times, returns on both
+      delivery paths in under 2 s of `process_time()` as a key whose text holds `<depth limit>`
+      (the default `max_depth` of 8 cuts the DAG), marked; it is alarm-guarded and, run against `71e42dd`'s `sanitize.py`, hangs until the alarm.
+      The same key holding an object whose `repr` is `"SECRET"` is written
+      `'["<unserializable: T>"]'`, with `"SECRET"` nowhere in the event.
 - [ ] `_coerce_unbounded` renders `{"fields": {(1, 2): 3}}` with the key `"[1, 2]"`, and a key of
       `("x" * 100_000,)` whole, unclipped.
 - [ ] `f = frozenset()`, then `f = frozenset({f, (f, i)})` applied 40 times, as the single key of a
@@ -298,8 +337,9 @@ container key's old text and re-derives it the same way.
 - [ ] The four sites named under *Tests that move* are re-derived and pass, and the search of
       `tests/` for any other pin on a container key's old text finds none left.
 - [ ] Planted out once each — the real-type test, the `Enum` exclusion, the key's node and byte
-      spend, the stop placeholder generalisation, the clip, the key-specific catch, and the
-      bytes-like pricing — a named test reddens,
+      spend, the stop placeholder generalisation, the clip, the key-specific catch, the bytes-like
+      pricing (and its `4 * len + 3` bound, planted down to `len`), and the routing of a container
+      key through `_dispatch` — a named test reddens,
       each built on a shape just over a budget or alarm-guarded; the PR body records each guard and
       the test that caught it.
 - [ ] Serves invariants 1, 6 and 8: the criteria that build an event run on both delivery paths,
@@ -330,14 +370,34 @@ is the node. The `str` claim is existing behaviour. A genuine
 `int` subclass *key* keeps its own `str()`, so `class Color(int, Enum)` as a key still reads
 `Color.RED`; a genuine `float` subclass key renders as its exact float.
 
-**Where `isinstance` stays, on purpose.** The routes that render through the object's own methods
-into library-produced text — `mapping()` and `members()` iteration, `isoformat()`, `str()` of a
-`UUID` or `Decimal`, the enum fallback `str()` — keep `isinstance`. What they write is the library's
-own text, always an exact `str`, `dict` or `list`, and transparent proxies (`wrapt.ObjectProxy`,
-Django's `SimpleLazyObject`) set `__class__` legitimately and render correctly through them today;
-switching those to `type()` would turn a proxied `dict` or `datetime` into a placeholder. A proxy of
-a scalar never worked: a proxied `int` is already a placeholder (SPEC-057's unbound reads), and a
-proxied `float` or `bool` reached the event as the proxy.
+**Real-type routing for builtin text, bytes and containers.** `isinstance` also chooses *which*
+branch renders a value, and a claim can send a real container or bytes object to a branch that
+calls `str()` on it. Measured at `71e42dd`: a real `tuple` subclass claiming `UUID` or `Decimal` as a
+field value hangs on the frozenset DAG applied 40 times and writes `'(SECRET,)'` for an object whose
+`repr` is `SECRET`; a real `bytes` subclass claiming `Decimal` and holding 64 MiB of zero bytes costs
+a 256 MiB peak. So in `_dispatch`, after the Enum branch and the int, float and bool handling and
+before the render-through block (`datetime`, `UUID`, `Decimal`), a value whose real type subclasses
+`str` goes to `text()`, one whose real type subclasses `bytes` or `bytearray` goes to the bytes
+route, one that subclasses `dict` goes to `mapping()`, and one that subclasses `tuple`, `list`,
+`set` or `frozenset` goes to `members()`. That is an `issubclass(type(value), ...)` test, which
+`__class__` cannot reach. `memoryview` cannot be subclassed and keeps its exact-type confirmation
+(SPEC-057 FR-003).
+
+**Where `isinstance` stays, on purpose.** Only for an object whose real type is none of those
+builtins: the routes that render through the object's own methods into library-produced text —
+`mapping()` and `members()` iteration over a caller `Mapping` or `Sequence`, `isoformat()`, `str()`
+of a `UUID` or `Decimal`, the enum fallback `str()` — keep `isinstance`. What they write is the
+library's own text, always an exact `str`, `dict` or `list`, and transparent proxies
+(`wrapt.ObjectProxy`, Django's `SimpleLazyObject`) set `__class__` legitimately and render correctly
+through them today; a proxy's real type is not a builtin, so the routing above leaves it alone, and
+switching those routes to `type()` would turn a proxied `dict` or `datetime` into a placeholder. A
+proxy of a scalar never worked: a proxied `int` is already a placeholder (SPEC-057's unbound reads),
+and a proxied `float` or `bool` reached the event as the proxy.
+
+**The key route.** `_key`'s test `isinstance(key, int) and not isinstance(key, bool)` is spoofable:
+an `int` subclass key whose `__class__` returns `bool` skipped `_bounded_int` and SPEC-057's
+integer-key pricing and fell to `str(key)`. It becomes `isinstance(key, int) and type(key) is not
+bool`, which is exact because `bool` cannot be subclassed.
 
 **The stored name.** `_type_name` reads the stored type name through
 `_STR_STR(type.__dict__["__name__"].__get__(type(value)))`, so a metaclass `__name__` property can
@@ -386,6 +446,22 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       `__format__` returning `"HIJACK"` gives `<unserializable: Stored>` (the stored text) for a
       value and `<unserializable key: Stored>` for a key, with every sibling in `fields` kept; at
       `71e42dd` the name is `?`.
+- [ ] A real `tuple` subclass whose `__class__` property returns `UUID` (and one returning
+      `Decimal`), as a field value holding the frozenset DAG applied 40 times, returns on both
+      delivery paths in under 2 s of `process_time()` as a list holding `<depth limit>` (the
+      default `max_depth` of 8 cuts the DAG), marked; it is alarm-guarded and hangs until the alarm
+      at `71e42dd`.
+- [ ] The same value holding an object whose `repr` is `"SECRET"` is the list
+      `["<unserializable: T>"]`, with `"SECRET"` nowhere in the event; at `71e42dd` it is the
+      string `'(SECRET,)'`.
+- [ ] A real `bytes` subclass whose `__class__` property returns `Decimal`, holding 64 MiB of zero
+      bytes (allocated before tracing), as a field value returns in under 2 s of `process_time()`
+      with a `tracemalloc` peak under 8 MiB and a value clipped to the ceiling, marked; at `71e42dd`
+      its peak is 256 MiB.
+- [ ] With `sys.set_int_max_str_digits(0)` (restored in a `finally`) an `int` subclass key of
+      3,000,000 digits whose `__class__` property returns `bool` is `<int: ~3000001 digits>`, as a
+      plain `int` key of the same value is, in under 2 s of `process_time()`, marked; at `71e42dd`
+      it costs 0.58 s and is rendered whole.
 - [ ] A proxy whose `__class__` is `dict` and which implements `items()` renders as the dict, and a
       proxy whose `__class__` is `datetime` renders through its `isoformat()`, exactly as at
       `71e42dd` (silence); a proxied `int` is still a placeholder.
@@ -400,9 +476,10 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       call to `type` or the local name `kind`, nor the name `_PLAIN_SCALARS`; it is run against a
       fixture holding the old shape and reddens.
 - [ ] Planted out once each — `kind is bool`, the int conversion, each of the three float
-      conversions (subclass branch, Enum branch, key branch), the stored-name read, and the
-      `_STR_STR` around it (dropping it reddens the `str`-subclass criterion) — a named test
-      reddens; the PR body records each.
+      conversions (subclass branch, Enum branch, key branch), the real-type routing of each of
+      `str`, `bytes`/`bytearray`, `dict` and `members()`, the key route's `type(key) is not bool`,
+      the stored-name read, and the `_STR_STR` around it (dropping it reddens the `str`-subclass
+      criterion) — a named test reddens; the PR body records each.
 - [ ] Serves invariants 1, 6 and 8: no input makes a call fail, the corpus rows run on both
       delivery paths, and the event is safe for a bare `json.dumps`.
 
@@ -429,14 +506,18 @@ names a type).
       `status` `ok`, and the span's events include the event with `{"a": 1}`; at `71e42dd` the
       function raises and the span records `status=error`.
 - [ ] `info("m", echo=Y())` with a raising `Y.__bool__` returns normally with no span open and inside
-      a `@trace`d function; the event is delivered once, nothing is written to the console stream
-      (read through `capsys`), and stderr names "echoing to the console". Each fails at `71e42dd`.
+      a `@trace`d function; the event is delivered once, nothing is written to the console stream,
+      and stderr names "echoing to the console". The echo is observed through a monkeypatched
+      `api._console = ConsoleWriter(stream=io.StringIO())`, as `tests/test_api.py` does, because
+      `api._console` binds `sys.stderr` at import (`console.py:60`) and `capsys` never sees an echo
+      line; the diagnostic is read from `capsys`. Each fails at `71e42dd`.
 - [ ] When the exception `X.__bool__` raises is of a class whose metaclass `__name__` property
       raises, the call still returns and stderr still names "merging the fields= argument", with the
       stored class name (the announcement's read is FR-004's `_diag` change).
 - [ ] `fields=[]`, `fields=None`, `fields={}` and `fields={"x": 1}` with `x=2`, and `echo=True`,
       `False`, `1` and `0`, behave exactly as at `71e42dd` (silence rows): the keyword wins a
-      collision, `echo=1` writes the console line and `echo=0` does not.
+      collision. Through the same `StringIO`, `echo=1` writes the console line and `echo=0` leaves it
+      empty.
 - [ ] Planted out once each — the `fields=` test back outside the `try`, and the `echo` test back
       outside the guard — a named test reddens.
 - [ ] Serves invariants 1 and 6: the call returns on a hostile argument, on both delivery paths.
@@ -451,8 +532,9 @@ metaclass, `_exception_stack`'s fallback reads `type(exc).__name__` unguarded, a
 and a counted loss goes unannounced. All three read the type's stored name through
 `_STR_STR(type.__dict__["__name__"].__get__(type(exc)))`, FR-002's read and for FR-002's reason: the
 unbound `str.__str__` returns an exact `str` where a `str` subclass name could raise or hijack the
-f-string. `_diag` is a leaf that imports nothing from the package, so it writes that expression
-itself; no other module's reading of a name changes. The `error` sub-document reads the stored
+f-string. `model.py` has no read of its own: it reuses `sanitize._type_name`. `_diag` is a leaf that
+imports nothing from the package, so it writes that expression itself; no other module's reading of
+a name changes. The `error` sub-document reads the stored
 `__module__` through `type.__dict__["__module__"].__get__(type(exc))`, taken as `str()` of it under a
 guard with `"?"` as the fallback (a class whose own `__module__` is an object whose `__str__` raises,
 or whose lookup fails). The stack's fallback placeholder `<unformattable traceback: T>` uses the
@@ -520,9 +602,10 @@ yielding both is dropped whole by `_merge`, announced and leaving the event.
 - [ ] An event with no colliding key is identical to `71e42dd`'s, truncation flag and key order
       included (silence).
 - [ ] Planted out once each — the stored-name read, the stored-module read, the stack fallback, the
-      `_STR_STR` in `model.py`'s read (the stack-fallback criterion reddens, not the `error.type`
-      one), the `_diag` read and its `_STR_STR`, and the rebuild's highest-first order (walking
-      lowest first reddens the `svc=3` criterion) — a named test reddens.
+      `_STR_STR` in `_type_name` (which `model.py` reuses, so the stack-fallback criterion reddens
+      through it, not the `error.type` one), the `_diag` read and its `_STR_STR`, and the rebuild's
+      highest-first order (walking lowest first reddens the `svc=3` criterion) — a named test
+      reddens.
 - [ ] Serves invariants 1, 2, 8 and 11: the user's exception is untouched, the events are delivered
       rather than lost, the loss is announced naming a type, and the event is built for a hostile
       class and key.
@@ -573,9 +656,9 @@ exact number and a `float` subclass key no longer uses its own `__str__`; a rais
 or silences its announcement; and a colliding key no longer costs its event, the lower-precedence
 key being the one dropped. `CHANGELOG.md`, `docs/spec-delivery/RELEASES.md` and the notes' title are
 not touched, and any sentence of the file that the change makes false is corrected. The build
-re-judges the file's headline sentence that a `>=1,<2` pin takes the release "without a code
+qualifies the file's headline sentence that a `>=1,<2` pin takes the release "without a code
 change": container keys now read as JSON, so a downstream query or alert on the old key text would
-notice, and the sentence is either qualified or followed by a note saying so. (At `0005dd4`, before
+notice, and the sentence says so. (At `0005dd4`, before
 this change was specified, no other sentence of the file was false, since it describes the OTLP
 sink, which maps an already assembled event.)
 
@@ -598,9 +681,10 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
       stating the old claim outside a hit struck through with a pointer to SPEC-063, and
       `_TypesOnly`'s docstring no longer says a `Config` validates its ceilings. The search is
       collapsed because "a key visits no value" wraps across two lines in `mapping()`'s docstring,
-      so a line-based search passes before any edit is made; it is piped over `git ls-files`
-      (`tr -s ' \n' '  ' < "$f" | grep -oE "..."`), never `for f in $VAR`, which zsh does not
-      word-split. `docs/spec-delivery/` is excluded: those are frozen
+      so a line-based search passes before any edit is made; it is written
+      `git ls-files src docs/architecture.md docs/specs | while read -r f; do tr -s ' \n' '  ' <
+      "$f" | grep -oE "..." | sed "s|^|$f: |"; done`, piped, never `for f in $VAR`, which zsh does
+      not word-split. `docs/spec-delivery/` is excluded: those are frozen
       records of what their specs shipped.
 - [ ] The decision file exists in `docs/decisions/event-assembly/` with its fence, entry and a dated
       History, names both rejected alternatives, and `sh scripts/gen-index.sh` leaves
@@ -612,7 +696,7 @@ the `value sanitizer` row of `docs/component-inventory.md`, the arc narrative in
       between `## New: OTLPSink (SPEC-056)` and `## What did not change`, listing each
       caller-visible change named above, and `git diff` shows `CHANGELOG.md` and
       `docs/spec-delivery/RELEASES.md` untouched. The headline sentence "without a code change"
-      is qualified, or a note follows it, to say that container-key text changed.
+      is qualified to say that container-key text changed; a note beside it does not satisfy this.
 - [ ] `sh scripts/docs-lint.sh`, `sh scripts/spec-lint.sh` and
       `poetry run python scripts/docstring-lint.py` pass.
 - [ ] Serves no invariant on its own: it records the promises the other four FRs keep, in the
@@ -629,12 +713,14 @@ _CONTAINER_KEYS = (tuple, list, dict, set, frozenset)
     # a container key: issubclass(type(key), _CONTAINER_KEYS) and not issubclass(type(key), Enum)
 
 _Coercer._key(key, depth) -> str         # gains the entry's value depth; mapping() passes depth + 1
-    container key  -> coerced = dispatch at depth + 1 (one node; the pass's guard is NOT applied,
-                      so a failure surfaces to key() and becomes <unserializable key: T>)
+    container key  -> node check; depth check; then mapping() if issubclass(type(key), dict)
+                      else members(), at depth + 1 -- never _dispatch, and the pass's guard is NOT
+                      applied, so a failure surfaces to key() and becomes <unserializable key: T>
                       text    = json.dumps(coerced, ensure_ascii=False)   # not charged again
                       return clip(text, max_value_bytes)                  # truncated when clipped
     bytes-like key -> n = bytes.__len__(key) / bytearray.__len__(key)       # unbound
-                      if self._charged + n > self._max_bytes: halt(_SIZE_LIMIT), return it unrendered
+                      if self._charged + 4 * n + 3 > self._max_bytes: halt(_SIZE_LIMIT), unrendered
+    int key        -> isinstance(key, int) and type(key) is not bool     # was: not isinstance(key, bool)
 _Coercer.mapping:  a stop after the key writes {self._stopped: self._stopped}   # was _SIZE_LIMIT
 
 _type_name(value) -> str                 # _STR_STR(type.__dict__["__name__"].__get__(type(value)))
