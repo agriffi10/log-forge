@@ -38,8 +38,9 @@ type could be widened freely.
 subclass that reads an empty body as success settles an unreadable one silently. That is what the base
 class does, since it ignores the body, and it is correct for OTLP's reading of an empty body as
 success, since the status there is the verdict. It is not a claim that every body-ignoring subclass
-is right to ignore the body: `HoneycombSink`'s `2xx` carries a per-event array it never reads, which
-`docs/architecture.md` §12 records as open. It is also why `ElasticsearchSink` reading an empty `2xx`
+is right to ignore the body: `HoneycombSink`'s `2xx` carries a per-event array, and it reads it
+and counts `b""` unadjudicated (*A Honeycomb batch response is a per-event verdict, read all of a
+chunk or none of it*). It is also why `ElasticsearchSink` reading an empty `2xx`
 as unadjudicated is the right reading for `_bulk`: `json.loads(b"")` raises, so an unreadable body
 takes *A 2xx _bulk response with no readable verdict is counted, never retried* with no branch of its
 own.
@@ -73,5 +74,7 @@ protocol error is now `HTTPSink`'s counted abandonment rather than one of its `t
 
 ### 2026-11-03
 
+- **Refined.** `HoneycombSink` now reads its per-event array and counts `b""`, closing the §12 item
+  this entry named as open.
 - **Settled.** A short, stalled or reset `2xx` body raised out of `emit` or was re-sent, and a
   garbage status line escaped raw; the status line now divides retry from settle.

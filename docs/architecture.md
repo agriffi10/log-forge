@@ -820,13 +820,6 @@ close it.
 
 ### Open
 
-- **`HoneycombSink` never reads its per-event verdict.** `/1/batch/<dataset>` answers `200`
-  with one status per event, and an event rejected inside it (`{"status": 400, ...}`) is counted
-  nowhere and announced nowhere, against invariant 2. The sink inherits `HTTPSink`'s default
-  `_handle_response`, which ignores the body. Found by the system-frame review of the 2xx
-  body-read fix. **Closed by** a `_handle_response` override that counts the rejected events,
-  decides what an empty or unreadable (`b""`) body means for this destination, and adds the class
-  to the body-reader roster in `tests/test_sinks_http_body_read.py`.
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it
@@ -1006,6 +999,17 @@ close it.
 
 ### Resolved
 
+- ~~**`HoneycombSink` never reads its per-event verdict**~~ (found by the system-frame review of
+  #283; invariant 2) → **closed by the fix that overrides `HoneycombSink._handle_response`**.
+  `/1/batch/<dataset>` answers `200` with one `{"status": ...}` per event, and the sink inherited
+  the default hook, which ignores the body, so an event rejected inside the `200` was counted
+  nowhere. The array is now read positionally and all of the chunk or none of it: a status outside
+  `2xx` is counted on `rejected_events`, and a body that is empty, unreadable (`b""`), not an array
+  of objects, the wrong length or holding a non-integer status is counted whole on
+  `dropped_unadjudicated` — both feed `losses().failed`, and neither is re-sent. A chunk whose every
+  event was rejected is undelivered, so it raises (invariant 7). The reading and its rejected
+  alternatives: *A Honeycomb batch response is a per-event verdict, read all of a chunk or none of
+  it*.
 - ~~**`health().inherited_sink` reads the owed record's last entry**~~ (SPEC-045; invariant 12) →
   **closed by SPEC-054 FR-005**. Arming order does not make a sink the installed one: `_swap_sink`
   seeds the record with the new sink and a preempted emit then appends the superseded one, so the

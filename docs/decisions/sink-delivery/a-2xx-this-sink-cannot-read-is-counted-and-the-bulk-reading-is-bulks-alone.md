@@ -1,11 +1,11 @@
 ---
 type: Decision
-title: "A 2xx this sink cannot read is counted, and the `_bulk` reading is `_bulk`'s alone"
-description: "an OTLP `2xx` with a `partialSuccess` that is not an object, a count that is not a usable integer, or a body over the response bound counts the chunk on `dropped_unadjudicated` (an upper bound, into `failed`) and settles it; a body that is empty, not JSON or not an object is full success, because OTLP needs no `partialSuccess` to succeed. `_bulk`'s counted reading of an unreadable 2xx is `_bulk`'s, not the family's. (SPEC-056)"
+title: "A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited"
+description: "an OTLP `2xx` with a `partialSuccess` that is not an object, a count that is not a usable integer, or a body over the response bound counts the chunk on `dropped_unadjudicated` (an upper bound, into `failed`) and settles it; a body that is empty, not JSON or not an object is full success, because OTLP needs no `partialSuccess` to succeed. `_bulk`'s counted reading of an unreadable 2xx is not the family's: a sink takes it only on its own argument, as `HoneycombSink` does. (SPEC-056)"
 ---
 
-**A 2xx this sink cannot read is counted, and the `_bulk` reading is `_bulk`'s alone** — an OTLP
-`2xx` whose verdict is present but unreadable — a `partialSuccess` that is `5`, `[]` or `"x"`, a
+**A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited** —
+an OTLP `2xx` whose verdict is present but unreadable — a `partialSuccess` that is `5`, `[]` or `"x"`, a
 count that is negative, a `bool`, a float, a list, non-ASCII digits, over-long or beyond int64, or a
 body longer than the 4 MiB response bound — is counted on `dropped_unadjudicated`, the chunk's size
 as the upper bound, with one `lost N log record(s)` line naming the class and never the body, and is
@@ -17,16 +17,19 @@ empty, not JSON, not an object or without a `partialSuccess` is full success her
 response with no readable verdict is counted, never retried*, #276). The two readings differ because
 the protocols do: a `_bulk` verdict can only come from the body, so no body is no verdict, while an
 OTLP success needs no `partialSuccess` at all and a proxy's page or a protobuf body is not this
-sink's to adjudicate. **`_bulk`'s counted reading is `_bulk`'s, not the family's**: `HTTPSink`'s
-default `_handle_response` still reads any `2xx` as delivered, and a new subclass copies neither
-reading without arguing for it. **A body that cannot be read at all is `b""`, and `b""` is full
+sink's to adjudicate. **`_bulk`'s counted reading is not the family's**: `HTTPSink`'s default
+`_handle_response` still reads any `2xx` as delivered, and a new subclass copies neither reading
+without arguing for it — `HoneycombSink` takes the counted one on its own argument, that its
+per-event verdict too is only in the body (*A Honeycomb batch response is a per-event verdict, read
+all of a chunk or none of it*). **A body that cannot be read at all is `b""`, and `b""` is full
 success here.** *After a status line the status decides; a 2xx whose body cannot be read is never
 re-sent* (#283) reads the body under a guard once the status is in hand and hands
 `_handle_response` `b""` for a read that failed, so an override cannot tell an empty body from an
 unreadable one and must read both the same way. OTLP's reading is the one that decision names as
 correct for it: a `2xx` is the verdict, an empty body is a success with nothing to say, so a body
 cut short, stalled or reset after the status line settles its chunk as delivered, uncounted — where
-the `_bulk` sinks count the same `b""` unadjudicated, because their only verdict is in the body. The
+the `_bulk` sinks and `HoneycombSink` count the same `b""` unadjudicated, because their only verdict
+is in the body. The
 bounded read keeps that rule rather than escaping it: CPython's `read(amt)` returns a short
 `Content-Length` body silently with `response.length` still above zero, where the bare `read()`
 raises `IncompleteRead`, so `HTTPSink._attempt` checks `response.length` after a bounded read and
@@ -47,6 +50,8 @@ a body declared at 10 MiB that is cut after 5 MiB is over the bound and counted,
 
 ### 2026-11-03
 
+- **Refined.** `HoneycombSink` now counts `b""` too, so "`_bulk`'s alone" in the title became
+  "argued, never inherited": the counted reading is still no subclass's default.
 - **Settled.** Shipped with `OTLPSink`; the `_bulk` contrast was drawn after #276 landed, and the
   unreadable-body paragraph was rewritten onto #283's guard when the branch was rebased over it —
   before #283, a Content-Length-truncated `2xx` reached this sink as short bytes.
