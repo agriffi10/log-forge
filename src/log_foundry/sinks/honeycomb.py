@@ -150,7 +150,7 @@ class HoneycombSink(HTTPSink):
         entries = usable_results(data)
         statuses = [status for status in map(_status, entries) if status is not None]
         if len(statuses) != sent or len(entries) != sent:
-            self._abandon_unadjudicated(sent, readable=len(entries))
+            self._abandon_unadjudicated(sent, readable=len(statuses))
             return True
         rejected = sum(1 for status in statuses if not 200 <= status < 300)
         if rejected:
@@ -191,7 +191,8 @@ class HoneycombSink(HTTPSink):
 
         Args:
           sent: How many events were in the request.
-          readable: How many objects the response's array carried.
+          readable: How many entries carried a status this sink could read — none when any
+            element of the array is not an object, since such an array is not read at all.
 
         Returns:
           None.
@@ -205,7 +206,7 @@ class HoneycombSink(HTTPSink):
             "event",
             sent,
             f"{type(self).__name__} could not adjudicate a batch response "
-            f"({sent} event(s) sent, {readable} readable entr(ies)); "
+            f"({sent} event(s) sent, {readable} readable status(es)); "
             f"they may have landed; not retried",
         )
 

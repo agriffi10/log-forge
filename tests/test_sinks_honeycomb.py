@@ -145,6 +145,9 @@ _NO_VERDICT = {
     "a scalar": b"202",
     "shorter than the chunk": b'[{"status": 202}, {"status": 202}]',
     "longer than the chunk": b'[{"status": 202}, {"status": 202}, {"status": 202}, {"status": 400}]',
+    "longer than the chunk by one entry with no status": (
+        b'[{"status": 400}, {"error": "x"}, {"status": 202}, {"status": 202}]'
+    ),
     "an entry that is not an object": b'[{"status": 202}, 202, {"status": 202}]',
     "an entry with no status": b'[{"status": 202}, {"error": "x"}, {"status": 400}]',
     "a string status": b'[{"status": 202}, {"status": "400"}, {"status": 400}]',
