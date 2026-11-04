@@ -244,9 +244,10 @@ class HoneycombSink(HTTPSink):
             when the message names the ``http.client`` error's type (:func:`_carried_in_a_path`).
             Each message names ``dataset`` rather than the ``url`` this class builds from both,
             whose own check names ``url`` (SPEC-049 FR-001), and quotes the dataset unless it
-            holds an ``@``, ``/``, ``?`` or ``#``; or if ``url`` carries a user or password, or a query or fragment, which the
-            appended path would land inside (:func:`_valid_base_url`), or an ``@`` anywhere
-            else, refused naming ``url`` once the path is appended.
+            holds an ``@``, ``/``, ``?`` or ``#``; or if ``url`` carries a user or password, or a
+            query or fragment, which the appended path would land inside
+            (:func:`_valid_base_url`), or an ``@`` anywhere else, refused naming ``url`` once the
+            path is appended.
         """
         _one_segment(dataset, type(self).__name__)
         _carried_in_a_path(dataset, type(self).__name__)
