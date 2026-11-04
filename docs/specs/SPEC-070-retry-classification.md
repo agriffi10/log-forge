@@ -386,9 +386,9 @@ one reply disagree about which records landed, and a resend of the coded ones co
 records the count says were taken — the reasoning *A positional response adjudicates all of a chunk
 or none of it* records for a length mismatch.
 
-The SNS sender fault becomes a fourth case beside the three that
+The SNS sender fault becomes a further case beside those that
 `docs/decisions/sink-delivery/a-sink-that-delivered-nothing-raises-one-that-delivered-something-reports.md`
-records as staying silent ("an SQS sender fault"); the build refines that entry in place with a
+records as staying silent ("an SQS sender fault"), a list SPEC-061 and SPEC-069 also extend; the build refines that entry in place with a
 dated History entry, and invariant 2's list of losses counted but never retried and invariant 7's
 list of batches that return having delivered nothing each name the SNS sender fault beside the SQS
 one.
@@ -428,7 +428,7 @@ one.
       is unadjudicated.
 - [ ] Invariant 2's list of losses counted but never retried and invariant 7's list of batches that
       return having delivered nothing each name the SNS sender fault; the decision *A sink that
-      delivered nothing raises; one that delivered something reports* names it as a fourth case,
+      delivered nothing raises; one that delivered something reports* names it as a further case,
       with a dated History entry; `docs/architecture.md`'s struck list and the README's two
       sender-fault paragraphs name `SNSSink` beside `SQSSink`.
 - [ ] Serves invariants 2, 6 and 7: a sender fault is counted once and never retried, and a
@@ -673,7 +673,7 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   tests. Add `failed_count` to `adjudicate_positional`, drop both sinks' falsy-count short-circuit,
   and add the three contradictory-count cases, run first against `fda134a` to watch them redden
   (all three counted nothing there). Refine *A sink that delivered nothing raises; one that
-  delivered something reports* with a dated History entry. Update `README.md` (the sender-fault paragraphs and the three-excepted-cases paragraph),
+  delivered something reports* with a dated History entry. Update `README.md` (the sender-fault paragraphs and the excepted-cases paragraph),
   invariants 2 and 7 (an SNS sender fault joins the SQS one in both lists) and `architecture.md`'s
   struck list.
 
@@ -712,3 +712,4 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
 - The PostgreSQL example changed from a NUL in `fields` (`UntranslatableCharacter`) to a caller's
   `VARCHAR(5)` column (`StringDataRightTruncation`), measured at `fda134a`, because SPEC-069 repairs
   every U+0000 before encoding, so the NUL never reaches the server once it lands.
+- Cross-arc review: the SNS sender fault is "a further case" in the silent-cases list, with no ordinal, since SPEC-061 and SPEC-069 extend the same list.

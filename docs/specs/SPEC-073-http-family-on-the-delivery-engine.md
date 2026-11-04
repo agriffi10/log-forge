@@ -383,8 +383,9 @@ deliberate, and each is a line in the release notes:
 3. **A `_body` that raises** moves from the catcher's failed term to `dropped` (`_unrenderable`). In
    1.x the exception escaped `emit` and the worker resent the batch, chunks that had landed included.
    Now the chunk is dropped, the rest are sent, and a batch whose every `_body` raises settles with
-   `flush()` truthy and `failed_batches` at 0. That is invariant 7's recorded exception for an
-   all-unrenderable batch, which FR-005 extends to name it.
+   `flush()` truthy and `failed_batches` at 0. That is invariant 7's recorded exception for a batch
+   of nothing but events the sink cannot encode, as SPEC-069 words it, which FR-005 extends to name
+   it.
 4. **A `2xx` reader that raises** moves from the catcher's failed term to `dropped_unadjudicated`
    (into `failed`). The events may have landed, so the run never fails on them and they are never
    resent.
@@ -734,8 +735,9 @@ The rewrites and markers:
 - `docs/invariants.md`:
   - Entry 7's "only a `2xx` rejecting every record of every chunk raises there" gains "or, through
     `deliver`, fails the run".
-  - Entry 7's recorded exceptions gain a batch whose every `_body` raises, beside the
-    all-unrenderable HTTP batch.
+  - Entry 7's recorded exceptions gain a batch whose every `_body` raises, beside SPEC-069's "a
+    batch of nothing but events the sink cannot encode", which replaced the all-unrenderable HTTP
+    batch.
   - Entry 2's list of deferring sites names the run context for `HTTPSink`.
 - The README's HTTP-family retry paragraph, the docstrings of `HTTPSink`, `_send` and the three
   readers, and `docs/component-inventory.md`'s `http` row describe the round.
@@ -790,7 +792,7 @@ def run_context() -> RunContext: ...   # the innermost run on the calling contex
 
 # used from SPEC-072, not added here: run_delivery(..., worker_retries=w | None); the budget table
 # of FR-001; emit_via_deliver(sink, batch, *, deliver=None); _run(sink, deliver, counters, batch,
-# *, retries, stop, decline); the static lookup that offers only a plain function.
+# *, sink_retries, worker_retries, stop, decline); the static lookup that offers only a plain function.
 
 
 # src/log_foundry/sinks/http.py
@@ -920,3 +922,6 @@ tests/
   - Eligibility is restored for an eligible subclass of an ineligible one.
   - The `_send` override bypass and the request-building hooks are named, and the halving and
     `_chunk_budget` citations are corrected.
+- Cross-arc review: the invariant 7 edit and FR-002's item 3 point at SPEC-069's wording of the
+  recorded exception, and the Data Model names `_run`'s `sink_retries, worker_retries` as SPEC-072
+  does.

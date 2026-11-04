@@ -36,8 +36,9 @@ and `emit` otherwise, and `emit` itself gains an inline adapter, so a third-part
 This is the central spec of the `stability-redesign` arc (release 1.2.0, additive: no count is
 reclassified, no `emit` contract changes). It builds on SPEC-066 (every sink's `max_retries` is an
 exact, floored `int`, so the engine reads it as one) and SPEC-068 (the worker's shutdown-expiry
-accounting that `Worker._in_flight` rides), both of which land first in 1.1.0 and are not in
-`depends_on` because they are not yet in this directory. It consumes SPEC-070's private
+accounting), both of which land first in 1.1.0 and are not in `depends_on` because they are not yet
+in this directory. `Worker._in_flight`, which FR-005 sets around a run, is SPEC-062's, already in
+`depends_on`. It consumes SPEC-070's private
 exception predicate, `_retryable_error(self, err: Exception) -> bool`. The seam is inert until
 SPEC-073: at this spec's build **no shipped sink defines `deliver`**, so every shipped sink runs
 exactly the paths it runs today and the engine is proven against test sinks.
@@ -411,15 +412,19 @@ in `MultiSink`'s absorbed count when an engine child's adapter raised under it),
 A batch of only `DROPPED` events settles, the recorded exception to invariant 7 (nothing in it is
 helped by a retry), and a partial outcome settles and leaves `flush()` true.
 
-**The losses a sink counts but never retries are re-derived here**, one per invariant 2's list:
+**The losses a sink counts but never retries are re-derived here**, one per invariant 2's list as
+SPEC-058, SPEC-061 (1.1.0), SPEC-069 and SPEC-070 leave it:
 
 | Loss invariant 2 lists | Outcome the sink returns |
 |---|---|
 | an unadjudicable batch response | `UNKNOWN` |
 | an SQS sender fault | `REJECTED` |
+| an SNS sender fault (SPEC-070) | `REJECTED` |
 | an oversized event | `DROPPED` |
-| a wrapper's or an SQS id callable's per-event failure beside delivered siblings | `DROPPED` |
-| an unrenderable HTTP event | `DROPPED` |
+| an SQS id callable's per-event failure beside delivered siblings | `DROPPED` |
+| a wrapper's per-event failure beside delivered siblings | `SKIPPED`, counted in the wrapper's own `_dropped` (SPEC-075) |
+| an event a sink cannot encode, which SPEC-069 widens from an unrenderable HTTP event | `DROPPED` |
+| a NATS core batch whose confirmation went unanswered (SPEC-061) | `UNKNOWN` |
 
 **The engine announces** a settled run's loss in one `_diag.lost` line naming counts by term and the
 number of rounds, never a value (invariant 11). A failed run's loss is announced by its catcher: the
@@ -499,9 +504,10 @@ unadjudicable `2xx`: the events are counted `failed_events`, the run never fails
 **Either is resent only by a sink that declares itself idempotent**, that is, a
 `log_foundry_idempotent` read with `inspect.getattr_static` that `is True` (a truthy non-`bool` is
 not a declaration). For an escaped exception the engine also asks SPEC-070's
-`sink._retryable_error(exc)`, read the same way, and resends only when it returns `True`, so a
-`TypeError` is never resent even by an idempotent sink; a sink without the predicate, every
-third-party sink among them, resends no exception, and a predicate that raises answers `False`. For
+`sink._retryable_error`, read the same way, through `is_retryable(predicate, exc)`, never by a
+direct call, and resends only when it answers `True`, so a `TypeError` is never resent even by an
+idempotent sink; a sink without the predicate, every third-party sink among them, resends no
+exception, and a predicate that raises answers `False` through `is_retryable`. For
 an `UNKNOWN` outcome or a malformed verdict there is no exception to ask, and idempotence alone
 decides. A resend is a further round: it is bounded by the retry budget and waits as FR-002 says.
 
@@ -882,3 +888,7 @@ tests/
 - The wait keeps the 1.x schedule (orchestrator, following Andrew's decision): `w + 1` cycles of
   `s + 1` attempts, the sinks' backoff restarting each cycle and the worker's `cycle_backoff` between
   cycles, and the abandoned line keeps 1.x's text with the cycle count.
+- Cross-arc review: FR-003's never-retried table is re-derived from invariant 2's list as SPEC-061,
+  SPEC-069 and SPEC-070 leave it (the SNS sender fault, the unencodable event and NATS's unconfirmed
+  batch added, a wrapper's failure shown as SPEC-075's `SKIPPED`); FR-004 consults `_retryable_error`
+  through `is_retryable`; `Worker._in_flight` is attributed to SPEC-062, not SPEC-068.

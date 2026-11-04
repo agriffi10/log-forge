@@ -57,7 +57,10 @@ often as before.
 - Only the events that failed are resent: under 1.x a raising batch was resent whole, chunks that
   had landed included.
 - An exception the sink does not declare retryable (SPEC-070) costs one attempt in total, where the
-  worker used to resend it. This includes a `NATSSink` batch whose every publish raised.
+  worker used to resend it. This includes a `NATSSink` batch whose every publish raised, and an SQS
+  FIFO batch whose every id callable raised: the caller's own exception is still re-raised from
+  `emit` by identity and still counted by no sink counter, but the worker no longer re-runs the
+  callables (FR-002).
 - A `Failed` item, `writeErrors` entry or positional result the sink cannot read is counted in
   `.failed` and never resent, where it used to escape `emit` raw (SQS, SNS) or be counted by length
   alone (MongoDB).
@@ -123,7 +126,7 @@ often as before.
 - What holds the population to the rule: the derived roster of engine sinks, the deletions, the
   counters, the idempotency declarations, Kafka and Pub/Sub unchanged, and every roster whose
   population this spec moves (FR-006).
-- Prose and records: each converted sink's docstrings, `docs/invariants.md` entries 2, 3 and 7,
+- Prose and records: each converted sink's docstrings, `docs/invariants.md` entries 2 and 3,
   `docs/architecture.md` §8, the README's sink table and partial-delivery text,
   `docs/component-inventory.md`, and the decision files under *Recorded text the build changes*.
 - A deliberate narrowing of the plan's "every shipped sink's `emit` runs the engine": `StdoutSink`,
@@ -242,7 +245,12 @@ the run:
 The shipped refusals are a closed or closing sink (`REJECTED`, the 1.x closed `SinkDeliveryError`),
 `NATSSink`'s forked child (`REJECTED`) and its disconnected client, latch and unanswered probe
 (`RETRYABLE`, SPEC-061's `SinkDeliveryError`), and `SQSSink`'s batch whose every FIFO id callable
-raised (`RETRYABLE`, the caller's own first exception).
+raised (`REJECTED`, the caller's own first exception). That last is the arc's one rule for caller code
+that failed on every event of a batch, which SPEC-075's wrappers follow too: the events are
+`REJECTED` with `refuse(first_exc)`, so the batch costs one attempt and is never retried (an
+exception from the caller's code is not one the sink's predicate calls transient, SPEC-070), no sink
+counter moves, the catcher's `failed_batches` or `orphan_lost` counts it as any failed run, and the
+`emit` path re-raises the caller's own first exception by identity.
 
 #### Acceptance Criteria:
 
@@ -296,15 +304,16 @@ calls it with `key="index"` (FR-003).
    an unencodable event is `DROPPED` with SPEC-069's line, an oversized one is `DROPPED` with
    `dropped_oversized` counted `SETTLED` and its 1.x line, and an SQS event whose FIFO id callable
    raised is `DROPPED` with its line beside deliverable siblings. When every SQS event's id callable
-   raised, the round is a refusal (FR-001): all `RETRYABLE`, with the caller's first exception, so the
-   engine retries the caller's code within the budget and the adapter re-raises that exception
-   unchanged if it never passes.
+   raised, the round is a refusal (FR-001): all `REJECTED`, with `refuse` given the caller's first
+   exception, so the batch costs one attempt, no sink counter moves, and the adapter re-raises that
+   exception by identity.
 2. Chunk with the sink's existing chunker (`chunk_items`, kept from SPEC-071) and send **every
    remaining chunk once per round**, in order, through `_send`, now one attempt with no loop, which
    keeps SPEC-048's guard inside it. A chunk's failure does not hold back the chunks after it, so
    one entry that keeps failing costs only itself, as in 1.x.
-3. A call that raises runs the sink's cleanup and asks `_retryable_error` (SPEC-070): `True` makes the
-   chunk `RETRYABLE`; `False` makes it `REJECTED` with an `ALWAYS` line naming the type and `not
+3. A call that raises runs the sink's cleanup and asks `is_retryable(self._retryable_error, err)`
+   (SPEC-070), never the predicate directly, so a predicate that raises answers `False`: `True` makes
+   the chunk `RETRYABLE`; `False` makes it `REJECTED` with an `ALWAYS` line naming the type and `not
    retried`.
 4. A response is adjudicated per entry. SQS and SNS: the keyed reader, then SPEC-070's
    `sender_fault`: a sender fault is `REJECTED`, marked a final rejection, with the 1.x line naming
@@ -362,10 +371,10 @@ unadjudicated; SNS (with SPEC-070) as SQS.
 - [ ] Oversized and unencodable events are counted once, on a settled run only, `.dropped_oversized`
       and `losses().dropped` both moving for an oversized one and only `losses().dropped` for an
       unencodable one; a failed run moves neither.
-- [ ] SQS FIFO with every id callable raising `KeyError`: no client call, `losses()` unchanged, the
-      callables called `max_retries + 1` times through `emit`, which re-raises that `KeyError` by
-      identity; through a `Worker`, `failed_batches == 1`; a callable that succeeds on the second
-      round delivers the batch once with nothing counted.
+- [ ] SQS FIFO with every id callable raising `KeyError`, `max_retries=3`: no client call,
+      `losses()` and `.failed` unchanged, and the callables called once per event through `emit`,
+      which re-raises that `KeyError` by identity; through `Worker(max_retries=2)`, one `deliver`
+      call and `failed_batches == 1`; as an orphan `info()`, one call and `orphan_lost == 1`.
 - [ ] Worker and orphan paths: a one-event sender fault records `orphan_lost == 0` and `.failed == 1`
       on both; a one-event batch the client refuses retryably every time records `orphan_lost == 1`
       (orphan) and `failed_batches == 1` (worker) with the same `.failed`.
@@ -416,7 +425,7 @@ the close alone.
 - [ ] MongoDB: an `AutoReconnect` on round one and success on round two sends the same document
       objects, carrying the same `_id` values, in both calls.
 - [ ] PostgreSQL: a retryable `OperationalError` on every attempt calls `_rollback()` once per round,
-      commits nothing, and counts the batch once; SPEC-070's `UntranslatableCharacter` case is one
+      commits nothing, and counts the batch once; SPEC-070's `StringDataRightTruncation` case is one
       attempt; a borrowed broken connection's line keeps its 1.x suffix.
 - [ ] ClickHouse and PostgreSQL: `close()` issued from another thread during a backoff returns before
       the next round would start, and that round makes no client call.
@@ -566,8 +575,10 @@ passing on its derived check (its docstring's mention of `send_all` is updated).
 
 #### Description:
 
-**The engine sinks**, derived from the tree: every class under `src/log_foundry/sinks/` other than
-`HTTPSink`'s family and SPEC-075's wrappers that defines `deliver`. At this spec's build they are
+**The engine sinks**, derived from the tree: every class under `src/log_foundry/sinks/` that defines
+`deliver`, other than a named exclusion. The exclusions are named in the roster, each with its
+reason: `HTTPSink`'s family (SPEC-073); SPEC-075 adds `FilteringSink`, `TransformSink` and
+`LogstashSink`, and the loop roster below excludes the same three. At this spec's build they are
 `SQSSink`, `SNSSink`, `KinesisSink`, `FirehoseSink`, `ClickHouseSink`, `MongoDBSink`, `PostgresSink`,
 `_RedisSink`, `RabbitMQSink`, `AzureEventHubsSink`, `NATSSink`, `SocketTransport` and `SyslogSink`:
 thirteen. Each holds `log_foundry_counters` as an instance attribute holding a `SinkCounters`,
@@ -613,15 +624,22 @@ defines `deliver` nor `log_foundry_counters`, and each keeps `rejected` and `los
 
 **Rosters whose population moves**, each re-derived rather than lowered:
 
-- `tests/test_sink_retry.py`'s `_modules_with_a_retry_loop` (pinned to twelve names by SPEC-071) finds
+- `tests/test_sink_retry.py`'s `_modules_with_a_retry_loop` (pinned by SPEC-073 to the base set less
+  `http`, eleven names) finds
   none after SPEC-073 and this spec. Its pin and its two tests are replaced by a derived check over
   `sinks/*.py` that no module but `_engine.py` and `_retry.py` calls `wait` or assigns a backoff
   constant, with a fixture corpus that plants each, and the stop-signal test is restated over the
   engine sinks. The tests that set `redis_mod._BACKOFF_BASE` and `sqs_mod._BACKOFF_BASE` patch the
   engine's.
-- SPEC-070's loop roster (floor twelve) is restated over the engine sinks: each class that defines
-  `deliver` and is not `NATSSink` or `SyslogSink` defines `_retryable_error` and calls it in its round's
-  exception handler; floor eleven.
+- SPEC-070's loop roster (floor 11 as SPEC-073 leaves it) is restated over the engine sinks: each
+  class under `sinks/` that defines `deliver`, other than a named exclusion, defines
+  `_retryable_error` and calls it in its round's exception handler as
+  `is_retryable(self._retryable_error, <the caught exception>)`; a direct `self._retryable_error(err)`
+  fails it, as in SPEC-070 FR-001. The exclusions are named in the roster, each with its reason:
+  `HTTPSink` (its classification is SPEC-073's, held by that spec's engine-only check), `NATSSink`
+  (no predicate) and `SyslogSink` (forwards to its transport); SPEC-075 adds `FilteringSink`,
+  `TransformSink` and `LogstashSink` to the same list. The population is the eleven engine sinks other
+  than `NATSSink` and `SyslogSink`; floor 11.
 - `tests/test_sink_concurrency.py`'s `_takes_the_transport_lock` and its three callers (the lock
   roster, the locked-sink close test, and the decision-doc check) read `emit` and `send_all` only; once
   the I/O moves into `deliver` an `emit` that only calls the adapter enters no lock, and the roster
@@ -652,6 +670,9 @@ defines `deliver` nor `log_foundry_counters`, and each keeps `rejected` and `los
       one adapter call, defines `emit` below the class defining `deliver`, or writes
       `dropped_oversized` outside the run context; its floor is 13, and a fixture tree of 12 fails on
       the floor.
+- [ ] SPEC-070's restated loop roster finds exactly the eleven classes, floor 11, and fails, naming
+      the class, on a fixture whose round's handler calls `self._retryable_error(err)` directly
+      rather than through `is_retryable`; removing one named exclusion reddens it naming that class.
 - [ ] `grep -rln '^_BACKOFF_BASE\|for attempt in range\|def send_all' src/log_foundry/sinks` finds
       nothing, and `BACKOFF_BASE` is assigned once in `src/log_foundry`, in `_engine.py`.
 - [ ] Over the thirteen, `losses()` reads `log_foundry_counters`, and `.failed`, `.dropped_oversized`
@@ -757,12 +778,20 @@ other site still stating the old claim:
   extended to a keyed response, with `dropped_unadjudicated` counted through the run context.
 - `docs/decisions/sink-delivery/a-client-exception-costs-its-chunk-and-is-provable-non-delivery-for-it.md`:
   its fence's "feeds SQS's recoverable term" now reads as a `RETRYABLE` chunk.
-- `docs/decisions/sink-delivery/a-sink-that-released-its-transport-refuses-one-that-released-nothing-keeps-accepting.md`
-  and `caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises.md`:
-  a dated History line saying the engine keeps each through the refusal marker; their fences are
+- `docs/decisions/sink-delivery/a-sink-that-released-its-transport-refuses-one-that-released-nothing-keeps-accepting.md`:
+  a dated History line saying the engine keeps it through the refusal marker; its fence is
   unchanged.
-- `docs/invariants.md` 2 (an engine sink's drop is counted by a run that settled), 3 (guarded by the
-  engine's tests) and 7 (an SQS or SNS batch lost only to sender faults settles); `README.md`'s
+- `docs/decisions/sink-delivery/caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises.md`:
+  this spec owns the edit for the arc, and SPEC-075 references it rather than rewriting the file. A
+  dated History line records the one rule for an `SQSSink` FIFO batch and a `FilteringSink` or
+  `TransformSink` that offers `deliver` (SPEC-075): when caller code fails on every event, the
+  events are `REJECTED` with the refusal marker, so the batch costs one attempt and is **no longer
+  retried by the worker**, no sink counter moves, and `emit` re-raises the first exception by
+  identity. The file is edited as SPEC-069 leaves it (SPEC-069 generalises its HTTP half), and its
+  fence's "re-raised unchanged and nothing is counted" stays as written.
+- `docs/invariants.md` 2 (an engine sink's drop is counted by a run that settled) and 3 (guarded by
+  the engine's tests). Entry 7 already names the SNS sender fault beside the SQS one (SPEC-070), and
+  this spec does not add it again; `README.md`'s
   sink rows that name `max_retries` per chunk or per message.
 
 ## Implementation Phases
@@ -818,3 +847,9 @@ other site still stating the old claim:
   carried its events. `.failed` stays assignable. `emit` is a one-call function so the AST rosters keyed
   on `def emit` keep finding the sinks, and `_takes_the_transport_lock` is re-aimed at `deliver`. The
   keyed reader matches the exact key type. FR-006 cites invariant 12.
+- Cross-arc review: an SQS FIFO batch whose every id callable raised is `REJECTED` with the refusal
+  marker, one attempt and never retried, the one rule SPEC-075's wrappers now share, and this spec
+  owns that decision's History line; the restated loop roster calls through `is_retryable`, names its
+  exclusions (SPEC-075's wrappers among them) and is floored at 11 as SPEC-073 leaves it;
+  `_modules_with_a_retry_loop`'s pin is SPEC-073's; the PostgreSQL criterion cites
+  `StringDataRightTruncation`; invariant 7's SNS sender fault is left to SPEC-070.

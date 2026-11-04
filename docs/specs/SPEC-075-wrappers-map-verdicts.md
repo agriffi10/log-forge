@@ -47,7 +47,8 @@ From SPEC-072 it uses:
 - `SKIPPED`.
 
 From SPEC-073 it uses the run context and its owner-addressed `count`. From SPEC-074 it uses the
-socket transport's `deliver` and the rosters this spec's three classes stand outside.
+socket transport's `deliver`, the refusal marker `RunContext.refuse`, and the rosters this spec's
+three classes stand outside.
 
 It also builds on SPEC-066, which lands first in 1.1.0 and makes `LogstashSink`'s `max_retries` an
 exact, floored `int` at construction. SPEC-066 is not in `depends_on` because it is not yet in the
@@ -85,10 +86,13 @@ Figures re-measured at `fda134a`, each with its instrument:
 - Prose: the wrapper and `MultiSink` docstrings, `docs/invariants.md` entries 2, 6 and 7,
   `docs/architecture.md` §8's wrapper paragraph, the README's wrapper text and
   `docs/component-inventory.md`.
-- At completion, three changes to the decisions in `docs/decisions/sink-delivery/`:
+- At completion, two changes to the decisions in `docs/decisions/sink-delivery/`, and one this spec
+  relies on but does not make:
   - `caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises`
-    is rewritten in place for the `deliver` path, with a dated History entry. On that path an
-    all-failed batch fails the run as `REJECTED` rather than re-raising.
+    is **not** rewritten here. SPEC-074 owns its dated History line, which records the arc's one rule
+    for an all-failed batch on the `deliver` path, this spec's wrappers included: `REJECTED` with the
+    refusal marker, one attempt, no longer retried by the worker, no sink counter moved. Its fence
+    stays.
   - `a-raising-emit-counts-nothing-whoever-catches-the-raise-owns-the-batchs-count` gains a dated
     refinement naming an engine child as a child that counted before raising.
   - One new decision records the wrapper rule: `deliver` is offered when the inner sink offers it,
@@ -101,8 +105,9 @@ Figures re-measured at `fda134a`, each with its instrument:
 - **Defining or changing an `Outcome`.** `SKIPPED` and the engine's counting of it are SPEC-072's.
 - **Any change to a wrapper's `emit`, its `losses()`, or to `MultiSink.emit`, `_absorbed` or
   `failed`.** A wrapper's `emit` keeps its body as it stands when this spec builds and does not
-  become SPEC-072's `emit_via_deliver`. On an all-failed batch it re-raises the caller's own
-  exception by identity, which the adapter's `SinkDeliveryError` cannot reproduce.
+  become SPEC-072's `emit_via_deliver`, because a wrapper over an emit-only sink has no `deliver`
+  for the adapter to run. On an all-failed batch it re-raises the caller's own exception by
+  identity, as 1.x does.
 - **`deliver` on `MultiSink`** (a fixed decision), and on `KafkaSink` and `GooglePubSubSink`.
 - **`SentrySink`.** It delivers through `HTTPSink._send`, never its delegate's `emit` or
   `deliver`, so it is not a wrapper in this spec's sense; its HTTP delivery is SPEC-073's.
@@ -181,12 +186,13 @@ re-run the caller's code, and a non-deterministic transform would then send a di
 shipped sink declares idempotence anyway (SPEC-074), so a wrapped shipped sink is resent exactly as
 it is alone.
 
-**The rosters these classes stand outside.** SPEC-074's derived roster of engine sinks requires
-`emit = emit_via_deliver`, `losses()` returning the counters' losses, and floor and exact count
-thirteen. SPEC-070's loop roster, as SPEC-074 restates it, requires `_retryable_error` on each class
-defining `deliver`. Both exclude SPEC-075's wrappers by name. This spec adds `FilteringSink`,
-`TransformSink` and `LogstashSink` to that exclusion, each with its reason, and keeps both
-populations at thirteen and eleven. The reason for each is that its `emit` is a 1.x body, its
+**The rosters these classes stand outside.** SPEC-074's derived roster of engine sinks requires a
+`def emit(self, batch)` whose body is the one call `emit_via_deliver(self, batch)`, `losses()`
+returning the counters' losses, and floor and exact count thirteen. SPEC-070's loop roster, as
+SPEC-074 restates it, requires `_retryable_error`, called through `is_retryable`, on each class
+defining `deliver`. Each roster names its exclusions, each with its reason. This spec adds
+`FilteringSink`, `TransformSink` and `LogstashSink` to both lists, as SPEC-074 says it will, and
+keeps both populations at thirteen and eleven. The reason for each is that its `emit` is a 1.x body, its
 `losses()` is a 1.x formula, and its `deliver` catches nothing. SPEC-074's check that no class
 under `sinks/` defines `log_foundry_idempotent` stays green, because none of the three does.
 
@@ -233,7 +239,7 @@ outcome:
 |---|---|---|
 | declined: the predicate said `False`, below the level floor, or the function returned `None` | `SKIPPED` | nothing |
 | the caller's code failed on it, and another event of this call was forwarded or declined | `SKIPPED` | `_dropped`, `SETTLED` |
-| the caller's code failed on it, and so did every event of this call | `REJECTED` | nothing |
+| the caller's code failed on it, and so did every event of this call | `REJECTED`, with `run_context().refuse(first_exc)` | nothing |
 | forwarded | the inner verdict's outcome at its forwarded position | nothing |
 | forwarded, and `outcomes_of` judged the inner verdict malformed | `UNKNOWN` | nothing |
 
@@ -250,14 +256,20 @@ SPEC-058's moment. A declined event is `SKIPPED` with no count, as the wrappers'
 docstrings say a declined event is not loss. Neither kind counts as accepted, so with a destination
 that fails every call a batch holding either still fails (invariant 7).
 
-**An all-failed batch fails at once.** A batch of nothing but failures is `REJECTED`, so the run
-fails and its catcher owns it (`failed_batches`, `orphan_lost`), as the 1.x re-raise made it. It is
-not `RETRYABLE`: an exception from the caller's code is not one any sink declared retryable, and
-SPEC-070's rule fails such an exception at once. So the worker no longer re-runs a raising
-predicate or function on this path. The `emit` path keeps the 1.x re-raise and the worker's retry.
-The engine also commits those events into the shared counters' `failed_events`, SPEC-072's
-failed-run upper bound. For a SPEC-074 inner sink that total is in its `losses().failed`. For an
-`HTTPSink` inner sink it is in no reported term but the catcher's.
+**An all-failed batch fails at once, and no sink counts it.** This is the arc's one rule for caller
+code that fails on every event of a batch, which SPEC-074 states for `SQSSink`'s FIFO id callables
+and records in the decision *Caller code that fails for one event costs only that event*. A batch
+of nothing but failures is `REJECTED`, and the wrapper calls `run_context().refuse(first_exc)` with
+the first exception its predicate or function raised (SPEC-074's refusal marker). So the run fails
+and its catcher owns it (`failed_batches`, `orphan_lost`), as the 1.x re-raise made it. It is not
+`RETRYABLE`: an exception from the caller's code is not one any sink declared retryable, and
+SPEC-070's rule fails such an exception at once, so the batch costs one attempt and the worker no
+longer re-runs a raising predicate or function on this path. Because the round is a refusal, the
+engine commits nothing for it: the shared counters' `failed_events`, the inner sink's `.failed` and
+`losses()`, and the wrapper's `_dropped` are all unchanged, which keeps the decision's "re-raised
+unchanged and nothing is counted". The wrapper's `emit` keeps its 1.x body, which re-raises the
+caller's first exception by identity. Over an emit-only inner sink, where the worker calls that
+`emit`, the worker's 1.x retry of the re-raise is unchanged.
 
 **The inner sink's own outcomes.** An `Exception` the inner sink's `deliver` raises propagates
 unchanged, so the engine applies SPEC-072's rule as it would to the bare inner sink: the run fails,
@@ -275,7 +287,8 @@ runs again, once for each event still to send. That is what the worker's 1.x who
 
 **`deliver` writes nothing itself.** It enters no `Deferral`, takes no lock and assigns no
 attribute, so calls on the drain thread and on orphan threads share nothing (SPEC-028). Its only
-count is the run-context registration above. It announces a caller-code failure with one
+count is the run-context registration above, and its only other run-context call is `refuse` on an
+all-failed call. It announces a caller-code failure with one
 `_diag.absorbed` line per call, written at once. The line names the wrapper class, the first
 exception's type and how many events were not forwarded, and never a value. That line is true
 whether or not the run then settles. It is not registered with the run context, because a sink's
@@ -294,9 +307,11 @@ bound, and the two paths reach it by different counts.
       `ACCEPTED`, returns `[SKIPPED, ACCEPTED, SKIPPED]`. The inner sink receives exactly
       `[kept]` by identity. The run settles with the wrapper's `_dropped == 1`, the shared counters'
       `dropped_events == 0`, and `wrapper.losses().dropped == 1`.
-- [ ] Every event raising returns all `REJECTED`, the inner sink is never called, and `_dropped`
-      stays 0. Under a `Worker` this gives `failed_batches == 1` with `flush()` falsy. As an orphan
-      `info()` it gives `orphan_lost == 1` with nothing raised.
+- [ ] Every event raising returns all `REJECTED` and calls `refuse` with the first exception; the
+      inner sink is never called, and `_dropped`, the shared counters' `failed_events` and the inner
+      sink's `losses()` stay unchanged. Under a `Worker(max_retries=3)` this is one `deliver` call,
+      `failed_batches == 1` and `flush()` falsy. As an orphan `info()` it gives `orphan_lost == 1`
+      with nothing raised. A direct `emit` of the same batch re-raises that exception by identity.
 - [ ] `[declined, raising]` settles with `_dropped == 1`. An all-declined batch never calls the
       inner sink and moves nothing. `[kept, raising]` with an inner sink that answers `REJECTED`
       fails with `_dropped == 0` and `failed_batches == 1`.
@@ -524,8 +539,8 @@ tests/
 ### Phase 3: Prose and records
 
 - The wrapper docstrings, `docs/invariants.md` entries 2, 6 and 7, `docs/architecture.md` §8, the
-  README's wrapper text, `docs/component-inventory.md`, and the decision rewrite, refinement and new
-  decision named in Scope.
+  README's wrapper text, `docs/component-inventory.md`, and the refinement and new decision named in
+  Scope.
 
 ## Revision history
 
@@ -548,3 +563,8 @@ tests/
   - the rosters they stand outside are named.
 
   `depends_on` gained SPEC-073 and SPEC-074, whose files are now in the directory.
+- Cross-arc review: an all-failed batch now calls SPEC-074's `refuse` with the caller's first
+  exception, so it is one attempt, never retried, and moves no sink counter (the `failed_events`
+  commit was removed); SPEC-074 owns the caller-code decision's History line and this spec no longer
+  rewrites that file. The engine-sink roster's `emit` rule is SPEC-074's one-call `def emit`, and
+  both rosters' exclusions are named lists that this spec extends.

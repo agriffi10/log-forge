@@ -380,17 +380,17 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   additive: `emit`'s contract, `losses()`, `SinkLosses` and every documented counter stay true for
   1.x callers.
 
-  The arc is cut along the seams the system already has. Live defects come first, as two specs of
-  rules that need no new mechanism: what a sink does with an event it cannot encode, and which
-  failures it retries. A behaviour-free kit spec follows, which pins the AST-derived rosters before
-  any code moves, so the refactor cannot shrink them silently. The plan's single "verdict engine"
-  step is split in two at the point where something inert goes live. SPEC-072 defines `deliver`,
-  `Verdict` and the engine against test sinks, and no shipped sink offers `deliver` until SPEC-073
-  puts the HTTP family on it. The SDK and driver sinks, the wrappers and the closed-guard helper
-  follow, the helper last of these because only the engine settles what a transport lock must
-  span. Lifecycle is reworked after delivery. `Runtime` first holds today's state with no
-  behaviour change, the owed-close registry and checked transitions then make that state the
-  authority, and fork's one walk comes last because it walks from the runtime's roots.
+  The arc is cut along the seams the system already has. Two specs carry rules that need no new
+  mechanism: what a sink does with an event it cannot encode, and which failures it retries. A kit
+  spec centralises the optional imports, the injected-client refusal and the chunker rule. It also
+  pins the AST-derived rosters, so that the later refactors cannot shrink them silently. The plan's
+  single "verdict engine" step is split where something inert goes live. SPEC-072 defines
+  `deliver`, `Verdict` and the engine against test sinks, and no shipped sink offers `deliver`
+  until SPEC-073 puts the HTTP family on it. The closed-guard helper is a spec of its own because
+  only the engine settles what a transport lock must span. Lifecycle is split the same way: one
+  spec moves today's state into `Runtime` with no behaviour change, the next makes that state the
+  authority through the owed-close registry and checked transitions, and fork's one walk is
+  separate because it walks from the runtime's roots.
 
   Three decisions were made while the arc was written, each by Andrew with the question tool on
   2026-11-04. A batch with nothing encodable settles, counted, rather than raising. A destination's
