@@ -110,7 +110,9 @@ Stated here rather than left to be found.
   share that gap, and this spec does not close it.
 - **Neither budget adds module-level mutable state.** The library never rebinds the constants and
   the counters live on the pass object, so nothing is stranded across a fork (invariant 12).
-- **A container mapping key is rendered before any budget applies.** A key that is not a `str`,
+- ~~**A container mapping key is rendered before any budget applies.**~~ **Superseded by SPEC-063
+  FR-001:** a builtin-container key is coerced as a value and written as the JSON of the result; a
+  `bytes` or `bytearray` key is priced before it is rendered. What follows was true at `324936e`. A key that is not a `str`,
   `int` or `float` — a `tuple`, a `frozenset`, or anything a caller `Mapping` yields, which need
   not even hash — is rendered by `str(key)`, the builtin `repr`, which recurses through shared
   members once per path. A key built from a shared sub-structure is therefore still exponential on
@@ -139,8 +141,10 @@ Stated here rather than left to be found.
 
 The pass counts every value it visits, scalar or container, including one that becomes
 `<depth limit>` or `<circular>`: every entry to `_Coercer.value`. The top-level `fields` mapping
-(entered at depth −1, without passing through `value`) and mapping keys (rendered by `key()`) are
-not values and are not counted. The value that would be the `_MAX_NODES + 1`th is not dispatched: it
+(entered at depth −1, without passing through `value`) is not a value and is not counted; ~~mapping
+keys (rendered by `key()`) are not values and are not counted~~ — **superseded by SPEC-063 FR-001:**
+a builtin-container key spends one node for itself and its members spend theirs, as values do, while
+a `str`, `int`, `float` or object key is still not counted. The value that would be the `_MAX_NODES + 1`th is not dispatched: it
 becomes the placeholder `<node limit>`, the event is marked `truncated`, and nothing after it is
 visited. Every container still open ends after the member it was writing, so the siblings that come
 later in walk order are dropped. That is the stated cost: walk order decides what is sacrificed, and
@@ -217,7 +221,8 @@ table under *Data Model*, in three classes:
   member's `str` value — is charged at its UTF-8 length *after* clipping.
 - **Text the pass produces** by calling `str()` or `isoformat()` itself — a `Decimal`, `UUID`,
   date or time, an enum's fallback `str(value)`, a key that is not a `str` (an integer or float key
-  included, and whatever placeholder it becomes), and a type-name placeholder
+  included, and whatever placeholder it becomes; **a builtin-container key is the exception since
+  SPEC-063**, which charges its members as values), and a type-name placeholder
   (`<unserializable: T>`, `<unserializable key: T>`) — is charged at the *larger* of its length in
   characters before clipping and its UTF-8 bytes after, because producing it was the work.
 - **An integer written as a value** is charged at the rendered length `integer()` estimates, digits
@@ -286,7 +291,9 @@ bound the bytes and cut a 256 × 256 structure, and would diverge from SPEC-056.
       that string `<size limit>` and marks the event; a sibling `"z"` after it in the list, and a
       second field `b`, are absent.
 - [ ] The same exactness holds for a structure that also holds, ahead of the special string in walk
-      order, an integer key, a one-element tuple key whose `str()` is 10,000 characters (charged
+      order, an integer key, ~~a one-element tuple key whose `str()` is 10,000 characters~~
+      (**superseded by SPEC-063 FR-001:** a tuple key is now the JSON of its coerced members, so the
+      test uses a `Decimal` key whose `str()` is 10,000 characters) (charged
       10,000 though written at 8,192), a float, a bool, a `None`, an over-long integer and a
       `<depth limit>` value (the last five charge nothing), the special string's length chosen so the
       total is exact. It is written whole with no `<size limit>`, and the over-by-one variant, which
@@ -492,7 +499,7 @@ What is charged against `_MAX_RENDERED_BYTES`:
 | Item written | Charge |
 |---|---|
 | `str` value or `str` key; decoded bytes-like; enum member's `str` value | UTF-8 bytes of the result, after clipping |
-| `Decimal`, `UUID`, date/time, enum fallback `str(value)`, non-`str` key (an integer or float key included, and whatever placeholder it becomes), `<unserializable: T>` and `<unserializable key: T>` | the larger of characters before clipping and UTF-8 bytes after |
+| `Decimal`, `UUID`, date/time, enum fallback `str(value)`, non-`str` key (an integer or float key included, and whatever placeholder it becomes; not a builtin-container key, **SPEC-063**: its members are charged as values), `<unserializable: T>` and `<unserializable key: T>` | the larger of characters before clipping and UTF-8 bytes after |
 | `int` written as a value | `integer()`'s rendered-length estimate: digits, plus one if negative |
 | `<depth limit>`, `<circular>`, `<node limit>`, `<size limit>`, `<int: …>`, `<float: …>`, finite float, `bool`, `None` | nothing |
 

@@ -2,7 +2,7 @@
 
 ``TransformSink`` runs its function *after* assembly, so the function can put ``bytes``, a
 ``datetime`` or a NaN into an event that invariant 8 promised every sink could serialize bare.
-Every result is checked once with invariant 8's observable; one that fails is replaced by a
+Every result is checked once with invariant 8's JSON check; one that fails is replaced by a
 types-only coercion — assembly's per-type rules, no configured ceiling, one fixed depth bound.
 
 Most tests here deliver into a ``MemorySink``, which never serializes: what arrives is exactly what

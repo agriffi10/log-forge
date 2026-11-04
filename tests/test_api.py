@@ -1100,3 +1100,142 @@ def test_a_span_whose_function_genuinely_raised_is_unchanged(lf, fake_sink) -> N
     ends = [e for e in fake_sink.events if e.get("status") is not None]
     assert ends[-1]["status"] == "error"
     assert ends[-1]["error"]["type"] == "RuntimeError", "the caller's type, not the library's"
+
+
+# -- SPEC-063 FR-003: a caller's argument's truthiness cannot raise into the application -------
+
+
+class _TruthRaises(Exception):
+    """What a hostile ``fields=`` or ``echo=`` raises from its truth test."""
+
+
+class _BoolRaisesFields(dict):
+    """A ``fields=`` mapping whose ``__bool__`` raises, so ``if not fields`` raises."""
+
+    def __bool__(self) -> bool:
+        raise _TruthRaises("bool")
+
+
+class _LenRaisesFields(dict):
+    """A ``fields=`` mapping with no ``__bool__`` whose ``__len__`` raises."""
+
+    def __len__(self) -> int:
+        raise _TruthRaises("len")
+
+
+class _EchoRaises:
+    def __bool__(self) -> bool:
+        raise _TruthRaises("echo")
+
+
+@pytest.mark.parametrize("hostile", [_BoolRaisesFields, _LenRaisesFields], ids=["bool", "len"])
+@pytest.mark.parametrize("level", LEVELS)
+def test_a_fields_argument_whose_truth_raises_is_ignored_and_announced(
+    lf, fake_sink, capsys, level: str, hostile: type
+) -> None:
+    """FR-003 AC1: the call returns, the event carries the keyword fields, and stderr says why."""
+    getattr(lf, level)("m", fields=hostile(), a=1)
+    events = [e for e in fake_sink.events if e["message"] == "m"]
+    assert [e["fields"] for e in events] == [{"a": 1}]
+    err = capsys.readouterr().err
+    assert "merging the fields= argument (_TruthRaises)" in err
+
+
+@pytest.mark.parametrize("hostile", [_BoolRaisesFields, _LenRaisesFields], ids=["bool", "len"])
+def test_a_fields_argument_whose_truth_raises_does_not_fail_a_traced_function(
+    lf, fake_sink, capsys, hostile: type
+) -> None:
+    """FR-003 AC2: the function returns its own value and its span ends ``ok``."""
+
+    @lf.trace(name="work")
+    def work() -> str:
+        lf.info("m", fields=hostile(), a=1)
+        return "own value"
+
+    assert contextvars.copy_context().run(work) == "own value"
+    ends = [e for e in fake_sink.events if e["message"] == "span.end"]
+    assert [e["status"] for e in ends] == ["ok"]
+    assert [e["fields"] for e in fake_sink.events if e["message"] == "m"] == [{"a": 1}]
+    assert "merging the fields= argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("route", ["orphan", "in_span"])
+def test_an_echo_whose_truth_raises_is_absorbed(
+    lf, fake_sink, capsys, monkeypatch, route: str
+) -> None:
+    """FR-003 AC3: the event is delivered once, nothing is echoed, and the fault is announced.
+
+    The echo is read from a writer over its own stream, because the default writer binds
+    ``sys.stderr`` when the module is imported, which is where the diagnostic also goes.
+    """
+    from log_foundry import console as console_mod
+
+    stream = io.StringIO()
+    monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=stream))
+
+    def call() -> None:
+        lf.info("m", echo=_EchoRaises())
+
+    if route == "orphan":
+        call()
+    else:
+        contextvars.copy_context().run(lf.trace(name="work")(call))
+        ends = [e for e in fake_sink.events if e["message"] == "span.end"]
+        assert [e["status"] for e in ends] == ["ok"]
+    assert len([e for e in fake_sink.events if e["message"] == "m"]) == 1
+    assert stream.getvalue() == ""
+    err = capsys.readouterr().err
+    assert "absorbed a failure while echoing to the console (_TruthRaises)" in err
+
+
+def _hostile_named_exception() -> type[BaseException]:
+    """An exception class stored as ``Stored`` whose metaclass ``__name__`` property raises."""
+
+    def name(cls: type) -> str:
+        raise RuntimeError("name")
+
+    meta = type("_Meta", (type,), {"__name__": property(name)})
+    return meta("Stored", (Exception,), {})  # type: ignore[no-any-return]
+
+
+def test_a_fields_truth_failure_from_a_hostile_class_names_its_stored_name(
+    lf, fake_sink, capsys
+) -> None:
+    """FR-003 AC4: the announcement still names the type, by its stored name (FR-004's read)."""
+    hostile_exc = _hostile_named_exception()
+
+    class _Fields(dict):
+        def __bool__(self) -> bool:
+            raise hostile_exc()
+
+    try:
+        lf.info("m", fields=_Fields(), a=1)
+    except BaseException:
+        pytest.fail("the hostile class's exception escaped lf.info: the fields= guard regressed")
+    assert [e["fields"] for e in fake_sink.events if e["message"] == "m"] == [{"a": 1}]
+    assert "merging the fields= argument (Stored)" in capsys.readouterr().err
+
+
+def test_ordinary_fields_and_echo_arguments_behave_as_before(
+    lf, fake_sink, capsys, monkeypatch
+) -> None:
+    """FR-003 AC5 (silence): an empty or plain ``fields=`` and any plain ``echo``, unchanged."""
+    from log_foundry import console as console_mod
+
+    for empty in ([], None, {}):
+        lf.info("m", fields=empty, a=1)
+    lf.info("m", fields={"x": 1}, x=2)
+    assert [e["fields"] for e in fake_sink.events if e["message"] == "m"] == [
+        {"a": 1},
+        {"a": 1},
+        {"a": 1},
+        {"x": 2},
+    ]
+    echoed = []
+    for echo in (True, False, 1, 0):
+        stream = io.StringIO()
+        monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=stream))
+        lf.info(f"echo-{echo!r}", echo=echo)
+        echoed.append("echo-" in stream.getvalue())
+    assert echoed == [True, False, True, False]
+    assert "absorbed" not in capsys.readouterr().err

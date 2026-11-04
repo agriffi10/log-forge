@@ -676,21 +676,25 @@ def test_produced_text_and_integers_are_charged_and_placeholders_are_not(
 ) -> None:
     """FR-002 AC2: every probe ahead of the special string either charges exactly or nothing.
 
-    Charges: ``a`` 1, the integer key ``12345`` 5, the tuple key 10,000 though written at 8,192,
-    2,046 strings of 8,192, and the special string; the float, the bool, the ``None``, the
+    Charges: ``a`` 1, the integer key ``12345`` 5, the ``Decimal`` key 10,000 though written at
+    8,192, 2,046 strings of 8,192, and the special string; the float, the bool, the ``None``, the
     over-long integer and the three ``<depth limit>`` values charge nothing. So 6,378 makes the
     total exactly 16,777,216. ``10**9000`` has 9,001 digits, past ``max_value_bytes`` under any
     interpreter limit, so it is a placeholder here whatever ``sys.get_int_max_str_digits()`` is.
+    The produced key is a ``Decimal``, which keeps ``str()``: SPEC-063 made a tuple key the JSON of
+    its coerced members, and at this ``max_depth`` of 2 a tuple key sits at value depth 2 and would
+    be ``"<depth limit>"`` whole, charging nothing, so it no longer probes a produced-text charge.
     """
     sink = _configure(max_keys=4096, max_depth=2)
     special = "y" * (6378 + over)
-    probes: list[object] = [{12345: None, ("x" * 9995,): None}, 1.5, True, None, 10**9000, [0]]
+    produced_key = Decimal("1" * 10_000)
+    probes: list[object] = [{12345: None, produced_key: None}, 1.5, True, None, 10**9000, [0]]
     event = _emit(route, {"a": [*probes, *([_S] * 2046), special]}, sink)
     fields = event["fields"]
     assert isinstance(fields, dict)
     out = fields["a"]
-    tuple_key = "('" + "x" * 8176 + TRUNCATION_MARKER
-    assert out[0] == {"12345": "<depth limit>", tuple_key: "<depth limit>"}
+    decimal_key = "1" * 8178 + TRUNCATION_MARKER
+    assert out[0] == {"12345": "<depth limit>", decimal_key: "<depth limit>"}
     assert out[1:4] == [1.5, True, None]
     assert isinstance(out[4], str)
     assert out[4].startswith("<int: ")
@@ -842,11 +846,17 @@ def test_a_dag_of_a_shared_long_string_returns_within_the_byte_budget(route: str
 
 @pytest.mark.parametrize("route", _ROUTES)
 def test_a_nest_of_long_produced_keys_returns_within_the_byte_budget(route: str) -> None:
-    """FR-002 AC9: three levels of 256 keys whose ``str()`` is a mebibyte; the 14th inner crosses.
+    """FR-002 AC9: three levels of 256 keys holding a mebibyte string, under the byte budget.
 
-    ``a`` costs 1, a key ``(s, i)`` its ``str()`` length (1,048,583 for ``i`` below 10, 1,048,584
-    for 10 to 99) and a ``0`` costs 1, so after the outer and middle keys the innermost mapping
-    fits thirteen entries. Those thirteen keys clip to one string and collapse into one entry.
+    Re-derived for SPEC-063 FR-001, under which a key ``(s, i)`` is the JSON of its coerced
+    members: ``s`` is the caller's text, charged its clip of 8,192 bytes, and ``i`` its estimated
+    length, 1 below 10, 2 from 10 to 99 and 3 from 100, and the key's text is not charged again.
+    Every key's text clips to ``'["' + "x" * 8176 + TRUNCATION_MARKER``, so each level collapses
+    to one entry and every visit of the outer and middle mappings re-walks the inner one. ``a``
+    costs 1; a visit of the inner mapping costs its 256 keys and a ``0`` of 1 each. Summed by those
+    rules, the walk crosses on the eighth visit of the inner mapping, at its 247th key
+    (``k = 246``), on that key's string member, so its last output is one collapsed entry and the
+    stop: the shape below is SPEC-057's, unchanged.
     """
     s = "x" * 1_048_576
     inner = {(s, i): 0 for i in range(256)}
@@ -854,7 +864,7 @@ def test_a_nest_of_long_produced_keys_returns_within_the_byte_budget(route: str)
     outer = {(s, i): middle for i in range(256)}
     sink = _configure()
     event = _emit(route, {"a": outer}, sink, deadline=5)
-    key = "('" + "x" * 8176 + TRUNCATION_MARKER
+    key = '["' + "x" * 8176 + TRUNCATION_MARKER
     assert event["fields"] == {"a": {key: {key: {key: 0, _SIZE_LIMIT: _SIZE_LIMIT}}}}
     assert event.get("truncated") is True
 
@@ -898,7 +908,23 @@ class _Site(NamedTuple):
 
 
 _EMOJI_KEY = ("😀" * 20,)
-_EMOJI_KEY_TEXT = "('" + "😀" * 20 + "',)"
+_EMOJI_KEY_TEXT = '["' + "😀" * 20 + '"]'
+
+
+class _EmojiObjectKey:
+    """A key whose ``str()`` is 25 four-byte characters: produced text whose bytes exceed them."""
+
+    def __str__(self) -> str:
+        return "😀" * 25
+
+
+_CONTAINER_KEY_SITES = frozenset({"tuple-key", "non-ascii-key-unclipped"})
+"""The rows whose key is a container: since SPEC-063 they charge their members, as values.
+
+A container key's member is the caller's text, charged its UTF-8 length after clipping, and the
+key's JSON text is not charged again, so these two rows hold that charge rather than the
+produced-text one the table's other rows hold, and have no ``str()`` premise.
+"""
 
 _PRODUCED_SITES: list[_Site] = [
     _Site("decimal", "value", Decimal("1" * 40), 14, 40, TRUNCATION_MARKER),
@@ -914,11 +940,12 @@ _PRODUCED_SITES: list[_Site] = [
         TRUNCATION_MARKER,
     ),
     _Site("value-placeholder", "value", _Opaque(), 14, 25, TRUNCATION_MARKER),
-    _Site("tuple-key", "key", ("x" * 20,), 14, 25, TRUNCATION_MARKER),
+    _Site("tuple-key", "key", ("x" * 20,), 14, 14, TRUNCATION_MARKER),
     _Site("float-key", "key", 1.2345678901234567, 14, 18, TRUNCATION_MARKER),
     _Site("int-key-past-the-ceiling", "key", 10**20, 14, 17, TRUNCATION_MARKER),
     _Site("key-placeholder", "key", _KeyBoom(), 14, 30, TRUNCATION_MARKER),
-    _Site("non-ascii-key-unclipped", "key", _EMOJI_KEY, 8192, 85, _EMOJI_KEY_TEXT),
+    _Site("non-ascii-key-unclipped", "key", _EMOJI_KEY, 8192, 80, _EMOJI_KEY_TEXT),
+    _Site("non-ascii-object-key", "key", _EmojiObjectKey(), 8192, 100, "😀" * 25),
     _Site("key-str-returns-a-subclass", "key", _SubclassKey(), 14, 20, TRUNCATION_MARKER),
 ]
 
@@ -931,8 +958,10 @@ def test_each_produced_text_site_is_charged_before_clipping(
 
     At ``max_value_bytes=14`` every clipped site's text becomes the marker alone, so a site
     charged after clipping (14) and one charged before it (its length in characters) differ.
-    The non-ASCII key is the other half: unclipped at the default ceiling, its 25 characters are
-    85 bytes, so a site charged its characters alone would undercharge it. The budget is patched
+    The non-ASCII object key is the other half: unclipped at the default ceiling, its 25
+    characters are 100 bytes, so a site charged its characters alone would undercharge it. The two
+    container-key rows (``_CONTAINER_KEY_SITES``) charge their members as values instead, the
+    tuple's clipped member 14 and the emoji tuple's 80 bytes. The budget is patched
     to sit exactly on the charge, then one byte under it: the site fits, then crosses, which pins
     the charge to exactly its number in both directions. A ``date`` is not here: it is ten
     characters, never clipped where these are, so both charges are the same number. The last
@@ -965,17 +994,18 @@ def test_the_produced_sites_are_as_long_as_the_table_says() -> None:
         "time": time(12, 30, 45, 123456, tzinfo=UTC).isoformat(),
         "enum-fallback": str(_ProducedFallback.MEMBER_WITH_A_LONG_NAME),
         "value-placeholder": "<unserializable: _Opaque>",
-        "tuple-key": str(("x" * 20,)),
         "float-key": str(1.2345678901234567),
         "int-key-past-the-ceiling": "<int: ~21 digits>",
         "key-placeholder": "<unserializable key: _KeyBoom>",
-        "non-ascii-key-unclipped": str(_EMOJI_KEY),
+        "non-ascii-object-key": str(_EmojiObjectKey()),
         "key-str-returns-a-subclass": str.__str__(str(_SubclassKey())),
     }
     assert type(str(_SubclassKey())) is _ZeroLen
     assert len(str(_SubclassKey())) == 0
-    assert set(texts) == {site.id for site in _PRODUCED_SITES}
+    assert set(texts) == {site.id for site in _PRODUCED_SITES} - _CONTAINER_KEY_SITES
     for site in _PRODUCED_SITES:
+        if site.id in _CONTAINER_KEY_SITES:
+            continue
         text = texts[site.id]
         if site.ceiling == 14:
             assert len(text) == site.charge > 16, site.id

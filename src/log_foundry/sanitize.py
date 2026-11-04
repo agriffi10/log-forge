@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -122,7 +123,85 @@ rejects each of the three bytes separately. The substitution runs only after a s
 already failed, so the common case never reaches it.
 """
 
-_PLAIN_SCALARS: frozenset[type] = frozenset({int, bool})
+_INT_INT = int.__int__
+"""``int.__int__``, unbound, the one way an ``int`` subclass value enters the event (SPEC-063).
+
+A route that returns the caller's object, or lets the object's own method decide a measurement,
+admits it only by an exact-type identity test or by converting it through an unbound builtin
+accessor first. ``isinstance`` consults ``__class__`` and a type-set membership test consults the
+metaclass's ``__hash__`` and ``__eq__``, both of which the caller's object controls. Measured at
+``71e42dd``: an object whose ``__class__`` returned ``bool``, one whose ``__class__`` returned
+``float`` with ``__float__`` returning ``1.0``, and an instance of a class whose metaclass hashed
+and compared equal to ``int`` each reached the assembled event as the object itself, and
+``json.dumps`` then raised ``TypeError`` in a sink. ``int.__int__`` returns an exact ``int`` of the
+stored magnitude for a genuine subclass, whatever its own ``__int__``, ``__str__`` or ``__repr__``
+say, and raises ``TypeError`` for an object that only claims to be an ``int``, which
+:meth:`_Coercer.value` turns into the type-name placeholder.
+"""
+_FLOAT_FLOAT = float.__float__
+"""``float.__float__``, unbound, for every route into the float rule (SPEC-063).
+
+The reason :data:`_INT_INT` gives. A ``float`` subclass's own ``__float__`` decided ``isfinite()``
+in :meth:`_Coercer.real` and the subclass instance itself reached the event; the unbound accessor
+returns an exact ``float`` of the stored value, measured at ``71e42dd`` as ``1.5`` for a subclass
+whose ``__float__`` returned ``9.0``, and refuses an impostor with ``TypeError``. On an exact
+``float`` it returns the same object, so the routes that apply it unconditionally pay one C call.
+"""
+_STORED_NAME = type.__dict__["__name__"].__get__
+"""The getter of ``type.__name__``, which reads the name a type stores past its metaclass.
+
+``type(value).__name__`` is resolved through the metaclass, so a metaclass that defines
+``__name__`` as a property chose the placeholder's text or raised (SPEC-063 FR-002). This reads the
+stored name whatever the metaclass says. Its result is still passed through :data:`_STR_STR`,
+because ``type.__name__``'s setter accepts a ``str`` subclass.
+"""
+
+_CONTAINER_KEYS: tuple[type, ...] = (tuple, list, dict, set, frozenset)
+"""The builtin containers a mapping key is coerced as, tested on the key's real type (SPEC-063)."""
+
+_REAL_ROUTED: tuple[type, ...] = (
+    str,
+    bytes,
+    bytearray,
+    dict,
+    tuple,
+    list,
+    set,
+    frozenset,
+    int,
+    float,
+)
+"""The builtins :meth:`_Coercer._dispatch` routes by real type, so a claim of ``Enum`` cannot.
+
+An object whose real type subclasses one of these is routed by that type, never by an ``Enum``
+claim made through ``__class__``, unless its real type is an ``Enum`` as well: the ``Enum``
+branch's fallback is ``str(value)``, the builtin ``repr`` for a real container (SPEC-063 FR-002).
+``int`` and ``float`` are here too, because their own branches bound and convert them, where the
+``Enum`` fallback would render a real ``int`` subclass by ``str()`` whatever its digit count.
+"""
+
+_ENUM_TEXT_BUILTINS: tuple[type, ...] = (tuple, list, dict, set, frozenset, bytes, bytearray)
+"""The builtins whose ``Enum`` member's text the library computes rather than ``str()`` (SPEC-063).
+
+An ``Enum`` member whose real type subclasses one of these, as a value that reaches the ``Enum``
+fallback or as a key, is written as :func:`_enum_text`, never through ``str()``. ``str()`` of such
+a member is the builtin container's or bytes' ``repr`` whenever the member's ``__str__`` is not
+``Enum.__str__``: a ``ReprEnum`` mixin restores the builtin's own ``__str__``, and a metaclass
+``mro()`` can put ``Enum`` into a real ``tuple`` subclass's MRO without inheriting from it.
+Measured at ``fda134a``: an mro-forged ``tuple`` around an object whose ``__repr__`` named a secret
+wrote it, value and key, and one around the shared ``frozenset`` DAG did not return on any route;
+a ``(tuple, ReprEnum)`` member holding the DAG did not return either, and a 16 MiB
+``(bytes, ReprEnum)`` member peaked at 64 MiB. ``str``, ``int`` and ``float`` mixins are not here:
+their members keep their routes.
+"""
+
+_BYTES_LEN = bytes.__len__
+"""The unbound lengths that price a bytes-like key before it is rendered (SPEC-063 FR-001).
+
+A subclass's own ``__len__`` cannot divert them, on :data:`_STR_LEN`'s reasoning.
+``_BYTEARRAY_LEN`` beside it is the same for ``bytearray``.
+"""
+_BYTEARRAY_LEN = bytearray.__len__
 
 _TEXTLIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
 
@@ -393,6 +472,11 @@ class _Coercer:
         per remaining value, which is what bounds it: the shape of ``<depth limit>`` would still
         write up to (``max_depth`` + 1) times ``max_keys`` of them.
 
+        A mapping key is not a node visited here, with one exception: a builtin-container key
+        spends one node for itself in :meth:`_container_key` and one per member per path through
+        this method, as a value at the entry's value depth would (SPEC-063 FR-001), so a key and
+        its members are counted where a ``str`` or scalar key is not.
+
         Args:
           value: The node to coerce.
           depth: How deep the node sits, measured against ``max_depth``.
@@ -420,11 +504,48 @@ class _Coercer:
         lets ``IntEnum`` and ``StrEnum`` members fall through to the ``Enum`` branch instead of
         passing through as themselves and handing a sink an ``Enum`` where a plain value was
         promised. ``int`` is tested ahead of the other scalars because it is the one with no
-        natural ceiling, ``bool`` ahead of ``int`` among the subclass branches because it is an
-        ``int`` subclass, and ``Decimal`` renders as a string so that ``Decimal("0.1")`` does
-        not become ``0.1000000000000000055``. Text the caller supplied goes to :meth:`text`, and
-        text this pass makes with ``str()`` or ``isoformat()`` to :meth:`produced`, because the
-        two are charged differently against the byte budget (SPEC-057 FR-002).
+        natural ceiling, and ``Decimal`` renders as a string so that ``Decimal("0.1")`` does not
+        become ``0.1000000000000000055``. Text the caller supplied goes to :meth:`text`, and text
+        this pass makes with ``str()`` or ``isoformat()`` to :meth:`produced`, because the two are
+        charged differently against the byte budget (SPEC-057 FR-002).
+
+        **A route that returns the caller's object, or lets its method decide a measurement,
+        admits it by exact type or through an unbound accessor** (SPEC-063 FR-002). The exact
+        block is identity tests; ``bool`` is one of them, because ``bool`` cannot be subclassed,
+        so the ``isinstance(value, bool)`` branch that followed the ``Enum`` one admitted only an
+        object claiming ``bool`` through ``__class__``, and returned it. An ``int`` or ``float``
+        subclass is converted by :data:`_INT_INT` or :data:`_FLOAT_FLOAT` before it is bounded,
+        so the event holds an exact number and an impostor raises into :meth:`value`'s guard. An
+        ``Enum`` member's value is admitted the same way, and a member whose value claims a type
+        it is not falls to the enum's own text, unless it claims ``float`` or ``str``, whose
+        conversion or unbound read raises and names the ``Enum`` class, the node.
+
+        **The ``Enum`` branch is entered only by a real ``Enum``, or by an object whose real type
+        is none of the builtins in** :data:`_REAL_ROUTED`. Its fallback is ``str(value)``, so a
+        real container claiming ``Enum`` through ``__class__`` reached the builtin ``repr``:
+        measured at ``71e42dd``, and unchanged until this test, a real ``tuple`` subclass
+        claiming ``Enum`` wrote ``(SECRET,)`` for an object whose ``__repr__`` returned
+        ``"SECRET"``, did not return around the shared ``frozenset`` DAG, and a ``bytes`` subclass
+        of 16 MiB peaked at 64 MiB. A proxy of an ``Enum`` keeps the branch, its real type being
+        no builtin, and so does every ``StrEnum``, ``IntEnum`` and ``(tuple, Enum)`` member.
+
+        **Then the real type routes the containers and the text.** A ``str``, ``bytes`` or
+        ``bytearray`` subclass, the exact ``memoryview``, a ``dict`` subclass and a ``tuple``,
+        ``list``, ``set`` or ``frozenset`` subclass are routed by ``issubclass(type(value), …)``,
+        ahead of every render-through ``isinstance`` branch and after the ``int`` and ``float``
+        branches, which convert or refuse what they admit. A real container that claims ``UUID``
+        or ``Decimal`` through ``__class__`` otherwise reached their ``str()``, the builtin
+        ``repr``: measured at ``71e42dd``, a real ``tuple`` subclass claiming ``UUID`` around a
+        shared ``frozenset`` DAG did not return, one holding an object whose ``__repr__``
+        returned ``"SECRET"`` wrote ``SECRET``, and a real ``bytes`` subclass claiming
+        ``Decimal`` was rendered whole by ``str()``. **``isinstance`` stays, on purpose, for the
+        render-through routes** — ``isoformat()``, ``str()`` of a ``UUID`` or ``Decimal``,
+        ``Mapping``, ``set`` and ``Sequence`` iteration, and the ``Enum`` branch for an object
+        that is no builtin — whose output is the library's own text and containers: a
+        transparent proxy
+        (``wrapt.ObjectProxy``, Django's ``SimpleLazyObject``) sets ``__class__`` legitimately and
+        renders correctly through them. An object that only claims ``str`` or a bytes-like type
+        falls through to the placeholder, the ``Sequence`` branch excluding the text-like types.
 
         Args:
           value: The node to route.
@@ -434,7 +555,8 @@ class _Coercer:
           The coerced node.
 
         Raises:
-          Exception: Whatever the value's own dunders raise; :meth:`value` is the guard.
+          Exception: Whatever the value's own dunders raise, or the ``TypeError`` an unbound
+            accessor raises for an impostor; :meth:`value` is the guard.
         """
         if depth >= self._cfg.max_depth:
             self.truncated = True
@@ -449,40 +571,46 @@ class _Coercer:
             return self.integer(value)  # type: ignore[arg-type]
         if kind is float:
             return self.real(value)  # type: ignore[arg-type]
-        if kind in _PLAIN_SCALARS:
+        if kind is bool:
             return value
         if kind is dict:
             return self.mapping(value, depth)  # type: ignore[arg-type]
         if kind is list:
             return self.members(value, depth)  # type: ignore[arg-type]
 
-        if isinstance(value, Enum):
+        if isinstance(value, Enum) and (
+            issubclass(kind, Enum) or not issubclass(kind, _REAL_ROUTED)
+        ):
             member = value.value
             if type(member) is int:
                 return self.integer(member)
-            if isinstance(member, float) and not isinstance(member, bool):
-                return self.real(member)
-            if type(member) in _PLAIN_SCALARS or member is None:
+            if isinstance(member, float):
+                return self.real(_FLOAT_FLOAT(member))
+            if type(member) is bool or member is None:
                 return member
             if isinstance(member, str):
                 return self.text(member)
+            if issubclass(kind, _ENUM_TEXT_BUILTINS):
+                return self.produced(_enum_text(value))
             return self.produced(str(value))
-        if isinstance(value, bool):
-            return value
         if isinstance(value, int):
-            return self.integer(value)
+            return self.integer(_INT_INT(value))
         if isinstance(value, float):
-            return self.real(value)
+            return self.real(_FLOAT_FLOAT(value))
+        if issubclass(kind, str):
+            return self.text(value)  # type: ignore[arg-type]
+        if issubclass(kind, (bytes, bytearray)) or kind is memoryview:
+            return self.text(self._decoded(self._head_bytes(value)))  # type: ignore[arg-type]
+        if issubclass(kind, dict):
+            return self.mapping(value, depth)  # type: ignore[arg-type]
+        if issubclass(kind, (tuple, list, set, frozenset)):
+            return self.members(value, depth)  # type: ignore[arg-type]
         if isinstance(value, (datetime, date, time)):
             return self.produced(value.isoformat())
         if isinstance(value, UUID):
             return self.produced(str(value))
         if isinstance(value, Decimal):
             return self.produced(str(value))
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            return self.text(self._decoded(self._head_bytes(value)))
-        if isinstance(value, str):
-            return self.text(value)
         if isinstance(value, Mapping):
             return self.mapping(value, depth)
         if isinstance(value, (set, frozenset)):
@@ -520,14 +648,15 @@ class _Coercer:
         a first dimension. That is an accepted limit: a single row is read whole, so a view whose
         one row exceeds the ceiling costs that row.
 
-        The view is tested by its exact type before any of it is read, because ``isinstance``
+        Every branch tests the real type before any of the value is read, because ``isinstance``
         consults ``__class__``, which any object may override: one claiming to be a
-        ``memoryview`` reached this branch, and its own ``nbytes`` and ``__bytes__`` chose how
+        ``memoryview`` reached this method, and its own ``nbytes`` and ``__bytes__`` chose how
         much the library read and decoded — measured, a cached 16 MiB ``__bytes__`` behind an
-        ``nbytes`` of zero was decoded whole on every visit, the read FR-003 bounds. Such an
-        object is refused here and becomes a type-name placeholder. The two slices above refuse
-        an impostor of their own types on the same terms, since an unbound accessor applies only
-        to an instance of its type.
+        ``nbytes`` of zero was decoded whole on every visit, the read FR-003 bounds. Since
+        SPEC-063 :meth:`_dispatch` routes here by the real type, so an impostor no longer
+        arrives; the refusal stays so that this method's contract does not rest on its caller.
+        A real ``bytearray`` subclass that claims ``bytes`` is read through its own slice rather
+        than refused by the ``bytes`` one, which an ``isinstance`` test here would choose.
 
         Args:
           value: The bytes-like to read.
@@ -543,19 +672,21 @@ class _Coercer:
             guard.
         """
         limit = self._cfg.max_value_bytes + 1
-        if isinstance(value, bytes):
-            return _BYTES_SLICE(value, slice(0, limit))
-        if isinstance(value, bytearray):
-            return bytes(_BYTEARRAY_SLICE(value, slice(0, limit)))
-        if type(value) is not memoryview:
+        kind = type(value)
+        if issubclass(kind, bytes):
+            return _BYTES_SLICE(cast("bytes", value), slice(0, limit))
+        if issubclass(kind, bytearray):
+            return bytes(_BYTEARRAY_SLICE(cast("bytearray", value), slice(0, limit)))
+        if kind is not memoryview:
             raise TypeError("not a memoryview")
-        if value.nbytes < limit:
-            return bytes(value)
-        if value.c_contiguous:
-            return bytes(value.cast("B")[:limit])
-        rows = value.shape[0] if value.shape else 1
-        row = value.nbytes // rows
-        return bytes(value[: -(-limit // row)])
+        view = cast("memoryview[int]", value)
+        if view.nbytes < limit:
+            return bytes(view)
+        if view.c_contiguous:
+            return bytes(view.cast("B")[:limit])
+        rows = view.shape[0] if view.shape else 1
+        row = view.nbytes // rows
+        return bytes(view[: -(-limit // row)])
 
     def _decoded(self, value: bytes) -> str:
         """Decodes bytes as UTF-8, replacing what does not decode and recording that it did.
@@ -589,12 +720,16 @@ class _Coercer:
         ``Mapping[object, object]``. :meth:`key` coerces whatever actually arrives.
 
         An entry's key is rendered and charged *before* its value is visited (SPEC-057 FR-002),
-        so a key that crosses the byte budget leaves its value unread: the entry is written
-        ``"<size limit>": "<size limit>"`` and the mapping ends. That reversed the order of the
-        single assignment it replaced, ``out[self.key(key)] = self.value(item, depth + 1)``,
-        because Python evaluates the right-hand side of a subscript assignment before the
-        subscript. Only a key's charge can stop the pass between the two, since a key visits no
-        value. After the value, a stop from anywhere beneath it ends this mapping too.
+        so a key that stops the pass leaves its value unread: the entry is written as the
+        placeholder of whichever budget stopped it, key and value both — ``"<size limit>":
+        "<size limit>"`` or ``"<node limit>": "<node limit>"`` — and the mapping ends. That
+        reversed the order of the single assignment it replaced,
+        ``out[self.key(key)] = self.value(item, depth + 1)``, because Python evaluates the
+        right-hand side of a subscript assignment before the subscript. Before SPEC-063 only a
+        key's byte charge could stop the pass between the two; a container key now visits its
+        members as values at the entry's value depth, so either budget can stop it there, and
+        the placeholder written is the one in ``_stopped`` (SPEC-063 FR-001). After the value, a
+        stop from anywhere beneath it ends this mapping too.
 
         Args:
           value: The mapping to coerce.
@@ -612,15 +747,16 @@ class _Coercer:
         self._parents.append(ident)
         try:
             out: dict[str, object] = {}
+            child = depth + 1
             for key, item in value.items():
                 if len(out) >= self._cfg.max_keys:
                     self.truncated = True
                     break
-                name = self.key(key)
+                name = self.key(key, child)
                 if self._stopped is not None:
-                    out[_SIZE_LIMIT] = _SIZE_LIMIT
+                    out[self._stopped] = self._stopped
                     break
-                out[name] = self.value(item, depth + 1)
+                out[name] = self.value(item, child)
                 if self._stopped is not None:
                     break
             return out
@@ -660,7 +796,7 @@ class _Coercer:
         finally:
             self._parents.pop()
 
-    def key(self, key: object) -> str:
+    def key(self, key: object, depth: int) -> str:
         """Coerces a mapping key to a bounded string, and is total (SPEC-055 FR-004).
 
         Whatever rendering the key raises — its own ``__str__``, or an unbound accessor refusing
@@ -681,26 +817,31 @@ class _Coercer:
         the loop's other two failures — the ``max_keys`` cap and a value that cannot be coerced
         — already have owners, and a third ``try`` around the loop would hide which one fired.
 
-        The placeholder is text this pass produced, so it is charged as :meth:`produced` text,
-        like every key that is not already a ``str`` (SPEC-057 FR-002).
+        The placeholder is text this pass produced, so it is charged as :meth:`produced` text
+        (SPEC-057 FR-002). A container key's own failure — its iteration raising — reaches this
+        guard too, which is why :meth:`_container_key` walks it without :meth:`value`'s guard:
+        that guard would turn the failure into the value placeholder ``<unserializable: T>``,
+        unmarked, written inside the key's text (SPEC-063 FR-001). The nodes and bytes such a key
+        spent before it failed stay spent.
 
         Args:
           key: The mapping key, of any type.
+          depth: The entry's value depth, at which a container key's members are coerced.
 
         Returns:
-          The bounded string form of the key, the key placeholder, or ``<size limit>`` when its
-          charge spent the byte budget.
+          The bounded string form of the key, the key placeholder, or the placeholder of the
+          budget the key spent.
 
         Raises:
           None.
         """
         try:
-            return self._key(key)
+            return self._key(key, depth)
         except Exception:
             self.truncated = True
             return self.produced(f"<unserializable key: {_type_name(key)}>")
 
-    def _key(self, key: object) -> str:
+    def _key(self, key: object, depth: int) -> str:
         """Renders one mapping key, since JSON object keys are always strings.
 
         An integer key is bounded by :meth:`_bounded_int` first. A bare ``str()`` here would
@@ -726,33 +867,167 @@ class _Coercer:
         shorter than its digits can be cut where its text would have fitted, which errs toward
         the cut.
 
-        A float key goes through :meth:`real` for the same reason. Its rendered form is short —
-        ``real`` computes its placeholder through :data:`_FLOAT_REPR` — but it is still text this
-        pass produced, so it is charged as such. A ``str`` key is the caller's own text and goes
-        to :meth:`text`; every other key's ``str()`` is produced and goes to :meth:`produced`.
+        The integer branch admits by ``type(key) is not bool`` rather than
+        ``not isinstance(key, bool)``, because ``isinstance`` consults ``__class__``: a real ``int``
+        subclass claiming ``bool`` skipped the bound and was rendered by ``str()`` whole —
+        measured at ``71e42dd``, three million digits under ``sys.set_int_max_str_digits(0)``.
+        An object that only claims ``bool`` or ``int`` reaches :meth:`_bounded_int`, whose
+        unbound reads refuse it, and becomes the key placeholder.
+
+        A float key goes through :meth:`real` for the same reason, converted first through
+        :data:`_FLOAT_FLOAT`, so a ``float`` subclass key renders as its exact float rather than
+        through its own ``__str__``, and an impostor becomes the key placeholder (SPEC-063
+        FR-002). A ``(float, Enum)`` member is excluded and keeps ``str()``, as a ``(int, Enum)``
+        member does through its own branch: an ``Enum`` key reads as its name, ``FE.A``, as it
+        did at ``71e42dd``. Its rendered form is short — ``real`` computes its placeholder through
+        :data:`_FLOAT_REPR` — but it is still text this pass produced, so it is charged as such.
+        A ``str`` key is the caller's own text and goes to :meth:`text`.
+
+        **A container key is coerced, not rendered** (SPEC-063 FR-001). A key whose *real* type
+        subclasses ``tuple``, ``list``, ``dict``, ``set`` or ``frozenset`` and not ``Enum`` is
+        handed to :meth:`_container_key`, whose docstring carries the rule, ahead of the
+        claim-based ``str``, ``int`` and ``float`` tests, so a real container claiming one of
+        those is still walked rather than refused by that type's unbound read; a real ``str``
+        subclass, a ``StrEnum`` included, is no container and reaches :meth:`text`. The real type,
+        because
+        an object that only claims through ``__class__`` to be a ``tuple`` is not walked and keeps
+        its own ``str()``, and not an ``Enum``, because a ``(tuple, Enum)`` member keeps
+        ``str()`` as ``Color(int, Enum)`` does, the value route sending an ``Enum`` to its own
+        branch ahead of the sequence one. A ``bytes`` or ``bytearray`` key is priced by
+        :meth:`_bytes_key_fits` before it is rendered. Every other key's ``str()`` is produced
+        text and goes to :meth:`produced`, an object key's default ``str()`` being its ``repr``,
+        the caller's code (SPEC-063, Accepted Limits).
 
         Args:
           key: The mapping key, of any type.
+          depth: The entry's value depth, at which a container key's members are coerced.
 
         Returns:
-          The bounded string form of the key, or ``<size limit>`` when its charge spent the
-          byte budget.
+          The bounded string form of the key, or the placeholder of the budget it spent.
 
         Raises:
-          Exception: Whatever the key's own ``__str__`` raises; :meth:`key` is the guard.
+          Exception: Whatever the key's own ``__str__`` or iteration raises, or the
+            ``TypeError`` an unbound accessor raises for an impostor; :meth:`key` is the guard.
         """
+        kind = type(key)
+        if issubclass(kind, _CONTAINER_KEYS) and not issubclass(kind, Enum):
+            return self._container_key(key, kind, depth)
+        if issubclass(kind, Enum) and issubclass(kind, _ENUM_TEXT_BUILTINS):
+            return self.produced(_enum_text(key))
         if isinstance(key, str):
             return self.text(key)
-        if isinstance(key, int) and not isinstance(key, bool):
+        if isinstance(key, int) and type(key) is not bool:
             rendered, length = self._bounded_int(key)
             if length is not None and self._charged + length - 1 > self._max_bytes:
                 self._halt(_SIZE_LIMIT)
                 return _SIZE_LIMIT
             return self.produced(rendered if isinstance(rendered, str) else str(rendered))
-        if isinstance(key, float):
-            replaced = self.real(key)
+        if isinstance(key, float) and not issubclass(kind, Enum):
+            replaced = self.real(_FLOAT_FLOAT(key))
             return self.produced(replaced if isinstance(replaced, str) else str(replaced))
+        if issubclass(kind, (bytes, bytearray)) and not self._bytes_key_fits(key, kind):
+            self._halt(_SIZE_LIMIT)
+            return _SIZE_LIMIT
         return self.produced(str(key))
+
+    def _container_key(self, key: object, kind: type, depth: int) -> str:
+        """Coerces a builtin-container key as a value and returns the JSON text of the result.
+
+        Before SPEC-063 such a key was rendered by ``str(key)``, the builtin ``repr``, before any
+        budget applied: it recurses through a shared member once per path, so
+        ``f = frozenset({f, (f, i)})`` applied forty times as one key never returned, a tuple of
+        64 references to one 1 MiB string rendered 64 MiB before the byte budget turned it into
+        ``<size limit>``, and each member's ``repr`` was written into the key, against arch §6's
+        no-``repr`` rule. Coerced instead, the key spends one node for itself and the pass's
+        nodes and bytes for its members exactly as a value at the entry's value depth would, and
+        obeys ``max_depth``, ``max_keys`` and the cycle check, so a member past the depth is
+        ``<depth limit>`` inside the text and one that cannot be coerced is its
+        ``<unserializable: T>`` placeholder there.
+
+        The members are walked by :meth:`mapping` for a real ``dict`` subclass and by
+        :meth:`members` otherwise, never through :meth:`_dispatch` or :meth:`value`. Not
+        ``_dispatch``, because its render-through ``isinstance`` branches would hand a real
+        ``tuple`` subclass claiming ``UUID`` or ``Decimal`` to ``str()`` — the builtin ``repr``
+        again, which hung on the DAG and wrote a member's ``repr`` when measured at ``71e42dd``
+        through the value route — and its ``int`` and ``float`` branches would refuse a real
+        container claiming either. Not ``value``, because its guard would turn the key's own
+        failure into a value placeholder where :meth:`key` must see it.
+
+        The text is ``json.dumps`` of the coerced form with the default separators, so ``(1, 2)``
+        is the key ``"[1, 2]"`` and a key whose coerced form is a string, ``<depth limit>`` or
+        ``<circular>``, reads as that string in quotes and cannot collide with a ``str`` key of
+        the same text. It is clipped to ``max_value_bytes`` and marks the event when clipped, but
+        it is not charged: its members were charged as values are, and the punctuation and
+        escapes are bounded by the node count and six times the charged text, like the
+        serialised event (SPEC-057). ``json.dumps`` cannot fail on a coerced tree, whose leaves
+        are exact scalars, finite floats and bounded integers under ``str`` keys. When the walk
+        stops the pass, the stop placeholder is returned unrendered and :meth:`mapping` writes it
+        for the entry's key and value both.
+
+        Args:
+          key: The container key.
+          kind: The key's real type, already tested.
+          depth: The entry's value depth, measured against ``max_depth``.
+
+        Returns:
+          The key's text, or the placeholder of the budget its walk spent.
+
+        Raises:
+          Exception: Whatever the key's own iteration raises; :meth:`key` is the guard.
+        """
+        if self._nodes >= self._max_nodes:
+            self._halt(_NODE_LIMIT)
+            return _NODE_LIMIT
+        self._nodes += 1
+        coerced: object
+        if depth >= self._cfg.max_depth:
+            self.truncated = True
+            coerced = _DEPTH_LIMIT
+        elif issubclass(kind, dict):
+            coerced = self.mapping(cast("Mapping[Any, object]", key), depth)
+        else:
+            coerced = self.members(cast("Iterable[object]", key), depth)
+        if self._stopped is not None:
+            return self._stopped
+        clipped, altered, _ = _clip(
+            json.dumps(coerced, ensure_ascii=False), self._cfg.max_value_bytes
+        )
+        if altered:
+            self.truncated = True
+        return clipped
+
+    def _bytes_key_fits(self, key: object, kind: type) -> bool:
+        """Returns whether a bytes-like key's rendered form can fit the pass's byte budget.
+
+        A ``bytes`` or ``bytearray`` key is rendered by ``str(key)``, its repr, up to four
+        characters per byte, so before SPEC-063 it cost its repr before the budget saw it:
+        measured at ``71e42dd``, a 64 MiB ``b"\\x00"`` key was rendered to 256 MiB (a
+        ``tracemalloc`` peak) and only then became ``<size limit>``. It is priced first at the
+        repr's upper bound, four characters per byte plus the ``b''`` around them, from its
+        length read through :data:`_BYTES_LEN` or :data:`_BYTEARRAY_LEN`, which the caller's
+        ``__len__`` cannot divert. When the pass's charge plus that bound would cross the budget,
+        the key is refused unrendered, as an integer key is (SPEC-057 FR-002); otherwise it is
+        rendered and charged its actual length by :meth:`produced`. The bound errs toward the
+        cut, refusing a short key whose repr would have fitted, and a ``bytearray``'s repr adds
+        its type name to it, which the actual charge then counts; what it guarantees is that a
+        refused key is never rendered and a rendered one costs at most the bound plus a type
+        name.
+
+        Args:
+          key: The bytes-like key.
+          kind: The key's real type, a ``bytes`` or ``bytearray`` subclass.
+
+        Returns:
+          ``True`` when the key may be rendered.
+
+        Raises:
+          None.
+        """
+        if issubclass(kind, bytes):
+            length = _BYTES_LEN(cast("bytes", key))
+        else:
+            length = _BYTEARRAY_LEN(cast("bytearray", key))
+        return self._charged + 4 * length + 3 <= self._max_bytes
 
     def _bounded_int(self, value: int) -> tuple[object, int | None]:
         """Returns an integer unchanged with its rendered length, or a placeholder when too long.
@@ -901,7 +1176,9 @@ class _Coercer:
         """Applies ``max_value_bytes`` to text this pass made, and charges the making of it.
 
         Text the pass produces by calling ``str()`` or ``isoformat()`` — a ``Decimal``, ``UUID``,
-        date or time, an enum's fallback, a key that is not a ``str``, a type-name placeholder —
+        date or time, an enum's fallback, a key that is neither a ``str`` nor a builtin
+        container (whose members are charged as values instead, SPEC-063), a type-name
+        placeholder —
         did not exist until the pass made it, so its length *is* the work: one ``Decimal`` of ten
         million digits referenced 256 times is 2,560,000,000 characters of ``str()``, which
         clipping afterwards does not undo. It is charged the larger of its length in characters
@@ -953,23 +1230,57 @@ class _Coercer:
         return self.produced(f"<unserializable: {_type_name(value)}>")
 
 
+def _enum_text(member: object) -> str:
+    """Returns ``Enum.__str__``'s default text for a member, computed without calling ``str()``.
+
+    The stored type name, through :func:`_type_name`, then ``.``, then the member's ``_name_``
+    through :data:`_STR_STR`, which returns an exact ``str`` for a ``str`` subclass and raises
+    ``TypeError`` for anything else. For an ordinary ``(tuple, Enum)`` member that is the text
+    ``str()`` gave, ``TE.A``; for a ``ReprEnum`` or an mro-forged member, whose ``str()`` is the
+    builtin's ``repr``, it is the same text where the ``repr`` wrote its members and recursed
+    through a shared one once per path (:data:`_ENUM_TEXT_BUILTINS`). The ``_name_`` read is the
+    caller's attribute, which may raise; the coercer's guard then writes the type-name placeholder,
+    as for any value or key whose rendering raised.
+
+    Args:
+      member: The ``Enum`` member, whose real type subclasses a builtin container or bytes.
+
+    Returns:
+      The member's ``Type.NAME`` text.
+
+    Raises:
+      TypeError: When the member's ``_name_`` is not a ``str``; the coercer is the guard.
+      Exception: Whatever reading ``_name_`` raises; the coercer is the guard.
+    """
+    return f"{_type_name(member)}.{_STR_STR(cast('Enum', member)._name_)}"
+
+
 def _type_name(value: object) -> str:
     """Returns a value's type name, or ``"?"`` when even that cannot be read.
 
-    Shared by both placeholders so the no-``repr`` rule has one implementation. A metaclass
-    whose ``__name__`` is a raising property is the case the fallback exists for.
+    Shared by both placeholders so the no-``repr`` rule has one implementation, and by
+    ``model``'s ``error`` sub-document and stack fallback. The name is the one the type stores,
+    read through :data:`_STORED_NAME` and then :data:`_STR_STR` (SPEC-063 FR-002). Before it,
+    ``type(value).__name__`` was resolved through the metaclass: measured at ``71e42dd``, a
+    metaclass whose ``__name__`` property raised made every placeholder ``?``, one returning
+    ``42`` or ``"renamed"`` named the type that, and in ``model`` the first two cost a span its
+    events. The ``str.__str__`` is needed because ``type.__name__``'s setter accepts a ``str``
+    subclass, which the descriptor then returns: measured on ``71e42dd``'s code with the read
+    alone in place, a subclass whose ``__format__`` returned ``"HIJACK"`` renamed the placeholder
+    through the f-string that embeds it, and one whose ``__str__`` raised took every sibling in
+    ``fields`` with it. The fallback ``"?"`` stays as a guard.
 
     Args:
       value: The value whose type is named.
 
     Returns:
-      The type's ``__name__``, or ``"?"``.
+      The type's stored name as an exact ``str``, or ``"?"``.
 
     Raises:
       None.
     """
     try:
-        return str(type(value).__name__)
+        return _STR_STR(_STORED_NAME(type(value)))
     except Exception:
         return "?"
 
@@ -1006,7 +1317,8 @@ def sanitize_fields(
     uniformly empty event. The truncation flag drives the event's ``truncated`` marker, so it
     must reflect ceilings that fired arbitrarily deep in the structure — hence the accumulator
     rather than a pure recursive function. The call is one pass, with its own node and byte
-    budgets (SPEC-057); the top-level mapping and the keys are not values, so they spend no node.
+    budgets (SPEC-057). The top-level mapping is not a value and spends no node; a key that is a
+    builtin container spends one, and its members spend theirs, as a value would (SPEC-063).
 
     Args:
       fields: The mapping to coerce.
@@ -1048,10 +1360,10 @@ class _TypesOnly:
     A transform's output is coerced for type only (SPEC-058 FR-001): what a transform adds is the
     caller's code choosing the size, so ``max_value_bytes`` and ``max_keys`` are lifted to
     ``sys.maxsize`` and ``max_depth`` is the fixed bound rather than the configured one. A
-    stand-in rather than a ``Config`` because a ``Config`` validates its ceilings, and because
-    the coercer reads exactly these three attributes — which
-    ``tests/test_transform_coercion.py`` derives from ``_Coercer``'s source, so a fourth read
-    there fails a test rather than an event.
+    stand-in rather than a ``Config`` because the coercer reads exactly these three attributes —
+    which ``tests/test_transform_coercion.py`` derives from ``_Coercer``'s source, so a fourth
+    read there fails a test rather than an event. Validation is not the reason:
+    ``configure()`` validates the ceilings; a hand-built ``Config`` does not.
 
     Attributes:
       max_value_bytes: No per-value ceiling.

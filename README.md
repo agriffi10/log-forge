@@ -1377,7 +1377,10 @@ Every value you pass is made JSON-safe and given a size ceiling once, when the e
 Strings are clipped to `max_value_bytes` (8192 by default), mappings and sequences to `max_keys`
 entries and `max_depth` levels. `datetime`, `UUID`, `Decimal`, `bytes` and friends render as
 strings; anything with no JSON form becomes `<unserializable: TypeName>` — the type name only,
-never a `repr`, so coercion can never leak a value the library was careful not to capture.
+never a `repr`, so coercion can never leak a value the library was careful not to capture. The
+exception is an object that claims, through `__class__`, to be a `UUID`, `Decimal`, `datetime` or
+`Enum`, as a transparent proxy does: it renders through that claim with its own `str()`,
+`isoformat()` or `.value`.
 
 **Floats that are not finite are replaced.** `NaN`, `Infinity` and `-Infinity` are values Python
 produces readily — a division that underflowed, a ratio over an empty window — and `json.dumps`
