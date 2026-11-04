@@ -1049,9 +1049,8 @@ close it.
   `BAGGAGE_MAX_BYTES` by whole members, as a prefix, because a value at the default ceiling alone
   exceeded the size the next process's `parse_baggage_header` accepts and had it refuse the whole
   header; a member with an empty key is skipped for the same reason, and a drop is announced on
-  stderr as a count. What stays open is the spoofed-scalar route above: an object that survives
-  coercion can still reach `str()` in the header with assembly's exposure, and the guard only makes
-  that raise a placeholder. The reasoning and its rejected alternatives: *The outbound baggage
+  stderr as a count. The spoofed-scalar route this entry left open was closed by SPEC-063: no
+  object survives coercion as itself any more, so the guard is a backstop for any coercer. The reasoning and its rejected alternatives: *The outbound baggage
   header renders through assembly's coercion and is capped by whole members*.
 - ~~**`HoneycombSink` never reads its per-event verdict**~~ (found by the system-frame review of
   #283; invariant 2) → **closed by the fix that overrides `HoneycombSink._handle_response`**.

@@ -6,7 +6,7 @@ description: "one `sanitize_fields` pass over the baggage, guarded at render not
 
 **The outbound baggage header renders through assembly's coercion and is capped by whole members.** `format_baggage_header` makes one `sanitize.sanitize_fields` pass over the whole baggage, under the node and byte budgets of SPEC-057 and the configured ceilings, then renders each coerced value as text (an exact `str` as it is, anything else with `str()`) and percent-encodes it. The guard binds at **render**, not at intake: `set_baggage` still stores arbitrary objects, because the event coerces them at assembly (invariant 8: once, at assembly), and the inbound route (`continue_trace`, then `parse_baggage_header`) already yields only capped `str` values. Before this, the header rendered with a bare `str()`: a shared-sublist DAG never returned, a value whose `__str__` raises raised into the caller, a lone surrogate (reachable from both `set_baggage` and an inbound header) raised `UnicodeEncodeError` from `quote`, and an integer past CPython's 4,300-digit limit raised `ValueError` — against `Raises: None.` (invariant 1), and in disagreement with event assembly over the same baggage (invariant 6).
 
-**The guard wraps the whole per-member render**, `str()` and both `quote` calls, because a `__str__` returning a `str` subclass with a raising `encode` gets past `str()` and fails in `quote`. A failing value becomes `<unserializable: T>`, named by `sanitize._type_name` (`"?"` when the name itself raises), never by `repr`. It catches `Exception`, never `BaseException`.
+**The guard wraps the whole per-member render**, `str()` and both `quote` calls, because a `__str__` returning a `str` subclass with a raising `encode` gets past `str()` and fails in `quote`. A failing value becomes `<unserializable: T>`, named by `sanitize._type_name`, which since SPEC-063 reads the stored name, so a metaclass `__name__` can neither raise nor rename it, never by `repr`. It catches `Exception`, never `BaseException`.
 
 **The header is at most `BAGGAGE_MAX_BYTES` (8192), by whole members, as a prefix.** Members are kept in the coerced mapping's order while the header, commas included, fits; the first one that does not fit ends it, and it and every member after it are dropped even where a later one is small. A partial member is never emitted, and one member that alone exceeds the cap yields `""`. The cap is the size the next log-foundry process's `parse_baggage_header` accepts, so the formatter never emits what its twin refuses whole. For the same reason a member whose encoded key is empty (`=1`, which the parser refuses) is skipped without ending the header.
 
@@ -21,9 +21,14 @@ description: "one `sanitize_fields` pass over the baggage, guarded at render not
 - *A `health()` counter*: `health()` is the ledger of events (invariant 2), a baggage member is not one, and a counter widens the frozen public surface (invariant 10) for a loss the stderr line already announces.
 - *A bare `+=`, or a lock, around the total*: `+=` can lose an increment so a line's count would not reproduce (invariant 11), and a new lock in `context.py` is a fork hazard (invariant 12); `next()` on a count is atomic under the GIL and needs neither. This deviates deliberately from `docs/best-practices/python/python.md` §13, which says not to rely on a built-in's atomicity across threads: on a free-threaded build an increment could be lost, and that costs only the exactness of a diagnostic count, never a header.
 
-**Do NOT** edit `sanitize.py` for this (a spoofed-scalar object that survives coercion can still reach `str()` here, with the same exposure assembly has, until its sibling spec closes the routes), and do not add a W3C 64-member cap: `max_keys` bounds the count at 256 and the byte cap is what the parser enforces. (SPEC-064)
+**Do NOT** edit `sanitize.py` for this (the spoofed-scalar route that let an object survive coercion and reach `str()` here was closed in `sanitize.py` by SPEC-063, its sibling spec), and do not add a W3C 64-member cap: `max_keys` bounds the count at 256 and the byte cap is what the parser enforces. (SPEC-064)
 
 ## History
+
+### 2026-11-04
+
+- **Refined** (SPEC-063): the spoofed-scalar route is closed, and `_type_name` reads the stored
+  name, so a placeholder names the real class where it was `"?"`.
 
 ### 2026-11-03
 
