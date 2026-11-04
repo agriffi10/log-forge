@@ -12,6 +12,10 @@ with the other eight.
   `decorator._warn_rejected` unchanged for a `str`) and `errno_of(exc)`. All 28 sites converted
   across `worker`, `decorator` and 17 sink modules. `api` needed nothing — SPEC-025 had already
   converted it.
+
+  > **Superseded by SPEC-067.** `rejected` no longer echoes SPEC-014's bounded `repr`: a `str` is
+  > its first 64 characters, quoted and escaped, anything else is `<TypeName>`, and no code of the
+  > value runs. See the failure-paths decision `one-module-writes-every-diagnostic-…`.
 - **An exception is named by type, never by `repr`** (FR-002). Twelve sites interpolated `{err!r}`.
   `PostgresSink` was the sharpest: `_row` binds the whole `json.dumps(event)` as a statement
   parameter and a psycopg error repr reprints the failing statement *and its bound parameters*, so

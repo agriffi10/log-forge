@@ -57,6 +57,12 @@ This spec routes every diagnostic through one helper that applies both rules, on
 - **The `_warn_rejected` echo in `decorator.py`.** It already bounds and `repr`-escapes an
   attacker-controllable value deliberately (SPEC-014), and that reasoning is sound. It moves to the
   new module unchanged in behaviour.
+
+  > **Superseded by SPEC-067.** `rejected` no longer takes a `repr` of the value: a `repr` taken
+  > before the cut never returned on a shared-sublist list and lost the line on a raising
+  > `__repr__`. A `str` is echoed as its first 64 characters, quoted and escaped, and anything else
+  > as `<TypeName>`, with no code of the value run. The decision lives in
+  > `docs/decisions/failure-paths/one-module-writes-every-diagnostic-so-the-rules-are-applied-once-rather-than-remembered-twenty-eight-times.md`.
 - **Structured (JSON) diagnostics.** These lines are for humans; the structured stream is the sink.
 
 ---
@@ -107,6 +113,11 @@ already bounds and escapes an inbound value.
 - [ ] `_warn_rejected`'s existing bounded-`repr` behaviour for inbound trace context is preserved
       exactly (its input is an inbound *header*, not an exception, and it is the one place a bounded
       `repr` is correct).
+
+  > **Superseded by SPEC-067.** No `repr` is correct here either: `rejected` now echoes a `str` by
+  > its first 64 characters and anything else by type name, running no code of the value, and still
+  > writes the line (`<?>`) when even that cannot be computed. See the failure-paths decision
+  > `one-module-writes-every-diagnostic-…`.
 
 ### FR-003: A diagnostic can never be the failure
 
@@ -164,6 +175,10 @@ def lost(what: str, count: int, detail: str = "") -> None:
 def rejected(reason: str, value: object) -> None:
     """An inbound value the library refused — bounded, repr-escaped (SPEC-014). Never raises."""
 ```
+
+> **Superseded by SPEC-067.** `rejected`'s echo is no longer a `repr` of the value: a `str` is its
+> first 64 characters, quoted and escaped, anything else is `<TypeName>`, and no code of the value
+> runs. See the failure-paths decision `one-module-writes-every-diagnostic-…`.
 
 `_diag.py` imports nothing from the package, so it can be used from any module — `worker`,
 `decorator`, `api`, and every sink — without an import cycle. It is the same discipline
