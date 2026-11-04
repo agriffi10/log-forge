@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-061
 title: "`NATSSink` Liveness and a Bounded Close"
 description: "Gives NATSSink a loop that runs for its whole life, a server round trip before every publish and after every core batch, and a close the sink itself bounds."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-047]
 ---
 
