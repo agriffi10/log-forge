@@ -948,32 +948,6 @@ close it.
   omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
   endpoint's response shape gets settled.
 
-- **A float passes the `max(x, 0)` floor on `max_retries` and `backup_count`, and breaks every
-  `emit`** (SPEC-065 system-frame review; invariant 13). Thirteen constructors floor `max_retries`
-  with `max(max_retries, 0)` — `HTTPSink`, `SocketTransport`, `SQSSink`, the Redis, Kinesis,
-  Firehose, SNS, Event Hubs, MongoDB, Postgres, ClickHouse and RabbitMQ sinks, and the worker — and
-  `max()` passes a float through to `range(retries + 1)`. Measured at `13318d4`:
-  `HTTPSink(url, max_retries=2.5).emit([e])` raises `TypeError: 'float' object cannot be interpreted
-  as an integer` with `failed=0`, as do `nan` and `inf`, and `SyslogSink(max_retries=2.5)` the same.
-  `RotatingFileSink(backup_count=2.5)` (or `inf`) raises from `range(...)` on the first rollover
-  *after* `_rotate` has closed the stream, so every later `emit` and `close()` raise
-  `ValueError: I/O operation on closed file` — the sink is dead for the life of the process.
-  **Closed by** refusing a non-`int` there with a named `TypeError` and flooring only the exact
-  `int`, as SPEC-065 did for `configure()`'s ceilings.
-- **`flush(timeout=)` and `shutdown(timeout=)` take `inf` and `nan` unchecked** (SPEC-065
-  system-frame review; invariants 1 and 13). Measured at `13318d4`, one process per value, with a
-  worker draining to a 0.4 s sink: `shutdown(timeout=math.inf)` and `shutdown(timeout=1e300)` raise
-  `OverflowError: timestamp out of range for platform time_t` into the caller and
-  `shutdown(timeout=math.nan)` raises `ValueError`, against `Raises: None`;
-  `flush(timeout=math.inf)` returns at once with reason `thread-died` while the thread is alive,
-  having delivered nothing, and `flush(timeout=math.nan)` reports `timed-out` at 0.00 s. **Closed
-  by** deciding, beside the SPEC-062 exit-drain budget, what each of the two degenerate values
-  means for a bounded wait, and refusing or flooring it by the sink-delivery rule.
-- **`SocketTransport(port=2.5)` is accepted and raises out of every `emit`** (SPEC-065
-  system-frame review; invariant 13). `_socket.py` checks `0 <= port <= 65535`, which a float
-  passes; measured at `13318d4`, UDP `sendto` then raises a raw `TypeError` on every batch — the
-  SPEC-049 port finding's shape, for a float. **Closed by** an `isinstance(port, int)` check with
-  the exact `int` stored, beside the range check.
 - **Queued items are announced twice on an expired exit drain** (SPEC-062 frame-2 review;
   invariant 2). The `ShutdownTimeout` line reports the queue as lost, and the decline or abandon
   line reports the same items again once `_final_drain` takes them, while their future is still
@@ -999,6 +973,25 @@ close it.
   `name=`. Reproduced at `97436c7`. It needs a deliberately lying `__class__`, and it is outside the
   inbound path SPEC-067 settled. **Closed by** testing `issubclass(type(name), str)` at
   decoration and keeping the exact `str` (`str.__str__`), as `continue_trace` does since SPEC-067.
+- **`NATSSink`'s float timeouts are forwarded to the driver unchecked** (SPEC-066, found while
+  closing the int doors; invariant 13). `connect_timeout`, `reconnect_time_wait` and
+  `drain_timeout` go into `nats.connect(**supplied)` exactly as given whenever they are not
+  `None` — no type check and no value check — so a `nan`, `inf` or a negative reaches `nats-py`
+  from the constructor. SPEC-061 also reads `drain_timeout` for the sink's own close deadline,
+  through `usable_timeout`, so a non-number there now raises that comparison's unnamed `TypeError`
+  at construction, while the driver still receives it unjudged. They are float doors, not the int
+  doors SPEC-066 closed, and `nats.py` was being rewritten by SPEC-061 while SPEC-066 was built,
+  so SPEC-066 changed only `max_reconnect_attempts` there. **Closed by** judging each by the
+  sink-delivery rule — refused if no value of that kind has a working configuration to protect,
+  floored through `usable_timeout` if one does.
+- **A `float` timeout too large for a socket constructs and raises out of every `emit`** (SPEC-066
+  second diff review, found while closing the int doors; invariant 13). `_retry.require_timeout`
+  accepts any positive finite number, and `socket.settimeout` raises `OverflowError` above about
+  `9.2e9` seconds (the platform's `PyTime_t`), so `HTTPSink(timeout=1e10)` constructs and its
+  `emit` raises that `OverflowError` uncounted — not an `OSError`, so the retry guard never sees
+  it. It is a `float` door of SPEC-049's, not an `int` door, so SPEC-066 did not change it.
+  **Closed by** an upper bound in `require_timeout` at what the socket accepts, refused rather
+  than floored if no value above it delivers — once the bound and its message are settled.
 
 ### Resolved
 
@@ -1057,6 +1050,32 @@ close it.
   exact `str`, and `continue_trace` turns a subclass into the exact `str` it holds once, on entry.
   The reasoning and its rejected alternatives: *An inbound value runs no code of its own anywhere
   on the inbound path*.
+- ~~**A float passes the `max(x, 0)` floor on `max_retries` and `backup_count`, and breaks every
+  `emit`**~~ (SPEC-065 system-frame review; invariant 13) → **closed by SPEC-066**. Every `int`
+  floor in a sink constructor and the worker — `max_retries` on twelve sink constructors and
+  `Worker.__init__`, `RotatingFileSink`'s `max_bytes` and `backup_count`, `HTTPSink`'s
+  `max_batch_count`, `PostgresSink`'s `connect_timeout` and `GooglePubSubSink`'s `max_pending` —
+  goes through `_retry.floor_count`, which refuses a non-`int` with a `TypeError` naming the class,
+  the argument and the type, and floors the exact `int` the value holds (`int.__index__`), so a
+  negative still floors and a subclass whose comparison lies can no longer keep one. Each judgement
+  precedes any client, connection or file the constructor builds. `GooglePubSubSink(max_pending=inf)`,
+  which meant no bound, is refused with the rest. `tests/test_numeric_door_roster.py` derives the
+  sites from the AST and fails naming any new `int` floor or range check left unjudged.
+- ~~**`flush(timeout=)` and `shutdown(timeout=)` take `inf` and `nan` unchecked**~~ (SPEC-065
+  system-frame review; invariants 1 and 13) → **closed by SPEC-066**. Both pass `timeout` through
+  `_retry.wait_budget` at entry, before anything is claimed or counted: `inf`, or any value above
+  `threading.TIMEOUT_MAX`, is the unbounded wait `None` is; `nan` is refused with `ValueError` and a
+  value that is not an `int`, a `float` or `None` with `TypeError`, both naming `timeout`; a value
+  below `-threading.TIMEOUT_MAX` becomes `0.0`, so no negative overflows the deadline sum. Zero and
+  negatives keep their meaning, and a refused `shutdown()` leaves the process unretired, so a retry
+  with a good value drains and closes.
+- ~~**`SocketTransport(port=2.5)` is accepted and raises out of every `emit`**~~ (SPEC-065
+  system-frame review; invariant 13) → **closed by SPEC-066**. The port goes through
+  `_retry.exact_int`, rebound to the parameter, and the `0`–`65535` range check runs on the exact
+  `int` it returns, so a float, `nan`, `inf` or `str` is refused with a `TypeError` naming `port`,
+  and an `int` subclass is judged by the number it holds. `SyslogSink` and `LogstashSink` refuse it
+  through the transport they build. `NATSSink.max_reconnect_attempts` was closed the same way.
+
 - ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
   invariant 13) → **closed by SPEC-065**. `config._require_positive` tested only `value < 1`, so a
   `float`, `nan` or `inf` was stored as given and `sanitize` then did integer arithmetic on it on

@@ -6,6 +6,8 @@ Every test here is in-process. Timing assertions use generous bounds and assert 
 
 from __future__ import annotations
 
+import decimal
+import fractions
 import json
 import math
 import threading
@@ -1176,3 +1178,184 @@ def test_usable_timeout_still_raises_the_comparisons_error_for_a_non_number() ->
     """FR-004 description: a non-number is passed through unchanged and the `<` still raises."""
     with pytest.raises(TypeError, match="not supported between instances"):
         usable_timeout("5", 7.0)  # type: ignore[arg-type]
+
+
+# --- SPEC-066 FR-001: exact_int and floor_count, the int doors' judgement ----------------------
+
+
+class Lie(int):
+    """An int subclass whose `<` and `>` both return False, so `max(Lie(-3), 0)` keeps the Lie."""
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    ("bad", "type_name"),
+    [
+        (2.5, "float"),
+        (math.nan, "float"),
+        (math.inf, "float"),
+        ("2", "str"),
+        (None, "NoneType"),
+        (b"2", "bytes"),
+        (fractions.Fraction(2), "Fraction"),
+        (decimal.Decimal(2), "Decimal"),
+    ],
+    ids=["2.5", "nan", "inf", "str", "None", "bytes", "Fraction", "Decimal"],
+)
+def test_exact_int_refuses_a_non_int_naming_the_owner_argument_and_type(
+    bad: object, type_name: str
+) -> None:
+    """A float was floored straight through by `max`; a str raised an unnamed comparison error."""
+    from log_foundry.sinks._retry import exact_int
+
+    with pytest.raises(TypeError) as info:
+        exact_int(bad, "n", "OwnerSink")  # type: ignore[arg-type]
+    assert str(info.value) == f"OwnerSink n must be an integer, not {type_name}"
+
+
+@pytest.mark.parametrize(
+    ("value", "held"),
+    [(True, 1), (False, 0), (Lie(-3), -3), (Lie(3), 3), (Sub(7), 7), (10**30, 10**30)],
+    ids=["True", "False", "Lie(-3)", "Lie(3)", "Sub(7)", "10**30"],
+)
+def test_exact_int_returns_the_exact_int_a_bool_or_subclass_holds(value: int, held: int) -> None:
+    """The caller never keeps the subclass, whose operators may lie downstream."""
+    from log_foundry.sinks._retry import exact_int
+
+    returned = exact_int(value, "n", "OwnerSink")
+    assert returned == held
+    assert type(returned) is int
+
+
+@pytest.mark.parametrize(
+    ("value", "floor", "expected"),
+    [(Lie(-3), 0, 0), (Lie(3), 0, 3), (-1, 0, 0), (True, 1, 1), (False, 1, 1), (5, 2, 5)],
+    ids=["Lie(-3)", "Lie(3)", "-1", "True-floor-1", "False-floor-1", "5-floor-2"],
+)
+def test_floor_count_floors_the_exact_int_not_the_callers_object(
+    value: int, floor: int, expected: int
+) -> None:
+    """A bare `max(x, floor)` returns `x` itself when it is not below: a Lie kept -3, True stayed True."""
+    from log_foundry.sinks._retry import floor_count
+
+    returned = floor_count(value, floor, "n", "OwnerSink")
+    assert returned == expected
+    assert type(returned) is int
+
+
+@pytest.mark.parametrize("bad", [2.5, math.nan, math.inf], ids=["2.5", "nan", "inf"])
+def test_floor_count_refuses_before_flooring(bad: float) -> None:
+    """`max(2.5, 0)` is 2.5 and `max(nan, 0)` is nan: the floor never refuses a float on its own."""
+    from log_foundry.sinks._retry import floor_count
+
+    with pytest.raises(TypeError, match=r"^OwnerSink n must be an integer, not float$"):
+        floor_count(bad, 0, "n", "OwnerSink")  # type: ignore[arg-type]
+
+
+# --- SPEC-066 FR-004: wait_budget, the public waits' one normalisation -------------------------
+
+
+class PosLie(float):
+    """A float subclass holding 0.0 whose comparisons and `__float__` all say it is positive."""
+
+    def __float__(self) -> float:
+        return 5.0
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    "value", [None, math.inf, 1e300, 10**400], ids=["None", "inf", "1e300", "10**400"]
+)
+def test_wait_budget_maps_none_and_unbounded_values_to_none(value: float | None) -> None:
+    """The owner's decision: inf, and anything above TIMEOUT_MAX, is the unbounded wait None is."""
+    from log_foundry.sinks._retry import wait_budget
+
+    assert wait_budget(value, "timeout") is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [threading.TIMEOUT_MAX, 2.0, 0, -1, -threading.TIMEOUT_MAX],
+    ids=["TIMEOUT_MAX", "2.0", "0", "-1", "-TIMEOUT_MAX"],
+)
+def test_wait_budget_passes_timeout_max_and_ordinary_values_unchanged(value: float) -> None:
+    """TIMEOUT_MAX already worked on both calls, so the upper test is a strict `>`."""
+    from log_foundry.sinks._retry import wait_budget
+
+    returned = wait_budget(value, "timeout")
+    assert returned == value
+    assert type(returned) is type(value)
+
+
+@pytest.mark.parametrize(
+    "value", [-math.inf, -1e300, -(10**400)], ids=["-inf", "-1e300", "-10**400"]
+)
+def test_wait_budget_clamps_a_negative_past_the_platform_bound_to_zero(value: float) -> None:
+    """`monotonic() + -10**400` raised OverflowError; a clamped zero keeps 'do not wait'."""
+    from log_foundry.sinks._retry import wait_budget
+
+    returned = wait_budget(value, "timeout")
+    assert returned == 0.0
+    assert type(returned) is float
+
+
+def test_wait_budget_refuses_nan() -> None:
+    from log_foundry.sinks._retry import wait_budget
+
+    with pytest.raises(ValueError, match=r"^timeout must not be NaN$"):
+        wait_budget(math.nan, "timeout")
+
+
+@pytest.mark.parametrize(
+    ("bad", "type_name"),
+    [
+        ("5", "str"),
+        (b"5", "bytes"),
+        (object(), "object"),
+        (fractions.Fraction(2), "Fraction"),
+        (decimal.Decimal(2), "Decimal"),
+    ],
+    ids=["str", "bytes", "object", "Fraction", "Decimal"],
+)
+def test_wait_budget_refuses_a_non_number_naming_the_accepted_types(
+    bad: object, type_name: str
+) -> None:
+    """A Fraction worked by duck typing; the message says what is accepted rather than 'not a number'."""
+    from log_foundry.sinks._retry import wait_budget
+
+    with pytest.raises(TypeError) as info:
+        wait_budget(bad, "timeout")  # type: ignore[arg-type]
+    assert str(info.value) == (
+        f"timeout must be an int or float number of seconds, or None, not {type_name}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "held", "kind"),
+    [(True, 1, int), (PosLie(0.0), 0.0, float), (Sub(5), 5, int)],
+    ids=["True", "PosLie(0.0)", "Sub(5)"],
+)
+def test_wait_budget_reads_a_bool_or_subclass_as_the_exact_builtin(
+    value: float, held: float, kind: type
+) -> None:
+    from log_foundry.sinks._retry import wait_budget
+
+    returned = wait_budget(value, "timeout")
+    assert returned == held
+    assert type(returned) is kind

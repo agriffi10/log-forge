@@ -18,7 +18,14 @@ from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import clamp_server_delay, require_positive, require_timeout, wait
+from log_foundry.sinks._retry import (
+    clamp_server_delay,
+    exact_seconds,
+    floor_count,
+    require_positive,
+    require_timeout,
+    wait,
+)
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = [
@@ -842,14 +849,25 @@ class HTTPSink:
           gzip: Whether to compress the body.
           max_retries: Retries after a failing request, floored at zero as ``Worker._emit``
             floors its own (SPEC-021) — a negative value otherwise skipped the loop entirely, so
-            the request was abandoned with no attempt made and no counter moved.
-          max_retry_after: Ceiling on a server-supplied ``Retry-After``. It is neither floored
-            nor rejected here, because ``clamp_server_delay`` refuses an unusable ceiling and
-            falls back to exponential backoff, keeping the validation in one place; it is stored
-            as given so a caller can read back what they passed.
+            the request was abandoned with no attempt made and no counter moved. Anything but an
+            ``int`` is refused with ``TypeError`` (SPEC-066 FR-001): ``2.5`` used to construct and
+            then raise out of ``range()`` on every batch with nothing counted. A ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds.
+          max_retry_after: Ceiling on a server-supplied ``Retry-After``, an ``int`` or a
+            ``float``. Its *value* is neither floored nor rejected here: a ceiling that is zero,
+            negative or ``NaN`` reaches ``clamp_server_delay``, which answers it by falling back
+            to exponential backoff, keeping that judgement in one place. Its *type* is judged here
+            (SPEC-066 FR-002): anything but an ``int`` or ``float`` is refused with ``TypeError``,
+            because a ``str`` or ``None`` used to construct and then raise an uncounted
+            ``TypeError`` out of every ``emit`` that met a ``Retry-After`` header. It is stored as
+            the exact ``int`` or ``float`` it holds, so a subclass whose comparisons lie is judged
+            by its number, and reads back as that number.
           max_batch_count: Entries one request may carry, or ``None`` for this class's
             :attr:`MAX_BATCH_COUNT`. Floored at one, since a zero or negative bound would make
-            every event oversized and discard the batch.
+            every event oversized and discard the batch. A supplied value that is not an ``int``
+            is refused with ``TypeError`` (SPEC-066 FR-002) — ``2.5`` chunked by three, ``nan`` by
+            one and ``inf`` without a limit, silently. The class attribute is the library's (or a
+            subclass's) own figure, so it is floored but not judged.
           max_batch_bytes: Bytes one request's body may reach, or ``None`` for this class's
             :attr:`MAX_BATCH_BYTES`. **Refused** when not positive rather than floored (SPEC-049,
             system-frame review): the floor at one this used to apply is not the count floor's
@@ -864,6 +882,9 @@ class HTTPSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` or a supplied ``max_batch_count`` is not an ``int``, or
+            ``max_retry_after`` is not an ``int`` or ``float`` (SPEC-066), the message carrying the
+            subclass's own name as the ``ValueError`` does.
           ValueError: If the URL carries a user or password before its host, its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
             build a request line for it or for the method,
@@ -885,10 +906,14 @@ class HTTPSink:
         self.body_format = body_format
         self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip
-        self.max_retries = max(max_retries, 0)
-        self.max_retry_after = max_retry_after
-        self.max_batch_count = max(
-            max_batch_count if max_batch_count is not None else self.MAX_BATCH_COUNT, 1
+        self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
+        self.max_retry_after = exact_seconds(
+            max_retry_after, "max_retry_after", type(self).__name__
+        )
+        self.max_batch_count = (
+            floor_count(max_batch_count, 1, "max_batch_count", type(self).__name__)
+            if max_batch_count is not None
+            else max(self.MAX_BATCH_COUNT, 1)
         )
         self.max_batch_bytes = (
             require_positive(max_batch_bytes, "max_batch_bytes", type(self).__name__)

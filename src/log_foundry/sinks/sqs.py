@@ -14,7 +14,7 @@ from typing import Any, NamedTuple
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["DedupIdSource", "GroupIdSource", "SQSSink"]
@@ -125,7 +125,9 @@ class SQSSink:
           client: A boto3-shaped SQS client, or ``None`` to build one lazily.
           max_retries: Retries for the failed entries of a chunk, floored at zero as
             ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having sent nothing, and reported success.
+            having sent nothing, and reported success. Anything but an ``int`` is refused
+            with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds.
           fifo: Overrides the queue type. AWS requires every FIFO queue name to end in
             ``.fifo``, so the suffix is a contract rather than a guess, but an explicit flag
             still wins.
@@ -138,9 +140,11 @@ class SQSSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ValueError: If a constant group id is blank.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
         if isinstance(message_group_id, str) and not message_group_id.strip():
             raise ValueError(
                 "message_group_id must be a non-empty string; pass None to group by trace_id"
@@ -151,7 +155,6 @@ class SQSSink:
             client = boto3.client("sqs")
         self.queue_url = queue_url
         self.client = client
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
         self.message_group_id = message_group_id

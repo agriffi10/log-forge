@@ -48,6 +48,9 @@ class NewRelicSink(HTTPSink):
           None.
 
         Raises:
+          TypeError: If a forwarded ``max_retries`` or ``max_batch_count`` is not an ``int``, or
+            a forwarded ``max_retry_after`` is not an ``int`` or ``float``, refused by
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: If the region is not one this API serves.
         """
         region = region.upper()

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import threading
+from log_foundry.sanitize import _int_text
 
 __all__ = ["MAX_WAIT", "clamp_server_delay", "usable_timeout", "wait"]
 
@@ -182,14 +181,45 @@ def require_timeout(value: float, name: str, owner: str) -> float:
         ``TypeError`` from inside ``<`` (SPEC-049, system-frame review).
       ValueError: When the exact value is zero, negative, infinite or ``NaN``.
     """
-    if not isinstance(value, int | float):
-        raise TypeError(f"{owner} {name} must be a number of seconds, not {type(value).__name__}")
-    exact = _exact_number(value)
+    exact = exact_seconds(value, name, owner)
     if not 0 < exact < float("inf"):
+        shown = _int_text(exact) if isinstance(exact, int) else repr(exact)
         raise ValueError(
-            f"{owner} {name} must be a positive, finite number of seconds, not {exact!r}"
+            f"{owner} {name} must be a positive, finite number of seconds, not {shown}"
         )
     return exact
+
+
+def exact_seconds(value: float, name: str, owner: str) -> float:
+    """Returns the exact ``int`` or ``float`` a duration argument holds, or refuses (SPEC-066).
+
+    The type half of :func:`require_timeout`, for a duration whose *value* is judged elsewhere.
+    ``HTTPSink.max_retry_after`` is the case: :func:`clamp_server_delay` already answers a
+    ceiling that is zero, negative or ``NaN`` by falling back to exponential backoff, and that
+    floor-side handling stays, but a ``str`` or ``None`` reached its ``ceiling > 0`` comparison
+    and raised an uncounted ``TypeError`` out of every ``emit`` that met a ``Retry-After`` header
+    (measured at ``7dc881f`` with ``max_retries=1``: one attempt, ``failed`` at zero). Refusing it
+    here moves the failure to the line that wrote it. The value is read through
+    :func:`_exact_number`, so a ``float`` subclass whose comparisons claim it is positive while it
+    holds ``-1.0`` is judged as ``-1.0``, an unusable ceiling and so exponential backoff; measured
+    at ``7dc881f``, its comparisons carried it through both ``min()`` calls to a pause of
+    :data:`MAX_WAIT`, a day, on a ``Retry-After: 1``.
+
+    Args:
+      value: The caller's duration, an ``int`` or a ``float``.
+      name: The argument's name, for the message.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The duration as the exact ``int`` or ``float`` it holds; ``True`` is returned as ``1``.
+
+    Raises:
+      TypeError: When the value is not an ``int`` or ``float`` instance, in
+        :func:`require_timeout`'s message shape.
+    """
+    if not isinstance(value, int | float):
+        raise TypeError(f"{owner} {name} must be a number of seconds, not {type(value).__name__}")
+    return _exact_number(value)
 
 
 def require_positive(value: int, name: str, owner: str) -> int:
@@ -225,5 +255,113 @@ def require_positive(value: int, name: str, owner: str) -> int:
         raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
     exact = int.__index__(value)
     if exact <= 0:
-        raise ValueError(f"{owner} {name} must be a positive integer, not {exact!r}")
+        raise ValueError(f"{owner} {name} must be a positive integer, not {_int_text(exact)}")
+    return exact
+
+
+def exact_int(value: int, name: str, owner: str) -> int:
+    """Returns the exact ``int`` an ``int`` argument holds, or refuses a non-``int`` (SPEC-066).
+
+    SPEC-065's rule at the doors it left: a value outside the declared type is refused with a
+    ``TypeError`` naming the argument and the type, never floored, even where it happened to
+    work. ``max(max_retries, 0)`` passed a ``float`` straight through — ``max(2.5, 0)`` is
+    ``2.5`` and ``max(nan, 0)`` is ``nan`` — so ``HTTPSink(max_retries=2.5)`` constructed and then
+    raised out of ``range()`` on every batch with nothing counted, and a ``str`` raised an unnamed
+    ``TypeError`` out of the comparison. An ``int`` instance, ``bool`` included, is of the
+    declared type: it is read through ``int.__index__``, the unbound builtin accessor, so an
+    ``int`` subclass whose comparisons lie is judged by the number it holds and the caller never
+    stores the subclass itself. The message shape is :func:`require_positive`'s, its twin for a
+    count that must be positive; this one judges the type only, and any range check is the
+    caller's, made on the exact value it returns.
+
+    Args:
+      value: The caller's argument, declared ``int``.
+      name: The argument's name, for the message.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The exact ``int`` the value holds; ``True`` is returned as ``1``.
+
+    Raises:
+      TypeError: When the value is not an ``int`` instance — a ``float`` (``nan`` and ``inf``
+        included), a ``str``, ``None``, or a number that only worked by duck typing.
+    """
+    if not isinstance(value, int):
+        raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
+    return int.__index__(value)
+
+
+def floor_count(value: int, floor: int, name: str, owner: str) -> int:
+    """Returns an ``int`` argument floored at ``floor``, refusing a non-``int`` first (SPEC-066).
+
+    The floor is the library's long-standing answer to a value that works but is odd — a
+    negative ``max_retries`` means no retries, and the sink still delivers — so it stays; only
+    the type is new. The floor is taken on the exact ``int`` :func:`exact_int` returns, never on
+    the caller's object: ``max(x, 0)`` returns ``x`` itself when ``x`` is not less than ``0``, so
+    an ``int`` subclass whose ``__lt__`` lies kept a negative, and ``max(True, 1)`` returns
+    ``True``. ``floor`` is supplied by the library, so the result is always an exact ``int``.
+
+    Args:
+      value: The caller's count, declared ``int``.
+      floor: The smallest value the count may take, an exact ``int`` the library supplies.
+      name: The argument's name, for the message.
+      owner: The class refusing it, for the message.
+
+    Returns:
+      The exact ``int`` the value holds, or ``floor`` when that is larger.
+
+    Raises:
+      TypeError: When the value is not an ``int`` instance, as :func:`exact_int` raises it.
+    """
+    return max(exact_int(value, name, owner), floor)
+
+
+def wait_budget(value: float | None, name: str) -> float | None:
+    """Returns the wait a public ``timeout`` asks for, or refuses one with no meaning (SPEC-066).
+
+    ``flush()`` and ``shutdown()`` had no verdict for ``inf``, ``nan`` or a non-number: measured
+    at ``ce2e1fe``, ``flush(math.inf)`` returned ``thread-died`` at once while the thread was
+    alive, ``flush(math.nan)`` returned ``timed-out``, and ``shutdown(math.inf)`` raised
+    ``OverflowError`` out of the deadline sum into the caller, against ``Raises: None``.
+    The owner's decision (2026-11-03): ``None`` stays unbounded, and ``inf`` or any value above
+    ``threading.TIMEOUT_MAX`` is the same unbounded wait — the caller's evident meaning, and
+    invariant 3's bound is the caller's to choose, none included. ``nan`` means nothing and is
+    refused with ``ValueError``. A value outside the declared ``float | None`` is refused with
+    ``TypeError``, the settled rule. Measured at ``7dc881f``, a ``Fraction`` worked for ``flush``
+    only and a numpy integer scalar on both calls, and both are now refused; a ``Decimal``, a
+    numpy ``float32`` or a ``str`` already failed, ``flush`` reporting ``thread-died`` and
+    ``shutdown`` raising a bare ``TypeError``, and now fails here with a named one. A numpy
+    ``float64`` is a ``float`` and works. A ``bool``, ``int`` or ``float`` subclass is read
+    as the exact builtin it holds, so a subclass whose comparisons lie is judged by its number.
+    Zero and negatives keep their meaning, *do not wait*; a value below ``-threading.TIMEOUT_MAX``
+    becomes ``0.0``, because ``time.monotonic() + timeout`` raises ``OverflowError`` for
+    ``-10**400``. ``threading.TIMEOUT_MAX`` itself is returned unchanged — it already worked on
+    both calls — which is why the upper test is a strict ``>``. A huge ``int`` is compared with
+    the float bound exactly, without converting it, so ``±10**400`` never overflows here.
+
+    Args:
+      value: The caller's ``timeout``, seconds or ``None``.
+      name: The argument's name, for the message.
+
+    Returns:
+      ``None`` for an unbounded wait, otherwise the exact ``int`` or ``float`` to pass on.
+
+    Raises:
+      TypeError: When the value is not ``None``, an ``int`` or a ``float``.
+      ValueError: When the value is NaN.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, int | float):
+        raise TypeError(
+            f"{name} must be an int or float number of seconds, or None, "
+            f"not {type(value).__name__}"
+        )
+    exact = _exact_number(value)
+    if exact != exact:
+        raise ValueError(f"{name} must not be NaN")
+    if exact > threading.TIMEOUT_MAX:
+        return None
+    if exact < -threading.TIMEOUT_MAX:
+        return 0.0
     return exact

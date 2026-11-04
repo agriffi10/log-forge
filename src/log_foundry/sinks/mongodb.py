@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import require_timeout, wait
+from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["MongoDBSink"]
@@ -151,7 +151,10 @@ class MongoDBSink:
           collection: The collection to insert into.
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned having attempted no insert, and reported
-            success.
+            success. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066 FR-001),
+            before any client is opened — a ``MongoClient`` starts monitor threads, so a refusal
+            raised after it would leave one behind. A ``bool`` or ``int`` subclass is read as the
+            ``int`` it holds.
           socket_timeout: Seconds one socket read or write may take, or ``None`` for
             :data:`DEFAULT_SOCKET_TIMEOUT` unless the URI's query names ``socketTimeoutMS``
             itself (SPEC-049 FR-005). ``pymongo``'s own default is unbounded. It is
@@ -165,11 +168,13 @@ class MongoDBSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ValueError: If either bound cannot bound anything, or if one is passed alongside
             ``client=``, which is already connected and cannot consume it — SPEC-043's rule that
             an argument no backend can use is an error rather than a silent ignore.
           ImportError: If the ``mongo`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "MongoDBSink")
         supplied = sorted(
             name
             for name, value in (
@@ -190,7 +195,6 @@ class MongoDBSink:
             client = MongoClient(uri, **_client_bounds(uri, socket_timeout, server_selection_timeout))
         self._client = client
         self._collection = client[database][collection]
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0

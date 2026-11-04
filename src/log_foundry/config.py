@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from log_foundry import _lifecycle
+from log_foundry.sanitize import _int_text
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -90,7 +91,10 @@ def _require_positive(name: str, value: object) -> int | None:
     :func:`_require_text` makes with ``str.__str__``, and it is what closes the zero ceiling
     SPEC-034 shut: a ``class Spoof(int)`` whose ``__lt__`` returned ``False`` passed the old
     ``value < 1`` test holding ``0``. The ``< 1`` test and the message are both built from the
-    exact ``int``, so a subclass whose ``__repr__`` raises still yields the ``ValueError``.
+    exact ``int``, so a subclass whose ``__repr__`` raises still yields the ``ValueError``, and
+    the message renders it through ``sanitize._int_text``, so a negative too long for CPython's
+    digit limit is named ``<int: ~N digits>`` rather than raising that limit's own ``ValueError``
+    out of the message, naming neither the setting nor the bound (SPEC-066).
 
     Args:
       name: The setting's name, used in the error message.
@@ -109,7 +113,7 @@ def _require_positive(name: str, value: object) -> int | None:
         raise TypeError(f"{name} must be an int, got {type(value).__name__}")
     exact = int.__index__(value)
     if exact < 1:
-        raise ValueError(f"{name} must be >= 1, got {exact}")
+        raise ValueError(f"{name} must be >= 1, got {_int_text(exact)}")
     return exact
 
 

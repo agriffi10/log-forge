@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import require_positive, require_timeout, wait
+from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["ClickHouseSink"]
@@ -79,7 +79,8 @@ class ClickHouseSink:
             no rows with ``losses()`` at zero.
           max_retries: Retries per chunk, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned from ``_insert`` having attempted nothing, and
-            reported success.
+            reported success. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
+            FR-001); a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
           send_receive_timeout: Seconds one request to the server may take, forwarded to
             ``get_client`` only when given (SPEC-049 FR-005). ``clickhouse-connect``'s own default
             is a finite 300 s, so it is exposed rather than overridden — but ``_insert`` makes
@@ -90,6 +91,8 @@ class ClickHouseSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), judged before any client is
+            opened.
           ValueError: If the table name is not a plain SQL identifier, the chunk size is not
             positive, ``send_receive_timeout`` cannot bound anything, or it is passed alongside
             ``client=``, which is already built and cannot consume it (SPEC-043's rule).
@@ -107,7 +110,7 @@ class ClickHouseSink:
             )
         self._table = valid_identifier(table)
         self._chunk_size = require_positive(chunk_size, "chunk_size", "ClickHouseSink")
-        self.max_retries = max(max_retries, 0)
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "ClickHouseSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False

@@ -9,7 +9,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import usable_timeout, wait
+from log_foundry.sinks._retry import floor_count, usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["GooglePubSubSink"]
@@ -117,7 +117,12 @@ class GooglePubSubSink:
           client: A publisher client to borrow, or ``None`` to build one.
           max_pending: Outstanding futures held before :meth:`emit` waits on the oldest, or
             ``None`` for :data:`DEFAULT_MAX_PENDING`. Floored at one, since a bound of zero would
-            make every publish synchronous and defeat the client's own batching.
+            make every publish synchronous and defeat the client's own batching. A supplied
+            value that is not an ``int`` is refused with ``TypeError`` (SPEC-066 FR-002), before
+            any client is built: ``nan`` raised at every reap and ``2.5`` from the third
+            outstanding future on. ``inf``, which used to mean no bound, is refused with them —
+            pass a large ``int`` such as ``sys.maxsize`` for that. A ``bool`` or ``int`` subclass
+            is read as the ``int`` it holds.
           overflow_timeout: Seconds to wait on one over-bound publish before putting it back,
             and since SPEC-048 the bound on ``close()`` too. The wait runs on the worker's single
             drain thread, so it is bounded by SPEC-027's rule that no sink wait may be unbounded
@@ -134,15 +139,20 @@ class GooglePubSubSink:
           None.
 
         Raises:
+          TypeError: If a supplied ``max_pending`` is not an ``int`` (SPEC-066).
           ImportError: If the ``gcp-pubsub`` extra is not installed.
         """
+        self.max_pending = (
+            floor_count(max_pending, 1, "max_pending", "GooglePubSubSink")
+            if max_pending is not None
+            else DEFAULT_MAX_PENDING
+        )
         if client is None:
             from google.cloud import pubsub_v1  # type: ignore[import-not-found, unused-ignore]
 
             client = pubsub_v1.PublisherClient()
         self.topic = topic
         self.client = client
-        self.max_pending = max(max_pending if max_pending is not None else DEFAULT_MAX_PENDING, 1)
         self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0

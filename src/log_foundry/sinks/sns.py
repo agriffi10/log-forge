@@ -9,7 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SNSSink"]
@@ -51,21 +51,24 @@ class SNSSink:
           client: A boto3-shaped SNS client, or ``None`` to build one lazily.
           max_retries: Retries for the failed entries of a chunk, floored at zero as
             ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having published nothing, and reported success.
+            having published nothing, and reported success. Anything but an ``int`` is refused
+            with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "SNSSink")
         if client is None:
             import boto3  # type: ignore[import-not-found]
 
             client = boto3.client("sns")
         self.topic_arn = topic_arn
         self.client = client
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0

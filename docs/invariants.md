@@ -35,13 +35,17 @@ runtime's intent (SPEC-025).
 `log_foundry` reaches application code, on any input, on any thread, in any lifecycle state.
 *Recorded exceptions:* a constructor, `configure()` or `@trace` may refuse an unusable argument
 at the call that supplies it — that is invariant 13, and it is the *opposite* promise for the
-moment of construction.
+moment of construction. So may `flush()` and `shutdown()`, for their `timeout` alone: a NaN is a
+`ValueError` and a value that is not an `int`, a `float` or `None` a `TypeError`, raised at entry
+before anything is drained, claimed or counted, so the call was never accepted and a retry with a
+good value works (SPEC-066).
 *Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`,
 `tests/test_assembly_budget.py` (a hostile argument returns on both delivery paths before a
 deadline), `tests/test_baggage_header.py` (a hostile baggage value, on either intake route, leaves
 `current_baggage_header()` returning before a deadline, SPEC-064), `tests/test_inbound_totality.py`
 (every hostile probe, in each of `continue_trace`'s arguments, returns before a deadline and runs
-none of its own code, SPEC-067);
+none of its own code, SPEC-067), `tests/test_numeric_doors.py` (a refused `flush()` or `shutdown()`
+timeout moves no counter and does not retire, SPEC-066);
 `tests/test_invariants_model.py` asserts it over random interleavings.
 
 ## 2. Every accepted event is delivered, or counted and announced — exactly once
@@ -338,7 +342,11 @@ that call — `TypeError` or `ValueError`, with the argument named — rather th
 failing on every `emit` for the life of the process, or silently delivering nothing (SPEC-043 at
 run time; SPEC-051 for the static half, where a mistyped forwarded keyword is a `mypy` error;
 SPEC-049 extended the run-time rule to timeouts, chunk sizes, the rotation interval, headers, URLs,
-the Sentry DSN and an argument the selected backend cannot consume, and floored what still works).
+the Sentry DSN and an argument the selected backend cannot consume, and floored what still works;
+SPEC-066 refused a non-`int` at every `int` floor and range check in a sink constructor and the
+worker, and a `max_retry_after` that is not an `int` or `float`, judged before any client is
+built, and gave `flush()` and `shutdown()` a verdict for their `timeout` — `inf` waits unbounded,
+a NaN or non-number is refused at the call).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
@@ -349,4 +357,6 @@ non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.p
 the per-sink refusal tests it added, and the floor-side pins in `tests/test_sink_retry.py`, which
 also holds SPEC-065's spoofed-subclass pins for the three validators, and
 `tests/test_sinks_pubsub.py` — whose spec Overview was the
-measured list of what still constructs and should not.
+measured list of what still constructs and should not; `tests/test_numeric_doors.py` for the
+`int` doors and the `flush()`/`shutdown()` `timeout`, and `tests/test_numeric_door_roster.py`,
+which derives the `int` doors from the AST and fails naming one left unjudged (SPEC-066).

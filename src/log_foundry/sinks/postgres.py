@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
-from log_foundry.sinks._retry import require_positive, wait
+from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["PostgresSink"]
@@ -86,26 +86,32 @@ class PostgresSink:
             batch, failing the same way each time.
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value returned having attempted no insert at all, and
-            reported success.
+            reported success. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
+            FR-001); a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
           connect_timeout: Seconds libpq may spend opening a connection. Defaults to
             :data:`DEFAULT_CONNECT_TIMEOUT` (5) and is floored at libpq's own minimum of 2, since
             ``0`` means "wait forever" and would reinstate the unbounded connect this argument
             exists to remove. It is passed explicitly and therefore **overrides any
             ``connect_timeout`` in the DSN** — a DSN asking for 30 gets this value instead, so
             set it here rather than there. Applies to the connection opened at construction and
-            to every reconnect.
+            to every reconnect. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
+            FR-002) — libpq wants a decimal integer — and that holds with an injected
+            ``connection=`` too, which never reads it: the declared type is already violated,
+            and the rule against validating an unread value is about a value, not a type.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` or ``connect_timeout`` is not an ``int`` (SPEC-066),
+            judged before any connection is opened.
           ValueError: If the table name is not a plain SQL identifier, or the chunk size is not
             positive.
           ImportError: If the ``postgres`` extra is not installed.
         """
         self._table = valid_identifier(table)
         self._chunk_size = require_positive(chunk_size, "chunk_size", "PostgresSink")
-        self.max_retries = max(max_retries, 0)
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "PostgresSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self._closed = False
@@ -113,7 +119,9 @@ class PostgresSink:
         self._counter_lock = threading.Lock()
         self._owns_connection = connection is None
         self._dsn = dsn
-        self.connect_timeout = max(connect_timeout, _MIN_CONNECT_TIMEOUT)
+        self.connect_timeout = floor_count(
+            connect_timeout, _MIN_CONNECT_TIMEOUT, "connect_timeout", "PostgresSink"
+        )
         if connection is None:
             connection = self._connect()
         self._conn = connection
