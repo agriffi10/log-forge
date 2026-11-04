@@ -555,6 +555,10 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
 
             _on_loop(sink, release())
             assert _wait_until(lambda: not sink._publish_stuck()), f"{cell_id}: latch held"
+            assert _wait_until(lambda: sink._stuck == ()), (
+                f"{cell_id}: a finished publish was left in the latch's record, which then grows "
+                "by one task per abandoned publish for the life of an outage"
+            )
             fake.answering = True
             fake.silent_after = None
             after = _timed(lambda: sink.emit([{"n": "after"}]))[1]
