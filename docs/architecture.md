@@ -822,6 +822,25 @@ close it.
 
 ### Open
 
+- **`configure()`'s stamps, its numeric ceilings, the `_retry` doors and `OTLPSink`'s endpoint
+  test their arguments with `isinstance` and name them with `type(value).__name__`** (SPEC-080
+  frame-2 review; invariant 13, the "argument named" half). The sites are `config._require_text`
+  and `_require_positive`, `sinks/_retry.py`'s validators (the `flush()`/`shutdown()` timeouts
+  and the sinks' `int` floors) and `sinks/otlp.py`'s endpoint check. Reproduced at `4f0c5741`:
+  `configure(service=x)` with `x`'s `__class__` property returning `str` raises `descriptor
+  '__str__' requires a 'str' object but received a '…'`, which does not name `service`; a raising
+  `__class__` raises its own exception; a metaclass `__name__` property returning `"str"` gives
+  `version must be a str, got str`. Every lying value is still stopped at the call, never per
+  emit, so only the message breaks the promise. **Closed by** routing each door through
+  `issubclass(type(v), T)` and the type's stored name, as SPEC-080 did for `@trace`.
+- **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
+  (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
+  `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
+  batch abandoned after 4 emit attempts`, `flush()` returns `reason='abandoned'` and
+  `failed_batches=1`. Counted and announced, so invariant 2 holds; refused nowhere, so 13 does
+  not. **Closed by** refusing at `configure()` a sink with no callable `emit` and `close`, read
+  through the type rather than the instance.
+
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it

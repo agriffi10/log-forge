@@ -986,8 +986,10 @@ def trace(
         object (the decorators are in the wrong order), a ``str`` (``name=`` was meant),
         anything not callable, or a generator function, whose iteration cannot be traced by a
         wrapper around the call (SPEC-055 FR-003) — invariant 13. Because ``name=`` is judged
-        first, a call carrying two bad arguments reports ``name=``: ``trace("checkout",
-        name=1)`` and ``trace(fn, name=1)`` both raise ``name= must be a str, got int``.
+        before the decorated object, a bad ``name=`` beside a bad object reports ``name=``:
+        ``trace("checkout", name=1)`` and ``trace(fn, name=1)`` both raise ``name= must be a
+        str, got int``. ``defaults=`` is copied before either, so a bad ``defaults=`` is
+        reported first.
       Exception: At this call, whatever ``dict(defaults)`` raises from the mapping's own code,
         or a ``MemoryError`` from copying an enormous ``str`` subclass ``name=``; at
         decoration, whatever the callable's own attributes raise while they are read — all in

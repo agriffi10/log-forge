@@ -174,7 +174,8 @@ the closure, and the truthiness test `exact_name or _span_name(fn)` runs on the 
 empty name still falls back to the qualified name. The copy is not guarded: a `MemoryError` from
 copying an enormous subclass propagates at the `trace(...)` call, which invariant 13 allows, where
 `_exact` swallows it only because `continue_trace` must be total. Because the check moves ahead of
-`decorate`, a call carrying two bad arguments reports `name=` first: `trace("checkout", name=1)`
+`decorate`, a bad `name=` beside a bad decorated object reports `name=` first (a bad `defaults=`,
+copied before both, is still reported ahead of them): `trace("checkout", name=1)`
 and `trace(fn, name=1)` both raise `name= must be a str, got int`, where at base the first gave the
 `str` hint. Both calls were already refused with a `TypeError`, and `trace`'s docstring states the
 order.

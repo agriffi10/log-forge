@@ -25,8 +25,9 @@ decision *An inbound value runs no code of its own anywhere on the inbound path*
   13's "raises at that call", rather than when the decorator it returns is applied. `decorate`
   reads the exact name from the closure, so the truthiness test that sends an empty name to the
   default runs on an exact `str`, never on a subclass's `__bool__` or `__len__`. Because the
-  judgement moved ahead of `decorate`, a call with two bad arguments reports `name=` first:
-  `trace("checkout", name=1)` and `trace(fn, name=1)` both say `got int`.
+  judgement moved ahead of `decorate`, a bad `name=` beside a bad decorated object reports `name=`
+  first: `trace("checkout", name=1)` and `trace(fn, name=1)` both say `got int`. `dict(defaults)`
+  still runs before it, so a bad `defaults=` is reported ahead of both.
 - **The span-name fallback** (`_span_name`) keeps a `__qualname__` only if its real type is a
   `str`, as an exact `str`, and otherwise names the callable by its type's stored name, so a
   metaclass `__name__` property can neither divert nor raise out of it.
