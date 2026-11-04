@@ -68,6 +68,16 @@ A sixth joins them with SPEC-061 FR-003: a core `NATSSink` batch whose confirmin
 unanswered is counted in `failed` and announced once, never retried, because the bytes are in
 flight to a server that may yet process them (five of five did after a `docker unpause`) and a
 retry would duplicate them; the next call is refused instead, so the stall is still reported.
+So is a `NATSSink` publish the driver never returned from within the budget, on every path where
+no confirmation will judge it — JetStream, and an injected client of either mode — counted as
+unconfirmed where it is abandoned, with every later call refused while it is still pending
+(SPEC-061 FR-001). That leaves a JetStream asymmetry, recorded rather than removed: an ack wait
+that expires *inside* the budget raises in the driver, is counted as a raised publish, and a batch
+in which nothing else landed goes back to the worker, which retries it (SPEC-047's behaviour); one
+that outlives the budget is abandoned, counted as unconfirmed, and never retried. Both mean the
+same thing — no ack, and the event may have been persisted — so the first can duplicate while the
+second can lose. The closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
+makes a retry safe.
 At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
 that returned; one that raised counts none of them, and whoever caught it — the worker, the
 orphan path or `MultiSink` — owns the batch. The sites are the drops `TransformSink`,
