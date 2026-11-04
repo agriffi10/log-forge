@@ -125,12 +125,17 @@ class SentrySink:
           backend: Which transport to use — ``"auto"``, ``"sdk"`` or ``"http"``.
           client: A ``sentry_sdk``-shaped object to use instead of importing one.
           opener: A ``urlopen``-shaped callable for the fallback, for tests.
-          max_retries: Retries the fallback's HTTP transport makes.
+          max_retries: Retries the fallback's HTTP transport makes, an ``int`` floored at zero;
+            anything else is refused with ``TypeError`` by that transport (SPEC-066 FR-001),
+            wherever this construction builds the fallback. Under ``backend="sdk"`` no fallback
+            is built, nothing reads the value, and nothing judges it.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If the HTTP fallback is built and ``max_retries`` is not an ``int``
+            (SPEC-066), refused by the :class:`~log_foundry.sinks.http.HTTPSink` it builds.
           ValueError: If ``backend`` is not one of the three names; if an argument cannot be used
             by any backend this construction can select; if the selection cannot be built —
             ``"sdk"`` with no client available, ``"http"`` with no DSN, or the default with

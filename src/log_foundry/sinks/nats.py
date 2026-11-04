@@ -10,7 +10,8 @@ import time
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import usable_timeout
+from log_foundry.sanitize import _int_text
+from log_foundry.sinks._retry import exact_int, usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 if TYPE_CHECKING:
@@ -332,6 +333,12 @@ class NATSSink:
             caller is told rather than quietly given different behaviour — and 1.0 is the major
             version §12 said the change was waiting for. ``reconnect_time_wait=0`` is untouched:
             it works, and is on the floor side of SPEC-049 FR-001's rule.
+
+            A value that is not an ``int`` is refused with ``TypeError`` (SPEC-066 FR-003), before
+            the positivity check, which then runs on the exact ``int``: ``2.5``, ``nan`` and
+            ``inf`` passed ``<= 0`` and were forwarded to ``nats-py`` as given. A ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds, and that exact ``int`` is what the
+            driver receives.
           reconnect_time_wait: Seconds between reconnect attempts, or ``None`` to pass nothing.
           drain_timeout: ~~Seconds ``Client.drain`` may spend, or ``None`` to pass nothing. It is
             forwarded because it does bound the driver's subscription drain, but it is **not**
@@ -357,16 +364,22 @@ class NATSSink:
             because ``nats.connect(servers or …, **supplied)`` would then pass it twice.
             ``publish_timeout`` is deliberately outside the set: it is this sink's own bound and
             applies to any client. Also if ``max_reconnect_attempts`` is non-positive.
+          TypeError: If ``max_reconnect_attempts`` is given and is not an ``int`` (SPEC-066),
+            judged first, before the conflict with ``client=`` and before any loop is created.
           ImportError: If the ``nats`` extra is not installed.
           Exception: Whatever the driver raises when connecting.
         """
+        if max_reconnect_attempts is not None:
+            max_reconnect_attempts = exact_int(
+                max_reconnect_attempts, "max_reconnect_attempts", "NATSSink"
+            )
         if max_reconnect_attempts is not None and max_reconnect_attempts <= 0:
             raise ValueError(
                 f"NATSSink max_reconnect_attempts must be positive, not "
-                f"{max_reconnect_attempts!r}: nats-py retires a server from its pool only under "
-                f"`max_reconnect_attempts > 0`, so a non-positive value never terminates the "
-                f"connect loop (measured: 0 and -1 both still blocking at 30 s, one probe past "
-                f"400 s). 1 is the smallest value that bounds anything."
+                f"{_int_text(max_reconnect_attempts)}: nats-py retires a server from its pool "
+                f"only under `max_reconnect_attempts > 0`, so a non-positive value never "
+                f"terminates the connect loop (measured: 0 and -1 both still blocking at 30 s, "
+                f"one probe past 400 s). 1 is the smallest value that bounds anything."
             )
         options: dict[str, object] = {
             "connect_timeout": connect_timeout,

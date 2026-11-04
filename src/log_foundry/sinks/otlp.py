@@ -101,7 +101,10 @@ class OTLPSink(HTTPSink):
           None.
 
         Raises:
-          TypeError: If ``endpoint`` is not a ``str``.
+          TypeError: If ``endpoint`` is not a ``str``, or a forwarded ``max_retries`` or
+            ``max_batch_count`` is not an ``int`` or ``max_retry_after`` not an ``int`` or
+            ``float``, refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class
+            (SPEC-066).
           ValueError: If ``endpoint`` carries a user or password before its host, has no
             ``http``/``https`` scheme or names no host, or if ``method`` is anything but
             ``"POST"`` — OTLP/HTTP is POST only, and accepting another

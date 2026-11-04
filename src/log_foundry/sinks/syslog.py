@@ -75,7 +75,9 @@ class SyslogSink:
 
         Args:
           host: The syslog host.
-          port: The syslog port.
+          port: The syslog port, an ``int`` in ``0``–``65535``, judged by the
+            :class:`~log_foundry.sinks._socket.SocketTransport` this sink builds (SPEC-066
+            FR-003).
           transport: ``"udp"`` or ``"tcp"``, which also selects the framing.
           facility: An RFC 5424 facility keyword.
           app_name: The ``APP-NAME`` field of every message. Whitespace and the empty string
@@ -84,7 +86,8 @@ class SyslogSink:
             ``STRUCTURED-DATA`` for every message the sink ever sends — corruption no counter
             sees, since the frame still arrives.
           timeout: Seconds allowed for a TCP connection.
-          max_retries: Reconnect retries per message.
+          max_retries: Reconnect retries per message, an ``int`` floored at zero; anything else
+            is refused with ``TypeError`` by the transport (SPEC-066 FR-001).
           max_datagram_bytes: The largest UDP datagram to attempt; a frame over it is dropped
             and counted rather than sent, retried and abandoned (SPEC-038 FR-007). Ignored for
             TCP, which is a stream.
@@ -93,8 +96,11 @@ class SyslogSink:
           None.
 
         Raises:
+          TypeError: If ``port`` or ``max_retries`` is not an ``int`` (SPEC-066), refused by the
+            transport this sink builds.
           ValueError: If the facility is not one of the supported keywords, or ``app_name`` is
-            empty or contains whitespace.
+            empty or contains whitespace, or the transport refuses ``port``, ``timeout`` or
+            ``max_datagram_bytes``.
         """
         if facility not in _FACILITY:
             raise ValueError(f"invalid facility {facility!r}; expected one of {sorted(_FACILITY)}")

@@ -98,7 +98,9 @@ class LogstashSink:
         Args:
           url: The HTTP endpoint, selecting HTTP mode.
           host: The destination host, selecting socket mode.
-          port: The destination port, selecting socket mode.
+          port: The destination port, selecting socket mode; an ``int`` in ``0``–``65535``,
+            judged by the :class:`~log_foundry.sinks._socket.SocketTransport` socket mode builds
+            (SPEC-066 FR-003).
           transport: ``"tcp"`` or ``"udp"`` in socket mode, or ``None`` for ``"tcp"``. The
             default is ``None`` rather than ``"tcp"`` so that an explicitly-passed value is
             distinguishable from one the caller never gave — SPEC-043's recorded limit, and what
@@ -110,7 +112,8 @@ class LogstashSink:
             what each one requires of the Logstash side; ``"ndjson"`` is the escape hatch for an
             input already configured with ``additional_codecs``.
           timeout: Seconds allowed per request or connection.
-          max_retries: Retries the chosen backend makes.
+          max_retries: Retries the chosen backend makes, an ``int`` floored at zero; anything
+            else is refused with ``TypeError`` by that backend, in either mode (SPEC-066 FR-001).
           max_datagram_bytes: In UDP socket mode, the largest datagram to attempt, or ``None``
             for :data:`DEFAULT_MAX_DATAGRAM_BYTES`; a frame over it is dropped and counted rather
             than sent, retried and abandoned (SPEC-038 FR-007). ``None`` by default for the reason
@@ -126,6 +129,10 @@ class LogstashSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` (either mode) or ``port`` (socket mode) is not an ``int``,
+            or in HTTP mode a forwarded ``max_batch_count`` is not an ``int`` or
+            ``max_retry_after`` not an ``int`` or ``float`` (SPEC-066), refused by the backend this
+            sink builds.
           ValueError: If neither a URL nor a host and port were given; if ``body_format`` is
             neither ``"json_array"`` nor ``"ndjson"``; if a socket-only argument accompanies
             ``url=``; or if an HTTP-only keyword accompanies ``host=``/``port=``. The last two are

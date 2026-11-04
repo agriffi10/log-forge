@@ -230,6 +230,47 @@ def _int_digit_ceiling(max_value_bytes: int) -> int:
     return max_value_bytes if limit <= 0 else min(max_value_bytes, limit)
 
 
+def _int_text(value: int) -> str:
+    """Returns an integer's digits for a refusal message, or ``<int: ~N digits>`` when too long.
+
+    A validator that names the value it refuses used to write ``{value!r}``, and CPython refuses
+    to convert an integer past ``sys.get_int_max_str_digits()`` digits: measured at ``7dc881f``,
+    ``SocketTransport("h", 10**5000)`` raised ``ValueError: Exceeds the limit (4300 digits) for
+    integer string conversion`` out of the port check's own message, naming neither ``port`` nor
+    the class, and ``require_positive`` did the same for ``-10**5000`` (SPEC-066). The placeholder
+    is this module's convention for an integer too large to render (SPEC-020): replaced, never
+    clipped, and sized by ``bit_length()`` through :data:`_INT_BIT_LENGTH`, never by converting
+    the value, which would raise the very error being avoided. The digit estimate is the one
+    :meth:`_Coercer._bounded_int` uses and overcounts by at most one, so a value at the edge is
+    replaced rather than rendered, and a negative counts its sign as one more character, as it
+    does there and in ``_otel._int_digits``, so under the default limit and ``max_value_bytes``
+    the three replace the same integers.
+
+    The ceiling is the interpreter's limit, and never more than its default
+    (``sys.int_info.default_max_str_digits``): with the limit lifted, or set to ``0`` for none, a
+    message would otherwise render millions of digits, which takes quadratic time and makes a
+    refusal slow to raise. The digits are read through ``int.__repr__``, unbound, so an ``int``
+    subclass cannot choose the text a refusal prints.
+
+    Args:
+      value: The integer to name, possibly a subclass instance.
+
+    Returns:
+      The integer's decimal digits, sign included, or the placeholder naming the digit count.
+
+    Raises:
+      None.
+    """
+    digits = _INT_BIT_LENGTH(value) * _LOG10_2_NUM // _LOG10_2_DEN + 1
+    rendered = digits + 1 if _INT_LT(value, 0) else digits
+    default = sys.int_info.default_max_str_digits
+    limit = sys.get_int_max_str_digits()
+    ceiling = default if limit <= 0 else min(limit, default)
+    if rendered > ceiling:
+        return f"<int: ~{digits} digits>"
+    return int.__repr__(value)
+
+
 def _measured(value: str) -> tuple[str, bytes, bool]:
     """Returns a string as an exact ``str`` that encodes strictly, its bytes, and whether it changed.
 

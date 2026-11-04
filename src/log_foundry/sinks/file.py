@@ -9,7 +9,8 @@ import time
 from typing import TextIO
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import require_positive
+from log_foundry.sanitize import _int_text
+from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["FileSink", "RotatingFileSink"]
@@ -32,6 +33,15 @@ def _rollover_seconds(when: str | None, interval: int) -> float | None:
     returns (SPEC-065 FR-004), not the caller's object: a subclass whose ``__rmul__`` returned
     ``0`` gave a period of ``0`` when the return was discarded, measured at ``71e42dd``.
 
+    The period must convert to a ``float``, because the deadline is ``time.monotonic()`` plus it:
+    measured at ``7dc881f``, ``when="S", interval=10**400`` raised a raw ``OverflowError: int too
+    large to convert to float`` out of that sum *after* the file had been opened, so the refusal
+    left the file on disk and its stream unclosed, and named neither ``interval`` nor the class
+    (SPEC-066). So the conversion is tried here, before anything is opened, and a period that
+    overflows is refused with ``ValueError`` naming ``interval``. Every period that converts is
+    still accepted, a century or a googol of seconds alike: a long period is a time trigger
+    that does not fire, which works.
+
     Args:
       when: The unit code, or ``None`` for no time trigger.
       interval: How many units make up one period, a positive ``int``.
@@ -44,7 +54,8 @@ def _rollover_seconds(when: str | None, interval: int) -> float | None:
       ValueError: If the unit code is unrecognized, so a typo fails loudly at construction rather
         than silently at runtime, or if the interval is not positive. The interval is checked even
         when there is no time trigger, because an interval that means nothing is a caller who
-        believes one is armed (SPEC-049 FR-003).
+        believes one is armed (SPEC-049 FR-003). Also if the period is too large to convert to a
+        ``float``, checked only when there is a time trigger, since only then is it summed.
     """
     interval = require_positive(interval, "interval", "RotatingFileSink")
     if when is None:
@@ -55,7 +66,15 @@ def _rollover_seconds(when: str | None, interval: int) -> float | None:
         raise ValueError(
             f"invalid 'when' unit {when!r}; expected one of {sorted(_WHEN_SECONDS)}"
         ) from None
-    return unit * interval
+    period = unit * interval
+    try:
+        float(period)
+    except OverflowError:
+        raise ValueError(
+            f"RotatingFileSink interval is too large: {_int_text(interval)} units of {when!r} "
+            f"is beyond the largest float number of seconds"
+        ) from None
+    return period
 
 
 def _reopen_discarding(stream: TextIO, path: str, encoding: str) -> TextIO:
@@ -302,17 +321,27 @@ class RotatingFileSink:
             lost, nothing raises, no counter moves. Refusing a configuration that works would be a
             breaking change; flooring is a no-op that makes the value legible.
 
+            Both must be an ``int`` (SPEC-066 FR-002), judged before the file is opened, so a
+            refused construction leaves nothing on disk. A ``float`` was floored straight through:
+            ``backup_count=2.5`` or ``inf`` raised out of ``range()`` on the first rollover *after*
+            the stream was closed, so the sink was dead for the life of the process, ``nan``
+            disabled backups, and ``max_bytes=nan`` disabled the size trigger. A ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds.
+
         Returns:
           None.
 
         Raises:
-          ValueError: If the unit code is unrecognized, or the interval is not positive.
+          TypeError: If ``max_bytes`` or ``backup_count`` is not an ``int`` (SPEC-066).
+          ValueError: If the unit code is unrecognized, the interval is not positive, or the
+            period it makes is too large to convert to a ``float`` number of seconds (SPEC-066) —
+            each refused before the file is opened.
           OSError: If the file cannot be opened.
         """
         self._path = path
         self._encoding = "utf-8"
-        self._max_bytes = max(max_bytes, 0)
-        self._backup_count = max(backup_count, 0)
+        self._max_bytes = floor_count(max_bytes, 0, "max_bytes", "RotatingFileSink")
+        self._backup_count = floor_count(backup_count, 0, "backup_count", "RotatingFileSink")
         self._interval_seconds = _rollover_seconds(when, interval)
         self._stream: TextIO = open(path, "a", encoding=self._encoding)
         self._size = os.path.getsize(path) if os.path.exists(path) else 0

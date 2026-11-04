@@ -8,7 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["AzureEventHubsSink"]
@@ -46,15 +46,19 @@ class AzureEventHubsSink:
           eventhub: The hub name used when building a producer.
           max_retries: Retries per ``EventDataBatch``, floored at zero as ``Worker._emit`` floors
             its own (SPEC-021) — a negative value returned from ``_send`` having attempted
-            nothing, and reported success.
+            nothing, and reported success. Anything but an ``int`` is refused with ``TypeError``
+            (SPEC-066 FR-001), before any producer is built; a ``bool`` or ``int`` subclass is
+            read as the ``int`` it holds.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ValueError: If no producer is injected and no connection string was given.
           ImportError: If the ``azure-eventhubs`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "AzureEventHubsSink")
         if producer is None:
             if connection_str is None:
                 raise ValueError(
@@ -68,7 +72,6 @@ class AzureEventHubsSink:
                 connection_str, eventhub_name=eventhub
             )
         self.producer = producer
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0

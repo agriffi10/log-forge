@@ -103,8 +103,10 @@ member keep working, as 1, 3 and the int they hold.
   non-number. The pins in `tests/test_sink_retry.py` stay green. **What does change** is FR-004:
   the exact builtin is tested and returned, so a subclass overriding a comparison or conversion is
   judged by the number it holds.
-- **`flush(timeout=)` and `shutdown(timeout=)`.** They are not constructors and validate nothing;
-  nothing here adds a check to them.
+- **`flush(timeout=)` and `shutdown(timeout=)`.** ~~They are not constructors and validate
+  nothing;~~ **superseded by SPEC-066 FR-004:** both now judge `timeout` at entry through
+  `_retry.wait_budget` (decision in `docs/decisions/sink-delivery/`). Nothing here adds a check to
+  them.
 - **Validating `Config` on direct construction.** `Config` is a frozen dataclass with no
   `__post_init__`, and it is in `log_foundry.__all__`, so `Config(max_keys=2.5)` constructs. Known
   residue, not widened: nothing in the library accepts a `Config` as input — `_rebind` copies the

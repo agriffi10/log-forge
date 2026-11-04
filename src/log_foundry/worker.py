@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.results import FlushResult
+from log_foundry.sinks._retry import floor_count
 
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink, SinkLosses
@@ -386,21 +387,24 @@ class Worker:
           batch_size: How many submissions accumulate before an emit is triggered.
           flush_interval: Seconds before a partial batch is emitted anyway.
           max_queue: Ceiling on buffered submissions, past which the newest is dropped.
-          max_retries: Retries after a failing emit, floored at zero by :meth:`_emit`. On the
-            exit drain a retry is declined when it is predicted to end after the ``shutdown()``
-            deadline (SPEC-062), so the retries a failing batch sees there are bounded by the
+          max_retries: Retries after a failing emit, an ``int`` floored at zero here (SPEC-066
+            FR-001); anything else is refused with ``TypeError``, and a ``bool`` or ``int``
+            subclass is stored as the exact ``int`` it holds. On the exit drain a retry is
+            declined when it is predicted to end after the ``shutdown()`` deadline (SPEC-062),
+            so the retries a failing batch sees there are bounded by the
             caller's budget as well as by this count; the first attempt is always made.
 
         Returns:
           None.
 
         Raises:
-          None.
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), before any thread starts or
+            stop signal is taken.
         """
         self.sink = sink
         self.batch_size = batch_size
         self.flush_interval = flush_interval
-        self.max_retries = max_retries
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "Worker")
         self.dropped = 0
         self.failed_batches = 0
         self.stopped_reason: str | None = None

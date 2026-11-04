@@ -10,7 +10,7 @@ from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._retry import wait
+from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["KinesisSink"]
@@ -67,14 +67,18 @@ class KinesisSink:
           partition_key_field: The event key used as the record's partition key.
           max_retries: Retries for the failed records of a chunk, floored at zero as
             ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having sent nothing, and reported success.
+            having sent nothing, and reported success. Anything but an ``int`` is refused
+            with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
+            ``int`` subclass is read as the ``int`` it holds.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", "KinesisSink")
         if client is None:
             import boto3  # type: ignore[import-not-found]
 
@@ -82,7 +86,6 @@ class KinesisSink:
         self.stream_name = stream_name
         self.client = client
         self.partition_key_field = partition_key_field
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0

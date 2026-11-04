@@ -37,14 +37,17 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
 
     This is the drain for a process that is frozen rather than exited — an AWS Lambda handler
     must drain before it returns, but will be invoked again on the same warm container. Call it
-    in a ``finally``: the invocation worth logging is the one that failed. Unlike
+    in a ``finally``: the invocation worth logging is the one that failed. It raises only at
+    entry, and only for a bad ``timeout`` argument, before anything is drained. Unlike
     :func:`shutdown` the background worker stays alive and the sink stays open, so logging
     continues normally afterwards.
 
     Args:
       timeout: Seconds to wait for the drain. ``None`` waits indefinitely, which is unsafe in
         any environment with an execution deadline — it converts "some logs were lost" into
-        "the invocation timed out".
+        "the invocation timed out". ``inf``, or any value above ``threading.TIMEOUT_MAX``, waits
+        as ``None`` does (SPEC-066 FR-004); zero or a negative does not wait. A ``bool`` or a
+        number subclass is read as the exact ``int`` or ``float`` it holds.
 
     Returns:
       A :class:`FlushResult`. Truthy when the events submitted before this call reached the
@@ -58,10 +61,13 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
       meant those, and a batch lost before the call belongs to :func:`health`.
 
     Raises:
-      None.
+      TypeError: If ``timeout`` is not an ``int``, a ``float`` or ``None``.
+      ValueError: If ``timeout`` is NaN.
     """
     from log_foundry._lifecycle import _flush_worker
+    from log_foundry.sinks._retry import wait_budget
 
+    timeout = wait_budget(timeout, "timeout")
     return _flush_worker(timeout)
 
 
@@ -173,16 +179,22 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         for the parts that are bounded, which is what this did unconditionally before and is
         still available on request. An expired shutdown reports a ``stopped_reason`` of
         ``"ShutdownTimeout"`` and leaves the sink open, since the drain thread may still be
-        inside ``emit``.
+        inside ``emit``. ``inf``, or any value above ``threading.TIMEOUT_MAX``, waits as ``None``
+        does (SPEC-066 FR-004); zero or a negative does not wait. A bad ``timeout`` is refused at
+        entry, before the process is retired or anything is drained, so a retry with a good
+        value works.
 
     Returns:
       None.
 
     Raises:
-      None.
+      TypeError: If ``timeout`` is not an ``int``, a ``float`` or ``None``.
+      ValueError: If ``timeout`` is NaN.
     """
     from log_foundry._lifecycle import _shutdown_worker
+    from log_foundry.sinks._retry import wait_budget
 
+    timeout = wait_budget(timeout, "timeout")
     _shutdown_worker(timeout)
 
 

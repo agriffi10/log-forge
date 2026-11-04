@@ -63,6 +63,9 @@ class SplunkHECSink(HTTPSink):
           None.
 
         Raises:
+          TypeError: If a forwarded ``max_retries`` or ``max_batch_count`` is not an ``int``, or
+            a forwarded ``max_retry_after`` is not an ``int`` or ``float``, refused by
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: For any argument :class:`~log_foundry.sinks.http.HTTPSink` refuses, under
             this class's name; a ``url`` carrying a user or password is told to pass the HEC
             token as ``token``, which this sink sends itself.

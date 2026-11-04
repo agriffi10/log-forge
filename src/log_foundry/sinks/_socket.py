@@ -8,7 +8,14 @@ import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import require_positive, require_timeout, wait
+from log_foundry.sanitize import _int_text
+from log_foundry.sinks._retry import (
+    exact_int,
+    floor_count,
+    require_positive,
+    require_timeout,
+    wait,
+)
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 if TYPE_CHECKING:
@@ -144,16 +151,21 @@ class SocketTransport:
 
         Args:
           host: The destination host.
-          port: The destination port.
+          port: The destination port, an ``int`` in ``0``–``65535``. Anything else is refused with
+            ``TypeError`` (SPEC-066 FR-003): ``2.5`` passed the range check and raised a raw
+            ``TypeError`` out of the first ``sendto`` or ``create_connection``. A ``bool`` or other
+            ``int`` subclass is read as the ``int`` it holds, and the range is checked on that.
           transport: ``"tcp"`` or ``"udp"``.
           timeout: Seconds allowed for a TCP connection. Refused at construction when it cannot
             bound anything (SPEC-049 FR-002): it reached ``create_connection`` and raised from
             inside ``send_all`` on every message. **This is a new refusal over UDP**, where the
             value was previously unused and a junk one was harmless — stated rather than
             discovered, since a UDP caller passing one has been silently fine until now.
-          max_retries: Reconnect retries per message, floored at zero for the reason
+          max_retries: Reconnect retries per message, an ``int``, floored at zero for the reason
             ``Worker._emit`` floors its own (SPEC-021) — a negative value made no attempt at all
-            and abandoned the message without moving ``failed``.
+            and abandoned the message without moving ``failed``. Anything else is refused with
+            ``TypeError`` (SPEC-066 FR-001); a ``bool`` or ``int`` subclass is read as the ``int``
+            it holds.
           max_datagram_bytes: The largest UDP datagram to attempt, defaulting to
             :data:`DEFAULT_MAX_DATAGRAM_BYTES`. Ignored for TCP, which is a stream.
 
@@ -161,6 +173,8 @@ class SocketTransport:
           None.
 
         Raises:
+          TypeError: If ``port`` or ``max_retries`` is not an ``int`` (SPEC-066); ``port``'s type
+            is judged before its range, so the range check reads the exact ``int``.
           ValueError: If the transport is neither TCP nor UDP, the timeout cannot bound anything,
             the port is outside ``0``–``65535``, or the datagram bound is not positive. The last
             two are SPEC-049's system-frame findings: an out-of-range port raised a raw
@@ -168,17 +182,21 @@ class SocketTransport:
             never saw it — where TCP counted the same value as a resolution failure; and a
             non-positive datagram bound made every UDP frame oversized, so ``emit`` returned having
             delivered nothing. Both are refused over TCP too, where they are inert or already
-            counted, for the reason the timeout is.
+            counted, for the reason the timeout is. The refused port is named in the message
+            through ``sanitize._int_text``, so one too long to convert to a string is named
+            ``<int: ~N digits>`` rather than raising CPython's digit-limit ``ValueError`` out of
+            the message itself, which named neither ``port`` nor this class (SPEC-066).
         """
         if transport not in ("tcp", "udp"):
             raise ValueError(f"invalid transport {transport!r}; expected 'tcp' or 'udp'")
+        port = exact_int(port, "port", "SocketTransport")
         if not 0 <= port <= 65535:
-            raise ValueError(f"SocketTransport port must be 0-65535, not {port!r}")
+            raise ValueError(f"SocketTransport port must be 0-65535, not {_int_text(port)}")
         self._host = host
         self._port = port
         self._transport = transport
         self._timeout = require_timeout(timeout, "timeout", "SocketTransport")
-        self._max_retries = max(max_retries, 0)
+        self._max_retries = floor_count(max_retries, 0, "max_retries", "SocketTransport")
         self._max_datagram_bytes = require_positive(
             max_datagram_bytes, "max_datagram_bytes", "SocketTransport"
         )

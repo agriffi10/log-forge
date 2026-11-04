@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import require_positive, wait
+from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
@@ -48,21 +48,24 @@ class _RedisSink:
           url: The connection URL used when opening a client.
           max_retries: Retries per batch, floored at zero as ``Worker._emit`` floors its own
             (SPEC-021) — a negative value made the retry range empty, so ``emit`` returned having
-            attempted nothing, a silent success.
+            attempted nothing, a silent success. Anything but an ``int`` is refused with
+            ``TypeError`` (SPEC-066 FR-001), before any client is opened, the message naming the
+            concrete subclass; a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
 
         Returns:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ImportError: If the ``redis`` extra is not installed.
         """
+        self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
         self._owns_client = client is None
         if client is None:
             import redis  # type: ignore[import-not-found]
 
             client = redis.Redis.from_url(url) if url else redis.Redis()
         self.client = client
-        self.max_retries = max(max_retries, 0)
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self._counter_lock = threading.Lock()
@@ -197,7 +200,8 @@ class RedisStreamsSink(_RedisSink):
           stream: The stream key to append to.
           client: A ``redis-py``-shaped client to borrow, or ``None`` to open one.
           url: The connection URL used when opening a client.
-          max_retries: Retries per batch.
+          max_retries: Retries per batch, an ``int`` floored at zero; anything else is refused
+            with ``TypeError`` (SPEC-066 FR-001).
           maxlen: A ceiling on the destination's length, or ``None`` for no ceiling.
 
             The default is ``None`` — today's unbounded behaviour — because silently discarding
@@ -215,6 +219,8 @@ class RedisStreamsSink(_RedisSink):
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or ``maxlen`` is given and
+            is not one.
           ValueError: If ``maxlen`` is given and not positive — ``redis-py`` refuses a negative
             ``XADD MAXLEN`` client-side on every emit, and ``0`` trims every entry the moment it
             lands, so neither has a working configuration to protect (SPEC-049, system-frame
@@ -270,7 +276,8 @@ class RedisListSink(_RedisSink):
           key: The list key to push onto.
           client: A ``redis-py``-shaped client to borrow, or ``None`` to open one.
           url: The connection URL used when opening a client.
-          max_retries: Retries per batch.
+          max_retries: Retries per batch, an ``int`` floored at zero; anything else is refused
+            with ``TypeError`` (SPEC-066 FR-001).
           maxlen: A ceiling on the destination's length, or ``None`` for no ceiling.
 
             The default is ``None`` — today's unbounded behaviour — because silently discarding
@@ -288,6 +295,8 @@ class RedisListSink(_RedisSink):
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or ``maxlen`` is given and
+            is not one.
           ValueError: If ``maxlen`` is given and not positive. A negative became
             ``LTRIM key N -1`` after every push — removing the *oldest* N rather than keeping the
             newest, so a short list was emptied on every batch with every counter at zero — and

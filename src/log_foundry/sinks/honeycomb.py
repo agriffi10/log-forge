@@ -133,6 +133,9 @@ class HoneycombSink(HTTPSink):
           None.
 
         Raises:
+          TypeError: If a forwarded ``max_retries`` or ``max_batch_count`` is not an ``int``, or
+            a forwarded ``max_retry_after`` is not an ``int`` or ``float``, refused by
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), or cannot
             be carried in a request path — checked against a fixed base so the message names
             ``dataset`` rather than the ``url`` this class builds from both, whose own check

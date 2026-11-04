@@ -1294,8 +1294,12 @@ folding it in would make every later `flush()` in the process report a failure i
 So `flush()` answers "did the logs I am waiting on get out", and `health()` answers "has anything
 been lost at all" — **check both**, as the handler below does.
 
-It never raises — a logging call must not be the reason your function fails. Passing
-`timeout=None` waits indefinitely, which is unsafe anywhere with an execution deadline.
+It never raises once it has accepted its `timeout` — a logging call must not be the reason
+your function fails. The one refusal is of the argument itself, at entry and before anything is
+drained: a NaN `timeout` raises `ValueError`, and one that is not an `int`, a `float` or `None`
+raises `TypeError` (`shutdown()` does the same). Passing `timeout=None`, `math.inf` or anything
+above `threading.TIMEOUT_MAX` waits indefinitely, which is unsafe anywhere with an execution
+deadline.
 
 #### Serverless / short-lived processes
 

@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
-from log_foundry.sinks._retry import require_timeout, wait
+from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["RabbitMQSink"]
@@ -70,7 +70,9 @@ class RabbitMQSink:
           url: The AMQP URL used when opening a connection.
           max_retries: Reconnect retries per message, floored at zero as ``Worker._emit`` floors
             its own (SPEC-021) — a negative value abandoned each message with no attempt made and
-            no counter moved.
+            no counter moved. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
+            FR-001), before any connection is opened; a ``bool`` or ``int`` subclass is read as
+            the ``int`` it holds.
           blocked_connection_timeout: Seconds a blocked broker may hold the connection, or
             ``None`` for :data:`DEFAULT_BLOCKED_CONNECTION_TIMEOUT` unless the URL's query names
             ``blocked_connection_timeout`` itself (SPEC-049 FR-005) — the library's default never
@@ -85,6 +87,7 @@ class RabbitMQSink:
           None.
 
         Raises:
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ValueError: If a bound cannot bound anything, or if one is passed alongside
             ``connection=``, which is already connected and cannot consume it — SPEC-043's rule
             that an argument no backend can use is an error rather than a silent ignore.
@@ -111,7 +114,7 @@ class RabbitMQSink:
         self._exchange = exchange
         self._routing_key = routing_key
         self._url = url
-        self._max_retries = max(max_retries, 0)
+        self._max_retries = floor_count(max_retries, 0, "max_retries", "RabbitMQSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
