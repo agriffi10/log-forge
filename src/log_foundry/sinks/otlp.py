@@ -102,8 +102,9 @@ class OTLPSink(HTTPSink):
 
         Raises:
           TypeError: If ``endpoint`` is not a ``str``.
-          ValueError: If ``endpoint`` has no ``http``/``https`` scheme or names no host, or if
-            ``method`` is anything but ``"POST"`` — OTLP/HTTP is POST only, and accepting another
+          ValueError: If ``endpoint`` carries a user or password before its host, has no
+            ``http``/``https`` scheme or names no host, or if ``method`` is anything but
+            ``"POST"`` — OTLP/HTTP is POST only, and accepting another
             would send every batch to a server that refuses it for the life of the process
             (invariant 13). Every other refusal is inherited.
         """

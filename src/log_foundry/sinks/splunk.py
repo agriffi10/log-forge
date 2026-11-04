@@ -37,6 +37,7 @@ class SplunkHECSink(HTTPSink):
 
     MAX_BATCH_COUNT = 1000
     MAX_BATCH_BYTES = 1_000_000
+    _CREDENTIALS = "this sink's token argument"
 
     def __init__(
         self,
@@ -62,7 +63,9 @@ class SplunkHECSink(HTTPSink):
           None.
 
         Raises:
-          None.
+          ValueError: For any argument :class:`~log_foundry.sinks.http.HTTPSink` refuses, under
+            this class's name; a ``url`` carrying a user or password is told to pass the HEC
+            token as ``token``, which this sink sends itself.
         """
         self._host = host
         self._source = source

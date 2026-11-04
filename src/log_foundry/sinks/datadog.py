@@ -6,7 +6,14 @@ import json
 import re
 from typing import Unpack
 
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _valid_url, merge_headers
+from log_foundry.sinks.http import (
+    HTTPPlatformKwargs,
+    HTTPSink,
+    _holds_at,
+    _refuse_userinfo,
+    _valid_url,
+    merge_headers,
+)
 
 __all__ = ["DatadogSink"]
 
@@ -20,7 +27,10 @@ _SITE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 
 ``site`` is placed into the intake host, so anything else in it moved the request: ``#`` emptied
 the path, ``?`` and ``/`` moved it, ``@`` put the batch on a host with an ``@`` in it, which
-resolves nowhere, and ``""``, ``..`` and ``%2e`` named no host Datadog serves. A port and a trailing
+resolves nowhere, and ``""``, ``..`` and ``%2e`` named no host Datadog serves. An ``@`` that makes
+userinfo of what precedes it is refused before this pattern is consulted, because this pattern's
+refusal echoes ``site``, and userinfo may hold a password; a ``site`` holding an ``@`` anywhere
+else is refused by this pattern without being quoted. A port and a trailing
 dot are refused with them, as not a Datadog site, though either reached the intake.
 """
 
@@ -51,6 +61,7 @@ class DatadogSink(HTTPSink):
     MAX_BATCH_COUNT = 1000
     MAX_EVENT_BYTES = 1_000_000
     MAX_BATCH_BYTES = 5_000_000
+    _CREDENTIALS = "this sink's api_key argument"
 
     def __init__(
         self,
@@ -76,15 +87,26 @@ class DatadogSink(HTTPSink):
           None.
 
         Raises:
-          ValueError: If ``site`` is not a host name of dot-separated LDH labels (:data:`_SITE`),
+          ValueError: If ``site`` puts a user or password before the intake host — refused first,
+            naming ``site`` and echoing nothing of it, since the next refusal quotes it — or is
+            not a host name of dot-separated LDH labels (:data:`_SITE`),
             or the intake URL it builds cannot be sent — refused here so the message names
             ``site``, the argument the caller wrote, rather than the ``url`` this class built from
             it (SPEC-049 FR-001).
         """
+        _refuse_userinfo(
+            f"https://http-intake.logs.{site}/api/v2/logs",
+            type(self).__name__,
+            "site",
+            self._CREDENTIALS,
+        )
         if not _SITE.fullmatch(site):
+            shown = f": {site!r}"
+            if _holds_at(site):
+                shown = "; the site is not quoted, since it holds an '@'"
             raise ValueError(
                 f"{type(self).__name__} site must be a Datadog site's host name, such as "
-                f"'datadoghq.com' or 'us5.datadoghq.com': {site!r}"
+                f"'datadoghq.com' or 'us5.datadoghq.com'{shown}"
             )
         url = _valid_url(
             f"https://http-intake.logs.{site}/api/v2/logs", type(self).__name__, name="site"
