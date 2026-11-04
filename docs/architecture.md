@@ -977,6 +977,15 @@ close it.
   resumes a drain that a later `Worker.claim_stop` cannot win, so its deadline is never recorded
   and its stop takes the second caller's branch. **Closed by** resetting `_stopped` beside
   `_exit_deadline` on the resume branch.
+- **`@trace(name=...)` tests its argument with `isinstance(name, str)`** (SPEC-067 frame-2 review;
+  invariant 13). `isinstance` reads the value's own `__class__`, so an object whose `__class__`
+  property returns `str` is accepted at decoration, and every call of the decorated function then
+  writes "absorbed a failure while opening a span (TypeError); this call runs untraced" and runs
+  untraced: the bad argument is refused on every call rather than where it was written. A raising
+  `__class__` property raises its own exception at decoration rather than the `TypeError` naming
+  `name=`. Reproduced at `97436c7`. It needs a deliberately lying `__class__`, and it is outside the
+  inbound path SPEC-067 settled. **Closed by** testing `issubclass(type(name), str)` at
+  decoration and keeping the exact `str` (`str.__str__`), as `continue_trace` does since SPEC-067.
 
 ### Resolved
 
