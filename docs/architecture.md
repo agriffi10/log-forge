@@ -989,6 +989,22 @@ close it.
   shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain thread,
   which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034), and a swap that does
   not wait on the thread it runs on.
+- **A shutdown sentinel can still strand behind the final drain on the ordinary path** (SPEC-068
+  diff review; invariant 2). The first caller queues `_SHUTDOWN` and then sets the stop event, but
+  a drain thread that wakes on the stop event first — at the end of an emit, or from a backoff —
+  can run `_final_drain` and make its last read before the put lands, so the sentinel is never
+  consumed and `health().queued` reads 1 for good with `submitted_after_shutdown` at 0. Measured
+  by SPEC-068's second diff review in roughly 1 to 8 of 300 races against the worker as it stood
+  before SPEC-068; it predates that spec, which closed the same shape
+  for the caller that takes over a drain-thread join (that one no longer queues a second sentinel).
+  **Closed by** putting the sentinel before the stop event can wake the drain, or by
+  `_final_drain` re-reading the queue after the stop until it has taken a sentinel.
+- **A `shutdown()` called inside an orphan-path sink's `emit` closes that sink from inside its own
+  emit** (SPEC-068 diff review; invariant 5). With no span active, `log_foundry.info()` emits on the
+  caller's own thread (`api.py`), and `_Lifecycle.held` asks only about the worker's thread, so the
+  closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
+  share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
+  per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
 
 ### Resolved
 

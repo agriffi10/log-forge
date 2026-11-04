@@ -170,13 +170,15 @@ join uses is the caller whose deadline the drain declines against.
   - the three §12 items moved to *Resolved*, struck through and never deleted. The queued-items
     item and the fork item are marked **closed by SPEC-068**. The second-`shutdown()` item is
     marked **decided final by SPEC-068**, with the cost above;
-  - two new §12 *Open* items, from the Out of Scope bullets below. The first is the
+  - four new §12 *Open* items, from the Out of Scope bullets below. The first is the
     after-shutdown submission line announcing a loss the final drain can still deliver. It is
     **closed by** writing that `lost` line only once the final drain's last read of the queue is
     done or the drain thread is dead. The second is `flush()` and `configure(sink=…)` on the drain
     thread waiting on themselves. It is **closed by** a decided answer for a flush made on the
     drain thread, which needs a new `FlushResult.reason` on a frozen public surface, and a swap
-    that does not wait on the thread it runs on;
+    that does not wait on the thread it runs on. The third and fourth, added after the second
+    diff review, are the ordinary-path stranded sentinel and a `shutdown()` inside an orphan-path
+    sink's `emit`, each with the closure its Out of Scope bullet names;
   - invariant 5's *Recorded exceptions* gain the expired case. An expired `shutdown()` leaves the
     sink open, and only a later call that finds the drain thread ended closes it (SPEC-027 FR-004,
     decided final by SPEC-068). The page records no such exception today, although the behaviour
@@ -215,6 +217,16 @@ join uses is the caller whose deadline the drain declines against.
   that zero rather than changing it.
 - **The closer, its grace and `_close_owed`'s choice.** Every route here reaches the existing
   closer unchanged.
+- **A `shutdown()` inside an orphan-path sink's `emit`** (found by the second diff review). With no
+  span active the emit runs on the caller's thread, `_Lifecycle.held` sees only the worker's
+  thread, and the closer closes the sink from inside its own emit; a non-reentrant lock shared by
+  `emit` and `close` then never returns. Pre-existing and identical at `fda134a`, so it goes to
+  `architecture.md` §12 at completion, closed by a per-thread inside-emit marker that `held()`
+  consults.
+- **The ordinary-path stranded sentinel** (found by the second diff review). A first caller's
+  sentinel can still land after the final drain's last read; this predates SPEC-068, which fixes
+  only the handover's second sentinel (FR-006). It goes to §12, closed by putting the sentinel
+  before the stop event can wake the drain or by the final drain re-reading until it takes one.
 
 ---
 
@@ -539,9 +551,12 @@ retirement count moves as for any `shutdown()`.
 **The handover: a join is owed.** The next caller **not** on the drain thread takes the gate over
 in `claim_stop`, under `Worker._lock`. It clears `_join_owed`, records **its own** deadline in
 place of the drain-thread caller's, and returns `True`. It then does the first caller's whole work
-in `stop` against its own timeout:
-- the sentinel, harmless if one is already queued, since `_drain` breaks on the first and
-  `_final_drain` skips the rest;
+in `stop` against its own timeout, except the sentinel:
+- **no** sentinel, because the drain-thread caller already queued one and set the stop event. A
+  second one is not harmless (found by the second diff review): taken over while `_final_drain`'s
+  emit is running, it lands after that drain's last read, is never consumed, and `health().queued`
+  reads 1 for good with `submitted_after_shutdown` at 0 — 33 of 300 unforced runs. The takeover
+  records `_join_taken_over` in the same critical section, and `stop` reads it to skip the put;
 - the stop event and the join;
 - on expiry, `ShutdownTimeout`, FR-001's line, `_drain_settled` and `_release_waiters`.
 
@@ -625,17 +640,22 @@ def pending(detail: str) -> None      # "log-foundry: <escaped, truncated detail
 Worker._join_owed: bool               # True only between a drain-thread win and the handover;
                                       # written under Worker._lock by claim_stop; reset on the
                                       # resume branch of _reinit_after_fork
+Worker._join_taken_over: bool         # True once a caller took the owed join over; tells stop
+                                      # not to queue a second sentinel; same lock and reset
 Worker.claim_stop(deadline) -> bool   # unchanged, plus: a drain-thread winner sets _join_owed;
                                       # a caller off the drain thread finding _join_owed clears it,
-                                      # records its own deadline and returns True (FR-006)
+                                      # sets _join_taken_over, records its own deadline and
+                                      # returns True (FR-006)
 Worker._queued_submissions() -> int   # replaces _queued_or_unknown: queue entries that are neither
                                       # _SHUTDOWN nor a _FlushMarker, under self._queue.mutex; 0 on
                                       # any failure
 Worker.stop(timeout, *, claimed=None) # expiry line via _diag.pending (FR-001); on the drain thread
                                       # itself: first caller queues the sentinel, sets the stop
-                                      # event and returns; losing caller returns (FR-006);
+                                      # event and returns; losing caller returns; the caller
+                                      # that took the join over queues no sentinel (FR-006);
                                       # otherwise both branches unchanged (FR-003)
 Worker._reinit_after_fork(*, resume)  # resume branch adds: _stopped = False; _join_owed = False;
+                                      # _join_taken_over = False;
                                       # _stop = _lifecycle._state.refresh_stop_signal()
 ```
 

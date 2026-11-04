@@ -788,6 +788,89 @@ def test_a_drain_thread_shutdown_that_loses_returns_at_once(
     assert sink.closes == 1, f"closed {sink.closes} times"
 
 
+class _FinalDrainGateSink:
+    """A sink whose first `emit` calls `shutdown()` and returns, and whose next `emit` parks.
+
+    The second emit is `_final_drain`'s, for the span queued behind the first: the drain-thread
+    `shutdown()` set the stop event, so the drain loop leaves for the final drain as soon as the
+    first emit returns. Parked there, the drain has made its last read of the queue.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.in_first = threading.Event()
+        self.go = threading.Event()
+        self.in_final = threading.Event()
+        self.gate = threading.Event()
+        self.delivered = 0
+        self.closes = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Calls `shutdown()` on the first call; parks on `gate` on the second."""
+        self.calls += 1
+        if self.calls == 1:
+            self.in_first.set()
+            assert self.go.wait(5.0)
+            log_foundry.shutdown(timeout=5.0)
+        else:
+            self.in_final.set()
+            self.gate.wait(10.0)
+        self.delivered += len(batch)
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closes += 1
+
+
+def test_a_join_taken_over_during_the_final_drain_strands_no_sentinel(monkeypatch) -> None:
+    """FR-006, found by the second diff review: the takeover queues no second sentinel.
+
+    The drain-thread winner already queued one and set the stop event. A caller that takes the
+    owed join over while `_final_drain`'s emit is running is past that drain's last read, so a
+    sentinel it queued would never be consumed: `health().queued` would read 1 for the life of
+    the process with `submitted_after_shutdown` at 0. Measured unforced in 33 of 300 runs; here
+    the takeover is forced to land inside the final drain's emit. Against a takeover that still
+    puts, the queue keeps a `_SHUTDOWN`.
+    """
+    sink = _FinalDrainGateSink()
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)  # type: ignore[arg-type]
+    install_worker(worker)
+    taken = threading.Event()
+    real_claim = Worker.claim_stop
+
+    def noting_claim(self: Worker, deadline: float | None) -> bool:
+        won = real_claim(self, deadline)
+        if won and threading.current_thread().name == "main":
+            taken.set()
+        return won
+
+    monkeypatch.setattr(Worker, "claim_stop", noting_claim)
+    try:
+        worker.submit(_span(0))
+        assert sink.in_first.wait(5.0)
+        worker.submit(_span(1))
+        sink.go.set()
+        assert sink.in_final.wait(5.0), "the premise: the drain is inside the final drain's emit"
+        assert worker._join_owed and not worker._drain_finished.is_set(), "the premise"
+
+        main = _MeasuredThread(lambda: _lifecycle._shutdown_worker(3.0), name="main")
+        main.start()
+        assert taken.wait(5.0), "the main call took the owed join over"
+        sink.gate.set()
+        elapsed = main.finish(3.0 + _SLACK)
+    finally:
+        sink.go.set()
+        sink.gate.set()
+    worker._thread.join(5.0)
+
+    assert not worker._thread.is_alive()
+    assert elapsed < 3.0, f"the main call took {elapsed:.2f}s"
+    assert log_foundry.health().queued == 0, "nothing is stranded in the queue"
+    assert not any(item is worker_mod._SHUTDOWN for item in worker._queue.queue)
+    assert sink.delivered == 2
+    assert sink.closes == 1
+
+
 def test_the_owed_join_is_taken_over_once_by_concurrent_callers(capsys) -> None:
     """FR-006, the single-use handover under contention, through the `shutdown()` route.
 
@@ -1023,6 +1106,7 @@ def test_resume_resets_the_stop_gate_and_replaces_a_set_stop_event() -> None:
     worker = Worker(sink, batch_size=1, flush_interval=0.01)  # type: ignore[arg-type]
     worker.stop(2.0)
     worker._join_owed = True
+    worker._join_taken_over = True
     inherited = worker._stop
     assert worker._stopped and inherited.is_set(), "the premise: a directly stopped worker"
 
@@ -1030,6 +1114,7 @@ def test_resume_resets_the_stop_gate_and_replaces_a_set_stop_event() -> None:
     try:
         assert worker._stopped is False
         assert worker._join_owed is False
+        assert worker._join_taken_over is False
         assert worker._exit_deadline is None
         assert worker._stop is not inherited and worker._stop.is_set() is False
         assert worker._stop is _lifecycle._state._stop, "the owner and the worker share it"
@@ -1073,11 +1158,13 @@ def test_retire_leaves_the_stop_gate_and_event_as_inherited() -> None:
     worker = Worker(_SignalSink(), batch_size=1, flush_interval=0.01)  # type: ignore[arg-type]
     worker.stop(2.0)
     worker._join_owed = True
+    worker._join_taken_over = True
     inherited, deadline = worker._stop, worker._exit_deadline
 
     worker._reinit_after_fork(resume=False)
 
     assert worker._stopped is True
     assert worker._join_owed is True
+    assert worker._join_taken_over is True
     assert worker._stop is inherited and inherited.is_set()
     assert worker._exit_deadline == deadline

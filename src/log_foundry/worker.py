@@ -123,7 +123,9 @@ class Health:
         stopping the world, and counts the internal flush/shutdown markers alongside real
         submissions — normally only in passing, but a ``flush()`` marker stranded by racing
         ``shutdown()`` is answered and then counted for the life of the process, since
-        ``Queue`` offers no way to remove one specific item.
+        ``Queue`` offers no way to remove one specific item. A ``_SHUTDOWN`` sentinel put after
+        the final drain's last read is counted the same way, a recorded exception
+        (``architecture.md`` §12).
       dropped: Submissions discarded because the queue was full (backpressure).
       failed_batches: Batches abandoned after the retry budget was spent, or whose retry the
         exit drain declined because it was predicted to end after the ``shutdown()``
@@ -369,8 +371,10 @@ class Worker:
         drain thread owed replaces the drain-thread caller's deadline with its own (SPEC-068
         FR-006). ``_join_owed`` records that debt — ``True`` only between a stop claimed **on**
         the drain thread, which cannot join itself, and the next caller off it, which takes the
-        gate over. It is written under ``_lock`` by :meth:`claim_stop` and reset with
-        ``_stopped`` where :meth:`_reinit_after_fork` starts a drain thread. ``_in_flight`` is the
+        gate over. ``_join_taken_over`` records that the debt was paid, so the caller that took
+        it over queues no second sentinel. Both are written under ``_lock`` by :meth:`claim_stop`
+        and reset with ``_stopped`` where :meth:`_reinit_after_fork` starts a drain thread.
+        ``_in_flight`` is the
         size of the batch :meth:`_emit` is holding, from before its first attempt until it returns,
         so an expired join can say how many events are inside the emit it gave up waiting on
         (FR-005). It is written by the drain thread and read without the lock by the stopper, as
@@ -425,6 +429,7 @@ class Worker:
         self._stopped = False
         self._exit_deadline: float | None = None
         self._join_owed = False
+        self._join_taken_over = False
         self._in_flight = 0
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
@@ -478,7 +483,7 @@ class Worker:
         the child's drain thread had ended before its first submission, which was never
         delivered and never counted. Resetting ``_stopped`` alone was measured too and is not
         enough: the deadline is then recorded, but the drain thread is still dead. So the branch
-        clears ``_stopped`` and ``_join_owed`` and takes its event from
+        clears ``_stopped``, ``_join_owed`` and ``_join_taken_over`` and takes its event from
         :meth:`~log_foundry._lifecycle._Lifecycle.refresh_stop_signal`, the call ``__init__``
         makes: the owner's current event when that is unset, so a worker never stopped keeps the
         event it had and the identity with the owner and the sink is unchanged, and a fresh one
@@ -572,6 +577,7 @@ class Worker:
         self._exit_deadline = None
         self._stopped = False
         self._join_owed = False
+        self._join_taken_over = False
         self._stop = _lifecycle._state.refresh_stop_signal()
         self._drain_finished.clear()
         self._drain_settled.clear()
@@ -1188,6 +1194,17 @@ class Worker:
         exit with no line and no close. A losing caller on the drain thread never takes the owed
         join over: it is the one thread that cannot perform it.
 
+        **The verdict stays a** ``bool``, because both callers — :meth:`stop` and
+        :func:`_lifecycle._shutdown_worker`, which passes it on as ``claimed`` — only need "do
+        the first caller's work". The one difference in that work is recorded beside it instead:
+        the takeover sets ``_join_taken_over`` in the same critical section, and :meth:`stop`
+        reads it to skip the sentinel, which the drain-thread winner already queued. A second one
+        is not harmless. Taken over while :meth:`_final_drain`'s emit is running, it lands after
+        that drain's last read, is never consumed, and ``health().queued`` reads 1 for the life
+        of the process with ``submitted_after_shutdown`` at 0 — measured in 33 of 300 unforced
+        runs. The drain needs no wake-up from it either: the drain-thread winner has set the stop
+        event, and the drain loop tests that as soon as the emit it is inside returns.
+
         Whether this caller is the drain thread is read **before** the lock, so the lock is still
         held across no call. In a forked child, ``self._thread`` names the inherited dead thread
         for an instant after the new one starts; :meth:`_reinit_after_fork` says why no caller
@@ -1216,6 +1233,7 @@ class Worker:
                 if not self._join_owed or on_drain_thread:
                     return False
                 self._join_owed = False
+                self._join_taken_over = True
                 self._exit_deadline = deadline
                 return True
             self._stopped = True
@@ -1256,7 +1274,9 @@ class Worker:
         on ``_drain_settled``, which only this same thread's exit or another caller's expiry can
         set. As the first caller it queues the sentinel unless the drain has finished, sets the
         stop event and returns: :meth:`claim_stop` has recorded that a join is owed, and the next
-        caller off this thread takes it over. It writes no expiry line and sets no
+        caller off this thread takes it over — doing the first caller's work except the sentinel,
+        which is already queued and a second copy of which can strand behind the final drain
+        (``_join_taken_over``, :meth:`claim_stop`). It writes no expiry line and sets no
         ``stopped_reason``, because nothing has timed out, and it calls no
         :meth:`_release_waiters`, because this thread's own exit sweeps the markers in
         :meth:`_run`'s ``finally``. As a losing caller it returns without waiting on
@@ -1309,7 +1329,8 @@ class Worker:
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
             return
-        if not self._drain_finished.is_set():
+        took_over = self._join_taken_over and not on_drain_thread
+        if not self._drain_finished.is_set() and not took_over:
             try:
                 self._queue.put_nowait(_SHUTDOWN)
             except queue.Full:

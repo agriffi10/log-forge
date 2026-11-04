@@ -21,7 +21,9 @@
 - Deviations: the plan review found two fork tests that passed only through the FR-005 defect;
   they now really retire their child (listed in the spec's Scope). FR-005 is not caller-visible —
   only a direct `Worker.stop()` leaves a live worker stopped — so it has no release note, and the
-  spec's API section says so.
+  spec's API section says so. The second diff review found the handover's own sentinel could
+  strand behind the final drain; the caller that takes the join over now queues none
+  (`Worker._join_taken_over`).
 
 ## What changed from earlier specs?
 
@@ -29,9 +31,10 @@
   longer opens `lost N item(s); `. SPEC-062's decision is refined with the drain-thread handover.
 - SPEC-039's note that the drain thread never reads `self._thread` is struck in the docstring and
   in `architecture.md` §13; the window it protected is argued unreachable instead.
-- `architecture.md` §12: three SPEC-062 items Resolved; two new Open items (the after-shutdown
-  submission line; `flush()` and `configure(sink=…)` on the drain thread). Invariant 5 records the
-  expired-shutdown exception.
+- `architecture.md` §12: three SPEC-062 items Resolved; four new Open items (the after-shutdown
+  submission line; `flush()` and `configure(sink=…)` on the drain thread; the ordinary-path
+  stranded sentinel; a `shutdown()` inside an orphan-path `emit` closing that sink). Invariant 5
+  records the expired-shutdown exception.
 
 ## Verification
 

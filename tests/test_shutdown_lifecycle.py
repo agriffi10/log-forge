@@ -991,6 +991,12 @@ def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() ->
     assert elapsed < _lifecycle.DEFAULT_CLOSER_GRACE, (
         f"shutdown(timeout=0) waited {elapsed:.2f}s on another caller's close"
     )
+    # The first caller is still inside the 5 s close. Left running, it finishes during whichever
+    # test this worker process runs next and reaches `join_closers` there: a test counting that
+    # call's grants then reads two (found in SPEC-068's build, once a new test file reshuffled
+    # the xdist schedule). So the test waits for its own thread before it ends.
+    first.join(10.0)
+    assert not first.is_alive(), "the first caller's close never finished"
 
 
 def test_a_daemon_thread_shutdown_finishes_its_close_before_the_process_exits() -> None:
