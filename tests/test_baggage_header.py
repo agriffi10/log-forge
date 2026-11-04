@@ -140,7 +140,7 @@ def _nameless() -> Iterator[None]:
 
 
 class _ClaimsBoolRaises:
-    """Claims `bool` through `__class__`, so coercion returns it as itself; its `__str__` raises."""
+    """Claims `bool` through `__class__`, refused by coercion since SPEC-063; `__str__` raises."""
 
     @property
     def __class__(self) -> type:  # type: ignore[override]
@@ -204,12 +204,11 @@ class Boom:
         raise RuntimeError("secret")
 
 
-def _assert_survives_coercion(value: object) -> None:
-    """The coercion-route premise: the object reaches the render as itself (arch §12)."""
+def _assert_refused_by_coercion(value: object) -> None:
+    """The coercion-route premise since SPEC-063: the spoof becomes coercion's own placeholder."""
     coerced = sanitize.sanitize_fields({"v": value}, cfg=Config())[0]["v"]
-    assert type(coerced) is type(value), (
-        "coercion no longer returns this spoof as itself (SPEC-063?), so this test would pass "
-        "on coercion's own placeholder and no longer reach the render guard"
+    assert coerced == f"<unserializable: {type.__dict__['__name__'].__get__(type(value))}>", (
+        "coercion returned this spoof as something other than its real-type placeholder"
     )
 
 
@@ -444,11 +443,17 @@ def test_an_inbound_lone_surrogate_renders_and_stays_stored() -> None:
     assert context.get_baggage()["k"] == "\ud800"
 
 
-def test_the_render_guard_isolates_a_value_that_survives_coercion() -> None:
-    """The guard, coercion route: the spoof reaches `str()`, and only its own member is lost."""
-    spoof = _ClaimsBoolRaises()
-    _assert_survives_coercion(spoof)
-    assert _header(a="1", v=spoof, z="2") == "a=1,v=%3Cunserializable%3A%20_ClaimsBoolRaises%3E,z=2"
+def test_a_bool_claim_becomes_coercion_s_own_placeholder() -> None:
+    """Coercion route: since SPEC-063 the spoof is refused by coercion, and only its member changes.
+
+    Before SPEC-063 it reached the render as itself and the guard named it; now coercion names it
+    by its real type before the render, so the header is the same text by the other route and the
+    guard itself is held by the `bypass_coercion` twins.
+    """
+    _assert_refused_by_coercion(_ClaimsBoolRaises())
+    assert _header(a="1", v=_ClaimsBoolRaises(), z="2") == (
+        "a=1,v=%3Cunserializable%3A%20_ClaimsBoolRaises%3E,z=2"
+    )
 
 
 def test_the_render_guard_isolates_a_raising_value(bypass_coercion: None) -> None:
@@ -456,11 +461,12 @@ def test_the_render_guard_isolates_a_raising_value(bypass_coercion: None) -> Non
     assert _header(a="1", v=Boom(), z="2") == "a=1,v=%3Cunserializable%3A%20Boom%3E,z=2"
 
 
-def test_a_str_subclass_with_a_raising_encode_is_guarded() -> None:
-    """Measured escape 1, coercion route: `str()` succeeds and `quote` raises."""
-    spoof = _ClaimsBoolSubStr()
-    _assert_survives_coercion(spoof)
-    assert _header(a="1", v=spoof, z="2") == "a=1,v=%3Cunserializable%3A%20_ClaimsBoolSubStr%3E,z=2"
+def test_a_bool_claim_with_a_raising_encode_becomes_coercion_s_placeholder() -> None:
+    """Measured escape 1, coercion route: since SPEC-063 coercion refuses it before any `str()`."""
+    _assert_refused_by_coercion(_ClaimsBoolSubStr())
+    assert _header(a="1", v=_ClaimsBoolSubStr(), z="2") == (
+        "a=1,v=%3Cunserializable%3A%20_ClaimsBoolSubStr%3E,z=2"
+    )
 
 
 def test_a_str_subclass_with_a_raising_encode_is_guarded_on_any_coercer(
@@ -472,22 +478,21 @@ def test_a_str_subclass_with_a_raising_encode_is_guarded_on_any_coercer(
     )
 
 
-def test_an_unreadable_type_name_becomes_a_question_mark() -> None:
-    """Measured escape 2, coercion route: naming the type raises too, so it is `?`."""
-    spoof = _ClaimsBoolNameless()
-    _assert_survives_coercion(spoof)
-    with _nameless():
-        header = _header(a="1", v=spoof, z="2")
-    assert header == "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
-
-
-def test_an_unreadable_type_name_becomes_a_question_mark_on_any_coercer(
-    bypass_coercion: None,
-) -> None:
-    """Measured escape 2, route-independent."""
+def test_a_raising_metaclass_name_is_read_as_the_stored_name() -> None:
+    """Measured escape 2, coercion route: since SPEC-063 the stored name is read, so none raises."""
+    _assert_refused_by_coercion(_ClaimsBoolNameless())
     with _nameless():
         header = _header(a="1", v=_ClaimsBoolNameless(), z="2")
-    assert header == "a=1,v=%3Cunserializable%3A%20%3F%3E,z=2"
+    assert header == "a=1,v=%3Cunserializable%3A%20_ClaimsBoolNameless%3E,z=2"
+
+
+def test_a_raising_metaclass_name_is_read_as_the_stored_name_on_any_coercer(
+    bypass_coercion: None,
+) -> None:
+    """Measured escape 2, route-independent: `_type_name` reads the stored name (SPEC-063)."""
+    with _nameless():
+        header = _header(a="1", v=_ClaimsBoolNameless(), z="2")
+    assert header == "a=1,v=%3Cunserializable%3A%20_ClaimsBoolNameless%3E,z=2"
 
 
 def _quote_refusing(refused: Callable[[object], bool]) -> Callable[..., str]:
@@ -529,14 +534,6 @@ def test_an_unencodable_placeholder_skips_its_member_and_is_counted(
     assert _header(a="1", b=Boom(), z="2") == "a=1,z=2"
     assert len(_lines(capsys.readouterr().err)) == 1
     assert next(context._dropped_members) == 2
-
-
-def test_a_base_exception_from_str_propagates() -> None:
-    """Coercion route: the guard catches `Exception`, never `BaseException` (invariant 1)."""
-    spoof = _ClaimsBoolHalts()
-    _assert_survives_coercion(spoof)
-    with pytest.raises(_Halt):
-        _header(a="1", v=spoof)
 
 
 def test_a_base_exception_from_str_propagates_on_any_coercer(bypass_coercion: None) -> None:

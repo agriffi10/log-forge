@@ -445,12 +445,13 @@ def format_baggage_header(baggage: dict[str, object]) -> str:
 def _render_member(key: str, value: object) -> str | None:
     """Renders one coerced baggage member as ``key=value``, or ``None`` when it must be skipped.
 
-    After coercion a value is a scalar, a list or a dict, so ``str()`` of it cannot raise except
-    for an object that spoofs a scalar type and survives coercion (arch §12). The guard therefore
-    wraps the whole value render, ``str()`` and ``quote`` both, because a ``__str__`` returning a
-    ``str`` subclass with a raising ``encode`` gets past ``str()`` and raises inside ``quote``.
-    Such a value becomes ``<unserializable: TypeName>``, named by ``sanitize._type_name`` so that
-    an unreadable type name is ``"?"`` rather than a second exception, and never by ``repr`` or
+    After coercion a value is an exact scalar, a list or a dict, so ``str()`` of it cannot raise:
+    since SPEC-063 an object that only claims a scalar type is coercion's own placeholder. The
+    guard still wraps the whole value render, ``str()`` and ``quote`` both, so the render stays
+    total on any coercer, and a ``__str__`` returning a ``str`` subclass with a raising ``encode``
+    gets past ``str()`` and raises inside ``quote``. Such a value becomes
+    ``<unserializable: TypeName>``, named by ``sanitize._type_name``, which reads the stored name
+    so that a metaclass cannot raise a second exception or rename it, and never by ``repr`` or
     the exception's text (invariant 11). Only ``Exception`` is caught, so a ``KeyboardInterrupt``
     still reaches the caller. A coerced key is always a ``str``, so the key's guard is defensive.
 
