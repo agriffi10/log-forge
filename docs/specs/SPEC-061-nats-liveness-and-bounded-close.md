@@ -230,8 +230,8 @@ every capped ack wait read as an abandoned publish instead of a raised one (agai
 at `publish_timeout=1.0`, 0 of 4 ack-starved emits raised; at `fda134a` all did). Below twice the
 margin the margin halves with what remains, so the timeout stays positive and inside the wait at
 every value; a fixed floor cannot. The probe's `PROBE_FLUSH_TIMEOUT` is the rule's mirror, a driver
-timeout that deliberately outlives every sink wait. Every latch ages from when the silence began,
-not from when the sink noticed it. A test holds the rule on the source: every `timeout=` the sink
+timeout that deliberately outlives every sink wait. Every latch ages from the start of the call
+whose budget the stall spent, not from when the sink noticed it. A test holds the rule on the source: every `timeout=` the sink
 hands the driver is `_driver_timeout(...)` or `PROBE_FLUSH_TIMEOUT`, from a pinned roster.
 
 #### Acceptance Criteria:
@@ -348,10 +348,13 @@ that. When FR-003's drained wait fails, `emit` and `flush` leave a probe outstan
 waiting for it, so the latch has a PING to age even when the stall shows as a buffer that is not
 moving rather than as an unanswered PING (diff review frame 2, finding 2: before, the confirmation
 short-circuited before any PING, so the next caller paid a whole budget sending its own). That
-probe is aged from when the drained wait **began**, when the buffer stopped moving, so the latch
-already holds when the call returns and the next caller is **refused at once** (diff review frame
-3, finding 2: dated when the wait failed, the next caller waited a whole budget more, 1.002 s at
-`publish_timeout=1.0` on the real driver, and callers queued behind it twice that).
+probe is aged from **the start of the call whose budget it spent** (`deadline - publish_timeout`),
+so the latch already holds when the call returns and the next caller is **refused at once**,
+deterministically: the drained wait fails only once the deadline has passed (diff review frame 3,
+finding 2: dated when the wait failed, the next caller waited a whole budget more, 1.002 s at
+`publish_timeout=1.0` on the real driver, and callers queued behind it twice that; dated when the
+drained wait began, it still waited whatever the pre-publish probe and the publishes had taken,
+which made the latch test flake one run in four).
 
 `PENDING_POLL = 0.005` is the step of the timed yield the FR-003 drained wait polls on.
 `PROBE_FLUSH_TIMEOUT = 600.0` is the driver's own `wait_for` bound inside the probe and must
@@ -449,9 +452,9 @@ zero confirms**: a probe still outstanding at that moment (one FR-002's latch wa
 an undrained buffer) is waited out first as a liveness answer, and the confirming PING is sent
 fresh once it has finished, so at most one probe is outstanding and none sent before the drain
 ever confirms. When the counter does not reach zero, a probe is left outstanding unawaited for
-FR-002's latch (`close()` excepted, since nothing follows it), aged from when the drained wait
-began so the next caller is refused at once, and that PING may overtake the buffer, which is why
-the rule above exists. No answer, including when the deadline is already
+FR-002's latch (`close()` excepted, since nothing follows it), aged from the start of the call
+so the next caller is refused at once, and that PING may overtake the buffer, which is why the
+rule above exists. No answer, including when the deadline is already
 spent or the client has become disconnected (the probe is still sent where it can be, so the next
 call can reuse it), means every
 event that was published and not otherwise counted is added to `failed` and announced once through
@@ -538,7 +541,8 @@ retry can count it again.
       unconfirmed batch -- with no sleep -- is refused by the latch in under 0.05 s and sends no
       PING; made while another thread holds the lock, it is refused in under 0.1 s, so before
       the lock; and callers queued on the lock behind the batch are refused within one and a half
-      budgets of their start.
+      budgets of their start. The same holds when a slow pre-publish PONG took two thirds of the
+      budget before the stall, so the latch does not depend on how early the drained wait began.
 - [ ] AC-18 (frame 3, finding 1): a JetStream client whose ack never arrives, owned or injected,
       with `publish_timeout=0.4` and a batch of one, makes `emit` raise `SinkDeliveryError` with
       `failed` 1 announced as "NATSSink publish, TimeoutError", not return with the publish

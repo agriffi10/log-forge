@@ -28,14 +28,14 @@ signature changed and no constructor argument was added.
 - **The single driver-timeout rule**: every timeout the sink hands the driver for a wait the driver
   reports by raising is `_driver_timeout(...)`, ending `DRIVER_DEADLINE_MARGIN` (0.05 s) inside the
   sink's own wait, or `PROBE_FLUSH_TIMEOUT`, which deliberately outlives it; every latch ages from
-  when the silence began. A test holds the first half on the source from a pinned roster.
+  the start of the call whose budget the stall spent. A test holds the first half on the source from a pinned roster.
 - **Tests**: `tests/test_sinks_nats_liveness.py` (fakes for FR-001 to FR-004 and the fork child,
   79 tests collected at `cc54227`) and `tests/test_sinks_nats_matrix.py`, the wait-and-latch matrix
   gated by mutation (96 tests collected at `cc54227`); `tests/integration/test_nats.py` gains the
   stall, restart, late-PONG, close-bound (core and JetStream) and landing tests.
 - Deviations the diff reviews forced, one line each: the abandoned-publish latch and counting an
   injected client's abandoned publish (frame 2, finding 1); a probe left behind by an undrained
-  confirmation, aged from when the drained wait began (frames 2 and 3); `close()` skipping its
+  confirmation, aged from the start of the call whose budget it spent (frames 2 and 3); `close()` skipping its
   round trip while a publish is abandoned (frame 3, finding 3); an injected `flush()` run as an
   uncancelled task under `publish_timeout`; the timing rule and the matrix (frame 3, AC-9).
 

@@ -139,8 +139,9 @@ ack-starved emits raised, where before SPEC-061 all did). The margin only has to
 scheduling between the two timers. Its mirror is :data:`PROBE_FLUSH_TIMEOUT`, a driver timeout
 that deliberately *outlives* every sink wait, because a PONG wait must never be cancelled.
 
-The second half of the rule is for latches: each ages from when the silence began, not from when
-the sink noticed it (:meth:`NATSSink._confirm`).
+The second half of the rule is for latches: each ages from the start of the call whose budget
+the stall spent, not from when the sink noticed it (:meth:`NATSSink._confirm`), so the latch holds
+for the very next caller and a stall costs one caller one budget.
 """
 
 _LOOP_THREAD_NAME = "log-foundry-nats-loop"
@@ -618,8 +619,8 @@ class NATSSink:
             raise SinkDeliveryError(f"{prefix}: the sink is closing")
         if self._latched():
             raise SinkDeliveryError(
-                f"{prefix}: the server has not answered a PING sent more than "
-                f"{self.publish_timeout}s ago"
+                f"{prefix}: the server has not answered a PING, and the stall it measures has "
+                f"lasted more than {self.publish_timeout}s"
             )
         self._refuse_while_stuck(prefix)
 
@@ -723,9 +724,9 @@ class NATSSink:
         awaited its ack, and an injected client has none either. The second round trip is sent
         only while the client still reports itself connected, because the driver's ``flush``
         returns without a PONG otherwise and the next call would wait on nothing. When the buffer
-        does not drain, a probe is left outstanding (:meth:`_confirm`), aged from when the drained
-        wait began, so the latch already holds when this call returns and the callers after it
-        are refused at once rather than each spending a budget.
+        does not drain, a probe is left outstanding (:meth:`_confirm`), aged from the start of
+        this call, so the latch already holds when this call returns and the callers after it are
+        refused at once rather than each spending a budget.
 
         Args:
           batch: The events to publish.
@@ -885,9 +886,9 @@ class NATSSink:
 
         Returns:
           True while the outstanding probe has gone unanswered for at least ``publish_timeout``
-          since the silence it measures began (when it was sent, or for a probe
-          :meth:`_confirm` left behind, when the drained wait began) and the driver has not
-          reconnected since.
+          since the instant it is aged from (when it was sent, or for a probe
+          :meth:`_confirm` left behind, the start of the call whose budget it spent) and the
+          driver has not reconnected since.
 
         Raises:
           None.
@@ -974,12 +975,12 @@ class NATSSink:
 
         The caller has established that no probe is outstanding, so at most one ever is. The tuple
         is assigned whole, which is what lets :meth:`_latched` read it without a lock. Its second
-        field is the instant the silence the probe measures began, which is when the PING is sent
-        unless the caller already knows the silence began earlier (:meth:`_confirm`); the latch
-        ages from it (:data:`DRIVER_DEADLINE_MARGIN` states the rule).
+        field is the instant the latch ages it from, which is when the PING is sent unless the
+        caller dates it earlier (:meth:`_confirm` dates it from the start of the call whose budget
+        the stall spent; :data:`DRIVER_DEADLINE_MARGIN` states the rule).
 
         Args:
-          silent_since: The ``time.monotonic()`` instant the silence began, or None for now.
+          silent_since: The ``time.monotonic()`` instant to age the probe from, or None for now.
 
         Returns:
           The new probe's ``(task, silent_since, reconnects)``.
@@ -1007,11 +1008,16 @@ class NATSSink:
         When the buffer does not drain by the deadline nothing can confirm it, and with ``arm`` a
         probe is left outstanding without being waited for, so :meth:`_latched` has a PING to age
         and the callers after this one are refused at once rather than each spending a budget
-        behind a buffer that is not moving. That probe is aged from the moment the drained wait
-        began, not from when it was sent: the silence began when the buffer stopped moving, and
-        a probe dated at the deadline would make the next caller wait a whole budget more before
-        the latch held (diff review frame 3, finding 2: the next call took 1.002 s at
-        ``publish_timeout=1.0`` on the real driver). That PING is sent over the undrained buffer,
+        behind a buffer that is not moving. That probe is aged from the start of the call whose
+        budget it spent, ``deadline - publish_timeout``, not from when it was sent: the drained
+        wait fails only once the deadline has passed, so the probe is already ``publish_timeout``
+        old when it is sent and the latch holds for the very next caller, deterministically. Dated
+        when the wait failed, the next caller waited a whole budget more (diff review frame 3,
+        finding 2: 1.002 s at ``publish_timeout=1.0`` on the real driver); dated when the drained
+        wait began, it still waited for whatever the probe and the publishes had taken, which made
+        the latch test flake when a slow pre-publish PONG ate the budget. Only ``emit`` and
+        ``flush`` arm, and both pass a ``publish_timeout`` deadline. That PING is sent over the
+        undrained buffer,
         and the rule above is what keeps it from ever confirming anything. ``close()`` passes
         ``arm=False``, since no call follows it.
 
@@ -1025,10 +1031,9 @@ class NATSSink:
         Raises:
           None.
         """
-        waiting_since = time.monotonic()
         if not await self._drained(deadline):
             if arm and self._outstanding_probe() is None:
-                self._send_probe(silent_since=waiting_since)
+                self._send_probe(silent_since=deadline - self.publish_timeout)
             return False
         if self._outstanding_probe() is not None and not await self._await_probe(deadline):
             return False

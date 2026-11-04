@@ -1781,8 +1781,9 @@ def test_close_and_flush_wait_for_the_flusher_before_their_ping(monkeypatch) -> 
     # arms none, since nothing follows it.
     #
     # Each call waits for the previous one's liveness PING to be answered first. That PING is
-    # aged from when the buffer stopped moving (frame-3 finding 2), so a call made before its
-    # PONG lands is refused by the latch without reaching the drained wait this test is about;
+    # aged from the start of the call whose budget it spent (frame-3 finding 2), so a call made
+    # before its PONG lands is refused by the latch without reaching the drained wait this test
+    # is about;
     # `test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age` covers that refusal.
     sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
     sink.emit([{"n": 1}])
@@ -2092,8 +2093,10 @@ def test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age(monkeypatch) ->
     The call is made at once. Frame-3 finding 2: the probe was dated when the drained wait
     failed, at the deadline, so the next caller waited a whole budget more (0.50 s on the fakes,
     1.002 s on the real driver at ``publish_timeout=1.0``); an earlier version of this test slept
-    past ``publish_timeout`` first and so could not see it. The probe is now aged from when the
-    drained wait began, when the buffer stopped moving.
+    past ``publish_timeout`` first and so could not see it. The probe is now aged from the start
+    of the call whose budget it spent. Dated when the drained wait began, as it briefly was, this
+    test flaked one run in four: the next caller still waited the time the probe and the publish
+    had taken.
     """
     sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.3)
     sink.emit([{"n": 1}])
@@ -2120,15 +2123,27 @@ def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) ->
     that reused the outstanding probe as the confirmation would return after two PINGs, the second
     sent with nothing written.
 
-    The publish takes 0.3 s of the 0.6 s budget, so the drained wait, which the liveness PING is
-    aged from (frame-3 finding 2), starts half-way through it: the flush made right after the emit
-    reaches the outstanding probe while it is younger than ``publish_timeout`` rather than being
-    refused by the latch, and can wait for its PONG.
+    The probe an undrained emit leaves behind is already ``publish_timeout`` old when the emit
+    returns (it is aged from the start of the call whose budget it spent), so a flush cannot
+    reach it before the latch does. The young outstanding probe this test needs is therefore built
+    through the sink's own route on the loop: the left-behind probe is answered, and the sink's
+    ``_send_probe`` sends a fresh PING, dated now, over the still-parked buffer. That is exactly
+    the state a liveness probe sent before the drain leaves, without depending on how early in a
+    budget the drained wait began.
     """
-    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.6)
-    fake.publish_delay = 0.3
+    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.5)
     sink.emit([{"n": 1}])
     assert fake.pubs_at_ping == [0, 0], "the probe, then the liveness PING over the full buffer"
+
+    async def young_liveness_probe_over_the_full_buffer() -> None:
+        assert sink._probe is not None
+        fake.deliver_pong()
+        await asyncio.wait({sink._probe[0]}, timeout=2.0)
+        assert sink._outstanding_probe() is None
+        sink._send_probe(silent_since=time.monotonic())
+
+    _on_loop(sink, young_liveness_probe_over_the_full_buffer())
+    assert fake.pubs_at_ping == [0, 0, 0], "a young PING sent over the undrained buffer"
 
     async def drain_and_answer_late() -> None:
         fake.flusher_parked = False
@@ -2142,5 +2157,46 @@ def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) ->
     sink.close()
 
     assert error is None, error
-    assert elapsed < 0.6, f"{elapsed:.2f}s"
-    assert pings == [0, 0, 1], "the confirmation must be a fresh PING sent after the drain"
+    assert elapsed < 0.5, f"{elapsed:.2f}s"
+    assert pings == [0, 0, 0, 1], "the confirmation must be a fresh PING sent after the drain"
+
+
+class SlowFirstPongParkedNATS(ParkedAndStalledNATS):
+    """The pre-publish PING is answered only after 0.2 s, then the server and the flusher stall."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        if not self.calls.count("flush"):
+            self.answering = False
+            asyncio.get_running_loop().call_later(0.2, self.deliver_pong)
+        await super().flush(timeout)
+
+
+def test_the_latch_holds_after_an_undrained_batch_however_late_the_drained_wait_began(
+    monkeypatch,
+) -> None:
+    """The left-behind probe is aged from the call's start, not from when its drained wait began.
+
+    The pre-publish PONG takes 0.2 s of the 0.3 s budget, so the drained wait begins two thirds of
+    the way through it and fails at the deadline. Aged from the call's start, the probe is a whole
+    budget old when the emit returns, and the next emit is refused by the latch at once, sending
+    no PING of its own. Aged from when the drained wait began, it was 0.1 s old: the next emit
+    reused it and waited the remaining 0.2 s before refusing with "no PONG", which is the shape
+    that made the latch test flake one parallel run in four.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=SlowFirstPongParkedNATS, publish_timeout=0.3)
+    sink.emit([{"n": 1}])
+    first = sink.losses()
+    pings = fake.calls.count("flush")
+    elapsed, error = _timed(lambda: sink.emit([{"n": 2}]))
+    later = fake.calls.count("flush")
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert first == SinkLosses(dropped=0, failed=1)
+    assert pings == 2, "the slow pre-publish probe, then the one left for the latch"
+    assert isinstance(error, SinkDeliveryError), error
+    assert "has not answered a PING" in str(error), (
+        f"refused by a reused wait, not the latch: {error}"
+    )
+    assert elapsed < 0.05, f"the latch must refuse at once: {elapsed:.3f}s"
+    assert later == pings, "the refused call sent no PING of its own"

@@ -19,7 +19,9 @@ import asyncio
 import contextlib
 import math
 import pathlib
+import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -75,6 +77,7 @@ NO_PONG = "NATSSink unconfirmed, no PONG after the batch"
 ABANDONED = "NATSSink unconfirmed, publish abandoned"
 JS_ABANDONED = "NATSSink unconfirmed, JetStream publish abandoned"
 ACK_RAISED = "NATSSink publish, TimeoutError"
+STUCK_OR_LATCHED = "abandoned|has not answered a PING"
 
 
 class StarvedJetStream:
@@ -98,6 +101,7 @@ class MatrixFake(LiveFakeNATS):
       block_at: The zero-based publish that blocks in the driver's force-flush, its bytes
         already queued as ``_send_command`` queues them, until :attr:`release` is set.
       starve: Whether a JetStream ack never arrives, so the driver's own ack timeout raises.
+      first_pong_delay: Seconds before the first PING's PONG arrives, the rest as configured.
       cancelled_flushes: How many of this client's ``flush`` calls were cancelled.
       release: The event that lets a blocked publish finish.
     """
@@ -111,6 +115,7 @@ class MatrixFake(LiveFakeNATS):
         delay: float = 0.0,
         starve: bool = False,
         hold_close: bool = False,
+        first_pong_delay: float = 0.0,
     ) -> None:
         super().__init__()
         self.silent_after = silent_after
@@ -119,6 +124,7 @@ class MatrixFake(LiveFakeNATS):
         self.publish_delay = delay
         self.starve = starve
         self.cancelled_flushes = 0
+        self.first_pong_delay = first_pong_delay
         self.release: asyncio.Event | None = None
         if hold_close:
             self.close_gate = asyncio.Event()
@@ -126,6 +132,9 @@ class MatrixFake(LiveFakeNATS):
     async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
         if self.silent_after is not None and self.calls.count("flush") >= self.silent_after:
             self.answering = False
+        if self.first_pong_delay and not self.calls.count("flush"):
+            self.answering = False
+            asyncio.get_running_loop().call_later(self.first_pong_delay, self.deliver_pong)
         try:
             await super().flush(timeout)
         except asyncio.CancelledError:
@@ -191,13 +200,17 @@ def _cells() -> dict[str, Cell]:
             add(f"{stem}-flush-healthy", call="flush", pings=1 if owned else None, **base)
             add(f"{stem}-close-healthy", call="close", pings=1 if owned else 0, **base)
             abandoned = JS_ABANDONED if js else (NO_PONG if owned else ABANDONED)
+            # An owned core client's stuck publish also leaves its buffer undrained, so the probe
+            # left behind latches too, from the call's start; which refusal a later caller meets
+            # depends on whether that PING's PONG has landed, and both are the correct refusal.
+            stuck = STUCK_OR_LATCHED if owned and not js else "abandoned"
             add(
                 f"{stem}-emit1-first-publish",
                 call="emit1",
                 fake={"block_at": 0},
                 failed=1,
                 lines=((1, abandoned),),
-                next_refused="abandoned",
+                next_refused=stuck,
                 queued_refused=True,
                 released_accepts=True,
                 **base,
@@ -208,7 +221,7 @@ def _cells() -> dict[str, Cell]:
                 fake={"block_at": 0},
                 failed=3,
                 lines=((2, UNATTEMPTED), (1, abandoned)),
-                next_refused="abandoned",
+                next_refused=stuck,
                 **base,
             )
             second = 2 if owned and not js else 1
@@ -218,7 +231,7 @@ def _cells() -> dict[str, Cell]:
                 fake={"block_at": 1},
                 failed=1 + second,
                 lines=((1, UNATTEMPTED), (second, abandoned)),
-                next_refused="abandoned",
+                next_refused=stuck,
                 **base,
             )
             add(
@@ -235,7 +248,7 @@ def _cells() -> dict[str, Cell]:
                 fake={"block_at": 0},
                 prelude=True,
                 raises=SinkDeliveryError,
-                match="abandoned",
+                match=stuck,
                 failed=1,
                 pings=0 if owned else None,
                 **base,
@@ -355,6 +368,18 @@ def _cells() -> dict[str, Cell]:
             fake={"silent_after": 0},
         )
     add(
+        "owned-core-emit1-slow-probe-then-undrained",
+        owned=True,
+        js=False,
+        call="emit1",
+        fake={"first_pong_delay": 2 * P / 3, "silent_after": 1, "park": True},
+        failed=1,
+        lines=((1, NO_PONG),),
+        pings=2,
+        next_refused="has not answered a PING",
+        queued_refused=True,
+    )
+    add(
         "owned-core-emit1-undrained-answering",
         owned=True,
         js=False,
@@ -457,7 +482,7 @@ def _refused_while_locked(sink: NATSSink) -> tuple[float, BaseException | None]:
     """Calls ``emit`` while another thread holds the sink's lock, so only a pre-lock check refuses.
 
     Waits briefly for either latch to read held, since the probe a stalled call leaves behind is
-    aged from when its silence began and holds within a millisecond of the call's return; a sink
+    aged from the start of the call whose budget it spent and holds by the call's return; a sink
     whose latch never holds fails the call's own assertion instead, after :data:`HOLD` seconds.
     """
     _wait_until(lambda: sink._latched() or sink._publish_stuck(), within=NEXT_BOUND)
@@ -526,7 +551,7 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
             assert error is None, f"{cell_id}: {error!r}"
         else:
             assert isinstance(error, cell.raises), f"{cell_id}: {error!r}"
-            assert cell.match in str(error), f"{cell_id}: {error}"
+            assert re.search(cell.match, str(error)), f"{cell_id}: {error}"
             assert "wedged" not in str(error), f"{cell_id}: the backstop fired: {error}"
         assert losses == SinkLosses(dropped=0, failed=cell.failed), f"{cell_id}: {losses}"
         assert lines == [f"log-foundry: lost {n} event(s); {why}" for n, why in cell.lines], lines
@@ -546,7 +571,7 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
         if cell.next_refused is not None:
             n_elapsed, n_error = _refused_while_locked(sink)
             assert isinstance(n_error, SinkDeliveryError), f"{cell_id}: next {n_error!r}"
-            assert cell.next_refused in str(n_error), f"{cell_id}: next {n_error}"
+            assert re.search(cell.next_refused, str(n_error)), f"{cell_id}: next {n_error}"
             assert n_elapsed < NEXT_BOUND, f"{cell_id}: next caller {n_elapsed:.3f}s"
         if cell.released_accepts:
 
@@ -716,16 +741,25 @@ def test_matrix_a_client_close_that_swallows_a_cancel_ends_inside_the_sequence(
 def test_matrix_a_liveness_ping_never_confirms_the_buffer(monkeypatch) -> None:
     # A PING sent over an undrained buffer may have overtaken the publishes. Here the buffer then
     # drains and that PING's PONG lands during a flush: the flush takes it as liveness only and
-    # confirms with a fresh PING sent after the drain. The publish takes half the budget, so the
-    # outstanding probe is younger than the budget when the flush reaches it.
+    # confirms with a fresh PING sent after the drain. The probe an undrained emit leaves behind
+    # is already a budget old, so the young one is sent through the sink's own `_send_probe` on
+    # the loop, over the still-parked buffer, once the left-behind one is answered.
     sink, fake, _ = _build(
-        monkeypatch,
-        factory=lambda: MatrixFake(silent_after=1, park=True, delay=0.3),
-        publish_timeout=0.6,
+        monkeypatch, factory=lambda: MatrixFake(silent_after=1, park=True), publish_timeout=P
     )
     try:
         sink.emit([{"n": 1}])
         assert fake.pubs_at_ping == [0, 0]
+
+        async def young_liveness_probe() -> None:
+            assert sink._probe is not None
+            fake.deliver_pong()
+            await asyncio.wait({sink._probe[0]}, timeout=2.0)
+            assert sink._outstanding_probe() is None
+            sink._send_probe(silent_since=time.monotonic())
+
+        _on_loop(sink, young_liveness_probe())
+        assert fake.pubs_at_ping == [0, 0, 0]
 
         async def drain_and_answer_late() -> None:
             fake.flusher_parked = False
@@ -737,7 +771,7 @@ def test_matrix_a_liveness_ping_never_confirms_the_buffer(monkeypatch) -> None:
         _on_loop(sink, drain_and_answer_late())
         error = _timed(sink.flush)[1]
         assert error is None, error
-        assert fake.pubs_at_ping == [0, 0, 1], "the confirmation must be sent after the drain"
+        assert fake.pubs_at_ping == [0, 0, 0, 1], "the confirmation must be sent after the drain"
     finally:
         _close_quietly(sink)
 
