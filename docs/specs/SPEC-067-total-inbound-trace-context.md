@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-067
 title: "Total Inbound Trace Context — a Bounded Echo and Parsers That Run No Code of the Value"
 description: "Makes continue_trace total over any argument it is handed: the rejection echo is bounded and runs no code of the value, and the four parsers accept only an exact str."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-014, SPEC-029, SPEC-064]
 ---
 

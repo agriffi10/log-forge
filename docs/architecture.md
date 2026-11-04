@@ -925,16 +925,6 @@ close it.
   drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
   library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
-- **`_diag.rejected` echoes an inbound value through an unbounded `repr()`** (SPEC-064
-  system-frame review; invariants 1 and 11). `continue_trace` passes every refused `traceparent`,
-  `trace_id`, `parent_span_id` or `baggage` to `_diag.rejected`, which calls `repr(value)` before
-  it slices the echo to `_MAX_REJECTED_ECHO`. Measured at `7501e5e` under a 3 s `setitimer`: a
-  shared-sublist DAG (the SPEC-064 case (a) value) passed as `traceparent` never returns; a value
-  whose `__repr__` raises returns `ContinueResult(reason="rejected")` with no line written, because
-  `rejected`'s own guard swallows the whole write, although `"rejected"` is documented as announced.
-  The same class as SPEC-064's header defect, on the diagnostic path rather than the header.
-  **Closed by** `rejected` echoing a non-`str` value by type name (`<TypeName>`) and slicing a
-  `str` before its `repr`, so the echo is bounded and the line is always written.
 - **`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, unverified.** It
   does not check that the object is `_bulk`-shaped, so a server answering every POST with
   `{"error": {"type": "auth"}, "status": 500}`, or with
@@ -1029,6 +1019,22 @@ close it.
   renders. The same edit made `_type_name` read the stored name through `str.__str__`, and read it
   in `model` and `_diag` too, where a metaclass `__name__` property had cost a span its events and
   silenced the announcement of a counted loss.
+- ~~**`_diag.rejected` echoes an inbound value through a `repr()` of the whole value**~~ (SPEC-064
+  system-frame review; invariants 1 and 11) → **closed by SPEC-067**. `rejected` called
+  `repr(value)` and only then cut the result to `_MAX_REJECTED_ECHO`, so a shared-sublist DAG passed
+  to `continue_trace` never returned, and a value whose `__repr__` raised gave
+  `reason="rejected"` with no line written, because the guard swallowed the whole write
+  (measured at `7501e5e`). The echo now runs no code of the value: a `str`, exact or a subclass, is
+  its first 64 characters read through `str`'s own slots, quoted, escaped and cut; anything else is
+  `<TypeName>`, read through `type`'s own descriptor; and `<?>` stands in when even that fails, so
+  the line is always written. The spec also closed the parser half, which the entry did not list:
+  `continue_trace` raised into the caller on a `str` subclass with an overridden method or on a
+  value whose `__class__` is a property, because the parsers called `isinstance` and then the
+  value's own methods; and a valid `str` subclass was adopted as itself, so a later
+  `current_traceparent()` raised that subclass's own exception. The parsers now accept only an
+  exact `str`, and `continue_trace` turns a subclass into the exact `str` it holds once, on entry.
+  The reasoning and its rejected alternatives: *An inbound value runs no code of its own anywhere
+  on the inbound path*.
 - ~~**`configure()` accepts a ceiling that is not an `int`**~~ (SPEC-057 system-frame review;
   invariant 13) → **closed by SPEC-065**. `config._require_positive` tested only `value < 1`, so a
   `float`, `nan` or `inf` was stored as given and `sanitize` then did integer arithmetic on it on
