@@ -8,7 +8,7 @@ pulled **on demand**, when the router's table says:
 @docs/process/session-rhythm.md
 
 - `@docs/process/reviewer-contract.md` — the review gate in full (pull before briefing any reviewer)
-- `@docs/process/model-routing.md` — which model does which job (pull before delegating anything)
+- `@docs/process/agent-roles.md` — which agent does which job (pull before delegating anything)
 - `@docs/process/completion-ritual.md` — the seven steps at spec completion + the doc-hygiene rules
 - `@docs/decisions/index.yaml` — the Key Decisions register, generated: every area's fences (the table below names the areas)
 - `@docs/invariants.md` — the numbered promises as observables; a spec's criteria and the system-frame diff review cite them by number (read before writing or reviewing either)
@@ -20,7 +20,7 @@ pulled **on demand**, when the router's table says:
 - `@docs/spec-delivery/SPEC-XXX-*.md` — what a past spec delivered (pull only when a dependency points to one)
 - `@docs/best-practices/INDEX.md` — domain coding rulebooks (Python); route here, then load only the section(s) you need
 - `.claude/rules/` — one path-scoped pointer per governed tree; fires when a matching file is opened with Read (a backstop, not the mechanism)
-- `.claude/agents/` — the subagent roles the routing table names, each carrying its default model
+- `.claude/agents/` — the subagent roles the roles table names, each inheriting the parent's model
 
 ---
 
@@ -161,7 +161,7 @@ SPEC-014) · `tracestate` · sampling · "follows-from" span relationships (defe
 
 **Start:** the session rhythm (`@docs/process/session-rhythm.md`) loads with this file — follow it literally: read the spec you're building in full, skim `@docs/component-inventory.md` and pull only the `architecture.md` section you need, confirm CI is green on `main`, branch from fresh `main` (with other sessions running, in your **own worktree** off `origin/main`, never the shared checkout), set `spec_status: In Progress` and regenerate the index in that first commit, plan, and put the plan through the reviewer gate before the first line of code. Decide the **PR grouping** yourself and say it in a sentence — it draws no reviewer. A decision only the human can make is asked with the **question tool** — options as selections, the recommended one first — and the build continues on the answer; a summary or a list of options that ends the turn is a stop, whatever it says. If this file and the rhythm disagree, this file wins — fix the drift there in the same session.
 
-**Delegate, and pick the model by the job:** the main session orchestrates. Each artifact — spec, plan, code, every review, every sweep — goes to a subagent from `.claude/agents/` on the model `@docs/process/model-routing.md` names for that job (Sonnet writes specs and docs; Opus reviews, and Fable builds-and-reviews what Fable wrote; Opus implements, Fable when the complexity rule triggers — concurrency, lifecycle, fork, the frozen public surface; Haiku enumerates). When unsure, one tier up, never down.
+**Delegate by the job:** the main session orchestrates. Each artifact — spec, plan, code, every review, every sweep — goes to the subagent role `@docs/process/agent-roles.md` names for that job, and every subagent runs on the model that started the task.
 
 **Review — three kinds of artifact, four reviews, one blocking gate:** a **spec**, an implementation **plan** and a **diff** each go to a reviewer in a **fresh context**, never the context that produced them. **Counts: one on the spec, one on the plan, two on every diff — and no fifth artifact draws a reviewer.** The two on a diff are two *frames*, not two rounds, both **before the push**: one reads the change against the spec's criteria and `best-practices/python`, the other starts from the **system** — for each numbered invariant in `@docs/invariants.md` the change touches, does it still hold on every *twin path* — and on code one of them **builds** the thing rather than reading it. A spec is not Draft-ready, a plan does not start code, and **a branch does not reach the remote**, until every finding is **fixed or flagged** — a rejection costs a sentence out loud. **The diff review gates the PUSH, not the merge, because green CI is not a review.** Cap same-frame rounds at two, then rotate the frame; exit on the *class* of finding shrinking, never on a round count, and never below the counts above. **A REPLACED artifact restarts its gate; a revised one does not.** Every reviewer runs this repo's gates against the branch. Full contract, with the measured evidence behind every clause: `@docs/process/reviewer-contract.md`.
 
