@@ -400,8 +400,9 @@ PONG (FR-002 rule 3) means the server processed every publish before it. A count
 never sees reach zero counts the batch, which is right: a PING only bumps the counter (the
 flusher's next run resets it with the rest), so on a connection that is draining at all it clears,
 and the only way it stays non-zero to the deadline is a peer that has stopped reading. A client
-that does not publish the counter is treated as drained. No answer, including when the deadline is already spent or the client has become
-disconnected (the probe is still sent where it can be, so the next call can reuse it), means every
+that does not publish the counter is treated as drained. No answer, including when the deadline
+is already spent or the client has become disconnected (the probe is still sent where it can be,
+so the next call can reuse it), means every
 event that was published and not otherwise counted is added to `failed` and announced once through
 `_diag.lost` with a reason naming the unconfirmed round trip, and **`emit` returns**. It does not
 raise, because the bytes are in flight to a server that may yet process them, and a worker retry
@@ -426,8 +427,9 @@ FR-005 records it as an exception under invariant 4.
 A core publish the deadline abandons (FR-001) is one of the published events this step counts
 when the confirmation goes unanswered, which it normally does, since an abandoned publish has
 spent the deadline. `failed` is a sink's own upper-bound counter, so an unconfirmed batch that
-later turns out to have landed stays counted. It is outside SPEC-059's `Deferral` rule, which governs `dropped`: the count
-is made on a path that returns, and nothing after it raises, so no retry can count it again.
+later turns out to have landed stays counted. It is outside SPEC-059's `Deferral` rule, which
+governs `dropped`: the count is made on a path that returns, and nothing after it raises, so no
+retry can count it again.
 
 #### Acceptance Criteria:
 
@@ -463,10 +465,12 @@ is made on a path that returns, and nothing after it raises, so no retry can cou
       `failed` 3, one "unconfirmed" line, and the fake's `flush` called once (no confirming PING
       was sent over a non-empty buffer); against the build before this wait the batch read
       confirmed with `failed` 0. With a flusher that drains 0.2 s after the batch, the PING is
-      sent after both publishes were written and the batch is confirmed with `failed` 0. A reused
-      probe's PING bytes on a healthy connection leave a later batch confirmed. `flush()` and
-      `close()`'s step 1 take the same wait and send no PING over a parked flusher. A client
-      without `pending_data_size` is treated as drained.
+      sent after both publishes were written and the batch is confirmed with `failed` 0. A
+      confirming PING left outstanding past one emit's deadline (that batch counted) and answered
+      during the next emit's reuse of it leaves the next batch confirmed, its own confirming PING
+      sent after its publish was written. `flush()` and `close()`'s step 1 take the same wait
+      and send no PING over a parked flusher. A client without `pending_data_size` is treated as
+      drained.
 - [ ] AC-15 (review finding 7): in JetStream mode with a fake whose publish blocks forever and
       `publish_timeout=0.5`, `emit` of three events returns at about 0.5 s with `failed` 3 (one
       abandoned and announced as unconfirmed, two unattempted), the loop thread alive and the
@@ -499,9 +503,12 @@ else `DEFAULT_CLOSE_TIMEOUT = 1.0`:
    so the PING confirms the outbound buffer rather than overtaking it), to push and confirm that
    buffer. The wait and the round trip together take at most `D`.
 2. `client.close()`, as a task under what remains of `D`, waited with `asyncio.wait` and
-   **cancelled on expiry**. Any failure from it, including the `TypeError` M8 measured while
-   reconnecting, is absorbed through `_diag.absorbed`. A client without a `close` attribute skips
-   the step.
+   **cancelled on expiry**, then one loop iteration yielded so that cancellation is delivered
+   before step 3 cancels again: two `cancel()` calls made before a task next runs coalesce into
+   one, and the driver's `_close` swallows one cancellation around its reconnection wait, so
+   without the yield the close task would park through step 3 and end only at the loop's stop.
+   Any failure from it, including the `TypeError` M8 measured while reconnecting, is absorbed
+   through `_diag.absorbed`. A client without a `close` attribute skips the step.
 3. Cancel the tasks still pending (the probe among them, now that no PONG can arrive), stop the
    loop and join the thread (FR-001).
 
@@ -509,8 +516,9 @@ Neither an expired nor a failed step 2 skips step 3. Afterwards `close()` raises
 when step 1 **ran** and went unanswered by the FR-002 rule (expiry, a client that turned
 disconnected during it, a moved reconnect counter), the probe's own exception if it raised,
 otherwise nothing. A **skipped** step 1 raises nothing: a client that is disconnected or latched at
-close time has nothing to push that is not already counted, because emits were refused throughout. This keeps today's contract,
-"whatever the flush raises; the loop is closed regardless", and nothing uncounted rides on the
+close time has nothing to push that is not already counted, because emits were refused
+throughout. This keeps today's contract, "whatever the flush raises; the loop is closed
+regardless", and nothing uncounted rides on the
 confirmation, since FR-003 left every core batch confirmed or counted.
 
 The consequence for an **injected** client is stated: the sink does not drain it. `close()` skips
@@ -583,7 +591,9 @@ close and reported as `SinkDeliveryError`, and the sink stays usable.
       the loop, so a second `close()` does not call the client again.
 - [ ] AC-15 (review finding 4): the fake's `close` swallows its first cancellation as the driver's
       `_close` does around its reconnection wait, so AC-3 passes only because step 2 cancels at
-      `D` and step 3 cancels again; after `close()` no task is pending on the loop.
+      `D` and step 3 cancels again; the close task has ended by the time the close coroutine
+      returns (a step 2 that drops its cancel, or cancels without yielding, leaves it parked
+      until the loop's stop), and after `close()` no task is pending on the loop.
 - [ ] AC-11: Serves invariants 3, 5, 6 and 7; invariant 5 because a close in flight is waited for
       under the lock and the connection is released exactly once, and invariant 6 because `emit`
       and `flush` share the probe.

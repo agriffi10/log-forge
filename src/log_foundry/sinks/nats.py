@@ -183,11 +183,12 @@ class NATSSink:
     > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
 
     The worst case is therefore ``publish_timeout`` per emit — SPEC-061's two round trips and every
-    publish, a JetStream ack wait included, spend that one deadline — and across the exit drain the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in
-    flight when the budget runs out and the first attempt of a tail batch — since
-    ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and a
-    batch's first attempt is always made. Before that it was ``(max_retries + 1) x publish_timeout``,
-    which exceeded the join at the defaults; ``architecture.md`` section 12 records the closure.
+    publish, a JetStream ack wait included, spend that one deadline — and across the exit drain
+    the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in flight when the
+    budget runs out and the first attempt of a tail batch — since ``Worker._emit`` declines a
+    retry predicted to end after that deadline (SPEC-062) and a batch's first attempt is always
+    made. Before that it was ``(max_retries + 1) x publish_timeout``, which exceeded the join at
+    the defaults; ``architecture.md`` section 12 records the closure.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with
@@ -207,12 +208,12 @@ class NATSSink:
     **Superseded by SPEC-061 FR-002:** the flag is no longer what guards a publish. For a client
     the sink connected itself, ``emit`` sends a PING and publishes only after the server's PONG
     arrives, so a stalled server is refused within ``publish_timeout`` rather than after the
-    driver's ping task notices it, which the driver's own ping arithmetic puts at between 240
-    and 360 s of loop time and never while the loop ran only inside a call (what SPEC-061
-    measured was 75 of 75 emits accepted over 148 s of such a stall). The flag stays in front
-    of the round trip as the cheap refusal. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
-    *reported* to the worker rather than one absorbed, and counting both would report one loss
-    twice.
+    driver's ping task notices it. When that happens is derived, not measured: the driver's own
+    ping arithmetic puts it at between 240 and 360 s of loop time, and never while the loop ran
+    only inside a call. What SPEC-061 measured was 75 of 75 emits accepted over 148 s of such a
+    stall. The flag stays in front of the round trip as the cheap refusal. Refusing moves no
+    ``losses()`` counter, per SPEC-032: it is a failure *reported* to the worker rather than one
+    absorbed, and counting both would report one loss twice.
     """
 
     def __init__(
@@ -952,6 +953,11 @@ class NATSSink:
         the join budget to run, so the loop is stopped with nothing "destroyed but pending". The
         driver's own ``_close`` swallows one cancellation of its own while it waits on its
         reconnection task, which is why step three cancels again rather than trusting step two's.
+        Step two yields one loop iteration after its cancel, because two ``cancel()`` calls made
+        before the task next runs coalesce into a single delivered cancellation: without the
+        yield, step three's cancel would merge into step two's, the driver would swallow the one
+        it received, and the close task would park through step three's wait to be ended only by
+        the loop's stop.
 
         Neither an expired nor a failed step two skips step three, and the outcome is returned
         rather than raised so :meth:`close` decides the raise after the loop is stopped.
@@ -983,6 +989,7 @@ class NATSSink:
             done, _ = await asyncio.wait({task}, timeout=max(0.0, end - time.monotonic()))
             if not done:
                 task.cancel()
+                await asyncio.sleep(0)
             elif not task.cancelled():
                 close_failure = task.exception()
                 if close_failure is not None:

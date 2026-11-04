@@ -100,6 +100,8 @@ class LiveFakeNATS:
         test can see a PING overtake the buffer.
       close_swallows_one_cancel: Whether ``close`` absorbs its first cancellation and keeps
         waiting, as the driver's ``_close`` does around its reconnection wait (client.py L820).
+      close_ended: Set once ``close`` has returned or raised, so a test can see whether the close
+        task ended inside the sink's close sequence or only when the loop was stopped.
     """
 
     def __init__(self) -> None:
@@ -130,6 +132,7 @@ class LiveFakeNATS:
         self.pubs_at_ping: list[int] = []
         self.close_swallows_one_cancel = True
         self._cancels_swallowed = 0
+        self.close_ended = False
         self.drain_timeout = 30.0
         self.drain_flush_timeout = 10.0
         self.connected_on: threading.Thread | None = None
@@ -239,6 +242,7 @@ class LiveFakeNATS:
                 raise self.close_raises("'NoneType' object is not callable")
             self.is_connected = False
         finally:
+            self.close_ended = True
             self._leave()
 
     async def _subs_drained(self) -> None:
@@ -1474,7 +1478,23 @@ def test_close_raises_timeout_when_its_probe_is_unanswered(monkeypatch) -> None:
 
 
 def test_a_client_close_that_never_returns_is_cancelled_at_the_deadline(monkeypatch) -> None:
-    # FR-004 AC-3 (M8: `client.close()` still running at 8 s with 20 MB pending).
+    # FR-004 AC-3 (M8: `client.close()` still running at 8 s with 20 MB pending), and AC-15.
+    #
+    # The fake swallows its first cancellation as the driver's `_close` does, so the close task
+    # ends inside the close sequence only if step two's cancel was DELIVERED before step three
+    # cancelled again. Two `cancel()` calls made before the task next runs coalesce into one, so
+    # a step two that dropped its cancel, or that cancelled without yielding, leaves the task
+    # parked through step three's wait and ended only by the loop's stop; `ended_in_sequence`
+    # reads the fake at the moment the close coroutine returns, which is what tells them apart.
+    ended_in_sequence: list[bool] = []
+    real_close_on_loop = NATSSink._close_on_loop
+
+    async def spy(self: NATSSink) -> Any:
+        outcome = await real_close_on_loop(self)
+        ended_in_sequence.append(self._client.close_ended)
+        return outcome
+
+    monkeypatch.setattr(NATSSink, "_close_on_loop", spy)
     sink, fake, _ = _build(monkeypatch, drain_timeout=0.5)
     fake.close_gate = asyncio.Event()
     began = time.monotonic()
@@ -1485,9 +1505,8 @@ def test_a_client_close_that_never_returns_is_cancelled_at_the_deadline(monkeypa
     assert "close" in fake.calls
     assert not sink._thread.is_alive()
     assert sink._loop.is_closed()
-    # The fake swallows its first cancellation as the driver's `_close` does, so the task ends
-    # only because step two cancelled it at the deadline AND step three cancelled it again.
     assert fake._cancels_swallowed == 1
+    assert ended_in_sequence == [True], "step three's cancel merged into step two's"
     assert asyncio.all_tasks(sink._loop) == set(), "the parked close must not outlive the loop"
 
 
@@ -1704,17 +1723,48 @@ def test_the_confirmation_waits_for_the_flusher_and_then_confirms(monkeypatch) -
     assert fake.pubs_at_ping[1] == 2, "the confirming PING must follow both written publishes"
 
 
+class LateSecondPongNATS(LiveFakeNATS):
+    """Answers every PING at once except the second, whose PONG arrives 0.8 s after it was sent."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        if self.calls.count("flush") != 1:
+            await super().flush(timeout)
+            return
+        self.answering = False
+        asyncio.get_running_loop().call_later(0.8, self.deliver_pong)
+        try:
+            await super().flush(timeout)
+        finally:
+            self.answering = True
+
+
 def test_a_reused_probes_ping_bytes_do_not_make_a_healthy_batch_unconfirmed(monkeypatch) -> None:
-    # `_send_ping` bumps the counter without queueing, so an outstanding probe leaves it
-    # non-zero until the flusher next runs; on a healthy connection the flusher runs on the
-    # next kick and resets it. The fake models exactly that, so a healthy batch stays confirmed.
-    sink, fake, _ = _build(monkeypatch)
+    """AC-14: an outstanding probe reused by the next emit leaves that emit's batch confirmed.
+
+    ``_send_ping`` adds the PING's bytes to ``pending_data_size`` without queueing anything, and
+    ``_flush_pending`` kicks the flusher in the same call, whose next run resets the counter
+    whatever the queue held (``Client._flusher``). So the bump outlives a flusher run only while
+    the flusher is parked in ``transport.drain()``, a peer that stopped reading, which is the batch
+    that must be counted. Here the first emit's confirming PING (sent 0.4 s in, after a slow
+    publish) is answered 0.8 s later, past that emit's 1.0 s deadline, so the first batch is
+    counted and its PING is still outstanding when the second emit starts; the second reuses it,
+    its PONG lands at about 1.2 s inside the reuse window (which ends at 1.4 s), and the second
+    batch's own confirmation must then go out and be answered with nothing left over.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=LateSecondPongNATS, publish_timeout=1.0)
+    fake.publish_delay = 0.4
     sink.emit([{"n": 1}])
-    sink.emit([{"n": 2}])
+    first = sink.losses()
+    fake.publish_delay = 0.0
+    elapsed, error = _timed(lambda: sink.emit([{"n": 2}]))
     losses = sink.losses()
+    pings = list(fake.pubs_at_ping)
     sink.close()
-    assert losses == SinkLosses(dropped=0, failed=0)
-    assert fake.pending_data_size == 0
+
+    assert first == SinkLosses(dropped=0, failed=1), "the late PONG must miss the first deadline"
+    assert error is None and elapsed < 1.0, f"{elapsed:.2f}s"
+    assert losses == first, "the batch sent after the reused probe was answered is confirmed"
+    assert pings == [0, 1, 2], "probe, a confirmation the next emit reused, then its own"
 
 
 def test_close_and_flush_wait_for_the_flusher_before_their_ping(monkeypatch) -> None:
