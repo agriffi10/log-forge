@@ -85,7 +85,7 @@ names, with each spy empty bar the callable's own `__class__` reads noted in FR-
   - `docs/architecture.md` §12's open item "**`@trace(name=...)` tests its argument with
     `isinstance(name, str)`**" moves to *Resolved*, closed by this spec, naming the sibling sites
     this spec also closed.
-  - One new decision file in `docs/decisions/failure-paths/`. Its fence states: *`@trace` routes
+  - One new decision file in `docs/decisions/trace-model/` (the area whose path-scoped rule fires on `decorator.py`; SPEC-067's inbound-path decision is its `failure-paths` sibling). Its fence states: *`@trace` routes
     the values it is handed (`name=`, a `__qualname__`, a type name, the `str` it refuses) on their
     real type, keeps a `str` as the exact `str` it holds and reads type names through `type`'s own
     descriptor; the callable itself may still run its own code at decoration, and the
