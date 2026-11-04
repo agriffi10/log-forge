@@ -28,6 +28,7 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 - [Assembly, decoration and echo residue](#assembly-decoration-and-echo-residue) — arc `assembly-decoration-and-echo-residue`
 - [Coercer and invariant 8](#coercer-and-invariant-8) — arc `coercer-and-invariant-8`
 - [OpenTelemetry-shaped output](#opentelemetry-shaped-output) — arc `opentelemetry-shaped-output`
+- [1.2.0 stability redesign](#120-stability-redesign) — arc `stability-redesign`
 
 ## Core logging pipeline
 
@@ -368,3 +369,40 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   (plus an `otel_traces` layout), last because it carries the most design risk: a `span.end`
   dropped under queue backpressure orphans child spans in a trace view. In-library metrics are not
   an item; they are derived downstream.
+
+## 1.2.0 stability redesign
+
+- **1.2.0 stability redesign (SPEC-069 to SPEC-079):** the plan Andrew settled on 2026-11-04, after
+  lifecycle had taken 14 specs and sink delivery 13. Both kept breaking for structural reasons:
+  lifecycle state had no single owner, and the sink contract left each of 34 sinks to decide alone
+  what a delivery meant, which is why one question, "did the batch land, and is it safe to send
+  again?", was answered three times in three places. All 34 sinks stay, and the release is
+  additive: `emit`'s contract, `losses()`, `SinkLosses` and every documented counter stay true for
+  1.x callers.
+
+  The arc is cut along the seams the system already has. Live defects come first, as two specs of
+  rules that need no new mechanism: what a sink does with an event it cannot encode, and which
+  failures it retries. A behaviour-free kit spec follows, which pins the AST-derived rosters before
+  any code moves, so the refactor cannot shrink them silently. The plan's single "verdict engine"
+  step is split in two at the point where something inert goes live. SPEC-072 defines `deliver`,
+  `Verdict` and the engine against test sinks, and no shipped sink offers `deliver` until SPEC-073
+  puts the HTTP family on it. The SDK and driver sinks, the wrappers and the closed-guard helper
+  follow, the helper last of these because only the engine settles what a transport lock must
+  span. Lifecycle is reworked after delivery. `Runtime` first holds today's state with no
+  behaviour change, the owed-close registry and checked transitions then make that state the
+  authority, and fork's one walk comes last because it walks from the runtime's roots.
+
+  Three decisions were made while the arc was written, each by Andrew with the question tool on
+  2026-11-04. A batch with nothing encodable settles, counted, rather than raising. A destination's
+  own refusal (PostgreSQL JSONB's U+0000, MongoDB's integers beyond 64 bits) is repaired and
+  delivered rather than dropped. The engine keeps the 1.x total retry budget,
+  `(sink max_retries + 1) × (worker max_retries + 1) − 1` on the worker path, and the 1.x wait
+  schedule, rather than the plan's sink-only budget. A fourth, also his, fixes when `sink_factory=`
+  runs: lazily on first use in every process.
+
+  Three peer specs fix code this arc then restructures, and none is in any `depends_on`, because
+  spec-lint refuses a dependency on a spec not yet in the directory. They are SPEC-061 (NATS
+  liveness and bounded close), SPEC-066 (numeric doors) and SPEC-068 (shutdown expiry). Each arc
+  spec that builds on one says so in its Overview, and the dependency joins `depends_on` once the
+  peer's file lands.
+
