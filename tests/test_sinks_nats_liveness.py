@@ -1841,14 +1841,16 @@ def test_a_slow_injected_flush_is_refused_at_the_budget_and_the_sink_stays_open(
     client = SlowInjectedNATS()
     sink = NATSSink("logs", client=client, publish_timeout=0.5)
     elapsed, error = _timed(sink.flush)
+    abandoned = set(sink._abandoned)
     assert isinstance(error, SinkDeliveryError) and "wedged" not in str(error), error
     assert 0.5 <= elapsed < 0.5 + CALL_SLACK, f"{elapsed:.2f}s"
     assert not sink._closed and sink._thread.is_alive()
     sink.emit([{"n": 1}])
     assert client.published == [b'{"n": 1}']
-    assert "flush-returned" not in client.calls, "the slow flush was abandoned, not cancelled"
-    _on_loop(sink, asyncio.wait(set(sink._abandoned), timeout=3.0))
-    assert "flush-returned" in client.calls, "and it ran to its end on its own"
+    assert "flush-returned" not in client.calls, "the slow flush cannot have finished yet"
+    if abandoned:
+        _on_loop(sink, asyncio.wait(abandoned, timeout=3.0))
+    assert "flush-returned" in client.calls, "the abandoned flush was cancelled, not left to run"
     sink.close()
 
 
@@ -1880,7 +1882,10 @@ def test_a_future_done_at_the_bounds_expiry_is_returned_not_raised(monkeypatch) 
         NATSSink, "_submit", lambda self, coro: ExpiredButDone(real_submit(self, coro))
     )
     sink, fake, _ = _build(monkeypatch)
-    sink.close()
+    try:
+        sink.close()
+    except TimeoutError as err:
+        pytest.fail(f"a close that finished was reported as an expired bound: {err}")
     assert sink._closed and not sink._thread.is_alive() and sink._loop.is_closed()
     sink.close()
     assert fake.calls.count("close") == 1
