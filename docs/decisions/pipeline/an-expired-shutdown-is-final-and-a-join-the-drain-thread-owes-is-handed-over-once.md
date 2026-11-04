@@ -10,9 +10,10 @@ is still inside the sink.
 
 **An expired shutdown is final.** A `stop()` that loses the once-only gate waits on
 `_drain_settled` within its own budget while the drain is still running, and an abandonment
-releases that wait. After an expiry `draining` is false, so a later caller returns at once: it
-writes no line, sets no `stopped_reason` and calls no `_release_waiters`. The closer then closes the
-sink only if it finds the drain thread ended; otherwise the sink stays owed for a later call.
+releases that wait. After an expiry `draining` is false, so a later caller does not wait on the
+drain thread: it writes no line, sets no `stopped_reason` and calls no `_release_waiters`. The
+closer then closes the sink only if it finds the drain thread ended; otherwise the sink stays owed
+for a later call.
 **The cost:** in an `atexit` exit after an expired `shutdown()`, a buffering sink whose drain thread
 is still inside an emit is neither flushed nor closed. **The reason:** an exit that has already
 spent the caller's budget does not spend a second one. Measured at `fda134a`, a second
@@ -36,7 +37,9 @@ deadline, and does the first caller's whole work — the join, and on expiry the
 SPEC-062's rule that the caller whose timeout the join uses is the caller whose deadline the drain
 declines against, because the drain-thread caller never joins; and it re-opens nothing, because no
 join has expired. The flag is cleared in the decision that takes it, so only one handover happens.
-A losing caller on the drain thread returns at once and never takes the owed join over.
+A losing caller on the drain thread never waits on its own thread and never takes the owed join
+over. Neither drain-thread caller is spared the rest of `shutdown()`: the closer and its grace
+still run there, as for any caller.
 
 **Rejected:**
 

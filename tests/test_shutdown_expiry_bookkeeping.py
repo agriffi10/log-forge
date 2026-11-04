@@ -288,7 +288,8 @@ def test_the_unfenced_swap_line_counts_queued_submissions(capsys) -> None:
     """FR-002 AC-1. Two spans queued behind the wedge; the swap's own marker is not counted."""
     old, worker = _unfenced_swap(queued=2)
     try:
-        _lifecycle._swap_sink(_SlowFailSink(0.0, fail_times=0), timeout=0.05)  # type: ignore[arg-type]
+        new = _SlowFailSink(0.0, fail_times=0)
+        _lifecycle._swap_sink(new, timeout=0.05)  # type: ignore[arg-type]
         line, rendered = _swap_line(capsys.readouterr().err)
         assert line == (
             _SWAP.format(T=rendered)
@@ -304,7 +305,8 @@ def test_the_unfenced_swap_line_with_only_its_marker_has_no_queued_clause(capsys
     """FR-002 AC-2. The retarget's unanswered marker is queued and is not a submission."""
     old, worker = _unfenced_swap(queued=0)
     try:
-        _lifecycle._swap_sink(_SlowFailSink(0.0, fail_times=0), timeout=0.05)  # type: ignore[arg-type]
+        new = _SlowFailSink(0.0, fail_times=0)
+        _lifecycle._swap_sink(new, timeout=0.05)  # type: ignore[arg-type]
         assert worker._queue.qsize() == 1, "the premise: only the retarget's marker is queued"
         err = capsys.readouterr().err
         line, rendered = _swap_line(err)
@@ -496,7 +498,8 @@ class _ReentrantSink:
     returned — and kept for the test thread to assert. Before the first call the emit waits for
     `go`, so a test can queue spans behind it; with `after_claim` it also waits on that worker's
     stop event, which `_shutdown_worker` sets only after the other caller's claim, so the two
-    claims are ordered by an idle wait rather than a poll inside the caller's CPU window. With `wedge` the first emit then blocks on `release` until the test lets it go.
+    claims are ordered by an idle wait rather than a poll inside the caller's CPU window. With
+    `wedge` the first emit then blocks on `release` until the test lets it go.
     """
 
     def __init__(

@@ -8,7 +8,8 @@
   submissions only, never the `_SHUTDOWN` sentinel or a flush marker. Each event queued or in
   flight at an expiry is announced lost at most once; the swap line now fits `_diag`'s bound.
 - An expired `shutdown()` is final, recorded as a decision and pinned, including in a real
-  interpreter exit: `atexit` returns at once and leaves a sink still inside an emit unclosed.
+  interpreter exit: `atexit`'s call does not wait on the worker thread and leaves a sink still
+  inside an emit unclosed.
 - A `shutdown()` made on the drain thread (inside a sink's `emit`) never joins and never waits on
   that thread. A drain-thread winner records `Worker._join_owed`, and the next caller off the
   thread takes the gate over in `claim_stop` with its own deadline — once.

@@ -308,8 +308,9 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait(capsys) -> None
 def test_an_atexit_exit_after_an_expired_shutdown_returns_without_closing() -> None:
     """FR-003 AC-4 (SPEC-068). The decided cost, pinned in a real interpreter exit.
 
-    After an expired ``shutdown()``, ``atexit``'s call returns at once and the interpreter exits
-    with a sink still inside an emit neither flushed nor closed. A waiting ``atexit`` would cost
+    After an expired ``shutdown()``, ``atexit``'s call does not wait on the drain thread and the
+    interpreter exits with a sink still inside an emit neither flushed nor closed. A waiting
+    ``atexit`` would cost
     ``DEFAULT_SHUTDOWN_TIMEOUT`` (30 s) on every such exit, after the caller's budget had already
     run out. The probe registers **before** ``import log_foundry``, so LIFO runs it after the
     library's own handler and its report proves that handler completed. The token, the exit

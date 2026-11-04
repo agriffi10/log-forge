@@ -995,10 +995,10 @@ close it.
 - ~~**Queued items are announced twice on an expired exit drain**~~ (SPEC-062 frame-2 review;
   invariant 2) → **closed by SPEC-068**. The `ShutdownTimeout` line called the queue lost, and the
   decline or abandon line announced the same items again once `_final_drain` took them; its count
-  was `qsize()`, so it also called the sentinel `stop()` had just queued a lost item. The line is now
-  written by `_diag.pending`, which claims no loss, and its queued clause counts submissions only
-  (`Worker._queued_submissions`), so each event queued or in flight at the expiry is announced lost
-  at most once. The unconfirmed-swap line, its twin, was rewritten the same way and now fits
+  was `qsize()`, so it also called the sentinel `stop()` had just queued a lost item. The line is
+  now written by `_diag.pending`, which claims no loss, and its queued clause counts submissions
+  only (`Worker._queued_submissions`), so each event queued or in flight at the expiry is announced
+  lost at most once. The unconfirmed-swap line, its twin, was rewritten the same way and now fits
   `_diag`'s detail bound instead of shipping cut off mid-word.
 - ~~**A second `shutdown()` after an expired one returns at once, whatever its budget, with the
   sink still open**~~ (SPEC-062 frame-2 review; invariants 3 and 5) → **decided final by
@@ -1773,9 +1773,9 @@ and a third copy is a fork with no merge.
   closer could free the sink under an emit in flight. It is safe because the window is
   unreachable: the new thread reaches `sink.emit` only through the queue, which the repair has
   just replaced empty, and nothing can fill it before the assignment, since the fork handler runs
-  on the child's only thread. Nothing enforces that. The alternative was measured and is worse: assigning first leaves a
-  worker whose `start()` raised reading `draining` forever and handing the next `shutdown()` a
-  `RuntimeError` from `join`, out of a public call documented to raise nothing.
+  on the child's only thread. Nothing enforces that. The alternative was measured and is worse:
+  assigning first leaves a worker whose `start()` raised reading `draining` forever and handing the
+  next `shutdown()` a `RuntimeError` from `join`, out of a public call documented to raise nothing.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment

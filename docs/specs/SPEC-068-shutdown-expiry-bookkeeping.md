@@ -527,7 +527,7 @@ self._thread`.
   sets the stop event, and returns **without joining**. It writes no expiry line and sets no
   `stopped_reason`, because nothing has timed out. It calls no `_release_waiters`, because the
   drain thread's own exit sweeps the markers in `_run`'s `finally`.
-- **As a losing caller** on the drain thread, it returns at once without waiting on
+- **As a losing caller** on the drain thread, its `stop()` returns at once without waiting on
   `_drain_settled`. It never takes an owed join over.
 
 The drain ends once the current emit returns. `_emit` treats that emit's outcome as usual: a
