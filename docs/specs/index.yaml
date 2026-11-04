@@ -404,6 +404,12 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-026", "SPEC-036", "SPEC-038", "SPEC-058"]
     path: "docs/specs/SPEC-059-retry-safe-drop-counts.md"
+  - id: "SPEC-061"
+    title: "`NATSSink` Liveness and a Bounded Close"
+    description: "Gives NATSSink a loop that runs for its whole life, a server round trip before every publish and after every core batch, and a close the sink itself bounds."
+    spec_status: "Completed"
+    depends_on: ["SPEC-047"]
+    path: "docs/specs/SPEC-061-nats-liveness-and-bounded-close.md"
   - id: "SPEC-062"
     title: "The Exit Drain's Retries Fit the Caller's Budget"
     description: "Makes Worker._emit decline a retry predicted to end after shutdown()'s deadline, so the join returns on time and the sink is closed rather than left open."

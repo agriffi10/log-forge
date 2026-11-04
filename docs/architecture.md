@@ -859,23 +859,36 @@ close it.
   SPEC-035 FR-002 drew the roster's module boundary where it did. Neither is a defect; both are
   recorded so the next reader knows the split was considered. **Closed by** a spec that does it,
   or by a decision that the shape is right.
-- **`NATSSink.close()`'s real bound is the driver's, and it is not reachable** (SPEC-047 FR-002).
-  `Client.drain` is `wait_for(drain_is_done, drain_timeout)` followed by `self.flush()`, whose 10 s
-  default is not a `connect()` option. `drain_timeout` is therefore forwarded but is **not** what
-  bounded `close()` in either measured case — 10.00 s against a stalled server (`FlushTimeoutError`)
-  and 0.00 s against a stopped one (`ConnectionReconnectingError`). **Closed by** the driver
-  exposing that flush timeout as a connect option, or by this sink driving `drain()` and `flush()`
-  itself instead of calling the driver's combined one.
-- **`NATSSink`'s `is_connected` guard has a wide, unmeasured window** (SPEC-047 FR-004). The flag
-  was still `True` **40 s after the server was stopped** — a lower bound, not the window — because
-  `nats-py` notices a dead server through a 120 s ping interval or a failed write. Batches accepted
-  in that window are buffered by the client and reported as delivered, which is the SPEC-026 shape
-  the guard was added to end and only narrows. **Closed by** a liveness check that does not depend
-  on the driver's own flag — a JetStream round trip, or the client's last-activity timestamp.
+- **A forked child's `NATSSink` refuses rather than reconnects** (SPEC-061 FR-001; invariant 12).
+  The sink runs its loop on a thread the child does not inherit, and it acquired no connection of
+  its own, so in a child `emit` and `flush` raise `SinkDeliveryError` and `close()` returns without
+  touching the inherited client, loop or thread. A `reacquire_after_fork` hook would connect during
+  the fork handler, where a connect blocks for up to the driver's whole reconnect budget on the
+  child's first instruction. **Closed by** a hook that connects lazily on the child's first call,
+  under a bound of its own, and a decision on what the child does while that connect is pending.
+- **A driver reader that dies while the status stays CONNECTED is invisible to the probe**
+  (SPEC-061 FR-002, the residual; invariant 7). The driver still cancels PONG futures of its own
+  (`drain()`, `Subscription._drain`, and after a reconnect), and a reader task that ends while
+  `is_connected` stays true makes `flush()` return without a round trip. The sink's answer rule
+  cannot see that from the public API, and nothing it may call can. A `client.close()` cancelled
+  at the close deadline (FR-004 step 2) leaves the same shape from the other side: the driver's
+  transport may still be open, so the socket can outlive `close()` until the process exits.
+  **Closed by** the driver exposing whether its reader is alive, or a last-heard-from timestamp,
+  as public API.
+- **A `NATSSink` whose driver has spent its reconnect budget is closed for good** (SPEC-061, Out of
+  Scope; invariant 7). Once `max_reconnect_attempts` is exhausted the driver closes the client and
+  the sink refuses every call, reported rather than silent, until the process restarts. **Closed
+  by** a sink that rebuilds its client after the budget is spent, under a bound, which is its own
+  spec because a rebuild during an outage is a reconnect loop of the sink's own.
 - **A timed-out JetStream publish is not retried, and cannot safely be** (SPEC-047, Out of Scope).
   A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
   (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
-  deduplicates, which makes a retry safe and is its own spec.
+  deduplicates, which makes a retry safe and is its own spec. Since SPEC-061 the same "no ack"
+  is treated two ways depending on how the wait ended: an ack wait that expires (every one the
+  budget caps does, inside the sink's own wait) raises and its batch can be retried by the
+  worker when nothing else in it landed, while a publish the driver never returns from is
+  abandoned and counted, never retried (`docs/invariants.md`, invariant 2's recorded
+  exception). The same header closes both.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
@@ -1152,6 +1165,20 @@ close it.
   `truncated` — since a numbered placeholder is the first step toward one that carries the key's
   identity. Both placeholders now go through `text()`, so a type named longer than
   `max_value_bytes` honours the ceiling too.
+- ~~**`NATSSink.close()`'s real bound is the driver's, and it is not reachable**~~ (SPEC-047
+  FR-002; invariant 3) → **closed by SPEC-061 FR-004**. The sink no longer calls the driver's
+  `drain()`, which swallows a cancellation and runs its `finally` flush to the driver's own 10 s —
+  measured at `71e42dd` as 12.00 s under a 2 s `wait_for` once a JetStream client holds its
+  response-inbox subscription. `close()` drives its own sequence under one deadline, `drain_timeout`
+  or 1.0 s by default: a server round trip, then `client.close()` as a task cancelled on expiry,
+  then the loop stopped and its thread joined; the stated worst case is the deadline plus 2 s.
+- ~~**`NATSSink`'s `is_connected` guard has a wide, unmeasured window**~~ (SPEC-047 FR-004;
+  invariant 7) → **closed by SPEC-061 FR-002**. Measured at `71e42dd`, the window was 75 of 75
+  emits accepted over 148 s under `docker pause`, because the driver's ping task only ran while a
+  call was in progress. The loop now runs on a sink-owned thread for the sink's life, and for a
+  client the sink connected itself `emit` publishes only after the server answers a PING inside
+  `publish_timeout`; the flag stays in front of the round trip as the cheap refusal. A core batch
+  is confirmed by a second round trip or counted (FR-003).
 - **The exit close ran the owed sinks in sequence** — introduced by SPEC-045, which made the
   owed-close record a set without changing how the set is drained → **fixed in SPEC-046**: the
   closes run concurrently and every one is joined, so the cost is the slowest rather than their
@@ -1226,6 +1253,14 @@ and a third copy is a fork with no merge.
   not failing, which it could not before. The alternative — raising when the deadline drops
   anything — would send a partially delivered batch back to `Worker._emit`'s retry and duplicate
   whatever landed, which is SPEC-018's rule and the reason partial failure must not raise.
+
+- **`NATSSink` cannot drive a client it did not connect, so an injected client's liveness is the
+  caller's.** A `nats-py` client is bound to the loop it connected on, and a flush driven from a
+  second loop returned only at its own timeout — 3.001 s in three of three runs at `71e42dd`
+  (SPEC-061, M10). So the server round trip before a publish, the confirmation after a core batch
+  and the round trip at close apply only to a client the sink built from `servers=`; an injected
+  `client=` keeps the driver's `is_connected` flag as its only guard, is never probed, and is
+  closed rather than drained. A caller who injects a client owns its liveness.
 
 - **An event logged from a task that outlives its span leaves its trace.** `contextvars` copies the
   same `Span` object into every task created inside a span, so a fire-and-forget `create_task` can

@@ -1036,29 +1036,33 @@ def test_a_guarded_counter_loses_no_increment_when_the_race_is_made_observable(
 
 
 def test_nats_sink_does_not_reenter_its_managed_event_loop() -> None:
-    """Concurrent emits never enter one ``asyncio`` loop twice — the worst finding of the arc.
+    """Concurrent emits never run two coroutines on one ``asyncio`` loop at once.
 
-    Unlocked, a second thread calling ``run_until_complete`` on a running loop raises
+    ~~Unlocked, a second thread calling ``run_until_complete`` on a running loop raises
     ``RuntimeError: This event loop is already running``, and can leave the loop's task
-    machinery in a state where a thread **never returns from ``emit``**. On the orphan path that
-    is an application thread hung forever inside ``log_foundry.info()``. The 30 s join inside
-    ``run_concurrently`` is what turns that hang into a failure rather than a stalled CI run.
-
-    Like the SQLite case, this one kills its mutant by hanging rather than by asserting. Measured
-    against the unlocked sink the test does fail — but the wedged threads are non-daemon, so
-    pytest itself then cannot exit and CI sees a job timeout rather than a red test. Stated
-    plainly because FR-004 asks for tests that are deterministic for CI, and this one is
-    deterministic only while the lock is present.
+    machinery in a state where a thread **never returns from ``emit``**.~~ Rewritten for
+    SPEC-061 FR-001 AC-11: the loop now runs on a thread the sink owns and each ``emit`` submits a
+    coroutine to it, so the unlocked failure is no longer a hang but an *interleaving* — two
+    emits' coroutines alternate at every ``await``, and the driver sees one caller's publishes
+    mixed into another's. The fake's ``publish`` yields once, which is the smallest thing that
+    lets two coroutines interleave, and counts how many are inside it at once. With the lock
+    held across the submit and the wait that count never passes one; with the lock removed it
+    does, measured, so the assertion is what carries the test rather than a timeout.
     """
     from log_foundry.sinks import nats as nats_mod
 
     class FakeClient:
         def __init__(self) -> None:
             self.published: list[bytes] = []
+            self.in_flight = 0
+            self.max_in_flight = 0
 
         async def publish(self, subject: str, payload: bytes) -> None:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
             await asyncio.sleep(0)
             self.published.append(payload)
+            self.in_flight -= 1
 
     client = FakeClient()
     sink = nats_mod.NATSSink("events", client=client)
@@ -1071,6 +1075,7 @@ def test_nats_sink_does_not_reenter_its_managed_event_loop() -> None:
     sink.close()
 
     assert errors == [], f"emits collided on the loop: {errors[:3]}"
+    assert client.max_in_flight == 1, "two emits' coroutines ran on the loop at once"
     assert len(client.published) == THREADS * PER_THREAD
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
