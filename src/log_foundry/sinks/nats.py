@@ -121,8 +121,51 @@ timed yield rather than a busy spin. Small enough that the wait adds at most thi
 round trip; large enough that a 10 s budget is a few thousand reads, not a spin.
 """
 
+DRIVER_DEADLINE_MARGIN = 0.05
+"""Seconds by which a timeout the sink hands the driver ends before the sink's own wait on it.
+
+**The one timing rule every wait in this module follows, stated here and applied through
+:func:`_driver_timeout`.** When the sink waits on a driver call that carries a timeout of its own,
+and the driver's expiry is meant to be *reported* -- a JetStream ack wait raises, the publish is
+counted as raised, and a batch in which nothing landed goes back to the worker for its retry --
+the driver's timeout must end strictly inside the sink's wait. Two timers due at the same instant
+are decided by the order they were armed, and the sink arms its ``asyncio.wait`` before the
+driver's task has even started, so a driver timeout *equal* to the sink's remaining budget loses
+the tie every time: the driver's raise is never seen, and the publish reads as one that never
+returned (diff review frame 3, finding 1: against a real server at ``publish_timeout=1.0``, 0 of 4
+ack-starved emits raised, where before SPEC-061 all did). The margin only has to cover the loop
+scheduling between the two timers. Its mirror is :data:`PROBE_FLUSH_TIMEOUT`, a driver timeout
+that deliberately *outlives* every sink wait, because a PONG wait must never be cancelled.
+
+The second half of the rule is for latches: each ages from when the silence began, not from when
+the sink noticed it (:meth:`NATSSink._confirm`).
+"""
+
 _LOOP_THREAD_NAME = "log-foundry-nats-loop"
 """The name of the daemon thread that runs a sink's event loop for the sink's whole life."""
+
+
+def _driver_timeout(remaining: float, ceiling: float) -> float:
+    """Returns the timeout to give the driver for a wait the sink bounds by ``remaining``.
+
+    The lesser of ``ceiling`` and ``remaining`` less :data:`DRIVER_DEADLINE_MARGIN`, so the
+    driver's expiry lands, and is raised, before the sink's own wait gives up on the call. Below
+    twice the margin the margin shrinks to half of what remains, which keeps the result positive
+    and below ``remaining`` at every value: a fixed floor could not, since a floor at or above a
+    tiny remainder hands the driver the tie the margin exists to avoid. A budget that small no
+    longer holds a scheduling gap either, so there the ordering is likely rather than assured.
+
+    Args:
+      remaining: Seconds the sink will wait on the call.
+      ceiling: The most the driver may be given, such as :data:`DEFAULT_ACK_TIMEOUT`.
+
+    Returns:
+      A timeout strictly between zero and ``remaining``, at most ``ceiling``.
+
+    Raises:
+      None.
+    """
+    return min(ceiling, remaining - min(DRIVER_DEADLINE_MARGIN, remaining / 2))
 
 
 def _retrieve(task: asyncio.Task[Any]) -> None:
@@ -598,11 +641,28 @@ class NATSSink:
         Raises:
           SinkDeliveryError: While an abandoned publish has not finished.
         """
-        if any(not task.done() for task in self._stuck):
+        if self._publish_stuck():
             raise SinkDeliveryError(
                 f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
                 "is still blocked in the driver"
             )
+
+    def _publish_stuck(self) -> bool:
+        """Reports whether a publish abandoned at an earlier deadline is still pending.
+
+        One read of ``self._stuck``, a tuple the loop thread replaces whole, so any thread may
+        call it without a lock.
+
+        Args:
+          None.
+
+        Returns:
+          True while any abandoned publish has not finished.
+
+        Raises:
+          None.
+        """
+        return any(not task.done() for task in self._stuck)
 
     def _refuse_under_the_lock(self, prefix: str) -> None:
         """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
@@ -901,24 +961,30 @@ class NATSSink:
             self._probe = probe = None
         return probe
 
-    def _send_probe(self) -> tuple[asyncio.Task[Any], float, int]:
+    def _send_probe(
+        self, silent_since: float | None = None
+    ) -> tuple[asyncio.Task[Any], float, int]:
         """Sends one PING through the driver's public ``flush`` and records it as the probe.
 
         The caller has established that no probe is outstanding, so at most one ever is. The tuple
-        is assigned whole, which is what lets :meth:`_latched` read it without a lock.
+        is assigned whole, which is what lets :meth:`_latched` read it without a lock. Its second
+        field is the instant the silence the probe measures began, which is when the PING is sent
+        unless the caller already knows the silence began earlier (:meth:`_confirm`); the latch
+        ages from it (:data:`DRIVER_DEADLINE_MARGIN` states the rule).
 
         Args:
-          None.
+          silent_since: The ``time.monotonic()`` instant the silence began, or None for now.
 
         Returns:
-          The new probe's ``(task, sent_at, reconnects)``.
+          The new probe's ``(task, silent_since, reconnects)``.
 
         Raises:
           None.
         """
         task = self._loop.create_task(self._client.flush(timeout=PROBE_FLUSH_TIMEOUT))
         task.add_done_callback(_retrieve)
-        probe = (task, time.monotonic(), self._reconnects())
+        since = time.monotonic() if silent_since is None else silent_since
+        probe = (task, since, self._reconnects())
         self._probe = probe
         return probe
 
@@ -935,9 +1001,13 @@ class NATSSink:
         When the buffer does not drain by the deadline nothing can confirm it, and with ``arm`` a
         probe is left outstanding without being waited for, so :meth:`_latched` has a PING to age
         and the callers after this one are refused at once rather than each spending a budget
-        behind a buffer that is not moving. That PING is sent over the undrained buffer, and the
-        rule above is what keeps it from ever confirming anything. ``close()`` passes ``arm=False``,
-        since no call follows it.
+        behind a buffer that is not moving. That probe is aged from the moment the drained wait
+        began, not from when it was sent: the silence began when the buffer stopped moving, and
+        a probe dated at the deadline would make the next caller wait a whole budget more before
+        the latch held (diff review frame 3, finding 2: the next call took 1.002 s at
+        ``publish_timeout=1.0`` on the real driver). That PING is sent over the undrained buffer,
+        and the rule above is what keeps it from ever confirming anything. ``close()`` passes
+        ``arm=False``, since no call follows it.
 
         Args:
           deadline: The ``time.monotonic()`` instant this call's own budget ends.
@@ -949,9 +1019,10 @@ class NATSSink:
         Raises:
           None.
         """
+        waiting_since = time.monotonic()
         if not await self._drained(deadline):
             if arm and self._outstanding_probe() is None:
-                self._send_probe()
+                self._send_probe(silent_since=waiting_since)
             return False
         if self._outstanding_probe() is not None and not await self._await_probe(deadline):
             return False
@@ -1105,7 +1176,12 @@ class NATSSink:
         end = time.monotonic() + self._drain_timeout
         answered: bool | None = None
         failure: BaseException | None = None
-        if self._probing() and not self._latched() and self._is_connected():
+        if (
+            self._probing()
+            and not self._latched()
+            and not self._publish_stuck()
+            and self._is_connected()
+        ):
             try:
                 answered = await self._confirm(end, arm=False)
             except Exception as err:
@@ -1240,8 +1316,12 @@ class NATSSink:
     async def _publish_bounded(self, target: Any, payload: bytes, remaining: float) -> bool:
         """Runs one publish as a task and waits for it under the remaining budget.
 
-        A JetStream publish is also given the driver's ``timeout`` for its ack wait, the lesser
-        of :data:`DEFAULT_ACK_TIMEOUT` and the remainder; a core publish takes none. The task is
+        A JetStream publish is also given the driver's ``timeout`` for its ack wait, through
+        :func:`_driver_timeout`: the lesser of :data:`DEFAULT_ACK_TIMEOUT` and the remainder less
+        :data:`DRIVER_DEADLINE_MARGIN`, so an ack wait the budget caps expires in the driver, which
+        raises it, rather than tying with this wait and reading as abandoned. A JetStream publish
+        abandoned here therefore means the driver ignored its own timeout. A core publish takes
+        no timeout. The task is
         never cancelled (see :meth:`_publish_all`); one that outlives the budget is kept in
         ``self._abandoned`` so it is neither collected mid-flight nor left with an unretrieved
         exception, and is cancelled at close with every other pending task. It is also recorded
@@ -1260,7 +1340,7 @@ class NATSSink:
         """
         if self._jetstream:
             publish = target.publish(
-                self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)
+                self._subject, payload, timeout=_driver_timeout(remaining, DEFAULT_ACK_TIMEOUT)
             )
         else:
             publish = target.publish(self._subject, payload)

@@ -1779,12 +1779,19 @@ def test_close_and_flush_wait_for_the_flusher_before_their_ping(monkeypatch) -> 
     # liveness PING for the latch when its wait fails (frame-2 finding 2), and the fake answers
     # both, so a sink that let such a PING confirm the buffer would not raise here. `close()`
     # arms none, since nothing follows it.
+    #
+    # Each call waits for the previous one's liveness PING to be answered first. That PING is
+    # aged from when the buffer stopped moving (frame-3 finding 2), so a call made before its
+    # PONG lands is refused by the latch without reaching the drained wait this test is about;
+    # `test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age` covers that refusal.
     sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
     sink.emit([{"n": 1}])
     assert fake.calls.count("flush") == 2
+    assert _wait_until(lambda: sink._probe is not None and sink._probe[0].done())
     with pytest.raises(SinkDeliveryError, match="PONG"):
         sink.flush()
     assert fake.calls.count("flush") == 3
+    assert _wait_until(lambda: sink._probe is not None and sink._probe[0].done())
     with pytest.raises(TimeoutError):
         sink.close()
     assert fake.calls.count("flush") == 3, "close's step one sent no PING over a parked flusher"
@@ -2081,12 +2088,17 @@ def test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age(monkeypatch) ->
     0.95 s for callers queued behind a 0.5 s emit). A probe is now left outstanding when the wait
     fails; once it has gone unanswered for ``publish_timeout`` the next call is refused before the
     lock, sending no PING of its own.
+
+    The call is made at once. Frame-3 finding 2: the probe was dated when the drained wait
+    failed, at the deadline, so the next caller waited a whole budget more (0.50 s on the fakes,
+    1.002 s on the real driver at ``publish_timeout=1.0``); an earlier version of this test slept
+    past ``publish_timeout`` first and so could not see it. The probe is now aged from when the
+    drained wait began, when the buffer stopped moving.
     """
     sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.3)
     sink.emit([{"n": 1}])
     first = sink.losses()
     pings = fake.calls.count("flush")
-    time.sleep(0.35)
     elapsed, error = _timed(lambda: sink.emit([{"n": 2}]))
     later = fake.calls.count("flush")
     with contextlib.suppress(TimeoutError):
@@ -2107,8 +2119,14 @@ def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) ->
     flush must take it as liveness only and send a fresh PING, after the drain, to confirm. A sink
     that reused the outstanding probe as the confirmation would return after two PINGs, the second
     sent with nothing written.
+
+    The publish takes 0.3 s of the 0.6 s budget, so the drained wait, which the liveness PING is
+    aged from (frame-3 finding 2), starts half-way through it: the flush made right after the emit
+    reaches the outstanding probe while it is younger than ``publish_timeout`` rather than being
+    refused by the latch, and can wait for its PONG.
     """
-    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.5)
+    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.6)
+    fake.publish_delay = 0.3
     sink.emit([{"n": 1}])
     assert fake.pubs_at_ping == [0, 0], "the probe, then the liveness PING over the full buffer"
 
@@ -2124,5 +2142,5 @@ def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) ->
     sink.close()
 
     assert error is None, error
-    assert elapsed < 0.5, f"{elapsed:.2f}s"
+    assert elapsed < 0.6, f"{elapsed:.2f}s"
     assert pings == [0, 0, 1], "the confirmation must be a fresh PING sent after the drain"
