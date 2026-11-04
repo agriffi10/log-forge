@@ -250,6 +250,32 @@ def _exact(value: object) -> object:
     return value
 
 
+def _stored_name(cls: type) -> str:
+    """Returns the name a type stores, as an exact ``str``, running no code of the type (SPEC-080).
+
+    The name is read through ``type``'s own ``__name__`` descriptor (``_diag._STORED_NAME``),
+    not ``cls.__name__``, so a metaclass ``__name__`` property or ``__getattribute__`` is never
+    consulted and cannot divert, raise or lie. ``type.__name__``'s setter accepts a ``str``
+    subclass and the descriptor hands it back as stored, so the result goes through
+    ``_diag._STR_STR``, ``str.__str__`` unbound, which copies the held text without running a
+    method of the subclass.
+
+    This is the decoration-time sibling of ``sanitize._type_name``, which is not reused: that
+    one swallows a failure to ``"?"`` because assembly must never raise, where at decoration
+    raising is allowed (invariant 13) and ``"?"`` would be a wrong span name.
+
+    Args:
+      cls: The type to name, normally ``type(value)`` for a value ``@trace`` was handed.
+
+    Returns:
+      The type's stored name, as an exact ``str``.
+
+    Raises:
+      None.
+    """
+    return _diag._STR_STR(_diag._STORED_NAME(cls))
+
+
 def _current_span_was_swept() -> bool:
     """Reports whether an in-span ``flush()`` has already shipped this span's events.
 
@@ -706,6 +732,36 @@ def _refuse_unusable(fn: object) -> None:
     and deferred: a refusal can be lifted into a wrap later without breaking anyone, while a
     wrap shipped first freezes its semantics at 1.0.
 
+    The checks run in a fixed order, so that only a callable runs its own code here (SPEC-080
+    FR-003, FR-004). Each of the first three routes on ``fn``'s **real** type, which asks
+    nothing of ``fn`` itself: ``isinstance`` would read ``fn``'s own ``__class__``, a property
+    free to raise or to lie.
+
+    1. ``issubclass(type(fn), str)`` comes first, so no other check reads a ``str`` subclass
+       before it is refused. The hint is rendered by ``_diag._echo``, which takes the first 64
+       characters through ``str``'s own slots, quotes, escapes and cuts them with ``…``, running
+       no method of a subclass; for ``"checkout"`` the message is the one it always was. A
+       callable that merely *claims* ``str`` through ``__class__`` no longer matches and is
+       traced like any callable instance.
+    2. ``issubclass(type(fn), (classmethod, staticmethod))``: the misordered-descriptor message,
+       naming the type's stored name (:func:`_stored_name`), so a real subclass is told its own
+       decorator.
+    3. ``not callable(fn)``, which reads the type's ``tp_call`` slot and runs no code of the
+       value; the type is named by its stored name.
+    4. Only then ``isinstance(fn, (classmethod, staticmethod))``, the one check that **keeps**
+       ``isinstance``, on purpose. A callable proxy that forwards ``__class__`` — a
+       ``wrapt.FunctionWrapper`` around a ``classmethod``, say — is a descriptor whose binding a
+       plain-function wrapper would lose, so refusing it is right, and it is told the kind it
+       claims. By this step the value is a callable, so its ``__class__`` raising here is the
+       caller's own code raising at decoration, never a per-call failure. The order has one
+       accepted trade-off: a *non-callable* proxy forwarding ``__class__`` to a ``classmethod``
+       is told it needs a callable rather than given the descriptor advice, still a refusal at
+       decoration naming the argument.
+
+    Both descriptor messages are built by :func:`_misordered`, which reads ``__func__`` and its
+    ``__qualname__`` only through ``getattr`` and keeps the latter only if its real type is a
+    ``str``.
+
     Args:
       fn: Whatever was handed to the decorator.
 
@@ -713,30 +769,68 @@ def _refuse_unusable(fn: object) -> None:
       None.
 
     Raises:
-      TypeError: If ``fn`` is a ``classmethod`` or ``staticmethod`` object, a ``str``, not
-        callable at all, or a generator function or async generator function.
-      Exception: Whatever the callable's own attribute access raises — a ``__class__`` property,
-        say — at decoration, in the caller's frame, which is invariant 13's moment.
+      TypeError: If ``fn`` is a ``str`` by real type, a ``classmethod`` or ``staticmethod`` by
+        real type or by the ``__class__`` a callable claims, not callable at all, or a generator
+        function or async generator function.
+      Exception: Whatever a callable's own attribute access raises — a ``__class__`` property,
+        say, or a ``classmethod`` or ``staticmethod``'s ``__func__`` — and whatever computing the
+        ``str`` hint's echo raises, such as a ``MemoryError``, at decoration, in the caller's
+        frame, which is invariant 13's moment.
     """
-    if isinstance(fn, (classmethod, staticmethod)):
-        kind = type(fn).__name__
-        inner = getattr(fn.__func__, "__qualname__", "the function")
+    if issubclass(type(fn), str):
         raise TypeError(
-            f"@trace cannot wrap the {kind} object around {inner}; put @{kind} above @trace, "
-            f"so that @trace decorates the plain function"
+            f"@trace needs a callable, got str; pass a span name as @trace(name={_diag._echo(fn)})"
         )
-    if isinstance(fn, str):
-        raise TypeError(
-            f"@trace needs a callable, got str; pass a span name as @trace(name={fn!r})"
-        )
+    if issubclass(type(fn), (classmethod, staticmethod)):
+        raise TypeError(_misordered(_stored_name(type(fn)), fn))
     if not callable(fn):
-        raise TypeError(f"@trace needs a callable, got {type(fn).__name__}")
+        raise TypeError(f"@trace needs a callable, got {_stored_name(type(fn))}")
+    if isinstance(fn, (classmethod, staticmethod)):
+        kind = "classmethod" if isinstance(fn, classmethod) else "staticmethod"
+        raise TypeError(_misordered(kind, fn))
     if _is_generator_function(fn):
         raise TypeError(
             f"@trace cannot trace the iteration of the generator function {_span_name(fn)}: its "
             f"body runs after the wrapper has returned, so the span would close before it "
             f"starts. Trace the consumer instead: the function that iterates it"
         )
+
+
+def _misordered(kind: str, fn: object) -> str:
+    """Builds the misordered-descriptor message, reading nothing it has not checked (SPEC-080).
+
+    ``kind`` is the decorator to move above ``@trace``: the real type's stored name for a
+    ``classmethod`` or ``staticmethod`` by real type, or the kind a callable proxy claims.
+    The wrapped function is named by ``fn.__func__.__qualname__``, each read through
+    ``getattr`` with a default, so a proxy with no ``__func__`` is described rather than
+    raising ``AttributeError``. The name is kept only if its real type is a ``str``, copied
+    with ``str.__str__`` so no method of a subclass runs; anything else — ``5``, or an object
+    whose ``__class__`` property claims ``str`` — becomes "the function" without being read.
+
+    A builder rather than a raiser, so both ``raise TypeError(...)`` sites stay visible in
+    :func:`_refuse_unusable`. The ``getattr`` defaults catch only ``AttributeError``: a callable
+    proxy's raising ``__func__`` property, or a raising ``__func__``/``__qualname__`` behind a
+    real ``classmethod`` or ``staticmethod``, is the caller's code and raises at decoration.
+
+    Args:
+      kind: The decorator name the message tells the caller to move.
+      fn: The descriptor or descriptor proxy that was handed to ``@trace``.
+
+    Returns:
+      The ``TypeError`` message.
+
+    Raises:
+      Exception: Whatever reading ``__func__`` or its ``__qualname__`` raises other than
+        ``AttributeError``, at decoration, in the caller's frame.
+    """
+    func_qualname = getattr(getattr(fn, "__func__", None), "__qualname__", None)
+    inner = "the function"
+    if issubclass(type(func_qualname), str):
+        inner = str.__str__(cast("str", func_qualname))
+    return (
+        f"@trace cannot wrap the {kind} object around {inner}; put @{kind} above @trace, "
+        f"so that @trace decorates the plain function"
+    )
 
 
 def _is_generator_function(fn: object) -> bool:
@@ -794,22 +888,33 @@ def _span_name(fn: object) -> str:
     ``fn.__qualname__`` where the callable has one, else its type's name — so a
     ``functools.partial`` traces as ``partial`` and a callable instance as its class, where
     reading the attribute per call inside the wrapper raised ``AttributeError`` into the
-    application on every call. A ``__qualname__`` that exists but is not a ``str`` needs no
-    clause: ``functools.wraps`` copies it onto the wrapper and Python refuses a non-``str``
-    there before any wrapper exists.
+    application on every call.
+
+    Both routes are taken on real types and both return an exact ``str`` (SPEC-080 FR-002). The
+    ``__qualname__`` is kept if ``issubclass(type(qualname), str)``, copied with
+    ``str.__str__`` so a subclass's methods never run and the span name is never the subclass
+    itself. Otherwise the type's stored name is used, read by :func:`_stored_name` through
+    ``type``'s own ``__name__`` descriptor, which a metaclass ``__name__`` property cannot
+    divert: through ``type(fn).__name__``, a property returning ``1`` decorated cleanly and then
+    absorbed every call's span, and one that raised raised out of decoration. A ``__qualname__``
+    that exists but is not a ``str`` needs no clause: ``functools.wraps`` copies it onto the
+    wrapper and Python refuses a non-``str`` there before any wrapper exists; the route above
+    no longer reads that value's ``__class__`` on the way.
 
     Args:
       fn: The callable being decorated.
 
     Returns:
-      The span name.
+      The span name, as an exact ``str``.
 
     Raises:
       Exception: Whatever the callable's own ``__qualname__`` lookup raises other than
         ``AttributeError``, at decoration, in the caller's frame.
     """
     qualname = getattr(fn, "__qualname__", None)
-    return qualname if isinstance(qualname, str) else type(fn).__name__
+    if issubclass(type(qualname), str):
+        return str.__str__(cast("str", qualname))
+    return _stored_name(type(fn))
 
 
 def _is_async(fn: object) -> bool:
@@ -859,7 +964,13 @@ def trace(
       func: The function being decorated when used bare, otherwise ``None``.
       name: Overrides the span name, which defaults to ``func.__qualname__`` where the callable
         has one and to its type's name otherwise — ``partial`` for a ``functools.partial``, the
-        class name for a callable instance (SPEC-055 FR-002).
+        class name for a callable instance (SPEC-055 FR-002). It is routed by its **real type
+        at this call** (SPEC-080 FR-001), ``issubclass(type(name), str)``, which never asks the
+        value: a ``str`` subclass is kept as the exact ``str`` it holds, copied with
+        ``str.__str__`` so no method of the subclass runs, then or on any later call; anything
+        else not ``None`` is raised here, before any decorator is applied, named by its type's
+        stored name. The copy is not guarded, so a ``MemoryError`` from copying an enormous
+        subclass propagates here too. An empty name still falls back to the default.
       defaults: Per-decorator default fields added to every event on the span. Any
         ``Mapping`` is accepted, and a copy is taken **once here**, at decoration — not per
         call. Before SPEC-051 FR-002 the caller's own object was bound to every span and read
@@ -870,13 +981,22 @@ def trace(
       The wrapped function, or a decorator when called with arguments.
 
     Raises:
-      TypeError: At decoration, for a ``classmethod`` or ``staticmethod`` object (the decorators
-        are in the wrong order), a ``str`` (``name=`` was meant), anything not callable, a
-        ``name=`` that is not a ``str`` (SPEC-055 FR-002), or a generator function, whose
-        iteration cannot be traced by a wrapper around the call (SPEC-055 FR-003) — invariant
-        13.
+      TypeError: At this call, for a ``name=`` that is not a ``str`` by real type (SPEC-055
+        FR-002, SPEC-080 FR-001). At decoration, for a ``classmethod`` or ``staticmethod``
+        object (the decorators are in the wrong order), a ``str`` (``name=`` was meant),
+        anything not callable, or a generator function, whose iteration cannot be traced by a
+        wrapper around the call (SPEC-055 FR-003) — invariant 13. Because ``name=`` is judged
+        first, a call carrying two bad arguments reports ``name=``: ``trace("checkout",
+        name=1)`` and ``trace(fn, name=1)`` both raise ``name= must be a str, got int``.
     """
     span_defaults = None if defaults is None else dict(defaults)
+    exact_name: str | None
+    if issubclass(type(name), str):
+        exact_name = str.__str__(cast("str", name))
+    elif name is None:
+        exact_name = None
+    else:
+        raise TypeError(f"@trace name= must be a str, got {_stored_name(type(name))}")
 
     def decorate(fn: F) -> F:
         """Wraps one function, selecting the sync or async wrapper at decoration time.
@@ -887,6 +1007,9 @@ def trace(
         stack and baggage across ``await`` points and concurrent tasks (arch §5), so the async
         span opens when the coroutine actually runs and closes when it finishes. The span name
         is resolved here, once, rather than read from ``fn`` on every call (SPEC-055 FR-002).
+        It reads the exact name :func:`trace` already resolved from ``name=`` (SPEC-080
+        FR-001), so the truthiness test that sends an empty name to :func:`_span_name` runs on
+        an exact ``str`` and never on a subclass's ``__bool__`` or ``__len__``.
 
         Args:
           fn: The function to wrap.
@@ -896,11 +1019,11 @@ def trace(
 
         Raises:
           TypeError: From :func:`_refuse_unusable`, at decoration.
+          Exception: Whatever the callable's own attributes raise while they are read, at
+            decoration, in the caller's frame.
         """
         _refuse_unusable(fn)
-        if name is not None and not isinstance(name, str):
-            raise TypeError(f"@trace name= must be a str, got {type(name).__name__}")
-        span_name = name or _span_name(fn)
+        span_name = exact_name or _span_name(fn)
         if _is_async(fn):
 
             @functools.wraps(fn)

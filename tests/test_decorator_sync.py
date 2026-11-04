@@ -7,12 +7,16 @@ façade export).
 
 import contextvars
 import gc
+import re
 import threading
 import time
+import types
 
 import pytest
 
 import log_foundry
+from conftest import Hostility, armed, object_probe, str_probe
+from log_foundry import _diag, decorator
 from log_foundry.sinks import stdout as stdout_sink
 
 
@@ -865,3 +869,533 @@ def test_a_function_that_returns_a_generator_object_is_accepted(fake_sink) -> No
         return gen()
 
     assert list(make()) == [1]
+
+
+# -- SPEC-080: @trace routes what it is handed on its real type ---------------------------------
+#
+# Every hostile value here records into `conftest.Hostility` while `armed()` is open and behaves
+# as its base type otherwise, because pytest reads these values when it reports a failure: its
+# `saferepr` reads `cls.__name__`, and an always-raising metaclass turns a failure into an
+# INTERNALERROR. Every armed body is one `with armed() as calls:`; assertions run after it closes.
+
+_SLIP = "@trace needs a callable, got str; pass a span name as @trace(name='checkout')"
+
+
+def _class_says(answer: object) -> property:
+    """A ``__class__`` property that records and answers ``answer`` (or raises) while armed."""
+
+    def read(self):  # type: ignore[no-untyped-def]
+        if Hostility.armed:
+            Hostility.calls.append("__class__")
+            if answer == "raise":
+                raise RuntimeError("__class__-secret")
+            return answer
+        return type(self)
+
+    return property(read)
+
+
+def _always_class(answer: type) -> property:
+    """A ``__class__`` property that always answers ``answer`` and records nothing.
+
+    For the callable proxies whose ``__class__`` the kept ``isinstance`` is allowed to read
+    (FR-004), so those reads do not land in a spy another criterion asserts empty.
+    """
+    return property(lambda self: answer)
+
+
+def _name_meta(answer: object) -> type:
+    """A fresh metaclass whose ``__name__`` property records and answers (or raises) while armed."""
+
+    def read(cls):  # type: ignore[no-untyped-def]
+        if Hostility.armed:
+            Hostility.calls.append("meta.__name__")
+            if answer == "raise":
+                raise RuntimeError("meta-name-secret")
+            return answer
+        return type.__dict__["__name__"].__get__(cls)
+
+    return type("_NameMeta", (type,), {"__name__": property(read)})
+
+
+def _str_with_bool(text: str) -> str:
+    """A ``str`` subclass holding ``text`` whose every method raises while armed, ``__bool__`` too.
+
+    ``str`` has no ``__bool__``, so ``str_probe`` cannot hook it; the truthiness of a subclass
+    is exactly what the old ``name or _span_name(fn)`` ran.
+    """
+
+    def boolean(self) -> bool:  # type: ignore[no-untyped-def]
+        if Hostility.armed:
+            Hostility.calls.append("__bool__")
+            raise RuntimeError("__bool__-secret")
+        return str.__len__(self) > 0
+
+    base = type(str_probe(text, raising="all"))
+    return type("_B", (base,), {"__bool__": boolean})(text)
+
+
+def _span_starts(fake_sink) -> list[tuple[object, type]]:
+    """Each ``span.start`` event's ``function`` and its exact type, in emission order."""
+    return [
+        (e["function"], type(e["function"]))
+        for e in fake_sink.events
+        if e["message"] == "span.start"
+    ]
+
+
+# FR-001: name= is routed on its real type at the trace(...) call, kept as an exact str.
+
+
+def test_a_name_claiming_str_is_refused_at_the_trace_call(capsys) -> None:
+    """At base the call returned a decorator, and every call it wrapped ran untraced."""
+    value = object_probe("_ClaimsStr", class_property="str")
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"name= must be a str, got _ClaimsStr$"),
+    ):
+        log_foundry.trace(name=value)
+
+    assert calls == []
+    assert capsys.readouterr().err == ""
+
+
+def test_a_name_whose_class_raises_is_refused_at_the_trace_call() -> None:
+    value = object_probe("_ClassRaises", class_property="raise")
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"name= must be a str, got _ClassRaises$"),
+    ):
+        log_foundry.trace(name=value)
+
+    assert calls == []
+
+
+def test_a_name_whose_type_says_str_is_refused_by_its_stored_name() -> None:
+    value = _name_meta("str")("_NameLies", (), {})()
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"name= must be a str, got _NameLies$"),
+    ):
+        log_foundry.trace(name=value)
+
+    assert calls == []
+
+
+async def test_a_hostile_str_subclass_name_traces_as_its_exact_str(fake_sink, capsys) -> None:
+    """No method of the subclass runs, at decoration or per call, on the sync or async wrapper."""
+    log_foundry.configure(service="t", sink=fake_sink)
+    name = _str_with_bool("checkout")
+
+    with armed() as calls:
+
+        @log_foundry.trace(name=name)
+        def work() -> int:
+            return 1
+
+        @log_foundry.trace(name=name)
+        async def awork() -> int:
+            return 2
+
+        results = [work(), work(), await awork(), await awork()]
+
+    log_foundry.shutdown()
+    assert results == [1, 1, 2, 2]
+    assert _span_starts(fake_sink) == [("checkout", str)] * 4
+    assert calls == []
+    assert capsys.readouterr().err == ""
+
+
+def test_an_empty_str_subclass_name_falls_back_to_the_qualified_name(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+    name = _str_with_bool("")
+
+    def work() -> int:
+        return 1
+
+    with armed() as calls:
+        result = log_foundry.trace(name=name)(work)()
+
+    log_foundry.shutdown()
+    assert result == 1
+    assert _spans_named(fake_sink) == {
+        "test_an_empty_str_subclass_name_falls_back_to_the_qualified_name.<locals>.work"
+    }
+    assert calls == []
+
+
+def test_a_non_str_name_is_refused_before_any_decorator_is_applied() -> None:
+    with pytest.raises(TypeError, match=r"name= must be a str, got int$"):
+        log_foundry.trace(name=1)
+
+
+def test_a_bad_name_is_reported_before_a_str_slip() -> None:
+    """Two bad arguments: ``name=`` is judged at the call, so it is the one reported."""
+    with pytest.raises(TypeError, match=r"name= must be a str, got int$"):
+        log_foundry.trace("checkout", name=1)
+
+
+def test_name_none_traces_under_the_qualified_name(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+
+    def work() -> int:
+        return 1
+
+    assert log_foundry.trace(name=None)(work)() == 1
+    log_foundry.shutdown()
+    assert _spans_named(fake_sink) == {
+        "test_name_none_traces_under_the_qualified_name.<locals>.work"
+    }
+
+
+# FR-002: the span-name fallback routes on real type and reads the stored type name.
+
+
+def test_a_callable_whose_type_name_is_not_a_str_traces_under_its_stored_name(
+    fake_sink, capsys
+) -> None:
+    """At base the span name was ``1``, and every call absorbed a failure opening its span."""
+    log_foundry.configure(service="t", sink=fake_sink)
+    cls = _name_meta(1)("_IntNamed", (), {"__call__": lambda self: 7})
+
+    with armed() as calls:
+        traced = log_foundry.trace(cls())
+        results = [traced(), traced()]
+
+    log_foundry.shutdown()
+    assert results == [7, 7]
+    assert _span_starts(fake_sink) == [("_IntNamed", str)] * 2
+    assert "absorbed a failure while opening a span" not in capsys.readouterr().err
+    assert calls == []
+
+
+async def test_a_callable_whose_type_name_raises_traces_under_its_stored_name(fake_sink) -> None:
+    log_foundry.configure(service="t", sink=fake_sink)
+    meta = _name_meta("raise")
+
+    async def acall(self) -> int:  # type: ignore[no-untyped-def]
+        return 2
+
+    sync_cls = meta("_Nameless", (), {"__call__": lambda self: 1})
+    async_cls = meta("_ANameless", (), {"__call__": acall})
+
+    with armed() as calls:
+        traced = log_foundry.trace(sync_cls())
+        atraced = log_foundry.trace(async_cls())
+        results = [traced(), await atraced()]
+
+    log_foundry.shutdown()
+    assert results == [1, 2]
+    assert sorted(_span_starts(fake_sink)) == [("_ANameless", str), ("_Nameless", str)]
+    assert calls == []
+
+
+def test_a_generator_callable_whose_type_name_raises_is_refused_by_its_stored_name() -> None:
+    """The generator refusal's message is ``_span_name``'s second caller."""
+
+    def produce(self):  # type: ignore[no-untyped-def]
+        yield 1
+
+    instance = _name_meta("raise")("_GenNameless", (), {"__call__": produce})()
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"generator function _GenNameless:"),
+    ):
+        log_foundry.trace(instance)
+
+    assert calls == []
+
+
+def test_span_name_copies_a_str_subclass_type_name() -> None:
+    class _Plain:
+        def __call__(self) -> None:
+            pass
+
+    _Plain.__name__ = str_probe("Held", raising="all")
+    instance = _Plain()
+
+    with armed() as calls:
+        got = decorator._span_name(instance)
+
+    assert type(got) is str
+    assert got == "Held"
+    assert calls == []
+
+
+def test_span_name_copies_a_str_subclass_qualname() -> None:
+    def f() -> None:
+        pass
+
+    f.__qualname__ = str_probe("Held.q", raising="all")
+
+    with armed() as calls:
+        got = decorator._span_name(f)
+
+    assert type(got) is str
+    assert got == "Held.q"
+    assert calls == []
+
+
+def test_a_qualname_claiming_str_is_refused_without_reading_its_class() -> None:
+    """``functools.wraps`` still refuses it; the route no longer runs its ``__class__`` first."""
+
+    class Handler:
+        def __call__(self) -> None:
+            pass
+
+    instance = Handler()
+    instance.__qualname__ = object_probe("_QualLies", class_property="str")
+
+    with armed() as calls, pytest.raises(TypeError, match="__qualname__"):
+        log_foundry.trace(instance)
+
+    assert calls == []
+
+
+# FR-003: the str slip is refused first, by real type, with a bounded hint.
+
+
+def test_the_str_slip_message_is_unchanged() -> None:
+    with pytest.raises(TypeError) as info:
+        log_foundry.trace("checkout")
+
+    assert str(info.value) == _SLIP
+
+
+def test_a_str_subclass_slip_is_refused_without_running_its_code() -> None:
+    value = str_probe("checkout", raising={"__repr__", "__getitem__", "__len__"})
+
+    with armed() as calls, pytest.raises(TypeError) as info:
+        log_foundry.trace(value)
+
+    assert str(info.value) == _SLIP
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: type("_CS", (str,), {"__class__": _class_says("raise")})("checkout"),
+        lambda: str_probe("checkout", raising={"__getattribute__"}),
+    ],
+    ids=["class-raises", "getattribute-raises"],
+)
+def test_a_str_subclass_slip_whose_class_or_attributes_raise_is_refused(make) -> None:
+    value = make()
+
+    with armed() as calls, pytest.raises(TypeError) as info:
+        log_foundry.trace(value)
+
+    assert str(info.value) == _SLIP
+    assert calls == []
+
+
+def test_a_str_subclass_slip_claiming_classmethod_is_refused_as_a_str() -> None:
+    value = type("_CM", (str,), {"__class__": _class_says(classmethod)})("checkout")
+
+    with armed() as calls, pytest.raises(TypeError) as info:
+        log_foundry.trace(value)
+
+    assert str(info.value) == _SLIP
+    assert calls == []
+
+
+def test_a_long_str_slip_is_echoed_bounded() -> None:
+    with pytest.raises(TypeError) as info:
+        log_foundry.trace("x" * 10_000)
+
+    assert str(info.value) == (
+        "@trace needs a callable, got str; pass a span name as @trace(name='" + "x" * 63 + "…)"
+    )
+
+
+def test_a_callable_claiming_str_is_traced(fake_sink, capsys) -> None:
+    """Its ``__class__`` still runs at decoration, the caller's own code; never per call."""
+    log_foundry.configure(service="t", sink=fake_sink)
+    reads: list[str] = []
+
+    class _CallableClaimsStr:
+        @property
+        def __class__(self) -> type:
+            reads.append("__class__")
+            return str
+
+        def __call__(self) -> int:
+            return 5
+
+    traced = log_foundry.trace(_CallableClaimsStr())
+    reads.clear()
+    results = [traced(), traced()]
+
+    log_foundry.shutdown()
+    assert results == [5, 5]
+    assert reads == []
+    assert _span_starts(fake_sink) == [("_CallableClaimsStr", str)] * 2
+    assert capsys.readouterr().err == ""
+
+
+def test_an_echo_failure_at_decoration_propagates(monkeypatch) -> None:
+    """``_diag._echo``'s second caller lets a failure out, where ``rejected`` writes ``<?>``."""
+
+    def failing(value: object) -> str:
+        raise MemoryError("echo")
+
+    monkeypatch.setattr(_diag, "_echo", failing)
+    with pytest.raises(MemoryError, match="echo"):
+        log_foundry.trace("checkout")
+
+
+# FR-004: the descriptor and non-callable refusals read nothing unchecked, isinstance last.
+
+
+def test_a_callable_claiming_classmethod_without_func_is_told_classmethod(capsys) -> None:
+    class _ClaimsCM:
+        __class__ = _always_class(classmethod)
+
+        def __call__(self) -> None:
+            pass
+
+    message = (
+        "cannot wrap the classmethod object around the function; put @classmethod above @trace"
+    )
+    with pytest.raises(TypeError, match=re.escape(message)):
+        log_foundry.trace(_ClaimsCM())
+
+    assert capsys.readouterr().err == ""
+
+
+def test_a_callable_claiming_staticmethod_is_told_staticmethod_and_its_func() -> None:
+    class _ClaimsSM:
+        __class__ = _always_class(staticmethod)
+
+        def __call__(self) -> None:
+            pass
+
+    def g() -> None:
+        pass
+
+    g.__qualname__ = "g"
+    instance = _ClaimsSM()
+    instance.__func__ = g
+
+    message = "cannot wrap the staticmethod object around g; put @staticmethod above @trace"
+    with pytest.raises(TypeError, match=re.escape(message)):
+        log_foundry.trace(instance)
+
+
+def test_a_claimed_classmethod_whose_func_qualname_is_not_a_str_says_the_function() -> None:
+    class _ClaimsCM:
+        __class__ = _always_class(classmethod)
+
+        def __call__(self) -> None:
+            pass
+
+    instance = _ClaimsCM()
+    instance.__func__ = types.SimpleNamespace(__qualname__=5)
+
+    with pytest.raises(TypeError, match="around the function;"):
+        log_foundry.trace(instance)
+
+
+def test_a_claimed_classmethod_whose_func_qualname_claims_str_says_the_function() -> None:
+    class _ClaimsCM:
+        __class__ = _always_class(classmethod)
+
+        def __call__(self) -> None:
+            pass
+
+    instance = _ClaimsCM()
+    instance.__func__ = types.SimpleNamespace(
+        __qualname__=object_probe("_QQ", class_property="str")
+    )
+
+    with armed() as calls, pytest.raises(TypeError, match="around the function;"):
+        log_foundry.trace(instance)
+
+    assert calls == []
+
+
+def test_a_real_classmethod_with_a_str_subclass_qualname_names_the_held_text() -> None:
+    def m(cls) -> None:
+        pass
+
+    m.__qualname__ = str_probe("K.m", raising={"__format__", "__str__"})
+    descriptor = classmethod(m)
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=re.escape("around K.m; put @classmethod above @trace")),
+    ):
+        log_foundry.trace(descriptor)
+
+    assert calls == []
+
+
+def test_a_classmethod_subclass_is_told_its_own_name() -> None:
+    class MyCM(classmethod):
+        pass
+
+    def m(cls) -> None:
+        pass
+
+    with pytest.raises(TypeError, match=re.escape("put @MyCM above @trace")):
+        log_foundry.trace(MyCM(m))
+
+
+def test_a_classmethod_subclass_whose_type_name_raises_is_told_its_stored_name() -> None:
+    def m(cls) -> None:
+        pass
+
+    descriptor = _name_meta("raise")("_NamelessCM", (classmethod,), {})(m)
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=re.escape("put @_NamelessCM above @trace")),
+    ):
+        log_foundry.trace(descriptor)
+
+    assert calls == []
+
+
+def test_a_non_callable_claiming_classmethod_is_told_it_needs_a_callable() -> None:
+    """The accepted trade-off: a non-callable proxy is not given the descriptor advice."""
+
+    class _NCProxy:
+        __class__ = _always_class(classmethod)
+
+    def g() -> None:
+        pass
+
+    instance = _NCProxy()
+    instance.__func__ = g
+
+    with pytest.raises(TypeError, match=r"needs a callable, got _NCProxy$"):
+        log_foundry.trace(instance)
+
+
+def test_a_non_callable_whose_class_raises_is_told_it_needs_a_callable() -> None:
+    value = object_probe("_ClassRaises", class_property="raise")
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"needs a callable, got _ClassRaises$"),
+    ):
+        log_foundry.trace(value)
+
+    assert calls == []
+
+
+def test_a_non_callable_whose_type_name_raises_is_told_its_stored_name() -> None:
+    value = object_probe("_Nameless", meta=True)
+
+    with (
+        armed() as calls,
+        pytest.raises(TypeError, match=r"needs a callable, got _Nameless$"),
+    ):
+        log_foundry.trace(value)
+
+    assert calls == []

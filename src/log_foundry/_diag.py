@@ -199,7 +199,13 @@ def rejected(reason: str, value: object) -> None:
 
 
 def _echo(value: object) -> str:
-    """Renders a refused inbound value for :func:`rejected` without running any of its code.
+    """Renders a refused value in bounded form without running any of its code.
+
+    It has two callers, which treat a failure differently. :func:`rejected` echoes a refused
+    inbound value, catches an ``Exception`` from computing the echo and writes ``<?>`` instead,
+    so its line is still written. ``decorator._refuse_unusable`` echoes the ``str`` handed to
+    ``@trace`` in place of a callable (SPEC-080 FR-003) and lets that failure propagate, at
+    decoration, into the caller's frame, which invariant 13 allows.
 
     The value's real type decides the route, through ``issubclass(type(value), str)``: an MRO
     check on ``str``'s side, where ``isinstance`` would read the value's own ``__class__`` and a
@@ -230,7 +236,8 @@ def _echo(value: object) -> str:
 
     Raises:
       Exception: Whatever computing the echo raises, such as a ``MemoryError``. :func:`rejected`
-        catches it and writes ``<?>`` in its place, so the line is still written.
+        catches it and writes ``<?>`` in its place, so the line is still written;
+        ``decorator._refuse_unusable`` lets it propagate at decoration.
     """
     if issubclass(type(value), str):
         text = str.__repr__(str.__getitem__(cast("str", value), slice(None, _MAX_REJECTED_ECHO)))
