@@ -988,6 +988,10 @@ def trace(
         wrapper around the call (SPEC-055 FR-003) — invariant 13. Because ``name=`` is judged
         first, a call carrying two bad arguments reports ``name=``: ``trace("checkout",
         name=1)`` and ``trace(fn, name=1)`` both raise ``name= must be a str, got int``.
+      Exception: At this call, whatever ``dict(defaults)`` raises from the mapping's own code,
+        or a ``MemoryError`` from copying an enormous ``str`` subclass ``name=``; at
+        decoration, whatever the callable's own attributes raise while they are read — all in
+        the caller's frame, which is invariant 13's moment.
     """
     span_defaults = None if defaults is None else dict(defaults)
     exact_name: str | None

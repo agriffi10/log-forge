@@ -2,7 +2,7 @@
 
 ## What was completed?
 
-Four FRs, built in `31f5b64`, in `decorator.py` and `_diag.py`'s `_echo` docstring. The principle:
+Four FRs, built in `56676b69`, in `decorator.py` and `_diag.py`'s `_echo` docstring. The principle:
 **`@trace` decides what a value is by asking `type`, never the value**, so of the decorated object
 only a callable runs its own code at decoration, and no argument decorates cleanly and then fails
 every call. It closes the `architecture.md` §12 item on `@trace(name=...)`'s `isinstance`, and the
@@ -56,7 +56,10 @@ signature changed, and no caller must change code.
 
 - **Owed until the PR's CI is green:** the `isinstance` fallback to `__class__`, the
   `type.__dict__["__name__"]` descriptor and `callable`'s slot read are CPython behaviour; this
-  worktree's interpreter is 3.13, so CI's 3.12 leg settles them on 3.12.
+  worktree's interpreter is 3.13, so CI's 3.12 leg settles them on 3.12. The frame-1 diff
+  review ran `tests/test_decorator_sync.py`, `test_decorator_async.py` and `test_diag.py` on a
+  local CPython 3.12.12 venv against `a6ad7bef`: 302 passed. That is one machine; CI's leg is
+  still the record.
 
 ## Verification
 
