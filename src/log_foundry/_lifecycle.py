@@ -1839,7 +1839,11 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     this caller's deadline in the same decision that wins the once-only gate, inside this same
     critical section, so the wake finds the deadline and the join that follows belongs to the
     caller who recorded it. The verdict is passed to :meth:`Worker.stop`, which then joins or
-    waits against this caller's own timeout. A late worker is stopped through ``stop`` without a
+    waits against this caller's own timeout. When the winner was the drain thread itself — a
+    sink's ``emit`` calling ``shutdown()`` — it cannot join, so the next call from another thread
+    takes the gate over in ``claim_stop`` with its own deadline and joins instead (SPEC-068
+    FR-006); nothing here changes for it, and the closer then leaves the sink a live drain thread
+    may still be inside, which on that call is the caller's own thread. A late worker is stopped through ``stop`` without a
     verdict and claims for itself, before it sets the different event it holds.
 
     Args:

@@ -21,14 +21,20 @@ import sys
 import threading
 import time
 
-from conftest import install_worker, retire_process
+import pytest
+
+import log_foundry
+from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _diag, _lifecycle
+from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
 from test_worker_exit_budget import (
+    _CPU_BOUND,
     _SLACK,
     _GatedSink,
     _lost_lines,
     _measured,
+    _MeasuredThread,
     _SlowFailSink,
 )
 
@@ -340,3 +346,513 @@ def test_the_unfenced_swap_line_fits_the_detail_bound(capsys) -> None:
         assert "…" not in err
     finally:
         worker.stop(2.0)
+
+
+# --------------------------------------------------------------------------- FR-004
+
+
+def _expiry_lines(err: str) -> int:
+    """How many `shutdown timed out` lines stderr holds."""
+    return err.count("shutdown timed out")
+
+
+def test_two_concurrent_expiring_shutdowns_write_one_line(capsys) -> None:
+    """FR-004 AC-1, a regression pin. Only the caller that won the gate joins and announces.
+
+    Against `stop()` deciding the gate on `_drain_settled` rather than on `claim_stop`, both
+    callers see it clear, both join, and the wedged sink gets two lines.
+    """
+    sink = _GatedSink()
+    worker = _wedged(sink)
+    install_worker(worker)
+    elapsed: list[float] = []
+    lock = threading.Lock()
+
+    def work(_index: int, _iteration: int) -> None:
+        started = time.monotonic()
+        _lifecycle._shutdown_worker(0.3)
+        with lock:
+            elapsed.append(time.monotonic() - started)
+
+    try:
+        cpu = time.process_time()
+        errors = run_concurrently(work, threads=2)
+        spent = time.process_time() - cpu
+        err = capsys.readouterr().err
+        assert not errors, errors
+        assert _expiry_lines(err) == 1, err
+        assert worker.stopped_reason == "ShutdownTimeout"
+        assert len(elapsed) == 2 and max(elapsed) < 0.3 + _SLACK, elapsed
+        assert spent < _CPU_BOUND, f"the two calls spent {spent:.3f}s of CPU: not idle"
+    finally:
+        _release(sink, worker)
+
+
+def test_a_caller_parked_after_a_lost_claim_returns_at_once_after_the_expiry(
+    capsys, monkeypatch
+) -> None:
+    """FR-004 AC-2, a regression pin, with an injected preemption point after a lost claim.
+
+    The loser is parked between losing `claim_stop` and reading `draining`, and released only
+    once the winner's join has expired and its line is written. It then finds the drain
+    settled and returns. Against a losing branch that joins the drain thread instead, it waits
+    out its whole 3 s budget on a thread that is still wedged.
+    """
+    sink = _GatedSink()
+    worker = _wedged(sink)
+    install_worker(worker)
+    parked = threading.Event()
+    release = threading.Event()
+    measured: dict[str, float] = {}
+    real_stop = Worker.stop
+
+    def parking_stop(
+        self: Worker,
+        timeout: float | None = worker_mod.DEFAULT_SHUTDOWN_TIMEOUT,
+        *,
+        claimed: bool | None = None,
+    ) -> None:
+        if threading.current_thread().name == "loser" and claimed is False:
+            parked.set()
+            assert release.wait(10.0)
+            measured["released"] = time.monotonic()
+            measured["cpu"] = time.process_time()
+        real_stop(self, timeout, claimed=claimed)
+
+    def lose() -> None:
+        _lifecycle._shutdown_worker(3.0)
+        measured["returned"] = time.monotonic()
+        measured["spent"] = time.process_time() - measured["cpu"]
+
+    monkeypatch.setattr(Worker, "stop", parking_stop)
+    winner = _MeasuredThread(lambda: _lifecycle._shutdown_worker(0.3), name="winner")
+    loser = threading.Thread(target=lose, name="loser")
+    try:
+        winner.start()
+        deadline = time.monotonic() + 5.0
+        while not worker._stopped and time.monotonic() < deadline:
+            threading.Event().wait(0.001)
+        loser.start()
+        assert parked.wait(5.0), "the loser lost its claim and is parked before `draining`"
+        winner.finish(0.3 + _SLACK + 1.0)
+        assert _expiry_lines(capsys.readouterr().err) == 1, "the winner's line is written"
+
+        release.set()
+        loser.join(10.0)
+        assert not loser.is_alive()
+        took = measured["returned"] - measured["released"]
+        assert took < 0.1, f"the loser waited {took:.2f}s after its release"
+        assert measured["spent"] < _CPU_BOUND, measured
+        assert capsys.readouterr().err == "", "the loser writes nothing"
+        assert sink.closes == 0, "the drain thread is still inside the sink"
+    finally:
+        release.set()
+        _release(sink, worker)
+
+
+def test_a_later_shutdown_does_not_reopen_a_declined_retry(capsys) -> None:
+    """FR-004 AC-3, a regression pin. The first caller's deadline is the one the drain uses.
+
+    Against a losing `claim_stop` that overwrites `_exit_deadline`, the released emit fails
+    into a deadline 5 s away and the drain makes 4 attempts instead of 1.
+    """
+    sink = _GatedSink()
+    worker = _wedged(sink)
+    install_worker(worker)
+    try:
+        retire_process(worker, 0.3)
+        first = worker._exit_deadline
+        assert worker.stopped_reason == "ShutdownTimeout", "the premise: the first one expired"
+
+        elapsed = _measured(lambda: _lifecycle._shutdown_worker(5.0))
+        assert elapsed < 0.1, f"the later caller waited {elapsed:.2f}s"
+        assert worker._exit_deadline == first, "the record is write-once"
+    finally:
+        released = time.monotonic()
+        _release(sink, worker)
+    joined = time.monotonic() - released
+    err = capsys.readouterr().err
+
+    assert not worker._thread.is_alive() and joined < 1.0, f"the thread took {joined:.2f}s"
+    assert len(sink.attempts) == 1, f"no retry was re-opened: {sink.attempts}"
+    assert worker.failed_batches == 1
+    lost = _lost_lines(err)
+    assert len(lost) == 1 and "shutdown() deadline" in lost[0][2], err
+    retire_process(worker, 3.0)
+    assert sink.closes == 1, "a later call finds the thread ended and closes the sink once"
+
+
+# --------------------------------------------------------------------------- FR-006
+
+
+class _ReentrantSink:
+    """A sink whose first `emit` calls `log_foundry.shutdown()` from the drain thread.
+
+    The calls are made with the timeouts in `inner`, in order, each measured where it runs —
+    wall time, CPU time, what it raised, and how many closes the sink had seen when it
+    returned — and kept for the test thread to assert. Before the first call the emit waits for
+    `go`, so a test can queue spans behind it; with `after_claim` it also waits until that
+    worker's gate has been claimed by another caller, which orders the two claims without a
+    sleep. With `wedge` the first emit then blocks on `release` until the test lets it go.
+    """
+
+    def __init__(
+        self,
+        inner: tuple[float, ...] = (5.0,),
+        *,
+        wedge: bool = False,
+        fail: bool = False,
+    ) -> None:
+        self.inner = inner
+        self.wedge = wedge
+        self.fail = fail
+        self.go = threading.Event()
+        self.go.set()
+        self.after_claim: Worker | None = None
+        self.in_emit = threading.Event()
+        self.inner_done = threading.Event()
+        self.release = threading.Event()
+        self.results: list[tuple[float, float, str | None, int]] = []
+        self.attempts = 0
+        self.delivered: list[dict[str, object]] = []
+        self.closes = 0
+        self._lock = threading.Lock()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Calls `shutdown()` on the first attempt, then wedges, fails or delivers."""
+        with self._lock:
+            self.attempts += 1
+            first = self.attempts == 1
+        if first:
+            self.in_emit.set()
+            assert self.go.wait(5.0)
+            if self.after_claim is not None:
+                until = time.monotonic() + 5.0
+                while not self.after_claim._stopped and time.monotonic() < until:
+                    threading.Event().wait(0.001)
+            for timeout in self.inner:
+                self.results.append(self._measured_shutdown(timeout))
+            self.inner_done.set()
+            if self.wedge:
+                self.release.wait(30.0)
+        if self.fail:
+            raise RuntimeError("down")
+        with self._lock:
+            self.delivered.extend(batch)
+
+    def _measured_shutdown(self, timeout: float) -> tuple[float, float, str | None, int]:
+        """Runs one `shutdown()` on this thread and reports what it cost and did."""
+        cpu = time.process_time()
+        wall = time.monotonic()
+        raised: str | None = None
+        try:
+            log_foundry.shutdown(timeout=timeout)
+        except BaseException as exc:
+            raised = type(exc).__name__
+        return time.monotonic() - wall, time.process_time() - cpu, raised, self.closes
+
+    def close(self) -> None:
+        """Counts the close."""
+        with self._lock:
+            self.closes += 1
+
+
+def _reentrant(sink: _ReentrantSink, *, queued: int = 0) -> Worker:
+    """Installs a `batch_size=1` worker over `sink`, starts its first emit, queues `queued` spans.
+
+    The queued spans carry 2 events each and are queued before `go` is set, so they are behind
+    the emit when its `shutdown()` runs.
+    """
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)  # type: ignore[arg-type]
+    install_worker(worker)
+    if queued:
+        sink.go.clear()
+    worker.submit(_span(0))
+    assert sink.in_emit.wait(5.0), "the premise: the drain thread is inside the first emit"
+    for n in range(queued):
+        worker.submit(_span(n + 1, events=2))
+    sink.go.set()
+    return worker
+
+
+def _inner_result(sink: _ReentrantSink, index: int = 0) -> tuple[float, float, str | None, int]:
+    """Waits for the drain-thread calls to finish and returns one of their measurements."""
+    assert sink.inner_done.wait(5.0), "the drain-thread shutdown() never returned"
+    return sink.results[index]
+
+
+def test_a_shutdown_inside_emit_returns_and_the_queue_is_delivered(capsys) -> None:
+    """FR-006 AC-1. The first caller on the drain thread neither joins itself nor raises.
+
+    At `fda134a` this call raised `RuntimeError` ("cannot join current thread") out of a
+    public call documented to raise nothing.
+    """
+    sink = _ReentrantSink((5.0,))
+    worker = _reentrant(sink, queued=1)
+    try:
+        elapsed, spent, raised, _ = _inner_result(sink)
+        worker._thread.join(5.0)
+        assert raised is None, f"shutdown() inside emit raised {raised}"
+        assert elapsed < 0.5 and spent < _CPU_BOUND, (elapsed, spent)
+        assert worker._exit_deadline is not None, "the drain-thread caller recorded its deadline"
+        assert not worker._thread.is_alive(), "the drain ended once the emit returned"
+        assert "shutdown timed out" not in capsys.readouterr().err
+        assert worker.stopped_reason is None, "nothing timed out"
+        assert len(sink.delivered) == 3, "the batch and the span queued behind it"
+    finally:
+        sink.release.set()
+        retire_process(worker, 3.0)
+
+
+def test_a_shutdown_inside_a_failing_emit_leaves_every_event_counted(capsys) -> None:
+    """FR-006 AC-2, a regression pin. The batch and the queue are counted by the normal lines.
+
+    Against a drain-thread branch that discards the queue before returning — replacing
+    `self._queue`, as the fork repair does — the 2 queued events vanish uncounted.
+    """
+    sink = _ReentrantSink((5.0,), fail=True)
+    worker = _reentrant(sink, queued=1)
+    try:
+        _inner_result(sink)
+        worker._thread.join(5.0)
+        err = capsys.readouterr().err
+        assert sum(n for n, _, _ in _lost_lines(err)) == 3, err
+        assert worker.failed_batches == 2
+    finally:
+        retire_process(worker, 3.0)
+
+
+@pytest.mark.parametrize("order", ["before_thread_ends", "after_thread_ends"])
+def test_a_shutdown_inside_emit_never_closes_the_sink_it_is_inside(order: str) -> None:
+    """FR-006 AC-3, a regression pin. The closer leaves a sink its own thread is inside.
+
+    Against `may_be_inside` answering `False` for the calling thread, the drain-thread call's
+    closer closes the sink inline from inside its own `emit`. A later call from another thread
+    then closes it exactly once, whether it runs while the drain thread is still alive — it
+    takes the owed join over, the gate is released, and the thread ends inside its budget — or
+    after the thread has ended.
+    """
+    sink = _ReentrantSink((5.0,), wedge=order == "before_thread_ends")
+    worker = _reentrant(sink)
+    try:
+        _, _, raised, closes_at_return = _inner_result(sink)
+        assert raised is None
+        assert closes_at_return == 0, "the inner call closed the sink it was inside"
+        if order == "before_thread_ends":
+            main = _MeasuredThread(lambda: _lifecycle._shutdown_worker(3.0), name="main")
+            main.start()
+            until = time.monotonic() + 5.0
+            while worker._join_owed and time.monotonic() < until:
+                threading.Event().wait(0.001)
+            assert not worker._join_owed, "the main call took the owed join over"
+            sink.release.set()
+            main.finish(3.0 + _SLACK)
+        else:
+            worker._thread.join(5.0)
+            assert not worker._thread.is_alive()
+            retire_process(worker, 3.0)
+        assert sink.closes == 1, f"closed {sink.closes} times"
+        retire_process(worker, 1.0)
+        assert sink.closes == 1, "and a further call leaves the count at 1"
+    finally:
+        sink.release.set()
+
+
+def _handed_over(capsys, sink: _ReentrantSink) -> tuple[Worker, float, float, float]:
+    """Wedges after a drain-thread `shutdown()`, then runs a main-thread `shutdown(0.5)`.
+
+    Returns the worker, the main call's wall time and the instants it was called and returned.
+    """
+    worker = _reentrant(sink)
+    _inner_result(sink)
+    capsys.readouterr()
+    called = time.monotonic()
+    elapsed = _measured(lambda: _lifecycle._shutdown_worker(0.5))
+    return worker, elapsed, called, time.monotonic()
+
+
+def test_a_wedge_after_a_drain_thread_shutdown_is_announced_by_the_next_caller(capsys) -> None:
+    """FR-006 AC-4. The join the drain thread could not make is made by the next caller.
+
+    Without the handover the main call waits out its budget on `_drain_settled` and writes
+    nothing; under `atexit` that was a 30.12 s exit with no line and no close.
+    """
+    sink = _ReentrantSink((5.0,), wedge=True)
+    try:
+        worker, elapsed, called, returned = _handed_over(capsys, sink)
+        err = capsys.readouterr().err
+        assert elapsed < 0.5 + _SLACK, f"the main call took {elapsed:.2f}s"
+        assert err.count("shutdown timed out after 0.5s") == 1, err
+        assert worker.stopped_reason == "ShutdownTimeout"
+        recorded = worker._exit_deadline
+        assert recorded is not None and called + 0.5 <= recorded <= returned + 0.5, (
+            "the deadline is the main caller's, not the drain-thread caller's"
+        )
+        assert sink.closes == 0, "the drain thread is still inside the sink"
+    finally:
+        sink.release.set()
+
+
+def test_only_one_caller_takes_the_owed_join_over(capsys) -> None:
+    """FR-006 AC-5. Once taken, the owed join is gone, and a third caller loses as before.
+
+    Against a handover that leaves `_join_owed` set, the third call takes the gate over again,
+    joins for its whole 3 s and writes a second line.
+    """
+    sink = _ReentrantSink((5.0,), wedge=True)
+    try:
+        _handed_over(capsys, sink)
+        capsys.readouterr()
+        elapsed = _measured(lambda: _lifecycle._shutdown_worker(3.0))
+        assert elapsed < 0.1, f"the third call took {elapsed:.2f}s"
+        assert capsys.readouterr().err == "", "and wrote nothing"
+    finally:
+        sink.release.set()
+
+
+def test_a_second_drain_thread_shutdown_does_not_take_the_owed_join(capsys) -> None:
+    """FR-006 AC-6. A loser on the drain thread returns, and the join stays owed.
+
+    Against a drain-thread loser that clears `_join_owed`, the main call loses too, waits out
+    its budget on `_drain_settled` and writes nothing.
+    """
+    sink = _ReentrantSink((5.0, 5.0), wedge=True)
+    try:
+        worker = _reentrant(sink)
+        elapsed, spent, raised, _ = _inner_result(sink, 1)
+        assert raised is None and elapsed < 0.1 and spent < _CPU_BOUND, (elapsed, spent, raised)
+        assert worker._join_owed, "the second drain-thread call left the join owed"
+        capsys.readouterr()
+
+        called = time.monotonic()
+        _measured(lambda: _lifecycle._shutdown_worker(0.5))
+        returned = time.monotonic()
+        assert capsys.readouterr().err.count("shutdown timed out after 0.5s") == 1
+        recorded = worker._exit_deadline
+        assert recorded is not None and called + 0.5 <= recorded <= returned + 0.5
+    finally:
+        sink.release.set()
+
+
+@pytest.mark.parametrize(("main_timeout", "inner_timeout"), [(3.0, 1.0), (1.0, 5.0)])
+def test_a_drain_thread_shutdown_that_loses_returns_at_once(
+    main_timeout: float, inner_timeout: float, capsys
+) -> None:
+    """FR-006 AC-7 and AC-8. A loser on the drain thread never waits on its own thread.
+
+    The main call is joining; the sink's `emit` waits until that claim is visible and only then
+    calls `shutdown()`, so the inner call provably loses. At `fda134a` it waited on
+    `_drain_settled`, which only this thread's exit or the main call's expiry could set: with
+    budgets 3.0 and 1.0 it blocked 1.01 s, and with 1.0 and 5.0 it made the main join expire.
+    """
+    sink = _ReentrantSink((inner_timeout,))
+    sink.go.clear()
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)  # type: ignore[arg-type]
+    install_worker(worker)
+    sink.after_claim = worker
+    worker.submit(_span(0))
+    assert sink.in_emit.wait(5.0)
+    sink.go.set()
+
+    called = time.monotonic()
+    main = _MeasuredThread(lambda: _lifecycle._shutdown_worker(main_timeout), name="main")
+    main.start()
+    elapsed = main.finish(main_timeout + _SLACK + 1.0)
+    returned = time.monotonic()
+
+    took, spent, raised, _ = _inner_result(sink)
+    assert raised is None and took < 0.1 and spent < _CPU_BOUND, (took, spent, raised)
+    recorded = worker._exit_deadline
+    assert recorded is not None, "the premise"
+    assert called + main_timeout <= recorded <= returned + main_timeout, (
+        "the premise: the main caller won the gate, so the inner call lost"
+    )
+    assert elapsed < main_timeout + _SLACK, f"the main call took {elapsed:.2f}s"
+    assert worker.stopped_reason is None, "the main join did not expire"
+    assert "shutdown timed out" not in capsys.readouterr().err
+    assert sink.closes == 1, f"closed {sink.closes} times"
+
+
+def test_the_owed_join_is_taken_over_once_by_concurrent_callers(capsys) -> None:
+    """FR-006, the single-use handover under contention, through the `shutdown()` route.
+
+    After a drain-thread win and a wedge, two `shutdown(0.3)` calls start together. Exactly one
+    takes the owed join over, joins and announces; the other loses. The recorded deadline is one
+    of the two callers', bracketed by its own call and return.
+    """
+    sink = _ReentrantSink((5.0,), wedge=True)
+    spans: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    def work(_index: int, _iteration: int) -> None:
+        called = time.monotonic()
+        _lifecycle._shutdown_worker(0.3)
+        with lock:
+            spans.append((called, time.monotonic()))
+
+    try:
+        worker = _reentrant(sink)
+        _inner_result(sink)
+        capsys.readouterr()
+        errors = run_concurrently(work, threads=2)
+        assert not errors, errors
+        assert _expiry_lines(capsys.readouterr().err) == 1
+        recorded = worker._exit_deadline
+        assert recorded is not None
+        assert any(c + 0.3 <= recorded <= r + 0.3 for c, r in spans), (recorded, spans)
+        assert not worker._join_owed
+    finally:
+        sink.release.set()
+
+
+class _RendezvousLock:
+    """Wraps a worker's `_lock` so the first acquisition by each of two stoppers waits for both.
+
+    Each stopper has necessarily done everything `claim_stop` does before its lock by the time
+    it arrives here, so a decision read outside the lock is read by both before either can
+    change it. That is the interleaving `run_concurrently` reaches only by chance.
+    """
+
+    def __init__(self, inner: threading.Lock) -> None:
+        self.inner = inner
+        self.barrier = threading.Barrier(2, timeout=5.0)
+        self.seen: set[str] = set()
+
+    def __enter__(self) -> bool:
+        name = threading.current_thread().name
+        if name.startswith("stopper") and name not in self.seen:
+            self.seen.add(name)
+            self.barrier.wait()
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc: object) -> None:
+        self.inner.__exit__(*exc)
+
+
+def test_the_owed_join_is_taken_over_once_when_both_claims_meet_at_the_lock(capsys) -> None:
+    """FR-006, the single-use handover with both claims forced to meet at `Worker._lock`.
+
+    `_shutdown_worker` claims under the owner's lock, which serializes two `shutdown()` calls
+    before `Worker._lock` is reached; two direct `stop()` calls claim under no outer lock. Both
+    are held at the lock until both have arrived. Against a handover decided on a read of
+    `_join_owed` taken outside the lock, both take the gate over, both join, and the wedge is
+    announced twice.
+    """
+    sink = _ReentrantSink((5.0,), wedge=True)
+    try:
+        worker = _reentrant(sink)
+        _inner_result(sink)
+        capsys.readouterr()
+        worker._lock = _RendezvousLock(worker._lock)  # type: ignore[assignment]
+        stoppers = [
+            threading.Thread(target=worker.stop, args=(0.3,), name=f"stopper-{i}") for i in (0, 1)
+        ]
+        for thread in stoppers:
+            thread.start()
+        for thread in stoppers:
+            thread.join(5.0)
+        assert not any(thread.is_alive() for thread in stoppers)
+        assert _expiry_lines(capsys.readouterr().err) == 1
+        assert not worker._join_owed
+    finally:
+        sink.release.set()

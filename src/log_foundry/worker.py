@@ -365,7 +365,12 @@ class Worker:
         whose deadline the drain declines against — and cleared only by
         :meth:`_reinit_after_fork` where that method starts a drain thread. Until a stop is
         claimed it is ``None``, which declines nothing, so ordinary draining, ``flush()`` and a
-        swap retry exactly as before. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
+        swap retry exactly as before. It has one other writer: a caller that takes over a join the
+        drain thread owed replaces the drain-thread caller's deadline with its own (SPEC-068
+        FR-006). ``_join_owed`` records that debt — ``True`` only between a stop claimed **on**
+        the drain thread, which cannot join itself, and the next caller off it, which takes the
+        gate over. It is written under ``_lock`` by :meth:`claim_stop` and reset with
+        ``_stopped`` where :meth:`_reinit_after_fork` starts a drain thread. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
         before its first attempt until it returns, so an expired join can say how many events
         are inside the emit it gave up waiting on (FR-005). It is written by the drain thread
         and read without the lock by the stopper, as :attr:`draining` is read: a single
@@ -418,6 +423,7 @@ class Worker:
         self._drain_settled = threading.Event()
         self._stopped = False
         self._exit_deadline: float | None = None
+        self._join_owed = False
         self._in_flight = 0
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
@@ -1135,6 +1141,27 @@ class Worker:
         write-once across concurrent stoppers without a second flag. Only
         :meth:`_reinit_after_fork` writes it otherwise, clearing it for a child that resumes.
 
+        **One exception: a join is owed** (SPEC-068 FR-006). A sink's ``emit`` can call
+        ``shutdown()``, and then the caller is the drain thread, which cannot join itself. When
+        that caller wins, the same critical section records ``_join_owed``, and :meth:`stop`
+        returns without joining. The next caller **not** on the drain thread then takes the gate
+        over here: it clears ``_join_owed``, records **its own** deadline in place of the
+        drain-thread caller's, and returns ``True``, so it does the first caller's whole work —
+        the join, and on expiry the line. That keeps SPEC-062's rule that the caller whose timeout
+        the join uses is the caller whose deadline the drain declines against, because the
+        drain-thread caller never joins. It does not re-open a retry a joining caller's deadline
+        declined, because no join has run yet; and it happens once, because the flag is cleared
+        in the decision that takes it, so every later caller loses as before. Without it, an emit
+        that wedged after the drain-thread call was announced by nobody, and every later caller,
+        ``atexit`` included, spent its whole budget waiting in silence — measured as a 30.12 s
+        exit with no line and no close. A losing caller on the drain thread never takes the owed
+        join over: it is the one thread that cannot perform it.
+
+        Whether this caller is the drain thread is read **before** the lock, so the lock is still
+        held across no call. In a forked child, ``self._thread`` names the inherited dead thread
+        for an instant after the new one starts; :meth:`_reinit_after_fork` says why no caller
+        can be on the new thread inside that instant.
+
         It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
         order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
         nesting ``_state._lock`` then ``Worker._lock`` is the order the closer already
@@ -1145,17 +1172,24 @@ class Worker:
             an unbounded stop.
 
         Returns:
-          Whether this caller won the gate. ``True`` means it must do the first caller's work
-          in :meth:`stop`; ``False`` means a stop is already under way and its deadline stands.
+          Whether this caller won the gate or took an owed join over. ``True`` means it must do
+          the first caller's work in :meth:`stop`; ``False`` means a stop is already under way
+          and its deadline stands.
 
         Raises:
           None.
         """
+        on_drain_thread = threading.current_thread() is self._thread
         with self._lock:
             if self._stopped:
-                return False
+                if not self._join_owed or on_drain_thread:
+                    return False
+                self._join_owed = False
+                self._exit_deadline = deadline
+                return True
             self._stopped = True
             self._exit_deadline = deadline
+            self._join_owed = on_drain_thread
             return True
 
     def stop(
@@ -1183,6 +1217,19 @@ class Worker:
         ``_drain_settled`` instead was tried and is wrong: two concurrent first callers both see it
         clear, both run the expiry branch, and a wedged sink produces two "shutdown timed out"
         lines with ``queued`` counted twice.
+
+        **On the drain thread itself it never joins and never waits** (SPEC-068 FR-006). A sink's
+        ``emit`` that calls ``shutdown()`` makes the drain thread the caller, and at ``fda134a`` a
+        first caller there raised ``RuntimeError`` out of ``Thread.join`` while a losing one waited
+        on ``_drain_settled``, which only this same thread's exit or another caller's expiry can
+        set. As the first caller it queues the sentinel unless the drain has finished, sets the
+        stop event and returns: :meth:`claim_stop` has recorded that a join is owed, and the next
+        caller off this thread takes it over. It writes no expiry line and sets no
+        ``stopped_reason``, because nothing has timed out, and it calls no
+        :meth:`_release_waiters`, because this thread's own exit sweeps the markers in
+        :meth:`_run`'s ``finally``. As a losing caller it returns at once. The drain ends once the
+        current emit returns, through :meth:`_drain`'s stop check and :meth:`_final_drain`, as for
+        any stop.
 
         **The claim is made before any stop event this worker holds is set**, on both routes.
         :func:`_lifecycle._shutdown_worker` claims for a live worker inside the critical section
@@ -1218,8 +1265,11 @@ class Worker:
           None.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        on_drain_thread = threading.current_thread() is self._thread
         first = self.claim_stop(deadline) if claimed is None else claimed
         if not first:
+            if on_drain_thread:
+                return
             if self.draining:
                 self._drain_settled.wait(
                     None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -1231,6 +1281,8 @@ class Worker:
             except queue.Full:
                 pass
         self._stop.set()
+        if on_drain_thread:
+            return
         self._thread.join(timeout)
         if self._thread.is_alive():
             queued = self._queued_submissions()
