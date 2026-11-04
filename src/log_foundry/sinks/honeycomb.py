@@ -14,6 +14,7 @@ from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
     _holds_at,
+    _holds_delimiter,
     _Item,
     _started_request,
     _valid_base_url,
@@ -29,14 +30,6 @@ _SEGMENT_BREAKERS = "/?#\\"
 _DOT_SEGMENTS = (".", "..")
 """The two segments a normalizing hop removes from a path (RFC 3986 §5.2.4)."""
 
-_UNQUOTABLE = "/?#"
-"""What keeps a refused dataset from being quoted, since it would land outside the segment.
-
-``d?api_key=…`` is a query, which is where a credential sits; an ``@`` in any form
-:func:`~log_foundry.sinks.http._holds_at` reads is unquotable too, since what precedes one may be
-a password.
-"""
-
 _DATASET_BASE = "http://localhost/1/batch/"
 """A fixed base the dataset is checked under, so a refusal is about the dataset and nothing else."""
 
@@ -44,17 +37,23 @@ _DATASET_BASE = "http://localhost/1/batch/"
 def _shown(dataset: str) -> str:
     """Returns how a refusal ends: quoting the dataset, or saying why it does not.
 
+    A ``/``, ``?`` or ``#`` would land outside the dataset's segment — ``d?api_key=…`` is a query,
+    which is where a credential sits — and what precedes an ``@`` may be a password. Each is read
+    in every form :func:`~log_foundry.sinks.http._holds_at` and
+    :func:`~log_foundry.sinks.http._holds_delimiter` read, so a fullwidth ``＃`` (``d＃SECRET``)
+    or a ``%3F`` hides what follows it too.
+
     Args:
       dataset: The dataset as the caller gave it.
 
     Returns:
-      ``: '<dataset>'``, or fixed text when it holds an ``@`` (:func:`_holds_at`) or any of
-      :data:`_UNQUOTABLE`.
+      ``: '<dataset>'``, or fixed text when it holds an ``@``, ``/``, ``?`` or ``#`` in any of
+      those forms.
 
     Raises:
       None.
     """
-    if _holds_at(dataset) or any(c in dataset for c in _UNQUOTABLE):
+    if _holds_at(dataset) or _holds_delimiter(dataset):
         return "; the dataset is not quoted, since it holds an '@', '/', '?' or '#'"
     return f": {dataset!r}"
 
@@ -140,8 +139,8 @@ def _one_segment(dataset: str, owner: str) -> None:
     RFC 3986 §6.2.2.2 and the WHATWG parser decode before removing it. An empty dataset, or one
     that is only whitespace, names no dataset at all. None of these could be relied on to reach
     the dataset named, so each is refused rather than encoded, and none of them goes anywhere new.
-    The refusal quotes the dataset unless it holds an ``@``, ``/``, ``?`` or ``#``
-    (:data:`_UNQUOTABLE`).
+    The refusal quotes the dataset unless it holds an ``@``, ``/``, ``?`` or ``#`` in any form
+    (:func:`_shown`).
 
     What stays is what delivered as written: ``%`` escapes, which are how a caller names a
     dataset ``http.client`` cannot carry raw; the sub-delimiters and ``:``, which ``urllib`` and

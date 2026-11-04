@@ -285,15 +285,21 @@ what a refusal quotes: the scheme group mirrors ``urllib``'s ``_splittype`` and 
 after the key. A refusal quotes :data:`_QUOTABLE_HEAD` instead.
 """
 
-_QUOTABLE_HEAD = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*")
+_QUOTABLE_HEAD = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://([^/?#]*)")
 """A URL's scheme, its ``//`` and its host, at the very start of it: what a refusal may quote.
 
 The scheme is RFC 3986's characters, so no ``?``, ``#``, ``%`` or ``:`` is read as part of one, and
-the host runs to the first ``/``, ``?`` or ``#``, the delimiters ``urlsplit`` and ``_splithost``
-both end it at. It is matched with nothing stripped first: a URL that starts with anything else —
-a control character, a tab inside ``http:\\t//`` — has no host this can tell apart, and is not
-quoted at all.
+the host — the group — runs to the first ``/``, ``?`` or ``#``, the delimiters ``urlsplit`` and
+``_splithost`` both end it at. Those are ASCII only, so a host run holding a delimiter in another
+form — a fullwidth question mark, number sign or solidus, which CJK input methods type and NFKC
+turns into the ASCII one, or a percent-encoded one — may run past where a reader ends the host,
+and is not quoted (:func:`_holds_delimiter`). It is matched with nothing stripped first: a URL
+that starts with anything else — a control character, a tab inside ``http:\\t//`` — has no host
+this can tell apart, and is not quoted at all.
 """
+
+_URL_DELIMITERS = "/?#"
+"""What ends a URL's host and starts its path, query or fragment."""
 
 
 def _started_request(host: str, method: str, selector: str) -> http.client.HTTPConnection:
@@ -370,6 +376,29 @@ def _holds_at(text: str) -> bool:
     )
 
 
+def _holds_delimiter(text: str) -> bool:
+    """Says whether text holds a ``/``, ``?`` or ``#`` as written, unquoted once, or under NFKC.
+
+    The same four forms :func:`_holds_at` reads, for the same reason: a reader that normalizes or
+    decodes before it splits ends a host at a delimiter the ASCII text does not show, and
+    ``urlsplit`` refuses a netloc NFKC turns into one, quoting it.
+
+    Args:
+      text: The text to test — a host run, a Datadog site or a Honeycomb dataset.
+
+    Returns:
+      ``True`` if any of the four forms contains one of :data:`_URL_DELIMITERS`.
+
+    Raises:
+      None.
+    """
+    return any(
+        char in form or char in unicodedata.normalize("NFKC", form)
+        for form in (text, unquote(text))
+        for char in _URL_DELIMITERS
+    )
+
+
 def _quotable_head(url: str) -> str | None:
     """Returns the URL's scheme and host as a refusal may quote them, or ``None`` if it may not.
 
@@ -379,19 +408,24 @@ def _quotable_head(url: str) -> str | None:
     and either can end a password whose ``#``, ``?`` or ``/`` ended the host early:
     ``http://elastic:pa#ss%40es:9200/x`` has the head ``http://elastic:pa``, which is the user
     and the start of the password. Testing only the head would quote them; testing the whole URL
-    quotes nothing whenever one may be there.
+    quotes nothing whenever one may be there. A host run holding a delimiter in any form
+    :func:`_holds_delimiter` reads has no quotable head either, since the host may end inside it:
+    ``https://es.example.com？api_key=SECRET/x`` has the ASCII host run
+    ``es.example.com？api_key=SECRET``, and ``http://h＃SECRET``, all head, was quoted whole with
+    ``urlsplit``'s reason chained, which quotes the netloc.
 
     Args:
       url: The URL as ``urllib`` unwraps it.
 
     Returns:
-      The head, or ``None`` when the URL does not start with one or holds an ``@`` anywhere.
+      The head, or ``None`` when the URL does not start with one, holds an ``@`` anywhere, or its
+      host run holds a delimiter in any form.
 
     Raises:
       None.
     """
     found = _QUOTABLE_HEAD.match(url)
-    if found is None or _holds_at(url):
+    if found is None or _holds_at(url) or _holds_delimiter(found.group(1)):
         return None
     return found.group()
 

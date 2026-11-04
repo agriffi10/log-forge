@@ -573,6 +573,12 @@ _FULLWIDTH_HASH = chr(0xFF03)
 _FULLWIDTH_AT = chr(0xFF20)
 """A character NFKC turns into ``@``."""
 
+_FULLWIDTH_QUESTION = chr(0xFF1F)
+"""A character NFKC turns into ``?``, which CJK input methods type routinely."""
+
+_FULLWIDTH_SOLIDUS = chr(0xFF0F)
+"""A character NFKC turns into ``/``."""
+
 
 def _assert_never_echoes(exc: BaseException, *secrets: str) -> None:
     """No secret in the exception or in anything reachable through ``__cause__``/``__context__``.
@@ -1095,10 +1101,35 @@ def test_a_refused_url_holding_an_at_sign_in_any_form_is_not_quoted(url: str, re
     _assert_printable(caught.value)
 
 
+_DELIMITER_IN_HOST = [
+    (f"https://h{_FULLWIDTH_QUESTION}token=SECRET/x", "is not a URL"),
+    (f"https://es.example.com{_FULLWIDTH_QUESTION}api_key=SECRET/x", "is not a URL"),
+    (f"http://h{_FULLWIDTH_HASH}SECRET", "is not a URL"),
+    (f"http://h{_FULLWIDTH_SOLIDUS}SECRET", "is not a URL"),
+    ("http://h%3FSECRET:x/y", "cannot be sent over HTTP"),
+]
+"""Refused URLs whose ASCII host run holds a delimiter in another form, so a reader that normalizes
+or decodes ends the host inside it. The fullwidth-``#`` one is all head, so it was quoted
+whole with ``urlsplit``'s reason chained, and that reason quotes the netloc."""
+
+
+@pytest.mark.parametrize(("url", "reason"), _DELIMITER_IN_HOST)
+def test_a_refused_url_whose_host_run_holds_a_delimiter_in_any_form_is_not_quoted(
+    url: str, reason: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"^HTTPSink url {reason}{re.escape(_UNQUOTED)}$") as e:
+        HTTPSink(url)
+
+    _assert_never_echoes(e.value, "SECRET", "token", "api_key", "es.example")
+    _assert_chains_nothing(e.value)
+
+
 @pytest.mark.parametrize(
     ("url", "head"),
     [
         ("http://h/x", "http://h"),
+        (f"http://h{_FULLWIDTH_HASH}x", None),
+        ("http://h%23x/y", None),
         ("http://elastic:pa#ss%40es:9200/x", None),
         ("http://h/x#a%40b", None),
         ("HTTPS://h:9200?x", "HTTPS://h:9200"),
@@ -1148,6 +1179,9 @@ _UNQUOTED_SITE = "; the site is not quoted, since it holds an '@', '/', '?' or '
         "datadoghq.com?api_key=USERX",
         "datadoghq.com#USERX",
         "us5/USERX.datadoghq.com",
+        f"datadoghq.com{_FULLWIDTH_HASH}USERX",
+        f"datadoghq.com{_FULLWIDTH_QUESTION}api_key=USERX",
+        "datadoghq.com%3FUSERX",
     ],
 )
 def test_a_datadog_site_holding_an_at_sign_or_a_delimiter_is_refused_unquoted(site: str) -> None:

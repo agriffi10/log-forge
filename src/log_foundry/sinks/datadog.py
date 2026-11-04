@@ -10,6 +10,7 @@ from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
     _holds_at,
+    _holds_delimiter,
     _refuse_userinfo,
     _valid_url,
     merge_headers,
@@ -30,16 +31,10 @@ the path, ``?`` and ``/`` moved it, ``@`` put the batch on a host with an ``@`` 
 resolves nowhere, and ``""``, ``..`` and ``%2e`` named no host Datadog serves. An ``@`` that makes
 userinfo of what precedes it is refused before this pattern is consulted, because this pattern's
 refusal echoes ``site``, and userinfo may hold a password; a ``site`` holding an ``@`` anywhere
-else, or a ``/``, ``?`` or ``#``, is refused by this pattern without being quoted
-(:data:`_UNQUOTABLE`). A port and a trailing dot are refused with them, as not a Datadog site,
-though either reached the intake.
-"""
-
-_UNQUOTABLE = "/?#"
-"""What would land outside the intake host, where a credential may sit: ``?api_key=…``.
-
-An ``@`` in any form :func:`~log_foundry.sinks.http._holds_at` reads is unquotable too, since what
-precedes one may be a password.
+else, or a ``/``, ``?`` or ``#`` — fullwidth or percent-encoded ones included, which a reader
+that normalizes or decodes ends a host at (:func:`~log_foundry.sinks.http._holds_delimiter`) — is
+refused by this pattern without being quoted. A port and a trailing dot are refused with them, as
+not a Datadog site, though either reached the intake.
 """
 
 
@@ -114,7 +109,7 @@ class DatadogSink(HTTPSink):
         )
         if not _SITE.fullmatch(site):
             shown = f": {site!r}"
-            if _holds_at(site) or any(char in site for char in _UNQUOTABLE):
+            if _holds_at(site) or _holds_delimiter(site):
                 shown = "; the site is not quoted, since it holds an '@', '/', '?' or '#'"
             raise ValueError(
                 f"{type(self).__name__} site must be a Datadog site's host name, such as "

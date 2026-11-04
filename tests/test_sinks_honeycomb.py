@@ -348,6 +348,23 @@ def test_an_uncarried_dataset_holding_an_encoded_at_sign_is_not_quoted(
     _assert_chains_nothing(caught.value)
 
 
+@pytest.mark.parametrize("dataset", ["d\uff03SECRET", "d\uff1fapi_key=SECRET", "d\uff0fSECRET"])
+def test_an_uncarried_dataset_holding_a_fullwidth_delimiter_is_not_quoted(dataset: str) -> None:
+    """NFKC turns these into ``#``, ``?`` and ``/``, so what follows is hidden, as for ASCII."""
+    with pytest.raises(
+        ValueError,
+        match=r"^HoneycombSink dataset cannot be carried in a request path "
+        r"\(UnicodeEncodeError\); ",
+    ) as caught:
+        HoneycombSink(_KEY, dataset)
+
+    assert str(caught.value).endswith(
+        "; the dataset is not quoted, since it holds an '@', '/', '?' or '#'"
+    )
+    _assert_never_echoes(caught.value, "SECRET", "api_key", _KEY, "localhost")
+    _assert_chains_nothing(caught.value)
+
+
 @pytest.mark.parametrize("dataset", ["d?api_key=SECRET", "d#SECRET", "SECRET/d", "a@SECRET/d"])
 def test_a_refused_dataset_holding_a_delimiter_or_an_at_sign_is_not_quoted(dataset: str) -> None:
     with pytest.raises(
