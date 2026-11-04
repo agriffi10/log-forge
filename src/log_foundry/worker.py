@@ -1268,22 +1268,22 @@ class Worker:
         lines with ``queued`` counted twice.
 
         **On the drain thread itself it never joins or waits on that thread** (SPEC-068 FR-006).
-        A sink's
-        ``emit`` that calls ``shutdown()`` makes the drain thread the caller, and at ``fda134a`` a
-        first caller there raised ``RuntimeError`` out of ``Thread.join`` while a losing one waited
-        on ``_drain_settled``, which only this same thread's exit or another caller's expiry can
-        set. As the first caller it queues the sentinel unless the drain has finished, sets the
-        stop event and returns: :meth:`claim_stop` has recorded that a join is owed, and the next
-        caller off this thread takes it over — doing the first caller's work except the sentinel,
-        which is already queued and a second copy of which can strand behind the final drain
-        (``_join_taken_over``, :meth:`claim_stop`). It writes no expiry line and sets no
-        ``stopped_reason``, because nothing has timed out, and it calls no
+        A bad ``timeout`` never reaches this far: the public ``shutdown()`` refuses it at entry
+        (SPEC-066), before anything is claimed, on the drain thread as anywhere — invariant 13's
+        refusal where the argument is written. A sink's ``emit`` that calls ``shutdown()`` makes the
+        drain thread the caller, and at ``fda134a`` a first caller there raised ``RuntimeError`` out
+        of ``Thread.join`` while a losing one waited on ``_drain_settled``, which only this same
+        thread's exit or another caller's expiry can set. As the first caller it queues the sentinel
+        unless the drain has finished, sets the stop event and returns: :meth:`claim_stop` has
+        recorded that a join is owed, and the next caller off this thread takes it over — doing the
+        first caller's work except the sentinel, which is already queued and a second copy of which
+        can strand behind the final drain (``_join_taken_over``, :meth:`claim_stop`). It writes no
+        expiry line and sets no ``stopped_reason``, because nothing has timed out, and it calls no
         :meth:`_release_waiters`, because this thread's own exit sweeps the markers in
         :meth:`_run`'s ``finally``. As a losing caller it returns without waiting on
-        ``_drain_settled``. What the rest of ``shutdown()`` does on that thread — the closer and
-        its grace — is the lifecycle owner's and unchanged. The drain ends once the
-        current emit returns, through :meth:`_drain`'s stop check and :meth:`_final_drain`, as for
-        any stop.
+        ``_drain_settled``. What the rest of ``shutdown()`` does on that thread — the closer and its
+        grace — is the lifecycle owner's and unchanged. The drain ends once the current emit
+        returns, through :meth:`_drain`'s stop check and :meth:`_final_drain`, as for any stop.
 
         **The claim is made before any stop event this worker holds is set**, on both routes.
         :func:`_lifecycle._shutdown_worker` claims for a live worker inside the critical section

@@ -182,7 +182,9 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         inside ``emit``. ``inf``, or any value above ``threading.TIMEOUT_MAX``, waits as ``None``
         does (SPEC-066 FR-004); zero or a negative does not wait. A bad ``timeout`` is refused at
         entry, before the process is retired or anything is drained, so a retry with a good
-        value works. Called from inside a sink's ``emit`` with a valid ``timeout``, it never
+        value works — from inside a sink's ``emit`` as anywhere, where it raises into that
+        ``emit`` and nothing is claimed. Called from inside a sink's ``emit`` with a valid
+        ``timeout``, it never
         waits on the worker thread and never raises: it stops the worker without joining it, the
         drain ends once that ``emit`` returns, and the next ``shutdown()`` from another thread
         joins the worker — and announces the timeout if that ``emit`` never returns (SPEC-068

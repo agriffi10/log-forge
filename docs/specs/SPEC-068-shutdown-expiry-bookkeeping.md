@@ -119,8 +119,9 @@ join uses is the caller whose deadline the drain declines against.
   `run_concurrently` and an injected preemption point (FR-004).
 - The resume branch of `_reinit_after_fork` resetting `_stopped` and the owed join, and replacing a
   set `_stop` (FR-005).
-- A `shutdown()` on the drain thread that never raises and never waits on that thread, on either
-  branch of the gate, and the owed join it hands to the next caller (FR-006).
+- A `shutdown()` on the drain thread that, given a valid `timeout`, never raises and never waits
+  on that thread, on either branch of the gate, and the owed join it hands to the next caller
+  (FR-006).
 - The prose that states the old behaviour, corrected in the same change:
   - `Worker.stop` (its losing branch is unchanged, and it gains the drain-thread case and the
     handover) and `Worker.claim_stop` (the handover);
@@ -533,6 +534,12 @@ drain thread still exits at once on the inherited set event: 0 attempts, nothing
 **The drain-thread caller.** `claim_stop` and `stop` ask `threading.current_thread() is
 self._thread`.
 
+**A bad `timeout` is refused first** (reconciled with SPEC-066 at the rebase). SPEC-066's entry
+check, `wait_budget(timeout, "timeout")` in `log_foundry.shutdown()`, runs before anything below,
+so a non-number or `nan` raises `TypeError` or `ValueError` into the sink's `emit` and nothing is
+claimed: invariant 13 refuses a bad argument where it is written, including from inside `emit`.
+"Never raises" below is said of a valid `timeout`.
+
 - **As the first caller** on the drain thread, it claims the gate and records its deadline. In the
   same critical section under `Worker._lock`, it records that a **join is owed**
   (`self._join_owed = True`). In `stop` it then queues the sentinel if the drain has not finished,
@@ -622,9 +629,15 @@ than relied on.
       way. The main call returns within 1.0 s plus slack with CPU under 0.05 s, its join does not
       expire (`stopped_reason is None`, no `shutdown timed out` line), and `close()` is called once.
       At `fda134a` the inner wait made that join expire (measured).
-- [ ] Serves invariants 1, 2 and 3: the call raises nothing, the batch and the queue are delivered
-      or counted once by the normal lines, no wait is spent on a thread that cannot end while it
-      waits, and a wedge after the call is still bounded and announced by the caller that joins.
+- [ ] **A bad `timeout` inside `emit` is refused and claims nothing.** A sink's `emit` that calls
+      `log_foundry.shutdown(float("nan"))`, or `shutdown("5")`, gets `ValueError` or `TypeError`
+      respectively inside the `emit`; afterwards `worker._stopped` is false, no `_SHUTDOWN` is
+      queued and `stopped_reason` is `None`, and a later valid `shutdown()` from the main thread
+      stops the worker and closes the sink once. Serves invariant 13.
+- [ ] Serves invariants 1, 2 and 3: with a valid `timeout` the call raises nothing, the batch and
+      the queue are delivered or counted once by the normal lines, no wait is spent on a thread
+      that cannot end while it waits, and a wedge after the call is still bounded and announced by
+      the caller that joins.
 
 ---
 
@@ -663,11 +676,12 @@ Worker._reinit_after_fork(*, resume)  # resume branch adds: _stopped = False; _j
 
 No public change. `shutdown()`, `flush()`, `configure()` and `Health` keep their signatures and
 fields. What a caller can observe changing is stderr wording (FR-001, FR-002), a `shutdown()`
-inside a sink's `emit` that returns instead of raising or blocking, and a later `shutdown()` that
-then joins and announces a wedge on its behalf (FR-006). A resumed child delivering (FR-005) is
-**not** caller-visible: both of `src/`'s callers of `Worker.stop` move the retirement count first,
-so a live worker that has been stopped exists only for a caller of the internal `Worker.stop`.
-FR-005 is hardening of that internal route, and the release notes carry no entry for it.
+inside a sink's `emit` that, given a valid `timeout`, returns instead of raising or blocking, and a
+later `shutdown()` that then joins and announces a wedge on its behalf (FR-006). A resumed child
+delivering (FR-005) is **not** caller-visible: both of `src/`'s callers of `Worker.stop` move the
+retirement count first, so a live worker that has been stopped exists only for a caller of the
+internal `Worker.stop`. FR-005 is hardening of that internal route, and the release notes carry no
+entry for it.
 
 ## File & Folder Structure
 

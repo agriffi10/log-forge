@@ -788,6 +788,79 @@ def test_a_drain_thread_shutdown_that_loses_returns_at_once(
     assert sink.closes == 1, f"closed {sink.closes} times"
 
 
+class _BadTimeoutSink:
+    """A sink whose first `emit` calls `log_foundry.shutdown()` with a bad timeout, then delivers.
+
+    It records what the call raised and the worker's gate and queue as they stood right after,
+    still inside the `emit`, so the test can show the refusal claimed nothing on the drain thread.
+    """
+
+    def __init__(self, timeout: object) -> None:
+        self.timeout = timeout
+        self.worker: Worker | None = None
+        self.raised: str | None = None
+        self.stopped_after: bool | None = None
+        self.sentinel_after: bool | None = None
+        self.done = threading.Event()
+        self.delivered = 0
+        self.closes = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Calls `shutdown()` with the bad timeout on the first call, then delivers."""
+        if not self.done.is_set():
+            try:
+                log_foundry.shutdown(timeout=self.timeout)  # type: ignore[arg-type]
+            except Exception as exc:
+                self.raised = type(exc).__name__
+            worker = self.worker
+            assert worker is not None
+            self.stopped_after = worker._stopped
+            self.sentinel_after = any(
+                item is worker_mod._SHUTDOWN for item in list(worker._queue.queue)
+            )
+            self.done.set()
+        self.delivered += len(batch)
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closes += 1
+
+
+@pytest.mark.parametrize(
+    ("timeout", "expected"),
+    [pytest.param(float("nan"), "ValueError", id="nan"), pytest.param("5", "TypeError", id="str")],
+)
+def test_a_bad_timeout_inside_emit_is_refused_and_claims_nothing(
+    timeout: object, expected: str, capsys
+) -> None:
+    """FR-006 reconciled with SPEC-066: the entry check runs first, on the drain thread too.
+
+    Invariant 13 refuses a bad argument where it is written, so a `shutdown()` made inside a
+    sink's `emit` with a `nan` or a non-number raises into that `emit` before anything is
+    claimed: the gate stays open, no sentinel is queued and no `stopped_reason` is set. A later
+    valid `shutdown()` from another thread then stops the worker and closes the sink once.
+    """
+    sink = _BadTimeoutSink(timeout)
+    worker = Worker(sink, batch_size=1, flush_interval=60.0)  # type: ignore[arg-type]
+    sink.worker = worker
+    install_worker(worker)
+    worker.submit(_span(0))
+    assert sink.done.wait(5.0), "the premise: the emit made its call"
+
+    assert sink.raised == expected, f"the bad timeout raised {sink.raised} inside emit"
+    assert sink.stopped_after is False, "nothing claimed the stop gate"
+    assert sink.sentinel_after is False, "no sentinel was queued"
+    assert worker._stopped is False and worker.stopped_reason is None
+    assert worker._thread.is_alive(), "the worker is still draining"
+
+    elapsed = _measured(lambda: retire_process(worker, 3.0))
+    assert elapsed < 1.0, f"the later shutdown took {elapsed:.2f}s"
+    assert not worker._thread.is_alive()
+    assert sink.delivered == 1
+    assert sink.closes == 1
+    assert "shutdown timed out" not in capsys.readouterr().err
+
+
 class _FinalDrainGateSink:
     """A sink whose first `emit` calls `shutdown()` and returns, and whose next `emit` parks.
 

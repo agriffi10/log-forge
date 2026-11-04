@@ -11,8 +11,9 @@
   interpreter exit: `atexit`'s call does not wait on the worker thread and leaves a sink still
   inside an emit unclosed.
 - A `shutdown()` made on the drain thread (inside a sink's `emit`) never joins and never waits on
-  that thread. A drain-thread winner records `Worker._join_owed`, and the next caller off the
-  thread takes the gate over in `claim_stop` with its own deadline — once.
+  that thread. SPEC-066's entry check runs first, so a bad `timeout` there still raises into the
+  `emit` and claims nothing (invariant 13). A drain-thread winner records `Worker._join_owed`, and
+  the next caller off the thread takes the gate over in `claim_stop` with its own deadline — once.
 - `_reinit_after_fork`'s resume branch resets `_stopped` and `_join_owed` and takes its stop event
   from `refresh_stop_signal()`, so a worker stopped directly and then forked delivers in the child
   and declines retries against the child's own deadline.
