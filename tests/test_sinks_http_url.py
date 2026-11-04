@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import http.client
 import pathlib
+import re
 import urllib.parse
 import urllib.request
 
@@ -22,7 +23,12 @@ from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from log_foundry.sinks.honeycomb import HoneycombSink
-from log_foundry.sinks.http import HTTPSink, _carries_userinfo
+from log_foundry.sinks.http import (
+    HTTPSink,
+    _carries_userinfo,
+    _quotable_head,
+    _started_request,
+)
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
@@ -127,22 +133,46 @@ def test_a_url_naming_no_usable_port_is_refused(url: str) -> None:
         HTTPSink(url)
 
 
+_UNQUOTED = "; the URL is not quoted, since its host cannot be told apart from the rest of it"
+"""How a refusal of a URL with no quotable scheme-and-host head ends."""
+
+_HEAD_ONLY = (
+    "; only the scheme and host are quoted, since a path, query or fragment may hold a credential"
+)
+"""How a refusal that quotes a URL's head, with something after it, ends."""
+
+
 @pytest.mark.parametrize("url", ["http:/\t/h/x", "http:\n//h/x"])
 def test_a_host_only_urlparse_finds_is_refused(url: str) -> None:
-    """``urlparse`` drops the tab or newline and finds a host; ``urllib`` keeps it, finding none."""
-    with pytest.raises(ValueError, match=r"^HTTPSink url names no host: "):
+    """``urlparse`` drops the tab or newline and finds a host; ``urllib`` keeps it, finding none.
+
+    Neither starts with ``scheme://``, so neither has a head a refusal can quote.
+    """
+    with pytest.raises(ValueError, match=r"^HTTPSink url names no host; ") as caught:
         HTTPSink(url)
+
+    assert str(caught.value).endswith(_UNQUOTED)
 
 
 def test_a_url_urlparse_cannot_parse_is_refused_naming_the_argument() -> None:
-    with pytest.raises(ValueError, match=r"^HTTPSink url is not a URL \(Invalid IPv6 URL\)"):
+    with pytest.raises(
+        ValueError, match=r"^HTTPSink url is not a URL \(ValueError\): 'http://\[::1'; "
+    ) as caught:
         HTTPSink("http://[::1/x")
+
+    assert str(caught.value).endswith(_HEAD_ONLY)
 
 
 def test_a_scheme_only_urlparse_strips_is_refused() -> None:
-    """``urlparse`` drops a leading NUL and reads ``http``; ``urllib`` reads ``\\x00http``."""
-    with pytest.raises(ValueError, match=r"^HTTPSink url must use http or https, not '\\x00http'"):
+    """``urlparse`` drops a leading NUL and reads ``http``; ``urllib`` reads ``\\x00http``.
+
+    The NUL comes before any scheme, so there is no head to quote, and the type ``urllib`` read is
+    not named either.
+    """
+    with pytest.raises(ValueError, match=r"^HTTPSink url must use http or https; ") as caught:
         HTTPSink("\x00http://h/x")
+
+    assert str(caught.value).endswith(_UNQUOTED)
 
 
 @pytest.mark.parametrize(
@@ -543,6 +573,12 @@ _FULLWIDTH_HASH = chr(0xFF03)
 _FULLWIDTH_AT = chr(0xFF20)
 """A character NFKC turns into ``@``."""
 
+_FULLWIDTH_QUESTION = chr(0xFF1F)
+"""A character NFKC turns into ``?``, which CJK input methods type routinely."""
+
+_FULLWIDTH_SOLIDUS = chr(0xFF0F)
+"""A character NFKC turns into ``/``."""
+
 
 def _assert_never_echoes(exc: BaseException, *secrets: str) -> None:
     """No secret in the exception or in anything reachable through ``__cause__``/``__context__``.
@@ -741,19 +777,83 @@ _NOT_USERINFO = [
     "http://h/?a=%40",
     "http://h#%40",
 ]
-"""An ``@`` outside the host, and a ``%2540``, which ``urllib`` decodes once, to ``%40``."""
+"""An ``@`` outside the host, and a ``%2540``, which ``urllib`` decodes once, to ``%40``.
+
+None is userinfo, which is what the predicate is held to below; the literal ``@`` forms are refused
+anyway, by the stray-``@`` check that follows the userinfo one (:data:`_STRAY_AT`).
+"""
+
+_PERCENT_AT = [url for url in _NOT_USERINFO if "@" not in url]
+"""The forms with no literal ``@``: the ``%40`` remedy the stray-``@`` refusal names."""
+
+_STRAY_AT_MESSAGE = r"must not hold an '@' outside its host: an '@' there may be a password "
+"""The stray-``@`` refusal's text after the owner and argument."""
+
+_STRAY_AT_REMEDY = "write an '@' that belongs in a path or query as '%40'"
+"""How the stray-``@`` refusal ends."""
+
+_HOST_ENDED_EARLY = [
+    ("http://elastic:12#ss@es:9200/x", "elastic:12"),
+    ("http://elastic:12?ss@es:9200/x", "elastic:12"),
+    ("http://elastic:12/ss@es:9200/x", "elastic:12"),
+    ("http://elastic#ss@es:9200/x", "elastic"),
+    ("http://elastic:#ss@es:9200/x", "elastic:"),
+]
+"""A password holding ``#``, ``?`` or ``/``, and the host ``urllib`` read instead of ``es:9200``."""
 
 
-@pytest.mark.parametrize("url", _NOT_USERINFO)
-def test_an_at_sign_that_is_not_userinfo_still_constructs(url: str) -> None:
+@pytest.mark.parametrize(("url", "host"), _HOST_ENDED_EARLY)
+def test_a_password_holding_a_delimiter_sent_the_request_to_another_host(
+    url: str, host: str
+) -> None:
+    """The premise, against the real stdlib: no userinfo is read, and the host is the wrong one."""
+    request = urllib.request.Request(url)  # noqa: S310
+
+    assert not _carries_userinfo(url)
+    assert request.host == host
+    assert urllib.parse.urlsplit(url).netloc == host
+
+
+_STRAY_AT = [
+    *(url for url, _host in _HOST_ENDED_EARLY),
+    *(url for url in _NOT_USERINFO if "@" in url),
+    "http:/USERX:PWX@h/1",
+    "http:///USERX:PWX@h/1",
+    "https:/USERX:PWX@h",
+]
+"""URLs whose every literal ``@`` is outside the host: refused by the stray-``@`` check alone.
+
+The single- and triple-slash forms read no host before the ``@`` and were already refused unquoted
+at ``253432f``; they reach the stray-``@`` refusal first now.
+"""
+
+
+@pytest.mark.parametrize("url", _STRAY_AT)
+def test_an_at_sign_outside_the_host_is_refused_without_echoing_the_url(url: str) -> None:
+    assert not _carries_userinfo(url), "the premise: no parser reads userinfo here"
+
+    with pytest.raises(ValueError, match=rf"^HTTPSink url {_STRAY_AT_MESSAGE}") as caught:
+        HTTPSink(url)
+
+    assert str(caught.value).endswith(_STRAY_AT_REMEDY)
+    _assert_never_echoes(caught.value, *_SECRETS, "PWY", "ss@es", "es:9200")
+    _assert_chains_nothing(caught.value)
+
+
+@pytest.mark.parametrize("url", _PERCENT_AT)
+def test_an_at_sign_written_as_percent_40_still_constructs(url: str) -> None:
     assert HTTPSink(url).url == url
 
 
-def test_an_at_sign_in_a_base_path_or_a_query_still_composes() -> None:
-    assert ElasticsearchSink("http://h/a@b/", index="i").url == "http://h/a@b/_bulk"
+def test_an_at_sign_in_a_base_path_or_a_query_is_refused_and_its_percent_40_composes() -> None:
+    with pytest.raises(ValueError, match=rf"^ElasticsearchSink url {_STRAY_AT_MESSAGE}"):
+        ElasticsearchSink("http://h/a@b/", index="i")
+    assert ElasticsearchSink("http://h/a%40b/", index="i").url == "http://h/a%40b/_bulk"
     for name in sorted(_VERBATIM):
-        _argument, build, _remedy = _VERBATIM[name]
-        assert build("https://h/collector?channel=a@b").url == "https://h/collector?channel=a@b"
+        argument, build, _remedy = _VERBATIM[name]
+        with pytest.raises(ValueError, match=rf"^{name} {argument} {_STRAY_AT_MESSAGE}"):
+            build("https://h/collector?channel=a@b")
+        assert build("https://h/c?channel=a%40b").url == "https://h/c?channel=a%40b"
 
 
 _PARSED_BY_BOTH = [
@@ -846,6 +946,8 @@ _SENTRY_REFUSALS = [
     ("https://SECRETKEY@h/a b/1", r"^SentrySink dsn cannot be sent over HTTP "),
     ("https://SECRETKEY@h\ud800/1", r"^SentrySink dsn cannot be sent over HTTP "),
     ("https://SECRETKEY€@h/1", r"^SentrySink dsn public key cannot be sent over HTTP "),
+    ("https:/SECRETKEY@h/1", r"^SentrySink dsn is missing its host, public key$"),
+    ("https://SECRETKEY@h:0/1", r"^SentrySink dsn names no usable port: 'https://h:0'; "),
 ]
 """Every refusal ``_parse_dsn`` raises, each reached by its own message, all carrying the key.
 
@@ -864,44 +966,200 @@ def test_no_sentry_dsn_refusal_echoes_the_key(dsn: str, message: str) -> None:
 
 
 _DELIMITED_PASSWORDS = [
-    ("http://USERX:PWX#PWY@h:9200/x", r"^HTTPSink url cannot be sent over HTTP \(InvalidURL\); "),
-    ("http://USERX:PWX?PWY@h:9200/x", r"^HTTPSink url cannot be sent over HTTP \(InvalidURL\); "),
-    ("http://USERX:PWX/PWY@h:9200/x", r"^HTTPSink url cannot be sent over HTTP \(InvalidURL\); "),
-    ("http://USERX:0#PWY@h/x", r"^HTTPSink url names no usable port; "),
-    ("http://[USERX:PWX#PWY@h/x", r"^HTTPSink url is not a URL; "),
-    ("ftp://USERX:PWX#PWY@h/x", r"^HTTPSink url must use http or https, not ftp scheme; "),
-    ("\x00http://USERX:PWX#PWY@h/x", r"^HTTPSink url must use http or https; "),
-    ("http:///USERX:PWX#PWY@h", r"^HTTPSink url names no host; "),
+    "http://USERX:PWX#PWY@h:9200/x",
+    "http://USERX:PWX?PWY@h:9200/x",
+    "http://USERX:PWX/PWY@h:9200/x",
+    "http://USERX:0#PWY@h/x",
+    "http://[USERX:PWX#PWY@h/x",
+    "ftp://USERX:PWX#PWY@h/x",
+    "\x00http://USERX:PWX#PWY@h/x",
+    "http:///USERX:PWX#PWY@h",
 ]
 """A password holding ``#``, ``?`` or ``/``, which ends the authority before its ``@``.
 
-Neither parser reads userinfo in these, so the userinfo refusal rightly stays quiet; each reaches
-a later refusal, which quoted the URL and chained a reason quoting part of it (``nonnumeric port:
-'PWX'``). One case per refusal ``_valid_url`` gives after the userinfo check.
+Neither parser reads userinfo in these, so the userinfo refusal rightly stays quiet. Each once
+reached a different later refusal, one per refusal ``_valid_url`` gives after the userinfo check,
+which quoted the URL and chained a reason quoting part of it (``nonnumeric port: 'PWX'``); the
+stray-``@`` refusal now reaches every one of them first.
 """
 
 
-@pytest.mark.parametrize(("url", "message"), _DELIMITED_PASSWORDS)
-def test_a_refused_url_holding_an_at_sign_is_never_quoted(url: str, message: str) -> None:
+@pytest.mark.parametrize("url", _DELIMITED_PASSWORDS)
+def test_a_password_holding_a_delimiter_is_refused_as_an_at_sign_outside_the_host(url: str) -> None:
     assert not _carries_userinfo(url), "the premise: no parser reads userinfo here"
 
-    with pytest.raises(ValueError, match=message) as caught:
+    with pytest.raises(ValueError, match=rf"^HTTPSink url {_STRAY_AT_MESSAGE}") as caught:
         HTTPSink(url)
 
-    assert str(caught.value).endswith("holds an '@' and what precedes one may be a password")
+    assert str(caught.value).endswith(_STRAY_AT_REMEDY)
     _assert_never_echoes(caught.value, *_SECRETS, "PWY")
     _assert_chains_nothing(caught.value)
+
+
+def test_the_parser_errors_a_refusal_chained_quoted_what_follows_the_host() -> None:
+    """The premise, against the real ``http.client``: its reason quotes the request target."""
+    with pytest.raises(http.client.InvalidURL) as invalid:
+        _started_request("h", "POST", "/x y?token=SECRET")
+    with pytest.raises(UnicodeEncodeError) as unencodable:
+        _started_request("h", "POST", "/x?a=\udc80SECRET")
+
+    assert "SECRET" in str(invalid.value)
+    assert "SECRET" in unencodable.value.object
+
+
+_AFTER_THE_HOST = [
+    ("http://[::1/x?token=SECRET", r"is not a URL \(ValueError\)", "http://[::1"),
+    ("ftp://h/x?token=SECRET", "must use http or https, not ftp scheme", "ftp://h"),
+    ("http:///x?token=SECRET", "names no host", "http://"),
+    ("http://h:abc/x?token=SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h:abc"),
+    ("http://h:abc/services/SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h:abc"),
+    ("http://h/x y?token=SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h"),
+    ("http://h/x?a=\udc80SECRET", r"cannot be sent over HTTP \(UnicodeEncodeError\)", "http://h"),
+    ("http://h:0/x#SECRET", "names no usable port", "http://h:0"),
+    ("https://h:99999/x#access_token=SECRET", "names no usable port", "https://h:99999"),
+]
+"""A refused URL with a credential after its host — in a query, a fragment or a path — the reason
+it is refused for, and the head the refusal quotes. One per refusal ``_valid_url`` gives after the
+two ``@`` checks, and one per ``http.client`` route that put the rest in its reason: ``InvalidURL``'s
+message and a ``UnicodeEncodeError``'s ``object``."""
+
+
+@pytest.mark.parametrize(("url", "reason", "head"), _AFTER_THE_HOST)
+def test_a_refused_url_quotes_only_its_scheme_and_host(url: str, reason: str, head: str) -> None:
+    with pytest.raises(
+        ValueError, match=rf"^HTTPSink url {reason}: {re.escape(repr(head))}; "
+    ) as caught:
+        HTTPSink(url)
+
+    assert str(caught.value).endswith(_HEAD_ONLY)
+    _assert_never_echoes(caught.value, "SECRET", "token", "services")
+    _assert_chains_nothing(caught.value)
+    _assert_printable(caught.value)
+
+
+_NO_HEAD = [
+    ("es.example.com?api_key=Splunk:SECRET", "must use http or https"),
+    ("h?api_key=SECRET://x/y", "must use http or https"),
+    ("h#SECRET://x/y", "must use http or https"),
+    ("h%3ASECRET://x/y", "must use http or https"),
+    ("\x00http://h/x?token=SECRET", "must use http or https"),
+    ("http:SECRET?x", "names no host"),
+    ("http:token=SECRET", "names no host"),
+    ("http:\t//h/x?token=SECRET", "names no host"),
+]
+"""Refused URLs that do not start with ``scheme://``, so no host can be told from the rest.
+
+The first is ``_AUTHORITY``'s run quoting a secret: its scheme group, which mirrors
+``urllib``'s ``_splittype``, runs to the first ``:`` over ``?``, ``#`` and ``%``. The ``://`` ones
+are a quotable head only if the scheme may hold those, which RFC 3986's scheme characters do not.
+"""
+
+
+@pytest.mark.parametrize(("url", "reason"), _NO_HEAD)
+def test_a_refused_url_with_no_head_is_not_quoted_at_all(url: str, reason: str) -> None:
+    with pytest.raises(ValueError, match=rf"^HTTPSink url {reason}{re.escape(_UNQUOTED)}$") as e:
+        HTTPSink(url)
+
+    _assert_never_echoes(e.value, "SECRET", "token", "es:9200")
+    _assert_chains_nothing(e.value)
+
+
+_AT_ANYWHERE_TEXT = (
+    "; the URL is not quoted, since it holds an '@', and what precedes one may be a password"
+)
+"""How a refusal of a URL holding an ``@`` in any form, anywhere, ends."""
+
+_AT_ANYWHERE = [
+    ("http://elastic:pa#ss%40es:9200/x", "cannot be sent over HTTP"),
+    (f"http://elastic:pa#ss{_FULLWIDTH_AT}es:9200/x", "cannot be sent over HTTP"),
+    ("http://USERX:PWX?PWY%40h:9200/x", "cannot be sent over HTTP"),
+    ("http://USERX:0#PWY%40h/x", "names no usable port"),
+    (f"http://USERX:PWX/PWY{_FULLWIDTH_AT}h/x", "cannot be sent over HTTP"),
+    ("http://h:abc/a%40SECRET", "cannot be sent over HTTP"),
+    (f"http://h/a{_FULLWIDTH_AT}SECRET", "cannot be sent over HTTP"),
+    ("elastic%3ASECRET%40es:9200/x", "must use http or https"),
+    ("elastic%3ASECRET%40es:9200", "must use http or https"),
+    (f"u{_FULLWIDTH_AT}SECRET:9200/x", "must use http or https"),
+]
+"""Refused URLs holding a ``%40`` or a fullwidth ``@``, which no ``@`` check before the quoting
+refusals catches. In the first five it ends a password whose ``#``, ``?`` or ``/`` ended the host
+early, so the head is the user and the start of the password: ``'http://elastic:pa'`` was quoted
+before the whole URL was tested. The last three have no head at all, and say the other reason."""
+
+
+@pytest.mark.parametrize(("url", "reason"), _AT_ANYWHERE)
+def test_a_refused_url_holding_an_at_sign_in_any_form_is_not_quoted(url: str, reason: str) -> None:
+    """The whole message is matched, anchored, so no part of the URL is in it: ``pa`` and ``ss``
+    cannot be searched for, since the fixed text says ``password``."""
+    with pytest.raises(
+        ValueError, match=rf"^HTTPSink url {reason}{re.escape(_AT_ANYWHERE_TEXT)}$"
+    ) as caught:
+        HTTPSink(url)
+
+    _assert_never_echoes(caught.value, "USERX", "PWX", "PWY", "SECRET", "es:9200", "elastic")
+    _assert_chains_nothing(caught.value)
+    _assert_printable(caught.value)
+
+
+_DELIMITER_IN_HOST = [
+    (f"https://h{_FULLWIDTH_QUESTION}token=SECRET/x", "is not a URL"),
+    (f"https://es.example.com{_FULLWIDTH_QUESTION}api_key=SECRET/x", "is not a URL"),
+    (f"http://h{_FULLWIDTH_HASH}SECRET", "is not a URL"),
+    (f"http://h{_FULLWIDTH_SOLIDUS}SECRET", "is not a URL"),
+    ("http://h%3FSECRET:x/y", "cannot be sent over HTTP"),
+]
+"""Refused URLs whose ASCII host run holds a delimiter in another form, so a reader that normalizes
+or decodes ends the host inside it. The fullwidth-``#`` one is all head, so it was quoted
+whole with ``urlsplit``'s reason chained, and that reason quotes the netloc."""
+
+
+@pytest.mark.parametrize(("url", "reason"), _DELIMITER_IN_HOST)
+def test_a_refused_url_whose_host_run_holds_a_delimiter_in_any_form_is_not_quoted(
+    url: str, reason: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"^HTTPSink url {reason}{re.escape(_UNQUOTED)}$") as e:
+        HTTPSink(url)
+
+    _assert_never_echoes(e.value, "SECRET", "token", "api_key", "es.example")
+    _assert_chains_nothing(e.value)
+
+
+@pytest.mark.parametrize(
+    ("url", "head"),
+    [
+        ("http://h/x", "http://h"),
+        (f"http://h{_FULLWIDTH_HASH}x", None),
+        ("http://h%23x/y", None),
+        ("http://elastic:pa#ss%40es:9200/x", None),
+        ("http://h/x#a%40b", None),
+        ("HTTPS://h:9200?x", "HTTPS://h:9200"),
+        ("svn+ssh.1-a://h#f", "svn+ssh.1-a://h"),
+        ("http://", "http://"),
+        ("http://u%40h/x", None),
+        (f"http://u{_FULLWIDTH_AT}h/x", None),
+        ("http://u@h/x", None),
+        ("1http://h/x", None),
+        ("http:/h/x", None),
+        (" http://h/x", None),
+    ],
+)
+def test_the_quotable_head_is_a_scheme_and_a_host_with_no_at_sign(
+    url: str, head: str | None
+) -> None:
+    """Held directly, because ``_valid_url`` refuses every ``@`` in a host before any refusal."""
+    assert _quotable_head(url) == head
 
 
 @pytest.mark.parametrize(
     ("url", "message"),
     [
-        ("http://h:abc/x", r"^HTTPSink url cannot be sent over HTTP \(nonnumeric port: 'abc'\): "),
-        ("http://[::1/x", r"^HTTPSink url is not a URL \(Invalid IPv6 URL\): "),
+        ("http://h:abc", r"^HTTPSink url cannot be sent over HTTP \(nonnumeric port: 'abc'\): "),
+        ("http://[::1", r"^HTTPSink url is not a URL \(Invalid IPv6 URL\): "),
     ],
 )
-def test_a_refused_url_with_no_at_sign_is_still_quoted_and_chained(url: str, message: str) -> None:
-    """The negative control: with no ``@`` the URL and the parser's reason are the useful part."""
+def test_a_refused_url_that_is_all_head_is_still_quoted_and_chained(url: str, message: str) -> None:
+    """The negative control: with nothing after the host the URL and the parser's reason are the
+    useful part, and there is nothing past the host for either to leak."""
     with pytest.raises(ValueError, match=message) as caught:
         HTTPSink(url)
 
@@ -909,8 +1167,24 @@ def test_a_refused_url_with_no_at_sign_is_still_quoted_and_chained(url: str, mes
     assert caught.value.__cause__ is not None
 
 
-@pytest.mark.parametrize("site", ["x/USERX@y", "a#USERX@b"])
-def test_a_datadog_site_holding_an_at_sign_is_refused_unquoted(site: str) -> None:
+_UNQUOTED_SITE = "; the site is not quoted, since it holds an '@', '/', '?' or '#'"
+
+
+@pytest.mark.parametrize(
+    "site",
+    [
+        "x/USERX@y",
+        "a#USERX@b",
+        "x/USERX",
+        "datadoghq.com?api_key=USERX",
+        "datadoghq.com#USERX",
+        "us5/USERX.datadoghq.com",
+        f"datadoghq.com{_FULLWIDTH_HASH}USERX",
+        f"datadoghq.com{_FULLWIDTH_QUESTION}api_key=USERX",
+        "datadoghq.com%3FUSERX",
+    ],
+)
+def test_a_datadog_site_holding_an_at_sign_or_a_delimiter_is_refused_unquoted(site: str) -> None:
     assert not _carries_userinfo(f"https://http-intake.logs.{site}/api/v2/logs"), "the premise"
 
     with pytest.raises(
@@ -919,12 +1193,90 @@ def test_a_datadog_site_holding_an_at_sign_is_refused_unquoted(site: str) -> Non
         DatadogSink("k", site=site)
 
     assert "USERX" not in str(caught.value)
-    assert str(caught.value).endswith("the site is not quoted, since it holds an '@'")
+    assert str(caught.value).endswith(_UNQUOTED_SITE)
 
 
-def test_a_datadog_site_with_no_at_sign_is_still_quoted() -> None:
-    with pytest.raises(ValueError, match=r"'dat adog\.com'$"):
-        DatadogSink("k", site="dat adog.com")
+@pytest.mark.parametrize("site", ["dat adog.com", "datadoghq.com:443", "a..b"])
+def test_a_datadog_site_with_no_at_sign_or_delimiter_is_still_quoted(site: str) -> None:
+    with pytest.raises(ValueError, match=rf"{re.escape(repr(site))}$"):
+        DatadogSink("k", site=site)
+
+
+def _stray_at_builds(name: str) -> list[tuple[str, object]]:
+    """Each way to put an ``@`` outside the host into the class's URL: the argument and a thunk."""
+    if name in _APPENDS:
+        _suffix, build, _remedy = _APPENDS[name]
+        bases = ("http://h/a@b", "http://elastic:12/ss@es:9200")
+        return [("url", lambda b=base, f=build: f(b)) for base in bases]
+    if name in _VERBATIM:
+        argument, build, _remedy = _VERBATIM[name]
+        urls = ("http://h/a@b", "http://elastic:12#ss@es:9200/x", "http://h/x?channel=a@b")
+        return [(argument, lambda u=url, f=build: f(u)) for url in urls]
+    return []
+
+
+@pytest.mark.parametrize("cls", _shipped_http_subclasses(), ids=lambda cls: cls.__name__)
+def test_every_http_subclass_refuses_an_at_sign_outside_the_host_naming_the_argument(
+    cls: type[HTTPSink],
+) -> None:
+    """Swept over the derived roster, through the rosters above, so a new subclass is declared.
+
+    An appending class is given path forms: a ``?`` or ``#`` base is refused before the
+    composed URL is checked, by the base check's own fixed text (the test below).
+    """
+    builds = _stray_at_builds(cls.__name__)
+    if cls.__name__ in _NO_CALLER_BASE:
+        assert builds == []
+        return
+    assert builds, f"{cls.__name__} has no stray-'@' builder"
+    for argument, build in builds:
+        with pytest.raises(
+            ValueError, match=rf"^{cls.__name__} {argument} {_STRAY_AT_MESSAGE}"
+        ) as caught:
+            build()  # type: ignore[operator]
+
+        assert str(caught.value).endswith(_STRAY_AT_REMEDY)
+        _assert_never_echoes(caught.value, "ss@es", "a@b", "es:9200")
+        _assert_chains_nothing(caught.value)
+
+
+@pytest.mark.parametrize("base", ["http://elastic:12#ss@es:9200", "http://elastic:12?ss@es:9200"])
+@pytest.mark.parametrize("name", sorted(_APPENDS))
+def test_an_appended_base_with_a_stray_at_after_a_delimiter_is_refused_unquoted(
+    name: str, base: str
+) -> None:
+    _suffix, build, _remedy = _APPENDS[name]
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^{name} url (cannot carry a query or fragment: |{_STRAY_AT_MESSAGE})",
+    ) as caught:
+        build(base)
+
+    _assert_never_echoes(caught.value, "ss@es", "es:9200")
+    _assert_chains_nothing(caught.value)
+
+
+def test_the_wrapper_and_the_dataset_refuse_a_stray_at_under_their_own_names() -> None:
+    with pytest.raises(ValueError, match=rf"^LogstashSink url {_STRAY_AT_MESSAGE}"):
+        LogstashSink(url="http://elastic:12#ss@es:9200/x")
+    with pytest.raises(ValueError, match=r"^HoneycombSink dataset must not hold an '@'; "):
+        HoneycombSink("k", "a@b")
+    with pytest.raises(ValueError, match=r"^DatadogSink site must be a Datadog site's") as e:
+        DatadogSink("k", site="a#USERX@b")
+    assert "USERX" not in str(e.value)
+
+
+def test_sentry_refuses_a_dsn_on_port_0_under_dsn_without_the_key() -> None:
+    """``0`` was dropped as a falsy port, so the fallback posted to the default port, where the
+    SDK posts to ``:0``, which never delivers; ``HTTPSink`` already refused port ``0``."""
+    with pytest.raises(
+        ValueError, match=r"^SentrySink dsn names no usable port: 'https://h:0'; "
+    ) as caught:
+        SentrySink(dsn="https://SECRETKEY@h:0/1", backend="http", opener=FakeOpener())
+
+    _assert_never_echoes(caught.value, *_SENTRY_SECRETS)
+    _assert_chains_nothing(caught.value)
 
 
 _URLSPLIT_REMOVES = sorted(urllib.parse._UNSAFE_URL_BYTES_TO_REMOVE)  # type: ignore[attr-defined]

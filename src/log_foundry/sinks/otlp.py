@@ -105,11 +105,11 @@ class OTLPSink(HTTPSink):
             ``max_batch_count`` is not an ``int`` or ``max_retry_after`` not an ``int`` or
             ``float``, refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class
             (SPEC-066).
-          ValueError: If ``endpoint`` carries a user or password before its host, has no
-            ``http``/``https`` scheme or names no host, or if ``method`` is anything but
-            ``"POST"`` — OTLP/HTTP is POST only, and accepting another
-            would send every batch to a server that refuses it for the life of the process
-            (invariant 13). Every other refusal is inherited.
+          ValueError: If ``endpoint`` carries a user or password before its host or an ``@``
+            anywhere else, has no ``http``/``https`` scheme or names no host, or if ``method`` is
+            anything but ``"POST"`` — OTLP/HTTP is POST only, and accepting another would send
+            every batch to a server that refuses it for the life of the process (invariant 13).
+            Every other refusal is inherited.
         """
         owner = type(self).__name__
         if not isinstance(endpoint, str):

@@ -80,7 +80,8 @@ class ElasticsearchSink(HTTPSink):
           ValueError: If the index is empty or contains whitespace, or ``url`` carries a user or
             password, or a query or fragment, which the appended ``/_bulk`` would land inside
             (:func:`~log_foundry.sinks.http._valid_base_url`) — a ``_bulk`` parameter such as
-            ``?pipeline=`` never reached ``_bulk``, so it was never applied.
+            ``?pipeline=`` never reached ``_bulk``, so it was never applied — or holds an ``@``
+            anywhere else, refused naming ``url`` once ``/_bulk`` is appended.
         """
         _valid_base_url(url, type(self).__name__, "/_bulk", credentials=self._CREDENTIALS)
         if not index or any(char.isspace() for char in index):

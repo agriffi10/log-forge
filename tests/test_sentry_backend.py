@@ -735,6 +735,7 @@ def test_a_dsn_with_no_prefix_posts_where_it_always_did(dsn: str, url: str) -> N
         ("https://k@h:9000/a/b/12", "https://h:9000/a/b/api/12/envelope/"),
         ("https://k@h//a/1", "https://h//a/api/1/envelope/"),
         ("https://k@h/p;x/1", "https://h/p;x/api/1/envelope/"),
+        ("https://k@h/pre@fix/1", "https://h/pre@fix/api/1/envelope/"),
     ],
 )
 def test_a_path_prefix_goes_before_api_as_the_sdks_place_it(dsn: str, url: str) -> None:
@@ -795,8 +796,13 @@ _SDK_PARITY = [
     "https://k@h/+1",
     "https://k@h/1_0",
     "https://k@h/\u0661",
+    "https://k@h/pre@fix/1",
 ]
-"""DSNs where this sink and ``sentry_sdk`` agree; default ports, ``//1`` and ``01`` differ."""
+"""DSNs where this sink and ``sentry_sdk`` agree; default ports, ``//1`` and ``01`` differ.
+
+``pre@fix`` is why the fallback is exempt from the stray-``@`` refusal every other HTTP sink URL
+gets: the SDK posts to that path as written.
+"""
 
 
 @pytest.mark.parametrize("dsn", _SDK_PARITY)
@@ -815,3 +821,30 @@ def test_a_project_id_refused_here_is_refused_by_the_sdk(project: str) -> None:
 
     with pytest.raises(sentry_sdk.utils.BadDsn):
         sentry_sdk.utils.Dsn(dsn)
+
+
+def test_a_prefix_at_sign_is_posted_as_written_and_not_as_percent_40() -> None:
+    """The fallback's ``HTTPSink`` is built on the ``%40`` form and its ``url`` set back."""
+    opener = FakeOpener()
+    sink = SentrySink(dsn="https://k@h/pre@fix/1", backend="http", opener=opener)
+
+    sink.emit([dict(ERROR)])
+
+    assert sink._http is not None
+    assert sink._http.url == "https://h/pre@fix/api/1/envelope/"
+    assert [call["url"] for call in opener.calls] == ["https://h/pre@fix/api/1/envelope/"]
+
+
+def test_the_sdk_posts_a_dsn_on_port_0_to_port_0_where_this_sink_refuses_it() -> None:
+    """The fallback dropped ``0`` as falsy and posted to the default port; the SDK keeps it, and a
+    request to port ``0`` never delivers, so the fallback now refuses the DSN instead."""
+    sentry_sdk = _real_sdk()
+    from_sdk = (
+        sentry_sdk.utils.Dsn("https://k@h:0/1")
+        .to_auth()
+        .get_api_url(sentry_sdk.utils.EndpointType.ENVELOPE)
+    )
+
+    assert from_sdk == "https://h:0/api/1/envelope/"
+    with pytest.raises(ValueError, match=r"^SentrySink dsn names no usable port: "):
+        SentrySink(dsn="https://k@h:0/1", backend="http", opener=FakeOpener())

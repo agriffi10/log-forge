@@ -10,6 +10,7 @@ from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
     _holds_at,
+    _holds_delimiter,
     _refuse_userinfo,
     _valid_url,
     merge_headers,
@@ -30,8 +31,10 @@ the path, ``?`` and ``/`` moved it, ``@`` put the batch on a host with an ``@`` 
 resolves nowhere, and ``""``, ``..`` and ``%2e`` named no host Datadog serves. An ``@`` that makes
 userinfo of what precedes it is refused before this pattern is consulted, because this pattern's
 refusal echoes ``site``, and userinfo may hold a password; a ``site`` holding an ``@`` anywhere
-else is refused by this pattern without being quoted. A port and a trailing
-dot are refused with them, as not a Datadog site, though either reached the intake.
+else, or a ``/``, ``?`` or ``#`` — fullwidth or percent-encoded ones included, which a reader
+that normalizes or decodes ends a host at (:func:`~log_foundry.sinks.http._holds_delimiter`) — is
+refused by this pattern without being quoted. A port and a trailing dot are refused with them, as
+not a Datadog site, though either reached the intake.
 """
 
 
@@ -92,7 +95,8 @@ class DatadogSink(HTTPSink):
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: If ``site`` puts a user or password before the intake host — refused first,
             naming ``site`` and echoing nothing of it, since the next refusal quotes it — or is
-            not a host name of dot-separated LDH labels (:data:`_SITE`),
+            not a host name of dot-separated LDH labels (:data:`_SITE`), quoted unless it holds an
+            ``@``, ``/``, ``?`` or ``#``, any of which puts text outside the intake host,
             or the intake URL it builds cannot be sent — refused here so the message names
             ``site``, the argument the caller wrote, rather than the ``url`` this class built from
             it (SPEC-049 FR-001).
@@ -105,8 +109,8 @@ class DatadogSink(HTTPSink):
         )
         if not _SITE.fullmatch(site):
             shown = f": {site!r}"
-            if _holds_at(site):
-                shown = "; the site is not quoted, since it holds an '@'"
+            if _holds_at(site) or _holds_delimiter(site):
+                shown = "; the site is not quoted, since it holds an '@', '/', '?' or '#'"
             raise ValueError(
                 f"{type(self).__name__} site must be a Datadog site's host name, such as "
                 f"'datadoghq.com' or 'us5.datadoghq.com'{shown}"

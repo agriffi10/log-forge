@@ -146,6 +146,19 @@ class SentrySink:
             that backend does not build — so a malformed one there has no effect, and refusing it
             would invent a failure rather than report one. It is validated wherever it is actually
             parsed, which is every construction that builds the fallback.
+
+            The fallback posts to the ingest URL exactly as the SDK builds it, an ``@`` in the
+            DSN's path prefix included, which :class:`HTTPSink` refuses in any URL it is given:
+            it is built on the URL with that ``@`` written ``%40``, which passes every one of its
+            checks, and its ``url`` is then set to the ingest URL itself. The only literal ``@``
+            an ingest URL can hold is in that prefix — the host's is refused by :func:`_parse_dsn`
+            and the project id is an integer — so the two URLs differ there alone, and
+            :func:`_parse_dsn` has already checked the real one. Three alternatives were
+            rejected. A private ``HTTPSink`` subclass would change the ``type(self).__name__``
+            in the fallback's stderr lines and join the roster of shipped subclasses the tests
+            derive. A private keyword on ``HTTPSink.__init__`` would widen a public signature a
+            roster test reads. And posting the ``%40`` form would send a different request from
+            the SDK's.
         """
         if backend not in _BACKENDS:
             raise ValueError(f"SentrySink backend must be one of {_BACKENDS!r}, not {backend!r}")
@@ -188,7 +201,10 @@ class SentrySink:
                 )
         else:
             ingest_url, self._auth_header = _parse_dsn(dsn)
-            self._http = HTTPSink(ingest_url, opener=opener, max_retries=max_retries)
+            self._http = HTTPSink(
+                ingest_url.replace("@", "%40"), opener=opener, max_retries=max_retries
+            )
+            self._http.url = ingest_url
         self._stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -628,7 +644,11 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
     sends ``1``; any other id ``int`` reads — ``+1``, `` 1``, ``1_0``, non-ASCII digits — is sent
     as the SDK sends it, ``str(int(id))``. An IPv6 host is put back in brackets, which ``hostname``
     strips: ``[2001:db8::1]`` otherwise reached ``http.client`` as host ``2001:db8:`` on port
-    ``1``. The SDK has that defect too, and it is not copied.
+    ``1``. The SDK has that defect too, and it is not copied. A port is kept whenever the DSN
+    names one: ``0`` was dropped as falsy, so ``https://k@h:0/1`` posted to the default port where
+    the SDK posts to ``h:0``, which never delivers, and it is now refused as a port no socket can
+    reach. An ``@`` in the path prefix is kept too, since the SDK posts there, so the ingest URL is
+    checked with ``path_at`` (:func:`~log_foundry.sinks.http._valid_url`).
 
     Args:
       dsn: The Sentry DSN.
@@ -638,7 +658,8 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
 
     Raises:
       ValueError: If the DSN lacks a scheme, a host, a public key or a project id, the project
-        id is not an integer ``int`` can read, or the ingest URL or auth header it derives could not be sent —
+        id is not an integer ``int`` can read, the port is ``0``, or the ingest URL or auth
+        header it derives could not be sent —
         checked here, under ``dsn``, because :class:`HTTPSink` would otherwise refuse a URL the
         caller never wrote under its own name, and the header only fails at ``emit``. A DSN
         ``urlsplit`` cannot read — an unclosed IPv6 bracket, a port past ``65535``, a bracketed
@@ -652,7 +673,7 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
     """
     try:
         parsed = urlsplit(dsn)
-        port = f":{parsed.port}" if parsed.port else ""
+        port = f":{parsed.port}" if parsed.port is not None else ""
     except ValueError:
         unreadable = True
     else:
@@ -694,7 +715,7 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
             "SentrySink dsn host must not hold an '@', percent-encoded or not: urllib decodes it "
             "into the host name it connects to"
         )
-    _valid_url(ingest_url, "SentrySink", name="dsn")
+    _valid_url(ingest_url, "SentrySink", name="dsn", path_at=True)
     failure = _unsendable_header("X-Sentry-Auth", auth_header)
     if failure:
         raise ValueError(f"SentrySink dsn public key cannot be sent over HTTP ({failure})")
