@@ -214,6 +214,21 @@ class NATSSink:
     stall. The flag stays in front of the round trip as the cheap refusal. Refusing moves no
     ``losses()`` counter, per SPEC-032: it is a failure *reported* to the worker rather than one
     absorbed, and counting both would report one loss twice.
+
+    **A publish the driver never returns from is abandoned at the deadline, counted, and latches
+    the sink** (SPEC-061 FR-001). It is counted where no confirmation will judge it -- the
+    JetStream path, an injected client -- and every later ``emit`` and ``flush`` is refused at
+    once while it is still pending, since each would only queue behind the same blocked
+    force-flush.
+
+    **A JetStream event with no ack is retried or not depending on when the ack wait ended**, and
+    the asymmetry is recorded rather than removed (``docs/invariants.md``, invariant 2). An ack
+    wait that expires inside the budget raises in the driver, so the event is counted as a raised
+    publish and a batch in which nothing landed goes back to the worker, which retries it
+    (SPEC-047's behaviour); a publish that outlives the budget is abandoned, counted as
+    unconfirmed and never retried. Both mean the same thing -- no ack, and the event may have been
+    persisted -- so the first can duplicate and the second can lose. What closes it is the
+    ``Nats-Msg-Id`` deduplication item in ``architecture.md`` section 12, which makes a retry safe.
     """
 
     def __init__(
@@ -336,6 +351,7 @@ class NATSSink:
         self._closed = False
         self._owns_client = client is None
         self._abandoned: set[asyncio.Task[Any]] = set()
+        self._stuck: tuple[asyncio.Task[Any], ...] = ()
         self._probe: tuple[asyncio.Task[Any], float, int] | None = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._serve, name=_LOOP_THREAD_NAME, daemon=True)
@@ -515,7 +531,9 @@ class NATSSink:
 
         Raises:
           SinkDeliveryError: When none of the events landed, when the sink is closed or closing,
-            in a forked child, or when the backstop bound expired and the sink closed itself.
+            in a forked child, while either latch holds (an unanswered probe, or a publish
+            abandoned at an earlier deadline and still pending), or when the backstop bound
+            expired and the sink closed itself.
         """
         if not batch:
             return
@@ -541,8 +559,9 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: In a forked child, while the sink is closing or closed, or while
-            the outstanding probe is known to be unanswered (the latch, SPEC-061 FR-002).
+          SinkDeliveryError: In a forked child, while the sink is closing or closed, while the
+            outstanding probe is known to be unanswered (the latch, SPEC-061 FR-002), or while a
+            publish abandoned at an earlier deadline is still blocked in the driver.
         """
         if os.getpid() != self._pid:
             raise SinkDeliveryError(f"{prefix}: a forked child acquired no connection")
@@ -555,12 +574,20 @@ class NATSSink:
                 f"{prefix}: the server has not answered a PING sent more than "
                 f"{self.publish_timeout}s ago"
             )
+        self._refuse_while_stuck(prefix)
 
-    def _refuse_under_the_lock(self, prefix: str) -> None:
-        """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
+    def _refuse_while_stuck(self, prefix: str) -> None:
+        """Raises while a publish abandoned at an earlier deadline is still pending (SPEC-061).
 
-        A ``close()`` can set its flag while this call was waiting for the lock, and a call that
-        then published would land after the closer believed the sink quiet.
+        The second latch, for every client, the sink's own and an injected one alike. A publish
+        is abandoned only when the driver did not return from it within the budget, which for a
+        core publish means its force-flush into a peer that stopped reading, and for a JetStream
+        one the same force-flush or an ack wait that outlived the budget. The next publish would
+        only queue behind the same blocked flush, so it is refused at once instead of spending a
+        budget of its own; a stall then costs one caller one budget, as the probe's latch makes it
+        for a silent server. Read before the lock and again after it, from one tuple the loop
+        thread replaces whole, so a caller never waits for it; it clears when the abandoned task
+        finishes, which its done callback records.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
@@ -569,12 +596,37 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink closed or began closing while the call waited.
+          SinkDeliveryError: While an abandoned publish has not finished.
+        """
+        if any(not task.done() for task in self._stuck):
+            raise SinkDeliveryError(
+                f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
+                "is still blocked in the driver"
+            )
+
+    def _refuse_under_the_lock(self, prefix: str) -> None:
+        """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
+
+        A ``close()`` can set its flag while this call was waiting for the lock, and a call that
+        then published would land after the closer believed the sink quiet. The abandoned-publish
+        latch is read again for the same reason: callers that queued on the lock before the
+        publish ahead of them was abandoned would otherwise each spend a budget behind it.
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: The sink closed or began closing while the call waited, or a
+            publish abandoned at an earlier deadline is still blocked in the driver.
         """
         if self._closed:
             raise SinkDeliveryError(f"{prefix}: the sink is closed")
         if self._closing:
             raise SinkDeliveryError(f"{prefix}: the sink is closing")
+        self._refuse_while_stuck(prefix)
 
     async def _emit_on_loop(self, batch: list[dict[str, object]]) -> None:
         """The coroutine behind :meth:`emit`, run on the loop thread (SPEC-061 FR-002).
@@ -606,7 +658,10 @@ class NATSSink:
         is counted rather than raised. JetStream mode has no such step, since each publish already
         awaited its ack, and an injected client has none either. The second round trip is sent
         only while the client still reports itself connected, because the driver's ``flush``
-        returns without a PONG otherwise and the next call would wait on nothing.
+        returns without a PONG otherwise and the next call would wait on nothing. When the buffer
+        does not drain, a probe is left outstanding (:meth:`_confirm`), so the latch has a PING
+        to age and the callers after this one are refused at once rather than each spending a
+        budget.
 
         Args:
           batch: The events to publish.
@@ -632,11 +687,7 @@ class NATSSink:
                 raise SinkDeliveryError(f"{refusal}: the client is disconnected")
         published = await self._publish_all(batch, deadline)
         if probing and not self._jetstream and published:
-            confirmed = (
-                self._is_connected()
-                and await self._drained(deadline)
-                and await self._await_probe(deadline)
-            )
+            confirmed = self._is_connected() and await self._confirm(deadline, arm=True)
             if not confirmed:
                 with self._counter_lock:
                     self.failed += published
@@ -759,6 +810,12 @@ class NATSSink:
         loop. The latch clears when the task finishes for any reason, when a reconnect moves the
         counter, or when the next call discards and re-sends.
 
+        The probe it ages is whichever PING is outstanding: one a caller waited on, or one
+        :meth:`_confirm` left behind when the driver's pending buffer did not drain by the
+        deadline, which is how a stall that shows as a buffer that is not moving, rather than as
+        an unanswered PING, arms the latch too. A publish the driver never returned from is the
+        other latch's (:meth:`_refuse_while_stuck`).
+
         Args:
           None.
 
@@ -811,14 +868,9 @@ class NATSSink:
         Raises:
           None.
         """
-        probe = self._probe
-        if probe is not None and (probe[0].done() or probe[2] != self._reconnects()):
-            self._probe = probe = None
+        probe = self._outstanding_probe()
         if probe is None:
-            task = self._loop.create_task(self._client.flush(timeout=PROBE_FLUSH_TIMEOUT))
-            task.add_done_callback(_retrieve)
-            probe = (task, time.monotonic(), self._reconnects())
-            self._probe = probe
+            probe = self._send_probe()
         task, sent_at, reconnects = probe
         now = time.monotonic()
         wait = min(deadline - now, self.publish_timeout - (now - sent_at))
@@ -826,6 +878,84 @@ class NATSSink:
         if not task.done() or task.cancelled() or task.exception() is not None:
             return False
         return self._is_connected() and self._reconnects() == reconnects
+
+    def _outstanding_probe(self) -> tuple[asyncio.Task[Any], float, int] | None:
+        """Returns the probe still pending on the current connection, discarding any other.
+
+        A probe that has finished is discarded, because its answer says nothing about now, and so
+        is one still pending after the driver's reconnect counter moved, because the driver reset
+        the PONG queue its future was in (SPEC-061 FR-002, rules 3 and 4). Runs on the loop thread,
+        the only writer of ``self._probe``.
+
+        Args:
+          None.
+
+        Returns:
+          The pending probe's ``(task, sent_at, reconnects)``, or None when there is none.
+
+        Raises:
+          None.
+        """
+        probe = self._probe
+        if probe is not None and (probe[0].done() or probe[2] != self._reconnects()):
+            self._probe = probe = None
+        return probe
+
+    def _send_probe(self) -> tuple[asyncio.Task[Any], float, int]:
+        """Sends one PING through the driver's public ``flush`` and records it as the probe.
+
+        The caller has established that no probe is outstanding, so at most one ever is. The tuple
+        is assigned whole, which is what lets :meth:`_latched` read it without a lock.
+
+        Args:
+          None.
+
+        Returns:
+          The new probe's ``(task, sent_at, reconnects)``.
+
+        Raises:
+          None.
+        """
+        task = self._loop.create_task(self._client.flush(timeout=PROBE_FLUSH_TIMEOUT))
+        task.add_done_callback(_retrieve)
+        probe = (task, time.monotonic(), self._reconnects())
+        self._probe = probe
+        return probe
+
+    async def _confirm(self, deadline: float, *, arm: bool) -> bool:
+        """Confirms the outbound buffer with a PING sent after it drained (SPEC-061 FR-003).
+
+        Waits for the driver's pending buffer to read zero (:meth:`_drained`), then asks the
+        server. **A PING sent before the buffer drained is liveness evidence only, never a
+        confirmation**: it may have overtaken the publishes it would confirm. So a probe still
+        outstanding at that point, one this call did not send, is waited out first as a liveness
+        answer, and only then is a fresh PING sent, which is the one that confirms; at most one
+        probe is ever outstanding, because the fresh one goes out only once the old one finished.
+
+        When the buffer does not drain by the deadline nothing can confirm it, and with ``arm`` a
+        probe is left outstanding without being waited for, so :meth:`_latched` has a PING to age
+        and the callers after this one are refused at once rather than each spending a budget
+        behind a buffer that is not moving. That PING is sent over the undrained buffer, and the
+        rule above is what keeps it from ever confirming anything. ``close()`` passes ``arm=False``,
+        since no call follows it.
+
+        Args:
+          deadline: The ``time.monotonic()`` instant this call's own budget ends.
+          arm: Whether to leave a probe outstanding when the buffer does not drain.
+
+        Returns:
+          True when a PING sent after the buffer drained was answered within the deadline.
+
+        Raises:
+          None.
+        """
+        if not await self._drained(deadline):
+            if arm and self._outstanding_probe() is None:
+                self._send_probe()
+            return False
+        if self._outstanding_probe() is not None and not await self._await_probe(deadline):
+            return False
+        return await self._await_probe(deadline)
 
     def _is_connected(self) -> bool:
         """Reports whether the client can currently put anything on the wire (FR-004 AC-5).
@@ -977,7 +1107,7 @@ class NATSSink:
         failure: BaseException | None = None
         if self._probing() and not self._latched() and self._is_connected():
             try:
-                answered = await self._drained(end) and await self._await_probe(end)
+                answered = await self._confirm(end, arm=False)
             except Exception as err:
                 failure = err
             probe = self._probe
@@ -1039,9 +1169,13 @@ class NATSSink:
         bytes already in its buffer may yet land, SPEC-061 M3 and M6). One that outlives the
         deadline is abandoned with a reference kept until close, counted as published so the batch
         is not sent back for a retry that could duplicate it, and the events after it as
-        unattempted. On the core path FR-003's confirmation then decides whether the batch is
-        confirmed or counted; on the JetStream path, which has no confirmation, the abandoned
-        publish is counted as unconfirmed here and announced.
+        unattempted. For a core client the sink probes, FR-003's confirmation then decides whether
+        the batch is confirmed or counted: the abandoned publish's bytes are already queued ahead of
+        any PING it sends, so its answer judges them too. Wherever no confirmation will run --
+        the JetStream path, an injected client, a client without ``flush`` -- the abandoned
+        publish is counted as unconfirmed here and announced; before frame-2 finding 1 an injected
+        core client's was counted nowhere, so a batch of one returned with ``failed`` at zero. An
+        abandoned publish also arms :meth:`_refuse_while_stuck` until it finishes.
 
         Two populations are counted by different rules. An event whose publish **raised** is a
         driver failure and is counted here exactly as before this spec. An event **never
@@ -1096,10 +1230,11 @@ class NATSSink:
             with self._counter_lock:
                 self.failed += unattempted
             _diag.lost("event", unattempted, f"NATSSink publish_timeout {self.publish_timeout}s")
-        if abandoned and self._jetstream:
+        if abandoned and (self._jetstream or not self._probing()):
             with self._counter_lock:
                 self.failed += abandoned
-            _diag.lost("event", abandoned, "NATSSink unconfirmed, JetStream publish abandoned")
+            kind = "JetStream publish" if self._jetstream else "publish"
+            _diag.lost("event", abandoned, f"NATSSink unconfirmed, {kind} abandoned")
         return published
 
     async def _publish_bounded(self, target: Any, payload: bytes, remaining: float) -> bool:
@@ -1109,7 +1244,8 @@ class NATSSink:
         of :data:`DEFAULT_ACK_TIMEOUT` and the remainder; a core publish takes none. The task is
         never cancelled (see :meth:`_publish_all`); one that outlives the budget is kept in
         ``self._abandoned`` so it is neither collected mid-flight nor left with an unretrieved
-        exception, and is cancelled at close with every other pending task.
+        exception, and is cancelled at close with every other pending task. It is also recorded
+        in ``self._stuck``, the abandoned-publish latch, until its done callback clears it.
 
         Args:
           target: The client or JetStream context to publish on.
@@ -1134,9 +1270,28 @@ class NATSSink:
         if not done:
             self._abandoned.add(task)
             task.add_done_callback(self._abandoned.discard)
+            self._stuck = (*self._stuck, task)
+            task.add_done_callback(self._unstick)
             return False
         task.result()
         return True
+
+    def _unstick(self, task: asyncio.Task[Any]) -> None:
+        """Clears a finished abandoned publish from the latch; a done callback on the loop thread.
+
+        Replaces the tuple whole rather than mutating it, so a caller thread reading it without a
+        lock sees the old tuple or the new one and never a set changing size under its iteration.
+
+        Args:
+          task: The abandoned publish that finished.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._stuck = tuple(other for other in self._stuck if other is not task)
 
     def flush(self) -> None:
         """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
@@ -1168,8 +1323,9 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink is closed or closing, this is a forked child, the round
-            trip went unanswered or the client is disconnected, or the backstop bound expired.
+          SinkDeliveryError: The sink is closed or closing, this is a forked child, either latch
+            holds, the round trip went unanswered or the client is disconnected, or the backstop
+            bound expired.
           Exception: Whatever an injected client's driver raises while flushing.
         """
         self._refuse_outside_the_lock("NATSSink cannot flush")
@@ -1202,9 +1358,10 @@ class NATSSink:
             return
         if not self._is_connected():
             raise SinkDeliveryError("NATSSink cannot flush: the client is disconnected")
-        if not (await self._drained(deadline) and await self._await_probe(deadline)):
+        if not await self._confirm(deadline, arm=True):
             raise SinkDeliveryError(
-                f"NATSSink cannot flush: no PONG from the server within {self.publish_timeout}s"
+                f"NATSSink cannot flush: no PONG confirmed the outbound buffer within "
+                f"{self.publish_timeout}s"
             )
 
     async def _flush_client(self, deadline: float) -> None:

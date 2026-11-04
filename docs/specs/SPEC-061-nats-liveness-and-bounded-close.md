@@ -174,11 +174,27 @@ both paths, as a task waited with `asyncio.wait` under what remains of the deadl
 cancels it**: the driver swallows the cancellation and the bytes already in its buffer may yet land
 (M3, M6). A publish that outlives the deadline is abandoned with a reference kept until `close()`,
 counted as published, and the events after it as unattempted, exactly as budget expiry counts
-them; on the core path FR-003's confirmation then runs on what remains of the deadline, which is
-normally nothing, so the batch is counted, and on the JetStream path, which has no confirmation,
-the abandoned publish is counted as unconfirmed at once and announced. The force-flush fires on
-the driver's **cumulative** pending size, so several JetStream publishes into a peer that stopped
-reading reach it as a core batch does, which is why the JetStream path is wrapped too.
+them; for a core client the sink probes, FR-003's confirmation then runs on what remains of the
+deadline, which is normally nothing, so the batch is counted, and wherever no confirmation will
+run -- the JetStream path, an injected client of either mode, a client without `flush` -- the
+abandoned publish is counted as unconfirmed at once and announced (diff review frame 2, finding
+1: an injected core client's abandoned publish was counted nowhere, so a batch of one returned
+with `failed` at zero). The force-flush fires on the driver's **cumulative** pending size, so
+several JetStream publishes into a peer that stopped reading reach it as a core batch does, which
+is why the JetStream path is wrapped too.
+
+**The abandoned-publish latch.** While any abandoned publish is still pending, `emit` and `flush`
+raise `SinkDeliveryError` naming it **at once**, before taking `self._lock` and again after
+acquiring it, for every client, the sink's own and an injected one alike: the next publish would
+only queue behind the same blocked force-flush. The state is one tuple the loop thread replaces
+whole (`_stuck`), read without a lock, and it clears when the abandoned task finishes. This keeps
+"a stall costs one caller one budget" true on the twin FR-002's latch cannot see, since an
+injected client is never probed; before it, eight concurrent orphan `info()` calls against an
+injected client whose publish blocked were served one after another at `4e96d1d`, 0.30 s to
+2.41 s, every counter at zero. The check after the lock is what refuses callers that queued
+before the publish ahead of them was abandoned. An abandoned injected `flush()` (FR-004) does
+not latch, because an injected flush is a PONG wait, not a write the next publish would queue
+behind.
 
 `close()` is FR-004's sequence; its tail stops the loop and joins the thread under
 `LOOP_JOIN_TIMEOUT`. Before stopping it cancels every task still pending on the loop and lets the
@@ -256,6 +272,14 @@ because a join that waits longer defeats FR-004's bound. `DEFAULT_CLOSE_TIMEOUT`
       the queued calls raise `SinkDeliveryError` naming a closing sink with the fake's `publish`
       count unchanged since `close()` began; a mutant that drops the post-acquire `_closing` read
       lets them publish.
+- [ ] AC-14 (frame 2, finding 1): an injected core client whose publish never returns, with a
+      batch of one and `publish_timeout=0.3`, makes `emit` return with `failed` 1 and a "publish
+      abandoned" announcement; with a batch of three, `failed` 3.
+- [ ] AC-15 (frame 2, finding 1): for an owned and an injected client whose publish blocks
+      after queueing its bytes, three `emit`s and a `flush` queued on the lock behind the
+      abandoned publish raise `SinkDeliveryError` naming it without publishing (one `publish`
+      call in total); an `emit` made while another thread holds the lock is refused in under
+      0.05 s; and once the abandoned publish finishes, the next `emit` is accepted.
 - [ ] AC-13: Serves invariants 3, 5, 6 and 12; invariant 6 because `emit`, `flush` and `close` all
       reach the loop through one submit-and-wait helper, asserted by the thread records in AC-2
       covering all three.
@@ -307,7 +331,10 @@ later caller is refused immediately, instead of each queueing on the lock for it
 `publish_timeout` (which is the application's thread on the orphan path, invariant 4), until the
 probe is answered, which resumes delivery, or a reconnect discards it. The latch clears when the
 probe task finishes for any reason, because the next call then sends a fresh PING and waits on
-that.
+that. When FR-003's drained wait fails, `emit` and `flush` leave a probe outstanding without
+waiting for it, so the latch has a PING to age even when the stall shows as a buffer that is not
+moving rather than as an unanswered PING (diff review frame 2, finding 2: before, the confirmation
+short-circuited before any PING, so the next caller paid a whole budget sending its own).
 
 `PENDING_POLL = 0.005` is the step of the timed yield the FR-003 drained wait polls on.
 `PROBE_FLUSH_TIMEOUT = 600.0` is the driver's own `wait_for` bound inside the probe and must
@@ -400,9 +427,15 @@ PONG (FR-002 rule 3) means the server processed every publish before it. A count
 never sees reach zero counts the batch, which is right: a PING only bumps the counter (the
 flusher's next run resets it with the rest), so on a connection that is draining at all it clears,
 and the only way it stays non-zero to the deadline is a peer that has stopped reading. A client
-that does not publish the counter is treated as drained. No answer, including when the deadline
-is already spent or the client has become disconnected (the probe is still sent where it can be,
-so the next call can reuse it), means every
+that does not publish the counter is treated as drained. **Only a PING sent after the counter read
+zero confirms**: a probe still outstanding at that moment (one FR-002's latch was aging, sent over
+an undrained buffer) is waited out first as a liveness answer, and the confirming PING is sent
+fresh once it has finished, so at most one probe is outstanding and none sent before the drain
+ever confirms. When the counter does not reach zero, a probe is left outstanding unawaited for
+FR-002's latch (`close()` excepted, since nothing follows it), and that PING may overtake the
+buffer, which is why the rule above exists. No answer, including when the deadline is already
+spent or the client has become disconnected (the probe is still sent where it can be, so the next
+call can reuse it), means every
 event that was published and not otherwise counted is added to `failed` and announced once through
 `_diag.lost` with a reason naming the unconfirmed round trip, and **`emit` returns**. It does not
 raise, because the bytes are in flight to a server that may yet process them, and a worker retry
@@ -462,19 +495,27 @@ retry can count it again.
       trip and no count.
 - [ ] AC-14 (review finding 1): with a fake whose publishes queue in a pending buffer its PING
       bypasses and whose flusher is parked, `emit` of three events returns at the deadline with
-      `failed` 3, one "unconfirmed" line, and the fake's `flush` called once (no confirming PING
-      was sent over a non-empty buffer); against the build before this wait the batch read
-      confirmed with `failed` 0. With a flusher that drains 0.2 s after the batch, the PING is
+      `failed` 3, one "unconfirmed" line, and the fake's `flush` called twice -- the pre-publish
+      probe and, at the deadline, one liveness PING over the full buffer that the fake answers
+      and that confirms nothing (frame 2, finding 2); against the build before this wait the batch
+      read confirmed with `failed` 0. With a flusher that drains 0.2 s after the batch, the PING is
       sent after both publishes were written and the batch is confirmed with `failed` 0. A
       confirming PING left outstanding past one emit's deadline (that batch counted) and answered
       during the next emit's reuse of it leaves the next batch confirmed, its own confirming PING
       sent after its publish was written. `flush()` and `close()`'s step 1 take the same wait
-      and send no PING over a parked flusher. A client without `pending_data_size` is treated as
-      drained.
+      and send no confirming PING over a parked flusher (`flush()` leaves one liveness PING,
+      `close()` none). A client without `pending_data_size`, or whose counter raises, is treated
+      as drained.
 - [ ] AC-15 (review finding 7): in JetStream mode with a fake whose publish blocks forever and
       `publish_timeout=0.5`, `emit` of three events returns at about 0.5 s with `failed` 3 (one
       abandoned and announced as unconfirmed, two unattempted), the loop thread alive and the
       sink open; before the JetStream wrap the parked publish reached the backstop.
+- [ ] AC-16 (frame 2, finding 2): with the flusher parked and the server silent after the
+      publishes, the call after an unconfirmed batch, made once `publish_timeout` has passed, is
+      refused by the latch in under 0.05 s and sends no PING of its own; and a liveness PING left
+      outstanding over an undrained buffer and answered during a later `flush()`, after the
+      buffer drained, does not confirm it: that flush sends a fresh PING after the drain (the
+      PINGs read 0, 0 and 1 written publishes).
 - [ ] AC-12: Serves invariants 2, 4, 6 and 7; invariant 2 because the unconfirmed events are
       counted and announced, invariant 4 because FR-005 records the two-round-trip cost on the
       orphan path, invariant 6 because core and JetStream are twins and differ only here, and
@@ -705,6 +746,8 @@ _probe: tuple[asyncio.Task[None], float, int] | None   # (task, monotonic() when
                                        #  would trip the latch on a probe just sent), one tuple
                                        #  cannot
 _abandoned: set[asyncio.Task[None]]    # core publishes that outlived their deadline, kept until close
+_stuck: tuple[asyncio.Task[None], ...] # abandoned publishes still pending: the second latch, read
+                                       #  lock-free, replaced whole by the loop thread
 _drain_timeout: float                  # the sink's own close deadline D
 ```
 
@@ -716,10 +759,12 @@ the README table row is unchanged.
 
 ```
 emit(batch)   raises SinkDeliveryError: closed or closing, forked child, disconnected, probe
-                      unanswered or latched, nothing published, or the backstop expired.
+                      unanswered or latched, an abandoned publish still pending, nothing
+                      published, or the backstop expired.
               returns None, having counted the batch in `failed`, when a core batch is unconfirmed.
 flush()       raises SinkDeliveryError: closed or closing, forked child, disconnected, probe
-                      unanswered or latched, or the backstop expired.
+                      unanswered or latched, an abandoned publish still pending, or the backstop
+                      expired.
 close()       raises TimeoutError: the round trip went unanswered within the deadline, or the
                       backstop expired (the loop is wedged: the sink marks itself closed, stops
                       the loop with call_soon_threadsafe and joins under LOOP_JOIN_TIMEOUT); or the

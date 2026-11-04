@@ -1694,6 +1694,11 @@ def test_a_ping_is_not_sent_while_publishes_are_still_queued_behind_the_flusher(
     confirming PONG arrived after 133 of 400 publishes. At 810b4c4 this fake's PING is answered
     and the batch reads confirmed with ``failed=0``; now the sink waits for the counter to read
     zero and counts the batch when the deadline passes first.
+
+    Since frame-2 finding 2 the sink then leaves a liveness probe outstanding for the latch to
+    age, and that PING does go out over the undrained buffer: the fake answers it, and the batch
+    must still read unconfirmed, because a PING sent before the buffer drained is never a
+    confirmation.
     """
     sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
     elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
@@ -1704,8 +1709,9 @@ def test_a_ping_is_not_sent_while_publishes_are_still_queued_behind_the_flusher(
 
     assert error is None
     assert 0.3 <= elapsed <= 0.3 + MARGIN, f"{elapsed:.2f}s"
-    assert losses == SinkLosses(dropped=0, failed=3)
-    assert fake.calls.count("flush") == 1, "no confirming PING while the buffer is non-empty"
+    assert losses == SinkLosses(dropped=0, failed=3), "the answered liveness PING confirmed it"
+    assert fake.pubs_at_ping == [0, 0], "the probe, then one liveness PING over the full buffer"
+    assert fake.timed_out == 0 and not fake._pongs, "and the server answered that PING"
     assert "unconfirmed" in capsys.readouterr().err
 
 
@@ -1768,16 +1774,21 @@ def test_a_reused_probes_ping_bytes_do_not_make_a_healthy_batch_unconfirmed(monk
 
 
 def test_close_and_flush_wait_for_the_flusher_before_their_ping(monkeypatch) -> None:
-    # FR-004's step one and `flush()` take the same wait: with the flusher parked, neither sends
-    # a PING and both report the deadline rather than a false confirmation.
+    # FR-004's step one and `flush()` take the same wait: with the flusher parked, both report
+    # the deadline rather than a false confirmation. Each of `emit` and `flush` leaves one
+    # liveness PING for the latch when its wait fails (frame-2 finding 2), and the fake answers
+    # both, so a sink that let such a PING confirm the buffer would not raise here. `close()`
+    # arms none, since nothing follows it.
     sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
     sink.emit([{"n": 1}])
+    assert fake.calls.count("flush") == 2
     with pytest.raises(SinkDeliveryError, match="PONG"):
         sink.flush()
-    assert fake.calls.count("flush") == 1
+    assert fake.calls.count("flush") == 3
     with pytest.raises(TimeoutError):
         sink.close()
-    assert fake.calls.count("flush") == 1, "close's step one sent no PING over a parked flusher"
+    assert fake.calls.count("flush") == 3, "close's step one sent no PING over a parked flusher"
+    assert fake.pubs_at_ping == [0, 0, 0]
 
 
 class CounterlessFakeNATS(LiveFakeNATS):
@@ -1916,3 +1927,202 @@ def test_a_blocking_jetstream_publish_is_abandoned_counted_and_the_sink_stays_op
     assert losses == SinkLosses(dropped=0, failed=3)
     assert "lost 1 event(s)" in err and "JetStream publish abandoned" in err
     assert "lost 2 event(s)" in err and "publish_timeout" in err
+
+
+# --- Frame-2 finding 1: an abandoned publish is counted on every twin, and latches ------------
+
+
+class ForceFlushBlockedNATS(LiveFakeNATS):
+    """A publish appends to the pending buffer, then blocks in the force-flush until the gate opens.
+
+    ``Client._send_command`` appends the command and bumps ``pending_data_size`` before it
+    force-flushes, so the bytes are already queued when the await stops returning; the base fake
+    parks before it queues anything, which would let an owned client's confirmation PING be
+    answered for a publish that never left.
+    """
+
+    async def _enter_publish(self, payload: bytes) -> None:
+        self._record("publish")
+        self.publish_entered.set()
+        self._add_pending(len(payload))
+        if self.publish_gate is not None:
+            await self.publish_gate.wait()
+        self.published.append(payload)
+        self._kick_flusher()
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_an_injected_core_publish_that_never_returns_is_counted_and_announced(
+    capsys, size: int
+) -> None:
+    """Frame-2 finding 1: before this, ``failed`` stayed 0 for a batch of one, silently.
+
+    An injected client has no confirmation round trip (M10), so nothing after the publish would
+    ever judge the abandoned event; it is counted as unconfirmed where it is abandoned, exactly
+    as the JetStream twin counts it, and the remainder as unattempted.
+    """
+    client = ForceFlushBlockedNATS()
+    gate = asyncio.Event()
+    client.publish_gate = gate
+    sink = NATSSink("logs", client=client, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": i} for i in range(size)]))
+    losses = sink.losses()
+    _open(sink, gate)
+    sink.close()
+    err = capsys.readouterr().err
+
+    assert error is None, error
+    assert elapsed <= 0.3 + MARGIN, f"{elapsed:.2f}s"
+    assert losses == SinkLosses(dropped=0, failed=size)
+    assert "lost 1 event(s); NATSSink unconfirmed, publish abandoned" in err, err
+    if size > 1:
+        assert f"lost {size - 1} event(s)" in err and "publish_timeout" in err
+
+
+def _wait_until(predicate: Callable[[], bool], within: float = 2.0) -> bool:
+    end = time.monotonic() + within
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.parametrize("owned", [True, False], ids=["owned", "injected"])
+def test_an_abandoned_publish_refuses_later_callers_at_once_until_it_finishes(
+    monkeypatch, owned: bool
+) -> None:
+    """Frame-2 finding 1, the latch: a stall behind a blocked force-flush costs one caller.
+
+    Callers already queued on the lock when the publish is abandoned are refused once they get
+    it, without publishing (the check after the lock); a caller arriving while another thread
+    holds the lock is refused without waiting for it (the check before the lock). When the
+    abandoned publish finishes the latch clears and the next emit is accepted. Before this, p9
+    measured eight such callers served one after another, 0.30 s to 2.41 s, every one of them
+    publishing into the same blocked flush.
+    """
+    if owned:
+        sink, fake, _ = _build(monkeypatch, factory=ForceFlushBlockedNATS, publish_timeout=0.3)
+    else:
+        fake = ForceFlushBlockedNATS()
+        sink = NATSSink("logs", client=fake, publish_timeout=0.3)
+    gate = asyncio.Event()
+    fake.publish_gate = gate
+    outcomes: dict[str, BaseException | None] = {}
+
+    def call(tag: str, action: Callable[[], object]) -> None:
+        outcomes[tag] = _timed(action)[1]
+
+    first = threading.Thread(target=call, args=("first", lambda: sink.emit([{"n": 0}])))
+    first.start()
+    assert fake.publish_entered.wait(2.0)
+    queued = [
+        threading.Thread(target=call, args=(f"q{i}", lambda i=i: sink.emit([{"n": i + 1}])))
+        for i in range(3)
+    ]
+    queued.append(threading.Thread(target=call, args=("flush", sink.flush)))
+    for thread in queued:
+        thread.start()
+    for thread in [first, *queued]:
+        thread.join(5.0)
+    publishes = fake.calls.count("publish")
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with sink._lock:
+            holding.set()
+            release.wait(5.0)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(2.0)
+    try:
+        late_elapsed, late_error = _timed(lambda: sink.emit([{"n": 9}]))
+    finally:
+        release.set()
+        holder.join(5.0)
+
+    _open(sink, gate)
+    cleared = _wait_until(lambda: not sink._stuck)
+    after_error = _timed(lambda: sink.emit([{"n": 10}]))[1]
+    losses = sink.losses()
+    sink.close()
+
+    assert outcomes["first"] is None, outcomes["first"]
+    for tag in ("q0", "q1", "q2", "flush"):
+        error = outcomes[tag]
+        assert isinstance(error, SinkDeliveryError) and "abandoned" in str(error), (tag, error)
+    assert publishes == 1, "a queued caller published into the blocked flush"
+    assert isinstance(late_error, SinkDeliveryError) and "abandoned" in str(late_error)
+    assert late_elapsed < 0.05, f"the latch must refuse without queueing: {late_elapsed:.3f}s"
+    assert cleared, "the latch did not clear when the abandoned publish finished"
+    assert after_error is None, after_error
+    assert losses == SinkLosses(dropped=0, failed=1), "the abandoned event, counted once"
+
+
+# --- Frame-2 finding 2: a buffer that never drains still arms the latch -----------------------
+
+
+class ParkedAndStalledNATS(StallsAfterFirstPublishNATS):
+    """The flusher is parked and the server stops answering once the batch is published."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flusher_parked = True
+
+
+def test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age(monkeypatch) -> None:
+    """Frame-2 finding 2: the call after an undrained batch is refused at once, not after a budget.
+
+    The confirmation's drained wait failing used to short-circuit before any PING, so no probe
+    existed for the latch to age, and the next caller sent one and waited a whole budget (p11:
+    0.95 s for callers queued behind a 0.5 s emit). A probe is now left outstanding when the wait
+    fails; once it has gone unanswered for ``publish_timeout`` the next call is refused before the
+    lock, sending no PING of its own.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.3)
+    sink.emit([{"n": 1}])
+    first = sink.losses()
+    pings = fake.calls.count("flush")
+    time.sleep(0.35)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 2}]))
+    later = fake.calls.count("flush")
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert first == SinkLosses(dropped=0, failed=1)
+    assert pings == 2, "the pre-publish probe, then the one left for the latch"
+    assert isinstance(error, SinkDeliveryError) and "PING" in str(error), error
+    assert elapsed < 0.05, f"the latch must refuse at once: {elapsed:.3f}s"
+    assert later == pings, "the refused call sent no PING of its own"
+
+
+def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) -> None:
+    """Frame-2 finding 2's guard: a liveness probe is never a batch's confirmation.
+
+    The PING left for the latch went out over an undrained buffer, so it may have overtaken the
+    publishes. Here the buffer then drains and that PING's PONG arrives during a ``flush()``: the
+    flush must take it as liveness only and send a fresh PING, after the drain, to confirm. A sink
+    that reused the outstanding probe as the confirmation would return after two PINGs, the second
+    sent with nothing written.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.5)
+    sink.emit([{"n": 1}])
+    assert fake.pubs_at_ping == [0, 0], "the probe, then the liveness PING over the full buffer"
+
+    async def drain_and_answer_late() -> None:
+        fake.flusher_parked = False
+        fake._run_flusher()
+        fake.answering = True
+        asyncio.get_running_loop().call_later(0.1, fake.deliver_pong)
+
+    _on_loop(sink, drain_and_answer_late())
+    elapsed, error = _timed(sink.flush)
+    pings = list(fake.pubs_at_ping)
+    sink.close()
+
+    assert error is None, error
+    assert elapsed < 0.5, f"{elapsed:.2f}s"
+    assert pings == [0, 0, 1], "the confirmation must be a fresh PING sent after the drain"
