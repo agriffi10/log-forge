@@ -95,9 +95,10 @@ transcript search that finds no message between two sessions does not prove they
 When Andrew worries about a class of problem (for instance, that recent changes let a sink block an
 application thread), spend one fresh-context `reviewer` subagent per branch, one at a time with the
 branch nearest the queue's head first, as his global rule on review agents asks. Pull
-`docs/process/model-routing.md` for the model and `docs/process/reviewer-contract.md` for the
-brief. Give each its own worktree (`isolation: "worktree"`, then `git switch --detach <branch>`
-because the branch is checked out elsewhere, and have it report the SHA it reviewed). Brief each one:
+`docs/process/agent-roles.md` for the role and `docs/process/reviewer-contract.md` for the
+brief, and pass no `model`, so each runs on this session's. Give each its own worktree
+(`isolation: "worktree"`, then `git switch --detach <branch>` because the branch is checked out
+elsewhere, and have it report the SHA it reviewed). Brief each one:
 - to start from the caller, not the diff: what the public API lets an application do, and which
   inputs and failures that produces;
 - to enumerate the whole population (every new raise, refusal or wait) before judging any;

@@ -83,7 +83,7 @@ this way).
   register* lists the rest); holds
   `docs/process/` to its router (imports match the loaded table, every part a row and every row a
   file, no nested imports), and `.claude/rules/` and `.claude/agents/` to their shapes — the two rule
-  templates, the allowed glob forms, the allowed models, the routing table; requires every Completed
+  templates, the allowed glob forms, `model: inherit`, the roles table; requires every Completed
   spec — read from its frontmatter, failing a spec whose `spec_status` cannot be read rather than
   skipping it — to have a delivery doc; checks that the pointers out of the always-loaded files resolve; and
   refuses one

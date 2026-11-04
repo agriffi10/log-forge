@@ -199,7 +199,9 @@ fi
 # written with one end anchored and the other on the word "here" went stale one commit after it was
 # written. Adding cases needs no edit here; `tests/docs-lint/` counted against this number says what
 # the headroom is today.
-CASES_MIN=294
+# Re-ratcheted to keep that headroom when the agent-roles port added its cases: the additions
+# had let it grow past three, so losing the whole `yaml-*` family had stopped firing.
+CASES_MIN=306
 if { [ -z "${DOCS_LINT_TEST_CASES:-}" ] || [ -n "${DOCS_LINT_TEST_FLOOR:-}" ]; } && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "docs-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"
   echo "shrunk or gone missing — a run over nothing exits 0 and looks exactly like a healthy"
