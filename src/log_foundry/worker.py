@@ -469,6 +469,25 @@ class Worker:
         a deadline the parent's caller set, forever. A retired parent forks a retired child, and
         that child's record is left as it stands.
 
+        **The resume branch also resets the stop gate and replaces a set stop event**
+        (SPEC-068 FR-005). Such a worker's child inherits ``_stopped`` true, which would make its
+        first ``shutdown()`` a losing caller that records no deadline, and inherits ``_stop``
+        **set**, because ``_fork._fresh_primitive`` carries an event's set state across — and
+        :meth:`_drain` tests ``_stop`` first, so the resumed drain loop exited at once. Measured:
+        the child's drain thread had ended before its first submission, which was never
+        delivered and never counted. Resetting ``_stopped`` alone was measured too and is not
+        enough: the deadline is then recorded, but the drain thread is still dead. So the branch
+        clears ``_stopped`` and ``_join_owed`` and takes its event from
+        :meth:`~log_foundry._lifecycle._Lifecycle.refresh_stop_signal`, the call ``__init__``
+        makes: the owner's current event when that is unset, so a worker never stopped keeps the
+        event it had and the identity with the owner and the sink is unchanged, and a fresh one
+        shared with the owner when it is set. It runs before the stop signal is offered, so the
+        sink is handed the new event. The owner's lock is not taken, for the reason
+        :func:`_lifecycle._rebuild_worker_after_fork` gives. The retired branch keeps all three
+        as inherited — a fork does not undo a ``shutdown()`` — and an owed join inherited there is
+        harmless: the next ``shutdown()`` in that child takes it over, finds ``_drain_finished``
+        set and joins the inherited thread, which is dead in the child and returns at once.
+
         ``_held`` is reset to the live sink alone. A child stranded nothing, and ``releasable()``
         refuses the parent's sinks on the pid stamp anyway — so keeping a superseded one buys no
         close and costs a strong reference, plus a pointless refused release at every child exit.
@@ -513,10 +532,17 @@ class Worker:
         what keeps :meth:`shutdown` from queueing a sentinel into a queue no thread will read.
 
         The success path assigns ``self._thread`` *after* the start, so for an instant a live
-        drain thread coexists with the inherited dead one in that attribute. That is safe only
-        because the drain thread never reads it — ``_run``, ``_drain``, ``_terminal_failure``
-        and ``_release_waiters`` do not, and the three readers are all on caller threads — which
-        is an invariant this note states rather than one anything enforces.
+        drain thread coexists with the inherited dead one in that attribute. ~~That is safe only
+        because the drain thread never reads it~~ — struck (SPEC-068 FR-006): :meth:`claim_stop`
+        and :meth:`stop` now ask ``threading.current_thread() is self._thread``, and they run on
+        the drain thread when a sink's ``emit`` calls ``shutdown()``. Inside that instant the
+        comparison would read false, the call would join the dead thread, which returns at once,
+        and :meth:`may_be_inside` would read the sink as free under an emit in flight. It cannot
+        happen: the new thread reaches ``sink.emit`` only by taking a submission or a marker from
+        the queue, the queue was replaced empty above, and nothing can fill it before the
+        assignment, because this handler runs on the child's only thread and nothing else in the
+        child runs until it returns. That is an argument this note states, not something any
+        lock enforces.
 
         Args:
           resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
@@ -543,6 +569,9 @@ class Worker:
             self._drain_settled.set()
             return
         self._exit_deadline = None
+        self._stopped = False
+        self._join_owed = False
+        self._stop = _lifecycle._state.refresh_stop_signal()
         self._drain_finished.clear()
         self._drain_settled.clear()
         _lifecycle.offer_stop_signal(self.sink, self._stop)

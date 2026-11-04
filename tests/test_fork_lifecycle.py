@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
+from conftest import install_worker
 from log_foundry import _fork, _lifecycle
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
@@ -1436,13 +1437,23 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     ``_drain_finished`` on a retired worker today, so the elapsed time cannot distinguish it and
     a first version of this test left that statement unkillable while the commit claimed
     otherwise; the state is asserted directly instead.
+
+    **The parent's stop is a real ``shutdown()``, so the child is really retired** (SPEC-068).
+    An earlier version installed the worker by assigning the slot and stopped it with a direct
+    ``worker.stop(30.0)``, which never moves the retirement count — so its child was *resumed*,
+    and the test passed only because a resumed child's drain loop exited at once on the
+    inherited set stop event. With that fixed, the retired branch's two ``set()`` calls could be
+    deleted and the test stayed green. Installing through ``install_worker`` and stopping through
+    ``_lifecycle._shutdown_worker`` is what puts the child on the branch this test is about.
     """
     sink, stream = _gated_file_sink(tmp_path, name="mid-shutdown.ndjson")
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     gate = _park_the_drain_thread(stream, worker, 0)
 
-    shutting_down = threading.Thread(target=lambda: worker.stop(30.0), daemon=True)
+    shutting_down = threading.Thread(
+        target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True
+    )
     shutting_down.start()
     deadline = time.monotonic() + 5.0
     while not worker._stopped and time.monotonic() < deadline:
@@ -1485,6 +1496,10 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     answer and the statement under test does nothing — a first version of this test did exactly
     that and passed in both worlds. The drain thread is parked inside ``emit`` and the shutdown
     runs on its own thread, so the fork lands while ``_drain_settled`` is genuinely unset.
+
+    **And the shutdown is a real one** (SPEC-068), for the reason the exit-budget test above
+    gives: a direct ``worker.stop()`` never moves the retirement count, so its child was resumed
+    rather than retired and this test passed through the FR-005 defect, not the retired branch.
     """
 
     class _SignalGateSink:
@@ -1505,13 +1520,15 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     sink = _SignalGateSink()
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     gate = _Gate()
     sink.gate = gate
     worker.submit([{"msg": "parks the drain thread"}])
     assert gate.entered.wait(5.0), "the drain thread never parked, so the fork misses the window"
 
-    shutting_down = threading.Thread(target=lambda: worker.stop(30.0), daemon=True)
+    shutting_down = threading.Thread(
+        target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True
+    )
     shutting_down.start()
 
     def parent_ready() -> bool:

@@ -16,6 +16,8 @@ wedged sink is released in a `finally`, so no blocked drain thread outlives its 
 
 from __future__ import annotations
 
+import io
+import os
 import re
 import sys
 import threading
@@ -28,6 +30,7 @@ from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _diag, _lifecycle
 from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
+from test_fork_lifecycle import report_from_child, run_in_child
 from test_worker_exit_budget import (
     _CPU_BOUND,
     _SLACK,
@@ -856,3 +859,208 @@ def test_the_owed_join_is_taken_over_once_when_both_claims_meet_at_the_lock(caps
         assert not worker._join_owed
     finally:
         sink.release.set()
+
+
+# --------------------------------------------------------------------------- FR-005
+
+_STARTED = "CHILD-STARTED;"
+"""Written by the child before anything else, so a child that crashed cannot read as a pass."""
+
+
+class _PidSink:
+    """Records which process delivered each batch; in a child, optionally slow and failing.
+
+    The parent's emits always deliver, so the worker can be stopped having delivered a span.
+    With `child_fails`, an emit in any other process idles for `child_seconds` and raises.
+    """
+
+    def __init__(self, *, child_fails: bool = False, child_seconds: float = 0.5) -> None:
+        self.parent = os.getpid()
+        self.child_fails = child_fails
+        self.child_seconds = child_seconds
+        self.log_foundry_stop_signal: threading.Event | None = None
+        self.emits: list[tuple[int, int, bool]] = []
+        self.closes = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Records the attempt, then delivers, or in a child with `child_fails` idles and raises."""
+        failing = self.child_fails and os.getpid() != self.parent
+        self.emits.append((os.getpid(), len(batch), not failing))
+        if failing:
+            threading.Event().wait(self.child_seconds)
+            raise RuntimeError("down in the child")
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closes += 1
+
+
+def _directly_stopped(sink: _PidSink) -> Worker:
+    """A worker that delivered one span and was stopped by `Worker.stop`, never by `shutdown()`.
+
+    A direct stop never moves the retirement count, so the fork handler resumes this worker;
+    both halves of that premise are asserted, with the stop event the child will inherit set.
+    """
+    worker = Worker(sink, batch_size=10, flush_interval=30.0)  # type: ignore[arg-type]
+    install_worker(worker)
+    worker.submit(_span(0))
+    worker.stop(5.0)
+    assert [n for _, n, ok in sink.emits if ok] == [1], "the premise: the parent delivered"
+    assert _lifecycle._state.live_worker() is worker, "the premise: the child will resume it"
+    assert worker._stop.is_set(), "the premise: the child inherits a set stop event"
+    return worker
+
+
+def _child_fields(child: object) -> dict[str, str]:
+    """Checks the positive control and parses the child's `key=value` report."""
+    assert child.finished, f"the child did not exit cleanly: {child}"  # type: ignore[attr-defined]
+    output: str = child.output  # type: ignore[attr-defined]
+    assert output.startswith(_STARTED), f"the child never reported its start: {output!r}"
+    return dict(field.split("=", 1) for field in output[len(_STARTED) :].split())
+
+
+def test_a_directly_stopped_worker_resumes_delivering_in_a_forked_child() -> None:
+    """FR-005 AC-1, AC-2 and AC-4. The resumed child has a drain thread that runs.
+
+    At `fda134a` the child inherited `_stopped` and a set `_stop`, its drain thread exited
+    before the first submission, nothing was delivered and its `shutdown()` recorded no
+    deadline. Its sink is the parent's, which the child must never close.
+    """
+    sink = _PidSink()
+    worker = _directly_stopped(sink)
+
+    def child() -> str:
+        report_from_child(_STARTED)
+        alive = worker._thread.is_alive()
+        worker.submit(_span(1))
+        cpu = time.process_time()
+        wall = time.monotonic()
+        log_foundry.shutdown(timeout=2.0)
+        elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+        mine = sum(n for pid, n, ok in sink.emits if pid == os.getpid() and ok)
+        return (
+            f"alive={alive} delivered={mine} elapsed={elapsed:.3f} cpu={spent:.4f} "
+            f"deadline={worker._exit_deadline is not None} closes={sink.closes}"
+        )
+
+    fields = _child_fields(run_in_child(child))
+    assert fields["alive"] == "True", fields
+    assert fields["delivered"] == "1", f"the child delivered its own span: {fields}"
+    assert float(fields["elapsed"]) < 0.5, fields
+    assert float(fields["cpu"]) < _CPU_BOUND, fields
+    assert fields["deadline"] == "True", fields
+    assert fields["closes"] == "0", "the child never closes a sink its parent acquired"
+
+
+def test_a_resumed_child_declines_retries_against_its_own_deadline() -> None:
+    """FR-005 AC-3 and AC-4. The child's exit drain fits the child's own budget.
+
+    A 0.5 s failing sink under `shutdown(timeout=1.2)`: two attempts, then the third is
+    declined. `fda134a` and a fix that resets `_stopped` alone both make no attempt at all.
+    """
+    sink = _PidSink(child_fails=True)
+    worker = _directly_stopped(sink)
+
+    def child() -> str:
+        report_from_child(_STARTED)
+        captured = io.StringIO()
+        sys.stderr = captured
+        worker.submit(_span(1))
+        cpu = time.process_time()
+        wall = time.monotonic()
+        log_foundry.shutdown(timeout=1.2)
+        elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+        attempts = sum(1 for pid, _, _ in sink.emits if pid == os.getpid())
+        lost = _lost_lines(captured.getvalue())
+        declined = sum(1 for _, _, rest in lost if "shutdown() deadline" in rest)
+        return (
+            f"attempts={attempts} elapsed={elapsed:.3f} cpu={spent:.4f} lost={len(lost)} "
+            f"declined={declined} failed={worker.failed_batches} closes={sink.closes}"
+        )
+
+    fields = _child_fields(run_in_child(child))
+    assert fields["attempts"] == "2", fields
+    assert float(fields["elapsed"]) < 1.2 + _SLACK, fields
+    assert float(fields["cpu"]) < _CPU_BOUND, fields
+    assert (fields["lost"], fields["declined"]) == ("1", "1"), fields
+    assert fields["failed"] == "1", fields
+    assert fields["closes"] == "0", "the child never closes a sink its parent acquired"
+
+
+class _SignalSink:
+    """A sink that declares `log_foundry_stop_signal`, so the worker offers it the stop event."""
+
+    def __init__(self) -> None:
+        self.log_foundry_stop_signal: threading.Event | None = None
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Delivers nowhere."""
+
+    def close(self) -> None:
+        """Nothing to close."""
+
+
+def test_resume_resets_the_stop_gate_and_replaces_a_set_stop_event() -> None:
+    """FR-005 AC-5. The resume branch gives a stopped worker what `__init__` gives a new one."""
+    sink = _SignalSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)  # type: ignore[arg-type]
+    worker.stop(2.0)
+    worker._join_owed = True
+    inherited = worker._stop
+    assert worker._stopped and inherited.is_set(), "the premise: a directly stopped worker"
+
+    worker._reinit_after_fork(resume=True)
+    try:
+        assert worker._stopped is False
+        assert worker._join_owed is False
+        assert worker._exit_deadline is None
+        assert worker._stop is not inherited and worker._stop.is_set() is False
+        assert worker._stop is _lifecycle._state._stop, "the owner and the worker share it"
+        assert sink.log_foundry_stop_signal is worker._stop, "and the sink was offered it"
+    finally:
+        worker.stop(2.0)
+        worker._thread.join(5.0)
+    assert not worker._thread.is_alive()
+
+
+def test_resume_keeps_an_unset_stop_event() -> None:
+    """FR-005 AC-5. A worker never stopped keeps the very event it had.
+
+    Called outside a fork, the original drain thread is still alive, blocked in `get` on the
+    queue the reinit replaced; that queue is handed a sentinel at teardown so both threads end.
+    """
+    sink = _SignalSink()
+    worker = Worker(sink, batch_size=1, flush_interval=0.01)  # type: ignore[arg-type]
+    before = worker._stop
+    original_thread, original_queue = worker._thread, worker._queue
+    assert not before.is_set(), "the premise: never stopped"
+
+    worker._reinit_after_fork(resume=True)
+    try:
+        assert worker._stop is before
+        assert worker._stop is _lifecycle._state._stop
+    finally:
+        original_queue.put_nowait(worker_mod._SHUTDOWN)
+        worker.stop(2.0)
+        worker._thread.join(5.0)
+        original_thread.join(5.0)
+    assert not worker._thread.is_alive() and not original_thread.is_alive()
+
+
+def test_retire_leaves_the_stop_gate_and_event_as_inherited() -> None:
+    """FR-005 AC-6, a regression pin. A fork does not undo a stop on the retired branch.
+
+    Against the resets applied on both branches, a retired child is handed a stop gate it can
+    win again and a stop event that is no longer set.
+    """
+    worker = Worker(_SignalSink(), batch_size=1, flush_interval=0.01)  # type: ignore[arg-type]
+    worker.stop(2.0)
+    worker._join_owed = True
+    inherited, deadline = worker._stop, worker._exit_deadline
+
+    worker._reinit_after_fork(resume=False)
+
+    assert worker._stopped is True
+    assert worker._join_owed is True
+    assert worker._stop is inherited and inherited.is_set()
+    assert worker._exit_deadline == deadline

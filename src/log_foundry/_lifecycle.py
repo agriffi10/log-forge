@@ -250,14 +250,20 @@ class _Lifecycle:
         ``shutdown()`` returned is handed a **fresh** one for the same reason a sink adopted then
         is — it delivers, and a set event would collapse every backoff to zero. A worker already
         holding the set event keeps it, since a retired worker is never restarted (SPEC-019), so
-        the replacement can only ever reach a later deliverer.
+        the replacement can only ever reach a later deliverer. **One worker holding a set event
+        is restarted** (SPEC-068 FR-005): a worker stopped by a direct ``Worker.stop()`` never
+        moved the retirement count, so a child forked from it is resumed, and its
+        ``_reinit_after_fork`` takes its event from here exactly as a freshly built worker does.
+        Without that, the resumed drain loop found the inherited event set and exited at once.
 
         It is a method rather than a rebind at the call site because the replacement must be a
         ``self`` attribute assignment: ``_fork``'s repair walk writes back at a module global or
         an instance attribute, and ``tests/test_fork_lifecycle.py``'s shape lint enforces that
         the source says so (SPEC-039 FR-002).
 
-        Callers hold ``_lock``.
+        Callers hold ``_lock``, with one exception: ``Worker._reinit_after_fork`` calls it from the
+        fork handler without it, for the reason :func:`_rebuild_worker_after_fork` gives for not
+        taking it — the child's only thread, its locks re-initialised moments earlier.
 
         Args:
           None.

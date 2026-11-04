@@ -1120,8 +1120,11 @@ def test_in_flight_is_reset_in_the_forked_child(resume: bool) -> None:
         assert worker._in_flight == 0
         assert worker._exit_deadline == (None if resume else 1.0)
     finally:
-        # A resumed thread here inherits the stop event the parent's stop() set — a real fork
-        # replaces that event before this handler runs — so its drain loop exits at once;
-        # joining it is what proves nothing is leaked, on either branch.
+        # A real fork carries the stop event's *set* state across, it does not replace it. Since
+        # SPEC-068 FR-005 the resume branch gives the worker an unset event and a reset gate, so
+        # its new drain thread keeps running until stopped; the retired branch starts none.
+        # Stopping and joining is what proves nothing is leaked, on either branch.
+        if resume:
+            worker.stop(2.0)
         worker._thread.join(5.0)
         assert not worker._thread.is_alive(), "no drain thread outlives the test"

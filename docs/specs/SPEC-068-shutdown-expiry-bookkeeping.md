@@ -153,6 +153,13 @@ join uses is the caller whose deadline the drain declines against.
     thread no longer exits at once after FR-005, so the test stops it; and its comment "a real fork
     replaces that event before this handler runs" is false — the replacement is set — and is
     corrected).
+  - `tests/test_fork_lifecycle.py::test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit`
+    and `::test_a_retired_childs_sink_is_not_left_backing_off_at_zero` (found by the plan review).
+    Each installed its worker by assigning the slot and stopped it with a direct
+    `worker.stop(30.0)`, which never moves the retirement count, so its child was *resumed*, not
+    retired, and passed only through the FR-005 defect: deleting the retired branch's two `set()`
+    calls left both green. Each now installs with `install_worker` and stops through
+    `_lifecycle._shutdown_worker(30.0)`, so the child really retires; the assertions are kept.
   - `tests/test_diag.py::test_diag_still_has_exactly_the_three_writers_it_documents` (renamed, as
     above).
   - Any other test the implementer finds asserting `lost N item(s)` from either line or the old
@@ -637,7 +644,10 @@ Worker._reinit_after_fork(*, resume)  # resume branch adds: _stopped = False; _j
 No public change. `shutdown()`, `flush()`, `configure()` and `Health` keep their signatures and
 fields. What a caller can observe changing is stderr wording (FR-001, FR-002), a `shutdown()`
 inside a sink's `emit` that returns instead of raising or blocking, and a later `shutdown()` that
-then joins and announces a wedge on its behalf (FR-006), and a resumed child delivering (FR-005).
+then joins and announces a wedge on its behalf (FR-006). A resumed child delivering (FR-005) is
+**not** caller-visible: both of `src/`'s callers of `Worker.stop` move the retirement count first,
+so a live worker that has been stopped exists only for a caller of the internal `Worker.stop`.
+FR-005 is hardening of that internal route, and the release notes carry no entry for it.
 
 ## File & Folder Structure
 
