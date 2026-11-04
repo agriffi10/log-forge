@@ -26,7 +26,16 @@ and the parser half the item did not list.
   turns a `str` subclass into its exact `str` through `str.__str__` on entry, for all four
   arguments. Guarded by `tests/test_inbound_totality.py`: the probe-by-argument rejection table,
   one adoption test per argument, the Probe G `current_traceparent()` test, the swept-span refusal
-  and the stream-fault verdict tests.
+  and the stream-fault verdict tests. Three guards keep the entry point from regrowing a path
+  around that normalisation:
+  - The table's single-argument columns are held equal to `continue_trace`'s signature.
+  - An AST check, `_normalisation_problems`, requires the body to open with one
+    `p = cast(…, _exact(p))` per parameter. A fixture corpus asserts the reason it gives for each
+    failure shape: a missing parameter, a late reassignment, the wrong name and a duplicate.
+  - Two columns pair a valid `traceparent` with a hostile `trace_id` or `parent_span_id`. Each
+    asserts the header is adopted, one "traceparent wins" line is written and no hook runs.
+
+  Each guard was shown to redden under a mutant that left the rest of the suite green.
 - **The prose** (FR-005): docstrings, the rewritten sentence in the failure-paths decision on
   `_diag`, superseded markers at SPEC-029's three spec sites and its delivery doc, and a
   `docs/release-notes/v1.1.0.md` entry. The probes the three test files share (`str_probe`,

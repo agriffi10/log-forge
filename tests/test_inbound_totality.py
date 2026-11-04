@@ -17,10 +17,13 @@ Every expected echo is a literal, never computed from `_diag`.
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import inspect
 import re
 import signal
 import sys
+import textwrap
 import threading
 import time
 import tracemalloc
@@ -30,7 +33,7 @@ import pytest
 
 import log_foundry
 from conftest import armed, fan_out, object_probe, str_probe
-from log_foundry import _diag
+from log_foundry import _diag, decorator
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -200,13 +203,31 @@ def _probe(kind: str, column: str) -> object:
     return str_probe(text, raising={kind.removeprefix("subclass")})
 
 
+_TRACEPARENT_WINS_COLUMNS = ("traceparent_plus_trace_id", "traceparent_plus_parent_span_id")
+
+
 def _continue(column: str, value: object) -> object:
     """Hands ``value`` to `continue_trace` as the one argument ``column`` names."""
     if column == "traceparent":
         return log_foundry.continue_trace(value)
     if column == "parent_beside_trace":
         return log_foundry.continue_trace(trace_id=_TRACE, parent_span_id=value)
+    if column == "traceparent_plus_trace_id":
+        return log_foundry.continue_trace(_TRACEPARENT, trace_id=value)
+    if column == "traceparent_plus_parent_span_id":
+        return log_foundry.continue_trace(_TRACEPARENT, parent_span_id=value)
     return log_foundry.continue_trace(**{column: value})
+
+
+def test_the_table_has_a_column_for_every_parameter() -> None:
+    """A parameter added to `continue_trace` must be classified here before anything passes.
+
+    The single-argument columns are hand-listed because each states a verdict (refused and
+    announced); this is what stops a new parameter being left out of them silently, the way a
+    new argument that skipped `_exact` would be — the rejection table cannot see a column it
+    does not have.
+    """
+    assert set(_REFUSING_COLUMNS) == set(inspect.signature(log_foundry.continue_trace).parameters)
 
 
 @pytest.mark.parametrize("kind", _PROBES)
@@ -244,6 +265,149 @@ def test_an_invalid_parent_beside_a_valid_trace_joins_as_a_root(
     assert result, "an invalid parent drops just the parent, never the trace"
     assert len(lines) == 1, lines
     assert "(invalid parent_span_id; joining as a root)" in lines[0]
+
+
+@pytest.mark.parametrize("kind", _PROBES)
+@pytest.mark.parametrize("column", _TRACEPARENT_WINS_COLUMNS)
+def test_a_valid_traceparent_wins_over_every_hostile_explicit_id(
+    capsys: pytest.CaptureFixture[str], column: str, kind: str
+) -> None:
+    """The traceparent branch tests the explicit ids only with `is not None`, after `_exact`.
+
+    So a hostile id beside a valid header is never read: the header is adopted and the one line
+    says it won. A guard there that inspects the id (an `isinstance`, a truthiness test) would
+    run its code, which is what this column exists to see.
+    """
+    value = _probe(kind, column)
+
+    with _deadline(5, f"continue_trace(<valid>, {column}=<{kind}>)"), armed() as calls:
+        result = _continue(column, value)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert calls == [], f"the value's own code ran: {calls}"
+    assert result, "a valid traceparent is adopted whatever the explicit ids are"
+    assert len(lines) == 1, lines
+    assert "(both traceparent and explicit ids given; traceparent wins)" in lines[0]
+
+
+# -- the normalisation's shape, checked on the source (twin paths, invariant 6) -------------------
+
+
+def _normalised_name(statement: ast.stmt) -> tuple[str, str] | None:
+    """For ``p = cast(<type>, _exact(q))`` returns ``(p, q)``; for anything else ``None``."""
+    if not (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+    ):
+        return None
+    call = statement.value
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "cast"
+        and len(call.args) == 2
+    ):
+        return None
+    inner = call.args[1]
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "_exact"
+        and len(inner.args) == 1
+        and isinstance(inner.args[0], ast.Name)
+    ):
+        return None
+    return statement.targets[0].id, inner.args[0].id
+
+
+def _normalisation_problems(source: str) -> list[str]:
+    """Every way `continue_trace`'s opening statements fail to normalise each parameter once.
+
+    The rule: after the docstring, the first statements are exactly one
+    ``p = cast(<anything>, _exact(p))`` per parameter, in any order, before any other statement.
+    The rejection table cannot guard this, because once the parsers refuse a subclass an argument
+    that skipped `_exact` is merely refused, which the table accepts.
+    """
+    function = next(
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.FunctionDef) and node.name == "continue_trace"
+    )
+    arguments = function.args
+    parameters = [a.arg for a in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)]
+    body = function.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    head = []
+    for statement in body:
+        pair = _normalised_name(statement)
+        if pair is None:
+            break
+        head.append(pair)
+    targets = [target for target, argument in head if target == argument]
+    later = [pair for pair in map(_normalised_name, body[len(head) :]) if pair is not None]
+    wrong = [f"{t}: _exact is applied to {a}, not to {t}" for t, a in head if t != a]
+    twice = [f"{n}: reassigned twice" for n in sorted({t for t in targets if targets.count(t) > 1})]
+    after = [f"{t}: normalised after another statement" for t, _ in later]
+    missing = [
+        f"{n}: not normalised before the first other statement"
+        for n in parameters
+        if n not in targets
+    ]
+    return wrong + twice + after + missing
+
+
+_SHAPE = '''
+def continue_trace(traceparent=None, *, trace_id=None, baggage=None):
+    """Doc."""
+    {lines}
+'''
+
+
+def _shape(*lines: str) -> str:
+    return _SHAPE.format(lines="\n    ".join(lines))
+
+
+_TP = 'traceparent = cast("str | None", _exact(traceparent))'
+_TID = 'trace_id = cast("str | None", _exact(trace_id))'
+_BAG = 'baggage = cast("str | None", _exact(baggage))'
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        (
+            _shape(_TP, _TID, "adopted = None"),
+            "baggage: not normalised before the first other statement",
+        ),
+        (_shape(_TP, _TID, "adopted = None", _BAG), "baggage: normalised after another statement"),
+        (
+            _shape(_TP, 'trace_id = cast("str | None", _exact(traceparent))', _BAG, "x = 1"),
+            "trace_id: _exact is applied to traceparent, not to trace_id",
+        ),
+        (_shape(_TP, _TID, _BAG, _TID, "x = 1"), "trace_id: reassigned twice"),
+    ],
+    ids=["missing", "after-another-statement", "wrong-name", "twice"],
+)
+def test_the_normalisation_check_names_each_way_it_fails(source: str, reason: str) -> None:
+    assert reason in _normalisation_problems(source)
+
+
+def test_the_normalisation_check_accepts_the_real_shape_in_any_order() -> None:
+    assert _normalisation_problems(_shape(_BAG, _TP, _TID, "adopted = None")) == []
+
+
+def test_continue_trace_normalises_every_parameter_first() -> None:
+    """The real `decorator.py`, by the same function the corpus above holds to its reasons."""
+    source = inspect.getsource(decorator.continue_trace)
+
+    assert _normalisation_problems(source) == []
 
 
 def _root_events(lf, fake_sink) -> list[dict]:
