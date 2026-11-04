@@ -36,8 +36,8 @@ This spec builds on SPEC-061 (`NATSSink` liveness and a bounded close), SPEC-066
 and are not in `depends_on` because they are not yet in this directory; `NATSSink` is converted
 **as SPEC-061 leaves it**, and no SPEC-061 criterion is rewritten here. It builds on SPEC-073 (the
 HTTP family on the engine), earlier in this arc, and uses its run context unchanged (FR-001). It
-consumes SPEC-069's encode step, SPEC-070's `_retryable_error` and entry predicates, and SPEC-071's
-`chunk_items` in `SQSSink`.
+consumes SPEC-069's encode guard through a sibling of its helper (FR-002), SPEC-070's
+`_retryable_error` and entry predicates, and SPEC-071's `chunk_items` in `SQSSink`.
 
 **The budget is 1.x's.** SPEC-072 gives a `deliver` sink's run, on the worker path,
 `(s + 1) x (w + 1) - 1` further rounds for a sink declaring `max_retries = s` under a worker with
@@ -82,7 +82,9 @@ often as before.
   finds 23 files, 21 once `base.py` (docstring) and `_deferral.py` (`wrapped_losses`) are set aside.
   Twelve are this spec's: the eleven above and `nats`. The other nine stay: `http`, `elasticsearch`,
   `honeycomb`, `otlp` and `sentry` (SPEC-073), `logstash` (SPEC-075), and `kafka`, `pubsub` and
-  `multi` (fixed decision). The plan counted 20 modules.
+  `multi` (fixed decision). The plan counted 20 modules. SPEC-069 adds a `losses()` to three more
+  modules outside this population (`stdout`, `file`, `sqlite`), which stay as SPEC-069 leaves them
+  (FR-006).
 - **The retry product.** A probe at `fda134a` (the shipped `RedisListSink`, `max_retries=3`, over a
   client whose `pipeline().execute()` raises `ConnectionError`, driven by `Worker(sink,
   max_retries=2)._emit` on a 5-event batch) made **12** client calls, left `sink.failed == 15` and
@@ -298,23 +300,56 @@ it*, applied to a keyed response. A missing `Failed` is the empty list, as today
 reply reads exactly as 1.x read it. `SQSSink` and `SNSSink` call it with `key="Id"`; `MongoDBSink`
 calls it with `key="index"` (FR-003).
 
-**The common round** of the four queue sinks, which FR-003 to FR-005 also follow:
+**The encode step in engine mode.** SPEC-069's `encode_events(batch, encode, pending, *, sink,
+counter="_unencodable")` counts on a `Deferral` into `_unencodable`, which these sinks no longer have
+(FR-006) and which a run spanning several `deliver` calls cannot use. So `_encode.py` gains a
+**sibling**, `encode_round(owner, batch, encode, *, sink)`, and `encode_events` keeps its signature
+and its callers (the local sinks, Kafka and Pub/Sub). Both run each event through one private guard,
+so the guard (`Exception` caught, never `BaseException`) is still written once. `encode_round`
+returns the round's positions and wire forms of the encodable events, in order; every position it
+omits is unencodable, and `deliver` makes it `DROPPED`. Its count is that outcome: SPEC-072's engine
+adds `DROPPED` events to `dropped_events` only when the run settles, which is the `Deferral`'s
+"counted only by a call that returned", and no `run_context().count` is made for it. Its line is
+SPEC-069's, unchanged in text, registered as `run_context().announce(<the line>, when=SETTLED)`.
 
-1. Build the batch's wire forms through SPEC-069's encode step and the sink's own drop decisions:
+**Each event is encoded once per run.** `encode_round` keeps every wire form, and every failure, in
+`run_context().notes(owner)`, keyed by event identity, as MongoDB keeps its documents (FR-003): a
+later round looks the event up instead of calling `encode` again. That keeps SPEC-069 FR-001's
+criterion that Postgres, the Redis sinks and ClickHouse call `encode` `len(batch)` times however many
+attempts are made, which a per-round encode would break, and it registers the line once per run,
+on the round that first meets a failure, which is the run's first round, since every later round's
+events are a subset of it. A round outside any run (SPEC-073: its own one-round run) encodes once.
+
+**The common round** of the four queue sinks, which FR-003 to FR-005 also follow, `NATSSink` excepted
+from step 1:
+
+1. Build the batch's wire forms through `encode_round` and the sink's own drop decisions:
    an unencodable event is `DROPPED` with SPEC-069's line, an oversized one is `DROPPED` with
    `dropped_oversized` counted `SETTLED` and its 1.x line, and an SQS event whose FIFO id callable
    raised is `DROPPED` with its line beside deliverable siblings. When every SQS event's id callable
    raised, the round is a refusal (FR-001): all `REJECTED`, with `refuse` given the caller's first
    exception, so the batch costs one attempt, no sink counter moves, and the adapter re-raises that
-   exception by identity.
+   exception by identity. A FIFO batch that **mixes** the two failures, with no deliverable event
+   (one id failure and one unencodable event, say), is neither case and is SPEC-069 FR-001's: its
+   events are all `DROPPED`, the run settles with `dropped_events == 2`, nothing is resent, and there
+   is no `refuse`, because not every event failed in caller code. `NATSSink` does not take this step.
+   SPEC-069 leaves it off the encode step, counting an unencodable event in `failed` as a publish
+   that raised, and FR-004 keeps that: the event is `REJECTED` with SPEC-061's publish line, so
+   `.failed` moves and `losses().dropped` does not.
 2. Chunk with the sink's existing chunker (`chunk_items`, kept from SPEC-071) and send **every
    remaining chunk once per round**, in order, through `_send`, now one attempt with no loop, which
    keeps SPEC-048's guard inside it. A chunk's failure does not hold back the chunks after it, so
    one entry that keeps failing costs only itself, as in 1.x.
 3. A call that raises runs the sink's cleanup and asks `is_retryable(self._retryable_error, err)`
    (SPEC-070), never the predicate directly, so a predicate that raises answers `False`: `True` makes
-   the chunk `RETRYABLE`; `False` makes it `REJECTED` with an `ALWAYS` line naming the type and `not
-   retried`.
+   the chunk `RETRYABLE`; `False` makes it `REJECTED` with an `ALWAYS` line in the arc's one form for
+   an exception, SPEC-070's `<Class>, N attempt(s), <Type>`, which SPEC-073 also writes, with `N` the
+   calls that carried the chunk (FR-001): `1 attempt(s)` for an exception refused on its first send.
+   On the engine this supersedes SPEC-070 FR-001's worker criterion: through `Worker(max_retries=2)`
+   a Redis client raising `TypeError` is called **once**, not three times, and `.failed` moves once
+   for the batch, because a `REJECTED` event is never resent and the worker no longer resends a whole
+   batch (SPEC-072). SPEC-070 FR-001's line criterion (one line naming `TypeError` and `1 attempt`)
+   still holds, in this one form.
 4. A response is adjudicated per entry. SQS and SNS: the keyed reader, then SPEC-070's
    `sender_fault`: a sender fault is `REJECTED`, marked a final rejection, with the 1.x line naming
    the first `Code`; any other failed entry is `RETRYABLE`; the rest `ACCEPTED`. Kinesis and Firehose:
@@ -329,6 +364,30 @@ calls it with `key="index"` (FR-003).
    chunks are sent without the held events. The send counts are kept in `notes(self)`. No other sink
    here promises an order across chunks (Kinesis `PutRecords` promises none across records), so
    none holds anything.
+
+**SQS's chunker changes signature.** SPEC-071 FR-004 kept `_chunks(batch, pending)`, handing its
+drops to the caller's `Deferral`, which this spec removes from `SQSSink`. It becomes
+`_chunks(batch) -> _Plan`, a `NamedTuple` of `chunks: list[list[_Prepared]]` (still built with
+`chunk_items`, still a list, every drop decided before the first send), `dropped: dict[int, str]`
+(each dropped position of the round's batch and its reason: oversize, id failure or unencodable) and
+`refused: Exception | None` (the first id callable's exception, set only when every event's id
+callable raised). `_Prepared` gains `index`, the event's position, so each chunk's outcomes map back
+to the verdict. `_chunks` counts and announces nothing; `deliver` turns `dropped` into `DROPPED`
+outcomes, writing the oversize and id-failure lines (`encode_round` registered the unencodable
+one), and `refused` into the refusal. SPEC-071's boundary corpus,
+`tests/test_sinks_sqs_chunks.py`, is kept and re-pointed at the new signature with the same cases
+and the same literal chunk lengths; it is not rewritten from the new code.
+
+**An SQS entry is prepared once per run, ids included.** In 1.x the sink's loop resent the same
+prepared entries, so a retry inside one `emit` kept its `MessageDeduplicationId` and SQS's 5-minute
+de-duplication interval could absorb a duplicate. Resolving the ids again each round would lose that,
+and `_dedup_id`'s random fallback would mint a new id per round. So `_chunks` keeps each event's
+prepared entry (body, `MessageGroupId`, `MessageDeduplicationId` and costed size) or its drop reason
+in `run_context().notes(self)`, keyed by event identity beside the wire forms `encode_round` keeps:
+the id callables and the random fallback run **once per event per run**, and every round of one run
+resends the identical entry. A round's `_Plan` is assembled from that cache: its chunks are re-formed
+over the events the round still holds, and each `_Prepared.index` is the event's position in that
+round's batch, so only the grouping and the index are per round.
 
 The run's raise-or-return then is the engine's, and it is 1.x's: SQS raised exactly when nothing
 landed and a retryable loss remained; Kinesis and Firehose when nothing landed and nothing was
@@ -367,7 +426,27 @@ unadjudicated; SNS (with SPEC-070) as SQS.
       `Worker(max_retries=2)`, 36 calls (12 per chunk), `failed_batches == 1`, `.failed` equal to the
       batch size, and the sink's lines read `4 attempt(s)` and `12 attempt(s)` respectively.
 - [ ] For each of the four, a chunk-one exception that `_retryable_error` refuses is one call,
-      counted, with chunks two and three sent in the same round.
+      counted, with chunks two and three sent in the same round, and its line reads
+      `1 attempt(s), <Type>`.
+- [ ] Encoded once per run: for `PostgresSink`, both Redis sinks and `ClickHouseSink` (SPEC-069
+      FR-001's four) and for each of the four queue sinks, over a client that fails retryably twice
+      and then accepts, with one unencodable event in the batch, `encode` is called `len(batch)` times
+      in all, SPEC-069's line for the unencodable event is written once, and the run settles with
+      `losses().dropped == 1`; a mutant that drops the `notes` cache reddens the call count.
+- [ ] SQS FIFO, a batch of one event whose id callable raises and one unencodable event and nothing
+      else: no client call, `deliver` called once, the run settles, `losses().dropped == 2`,
+      `.failed` unchanged, `emit` returns, and through `Worker(max_retries=2)` `failed_batches == 0`.
+- [ ] SQS FIFO ids once per run: over a client that fails one entry retryably twice and then
+      accepts it, with counting `group_id` and `dedup_id` callables (the latter returning `None`
+      for one event, so the random fallback runs), each callable is called once per event in the
+      run, and every resend of the failed entry carries the same `MessageDeduplicationId` and
+      `MessageGroupId` as its first send. A mutant that resolves ids per round reddens both the call
+      count and the id equality.
+- [ ] `tests/test_sinks_sqs_chunks.py` (SPEC-071 FR-004) is kept and re-pointed at the new
+      `_chunks(batch) -> _Plan`: every case keeps its batch and its literal chunk lengths; a drop it
+      used to read from the `Deferral` is read as that position in `_Plan.dropped`; the
+      all-id-failed case asserts `_Plan.refused` is the first exception by identity instead of a
+      raise. No case is deleted, which a diff of its collected test names on both refs shows.
 - [ ] Oversized and unencodable events are counted once, on a settled run only, `.dropped_oversized`
       and `losses().dropped` both moving for an oversized one and only `losses().dropped` for an
       unencodable one; a failed run moves neither.
@@ -392,7 +471,8 @@ unadjudicated; SNS (with SPEC-070) as SQS.
 `ClickHouseSink`, `MongoDBSink` and `PostgresSink` follow FR-002's common round with their own unit
 of a call.
 
-- **ClickHouse** encodes every row (SPEC-069), chunks with `chunk_list`, and inserts every remaining
+- **ClickHouse** encodes every row through `encode_round` (FR-002), chunks with `chunk_list`, and
+  inserts every remaining
   chunk once per round. 1.x raised when no chunk inserted; the engine's rule is the same.
 - **MongoDB** drops oversized and unencodable documents as FR-002 does and makes one `insert_many(...,
   ordered=False)` per round. The documents are **built once per run** and kept across its rounds in
@@ -448,7 +528,8 @@ the close alone.
 #### Description:
 
 - **Redis** (`_RedisSink`, so both `RedisStreamsSink` and `RedisListSink`): one pipeline per round
-  over the encodable events (SPEC-069), all `ACCEPTED` on `execute()`, or all `RETRYABLE` or
+  over the encodable events (`encode_round`, FR-002), all `ACCEPTED` on `execute()`, or all
+  `RETRYABLE` or
   `REJECTED` by `_retryable_error`. `deliver` and `emit` are defined on `_RedisSink`, and neither
   subclass defines `emit`, so SPEC-072's override rule offers `deliver` on both. A closed sink's round
   is a refusal (FR-001).
@@ -464,7 +545,8 @@ the close alone.
   publish is a refusal round (FR-001) carrying SPEC-061's own `SinkDeliveryError`: `RETRYABLE` for a
   disconnected client, the latch and an unanswered pre-publish probe, which a later round can pass;
   `REJECTED` for a forked child, a closed or a closing sink. A publish that raises is `REJECTED` with
-  SPEC-061's line (NATS declares no predicate). An event the deadline left unattempted is
+  SPEC-061's line (NATS declares no predicate), and so is an event `json.dumps` cannot encode, which
+  stays inside the publish path, off FR-002's step 1. An event the deadline left unattempted is
   `RETRYABLE`, its `LAST` line SPEC-061's `publish_timeout` line. A core batch whose confirmation went
   unanswered makes its published events `UNKNOWN` with SPEC-061's `unconfirmed` line, never resent.
   The wedged-loop backstop raises SPEC-061's `SinkDeliveryError` unchanged, which SPEC-072 counts as
@@ -487,7 +569,9 @@ SPEC-061 shows can pass, a refusal before the first publish, is `RETRYABLE` and 
 
 - [ ] Redis, both sinks, `max_retries=3`: an always-retryable `execute()` is 4 calls through `emit`
       and 12 through `Worker(max_retries=2)` (the Overview's probe), `.failed` equals the batch size
-      once, and the line names the type; a `TypeError` is one call.
+      once, and the line names the type; a `TypeError` is one call through `emit` and one through
+      `Worker(max_retries=2)` (SPEC-070 FR-001's three, superseded on the engine), `.failed` moves
+      once, and the one line reads `1 attempt(s), TypeError`.
 - [ ] RabbitMQ: with message two's first publish retryable and its second accepted, the broker sees
       1, 2, 3, 2, `_reset()` runs once, and nothing is counted; a non-retryable failure on message two
       leaves 1 and 3 published and `.failed == 1`.
@@ -505,6 +589,10 @@ SPEC-061 shows can pass, a refusal before the first publish, is `RETRYABLE` and 
 - [ ] NATS: one publish raising beside two unconfirmed is `.failed == 3` and `emit` returns; every
       publish raising is `.failed == n`, `emit` raises, and a `Worker` makes one `deliver` call;
       SPEC-061's blocked-publish case still returns with `.failed` equal to the batch size.
+- [ ] NATS keeps SPEC-069's ledger: one unencodable event among several is `.failed == 1` and
+      `losses().dropped == 0`, and `emit` returns; a batch of nothing but unencodable events raises
+      `SinkDeliveryError` with `.failed` equal to the batch size. SPEC-069 FR-001's and FR-002's NATS
+      criteria pass unedited.
 - [ ] `tests/test_sinks_{redis,rabbitmq,eventhubs}.py`, `tests/integration/test_{redis,rabbitmq}.py`
       and the `tests/test_sink_losses.py` rows pass, editing only the named patch points and
       multiplied-total assertions, each named in the PR; the integration cases settle on the
@@ -532,8 +620,9 @@ passing on its derived check (its docstring's mention of `send_all` is updated).
   and the transport gains `log_foundry_counters` (an instance attribute), `deliver`, a read-only
   `max_retries` and a `_counter_lock` property as FR-001 describes. `send_all`, its `pending`
   parameter, `_send_one`'s loop and `_BACKOFF_BASE` are deleted.
-- **A round** frames every event through SPEC-069's encode step (`DROPPED` with its line), drops a
-  UDP frame over `max_datagram_bytes` as `DROPPED` with `dropped_oversized` counted `SETTLED` and the
+- **A round** frames every event through `encode_round` (FR-002; `DROPPED` with SPEC-069's line),
+  drops a UDP frame over `max_datagram_bytes` as `DROPPED` with `dropped_oversized` counted
+  `SETTLED` and the
   1.x line, then sends every remaining frame once, in order, under `self._lock` for the round. An
   exception runs `_reset()` (SPEC-070); one `_retryable_error` accepts (outside `_PERMANENT_ERRNOS`)
   makes that frame `RETRYABLE`, its `LAST` line naming the type and errno as the 1.x line did; one it
@@ -594,7 +683,11 @@ sinks, SPEC-069's `_unencodable` are deleted, folded into `dropped_events`. `Rab
 **The deletions.** The eleven `for attempt in range` loops, the eleven `_BACKOFF_BASE` constants,
 `SocketTransport.send_all`, and the twelve hand-built `SinkLosses` of the Overview go, so after this
 spec (and SPEC-073) no module under `sinks/` but `_engine.py` assigns a backoff constant or calls
-`wait`, and the `SinkLosses` builds left are the nine the Overview names.
+`wait`, and no converted module builds a `SinkLosses`. Counted on SPEC-069's ledger rather than
+`fda134a`'s: the Overview's grep, run on the build's base commit and again after the build, loses
+exactly the twelve converted modules. What it still finds is the nine the Overview names, plus
+`stdout`, `file` and `sqlite`, whose `losses()` SPEC-069 adds and this spec does not touch, for any
+of the three that builds its report with a literal `SinkLosses(` rather than `wrapped_losses`.
 
 **Idempotency: no shipped sink declares itself idempotent**, so an `UNKNOWN` outcome or an escaped
 exception is never resent (SPEC-072). The evidence per destination: Kinesis and Firehose tell the
@@ -614,9 +707,11 @@ entry, `REJECTED` and counted although the document landed, so resending an unkn
 turn it into a miscounted failure, not a delivery. The one other candidate is an **SQS FIFO queue**,
 which accepts but does not deliver a message whose `MessageDeduplicationId` it has seen within a
 5-minute interval (the documentation string of `SendMessageBatchRequestEntry.MessageDeduplicationId`
-in botocore 1.43.123's SQS service model). It is not declared, because `SQSSink._dedup_id` falls back
-to a fresh random id when an event yields none, so the resend that matters is not guaranteed
-identical. JetStream de-duplication needs a `Nats-Msg-Id` header that `NATSSink` does not send
+in botocore 1.43.123's SQS service model). Within one run the resend is identical (FR-002 prepares
+each entry once per run, ids included), but it is still not declared: `log_foundry_idempotent` is a
+class attribute, and the same class writes to standard queues, which de-duplicate nothing; and on a
+FIFO queue SQS absorbs a duplicate only within that 5-minute interval, which the sink neither
+measures nor bounds a run to. JetStream de-duplication needs a `Nats-Msg-Id` header that `NATSSink` does not send
 (SPEC-061, Out of Scope).
 
 **Kafka and Pub/Sub.** Nothing changes for them: `kafka.py` and `pubsub.py` are not edited, neither
@@ -723,6 +818,22 @@ class KeyedAdjudication(NamedTuple):
 
 def adjudicate_keyed(keys: Sequence[object], failed: object, *, key: str) -> KeyedAdjudication: ...
     # a key matches only a sent key of the same exact type
+
+# src/log_foundry/sinks/_encode.py  -- SPEC-069's module; encode_events unchanged beside it
+def encode_round(owner: object, batch: list[dict[str, object]],
+                 encode: Callable[[dict[str, object]], T], *, sink: str) -> list[tuple[int, T]]: ...
+    # (position, wire form) of each encodable event, in order; an omitted position is DROPPED.
+    # Forms and failures cached per run in run_context().notes(owner), keyed by event identity;
+    # SPEC-069's line registered once per run with announce(..., when=SETTLED)
+
+# src/log_foundry/sinks/sqs.py
+class _Prepared(NamedTuple): index: int; body: str; group_id: str | None; dedup_id: str | None; size: int
+class _Plan(NamedTuple):
+    chunks: list[list[_Prepared]]
+    dropped: dict[int, str]                  # position -> oversize | id failure | unencodable
+    refused: Exception | None                # the first id exception, when every id callable raised
+SQSSink._chunks(self, batch: list[dict[str, object]]) -> _Plan   # was (batch, pending) -> list
+    # each event's entry (body, ids, size) or drop reason cached per run in notes(self); ids once per run
 ```
 
 ## API / Interface Contract
@@ -750,6 +861,7 @@ class RabbitMQSink:                              # also SocketTransport, SyslogS
 src/log_foundry/sinks/
 ├── _engine.py      # + RunContext.final_rejections, RunContext.refuse, the one-lock commit
 ├── _batch.py       # + adjudicate_keyed
+├── _encode.py      # + encode_round, beside SPEC-069's encode_events
 ├── sqs.py sns.py kinesis.py firehose.py           # FR-002
 ├── clickhouse.py mongodb.py postgres.py           # FR-003
 ├── redis.py rabbitmq.py eventhubs.py nats.py      # FR-004
@@ -782,12 +894,12 @@ other site still stating the old claim:
   a dated History line saying the engine keeps it through the refusal marker; its fence is
   unchanged.
 - `docs/decisions/sink-delivery/caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises.md`:
-  this spec owns the edit for the arc, and SPEC-075 references it rather than rewriting the file. A
-  dated History line records the one rule for an `SQSSink` FIFO batch and a `FilteringSink` or
-  `TransformSink` that offers `deliver` (SPEC-075): when caller code fails on every event, the
-  events are `REJECTED` with the refusal marker, so the batch costs one attempt and is **no longer
-  retried by the worker**, no sink counter moves, and `emit` re-raises the first exception by
-  identity. The file is edited as SPEC-069 leaves it (SPEC-069 generalises its HTTP half), and its
+  a dated History line records the rule for an `SQSSink` FIFO batch only: when every event's id
+  callable raised, the events are `REJECTED` with the refusal marker, so the batch costs one attempt
+  and is **no longer retried by the worker**, no sink counter moves, and `emit` re-raises the first
+  exception by identity. The wrappers' half is not recorded here, because `FilteringSink.deliver` and
+  `TransformSink.deliver` do not exist until SPEC-075, which adds its own History line when it
+  builds them. The file is edited as SPEC-069 leaves it (SPEC-069 generalises its HTTP half), and its
   fence's "re-raised unchanged and nothing is counted" stays as written.
 - `docs/invariants.md` 2 (an engine sink's drop is counted by a run that settled) and 3 (guarded by
   the engine's tests). Entry 7 already names the SNS sender fault beside the SQS one (SPEC-070), and
@@ -853,3 +965,17 @@ other site still stating the old claim:
   exclusions (SPEC-075's wrappers among them) and is floored at 11 as SPEC-073 leaves it;
   `_modules_with_a_retry_loop`'s pin is SPEC-073's; the PostgreSQL criterion cites
   `StringDataRightTruncation`; invariant 7's SNS sender fault is left to SPEC-070.
+- Build-order re-read: the encode step on the engine is a named sibling, `encode_round`, whose count
+  is the `DROPPED` outcome and whose line is a `SETTLED` announcement, and it caches each event's
+  wire form per run so SPEC-069's encode-once criterion holds; `NATSSink` is exempt from step 1 and
+  keeps its unencodable count on `failed`; the mixed id-failure and unencodable FIFO batch settles
+  with `dropped == 2`; SQS's `_chunks` becomes `_chunks(batch) -> _Plan` with SPEC-071's corpus
+  re-pointed; the caller-code decision's History line records the SQS half only; a refused
+  exception's line is the arc's one form, `N attempt(s), <Type>`, superseding SPEC-070 FR-001's
+  three-call worker criterion on the engine; the `SinkLosses` builders left are recounted on
+  SPEC-069's ledger.
+- Orchestrator's decision after the re-read: an SQS entry, its FIFO ids and `_dedup_id`'s random
+  fallback included, is prepared once per run and cached in `notes(self)`, so every round resends
+  the identical `MessageDeduplicationId` and `MessageGroupId`, as 1.x's loop did inside one `emit`;
+  a criterion kills the per-round mutant, and FR-006's idempotency reasoning no longer rests on
+  per-round ids.

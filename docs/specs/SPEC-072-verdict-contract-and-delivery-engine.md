@@ -427,7 +427,10 @@ SPEC-058, SPEC-061 (1.1.0), SPEC-069 and SPEC-070 leave it:
 | a NATS core batch whose confirmation went unanswered (SPEC-061) | `UNKNOWN` |
 
 **The engine announces** a settled run's loss in one `_diag.lost` line naming counts by term and the
-number of rounds, never a value (invariant 11). A failed run's loss is announced by its catcher: the
+number of rounds, never a value (invariant 11), unless the sink registered an announcement of its
+own for the run through the run context SPEC-073 adds: such a run is announced by the sink's lines
+alone, and the engine writes no settled line, so a loss is never announced twice. A failed run's
+loss is announced by its catcher: the
 worker's abandon or declined line, the orphan path's line, or the adapter's raise. A raising round is
 also announced by `_diag.absorbed`, which names the exception's type.
 
@@ -504,9 +507,17 @@ unadjudicable `2xx`: the events are counted `failed_events`, the run never fails
 **Either is resent only by a sink that declares itself idempotent**, that is, a
 `log_foundry_idempotent` read with `inspect.getattr_static` that `is True` (a truthy non-`bool` is
 not a declaration). For an escaped exception the engine also asks SPEC-070's
-`sink._retryable_error`, read the same way, through `is_retryable(predicate, exc)`, never by a
-direct call, and resends only when it answers `True`, so a `TypeError` is never resent even by an
-idempotent sink; a sink without the predicate, every third-party sink among them, resends no
+`sink._retryable_error`, found statically too and then **bound**, through
+`is_retryable(predicate, exc)`, never by a direct call, and resends only when it answers `True`, so a
+`TypeError` is never resent even by an idempotent sink. Found statically on an instance,
+`inspect.getattr_static` returns the class's unbound function, which `is_retryable` would call with
+one argument short: it raises `TypeError` inside the wrapper, answers `False`, and every predicate
+would be refused silently. So a predicate found on the class is bound with
+`found.__get__(sink, type(sink))`, which is SPEC-070's contract (the engine receives the bound
+`sink._retryable_error`) and also unwraps a `staticmethod`; one found in the instance's own
+`__dict__` is used as found, as ordinary attribute access would. A sink without the predicate, every
+third-party sink among them, resends no exception, and a predicate that raises answers `False`
+through `is_retryable`; a sink without the predicate, every third-party sink among them, resends no
 exception, and a predicate that raises answers `False` through `is_retryable`. For
 an `UNKNOWN` outcome or a malformed verdict there is no exception to ask, and idempotence alone
 decides. A resend is a further round: it is bounded by the retry budget and waits as FR-002 says.
@@ -521,6 +532,11 @@ decides. A resend is a further round: it is bounded by the retry budget and wait
       exception is called a second time with all `n` events, and a second-round `ACCEPTED` ends with
       `failed_events == 0`; with a `_retryable_error` that refuses it, raises, or is absent, it is not
       resent.
+- [ ] A shipped predicate answers through the engine: a test sink subclassing `HTTPSink`, with
+      `log_foundry_idempotent = True` and a `deliver` that raises `urllib.error.URLError` once and
+      then returns all `ACCEPTED`, is called twice and ends with `failed_events == 0`, because the
+      inherited `HTTPSink._retryable_error` answered `True`. With the engine's binding removed (the
+      mutant: the static lookup's result passed to `is_retryable` unbound), it is called once.
 - [ ] `log_foundry_idempotent = 1` and `= "yes"` are not declarations: the sink is not resent.
 - [ ] Each malformed verdict (a returned `None`, a `dict`, a verdict one outcome short, an outcome
       that is a bare string, a subclass whose `outcomes` raises) settles with `failed_events == n`
@@ -892,3 +908,8 @@ tests/
   SPEC-069 and SPEC-070 leave it (the SNS sender fault, the unencodable event and NATS's unconfirmed
   batch added, a wrapper's failure shown as SPEC-075's `SKIPPED`); FR-004 consults `_retryable_error`
   through `is_retryable`; `Worker._in_flight` is attributed to SPEC-062, not SPEC-068.
+- Build-order re-read: FR-004 binds a statically found `_retryable_error` with
+  `__get__(sink, type(sink))`, since the unbound function would make `is_retryable` refuse every
+  predicate, and a criterion proves `HTTPSink`'s inherited predicate answers `True` through the
+  engine; FR-003 states that a run whose sink registered its own announcement gets no engine
+  settled line, the refinement SPEC-073 relies on.

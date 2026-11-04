@@ -356,7 +356,8 @@ the count, never into itself.
 
 Each line keeps its 1.x text, and the attempt count it names is the round number. A run in which the
 sink registered any announcement is announced by those lines alone, so a family loss keeps the
-line it has in 1.x and the engine writes no settled line of its own. A failed run's catcher still
+line it has in 1.x and the engine writes no settled line of its own: that is SPEC-072 FR-003's
+refinement of the engine's settled line, which this spec relies on rather than adds. A failed run's catcher still
 writes its line: the worker's abandoned or declined line, the orphan path's, or the adapter's raise.
 
 The engine's event-unit totals still land in `log_foundry_counters` as SPEC-072 defines them.
@@ -925,3 +926,5 @@ tests/
 - Cross-arc review: the invariant 7 edit and FR-002's item 3 point at SPEC-069's wording of the
   recorded exception, and the Data Model names `_run`'s `sink_retries, worker_retries` as SPEC-072
   does.
+- Build-order re-read: FR-002's "no engine settled line" for a run with a registered announcement
+  cites SPEC-072 FR-003, which now carries that refinement itself.

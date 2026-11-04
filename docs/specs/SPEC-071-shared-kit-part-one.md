@@ -360,6 +360,12 @@ the release note lists them: a 1.x caller passing one beside an injected object 
 tell an argument the caller gave from one left at its default. `None` is resolved to the default
 before the floor runs, and the floor is unchanged (`max(..., 2)`, through SPEC-066's
 `floor_count` once that lands, which refuses a non-`int` and so must never see `None`). The
+resolution rebinds the parameter's own name — `connect_timeout = DEFAULT_CONNECT_TIMEOUT if
+connect_timeout is None else connect_timeout` — and the floor call still receives `connect_timeout`
+itself as its first positional argument. That is load-bearing: SPEC-070 FR-005's row-1 scan finds
+`PostgresSink` only because the parameter reaches `max` or `floor_count` positionally, and it pins
+that row at a floor of four. Resolving into a differently named local, or passing it by keyword,
+would take Postgres out of sight of the scan. The
 attribute `PostgresSink.connect_timeout` still reads the floored effective value, `5` by default.
 This is additive under invariant 10: the parameter's type only widens, so a typed consumer passing
 an `int`, or nothing, still type-checks and behaves as before; the one caller it breaks is the one
@@ -428,6 +434,9 @@ is about bounding waits.
 - [ ] `inspect.signature(PostgresSink).parameters["connect_timeout"]` has default `None` and
       annotation `int | None`, and `tests/typed_consumer/` and `tests/test_public_surface.py` pass
       unedited.
+- [ ] `tests/test_declared_exceptions.py`'s row-1 population is still exactly `{KafkaSink,
+      NATSSink, GooglePubSubSink, PostgresSink}`, unedited, with `PostgresSink` found through
+      `connect_timeout` passed positionally to the floor call.
 - [ ] `SQLiteSink(":memory:", connection=c)` still constructs and writes through `c`, and
       `docs/invariants.md` §13 carries a *Recorded exceptions* line naming a required argument
       documented as ignored beside an injected connection.
@@ -469,7 +478,7 @@ it. The cases:
 - A FIFO queue where the ids' bytes are what push a chunk over.
 - A batch of only oversize events: no chunk and no raise.
 - A batch whose every id callable raises: the first exception re-raised unchanged.
-- An unencodable event, if SPEC-069 has landed.
+- An unencodable event (SPEC-069, earlier in the arc).
 
 The table is recorded from the old code and holds literals, not a copy of the old algorithm, which
 keeps the check from mirroring what it checks. `HTTPSink._take` and `AzureEventHubsSink` keep their
@@ -604,3 +613,6 @@ docs/release-notes/v1.2.0.md
   connection is refused like the other eight options, through a `None` "not given" default, which
   only widens the parameter's type. `SQLiteSink.database` stays accepted, as invariant 13's recorded
   exception rather than as something left open.
+- **Revised after the arc's build-order re-read.** The `connect_timeout` resolution now keeps the
+  parameter as the floor call's positional argument, with a criterion that SPEC-070's row-1
+  population is unchanged, and the SQS corpus's unencodable case is unconditional.

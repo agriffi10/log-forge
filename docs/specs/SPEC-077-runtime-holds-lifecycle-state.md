@@ -142,8 +142,11 @@ each keeps its body except for the path and, in `_clear_after_fork`, FR-002's ad
   `info()`, `configure(B)` runs no fork hook on the superseded `A` (the existing SPEC-044 FR-005
   fork test, edited only for the path).
 - [ ] The set of `with <lock>:` sites in `_lifecycle.py` and `worker.py`, each as the function that
-  holds it and the lock it takes, equals the set at `fda134a`, which a test in this spec holds as
-  a literal, with a moved lock compared under its new path.
+  holds it and the lock it takes, equals the set **derived on the build's base commit**, which a
+  test in this spec holds as a literal, with a moved lock compared under its new path. Not the set
+  at `fda134a`: SPEC-072, earlier in the arc, rewrites `Worker._emit` and adds `_retry_declined`, so
+  the literal is recorded in this spec's first phase from the unmodified base, the way SPEC-071
+  records its pins.
 - [ ] No docstring in `src/` names `_Lifecycle` or a removed module-level name as a module
   attribute: ``grep -rnE '\b_Lifecycle\b|_lifecycle\.(_closers|_closing_now|_owned|_marking_failed|_FORK_SKIP)\b|:data:`(_closers|_closers_lock|_closing_now|_closing_now_lock|_owned|_owned_lock|_marking_failed|_FORK_SKIP)`' src/``
   is empty. At `fda134a` it finds 30 lines: 13 naming `_Lifecycle`, 13 `:data:` references and 4
@@ -433,9 +436,11 @@ concurrency the state after a step is not determined.
 
 The proof that this is a refactor is the existing suites, edited only where they pin a location.
 The edits are the moves: tests that read a module-level name now read it off `_state`, and nothing
-else about them changes. The files, found at `fda134a` with `grep -rlw -- <name> tests/` for each of
-the seven names and `grep -rlw _Lifecycle tests/`, are `tests/conftest.py` (its reset fixture
-clears `_closers` and `_closing_now` and takes their locks, and also empties the two new token
+else about them changes. The files are found **on the build's base commit**, as SPEC-071 derives its
+pins, with `grep -rlw -- <name> tests/` for each of the seven names and `grep -rlw _Lifecycle
+tests/`; the earlier specs of the arc add and edit tests, so the list below, measured at `fda134a`,
+is where the search starts and not its answer. At `fda134a` they are `tests/conftest.py` (its
+reset fixture clears `_closers` and `_closing_now` and takes their locks, and also empties the two new token
 sets, which is an addition), `test_sink_ownership.py`, `test_config.py`, `test_owed_closes.py`,
 `test_lifecycle_races.py`, `test_shutdown_lifecycle.py`, `test_fork_lifecycle.py`,
 `test_sink_release_roster.py`, `test_concurrent_owed_closes.py` and
@@ -622,3 +627,6 @@ updated for the rename and for the three loose names that moved.
   became recorders; the inverted `_skipped_names` assertion and the `test_public_surface.py` hit
   were named; the docstring grep was widened; and `_shutdown_running`'s inheritance by a child is
   recorded as a measured defect rather than pinned.
+- Build-order re-read: FR-001's lock-site literal and FR-005's file list are derived on the build's
+  base commit, as SPEC-071's pins are, since SPEC-072 rewrites `Worker._emit` and adds
+  `_retry_declined` before this spec builds.

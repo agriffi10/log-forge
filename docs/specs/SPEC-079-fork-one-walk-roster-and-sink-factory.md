@@ -384,7 +384,8 @@ first.
     `test_the_reacquired_roster_does_not_survive_into_the_next_fork` and
     `test_the_reacquired_roster_is_empty_when_the_repair_walk_starts` drive the registered walk;
   - `test_the_fork_repair_walk_does_not_reach_a_superseded_sink` asserts that the superseded sink's
-    hook is not called and drops its assertion on `_lifecycle._FORK_SKIP`.
+    hook is not called and drops its assertion on `_state._FORK_SKIP` (the module-level
+    `_lifecycle._FORK_SKIP` it named at `fda134a`, which SPEC-077 moved onto `Runtime`).
 - `tests/test_owed_closes.py::test_a_forked_child_repairs_every_owed_sink_not_only_the_last`
   changes only its docstring.
 - `tests/test_lifecycle_races.py::test_a_child_still_refuses_to_close_an_inherited_superseded_sink`
@@ -957,3 +958,5 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   - Invariant 13's recorded exception is listed.
   - `health()` joined the roster's call list, so removing `_loss_lock` reddens.
   - The two reset requirements were folded into FR-004, which brings the FR count to six.
+- Build-order re-read: FR-003's dropped assertion names `_state._FORK_SKIP`, the name SPEC-077
+  leaves, not the removed module-level `_lifecycle._FORK_SKIP`.

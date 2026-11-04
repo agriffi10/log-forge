@@ -86,13 +86,13 @@ Figures re-measured at `fda134a`, each with its instrument:
 - Prose: the wrapper and `MultiSink` docstrings, `docs/invariants.md` entries 2, 6 and 7,
   `docs/architecture.md` §8's wrapper paragraph, the README's wrapper text and
   `docs/component-inventory.md`.
-- At completion, two changes to the decisions in `docs/decisions/sink-delivery/`, and one this spec
-  relies on but does not make:
+- At completion, three changes to the decisions in `docs/decisions/sink-delivery/`:
   - `caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises`
-    is **not** rewritten here. SPEC-074 owns its dated History line, which records the arc's one rule
-    for an all-failed batch on the `deliver` path, this spec's wrappers included: `REJECTED` with the
-    refusal marker, one attempt, no longer retried by the worker, no sink counter moved. Its fence
-    stays.
+    gains this spec's own dated History line, beside the one SPEC-074 wrote for an `SQSSink` FIFO
+    batch: a `FilteringSink` or `TransformSink` that offers `deliver` follows the same rule when its
+    predicate or transform fails on every event — `REJECTED` with the refusal marker, one attempt, no
+    longer retried by the worker, no sink counter moved, and `emit` re-raising the first exception
+    by identity. Its fence and body stay.
   - `a-raising-emit-counts-nothing-whoever-catches-the-raise-owns-the-batchs-count` gains a dated
     refinement naming an engine child as a child that counted before raising.
   - One new decision records the wrapper rule: `deliver` is offered when the inner sink offers it,
@@ -258,7 +258,8 @@ that fails every call a batch holding either still fails (invariant 7).
 
 **An all-failed batch fails at once, and no sink counts it.** This is the arc's one rule for caller
 code that fails on every event of a batch, which SPEC-074 states for `SQSSink`'s FIFO id callables
-and records in the decision *Caller code that fails for one event costs only that event*. A batch
+and records, for SQS, in the decision *Caller code that fails for one event costs only that event*;
+this spec adds the wrappers' History line to that decision (*Scope*). A batch
 of nothing but failures is `REJECTED`, and the wrapper calls `run_context().refuse(first_exc)` with
 the first exception its predicate or function raised (SPEC-074's refusal marker). So the run fails
 and its catcher owns it (`failed_batches`, `orphan_lost`), as the 1.x re-raise made it. It is not
@@ -539,8 +540,8 @@ tests/
 ### Phase 3: Prose and records
 
 - The wrapper docstrings, `docs/invariants.md` entries 2, 6 and 7, `docs/architecture.md` §8, the
-  README's wrapper text, `docs/component-inventory.md`, and the refinement and new decision named in
-  Scope.
+  README's wrapper text, `docs/component-inventory.md`, and the caller-code History line, the
+  refinement and the new decision named in Scope.
 
 ## Revision history
 
@@ -568,3 +569,6 @@ tests/
   commit was removed); SPEC-074 owns the caller-code decision's History line and this spec no longer
   rewrites that file. The engine-sink roster's `emit` rule is SPEC-074's one-call `def emit`, and
   both rosters' exclusions are named lists that this spec extends.
+- Build-order re-read: SPEC-074 now records only the SQS half of the caller-code decision's History,
+  since the wrappers' `deliver` does not exist until this spec, so this spec writes the wrappers'
+  History line itself.

@@ -53,7 +53,7 @@ a verdict for `inf`, `nan` and a non-number at the public call, so every transit
 `None` or a finite number. SPEC-068 settles `architecture.md` §12's double announce on an expired
 exit drain, a second `shutdown()` after an expired one, and a fork-resumed worker not resetting
 `Worker._stopped`; the `STOP` row below takes those answers as SPEC-068 leaves them. SPEC-077 is in
-`depends_on` and is the base this spec edits. **This spec changes four of SPEC-077's names,
+`depends_on` and is the base this spec edits. **This spec changes five things SPEC-077 pins,
 each on purpose:**
 - Its token sets `_swaps_running` and `_stops_running` hold `_Operation`s, not bare `object()`s
   (FR-003).
@@ -63,6 +63,9 @@ each on purpose:**
   `_owed` are replaced by `Runtime._closes`.
 - Its inventory floor of lock and event construction sites in `_lifecycle.py` and `worker.py`
   falls from eleven to ten, for the merged leaf lock (FR-006).
+- Its FR-001 lock-site test, the literal set of `with <lock>:` sites in `_lifecycle.py` and
+  `worker.py` by holding function and lock, goes red once `_closing_now_lock` and `_closers_lock`
+  merge and `join_closers` is deleted; its literal is re-recorded (FR-006).
 
 ## Scope
 
@@ -506,7 +509,7 @@ Tests that pin a removed mechanism are re-expressed, never deleted. Measured at 
 `test_worker.py` and `test_worker_predicate_roster.py`. Most edits are a path. The rest move a
 monkeypatch from `join_closers` to the registry's graced join and keep the assertion.
 
-Three derived guards are re-derived, never left to shrink. `tests/test_lifecycle_races.py`'s
+Four guards are re-derived, never left to shrink. `tests/test_lifecycle_races.py`'s
 under-lock lint keys on names (`_UNDER_LOCK_OFFENDERS = frozenset({"join_closers", "_close_owed"})`
 at `fda134a`), so removing `join_closers` would empty half of it silently: the set names the
 registry's join methods instead, and a mutant that calls one under `_state._lock` must fail it.
@@ -514,7 +517,10 @@ registry's join methods instead, and a mutant that calls one under `_state._lock
 `fda134a`) does not fall, and the state reads in the entries are filed with a category. SPEC-077's
 lifecycle inventory test re-declares the moved fields, and its floor of lock and event construction
 sites in `_lifecycle.py` and `worker.py` falls by exactly one, for the merged leaf, in the same
-commit, with the merge named in the table's `reason`. The registry's rows carry the child values
+commit, with the merge named in the table's `reason`. SPEC-077 FR-001's lock-site test holds its
+`with <lock>:` sites as a literal, so it is re-recorded in the commit that merges the locks: every
+site that took `_closing_now_lock` or `_closers_lock` is listed under the registry's one leaf lock,
+`join_closers`' sites leave with it, the registry's graced join enters, and no other row changes. The registry's rows carry the child values
 FR-001 gives, and the token sets keep `reset: _clear_after_fork`.
 
 #### Acceptance Criteria:
@@ -525,6 +531,10 @@ FR-001 gives, and the token sets keep `reset: _clear_after_fork`.
   fixed seed range with the stored-versus-derived check of FR-003 after every step.
 - [ ] A mutant calling the registry's graced join under `_state._lock` fails the under-lock lint,
   and the predicate roster's `_lifecycle` floor is at least 43.
+- [ ] SPEC-077 FR-001's lock-site test passes against its re-recorded literal, whose diff from
+  SPEC-077's names only the merged leaf lock's sites, `join_closers`' removed sites and the
+  registry's join; a mutant that takes `_state._lock` in place of the leaf in one registry method
+  reddens it.
 - [ ] Each guard of a defect this spec closes is mutation-tested, and the named test goes red:
   - A swap that does not decline in `DRAINING` with no live worker: FR-004's swap-during-drain test.
   - A swap that declines in `DRAINING` with a live worker: FR-004's tail test.
@@ -690,3 +700,6 @@ row for the registry. The release notes for 1.2.0 carry the two fixes.
   - The SPEC-046 citation is corrected, the `grace_end` criterion tightened, the FR-005 deadline
     scan made to discriminate, the FR-005 title narrowed, and `closing_count` added to the removed
     names.
+- Build-order re-read: SPEC-077 FR-001's lock-site test, which the lock merge and the deletion of
+  `join_closers` turn red, is added to the Overview's list of SPEC-077 pins this spec changes and to
+  FR-006's re-derived guards, with a criterion.
