@@ -1795,11 +1795,31 @@ class CounterlessFakeNATS(LiveFakeNATS):
         pass
 
 
-def test_a_client_without_the_counter_is_treated_as_drained(monkeypatch) -> None:
-    sink, _, _ = _build(monkeypatch, factory=CounterlessFakeNATS)
+class HostileCounterNATS(CounterlessFakeNATS):
+    """A client whose ``pending_data_size`` raises something ``getattr``'s default cannot absorb."""
+
+    @property
+    def pending_data_size(self) -> int:
+        raise RuntimeError("the transport is gone")
+
+    @pending_data_size.setter
+    def pending_data_size(self, value: int) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "factory", [CounterlessFakeNATS, HostileCounterNATS], ids=["absent", "raising"]
+)
+def test_a_client_without_the_counter_is_treated_as_drained(monkeypatch, factory) -> None:
+    # An absent attribute takes `getattr`'s default and a raising one takes the `except`: two
+    # separate branches, so each has its own case. Either way the sink invents no loss.
+    sink, fake, _ = _build(monkeypatch, factory=factory, publish_timeout=0.5)
     sink.emit([{"n": 1}])
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    losses = sink.losses()
+    pings = fake.calls.count("flush")
     sink.close()
+    assert losses == SinkLosses(dropped=0, failed=0)
+    assert pings == 2, "the probe, then a confirmation sent at once rather than at the deadline"
 
 
 # --- Review finding 2: an injected client's flush is bounded inside the coroutine -------------
