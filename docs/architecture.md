@@ -822,6 +822,25 @@ close it.
 
 ### Open
 
+- **`configure()`'s stamps, its numeric ceilings, the `_retry` doors and `OTLPSink`'s endpoint
+  test their arguments with `isinstance` and name them with `type(value).__name__`** (SPEC-080
+  frame-2 review; invariant 13, the "argument named" half). The sites are `config._require_text`
+  and `_require_positive`, `sinks/_retry.py`'s validators (the `flush()`/`shutdown()` timeouts
+  and the sinks' `int` floors) and `sinks/otlp.py`'s endpoint check. Reproduced at `4f0c5741`:
+  `configure(service=x)` with `x`'s `__class__` property returning `str` raises `descriptor
+  '__str__' requires a 'str' object but received a '…'`, which does not name `service`; a raising
+  `__class__` raises its own exception; a metaclass `__name__` property returning `"str"` gives
+  `version must be a str, got str`. Every lying value is still stopped at the call, never per
+  emit, so only the message breaks the promise. **Closed by** routing each door through
+  `issubclass(type(v), T)` and the type's stored name, as SPEC-080 did for `@trace`.
+- **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
+  (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
+  `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
+  batch abandoned after 4 emit attempts`, `flush()` returns `reason='abandoned'` and
+  `failed_batches=1`. Counted and announced, so invariant 2 holds; refused nowhere, so 13 does
+  not. **Closed by** refusing at `configure()` a sink with no callable `emit` and `close`, read
+  through the type rather than the instance.
+
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it
@@ -948,15 +967,6 @@ close it.
   omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
   endpoint's response shape gets settled.
 
-- **`@trace(name=...)` tests its argument with `isinstance(name, str)`** (SPEC-067 frame-2 review;
-  invariant 13). `isinstance` reads the value's own `__class__`, so an object whose `__class__`
-  property returns `str` is accepted at decoration, and every call of the decorated function then
-  writes "absorbed a failure while opening a span (TypeError); this call runs untraced" and runs
-  untraced: the bad argument is refused on every call rather than where it was written. A raising
-  `__class__` property raises its own exception at decoration rather than the `TypeError` naming
-  `name=`. Reproduced at `97436c7`. It needs a deliberately lying `__class__`, and it is outside the
-  inbound path SPEC-067 settled. **Closed by** testing `issubclass(type(name), str)` at
-  decoration and keeping the exact `str` (`str.__str__`), as `continue_trace` does since SPEC-067.
 - **`NATSSink`'s float timeouts are forwarded to the driver unchecked** (SPEC-066, found while
   closing the int doors; invariant 13). `connect_timeout`, `reconnect_time_wait` and
   `drain_timeout` go into `nats.connect(**supplied)` exactly as given whenever they are not
@@ -1088,6 +1098,29 @@ close it.
   exact `str`, and `continue_trace` turns a subclass into the exact `str` it holds once, on entry.
   The reasoning and its rejected alternatives: *An inbound value runs no code of its own anywhere
   on the inbound path*.
+- ~~**`@trace(name=...)` tests its argument with `isinstance(name, str)`**~~ (SPEC-067 frame-2
+  review; invariant 13) → **closed by SPEC-080**. `isinstance` reads the value's own `__class__`,
+  so a `name=` whose `__class__` property returned `str` decorated cleanly and every call then
+  wrote "absorbed a failure while opening a span (TypeError); this call runs untraced" and ran
+  untraced, and a raising one raised its own exception at decoration (reproduced at `97436c7`).
+  `name=` is now routed on its real type, `issubclass(type(name), str)`, in `trace`'s own body: a
+  `str` subclass is kept as the exact `str` it holds (`str.__str__`), so its `__bool__` no longer
+  runs at decoration, and anything else not `None` raises the `TypeError` at the
+  `trace(name=...)` call itself, before any decorator is applied, naming its type's stored name.
+  The spec also closed the decorator's sibling sites, which the entry did not list. `_span_name`'s
+  fallback read `type(fn).__name__`, so a metaclass `__name__` property returning `1` decorated and
+  then absorbed every call, and one that raised raised at decoration; it now keeps a `__qualname__`
+  only by real type, as an exact `str`, and otherwise reads the type's stored name through
+  `type`'s own descriptor. The `str` slip was tested with `isinstance` behind the descriptor test
+  and echoed with an unbounded `repr` (a 10,000-character `str` gave a 10,069-character message,
+  measured at `253432f`); it is now tested first, by real type, and echoed through `_diag._echo`,
+  cut at 64 characters, and a callable that merely claims `str` is traced. The misordered-descriptor
+  message read `fn.__func__` unguarded and named the type through `type(fn).__name__`, and the
+  non-callable message read the type name the same way; both now read only what they have checked,
+  through `_misordered` and `_stored_name`. The descriptor test for a proxy keeps `isinstance`, last
+  and reached only by a callable, on purpose. The reasoning, the check order and its trade-off:
+  *`@trace` routes what it is handed on its real type, and only a callable runs its own code at
+  decoration*.
 - ~~**A float passes the `max(x, 0)` floor on `max_retries` and `backup_count`, and breaks every
   `emit`**~~ (SPEC-065 system-frame review; invariant 13) → **closed by SPEC-066**. Every `int`
   floor in a sink constructor and the worker — `max_retries` on twelve sink constructors and
