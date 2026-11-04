@@ -106,6 +106,7 @@ class HoneycombSink(HTTPSink):
 
     MAX_BATCH_COUNT = 1000
     MAX_BATCH_BYTES = 1_000_000
+    _CREDENTIALS = "this sink's api_key argument"
 
     def __init__(
         self,
@@ -135,12 +136,15 @@ class HoneycombSink(HTTPSink):
           ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), or cannot
             be carried in a request path — checked against a fixed base so the message names
             ``dataset`` rather than the ``url`` this class builds from both, whose own check
-            names ``url`` (SPEC-049 FR-001); or if ``url`` carries a query or fragment, which
-            the appended path would land inside (:func:`_valid_base_url`).
+            names ``url`` (SPEC-049 FR-001); or if ``url`` carries a user or password, or a
+            query or fragment, which the appended path would land inside
+            (:func:`_valid_base_url`).
         """
         _one_segment(dataset, type(self).__name__)
         _valid_url(f"http://localhost/1/batch/{dataset}", type(self).__name__, name="dataset")
-        _valid_base_url(url, type(self).__name__, f"/1/batch/{dataset}")
+        _valid_base_url(
+            url, type(self).__name__, f"/1/batch/{dataset}", credentials=self._CREDENTIALS
+        )
         headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",

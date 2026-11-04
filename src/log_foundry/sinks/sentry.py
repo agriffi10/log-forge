@@ -11,7 +11,12 @@ from urllib.parse import urlsplit
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.http import HTTPSink, _unsendable_header, _valid_url
+from log_foundry.sinks.http import (
+    HTTPSink,
+    _carries_userinfo,
+    _unsendable_header,
+    _valid_url,
+)
 
 __all__ = ["Backend", "SentrySink"]
 
@@ -630,16 +635,29 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
       ValueError: If the DSN lacks a scheme, a host, a public key or a project id, the project
         id is not an integer ``int`` can read, or the ingest URL or auth header it derives could not be sent —
         checked here, under ``dsn``, because :class:`HTTPSink` would otherwise refuse a URL the
-        caller never wrote under its own name, and the header only fails at ``emit``. The key is
-        never echoed by those three; a DSN ``urlsplit`` cannot read — an unclosed IPv6 bracket,
-        a port past ``65535`` — is refused naming ``dsn`` too, with ``urlsplit``'s reason rather
-        than the DSN.
+        caller never wrote under its own name, and the header only fails at ``emit``. A DSN
+        ``urlsplit`` cannot read — an unclosed IPv6 bracket, a port past ``65535``, a bracketed
+        host that is no IP address, a character NFKC turns into a delimiter — is refused naming
+        ``dsn`` too, and so is a host holding an ``@`` once percent-decoded, which ``urllib``
+        decodes into the host it connects to. **No refusal echoes the DSN or chains an exception
+        that does**: the public key is in it, and ``urlsplit``'s own error quotes the whole netloc
+        for an NFKC character, key included, and on some Python releases (3.13.1, for one) the
+        bracketed text for a bad bracket, which in ``https://[key]@h/1`` is the key — so the
+        reason is fixed text, raised outside the ``except``. A user before the ``@`` is not refused: by Sentry's format it is the key.
     """
     try:
         parsed = urlsplit(dsn)
         port = f":{parsed.port}" if parsed.port else ""
-    except ValueError as err:
-        raise ValueError(f"SentrySink dsn is not a URL ({err})") from err
+    except ValueError:
+        unreadable = True
+    else:
+        unreadable = False
+    if unreadable:
+        raise ValueError(
+            "SentrySink dsn is not a URL urlsplit can read: an unclosed IPv6 bracket, a port "
+            "that is not a number from 0 to 65535, a bracketed host that is not an IP address, "
+            "or a character NFKC normalization turns into a URL delimiter"
+        )
     missing = [
         name
         for name, value in (
@@ -651,9 +669,7 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
         if not value
     ]
     if missing:
-        raise ValueError(
-            f"SentrySink dsn is missing its {', '.join(missing)}: {dsn!r}"
-        )
+        raise ValueError(f"SentrySink dsn is missing its {', '.join(missing)}")
     head, _, project = parsed.path.rpartition("/")
     if not _PROJECT_ID.fullmatch(project):
         try:
@@ -668,6 +684,11 @@ def _parse_dsn(dsn: str) -> tuple[str, str]:
         host = f"[{host}]"
     ingest_url = f"{parsed.scheme}://{host}{port}{prefix}api/{project}/envelope/"
     auth_header = f"Sentry sentry_key={parsed.username}, sentry_version=7, sentry_client=log-foundry"
+    if _carries_userinfo(ingest_url):
+        raise ValueError(
+            "SentrySink dsn host must not hold an '@', percent-encoded or not: urllib decodes it "
+            "into the host name it connects to"
+        )
     _valid_url(ingest_url, "SentrySink", name="dsn")
     failure = _unsendable_header("X-Sentry-Auth", auth_header)
     if failure:

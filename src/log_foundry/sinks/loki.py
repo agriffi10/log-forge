@@ -63,11 +63,12 @@ class LokiSink(HTTPSink):
           None.
 
         Raises:
-          ValueError: If ``url`` carries a query or fragment, which the appended push path would
-            land inside (:func:`~log_foundry.sinks.http._valid_base_url`), or the URL it builds
-            cannot be sent.
+          ValueError: If ``url`` carries a user or password, or a query or fragment, which the
+            appended push path would land inside
+            (:func:`~log_foundry.sinks.http._valid_base_url`), or the URL it builds cannot be
+            sent.
         """
-        _valid_base_url(url, type(self).__name__, _PUSH_PATH)
+        _valid_base_url(url, type(self).__name__, _PUSH_PATH, credentials=self._CREDENTIALS)
         self._labels = labels
         super().__init__(
             url.rstrip("/") + _PUSH_PATH, body_format="json_array", **http_kwargs
