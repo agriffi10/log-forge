@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+import re
 import textwrap
 import threading
 import time
@@ -268,9 +269,14 @@ def test_a_second_shutdown_after_the_first_completed_returns_immediately() -> No
     assert sink.closed == 1, "and it did not close the sink a second time"
 
 
-def test_an_expired_first_shutdown_does_not_make_the_second_wait() -> None:
+def test_an_expired_first_shutdown_does_not_make_the_second_wait(capsys) -> None:
     """AC-5. The drain thread is wedged and nothing will release it, so waiting on
-    ``_drain_finished`` would spend the whole second budget before an exit that must happen."""
+    ``_drain_finished`` would spend the whole second budget before an exit that must happen.
+
+    SPEC-068 FR-003 records this as a decision — an expired shutdown is final — and pins all of
+    its shape here, not only the time: the second call is idle, writes nothing, and leaves the
+    sink open for a call that finds the thread ended. Its CPU window covers only that call.
+    """
     sink = WedgedSink()
     log_foundry.configure(service="t", sink=sink)
     _trace_once()
@@ -279,18 +285,81 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait() -> None:
 
     try:
         assert sink.in_emit.wait(5.0)
-        log_foundry.shutdown(timeout=0.5)  # expires: the sink ignores the stop signal
+        log_foundry.shutdown(timeout=0.3)  # expires: the sink ignores the stop signal
         assert worker.stopped_reason == "ShutdownTimeout", "the first shutdown did not expire"
+        capsys.readouterr()
 
+        cpu = time.process_time()
         start = time.monotonic()
-        log_foundry.shutdown(timeout=30.0)
+        log_foundry.shutdown(timeout=3.0)
         elapsed = time.monotonic() - start
+        spent = time.process_time() - cpu
 
-        assert elapsed < 1.0, (
+        assert elapsed < 0.1, (
             f"the second shutdown waited {elapsed:.2f}s on a drain the first one abandoned"
         )
+        assert spent < 0.05, f"the second shutdown spent {spent:.3f}s of CPU: it is not idle"
+        assert capsys.readouterr().err == "", "a losing caller writes nothing"
+        assert sink.closed == 0, "the drain thread is still inside the sink, so it stays open"
     finally:
         sink.release.set()
+
+
+def test_an_atexit_exit_after_an_expired_shutdown_returns_without_closing() -> None:
+    """FR-003 AC-4 (SPEC-068). The decided cost, pinned in a real interpreter exit.
+
+    After an expired ``shutdown()``, ``atexit``'s call does not wait on the drain thread and the
+    interpreter exits with a sink still inside an emit neither flushed nor closed. A waiting
+    ``atexit`` would cost
+    ``DEFAULT_SHUTDOWN_TIMEOUT`` (30 s) on every such exit, after the caller's budget had already
+    run out. The probe registers **before** ``import log_foundry``, so LIFO runs it after the
+    library's own handler and its report proves that handler completed. The token, the exit
+    status, the expiry line and the probe's own line are the positive control: a child that
+    crashed, or never reached its shutdown, cannot read as a pass.
+    """
+    import subprocess
+    import sys
+
+    program = textwrap.dedent(
+        """
+        import atexit, sys, threading, time
+        sys.path.insert(0, "src")
+        state = {"closes": 0, "token_at": None}
+        atexit.register(lambda: print(
+            "PROBE closes=%d elapsed=%.3f"
+            % (state["closes"], time.monotonic() - state["token_at"]), flush=True))
+
+        import log_foundry
+
+        class Wedged:
+            log_foundry_stop_signal = None
+            def __init__(self): self.never = threading.Event()
+            def emit(self, b): self.never.wait()
+            def close(self): state["closes"] += 1
+
+        log_foundry.configure(service="t", sink=Wedged())
+
+        @log_foundry.trace
+        def w(): log_foundry.info("x")
+        w()
+
+        log_foundry.shutdown(timeout=0.3)
+        state["token_at"] = time.monotonic()
+        print("SHUTDOWN-RETURNED", flush=True)
+        """
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=90
+    )
+    assert result.returncode == 0, f"the child failed: {result.stderr[-800:]}"
+    assert "SHUTDOWN-RETURNED" in result.stdout, f"never got there: {result.stderr[-800:]}"
+    assert "shutdown timed out after 0.3s" in result.stderr, result.stderr[-800:]
+    probe = re.search(r"PROBE closes=(\d+) elapsed=([0-9.]+)", result.stdout)
+    assert probe is not None, f"the library's atexit handler did not complete:\n{result.stdout}"
+    assert probe.group(1) == "0", f"the wedged sink was closed at exit:\n{result.stdout}"
+    assert float(probe.group(2)) < 1.0, (
+        f"atexit waited on the drain thread after an expired shutdown:\n{result.stdout}"
+    )
 
 
 def test_the_closer_grace_is_granted_exactly_once_per_call(monkeypatch) -> None:
@@ -922,6 +991,12 @@ def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() ->
     assert elapsed < _lifecycle.DEFAULT_CLOSER_GRACE, (
         f"shutdown(timeout=0) waited {elapsed:.2f}s on another caller's close"
     )
+    # The first caller is still inside the 5 s close. Left running, it finishes during whichever
+    # test this worker process runs next and reaches `join_closers` there: a test counting that
+    # call's grants then reads two (found in SPEC-068's build, once a new test file reshuffled
+    # the xdist schedule). So the test waits for its own thread before it ends.
+    first.join(10.0)
+    assert not first.is_alive(), "the first caller's close never finished"
 
 
 def test_a_daemon_thread_shutdown_finishes_its_close_before_the_process_exits() -> None:

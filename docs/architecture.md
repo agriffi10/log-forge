@@ -948,22 +948,6 @@ close it.
   omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
   endpoint's response shape gets settled.
 
-- **Queued items are announced twice on an expired exit drain** (SPEC-062 frame-2 review;
-  invariant 2). The `ShutdownTimeout` line reports the queue as lost, and the decline or abandon
-  line reports the same items again once `_final_drain` takes them, while their future is still
-  open — the shape SPEC-062 FR-005 closed for the events *in flight*, left open for the events
-  still queued. **Closed by** a line that reports the queue as pending, counted when the drain
-  takes it, as FR-005 does for the batch.
-- **A second `shutdown()` after an expired one returns at once, whatever its budget, with the sink
-  still open** (SPEC-062 frame-2 review; invariants 3 and 5). Its `claimed=False` branch waits on
-  `_drain_settled`, which the expiry has already set. A third call after the thread ends closes the
-  sink. **Closed by** a second caller that waits on the drain thread rather than on the settled
-  event, or by deciding the expired state is final.
-- **`_reinit_after_fork(resume=True)` does not reset `_stopped`** (SPEC-062 frame-2 review;
-  invariant 12). A worker stopped directly, which never moved the retirement count, and then forked
-  resumes a drain that a later `Worker.claim_stop` cannot win, so its deadline is never recorded
-  and its stop takes the second caller's branch. **Closed by** resetting `_stopped` beside
-  `_exit_deadline` on the resume branch.
 - **`@trace(name=...)` tests its argument with `isinstance(name, str)`** (SPEC-067 frame-2 review;
   invariant 13). `isinstance` reads the value's own `__class__`, so an object whose `__class__`
   property returns `str` is accepted at decoration, and every call of the decorated function then
@@ -992,8 +976,62 @@ close it.
   it. It is a `float` door of SPEC-049's, not an `int` door, so SPEC-066 did not change it.
   **Closed by** an upper bound in `require_timeout` at what the socket accepts, refused rather
   than floored if no value above it delivers — once the bound and its message are settled.
+- **The after-shutdown submission line announces a loss the final drain can still deliver**
+  (SPEC-068; invariant 2). `Worker._count_undeliverable` writes `lost N submission(s)` ("nothing
+  will drain these") for a submission made after the retirement count moved, but one made before
+  `_final_drain`'s last read is still taken by that drain and delivered, or announced again by
+  `_emit` if it fails. `Worker.submit`'s docstring already calls the line over-strong.
+  **Closed by** writing that `lost` line only once the final drain's last read of the queue is
+  done or the drain thread is dead.
+- **`flush()` and `configure(sink=…)` called on the drain thread wait on themselves** (SPEC-068
+  spec review; invariant 3). A sink's `emit` that calls either waits on the thread it runs on:
+  measured, a 1.009 s `timed-out` flush and a 5.007 s stranded swap. SPEC-068 FR-006 closed this
+  shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain thread,
+  which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034), and a swap that does
+  not wait on the thread it runs on.
+- **A shutdown sentinel can still strand behind the final drain on the ordinary path** (SPEC-068
+  diff review; invariant 2). The first caller queues `_SHUTDOWN` and then sets the stop event, but
+  a drain thread that wakes on the stop event first — at the end of an emit, or from a backoff —
+  can run `_final_drain` and make its last read before the put lands, so the sentinel is never
+  consumed and `health().queued` reads 1 for good with `submitted_after_shutdown` at 0. Measured
+  by SPEC-068's second diff review in roughly 1 to 8 of 300 races against the worker as it stood
+  before SPEC-068; it predates that spec, which closed the same shape
+  for the caller that takes over a drain-thread join (that one no longer queues a second sentinel).
+  **Closed by** putting the sentinel before the stop event can wake the drain, or by
+  `_final_drain` re-reading the queue after the stop until it has taken a sentinel.
+- **A `shutdown()` called inside an orphan-path sink's `emit` closes that sink from inside its own
+  emit** (SPEC-068 diff review; invariant 5). With no span active, `log_foundry.info()` emits on the
+  caller's own thread (`api.py`), and `_Lifecycle.held` asks only about the worker's thread, so the
+  closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
+  share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
+  per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
 
 ### Resolved
+
+- ~~**Queued items are announced twice on an expired exit drain**~~ (SPEC-062 frame-2 review;
+  invariant 2) → **closed by SPEC-068**. The `ShutdownTimeout` line called the queue lost, and the
+  decline or abandon line announced the same items again once `_final_drain` took them; its count
+  was `qsize()`, so it also called the sentinel `stop()` had just queued a lost item. The line is
+  now written by `_diag.pending`, which claims no loss, and its queued clause counts submissions
+  only (`Worker._queued_submissions`), so each event queued or in flight at the expiry is announced
+  lost at most once. The unconfirmed-swap line, its twin, was rewritten the same way and now fits
+  `_diag`'s detail bound instead of shipping cut off mid-word.
+- ~~**A second `shutdown()` after an expired one returns at once, whatever its budget, with the
+  sink still open**~~ (SPEC-062 frame-2 review; invariants 3 and 5) → **decided final by
+  SPEC-068**. An expired `shutdown()` is final: a later caller waits only for a stop still in
+  progress, and the sink an expired call left open is closed by the first call that finds the
+  drain thread ended. **The cost:** in an `atexit` exit after an expired `shutdown()`, a buffering
+  sink whose drain thread is still inside an emit is neither flushed nor closed. **The reason:** an
+  exit that has already spent the caller's budget does not spend a second one — a waiting `atexit`
+  would add `DEFAULT_SHUTDOWN_TIMEOUT` (30 s) to every exit over a wedged sink. Reasoning in
+  `docs/decisions/pipeline/`.
+- ~~**`_reinit_after_fork(resume=True)` does not reset `_stopped`**~~ (SPEC-062 frame-2 review;
+  invariant 12) → **closed by SPEC-068**. Resetting `_stopped` alone was measured and is not
+  enough: the child also inherits the stop event **set**, and its resumed drain loop exited at
+  once. The resume branch now resets `_stopped` and the owed join and takes its event from
+  `refresh_stop_signal()`, as a new worker does; a resumed child delivers and declines retries
+  against its own deadline. The route is internal: only a direct `Worker.stop()` leaves a live
+  worker stopped.
 
 - ~~**A mapping key built from a shared sub-structure is rendered whole before any budget applies**~~
   (SPEC-057, Accepted Limits; invariants 1 and 8) → **closed by SPEC-063 FR-001**. A key whose real
@@ -1415,6 +1453,15 @@ and a third copy is a fork with no merge.
   exercises the method against a queue holding a mix of markers and event-lists, so the change
   surfaces as a test failure on a new interpreter rather than as that silence.
 
+  **`Worker._queued_submissions` is the second reader** (SPEC-068 FR-001). It takes the same
+  `Queue.mutex` and iterates the same `Queue.queue` to count the submissions still queued —
+  every entry that is neither the `_SHUTDOWN` sentinel nor a flush marker, `_final_drain`'s own
+  classification — for the expiry line and the unconfirmed-swap line, which `qsize()` cannot
+  serve because it counts the sentinel and the markers too. Its blast radius is smaller than
+  `_release_waiters`': the same CPython change would make it return 0, so both lines would lose
+  their queued clause and say nothing false. A test replaces the mutex with one that cannot be
+  entered and asserts exactly that.
+
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
   `MongoDBSink(client=…)`) does **not** close that client: it is the caller's to release, and
@@ -1735,11 +1782,16 @@ and a third copy is a fork with no merge.
 
 - **`Worker._reinit_after_fork` installs `self._thread` only after `start()` succeeds**
   (SPEC-039 FR-002), so for an instant a live drain thread coexists with the inherited dead one
-  in that attribute. Safe only because the drain thread never reads it — `_run`, `_drain`,
-  `_terminal_failure` and `_release_waiters` do not, and every reader is on a caller thread —
-  which nothing enforces. The alternative was measured and is worse: assigning first leaves a
-  worker whose `start()` raised reading `draining` forever and handing the next `shutdown()` a
-  `RuntimeError` from `join`, out of a public call documented to raise nothing.
+  in that attribute. ~~Safe only because the drain thread never reads it~~ — struck (SPEC-068
+  FR-006): `Worker.claim_stop` and `Worker.stop` ask whether the caller is the drain thread by
+  comparing against `self._thread`, and they run on it when a sink's `emit` calls `shutdown()`.
+  Inside the window that comparison would read false, the call would join the dead thread and the
+  closer could free the sink under an emit in flight. It is safe because the window is
+  unreachable: the new thread reaches `sink.emit` only through the queue, which the repair has
+  just replaced empty, and nothing can fill it before the assignment, since the fork handler runs
+  on the child's only thread. Nothing enforces that. The alternative was measured and is worse:
+  assigning first leaves a worker whose `start()` raised reading `draining` forever and handing the
+  next `shutdown()` a `RuntimeError` from `join`, out of a public call documented to raise nothing.
 
 - **`atexit` does not run when a serverless environment is reaped.** The graceful drain (§9) is
   registered via `atexit`, which covers a process that *exits*. A Lambda execution environment

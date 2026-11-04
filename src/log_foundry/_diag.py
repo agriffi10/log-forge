@@ -1,4 +1,4 @@
-"""The library's own diagnostic channel — one line on stderr, for what it lost or absorbed.
+"""The library's own diagnostic channel — one stderr line for what it lost, absorbed or awaits.
 
 Four rules, all load-bearing (SPEC-029 FR-004, SPEC-067 FR-001):
 
@@ -16,6 +16,12 @@ Four rules, all load-bearing (SPEC-029 FR-004, SPEC-067 FR-001):
   as ``<TypeName>``, read through ``type``'s own descriptor; never a ``repr`` of the value. If
   even that cannot be computed, the line is still written with ``<?>``.
 
+Four writers, one per kind of line (SPEC-068 FR-001): ``absorbed`` for a failure swallowed rather
+than propagated, ``lost`` for a counted loss, ``rejected`` for an inbound trace context refused,
+and ``pending`` for an outcome not yet decided. The fourth exists because a line written while
+the drain thread is still inside the sink cannot know whether what it describes will be
+delivered, and a ``lost`` line there announced a loss that another line then announced again.
+
 Stderr stays the channel: routing through the ``logging`` module would make the library's own
 failure reports depend on machinery that may be the thing failing. This module must import
 nothing from its own package — it is reached at module scope while the package is still
@@ -27,7 +33,7 @@ from __future__ import annotations
 import sys
 from typing import cast
 
-__all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "rejected"]
+__all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "pending", "rejected"]
 
 WARN_EVERY = 1000
 """The period of every per-event throttle in the library (SPEC-017 FR-005, SPEC-055 FR-005).
@@ -118,6 +124,33 @@ def lost(what: str, count: int, detail: str = "") -> None:
     """
     try:
         sys.stderr.write(f"log-foundry: lost {count} {_escape(what)}(s){_suffix(detail)}\n")
+    except Exception:
+        pass
+
+
+def pending(detail: str) -> None:
+    """Reports an outcome the library cannot decide yet, without claiming a loss (SPEC-068 FR-001).
+
+    The line is ``log-foundry: <detail>``, with no ``lost N ...`` prefix: what it describes may
+    still be delivered, and whichever line settles it later carries the count. That is what keeps
+    an event from being announced lost twice — once while its future was open, and again by the
+    drain that took it. The detail is escaped and bounded exactly as :func:`lost`'s is, through
+    the same helper.
+
+    Args:
+      detail: What is pending and why, built from library-controlled values only. An empty
+        detail writes nothing, because a bare prefix says nothing a reader could act on.
+
+    Returns:
+      None.
+
+    Raises:
+      None on a stream fault; a ``BaseException`` from the write still propagates.
+    """
+    if not detail:
+        return
+    try:
+        sys.stderr.write(f"log-foundry: {_bounded(detail)}\n")
     except Exception:
         pass
 
@@ -249,9 +282,7 @@ def errno_of(exc: BaseException) -> str:
 def _suffix(detail: str) -> str:
     """Renders a detail as a bounded, escaped ``"; ..."`` suffix.
 
-    Escaping precedes truncation so the bound applies to what is written, and so truncation
-    can only remove characters from an already-safe string rather than split an escape into
-    something that is not one.
+    The escape and the cut are :func:`_bounded`'s, shared with :func:`pending`.
 
     Args:
       detail: The caller-supplied detail, possibly empty.
@@ -267,12 +298,32 @@ def _suffix(detail: str) -> str:
     if not detail:
         return ""
     try:
-        shown = _escape(detail)
-        if len(shown) > _MAX_DETAIL:
-            shown = shown[:_MAX_DETAIL] + "…"
-        return f"; {shown}"
+        return f"; {_bounded(detail)}"
     except Exception:
         return ""
+
+
+def _bounded(detail: str) -> str:
+    """Escapes a detail and cuts it to ``_MAX_DETAIL``, marking a cut with ``…``.
+
+    Escaping precedes the cut so the bound applies to what is written, and so the cut can only
+    remove characters from an already-safe string rather than split an escape into something
+    that is not one. One helper for :func:`_suffix` and :func:`pending`, so the two writers that
+    carry a free-form detail cannot drift apart on the rule.
+
+    Args:
+      detail: The caller-supplied detail.
+
+    Returns:
+      The escaped detail, at most ``_MAX_DETAIL`` characters plus the cut mark.
+
+    Raises:
+      Exception: Whatever escaping a detail that is not a ``str`` raises; both callers guard it.
+    """
+    shown = _escape(detail)
+    if len(shown) > _MAX_DETAIL:
+        shown = shown[:_MAX_DETAIL] + "…"
+    return shown
 
 
 def _escape(text: str) -> str:

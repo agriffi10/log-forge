@@ -123,7 +123,9 @@ class Health:
         stopping the world, and counts the internal flush/shutdown markers alongside real
         submissions — normally only in passing, but a ``flush()`` marker stranded by racing
         ``shutdown()`` is answered and then counted for the life of the process, since
-        ``Queue`` offers no way to remove one specific item.
+        ``Queue`` offers no way to remove one specific item. A ``_SHUTDOWN`` sentinel put after
+        the final drain's last read is counted the same way, a recorded exception
+        (``architecture.md`` §12).
       dropped: Submissions discarded because the queue was full (backpressure).
       failed_batches: Batches abandoned after the retry budget was spent, or whose retry the
         exit drain declined because it was predicted to end after the ``shutdown()``
@@ -365,11 +367,19 @@ class Worker:
         whose deadline the drain declines against — and cleared only by
         :meth:`_reinit_after_fork` where that method starts a drain thread. Until a stop is
         claimed it is ``None``, which declines nothing, so ordinary draining, ``flush()`` and a
-        swap retry exactly as before. ``_in_flight`` is the size of the batch :meth:`_emit` is holding, from
-        before its first attempt until it returns, so an expired join can say how many events
-        are inside the emit it gave up waiting on (FR-005). It is written by the drain thread
-        and read without the lock by the stopper, as :attr:`draining` is read: a single
-        assignment, so a reader sees one of two answers, both true at the instant.
+        swap retry exactly as before. It has one other writer: a caller that takes over a join the
+        drain thread owed replaces the drain-thread caller's deadline with its own (SPEC-068
+        FR-006). ``_join_owed`` records that debt — ``True`` only between a stop claimed **on**
+        the drain thread, which cannot join itself, and the next caller off it, which takes the
+        gate over. ``_join_taken_over`` records that the debt was paid, so the caller that took
+        it over queues no second sentinel. Both are written under ``_lock`` by :meth:`claim_stop`
+        and reset with ``_stopped`` where :meth:`_reinit_after_fork` starts a drain thread.
+        ``_in_flight`` is the
+        size of the batch :meth:`_emit` is holding, from before its first attempt until it returns,
+        so an expired join can say how many events are inside the emit it gave up waiting on
+        (FR-005). It is written by the drain thread and read without the lock by the stopper, as
+        :attr:`draining` is read: a single assignment, so a reader sees one of two answers, both
+        true at the instant.
 
         ``sink_released=`` used to sit here and is retired (SPEC-054 FR-002). It made a worker
         built during a ``shutdown()`` inherit a discharged close for a sink that shutdown's orphan
@@ -418,6 +428,8 @@ class Worker:
         self._drain_settled = threading.Event()
         self._stopped = False
         self._exit_deadline: float | None = None
+        self._join_owed = False
+        self._join_taken_over = False
         self._in_flight = 0
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
@@ -463,6 +475,25 @@ class Worker:
         a deadline the parent's caller set, forever. A retired parent forks a retired child, and
         that child's record is left as it stands.
 
+        **The resume branch also resets the stop gate and replaces a set stop event**
+        (SPEC-068 FR-005). Such a worker's child inherits ``_stopped`` true, which would make its
+        first ``shutdown()`` a losing caller that records no deadline, and inherits ``_stop``
+        **set**, because ``_fork._fresh_primitive`` carries an event's set state across — and
+        :meth:`_drain` tests ``_stop`` first, so the resumed drain loop exited at once. Measured:
+        the child's drain thread had ended before its first submission, which was never
+        delivered and never counted. Resetting ``_stopped`` alone was measured too and is not
+        enough: the deadline is then recorded, but the drain thread is still dead. So the branch
+        clears ``_stopped``, ``_join_owed`` and ``_join_taken_over`` and takes its event from
+        :meth:`~log_foundry._lifecycle._Lifecycle.refresh_stop_signal`, the call ``__init__``
+        makes: the owner's current event when that is unset, so a worker never stopped keeps the
+        event it had and the identity with the owner and the sink is unchanged, and a fresh one
+        shared with the owner when it is set. It runs before the stop signal is offered, so the
+        sink is handed the new event. The owner's lock is not taken, for the reason
+        :func:`_lifecycle._rebuild_worker_after_fork` gives. The retired branch keeps all three
+        as inherited — a fork does not undo a ``shutdown()`` — and an owed join inherited there is
+        harmless: the next ``shutdown()`` in that child takes it over, finds ``_drain_finished``
+        set and joins the inherited thread, which is dead in the child and returns at once.
+
         ``_held`` is reset to the live sink alone. A child stranded nothing, and ``releasable()``
         refuses the parent's sinks on the pid stamp anyway — so keeping a superseded one buys no
         close and costs a strong reference, plus a pointless refused release at every child exit.
@@ -507,10 +538,17 @@ class Worker:
         what keeps :meth:`shutdown` from queueing a sentinel into a queue no thread will read.
 
         The success path assigns ``self._thread`` *after* the start, so for an instant a live
-        drain thread coexists with the inherited dead one in that attribute. That is safe only
-        because the drain thread never reads it — ``_run``, ``_drain``, ``_terminal_failure``
-        and ``_release_waiters`` do not, and the three readers are all on caller threads — which
-        is an invariant this note states rather than one anything enforces.
+        drain thread coexists with the inherited dead one in that attribute. ~~That is safe only
+        because the drain thread never reads it~~ — struck (SPEC-068 FR-006): :meth:`claim_stop`
+        and :meth:`stop` now ask ``threading.current_thread() is self._thread``, and they run on
+        the drain thread when a sink's ``emit`` calls ``shutdown()``. Inside that instant the
+        comparison would read false, the call would join the dead thread, which returns at once,
+        and :meth:`may_be_inside` would read the sink as free under an emit in flight. It cannot
+        happen: the new thread reaches ``sink.emit`` only by taking a submission or a marker from
+        the queue, the queue was replaced empty above, and nothing can fill it before the
+        assignment, because this handler runs on the child's only thread and nothing else in the
+        child runs until it returns. That is an argument this note states, not something any
+        lock enforces.
 
         Args:
           resume: Whether to start a drain thread. ``False`` for a retired parent, which forks
@@ -537,6 +575,10 @@ class Worker:
             self._drain_settled.set()
             return
         self._exit_deadline = None
+        self._stopped = False
+        self._join_owed = False
+        self._join_taken_over = False
+        self._stop = _lifecycle._state.refresh_stop_signal()
         self._drain_finished.clear()
         self._drain_settled.clear()
         _lifecycle.offer_stop_signal(self.sink, self._stop)
@@ -1072,13 +1114,23 @@ class Worker:
     def _record_incomplete_swap(self, timeout: float | None, sink: Sink) -> None:
         """Records a swap whose drain could not be confirmed, then announces it (FR-003).
 
-        Two things are reported at once because they have one cause: queued items may have been
+        Two things are reported at once because they have one cause: queued submissions may be
         carried to the new sink rather than the old one, and the old sink is not closed here. The
-        count is queued *items* — one per submitted span plus any marker — which makes it a
-        floor on the events involved, the useful direction for a reader deciding whether to care.
-        It counts the queue and not the previous sink's buffer deliberately: the queued items are
+        line is a :func:`~log_foundry._diag.pending` one, never a loss (SPEC-068 FR-002): those
+        submissions sit on a **live** drain, may well be delivered to the new sink, and are
+        counted by :meth:`_emit` if they are later abandoned — so a ``lost`` line here announced
+        them a second time. The count is :meth:`_queued_submissions`, which leaves out this
+        swap's own unanswered flush marker, and the clause is dropped when it is zero. It counts
+        the queue and not the previous sink's buffer deliberately: the queued submissions are
         the ones that may be misrouted. A probe read it as zero while nine events sat in that
         sink's client buffer, and both numbers were right about different things.
+
+        The wording is the shortest that still says both things, because the whole line must fit
+        ``_diag``'s detail bound. The line it replaced was 214 characters at a 4-character budget
+        and shipped cut off mid-word; this one fits at a 14-character budget, the longest
+        ``_bounded_seconds`` renders for a finite float, with a six-digit count. The substrings
+        ``could not be confirmed drained`` and ``left open`` are kept, which ``configure()``'s
+        tests read.
 
         **The sink is also recorded, not merely announced** (SPEC-050 FR-004). It is owed a close
         that cannot be performed now — the drain thread may still be inside its ``emit``, which is
@@ -1101,14 +1153,15 @@ class Worker:
         """
         with self._lock:
             self.incomplete_swaps += 1
-        _diag.lost(
-            "item",
-            self._queued_or_unknown(),
+        queued = self._queued_submissions()
+        detail = (
             f"the previous sink could not be confirmed drained within "
-            f"{_bounded_seconds(timeout)} of a configure(sink=...); it is left open until a "
-            f"shutdown() that finds the drain thread ended closes it, and queued items may "
-            f"reach the new sink instead",
+            f"{_bounded_seconds(timeout)}; it is left open until a shutdown() finds the drain "
+            f"thread ended"
         )
+        if queued:
+            detail += f"; {queued} submission(s) still queued, which may reach the new sink"
+        _diag.pending(detail)
 
     def claim_stop(self, deadline: float | None) -> bool:
         """Wins or loses the once-only stop gate, recording the winner's deadline (SPEC-062).
@@ -1121,8 +1174,41 @@ class Worker:
         sink was never closed. Here whoever sets ``_stopped`` is whoever's deadline is written,
         so the drain always declines against the deadline the joining caller is holding, and a
         later caller's deadline is refused along with its claim, which is what makes the record
-        write-once across concurrent stoppers without a second flag. Only
-        :meth:`_reinit_after_fork` writes it otherwise, clearing it for a child that resumes.
+        write-once across concurrent stoppers — save for the one handover below, which
+        ``_join_owed`` exists to allow. Only :meth:`_reinit_after_fork` writes it otherwise,
+        clearing it for a child that resumes.
+
+        **One exception: a join is owed** (SPEC-068 FR-006). A sink's ``emit`` can call
+        ``shutdown()``, and then the caller is the drain thread, which cannot join itself. When
+        that caller wins, the same critical section records ``_join_owed``, and :meth:`stop`
+        returns without joining. The next caller **not** on the drain thread then takes the gate
+        over here: it clears ``_join_owed``, records **its own** deadline in place of the
+        drain-thread caller's, and returns ``True``, so it does the first caller's whole work —
+        the join, and on expiry the line. That keeps SPEC-062's rule that the caller whose timeout
+        the join uses is the caller whose deadline the drain declines against, because the
+        drain-thread caller never joins. It does not re-open a retry a joining caller's deadline
+        declined, because no join has run yet; and it happens once, because the flag is cleared
+        in the decision that takes it, so every later caller loses as before. Without it, an emit
+        that wedged after the drain-thread call was announced by nobody, and every later caller,
+        ``atexit`` included, spent its whole budget waiting in silence — measured as a 30.12 s
+        exit with no line and no close. A losing caller on the drain thread never takes the owed
+        join over: it is the one thread that cannot perform it.
+
+        **The verdict stays a** ``bool``, because both callers — :meth:`stop` and
+        :func:`_lifecycle._shutdown_worker`, which passes it on as ``claimed`` — only need "do
+        the first caller's work". The one difference in that work is recorded beside it instead:
+        the takeover sets ``_join_taken_over`` in the same critical section, and :meth:`stop`
+        reads it to skip the sentinel, which the drain-thread winner already queued. A second one
+        is not harmless. Taken over while :meth:`_final_drain`'s emit is running, it lands after
+        that drain's last read, is never consumed, and ``health().queued`` reads 1 for the life
+        of the process with ``submitted_after_shutdown`` at 0 — measured in 33 of 300 unforced
+        runs. The drain needs no wake-up from it either: the drain-thread winner has set the stop
+        event, and the drain loop tests that as soon as the emit it is inside returns.
+
+        Whether this caller is the drain thread is read **before** the lock, so the lock is still
+        held across no call. In a forked child, ``self._thread`` names the inherited dead thread
+        for an instant after the new one starts; :meth:`_reinit_after_fork` says why no caller
+        can be on the new thread inside that instant.
 
         It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
         order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
@@ -1134,17 +1220,25 @@ class Worker:
             an unbounded stop.
 
         Returns:
-          Whether this caller won the gate. ``True`` means it must do the first caller's work
-          in :meth:`stop`; ``False`` means a stop is already under way and its deadline stands.
+          Whether this caller won the gate or took an owed join over. ``True`` means it must do
+          the first caller's work in :meth:`stop`; ``False`` means a stop is already under way
+          and its deadline stands.
 
         Raises:
           None.
         """
+        on_drain_thread = threading.current_thread() is self._thread
         with self._lock:
             if self._stopped:
-                return False
+                if not self._join_owed or on_drain_thread:
+                    return False
+                self._join_owed = False
+                self._join_taken_over = True
+                self._exit_deadline = deadline
+                return True
             self._stopped = True
             self._exit_deadline = deadline
+            self._join_owed = on_drain_thread
             return True
 
     def stop(
@@ -1173,6 +1267,24 @@ class Worker:
         clear, both run the expiry branch, and a wedged sink produces two "shutdown timed out"
         lines with ``queued`` counted twice.
 
+        **On the drain thread itself it never joins or waits on that thread** (SPEC-068 FR-006).
+        A bad ``timeout`` never reaches this far: the public ``shutdown()`` refuses it at entry
+        (SPEC-066), before anything is claimed, on the drain thread as anywhere — invariant 13's
+        refusal where the argument is written. A sink's ``emit`` that calls ``shutdown()`` makes the
+        drain thread the caller, and at ``fda134a`` a first caller there raised ``RuntimeError`` out
+        of ``Thread.join`` while a losing one waited on ``_drain_settled``, which only this same
+        thread's exit or another caller's expiry can set. As the first caller it queues the sentinel
+        unless the drain has finished, sets the stop event and returns: :meth:`claim_stop` has
+        recorded that a join is owed, and the next caller off this thread takes it over — doing the
+        first caller's work except the sentinel, which is already queued and a second copy of which
+        can strand behind the final drain (``_join_taken_over``, :meth:`claim_stop`). It writes no
+        expiry line and sets no ``stopped_reason``, because nothing has timed out, and it calls no
+        :meth:`_release_waiters`, because this thread's own exit sweeps the markers in
+        :meth:`_run`'s ``finally``. As a losing caller it returns without waiting on
+        ``_drain_settled``. What the rest of ``shutdown()`` does on that thread — the closer and its
+        grace — is the lifecycle owner's and unchanged. The drain ends once the current emit
+        returns, through :meth:`_drain`'s stop check and :meth:`_final_drain`, as for any stop.
+
         **The claim is made before any stop event this worker holds is set**, on both routes.
         :func:`_lifecycle._shutdown_worker` claims for a live worker inside the critical section
         that moves the retirement count, before it sets ``_state._stop`` — which is this worker's
@@ -1184,10 +1296,16 @@ class Worker:
 
         An expired join leaves the sink **open**, because the thread is still inside it
         (SPEC-027 FR-004). The closer sees that through :meth:`may_be_inside` and leaves the sink
-        in the owner's record for a later call. The expiry line then also reports how many events
-        are inside the emit the thread is still running (SPEC-062 FR-005), separately from the
-        queued count and not as lost: their future is still open, and :meth:`_emit` counts them
-        when it returns.
+        in the owner's record for a later call. The expiry line reports what is **pending**, never
+        a loss (SPEC-068 FR-001): how many events are inside the emit the thread is still running
+        (SPEC-062 FR-005) and how many submissions are still queued behind it, each clause only
+        when non-zero. Neither is lost yet. The emit may still deliver, and :meth:`_emit` counts
+        its batch when it returns; the queued submissions are counted by whichever ``_emit`` line
+        settles them, one per batch, so each event is announced lost at most once. The queued
+        clause promises no later count on purpose: when the wedged emit is :meth:`_final_drain`'s
+        own, what is queued arrived after that drain's last read and will never be taken. It
+        counts submissions only, never the sentinel just queued or a flush marker
+        (:meth:`_queued_submissions`).
 
         Args:
           timeout: Seconds to wait for the drain thread, or ``None`` to wait indefinitely.
@@ -1201,22 +1319,28 @@ class Worker:
           None.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        on_drain_thread = threading.current_thread() is self._thread
         first = self.claim_stop(deadline) if claimed is None else claimed
         if not first:
+            if on_drain_thread:
+                return
             if self.draining:
                 self._drain_settled.wait(
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
             return
-        if not self._drain_finished.is_set():
+        took_over = self._join_taken_over and not on_drain_thread
+        if not self._drain_finished.is_set() and not took_over:
             try:
                 self._queue.put_nowait(_SHUTDOWN)
             except queue.Full:
                 pass
         self._stop.set()
+        if on_drain_thread:
+            return
         self._thread.join(timeout)
         if self._thread.is_alive():
-            queued = self._queued_or_unknown()
+            queued = self._queued_submissions()
             in_flight = self._in_flight
             with self._lock:
                 if self.stopped_reason is None:
@@ -1228,28 +1352,44 @@ class Worker:
             )
             if in_flight:
                 detail += f"; {in_flight} event(s) in flight, counted when the emit returns"
-            _diag.lost("item", queued, detail)
+            if queued:
+                detail += f"; {queued} submission(s) still queued"
+            _diag.pending(detail)
             self._release_waiters()
             return
         self._release_waiters()
 
-    def _queued_or_unknown(self) -> int:
-        """Returns queued items, or zero where the platform does not implement ``qsize``.
+    def _queued_submissions(self) -> int:
+        """Counts the submissions still queued, leaving out the shutdown sentinel and flush markers.
 
-        Items, not events: the queue holds one entry per submitted span plus any
-        flush/shutdown marker.
+        Submissions, not events and not entries (SPEC-068 FR-001): the queue holds one entry per
+        submitted span plus any ``_SHUTDOWN`` sentinel and ``_FlushMarker``, and ``qsize()``
+        counts all three. The expiry line used that and so announced the sentinel ``stop()`` had
+        just queued as a lost item, and the swap line counted its own unanswered marker. The
+        classification is :meth:`_final_drain`'s — an entry that is neither of the two is a
+        submission — so the line counts exactly what a drain would take.
+
+        It reads ``Queue``'s private ``mutex`` and ``queue``, the access :meth:`_release_waiters`
+        already makes and ``architecture.md`` §13 records: there is no public way to inspect a
+        queue without consuming it. A CPython change there would make this read 0, dropping the
+        queued clause from a line, rather than raise.
 
         Args:
           None.
 
         Returns:
-          The queue size, or 0 when it cannot be read.
+          The number of queued submissions, or 0 when the queue cannot be read.
 
         Raises:
           None. A diagnostic must not be the reason the diagnosis is lost.
         """
         try:
-            return self._queue.qsize()
+            with self._queue.mutex:
+                return sum(
+                    1
+                    for item in self._queue.queue
+                    if item is not _SHUTDOWN and not isinstance(item, _FlushMarker)
+                )
         except Exception:
             return 0
 
@@ -1611,11 +1751,11 @@ class Worker:
         0.8 s, 0.3 s — can run the next for as long as it ever has, and a prediction from a
         shorter one lets the join expire with the sink left open, which is the outcome the
         budget exists to prevent. The deadline is read without the lock, as :attr:`draining` is
-        read: it is written by :meth:`claim_stop` in the decision that wins the stop gate, and
-        a stale read costs at most one attempt, which invariant 3's observable already allows.
-        Measured at ``71e42dd``, before the rule, a 0.5 s failing sink under
-        ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and ``close()`` ran 0 times;
-        with it, 2 attempts and one close.
+        read: it is written by :meth:`claim_stop` in the decision that wins the stop gate or
+        takes an owed join over (SPEC-068 FR-006), and a stale read costs at most one attempt, which
+        invariant 3's observable already allows. Measured at ``71e42dd``, before the rule, a 0.5 s
+        failing sink under ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and
+        ``close()`` ran 0 times; with it, 2 attempts and one close.
 
         A declined retry is counted once in ``failed_batches`` and announced once, with a reason
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from

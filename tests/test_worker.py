@@ -3425,7 +3425,7 @@ def test_the_incomplete_swap_line_no_longer_says_the_sink_stays_open(capsys) -> 
     err = capsys.readouterr().err
 
     assert err.count("could not be confirmed drained") == 1, "exactly one line per swap"
-    assert "shutdown() that finds the drain thread ended closes it" in err
+    assert "it is left open until a shutdown() finds the drain thread ended" in err
     assert worker.incomplete_swaps == 1
 
     worker.stop(timeout=10.0)

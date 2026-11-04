@@ -978,19 +978,20 @@ def _expire_on_a_wedged_batch(capsys) -> tuple[_GatedSink, Worker, str]:
 
 
 def test_the_expiry_line_counts_the_batch_in_flight(capsys) -> None:
-    """FR-005 AC-1 and AC-2. The queue is still `0 item(s)`; the batch inside the emit is named.
+    """FR-005 AC-1 and AC-2. The batch inside the emit is named; the empty queue is not.
 
-    Releasing the sink to fail then declines the retry, and the `lost` figures across the two
-    lines sum to 3 events: the expiry line counted the batch as in flight, never as lost.
+    Since SPEC-068 FR-001 the expiry line is a `_diag.pending` line rather than a `lost` one,
+    and its queued clause appears only when a submission is queued, so here it has none.
+    Releasing the sink to fail then declines the retry, and the `lost` figures across stderr
+    sum to 3 events: the expiry line counted the batch as in flight, never as lost.
     """
     sink, worker, err = _expire_on_a_wedged_batch(capsys)
 
-    lines = _lost_lines(err)
-    assert len(lines) == 1, err
-    count, what, detail = lines[0]
-    assert (count, what) == (0, "item"), "the queue clause still counts the queue, which is empty"
-    assert "3 event(s) in flight" in detail, err
-    assert "counted when the emit returns" in detail, err
+    assert _lost_lines(err) == [], "the expiry line announces no loss"
+    assert err == (
+        "log-foundry: shutdown timed out after 0.5s; the sink is left open because the worker "
+        "thread is still using it; 3 event(s) in flight, counted when the emit returns\n"
+    ), err
 
     sink.fail = True
     sink.release.set()
@@ -1020,12 +1021,15 @@ def test_releasing_the_wedged_emit_to_succeed_announces_no_loss(capsys) -> None:
 
 
 def test_the_expiry_line_is_unchanged_when_nothing_is_in_flight(capsys) -> None:
-    """FR-005 AC-4. With no batch inside `_emit`, the line is `71e42dd`'s byte for byte.
+    """FR-005 AC-4, as SPEC-068 FR-001 revised it: no clause when nothing is in flight or queued.
 
     The only deterministic route to "expired with nothing in flight" is to park the drain
     thread **before** `_emit` writes the count: `_emit_pending` calls `self._emit`, so an
-    instance attribute over the method parks it there. The 1 item is the unconsumed shutdown
-    sentinel, which is existing behaviour of the queued count.
+    instance attribute over the method parks it there. Until SPEC-068 the line opened
+    `lost 1 item(s); ` here, and the 1 was the shutdown sentinel `stop()` had just queued. The
+    line is now a `_diag.pending` one, which claims no loss, and its queued clause counts
+    submissions only, so the sentinel is not in it and the line ends after its first part.
+    This supersedes SPEC-062 FR-005 AC-4's byte-for-byte promise against `71e42dd`.
     """
     sink = _SlowFailSink(0.0, fail_times=0)
     worker = Worker(sink, batch_size=1, flush_interval=60.0)
@@ -1049,8 +1053,8 @@ def test_the_expiry_line_is_unchanged_when_nothing_is_in_flight(capsys) -> None:
     worker._thread.join(5.0)
 
     assert err == (
-        "log-foundry: lost 1 item(s); shutdown timed out after 0.2s; the sink is left open "
-        "because the worker thread is still using it\n"
+        "log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker "
+        "thread is still using it\n"
     )
 
 
@@ -1116,8 +1120,11 @@ def test_in_flight_is_reset_in_the_forked_child(resume: bool) -> None:
         assert worker._in_flight == 0
         assert worker._exit_deadline == (None if resume else 1.0)
     finally:
-        # A resumed thread here inherits the stop event the parent's stop() set — a real fork
-        # replaces that event before this handler runs — so its drain loop exits at once;
-        # joining it is what proves nothing is leaked, on either branch.
+        # A real fork carries the stop event's *set* state across, it does not replace it. Since
+        # SPEC-068 FR-005 the resume branch gives the worker an unset event and a reset gate, so
+        # its new drain thread keeps running until stopped; the retired branch starts none.
+        # Stopping and joining is what proves nothing is leaked, on either branch.
+        if resume:
+            worker.stop(2.0)
         worker._thread.join(5.0)
         assert not worker._thread.is_alive(), "no drain thread outlives the test"
