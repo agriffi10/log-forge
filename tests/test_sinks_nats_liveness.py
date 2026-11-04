@@ -91,6 +91,15 @@ class LiveFakeNATS:
       publish_delay: Seconds each publish sleeps on the loop, so a batch can spend its budget.
       subs: The driver's subscription count; one after the first JetStream publish (M7).
       in_flight: Sink calls currently inside the fake; ``max_in_flight`` is its high-water mark.
+      pending_data_size: The driver's public counter of bytes queued for its flusher. A publish
+        adds its payload and kicks the flusher; a PING adds ``len(b"PING\\r\\n")`` without
+        queueing anything, as ``_send_ping`` does, and the flusher's next run resets it to zero.
+      flusher_parked: While true the flusher never runs, as it is while the transport is past
+        its high-water mark and the flusher sits in ``drain()``; the counter then stays non-zero.
+      pubs_at_ping: How many publishes the flusher had written when each PING was sent, so a
+        test can see a PING overtake the buffer.
+      close_swallows_one_cancel: Whether ``close`` absorbs its first cancellation and keeps
+        waiting, as the driver's ``_close`` does around its reconnection wait (client.py L820).
     """
 
     def __init__(self) -> None:
@@ -115,6 +124,12 @@ class LiveFakeNATS:
         self.subs = 0
         self.in_flight = 0
         self.max_in_flight = 0
+        self.pending_data_size = 0
+        self.flusher_parked = False
+        self.written: list[bytes] = []
+        self.pubs_at_ping: list[int] = []
+        self.close_swallows_one_cancel = True
+        self._cancels_swallowed = 0
         self.drain_timeout = 30.0
         self.drain_flush_timeout = 10.0
         self.connected_on: threading.Thread | None = None
@@ -130,6 +145,19 @@ class LiveFakeNATS:
     def _leave(self) -> None:
         self.in_flight -= 1
 
+    def _add_pending(self, size: int) -> None:
+        self.pending_data_size += size
+
+    def _kick_flusher(self) -> None:
+        asyncio.get_running_loop().call_soon(self._run_flusher)
+
+    def _run_flusher(self) -> None:
+        """``Client._flusher`` L2348: writes the queue and resets the counter, unless parked."""
+        if self.flusher_parked:
+            return
+        self.written.extend(self.published[len(self.written) :])
+        self.pending_data_size = 0
+
     async def _enter_publish(self, payload: bytes) -> None:
         self._record("publish")
         self._enter()
@@ -142,6 +170,8 @@ class LiveFakeNATS:
             if self.publish_raises:
                 raise RuntimeError("no responders")
             self.published.append(payload)
+            self._add_pending(len(payload))
+            self._kick_flusher()
         finally:
             self._leave()
 
@@ -163,6 +193,9 @@ class LiveFakeNATS:
         try:
             future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             self._pongs.append(future)
+            self.pubs_at_ping.append(len(self.written))
+            self._add_pending(len(b"PING\r\n"))
+            self._kick_flusher()
             if self.answering:
                 asyncio.get_running_loop().call_soon(self.deliver_pong)
             try:
@@ -195,8 +228,13 @@ class LiveFakeNATS:
         self._record("close")
         self._enter()
         try:
-            if self.close_gate is not None:
-                await self.close_gate.wait()
+            while self.close_gate is not None and not self.close_gate.is_set():
+                try:
+                    await self.close_gate.wait()
+                except asyncio.CancelledError:
+                    if not self.close_swallows_one_cancel or self._cancels_swallowed:
+                        raise
+                    self._cancels_swallowed += 1
             if self.close_raises is not None:
                 raise self.close_raises("'NoneType' object is not callable")
             self.is_connected = False
@@ -454,26 +492,26 @@ def test_concurrent_emit_flush_and_close_serialize_on_the_loop(monkeypatch) -> N
     assert not sink._thread.is_alive()
 
 
-class ParkedJetStreamNATS(LiveFakeNATS):
-    """A JetStream fake whose publish ignores the ack timeout the sink passes and never returns.
+class BlockingPublishNATS(LiveFakeNATS):
+    """A fake whose publish blocks the loop thread itself for 3 s, as a driver stuck in C would.
 
-    JetStream mode is where the backstop is reachable through the driver's own shape: a core
-    publish is wrapped in a task the sink bounds itself (SPEC-061 M-2), but a JetStream publish
-    is awaited directly under the driver's ack timeout, so a driver that ignores that timeout is
-    the coroutine that does not honour its deadline.
+    Every await the sink makes is bounded by ``asyncio.wait`` (the probe, each publish on both
+    paths, the drained wait, an injected flush), so a coroutine that merely never resolves can
+    no longer reach the backstop; what can is a loop thread that does not return to the loop,
+    which is the wedge the backstop exists for.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.publish_gate = asyncio.Event()
+    async def _enter_publish(self, payload: bytes) -> None:
+        self._record("publish")
+        # A deliberate block of the loop thread: the whole point of this fake.
+        time.sleep(3.0)  # noqa: ASYNC251
+        self.published.append(payload)
 
 
 def test_the_backstop_closes_the_sink_when_a_publish_never_returns(monkeypatch) -> None:
     # FR-001 AC-6. Run on a helper thread with a bounded join, so a backstop that does not fire
     # fails the test rather than hanging the runner.
-    sink, _, _ = _build(
-        monkeypatch, factory=ParkedJetStreamNATS, jetstream=True, publish_timeout=0.2
-    )
+    sink, _, _ = _build(monkeypatch, factory=BlockingPublishNATS, publish_timeout=0.2)
     outcome: list[BaseException | None] = []
 
     def emit() -> None:
@@ -495,7 +533,8 @@ def test_the_backstop_closes_the_sink_when_a_publish_never_returns(monkeypatch) 
     assert elapsed <= 0.2 + CALL_SLACK + LOOP_JOIN_TIMEOUT + MARGIN, f"{elapsed:.2f}s"
     with pytest.raises(SinkDeliveryError, match="closed"):
         sink.emit([{"n": 2}])
-    sink._thread.join(LOOP_JOIN_TIMEOUT)
+    assert sink._thread.is_alive(), "the wedged thread is abandoned as a daemon, not joined"
+    sink._thread.join(3.0 + LOOP_JOIN_TIMEOUT)
     assert not sink._thread.is_alive(), "the cancel-then-stop never ended the loop"
     sink.close()
 
@@ -1446,6 +1485,10 @@ def test_a_client_close_that_never_returns_is_cancelled_at_the_deadline(monkeypa
     assert "close" in fake.calls
     assert not sink._thread.is_alive()
     assert sink._loop.is_closed()
+    # The fake swallows its first cancellation as the driver's `_close` does, so the task ends
+    # only because step two cancelled it at the deadline AND step three cancelled it again.
+    assert fake._cancels_swallowed == 1
+    assert asyncio.all_tasks(sink._loop) == set(), "the parked close must not outlive the loop"
 
 
 def test_a_failing_client_close_is_absorbed_and_the_loop_still_stops(monkeypatch, capsys) -> None:
@@ -1595,3 +1638,206 @@ def test_a_skipped_close_probe_raises_nothing(monkeypatch, reason: str) -> None:
     assert "close" in fake.calls
     assert not sink._thread.is_alive() and sink._loop.is_closed()
     assert elapsed <= DEFAULT_CLOSE_TIMEOUT + LOOP_JOIN_TIMEOUT + MARGIN
+
+
+# --- Review finding 1: a PING must not overtake the driver's pending buffer -------------------
+
+
+class ParkedFlusherNATS(LiveFakeNATS):
+    """The transport is past its high-water mark: publishes queue, the flusher never runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flusher_parked = True
+
+
+class SlowFlusherNATS(LiveFakeNATS):
+    """The flusher is parked for 0.2 s after the batch, then drains it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flusher_parked = True
+        asyncio.get_running_loop().call_later(0.2, self._unpark)
+
+    def _unpark(self) -> None:
+        self.flusher_parked = False
+        self._run_flusher()
+
+
+def test_a_ping_is_not_sent_while_publishes_are_still_queued_behind_the_flusher(
+    monkeypatch, capsys
+) -> None:
+    """Review finding 1, red against 810b4c4.
+
+    ``_send_ping`` writes to the transport directly while publishes wait in ``_pending`` for the
+    flusher; with the flusher parked the PING overtakes them and the server answers it having
+    processed none of the batch. Reproduced on CPython 3.12.12 against a raw-socket server: the
+    confirming PONG arrived after 133 of 400 publishes. At 810b4c4 this fake's PING is answered
+    and the batch reads confirmed with ``failed=0``; now the sink waits for the counter to read
+    zero and counts the batch when the deadline passes first.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
+    losses = sink.losses()
+    assert fake.pending_data_size > 0, "the fake's flusher must still be parked"
+    with contextlib.suppress(TimeoutError):
+        sink.close()
+
+    assert error is None
+    assert 0.3 <= elapsed <= 0.3 + MARGIN, f"{elapsed:.2f}s"
+    assert losses == SinkLosses(dropped=0, failed=3)
+    assert fake.calls.count("flush") == 1, "no confirming PING while the buffer is non-empty"
+    assert "unconfirmed" in capsys.readouterr().err
+
+
+def test_the_confirmation_waits_for_the_flusher_and_then_confirms(monkeypatch) -> None:
+    # The other half of finding 1: a flusher that drains inside the deadline is waited for, the
+    # PING goes out after the last publish was written, and the batch is confirmed. A wait that
+    # merely counted every parked batch would fail here.
+    sink, fake, _ = _build(monkeypatch, factory=SlowFlusherNATS, publish_timeout=1.0)
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}]))
+    losses = sink.losses()
+    sink.close()
+
+    assert error is None and 0.2 <= elapsed < 1.0, f"{elapsed:.2f}s"
+    assert losses == SinkLosses(dropped=0, failed=0)
+    assert fake.pubs_at_ping[1] == 2, "the confirming PING must follow both written publishes"
+
+
+def test_a_reused_probes_ping_bytes_do_not_make_a_healthy_batch_unconfirmed(monkeypatch) -> None:
+    # `_send_ping` bumps the counter without queueing, so an outstanding probe leaves it
+    # non-zero until the flusher next runs; on a healthy connection the flusher runs on the
+    # next kick and resets it. The fake models exactly that, so a healthy batch stays confirmed.
+    sink, fake, _ = _build(monkeypatch)
+    sink.emit([{"n": 1}])
+    sink.emit([{"n": 2}])
+    losses = sink.losses()
+    sink.close()
+    assert losses == SinkLosses(dropped=0, failed=0)
+    assert fake.pending_data_size == 0
+
+
+def test_close_and_flush_wait_for_the_flusher_before_their_ping(monkeypatch) -> None:
+    # FR-004's step one and `flush()` take the same wait: with the flusher parked, neither sends
+    # a PING and both report the deadline rather than a false confirmation.
+    sink, fake, _ = _build(monkeypatch, factory=ParkedFlusherNATS, publish_timeout=0.3)
+    sink.emit([{"n": 1}])
+    with pytest.raises(SinkDeliveryError, match="PONG"):
+        sink.flush()
+    assert fake.calls.count("flush") == 1
+    with pytest.raises(TimeoutError):
+        sink.close()
+    assert fake.calls.count("flush") == 1, "close's step one sent no PING over a parked flusher"
+
+
+class CounterlessFakeNATS(LiveFakeNATS):
+    """A client without ``pending_data_size``: treated as drained, confirmed as before."""
+
+    def _add_pending(self, size: int) -> None:
+        pass
+
+    @property
+    def pending_data_size(self) -> int:
+        raise AttributeError("pending_data_size")
+
+    @pending_data_size.setter
+    def pending_data_size(self, value: int) -> None:
+        pass
+
+
+def test_a_client_without_the_counter_is_treated_as_drained(monkeypatch) -> None:
+    sink, _, _ = _build(monkeypatch, factory=CounterlessFakeNATS)
+    sink.emit([{"n": 1}])
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    sink.close()
+
+
+# --- Review finding 2: an injected client's flush is bounded inside the coroutine -------------
+
+
+class SlowInjectedNATS(LiveFakeNATS):
+    """An injected client whose ``flush`` takes 2 s, longer than the sink's budget."""
+
+    async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
+        self._record("flush")
+        await asyncio.sleep(2.0)
+        self.calls.append("flush-returned")
+
+
+def test_a_slow_injected_flush_is_refused_at_the_budget_and_the_sink_stays_open() -> None:
+    # Red against 810b4c4: the injected flush reached the backstop at `publish_timeout +
+    # CALL_SLACK` and closed the sink for good ("loop is wedged"); measured on a real client
+    # connected on another loop, 2.01 s and every later emit refused.
+    client = SlowInjectedNATS()
+    sink = NATSSink("logs", client=client, publish_timeout=0.5)
+    elapsed, error = _timed(sink.flush)
+    assert isinstance(error, SinkDeliveryError) and "wedged" not in str(error), error
+    assert 0.5 <= elapsed < 0.5 + CALL_SLACK, f"{elapsed:.2f}s"
+    assert not sink._closed and sink._thread.is_alive()
+    sink.emit([{"n": 1}])
+    assert client.published == [b'{"n": 1}']
+    assert "flush-returned" not in client.calls, "the slow flush was abandoned, not cancelled"
+    _on_loop(sink, asyncio.wait(set(sink._abandoned), timeout=3.0))
+    assert "flush-returned" in client.calls, "and it ran to its end on its own"
+    sink.close()
+
+
+# --- Review finding 3: a future already done when the bound expires returns its result --------
+
+
+def test_a_future_done_at_the_bounds_expiry_is_returned_not_raised(monkeypatch) -> None:
+    # The racing shape, forced: the future's bounded wait reports expiry although the coroutine
+    # finished. `close()` must still mark the sink closed and stop the loop; a version that
+    # re-raised escaped before either, so a second close() called the client again.
+    real_submit = NATSSink._submit
+
+    class ExpiredButDone:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            self.first = True
+
+        def result(self, timeout: float | None = None) -> Any:
+            if timeout is not None and self.first:
+                self.first = False
+                self._inner.result(timeout)
+                raise TimeoutError("the bound expired on a finished future")
+            return self._inner.result(timeout)
+
+        def done(self) -> bool:
+            return self._inner.done()
+
+    monkeypatch.setattr(
+        NATSSink, "_submit", lambda self, coro: ExpiredButDone(real_submit(self, coro))
+    )
+    sink, fake, _ = _build(monkeypatch)
+    sink.close()
+    assert sink._closed and not sink._thread.is_alive() and sink._loop.is_closed()
+    sink.close()
+    assert fake.calls.count("close") == 1
+
+
+# --- Review finding 7: a JetStream publish that blocks is abandoned and counted ---------------
+
+
+def test_a_blocking_jetstream_publish_is_abandoned_counted_and_the_sink_stays_open(
+    monkeypatch, capsys
+) -> None:
+    """The force-flush fires on the cumulative pending size, so several JetStream publishes into
+    a peer that stopped reading block as a core one does; the same per-publish task wait bounds
+    them. At 810b4c4 the parked publish reached the backstop and closed the sink."""
+    sink, fake, _ = _build(monkeypatch, jetstream=True, publish_timeout=0.5)
+    gate = asyncio.Event()
+    fake.publish_gate = gate
+    elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
+    losses = sink.losses()
+    alive = sink._thread.is_alive() and not sink._closed
+    _open(sink, gate)
+    sink.close()
+    err = capsys.readouterr().err
+
+    assert error is None, error
+    assert 0.5 <= elapsed <= 0.5 + MARGIN, f"{elapsed:.2f}s"
+    assert alive, "the backstop must not have fired"
+    assert losses == SinkLosses(dropped=0, failed=3)
+    assert "lost 1 event(s)" in err and "JetStream publish abandoned" in err
+    assert "lost 2 event(s)" in err and "publish_timeout" in err

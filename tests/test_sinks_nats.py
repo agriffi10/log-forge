@@ -167,7 +167,7 @@ def test_a_client_whose_probe_raises_is_treated_as_connected() -> None:
     client = Hostile()
     sink = NATSSink("subject", client=client)
 
-    sink.emit([{"a": 1}])   # a diagnostic probe must never be the reason a batch fails
+    sink.emit([{"a": 1}])  # a diagnostic probe must never be the reason a batch fails
     sink.close()
 
     assert len(client.published) == 1
@@ -355,14 +355,37 @@ def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch
 def test_an_expired_budget_with_nothing_published_books_only_what_it_attempted() -> None:
     # FR-001 AC-7, raising path. `Worker._emit` retries the whole batch on an exception, so
     # booking the never-attempted remainder here would report a loss that has not happened.
-    client = SlowNATS(per_event=0.08, fail=True)
+    #
+    # Since SPEC-061 the publish in flight when the deadline passes is abandoned rather than
+    # awaited (it may yet land, so it is counted as published and as unconfirmed, and the batch is
+    # not sent back for a retry that could duplicate it). A fake whose publishes cost time
+    # therefore always straddles the deadline, and the raising path needs one whose failures are
+    # instant: every attempt raises, nothing is in flight, and `emit` raises having booked only
+    # the attempts. The straddling shape has its own test below.
+    client = SlowNATS(per_event=0.0, fail=True)
     sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"n": i} for i in range(30)])
     sink.close()
 
-    assert client.calls < 30, "the deadline must have stopped the loop short"
+    assert client.calls == 30
     assert sink.failed == client.calls, "only the attempts that raised are booked"
+
+
+def test_a_failing_publish_in_flight_at_the_deadline_is_abandoned_and_each_loss_counted_once() -> (
+    None
+):
+    # SPEC-061's reading of the same batch: the slow failing publish the deadline interrupts is
+    # abandoned, so `emit` returns, and the three populations -- the attempts that raised, the one
+    # abandoned, the remainder never attempted -- add up to the batch exactly once.
+    client = SlowNATS(per_event=0.08, fail=True)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
+    sink.emit([{"n": i} for i in range(30)])
+    calls_at_return = client.calls
+    sink.close()
+
+    assert 0 < calls_at_return < 30, "the deadline must have stopped the loop short"
+    assert sink.failed == 30, "raised once, abandoned once, unattempted once: never twice"
 
 
 def test_an_expired_budget_with_something_published_books_the_remainder() -> None:
@@ -371,11 +394,14 @@ def test_an_expired_budget_with_something_published_books_the_remainder() -> Non
     client = SlowNATS(per_event=0.08)
     sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
     sink.emit([{"n": i} for i in range(30)])
+    # Read at the moment emit returned: since SPEC-061 the publish in flight at the deadline is
+    # abandoned rather than awaited, so it lands in the fake AFTER this and is counted as
+    # unconfirmed, an upper bound a late landing does not reduce.
+    published = len(client.published)
     sink.close()
 
-    published = len(client.published)
     assert 0 < published < 30
-    assert sink.failed == 30 - published, "every event the deadline skipped is counted once"
+    assert sink.failed == 30 - published, "every event not delivered when emit returned is counted"
 
 
 def test_the_core_path_delivers_a_whole_batch_with_a_publish_timeout_set() -> None:
@@ -451,7 +477,10 @@ def test_the_deadline_drop_is_announced_not_only_counted(capsys) -> None:
 
     err = capsys.readouterr().err
     assert "publish_timeout" in err, "the events the deadline skipped must be announced"
-    assert str(sink.failed) in err, "the announcement carries the count, not one line per event"
+    announced = sum(
+        int(line.split("lost ")[1].split()[0]) for line in err.splitlines() if "lost " in line
+    )
+    assert announced == sink.failed, "the announcements carry the count, not one line per event"
 
 
 def test_an_unserializable_event_is_isolated_not_allowed_to_destroy_the_batch() -> None:
@@ -467,7 +496,7 @@ def test_an_unserializable_event_is_isolated_not_allowed_to_destroy_the_batch() 
     client = SlowNATS(per_event=0.0)
     sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=30.0)
     batch: list[dict[str, object]] = [{"n": 0}, {"n": 1}, {"bad": object()}, {"n": 3}, {"n": 4}]
-    sink.emit(batch)          # must NOT raise: four of the five published
+    sink.emit(batch)  # must NOT raise: four of the five published
     sink.close()
 
     assert len(client.published) == 4
@@ -680,12 +709,9 @@ def _forwarded_connect_kwargs() -> set[str]:
         if isinstance(node, ast.FunctionDef) and node.name == "__init__":
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Dict) and any(
-                    isinstance(k, ast.Constant) and k.value == "connect_timeout"
-                    for k in sub.keys
+                    isinstance(k, ast.Constant) and k.value == "connect_timeout" for k in sub.keys
                 ):
-                    return {
-                        k.value for k in sub.keys if isinstance(k, ast.Constant)
-                    }
+                    return {k.value for k in sub.keys if isinstance(k, ast.Constant)}
     raise AssertionError("could not locate the forwarded-options dict in nats.py")
 
 

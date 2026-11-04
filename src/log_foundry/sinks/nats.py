@@ -105,6 +105,18 @@ abandoned as a daemon and its loop is left unclosed, since a running loop cannot
 stated worst case for a close is its deadline plus :data:`CALL_SLACK` plus this.
 """
 
+PENDING_POLL = 0.005
+"""Seconds between reads of the driver's ``pending_data_size`` while a round trip waits for zero.
+
+The driver writes a PING straight to the transport while publishes wait in its pending buffer
+for the flusher, so a PING sent while that buffer is non-empty overtakes the publishes and its
+PONG confirms nothing about them (SPEC-061, review finding 1: reproduced on CPython 3.12.12, the
+server had parsed 133 of 400 publishes when it answered). Before a confirming round trip the sink
+therefore waits, inside its deadline, until the counter reads zero, polling at this step on a
+timed yield rather than a busy spin. Small enough that the wait adds at most this to a healthy
+round trip; large enough that a 10 s budget is a few thousand reads, not a spin.
+"""
+
 _LOOP_THREAD_NAME = "log-foundry-nats-loop"
 """The name of the daemon thread that runs a sink's event loop for the sink's whole life."""
 
@@ -129,7 +141,7 @@ def _retrieve(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-class _LoopWedged(TimeoutError):
+class _LoopWedgedError(TimeoutError):
     """The backstop bound expired on a coroutine that had not finished (SPEC-061 FR-001).
 
     A private subclass so ``emit``, ``flush`` and ``close`` can tell the backstop's expiry from a
@@ -191,9 +203,10 @@ class NATSSink:
     **Superseded by SPEC-061 FR-002:** the flag is no longer what guards a publish. For a client
     the sink connected itself, ``emit`` sends a PING and publishes only after the server's PONG
     arrives, so a stalled server is refused within ``publish_timeout`` rather than after the
-    driver's ping task notices it, which SPEC-061 measured at between 240 and 360 s of loop time
-    and never while the loop ran only inside a call. The flag stays in front of the round trip as
-    the cheap refusal. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
+    driver's ping task notices it, which the driver's own ping arithmetic puts at between 240
+    and 360 s of loop time and never while the loop ran only inside a call (what SPEC-061
+    measured was 75 of 75 emits accepted over 148 s of such a stall). The flag stays in front
+    of the round trip as the cheap refusal. Refusing moves no ``losses()`` counter, per SPEC-032: it is a failure
     *reported* to the worker rather than one absorbed, and counting both would report one loss
     twice.
     """
@@ -378,9 +391,9 @@ class NATSSink:
         M3). The loop is abandoned instead: the sink marks itself closed, schedules a cancel of
         every task and a stop, and joins the thread under :data:`LOOP_JOIN_TIMEOUT`.
 
-        A future that completed at the moment the bound expired is not a wedged loop, so the
-        expiry is re-raised without abandoning anything; the caller still reports it, which is the
-        duplicate the spec accepts beside a hung thread.
+        A future that completed at the moment the bound expired is not a wedged loop: its result
+        is returned, or its exception raised, exactly as if the wait had ended a moment sooner, so
+        a ``close()`` that finished on the last tick still marks the sink closed and stops the loop.
 
         Args:
           coro: The coroutine to run.
@@ -390,7 +403,7 @@ class NATSSink:
           Whatever the coroutine returned.
 
         Raises:
-          _LoopWedged: The bound expired; the sink is now closed.
+          _LoopWedgedError: The bound expired; the sink is now closed.
           Exception: Whatever the coroutine raised, a driver's ``TimeoutError`` included.
         """
         future = self._submit(coro)
@@ -398,9 +411,9 @@ class NATSSink:
             return future.result(bound)
         except TimeoutError as err:
             if future.done():
-                raise
+                return future.result()
             self._abandon_loop()
-            raise _LoopWedged(
+            raise _LoopWedgedError(
                 f"NATSSink: no answer from the loop within {bound}s; the sink is now closed"
             ) from err
 
@@ -506,7 +519,7 @@ class NATSSink:
             self._refuse_under_the_lock(f"NATSSink published none of {len(batch)} event(s)")
             try:
                 self._run(self._emit_on_loop(batch), self.publish_timeout + CALL_SLACK)
-            except _LoopWedged as err:
+            except _LoopWedgedError as err:
                 raise SinkDeliveryError(
                     f"NATSSink published none of {len(batch)} event(s) within "
                     f"{self.publish_timeout + CALL_SLACK}s: the loop is wedged and the sink is "
@@ -569,20 +582,26 @@ class NATSSink:
         reported to the worker is not also counted).
 
         **A core batch is then confirmed, or counted** (SPEC-061 FR-003). A core ``publish``
-        returns once its bytes are in the driver's buffer, so after the last one a second round
-        trip is sent within what remains of the deadline: a single connection is processed in
-        order, so an answered PONG means the server processed every publish before it. No answer,
-        including when the deadline is already spent or the client has become disconnected, adds
-        every event published and not otherwise counted to ``failed`` and announces it once, and
-        **this returns rather than raises**: the bytes are in flight to a server that may yet
-        process them (M6: five publishes written to a paused server all landed after it resumed),
-        so a worker retry could deliver them twice, which is SPEC-018's rule for an unadjudicable
-        batch. The stall is still reported, because the next call is refused by the probe or its
-        latch; only the one batch that straddles the onset of a stall is counted rather than
-        raised. JetStream mode has no such step, since each publish already awaited its ack, and
-        an injected client has none either. The second round trip is sent only while the client
-        still reports itself connected, because the driver's ``flush`` returns without a PONG
-        otherwise and the next call would wait on nothing.
+        returns once its bytes are in the driver's pending buffer, which the driver's flusher
+        task writes to the transport, while a PING is written to the transport directly. So the
+        second round trip is sent only once the driver's public ``pending_data_size`` reads zero,
+        waited for inside what remains of the deadline (:meth:`_drained`): then every publish is
+        in the transport ahead of the PING, a single connection is processed in order, and an
+        answered PONG means the server processed every publish before it. A PING sent while the
+        buffer is non-empty overtakes the publishes and confirms nothing about them (reproduced
+        on CPython 3.12.12, where the transport pauses the flusher past its high-water mark: 133
+        of 400 publishes parsed at the PONG). No answer, including when the buffer has not
+        drained by the deadline, the deadline is already spent, or the client has become
+        disconnected, adds every event published and not otherwise counted to ``failed`` and
+        announces it once, and **this returns rather than raises**: the bytes are in flight to a
+        server that may yet process them (M6: five publishes written to a paused server all
+        landed after it resumed), so a worker retry could deliver them twice, which is SPEC-018's
+        rule for an unadjudicable batch. The stall is still reported, because the next call is
+        refused by the probe or its latch; only the one batch that straddles the onset of a stall
+        is counted rather than raised. JetStream mode has no such step, since each publish already
+        awaited its ack, and an injected client has none either. The second round trip is sent
+        only while the client still reports itself connected, because the driver's ``flush``
+        returns without a PONG otherwise and the next call would wait on nothing.
 
         Args:
           batch: The events to publish.
@@ -608,11 +627,81 @@ class NATSSink:
                 raise SinkDeliveryError(f"{refusal}: the client is disconnected")
         published = await self._publish_all(batch, deadline)
         if probing and not self._jetstream and published:
-            confirmed = self._is_connected() and await self._await_probe(deadline)
+            confirmed = (
+                self._is_connected()
+                and await self._drained(deadline)
+                and await self._await_probe(deadline)
+            )
             if not confirmed:
                 with self._counter_lock:
                     self.failed += published
                 _diag.lost("event", published, "NATSSink unconfirmed, no PONG after the batch")
+
+    async def _drained(self, deadline: float) -> bool:
+        """Waits until the driver's pending buffer is empty, so a PING cannot overtake it.
+
+        The driver's ``pending_data_size`` counts bytes queued for its flusher task, and a PING
+        bypasses that queue (the driver writes a PING to the transport directly and only bumps
+        the counter, which the flusher's next run resets with the rest). A counter left non-zero by
+        an outstanding probe's PING therefore clears as soon as the flusher runs, which on a
+        connection that is draining at all it does; the only way it stays non-zero to the deadline
+        is a peer that has stopped reading, and that batch is exactly the one that must be counted
+        rather than confirmed. Polled on a timed yield at :data:`PENDING_POLL` rather than awaited
+        on a driver future, because every driver future here is one the sink must not cancel. A
+        client that does not publish the counter, or whose attribute raises, is treated as
+        drained: the sink does not invent a loss for a client that never claimed the capability.
+
+        Args:
+          deadline: The ``time.monotonic()`` instant this call's own budget ends.
+
+        Returns:
+          True once the counter read zero, False when the deadline passed first.
+
+        Raises:
+          None.
+        """
+        while True:
+            if self._pending_bytes() == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await self._pause(min(PENDING_POLL, remaining))
+
+    def _pending_bytes(self) -> int:
+        """Reads the driver's public ``pending_data_size``, or zero when it cannot be read.
+
+        Args:
+          None.
+
+        Returns:
+          The bytes still queued for the driver's flusher, zero for a client without the counter.
+
+        Raises:
+          None.
+        """
+        try:
+            return int(getattr(self._client, "pending_data_size", 0))
+        except Exception:
+            return 0
+
+    async def _pause(self, seconds: float) -> None:
+        """Yields the loop for a bounded time without a driver future and without cancelling one.
+
+        A fresh never-resolved future waited with ``asyncio.wait`` and a timeout: the wait's own
+        timer ends it, and a cancellation of the surrounding task is delivered cleanly, with no
+        callback left to fire on a finished future.
+
+        Args:
+          seconds: How long to yield.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        await asyncio.wait({self._loop.create_future()}, timeout=seconds)
 
     def _probing(self) -> bool:
         """Reports whether this client is one the sink asks the server about (SPEC-061 FR-002).
@@ -791,18 +880,13 @@ class NATSSink:
         or the thread, because the child acquired none of them (invariant 12); a second call, or
         one after the backstop closed the sink, returns without touching anything.
 
-        Args:
-          None.
-
-        Returns:
-          None.
-
         **The sequence is the sink's own, not the driver's ``drain()``** (SPEC-061 FR-004).
         ``drain()`` cannot be bounded from outside: it swallows a cancellation and its ``finally``
         flush runs to the driver's own 10 s, measured at 12.00 s under a 2 s ``wait_for`` once a
         JetStream client holds its response-inbox subscription (M7). So under one deadline, the
         ``drain_timeout`` the caller passed or :data:`DEFAULT_CLOSE_TIMEOUT`, the loop thread runs
-        a round trip through the FR-002 probe to push and confirm the outbound buffer, then
+        a round trip through the FR-002 probe, sent once the driver's pending buffer has drained
+        (:meth:`_drained`) so it confirms the outbound buffer rather than overtaking it, then
         ``client.close()`` as a task cancelled on expiry, then stops the loop. The round trip is
         skipped when the client is injected, has no ``flush``, reports itself disconnected, or has
         a probe latched as unanswered, and a skipped round trip raises nothing: emits were refused
@@ -836,7 +920,7 @@ class NATSSink:
                 answered, failure = self._run(
                     self._close_on_loop(), self._drain_timeout + CALL_SLACK
                 )
-            except _LoopWedged as err:
+            except _LoopWedgedError as err:
                 raise TimeoutError(
                     f"NATSSink close: the loop did not answer within "
                     f"{self._drain_timeout + CALL_SLACK}s and was abandoned"
@@ -883,7 +967,7 @@ class NATSSink:
         failure: BaseException | None = None
         if self._probing() and not self._latched() and self._is_connected():
             try:
-                answered = await self._await_probe(end)
+                answered = await self._drained(end) and await self._await_probe(end)
             except Exception as err:
                 failure = err
             probe = self._probe
@@ -934,17 +1018,19 @@ class NATSSink:
         remaining)`` — never the bare remainder, which would hand the first event of a fresh
         budget a longer ack wait than the driver's own default. ~~A core publish accepts none and
         writes into the client's outbound buffer without waiting, so the deadline is checked
-        between events, which is all there is to check.~~ **Corrected by SPEC-061 FR-001:** a core
+        between events, which is all there is to check.~~ **Corrected by SPEC-061 FR-001:** a
         publish can block without limit, because the driver force-flushes once its pending buffer
         passes 2 MiB and its flush timeout defaults to ``None``, so against a stalled peer the
-        await never returns. Each core publish therefore runs as a task waited under what remains
-        of the deadline and **never cancelled** (the driver swallows the cancellation, and bytes
-        already in its buffer may yet land, SPEC-061 M3 and M6). One that outlives the deadline is
-        abandoned with a reference kept until close, counted as published, and the events after it
-        as unattempted; FR-003's confirmation then decides whether the batch is confirmed or
-        counted. A JetStream publish is not wrapped, because its ack wait is bounded by the
-        driver's own timeout and its send can only block once a single payload exceeds the
-        driver's pending size.
+        await never returns. The force-flush fires on the **cumulative** pending size, so several
+        JetStream publishes into a peer that stopped reading reach it too, not only a single
+        oversized payload. Every publish on either path therefore runs as a task waited under what
+        remains of the deadline and **never cancelled** (the driver swallows the cancellation, and
+        bytes already in its buffer may yet land, SPEC-061 M3 and M6). One that outlives the
+        deadline is abandoned with a reference kept until close, counted as published so the batch
+        is not sent back for a retry that could duplicate it, and the events after it as
+        unattempted. On the core path FR-003's confirmation then decides whether the batch is
+        confirmed or counted; on the JetStream path, which has no confirmation, the abandoned
+        publish is counted as unconfirmed here and announced.
 
         Two populations are counted by different rules. An event whose publish **raised** is a
         driver failure and is counted here exactly as before this spec. An event **never
@@ -967,6 +1053,7 @@ class NATSSink:
         target = self._client.jetstream() if self._jetstream else self._client
         published = 0
         attempted = 0
+        abandoned = 0
         for event in batch:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -974,12 +1061,9 @@ class NATSSink:
             attempted += 1
             try:
                 payload = json.dumps(event).encode("utf-8")
-                if self._jetstream:
-                    await target.publish(
-                        self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)
-                    )
-                elif not await self._publish_bounded(target, payload, remaining):
+                if not await self._publish_bounded(target, payload, remaining):
                     published += 1
+                    abandoned += 1
                     break
             except Exception as err:
                 with self._counter_lock:
@@ -1001,17 +1085,23 @@ class NATSSink:
             with self._counter_lock:
                 self.failed += unattempted
             _diag.lost("event", unattempted, f"NATSSink publish_timeout {self.publish_timeout}s")
+        if abandoned and self._jetstream:
+            with self._counter_lock:
+                self.failed += abandoned
+            _diag.lost("event", abandoned, "NATSSink unconfirmed, JetStream publish abandoned")
         return published
 
     async def _publish_bounded(self, target: Any, payload: bytes, remaining: float) -> bool:
-        """Runs one core publish as a task and waits for it under the remaining budget.
+        """Runs one publish as a task and waits for it under the remaining budget.
 
-        The task is never cancelled (see :meth:`_publish_all`); one that outlives the budget is
-        kept in ``self._abandoned`` so it is neither collected mid-flight nor left with an
-        unretrieved exception, and is cancelled at close with every other pending task.
+        A JetStream publish is also given the driver's ``timeout`` for its ack wait, the lesser
+        of :data:`DEFAULT_ACK_TIMEOUT` and the remainder; a core publish takes none. The task is
+        never cancelled (see :meth:`_publish_all`); one that outlives the budget is kept in
+        ``self._abandoned`` so it is neither collected mid-flight nor left with an unretrieved
+        exception, and is cancelled at close with every other pending task.
 
         Args:
-          target: The client to publish on.
+          target: The client or JetStream context to publish on.
           payload: The encoded event.
           remaining: Seconds left in the batch's deadline.
 
@@ -1021,7 +1111,13 @@ class NATSSink:
         Raises:
           Exception: Whatever the completed publish raised.
         """
-        task = self._loop.create_task(target.publish(self._subject, payload))
+        if self._jetstream:
+            publish = target.publish(
+                self._subject, payload, timeout=min(DEFAULT_ACK_TIMEOUT, remaining)
+            )
+        else:
+            publish = target.publish(self._subject, payload)
+        task = self._loop.create_task(publish)
         task.add_done_callback(_retrieve)
         done, _ = await asyncio.wait({task}, timeout=remaining)
         if not done:
@@ -1045,7 +1141,11 @@ class NATSSink:
         driver's 10 s ``FlushTimeoutError`` can no longer escape from it, and this never cancels a
         PONG wait; the driver still cancels futures of its own, so this is narrower than the claim
         that the M3 hazard is gone. It counts nothing. An injected client, or one with no
-        ``flush``, keeps the bare driver call and whatever it raises.
+        ``flush``, keeps the bare driver call and whatever it raises, run as a task waited under
+        ``publish_timeout`` and never cancelled (M3 again, on the injected client): a flush that
+        outlives the budget is abandoned and reported as ``SinkDeliveryError``, and the sink stays
+        usable, where before this bound a slow injected flush reached the backstop and closed the
+        sink for good.
 
         Takes the same lock :meth:`emit` does and runs the same guards in the same order, for the
         reasons recorded there.
@@ -1066,7 +1166,7 @@ class NATSSink:
             self._refuse_under_the_lock("NATSSink cannot flush")
             try:
                 self._run(self._flush_on_loop(), self.publish_timeout + CALL_SLACK)
-            except _LoopWedged as err:
+            except _LoopWedgedError as err:
                 raise SinkDeliveryError(
                     f"NATSSink cannot flush: no answer within {self.publish_timeout + CALL_SLACK}s,"
                     " the loop is wedged and the sink is now closed"
@@ -1085,31 +1185,47 @@ class NATSSink:
           SinkDeliveryError: A probed client is disconnected or did not answer the round trip.
           Exception: Whatever an injected client's driver raises while flushing.
         """
+        deadline = time.monotonic() + self.publish_timeout
         if not self._probing():
-            await self._flush_client()
+            await self._flush_client(deadline)
             return
         if not self._is_connected():
             raise SinkDeliveryError("NATSSink cannot flush: the client is disconnected")
-        if not await self._await_probe(time.monotonic() + self.publish_timeout):
+        if not (await self._drained(deadline) and await self._await_probe(deadline)):
             raise SinkDeliveryError(
                 f"NATSSink cannot flush: no PONG from the server within {self.publish_timeout}s"
             )
 
-    async def _flush_client(self) -> None:
-        """Flushes the client if the driver offers a flush, probed by name.
+    async def _flush_client(self, deadline: float) -> None:
+        """Flushes an injected client if it offers a flush, probed by name, under the deadline.
 
         Probed by name because the sink is written against a driver it does not own, and a client
-        without the method has nothing buffered to push.
+        without the method has nothing buffered to push. The call runs as a task waited with
+        ``asyncio.wait`` and never cancelled, because an injected ``nats-py`` client's flush is a
+        PONG wait too (M3); one that outlives the deadline is kept in ``self._abandoned`` and
+        reported, and the sink stays open.
 
         Args:
-          None.
+          deadline: The ``time.monotonic()`` instant this call's own budget ends.
 
         Returns:
           None.
 
         Raises:
+          SinkDeliveryError: The flush did not return within the deadline.
           Exception: Whatever the driver raises while flushing.
         """
         flush = getattr(self._client, "flush", None)
-        if flush is not None:
-            await flush()
+        if flush is None:
+            return
+        task = self._loop.create_task(flush())
+        task.add_done_callback(_retrieve)
+        done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - time.monotonic()))
+        if not done:
+            self._abandoned.add(task)
+            task.add_done_callback(self._abandoned.discard)
+            raise SinkDeliveryError(
+                f"NATSSink cannot flush: the client's flush did not return within "
+                f"{self.publish_timeout}s"
+            )
+        task.result()
