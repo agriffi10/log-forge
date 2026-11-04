@@ -373,22 +373,25 @@ def _holds_at(text: str) -> bool:
 def _quotable_head(url: str) -> str | None:
     """Returns the URL's scheme and host as a refusal may quote them, or ``None`` if it may not.
 
-    The head is :data:`_QUOTABLE_HEAD`'s match. A head holding an ``@`` in any form
-    :func:`_holds_at` reads is not quotable either: by the time a refusal is built every such
-    ``@`` in the host has been refused, so this is the guard that keeps a refusal reached some
-    other way — a caller skipping those checks — from quoting what precedes one.
+    The head is :data:`_QUOTABLE_HEAD`'s match. A URL holding an ``@`` **anywhere**, in any form
+    :func:`_holds_at` reads, has no quotable head, though the head itself holds none. The literal
+    ``@`` is refused before any refusal that quotes, but a ``%40`` or a fullwidth ``＠`` is not,
+    and either can end a password whose ``#``, ``?`` or ``/`` ended the host early:
+    ``http://elastic:pa#ss%40es:9200/x`` has the head ``http://elastic:pa``, which is the user
+    and the start of the password. Testing only the head would quote them; testing the whole URL
+    quotes nothing whenever one may be there.
 
     Args:
       url: The URL as ``urllib`` unwraps it.
 
     Returns:
-      The head, or ``None`` when the URL does not start with one or the head holds an ``@``.
+      The head, or ``None`` when the URL does not start with one or holds an ``@`` anywhere.
 
     Raises:
       None.
     """
     found = _QUOTABLE_HEAD.match(url)
-    if found is None or _holds_at(found.group()):
+    if found is None or _holds_at(url):
         return None
     return found.group()
 
@@ -405,9 +408,10 @@ def _refuse_url(
     So the message quotes the head (:func:`_quotable_head`) and nothing after it, and gives the
     parser's error by its type name alone, chaining nothing. A URL that is all head quotes it
     whole, with the parser's reason, chained, since there nothing follows the host to leak and the
-    reason is the useful part. A URL with no quotable head is quoted not at all. It is raised from
-    a function called outside any ``except``, so a refusal that chains nothing has no
-    ``__context__`` either.
+    reason is the useful part. A URL with no quotable head is quoted not at all, and the message
+    says which of :func:`_quotable_head`'s two reasons applied: no head to tell apart, or an ``@``
+    somewhere. It is raised from a function called outside any ``except``, so a refusal that
+    chains nothing has no ``__context__`` either.
 
     Args:
       owner: The class refusing the URL, for the message.
@@ -424,10 +428,12 @@ def _refuse_url(
       ValueError: Always.
     """
     if head is None:
-        raise ValueError(
-            f"{owner} {name} {reason}; the URL is not quoted, since its host cannot be told apart "
-            f"from the rest of it"
-        ) from None
+        why = (
+            "it holds an '@', and what precedes one may be a password"
+            if _holds_at(url)
+            else "its host cannot be told apart from the rest of it"
+        )
+        raise ValueError(f"{owner} {name} {reason}; the URL is not quoted, since {why}") from None
     if head == url:
         detail = f" ({err})" if err is not None else ""
         raise ValueError(f"{owner} {name} {reason}{detail}: {url!r}") from err
@@ -442,13 +448,16 @@ def _refuse_stray_at(url: str, owner: str, name: str) -> None:
     """Raises if the URL holds a literal ``@`` anywhere, never echoing the URL or chaining anything.
 
     It runs right after :func:`_refuse_userinfo`, which has refused every ``@`` in the host, so any
-    ``@`` left is outside it — and one there is most often a password that ended the host early:
+    ``@`` left is outside it — and one there may be a password that ended the host early:
     ``http://elastic:12#ss@es:9200/x`` reads as host ``elastic:12``, so it constructed and every
-    request went to a host the caller never named, ``?`` and ``/`` alike. An ``@`` that really
-    belongs in a path, query or fragment is written ``%40``, which sends the same request to any
-    server that decodes it, so the message names that remedy. ``%40`` and a fullwidth ``＠`` are not
-    refused here: the first is the remedy, and the second is non-ASCII outside the host, which
-    ``http.client`` refuses later, unquoted (:func:`_refuse_url`).
+    request went to a host the caller never named, ``?`` and ``/`` alike. The two cannot be told
+    apart, so the message says the ``@`` *may* be one. An ``@`` that really belongs in a path,
+    query or fragment is written ``%40``, which sends the same request to any server that decodes
+    it, so the message names that remedy. ``%40`` and a fullwidth ``＠`` are not refused here: the
+    first is the remedy, and the second is no ``@`` to ``urllib``. In a path or query a fullwidth
+    one is non-ASCII, which ``http.client`` refuses; in a fragment, which is never sent, it is not
+    refused at all — ``HTTPSink("http://h/x#a＠b")`` constructs. A refusal of a URL holding either
+    anywhere quotes nothing of it (:func:`_quotable_head`).
 
     Args:
       url: The URL as ``urllib`` unwraps it.
@@ -463,9 +472,9 @@ def _refuse_stray_at(url: str, owner: str, name: str) -> None:
     """
     if "@" in url:
         raise ValueError(
-            f"{owner} {name} must not hold an '@' outside its host: a password holding '#', '?' "
-            f"or '/' ends the host before its '@', so the request goes to a host you never named; "
-            f"write an '@' that belongs in a path or query as '%40'"
+            f"{owner} {name} must not hold an '@' outside its host: an '@' there may be a "
+            f"password whose '#', '?' or '/' ended the host early, sending the request to another "
+            f"host; write an '@' that belongs in a path or query as '%40'"
         )
 
 

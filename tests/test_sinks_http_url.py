@@ -780,7 +780,7 @@ anyway, by the stray-``@`` check that follows the userinfo one (:data:`_STRAY_AT
 _PERCENT_AT = [url for url in _NOT_USERINFO if "@" not in url]
 """The forms with no literal ``@``: the ``%40`` remedy the stray-``@`` refusal names."""
 
-_STRAY_AT_MESSAGE = r"must not hold an '@' outside its host: a password holding "
+_STRAY_AT_MESSAGE = r"must not hold an '@' outside its host: an '@' there may be a password "
 """The stray-``@`` refusal's text after the owner and argument."""
 
 _STRAY_AT_REMEDY = "write an '@' that belongs in a path or query as '%40'"
@@ -1007,14 +1007,8 @@ _AFTER_THE_HOST = [
     ("http:///x?token=SECRET", "names no host", "http://"),
     ("http://h:abc/x?token=SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h:abc"),
     ("http://h:abc/services/SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h:abc"),
-    ("http://h:abc/a%40SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h:abc"),
     ("http://h/x y?token=SECRET", r"cannot be sent over HTTP \(InvalidURL\)", "http://h"),
     ("http://h/x?a=\udc80SECRET", r"cannot be sent over HTTP \(UnicodeEncodeError\)", "http://h"),
-    (
-        f"http://h/a{_FULLWIDTH_AT}SECRET",
-        r"cannot be sent over HTTP \(UnicodeEncodeError\)",
-        "http://h",
-    ),
     ("http://h:0/x#SECRET", "names no usable port", "http://h:0"),
     ("https://h:99999/x#access_token=SECRET", "names no usable port", "https://h:99999"),
 ]
@@ -1039,9 +1033,6 @@ def test_a_refused_url_quotes_only_its_scheme_and_host(url: str, reason: str, he
 
 _NO_HEAD = [
     ("es.example.com?api_key=Splunk:SECRET", "must use http or https"),
-    ("elastic%3ASECRET%40es:9200/x", "must use http or https"),
-    ("elastic%3ASECRET%40es:9200", "must use http or https"),
-    (f"u{_FULLWIDTH_AT}SECRET:9200/x", "must use http or https"),
     ("h?api_key=SECRET://x/y", "must use http or https"),
     ("h#SECRET://x/y", "must use http or https"),
     ("h%3ASECRET://x/y", "must use http or https"),
@@ -1052,7 +1043,7 @@ _NO_HEAD = [
 ]
 """Refused URLs that do not start with ``scheme://``, so no host can be told from the rest.
 
-The first two are ``_AUTHORITY``'s run quoting a secret: its scheme group, which mirrors
+The first is ``_AUTHORITY``'s run quoting a secret: its scheme group, which mirrors
 ``urllib``'s ``_splittype``, runs to the first ``:`` over ``?``, ``#`` and ``%``. The ``://`` ones
 are a quotable head only if the scheme may hold those, which RFC 3986's scheme characters do not.
 """
@@ -1067,10 +1058,49 @@ def test_a_refused_url_with_no_head_is_not_quoted_at_all(url: str, reason: str) 
     _assert_chains_nothing(e.value)
 
 
+_AT_ANYWHERE_TEXT = (
+    "; the URL is not quoted, since it holds an '@', and what precedes one may be a password"
+)
+"""How a refusal of a URL holding an ``@`` in any form, anywhere, ends."""
+
+_AT_ANYWHERE = [
+    ("http://elastic:pa#ss%40es:9200/x", "cannot be sent over HTTP"),
+    (f"http://elastic:pa#ss{_FULLWIDTH_AT}es:9200/x", "cannot be sent over HTTP"),
+    ("http://USERX:PWX?PWY%40h:9200/x", "cannot be sent over HTTP"),
+    ("http://USERX:0#PWY%40h/x", "names no usable port"),
+    (f"http://USERX:PWX/PWY{_FULLWIDTH_AT}h/x", "cannot be sent over HTTP"),
+    ("http://h:abc/a%40SECRET", "cannot be sent over HTTP"),
+    (f"http://h/a{_FULLWIDTH_AT}SECRET", "cannot be sent over HTTP"),
+    ("elastic%3ASECRET%40es:9200/x", "must use http or https"),
+    ("elastic%3ASECRET%40es:9200", "must use http or https"),
+    (f"u{_FULLWIDTH_AT}SECRET:9200/x", "must use http or https"),
+]
+"""Refused URLs holding a ``%40`` or a fullwidth ``@``, which no ``@`` check before the quoting
+refusals catches. In the first five it ends a password whose ``#``, ``?`` or ``/`` ended the host
+early, so the head is the user and the start of the password: ``'http://elastic:pa'`` was quoted
+before the whole URL was tested. The last three have no head at all, and say the other reason."""
+
+
+@pytest.mark.parametrize(("url", "reason"), _AT_ANYWHERE)
+def test_a_refused_url_holding_an_at_sign_in_any_form_is_not_quoted(url: str, reason: str) -> None:
+    """The whole message is matched, anchored, so no part of the URL is in it: ``pa`` and ``ss``
+    cannot be searched for, since the fixed text says ``password``."""
+    with pytest.raises(
+        ValueError, match=rf"^HTTPSink url {reason}{re.escape(_AT_ANYWHERE_TEXT)}$"
+    ) as caught:
+        HTTPSink(url)
+
+    _assert_never_echoes(caught.value, "USERX", "PWX", "PWY", "SECRET", "es:9200", "elastic")
+    _assert_chains_nothing(caught.value)
+    _assert_printable(caught.value)
+
+
 @pytest.mark.parametrize(
     ("url", "head"),
     [
         ("http://h/x", "http://h"),
+        ("http://elastic:pa#ss%40es:9200/x", None),
+        ("http://h/x#a%40b", None),
         ("HTTPS://h:9200?x", "HTTPS://h:9200"),
         ("svn+ssh.1-a://h#f", "svn+ssh.1-a://h"),
         ("http://", "http://"),
