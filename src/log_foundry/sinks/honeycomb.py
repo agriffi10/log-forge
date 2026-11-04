@@ -11,6 +11,7 @@ from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
+    _holds_at,
     _Item,
     _valid_base_url,
     _valid_url,
@@ -25,6 +26,14 @@ _SEGMENT_BREAKERS = "/?#\\"
 _DOT_SEGMENTS = (".", "..")
 """The two segments a normalizing hop removes from a path (RFC 3986 §5.2.4)."""
 
+_UNQUOTABLE = "/?#"
+"""What keeps a refused dataset from being quoted, since it would land outside the segment.
+
+``d?api_key=…`` is a query, which is where a credential sits; an ``@`` in any form
+:func:`~log_foundry.sinks.http._holds_at` reads is unquotable too, since what precedes one may be
+a password.
+"""
+
 
 def _one_segment(dataset: str, owner: str) -> None:
     """Refuses a dataset that would not reach Honeycomb as the one path segment it names.
@@ -38,14 +47,17 @@ def _one_segment(dataset: str, owner: str) -> None:
     which a normalizing hop removes, and so is its percent-encoded form (``%2e``, ``.%2E``), which
     RFC 3986 §6.2.2.2 and the WHATWG parser decode before removing it. An empty dataset, or one
     that is only whitespace, names no dataset at all. None of these could be relied on to reach
-    the dataset named, so each is refused rather than encoded, and no dataset that delivered
-    before goes anywhere new.
+    the dataset named, so each is refused rather than encoded, and none of them goes anywhere new.
+    The refusal quotes the dataset unless it holds an ``@``, ``/``, ``?`` or ``#``
+    (:data:`_UNQUOTABLE`).
 
     What stays is what delivered as written: ``%`` escapes, which are how a caller names a
-    dataset ``http.client`` cannot carry raw; the sub-delimiters, ``:`` and ``@``, which
-    ``urllib`` and ``http.client`` carry unchanged; and trailing whitespace, which
-    ``urllib.parse.unwrap`` floors on every URL, so the dot and empty checks read the dataset
-    after that same strip.
+    dataset ``http.client`` cannot carry raw; the sub-delimiters and ``:``, which ``urllib`` and
+    ``http.client`` carry unchanged; and trailing whitespace, which ``urllib.parse.unwrap`` floors
+    on every URL, so the dot and empty checks read the dataset after that same strip. A literal
+    ``@`` is not checked here: it delivered as written, but the URL this class builds is refused
+    holding one by :func:`~log_foundry.sinks.http._valid_url`, under ``dataset``, as every HTTP
+    sink URL is, and ``%40`` is how a dataset with an ``@`` in its name reaches it.
 
     Args:
       dataset: The dataset as the caller gave it.
@@ -57,14 +69,18 @@ def _one_segment(dataset: str, owner: str) -> None:
     Raises:
       ValueError: If ``dataset`` holds ``/``, ``?``, ``#`` or a backslash, is ``.`` or ``..``
         once stripped and its ``%2e`` decoded, or is empty once stripped. The message echoes
-        the dataset and nothing else.
+        the dataset and nothing else, and not the dataset either when it holds an ``@``, ``/``,
+        ``?`` or ``#``.
     """
     segment = dataset.strip()
     dots = segment.lower().replace("%2e", ".")
     if not segment or dots in _DOT_SEGMENTS or any(c in dataset for c in _SEGMENT_BREAKERS):
+        shown = f": {dataset!r}"
+        if _holds_at(dataset) or any(c in dataset for c in _UNQUOTABLE):
+            shown = "; the dataset is not quoted, since it holds an '@', '/', '?' or '#'"
         raise ValueError(
             f"{owner} dataset must be one path segment: not empty, '.' or '..', and without "
-            f"'/', '?', '#' or a backslash: {dataset!r}"
+            f"'/', '?', '#' or a backslash{shown}"
         )
 
 
@@ -136,12 +152,13 @@ class HoneycombSink(HTTPSink):
           TypeError: If a forwarded ``max_retries`` or ``max_batch_count`` is not an ``int``, or
             a forwarded ``max_retry_after`` is not an ``int`` or ``float``, refused by
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
-          ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), or cannot
-            be carried in a request path — checked against a fixed base so the message names
-            ``dataset`` rather than the ``url`` this class builds from both, whose own check
-            names ``url`` (SPEC-049 FR-001); or if ``url`` carries a user or password, or a
-            query or fragment, which the appended path would land inside
-            (:func:`_valid_base_url`).
+          ValueError: If ``dataset`` is not one path segment (:func:`_one_segment`), holds a
+            literal ``@`` — write it ``%40`` — or cannot be carried in a request path, the last
+            two checked against a fixed base so the message names ``dataset`` rather than the
+            ``url`` this class builds from both, whose own check names ``url`` (SPEC-049 FR-001);
+            or if ``url`` carries a user or password, or a query or fragment, which the
+            appended path would land inside (:func:`_valid_base_url`), or an ``@`` anywhere
+            else, refused naming ``url`` once the path is appended.
         """
         _one_segment(dataset, type(self).__name__)
         _valid_url(f"http://localhost/1/batch/{dataset}", type(self).__name__, name="dataset")

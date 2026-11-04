@@ -267,13 +267,17 @@ def test_a_dataset_that_is_not_one_path_segment_is_refused_at_construction(datas
         ("d%2Fx", "https://api.honeycomb.io/1/batch/d%2Fx"),
         ("d;x", "https://api.honeycomb.io/1/batch/d;x"),
         ("d:x", "https://api.honeycomb.io/1/batch/d:x"),
-        ("d@x", "https://api.honeycomb.io/1/batch/d@x"),
+        ("d%40x", "https://api.honeycomb.io/1/batch/d%40x"),
         ("d-x_1", "https://api.honeycomb.io/1/batch/d-x_1"),
         ("d\n", "https://api.honeycomb.io/1/batch/d"),
     ],
 )
 def test_a_dataset_that_delivered_before_still_goes_where_it_went(dataset: str, url: str) -> None:
-    """The positive control: every working dataset constructs, and its URL is unchanged."""
+    """The positive control: every working dataset constructs, and its URL is unchanged.
+
+    ``d@x`` delivered as written too, and is refused now as every HTTP sink URL holding an ``@``
+    outside its host is (the test below); ``d%40x`` is how that dataset is named.
+    """
     opener = FakeOpener([_verdict(202)])
     sink = HoneycombSink(_KEY, dataset, opener=opener, max_retries=0)
 
@@ -281,3 +285,35 @@ def test_a_dataset_that_delivered_before_still_goes_where_it_went(dataset: str, 
 
     assert sink.url == url
     assert opener.calls[0]["url"] == url
+
+
+def test_a_dataset_holding_an_at_sign_is_refused_naming_dataset() -> None:
+    with pytest.raises(
+        ValueError, match=r"^HoneycombSink dataset must not hold an '@' outside its host: "
+    ) as caught:
+        HoneycombSink(_KEY, "d@x")
+
+    assert str(caught.value).endswith("write an '@' that belongs in a path or query as '%40'")
+    assert "d@x" not in str(caught.value)
+    assert _KEY not in str(caught.value)
+
+
+@pytest.mark.parametrize("dataset", ["d?api_key=SECRET", "d#SECRET", "SECRET/d", "a@SECRET/d"])
+def test_a_refused_dataset_holding_a_delimiter_or_an_at_sign_is_not_quoted(dataset: str) -> None:
+    with pytest.raises(
+        ValueError, match=r"^HoneycombSink dataset must be one path segment: "
+    ) as caught:
+        HoneycombSink(_KEY, dataset)
+
+    assert "SECRET" not in str(caught.value)
+    assert str(caught.value).endswith(
+        "; the dataset is not quoted, since it holds an '@', '/', '?' or '#'"
+    )
+
+
+@pytest.mark.parametrize("dataset", ["d\\x", "..", "%2e", " "])
+def test_a_refused_dataset_with_no_delimiter_or_at_sign_is_still_quoted(dataset: str) -> None:
+    with pytest.raises(ValueError, match=r"^HoneycombSink dataset must be one path segment: ") as e:
+        HoneycombSink(_KEY, dataset)
+
+    assert str(e.value).endswith(f"backslash: {dataset!r}")

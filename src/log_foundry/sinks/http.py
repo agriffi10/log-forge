@@ -279,7 +279,20 @@ _AUTHORITY = re.compile(r"(?:[^/:]*:)?(?://)?([^/?#]*)", re.DOTALL)
 
 Every part is optional, so it matches any string. Where both parsers find a scheme and a host it is
 the netloc ``urlsplit`` reads and the host ``urllib``'s ``_splithost`` reads; where they do not, it
-is the run that would have been the host, which is all a refusal needs to avoid echoing.
+is the run that would have been the host, which is what :func:`_carries_userinfo` tests. It is not
+what a refusal quotes: the scheme group mirrors ``urllib``'s ``_splittype`` and runs to the first
+``:`` over ``?``, ``#`` and ``%``, so in ``es.example.com?api_key=Splunk:SECRET`` the run is text
+after the key. A refusal quotes :data:`_QUOTABLE_HEAD` instead.
+"""
+
+_QUOTABLE_HEAD = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*")
+"""A URL's scheme, its ``//`` and its host, at the very start of it: what a refusal may quote.
+
+The scheme is RFC 3986's characters, so no ``?``, ``#``, ``%`` or ``:`` is read as part of one, and
+the host runs to the first ``/``, ``?`` or ``#``, the delimiters ``urlsplit`` and ``_splithost``
+both end it at. It is matched with nothing stripped first: a URL that starts with anything else —
+a control character, a tab inside ``http:\\t//`` — has no host this can tell apart, and is not
+quoted at all.
 """
 
 
@@ -357,42 +370,110 @@ def _holds_at(text: str) -> bool:
     )
 
 
-def _url_refusal(owner: str, name: str, reason: str, url: str) -> ValueError:
-    """Builds a refusal of a URL that quotes it only when it holds no ``@`` (:func:`_holds_at`).
+def _quotable_head(url: str) -> str | None:
+    """Returns the URL's scheme and host as a refusal may quote them, or ``None`` if it may not.
 
-    A URL with no userinfo can still carry a password: ``http://elastic:pa#ss@es:9200/x`` ends its
-    authority at the ``#``, so neither parser reads userinfo and :func:`_refuse_userinfo` rightly
-    stays quiet, but ``http.client`` then reads ``pa`` as a port and its refusal printed the URL and
-    chained ``nonnumeric port: 'pa'`` — and ``?`` and ``/`` do the same. Every ``@`` in a URL is
-    where a credential may sit, so a refusal of one names the argument and the reason in fixed
-    text; the caller raises it outside any ``except``, from ``None``, so nothing is chained. A URL
-    with no ``@`` is quoted as before, since there the echo is the most useful part of the message.
+    The head is :data:`_QUOTABLE_HEAD`'s match. A head holding an ``@`` in any form
+    :func:`_holds_at` reads is not quotable either: by the time a refusal is built every such
+    ``@`` in the host has been refused, so this is the guard that keeps a refusal reached some
+    other way — a caller skipping those checks — from quoting what precedes one.
 
     Args:
-      owner: The class refusing the URL, for the message.
-      name: The argument the message names.
-      reason: Why it is refused; for a URL with an ``@``, a reason that quotes no part of it.
-      url: The URL refused.
+      url: The URL as ``urllib`` unwraps it.
 
     Returns:
-      The ``ValueError`` to raise.
+      The head, or ``None`` when the URL does not start with one or the head holds an ``@``.
 
     Raises:
       None.
     """
-    if _holds_at(url):
-        return ValueError(
-            f"{owner} {name} {reason}; the URL is not quoted, since it holds an '@' and what "
-            f"precedes one may be a password"
+    found = _QUOTABLE_HEAD.match(url)
+    if found is None or _holds_at(found.group()):
+        return None
+    return found.group()
+
+
+def _refuse_url(
+    owner: str, name: str, reason: str, url: str, head: str | None, err: Exception | None = None
+) -> NoReturn:
+    """Raises a refusal of a URL that quotes no more of it than its scheme and host.
+
+    A path, query or fragment is where a credential sits — ``?api_key=…``, ``#access_token=…``,
+    ``/services/<token>`` — and a URL refused for any reason printed all of them, and the parser's
+    reason it chained could quote them too: ``http.client``'s ``InvalidURL`` quotes the request
+    target, query included, and a ``UnicodeEncodeError``'s ``object`` is the whole request line.
+    So the message quotes the head (:func:`_quotable_head`) and nothing after it, and gives the
+    parser's error by its type name alone, chaining nothing. A URL that is all head quotes it
+    whole, with the parser's reason, chained, since there nothing follows the host to leak and the
+    reason is the useful part. A URL with no quotable head is quoted not at all. It is raised from
+    a function called outside any ``except``, so a refusal that chains nothing has no
+    ``__context__`` either.
+
+    Args:
+      owner: The class refusing the URL, for the message.
+      name: The argument the message names.
+      reason: Why it is refused, quoting nothing outside ``head``.
+      url: The URL refused, as ``urllib`` unwraps it.
+      head: :func:`_quotable_head` of ``url``.
+      err: The parser's error behind the refusal, if one raised.
+
+    Returns:
+      None; it always raises.
+
+    Raises:
+      ValueError: Always.
+    """
+    if head is None:
+        raise ValueError(
+            f"{owner} {name} {reason}; the URL is not quoted, since its host cannot be told apart "
+            f"from the rest of it"
+        ) from None
+    if head == url:
+        detail = f" ({err})" if err is not None else ""
+        raise ValueError(f"{owner} {name} {reason}{detail}: {url!r}") from err
+    detail = f" ({type(err).__name__})" if err is not None else ""
+    raise ValueError(
+        f"{owner} {name} {reason}{detail}: {head!r}; only the scheme and host are quoted, since a "
+        f"path, query or fragment may hold a credential"
+    ) from None
+
+
+def _refuse_stray_at(url: str, owner: str, name: str) -> None:
+    """Raises if the URL holds a literal ``@`` anywhere, never echoing the URL or chaining anything.
+
+    It runs right after :func:`_refuse_userinfo`, which has refused every ``@`` in the host, so any
+    ``@`` left is outside it — and one there is most often a password that ended the host early:
+    ``http://elastic:12#ss@es:9200/x`` reads as host ``elastic:12``, so it constructed and every
+    request went to a host the caller never named, ``?`` and ``/`` alike. An ``@`` that really
+    belongs in a path, query or fragment is written ``%40``, which sends the same request to any
+    server that decodes it, so the message names that remedy. ``%40`` and a fullwidth ``＠`` are not
+    refused here: the first is the remedy, and the second is non-ASCII outside the host, which
+    ``http.client`` refuses later, unquoted (:func:`_refuse_url`).
+
+    Args:
+      url: The URL as ``urllib`` unwraps it.
+      owner: The class refusing it, for the message.
+      name: The argument the message names.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: If the URL holds an ``@``.
+    """
+    if "@" in url:
+        raise ValueError(
+            f"{owner} {name} must not hold an '@' outside its host: a password holding '#', '?' "
+            f"or '/' ends the host before its '@', so the request goes to a host you never named; "
+            f"write an '@' that belongs in a path or query as '%40'"
         )
-    return ValueError(f"{owner} {name} {reason}: {url!r}")
 
 
 def _refuse_userinfo(url: str, owner: str, name: str, credentials: str) -> None:
     """Raises if the URL carries a user or password, never echoing the URL or chaining anything.
 
-    It runs before every other check of a URL, because every other refusal quotes the URL and
-    ``urlsplit``'s own errors quote the netloc — a password included. The message names the
+    It runs before every other check of a URL, because every other refusal quotes the URL's host
+    and ``urlsplit``'s own errors quote the netloc — a password included. The message names the
     argument the caller wrote and where credentials go instead; it holds nothing derived from the
     URL, and it is raised outside any ``except``, so neither ``__cause__`` nor ``__context__`` is
     set.
@@ -417,7 +498,14 @@ def _refuse_userinfo(url: str, owner: str, name: str, credentials: str) -> None:
         )
 
 
-def _valid_url(url: str, owner: str, name: str = "url", credentials: str = _AUTH_REMEDY) -> str:
+def _valid_url(
+    url: str,
+    owner: str,
+    name: str = "url",
+    credentials: str = _AUTH_REMEDY,
+    *,
+    path_at: bool = False,
+) -> str:
     """Returns a URL this family can actually POST to, or raises (SPEC-049 FR-001).
 
     A scheme ``urllib`` will open but this sink cannot use is a configuration error that surfaced
@@ -433,12 +521,9 @@ def _valid_url(url: str, owner: str, name: str = "url", credentials: str = _AUTH
     delivered once. A lone surrogate or any other non-ASCII character outside the host raised
     ``UnicodeEncodeError`` out of every ``emit`` with ``failed == 0`` and no stderr line; a space or
     control character raises ``InvalidURL``, which :meth:`HTTPSink._send` counts as a connection
-    error — on every request, for the life of the process. A user or password before the host is
-    refused first, by :func:`_refuse_userinfo`, because every refusal after it quotes the URL;
-    ``http.client`` read ``user:password@h`` as a port before that check existed, and the refusal
-    it gave printed the password. Rather than list those characters, the check builds the
-    request line the way ``urllib`` would — the connection ``do_open`` builds for the request's
-    host, then ``putrequest`` and the ``Host`` header ``urllib`` writes itself
+    error — on every request, for the life of the process. Rather than list those characters, the
+    check builds the request line the way ``urllib`` would — the connection ``do_open`` builds for
+    the request's host, then ``putrequest`` and the ``Host`` header ``urllib`` writes itself
     (:func:`_started_request`), which encode and validate without opening a socket — so the refusal
     tracks ``http.client``'s own rules instead of a copy of them. That header is why a host
     ``http.client`` would IDNA-encode is refused anyway when it is not Latin-1: ``urllib`` sends the
@@ -448,28 +533,44 @@ def _valid_url(url: str, owner: str, name: str = "url", credentials: str = _AUTH
     ``http.client`` does. A missing host, or a port of ``0`` or past ``65535``, is refused because
     every request fails, counted, for the life of the process, and that is knowable here.
 
+    The checks run in a fixed order. A user or password before the host is refused first, by
+    :func:`_refuse_userinfo`, because every refusal after it quotes the host; ``http.client`` read
+    ``user:password@h`` as a port before that check existed, and the refusal it gave printed the
+    password. A literal ``@`` anywhere else is refused second, by :func:`_refuse_stray_at`, because
+    one there is most often a password whose ``#``, ``?`` or ``/`` ended the host before its ``@``,
+    sending every request to a host the caller never named. Only then the rest, each of which
+    quotes the URL's scheme and host and nothing after them (:func:`_refuse_url`). ``SentrySink``
+    alone skips the second check, with ``path_at``: an ``@`` in a DSN's path prefix is a path the
+    SDK delivers to, and the ingest URL it builds can hold no other literal ``@``.
+
     Args:
       url: The endpoint as constructed.
       owner: The class refusing it, for the message.
       name: The argument the message names — ``url`` here, the argument a subclass built the URL
         from where it checks that argument itself first.
       credentials: Where the class takes credentials instead, for a URL carrying userinfo.
+      path_at: Whether a literal ``@`` outside the host is let through; ``SentrySink``'s only.
 
     Returns:
       The URL as ``urllib`` unwraps it, without surrounding whitespace.
 
     Raises:
-      ValueError: If the URL carries a user or password before its host (:func:`_refuse_userinfo`,
-        whose message echoes nothing of the URL), the scheme is not ``http`` or ``https``, the URL
+      ValueError: If the URL carries a user or password before its host (:func:`_refuse_userinfo`)
+        or, unless ``path_at``, an ``@`` anywhere else (:func:`_refuse_stray_at`) — both in fixed
+        text that echoes nothing of the URL — or the scheme is not ``http`` or ``https``, the URL
         names no host — every request to ``http:///x`` fails with a counted ``URLError`` for the
         life of the process, which is knowable here (SPEC-049, system-frame review) — its port is
         not one a socket can reach, or ``http.client`` cannot build a request line for it. Each of
-        those quotes the URL and its parser's reason, chained, unless the URL holds an ``@``
-        anywhere, when it gives fixed text and chains nothing (:func:`_url_refusal`).
+        those quotes the URL's scheme and host and gives the parser's error by its type alone,
+        chaining nothing, unless nothing follows the host, when it quotes the URL with the parser's
+        reason, chained, or the URL has no host it can tell apart, when it quotes nothing
+        (:func:`_refuse_url`).
     """
     url = unwrap(url)
     _refuse_userinfo(url, owner, name, credentials)
-    hidden = _holds_at(url)
+    if not path_at:
+        _refuse_stray_at(url, owner, name)
+    head = _quotable_head(url)
     try:
         parsed = urlparse(url)
     except ValueError as err:
@@ -477,19 +578,21 @@ def _valid_url(url: str, owner: str, name: str = "url", credentials: str = _AUTH
     else:
         unparsed = None
     if unparsed is not None:
-        reason = "is not a URL" if hidden else f"is not a URL ({unparsed})"
-        raise _url_refusal(owner, name, reason, url) from None if hidden else unparsed
+        _refuse_url(owner, name, "is not a URL", url, head, unparsed)
     scheme = parsed.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
-        raise _url_refusal(owner, name, f"must use http or https, not {scheme or 'no'} scheme", url)
+        reason = "must use http or https"
+        if head is not None:
+            reason = f"{reason}, not {scheme or 'no'} scheme"
+        _refuse_url(owner, name, reason, url, head)
     request = urllib.request.Request(url)  # noqa: S310
     if request.type.lower() != scheme:
         reason = "must use http or https"
-        if not hidden:
+        if head is not None:
             reason = f"{reason}, not {request.type!r}"
-        raise _url_refusal(owner, name, reason, url)
+        _refuse_url(owner, name, reason, url, head)
     if not parsed.netloc or not request.host:
-        raise _url_refusal(owner, name, "names no host", url)
+        _refuse_url(owner, name, "names no host", url, head)
     try:
         connection = _started_request(request.host, "POST", request.selector)
         connection.putheader("Host", request.host)
@@ -498,14 +601,9 @@ def _valid_url(url: str, owner: str, name: str = "url", credentials: str = _AUTH
     else:
         unsendable = None
     if unsendable is not None:
-        reason = (
-            f"cannot be sent over HTTP ({type(unsendable).__name__})"
-            if hidden
-            else f"cannot be sent over HTTP ({unsendable})"
-        )
-        raise _url_refusal(owner, name, reason, url) from None if hidden else unsendable
+        _refuse_url(owner, name, "cannot be sent over HTTP", url, head, unsendable)
     if not 0 < connection.port <= _MAX_PORT:
-        raise _url_refusal(owner, name, "names no usable port", url)
+        _refuse_url(owner, name, "names no usable port", url, head)
     return url
 
 
@@ -885,7 +983,8 @@ class HTTPSink:
           TypeError: If ``max_retries`` or a supplied ``max_batch_count`` is not an ``int``, or
             ``max_retry_after`` is not an ``int`` or ``float`` (SPEC-066), the message carrying the
             subclass's own name as the ``ValueError`` does.
-          ValueError: If the URL carries a user or password before its host, its scheme is not
+          ValueError: If the URL carries a user or password before its host or an ``@`` anywhere
+            else — write one that belongs in a path or query as ``%40`` — its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
             build a request line for it or for the method,
             a header name or value or a bearer token contains CR or LF, the timeout cannot bound
