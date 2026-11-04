@@ -821,7 +821,12 @@ def test_a_deferred_close_does_not_re_drain() -> None:
 
 
 def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
-    """ "item(s)", not "event(s)": the queue holds one entry per span, plus internal markers."""
+    """Submissions, not events and not entries: the sentinel `stop()` queued is not counted.
+
+    The queue holds one entry per span plus internal markers. Until SPEC-068 FR-001 the line read
+    `lost 3 item(s)` here — the two queued spans and the `_SHUTDOWN` sentinel — and announced
+    them lost while the wedged emit could still return; it now names them as still queued.
+    """
     sink = _WedgedSink()
     worker = Worker(sink, batch_size=1)
     worker.submit([{"a": 1}, {"a": 2}])  # one item, two events
@@ -835,11 +840,12 @@ def test_the_expired_shutdown_line_counts_what_is_still_queued(capsys) -> None:
         sink.release.set()
 
     assert "lost 1 drain(s)" not in err, "nothing counted a 'drain'"
-    # 2 submissions still queued + the _SHUTDOWN sentinel. Asserted exactly, because a count
-    # nobody checks is how "lost 1 drain(s)" survived the first round of tests.
-    assert "lost 3 item(s)" in err
+    # 2 submissions still queued; the _SHUTDOWN sentinel is not one. Asserted exactly, because a
+    # count nobody checks is how "lost 1 drain(s)" survived the first round of tests.
+    assert "; 2 submission(s) still queued" in err
+    assert "item(s)" not in err, "the queue is no longer announced as lost items"
     # The batch inside the wedged emit is reported separately as in flight (SPEC-062 FR-005),
-    # so the narrowing is to the figure this test is about: the lost count is items, never
+    # so the narrowing is to the figure this test is about: the queued count is spans, never
     # the events inside them.
     assert "lost 2 event(s)" not in err, "the queue counts spans, not the events inside them"
     assert "shutdown timed out after 0.2s" in err

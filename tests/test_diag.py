@@ -115,6 +115,7 @@ def test_lost_without_a_detail_omits_the_semicolon(err: _Stderr) -> None:
         lambda: _diag.absorbed("closing a span", _Boom(), "a detail"),
         lambda: _diag.lost("event", 3, "a detail"),
         lambda: _diag.rejected("unparseable traceparent", "00-bad"),
+        lambda: _diag.pending("a detail"),
     ],
 )
 def test_every_line_is_single_and_prefixed(err: _Stderr, write: Callable[[], None]) -> None:
@@ -497,6 +498,7 @@ def test_errno_of_renders_an_int_subclass_as_a_number() -> None:
         lambda: _diag.absorbed("closing a span", _Boom(), "a detail"),
         lambda: _diag.lost("event", 3, "a detail"),
         lambda: _diag.rejected("unparseable traceparent", "00-bad"),
+        lambda: _diag.pending("a detail"),
     ],
 )
 @pytest.mark.parametrize("fault", [ValueError("closed"), OSError(32, "Broken pipe")])
@@ -518,6 +520,7 @@ def test_a_none_stderr_is_absorbed(monkeypatch: pytest.MonkeyPatch) -> None:
     _diag.absorbed("closing a span", _Boom())
     _diag.lost("event", 1)
     _diag.rejected("invalid trace_id", "x")
+    _diag.pending("a detail")
 
 
 @pytest.mark.parametrize(
@@ -526,6 +529,7 @@ def test_a_none_stderr_is_absorbed(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: _diag.absorbed("closing a span", _Boom()),
         lambda: _diag.lost("event", 3),
         lambda: _diag.rejected("unparseable traceparent", "00-bad"),
+        lambda: _diag.pending("a detail"),
     ],
 )
 @pytest.mark.parametrize("fault", [KeyboardInterrupt(), SystemExit(1)])
@@ -759,17 +763,18 @@ def test_the_stderr_walker_states_what_it_does_not_catch(source: str) -> None:
     assert _stderr_writes(ast.parse(source)) == []
 
 
-def test_diag_still_has_exactly_the_three_writers_it_documents() -> None:
+def test_diag_still_has_exactly_the_four_writers_it_documents() -> None:
     """A tripwire, separate from the vacuity check above, and deliberately brittle.
 
-    ``architecture.md`` §6 and ``_diag``'s own docstring both describe three writers. A fourth is
-    fine — it just has to be a decision, taken with the docs in front of you, rather than a
-    quiet fourth spelling of a line the other three already write.
+    ``_diag``'s own docstring names four writers, one per kind of line: ``absorbed``, ``lost``,
+    ``rejected`` and, since SPEC-068 FR-001, ``pending``. A fifth is fine — it just has to be a
+    decision, taken with the docs in front of you, rather than a quiet fifth spelling of a line
+    the other four already write.
     """
     writes = _stderr_writes(ast.parse((_SRC / "_diag.py").read_text(encoding="utf-8")))
-    assert len(writes) == 3, (
-        f"_diag has {len(writes)} stderr writes, not 3 — if a writer was added, update "
-        f"_diag's docstring and architecture.md §6 to match"
+    assert len(writes) == 4, (
+        f"_diag has {len(writes)} stderr writes, not 4 — if a writer was added, update "
+        f"_diag's docstring to match"
     )
 
 

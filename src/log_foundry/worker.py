@@ -1072,13 +1072,23 @@ class Worker:
     def _record_incomplete_swap(self, timeout: float | None, sink: Sink) -> None:
         """Records a swap whose drain could not be confirmed, then announces it (FR-003).
 
-        Two things are reported at once because they have one cause: queued items may have been
+        Two things are reported at once because they have one cause: queued submissions may be
         carried to the new sink rather than the old one, and the old sink is not closed here. The
-        count is queued *items* — one per submitted span plus any marker — which makes it a
-        floor on the events involved, the useful direction for a reader deciding whether to care.
-        It counts the queue and not the previous sink's buffer deliberately: the queued items are
+        line is a :func:`~log_foundry._diag.pending` one, never a loss (SPEC-068 FR-002): those
+        submissions sit on a **live** drain, may well be delivered to the new sink, and are
+        counted by :meth:`_emit` if they are later abandoned — so a ``lost`` line here announced
+        them a second time. The count is :meth:`_queued_submissions`, which leaves out this
+        swap's own unanswered flush marker, and the clause is dropped when it is zero. It counts
+        the queue and not the previous sink's buffer deliberately: the queued submissions are
         the ones that may be misrouted. A probe read it as zero while nine events sat in that
         sink's client buffer, and both numbers were right about different things.
+
+        The wording is the shortest that still says both things, because the whole line must fit
+        ``_diag``'s detail bound. The line it replaced was 214 characters at a 4-character budget
+        and shipped cut off mid-word; this one fits at a 14-character budget, the longest
+        ``_bounded_seconds`` renders for a finite float, with a six-digit count. The substrings
+        ``could not be confirmed drained`` and ``left open`` are kept, which ``configure()``'s
+        tests read.
 
         **The sink is also recorded, not merely announced** (SPEC-050 FR-004). It is owed a close
         that cannot be performed now — the drain thread may still be inside its ``emit``, which is
@@ -1101,14 +1111,15 @@ class Worker:
         """
         with self._lock:
             self.incomplete_swaps += 1
-        _diag.lost(
-            "item",
-            self._queued_or_unknown(),
+        queued = self._queued_submissions()
+        detail = (
             f"the previous sink could not be confirmed drained within "
-            f"{_bounded_seconds(timeout)} of a configure(sink=...); it is left open until a "
-            f"shutdown() that finds the drain thread ended closes it, and queued items may "
-            f"reach the new sink instead",
+            f"{_bounded_seconds(timeout)}; it is left open until a shutdown() finds the drain "
+            f"thread ended"
         )
+        if queued:
+            detail += f"; {queued} submission(s) still queued, which may reach the new sink"
+        _diag.pending(detail)
 
     def claim_stop(self, deadline: float | None) -> bool:
         """Wins or loses the once-only stop gate, recording the winner's deadline (SPEC-062).
@@ -1184,10 +1195,16 @@ class Worker:
 
         An expired join leaves the sink **open**, because the thread is still inside it
         (SPEC-027 FR-004). The closer sees that through :meth:`may_be_inside` and leaves the sink
-        in the owner's record for a later call. The expiry line then also reports how many events
-        are inside the emit the thread is still running (SPEC-062 FR-005), separately from the
-        queued count and not as lost: their future is still open, and :meth:`_emit` counts them
-        when it returns.
+        in the owner's record for a later call. The expiry line reports what is **pending**, never
+        a loss (SPEC-068 FR-001): how many events are inside the emit the thread is still running
+        (SPEC-062 FR-005) and how many submissions are still queued behind it, each clause only
+        when non-zero. Neither is lost yet. The emit may still deliver, and :meth:`_emit` counts
+        its batch when it returns; the queued submissions are counted by whichever ``_emit`` line
+        settles them, one per batch, so each event is announced lost at most once. The queued
+        clause promises no later count on purpose: when the wedged emit is :meth:`_final_drain`'s
+        own, what is queued arrived after that drain's last read and will never be taken. It
+        counts submissions only, never the sentinel just queued or a flush marker
+        (:meth:`_queued_submissions`).
 
         Args:
           timeout: Seconds to wait for the drain thread, or ``None`` to wait indefinitely.
@@ -1216,7 +1233,7 @@ class Worker:
         self._stop.set()
         self._thread.join(timeout)
         if self._thread.is_alive():
-            queued = self._queued_or_unknown()
+            queued = self._queued_submissions()
             in_flight = self._in_flight
             with self._lock:
                 if self.stopped_reason is None:
@@ -1228,28 +1245,44 @@ class Worker:
             )
             if in_flight:
                 detail += f"; {in_flight} event(s) in flight, counted when the emit returns"
-            _diag.lost("item", queued, detail)
+            if queued:
+                detail += f"; {queued} submission(s) still queued"
+            _diag.pending(detail)
             self._release_waiters()
             return
         self._release_waiters()
 
-    def _queued_or_unknown(self) -> int:
-        """Returns queued items, or zero where the platform does not implement ``qsize``.
+    def _queued_submissions(self) -> int:
+        """Counts the submissions still queued, leaving out the shutdown sentinel and flush markers.
 
-        Items, not events: the queue holds one entry per submitted span plus any
-        flush/shutdown marker.
+        Submissions, not events and not entries (SPEC-068 FR-001): the queue holds one entry per
+        submitted span plus any ``_SHUTDOWN`` sentinel and ``_FlushMarker``, and ``qsize()``
+        counts all three. The expiry line used that and so announced the sentinel ``stop()`` had
+        just queued as a lost item, and the swap line counted its own unanswered marker. The
+        classification is :meth:`_final_drain`'s — an entry that is neither of the two is a
+        submission — so the line counts exactly what a drain would take.
+
+        It reads ``Queue``'s private ``mutex`` and ``queue``, the access :meth:`_release_waiters`
+        already makes and ``architecture.md`` §13 records: there is no public way to inspect a
+        queue without consuming it. A CPython change there would make this read 0, dropping the
+        queued clause from a line, rather than raise.
 
         Args:
           None.
 
         Returns:
-          The queue size, or 0 when it cannot be read.
+          The number of queued submissions, or 0 when the queue cannot be read.
 
         Raises:
           None. A diagnostic must not be the reason the diagnosis is lost.
         """
         try:
-            return self._queue.qsize()
+            with self._queue.mutex:
+                return sum(
+                    1
+                    for item in self._queue.queue
+                    if item is not _SHUTDOWN and not isinstance(item, _FlushMarker)
+                )
         except Exception:
             return 0
 

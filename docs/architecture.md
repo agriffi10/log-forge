@@ -1415,6 +1415,15 @@ and a third copy is a fork with no merge.
   exercises the method against a queue holding a mix of markers and event-lists, so the change
   surfaces as a test failure on a new interpreter rather than as that silence.
 
+  **`Worker._queued_submissions` is the second reader** (SPEC-068 FR-001). It takes the same
+  `Queue.mutex` and iterates the same `Queue.queue` to count the submissions still queued —
+  every entry that is neither the `_SHUTDOWN` sentinel nor a flush marker, `_final_drain`'s own
+  classification — for the expiry line and the unconfirmed-swap line, which `qsize()` cannot
+  serve because it counts the sentinel and the markers too. Its blast radius is smaller than
+  `_release_waiters`': the same CPython change would make it return 0, so both lines would lose
+  their queued clause and say nothing false. A test replaces the mutex with one that cannot be
+  entered and asserts exactly that.
+
 - **A borrowed client outlives the sink that used it, and the sink refuses regardless.** Closing a
   sink built on an injected client (`SQSSink(client=…)`, `RedisListSink(client=…)`,
   `MongoDBSink(client=…)`) does **not** close that client: it is the caller's to release, and
