@@ -46,7 +46,7 @@ The work is therefore independent of the value's size and shape. Measured throug
 `continue_trace` at `2e790e9`: a shared-sublist list (`[y] * 16` seven times deep) did not return
 in 3 s, and a 50,000,000-character `str` cost 0.10 to 0.11 s of CPU inside `rejected`; on a
 10^8-character `str` subclass at `7dc881f` the slot slice peaks at 105 bytes of traced memory
-where a full copy peaks at 100,000,085.
+where a full copy peaks at 100,000,041 (`str.__str__` of it alone).
 
 **Rejected.**
 

@@ -212,7 +212,7 @@ sees all of it. CPU time against `repr` of the same value in the same test catch
 value without pinning an absolute number, so a slow or loaded machine moves both; but it passes a
 full O(n) copy followed by a slice, which costs 0.02 to 0.03 of a `repr`. Peak allocation under
 `tracemalloc` is deterministic and catches that copy: measured at `7dc881f` on a 10^8-character
-`str` subclass, the slot slice peaks at 105 bytes and a full copy at 100,000,085.
+`str` subclass, the slot slice peaks at 105 bytes and a full copy at 100,000,041 (`str.__str__` of it alone).
 
 #### Acceptance Criteria:
 

@@ -42,7 +42,7 @@ return in 3 s (2.97 s of CPU, no line written); a value whose `__repr__` raised 
 `reason="rejected"` with no line; a 50,000,000-character `str` cost 0.10 to 0.11 s of CPU inside
 `rejected`. At `7dc881f`: a valid `str` subclass was adopted as itself and `current_traceparent()`
 then raised its `RuntimeError`; on a 10^8-character `str` subclass the slot slice peaks at 105 bytes
-of traced memory and a full copy at 100,000,085.
+of traced memory and a full copy at 100,000,041 (`str.__str__` of it alone).
 
 ## What changed from earlier specs?
 

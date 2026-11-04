@@ -584,6 +584,7 @@ def test_module_docstring_states_the_rules() -> None:
     assert "BaseException" in doc, "the guard's one exclusion"
     assert "Record first, announce second" in doc
     assert "logging" in doc, "why stderr rather than the logging module"
+    assert "An inbound value runs no code of its own" in doc, "SPEC-067's rule for rejected"
 
 
 def test_diag_imports_nothing_from_its_own_package() -> None:

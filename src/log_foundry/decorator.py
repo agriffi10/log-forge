@@ -227,17 +227,26 @@ def _exact(value: object) -> object:
     ``__str__``, ``__len__`` or anything else. A value of any other type is not touched at all,
     so the parsers refuse it and ``_diag.rejected`` names it by type.
 
+    The copy is linear in the subclass's length, so a subclass too large to duplicate raises
+    ``MemoryError`` from it. That ``Exception`` returns the value as it is, and the parsers then
+    refuse it as not an exact ``str`` and ``_diag.rejected`` echoes it through a bounded slice,
+    which copies nothing, so the call stays total rather than failing the caller.
+
     Args:
       value: One of :func:`continue_trace`'s inbound arguments, of any type.
 
     Returns:
-      An exact ``str`` for a ``str`` or ``str`` subclass, otherwise ``value`` itself.
+      An exact ``str`` for a ``str`` or ``str`` subclass; otherwise, or when the copy fails,
+      ``value`` itself.
 
     Raises:
       None.
     """
     if issubclass(type(value), str):
-        return str.__str__(cast("str", value))
+        try:
+            return str.__str__(cast("str", value))
+        except Exception:
+            return value
     return value
 
 
