@@ -112,6 +112,9 @@ FR-003.
     misordered-descriptor proxy is told the decorator by its claimed kind, and a non-callable one
     that it needs a callable; and the refusal messages differ for these exotic arguments only. It
     ends with a "Who must change code" line saying no caller must.
+  - `docs/invariants.md` invariant 13's *Guarded* line names SPEC-080 beside SPEC-055 for what
+    `@trace` refuses, and the trace-model decision *Unit of work = a decorated call* gains a
+    one-line pointer to the new decision and a dated History entry (nothing in it becomes false).
 
 ### Out of Scope
 
@@ -170,7 +173,11 @@ call", rather than when the decorator it returns is applied. `decorate` reads th
 the closure, and the truthiness test `exact_name or _span_name(fn)` runs on the exact `str`, so an
 empty name still falls back to the qualified name. The copy is not guarded: a `MemoryError` from
 copying an enormous subclass propagates at the `trace(...)` call, which invariant 13 allows, where
-`_exact` swallows it only because `continue_trace` must be total.
+`_exact` swallows it only because `continue_trace` must be total. Because the check moves ahead of
+`decorate`, a call carrying two bad arguments reports `name=` first: `trace("checkout", name=1)`
+and `trace(fn, name=1)` both raise `name= must be a str, got int`, where at base the first gave the
+`str` hint. Both calls were already refused with a `TypeError`, and `trace`'s docstring states the
+order.
 
 #### Acceptance Criteria:
 
@@ -179,9 +186,11 @@ copying an enormous subclass propagates at the `trace(...)` call, which invarian
       the returned decorator being applied; the `__class__` spy is empty and stderr is empty.
       *Fails at base: the call returns a decorator.*
 - [ ] A `name=` whose `__class__` property raises gives the same `TypeError` at the `trace(...)`
-      call, spy empty. *Fails at base: `RuntimeError`.*
-- [ ] A `name=` whose class's metaclass `__name__` property returns `"str"` is refused naming the
-      class's stored name, and the metaclass spy is empty. *Fails at base: `got str`.*
+      call, spy empty. *Fails at base: the call returns a decorator; applying it raises
+      `RuntimeError`.*
+- [ ] A `name=` whose class's metaclass `__name__` property returns `"str"` is refused at the
+      `trace(...)` call naming the class's stored name, and the metaclass spy is empty. *Fails at
+      base: the call returns a decorator; applying it says `got str`.*
 - [ ] A `str` subclass `name=` whose `__bool__`, `__len__`, `__str__`, `__repr__`, `__format__` and
       `__eq__` all raise decorates a plain function and an `async def`; two calls of each emit two
       `span.start` events whose `function` equals the held text with `type(...) is str`, stderr
@@ -244,7 +253,7 @@ a second caller: `_diag.rejected` catches a failure computing the echo and write
 decoration the failure propagates into the caller's frame, which invariant 13 allows. A callable
 whose `__class__` claims `str` no longer matches and is traced like any callable instance; its own
 `__class__` property still runs at decoration through the later checks (Out of Scope), some reads
-at decoration (25 on CPython 3.13.1) and none per call.
+at decoration (25 on CPython 3.13.1, 19 on 3.12.12) and none per call.
 
 #### Acceptance Criteria:
 
