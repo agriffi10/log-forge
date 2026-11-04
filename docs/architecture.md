@@ -884,10 +884,11 @@ close it.
   A lost ack is indistinguishable from a lost publish, so re-sending duplicates whatever landed
   (SPEC-018's rule). **Closed by** setting a `Nats-Msg-Id` header per event so the server
   deduplicates, which makes a retry safe and is its own spec. Since SPEC-061 the same "no ack"
-  is treated two ways depending on when the wait ended: an ack wait expiring inside the budget
-  raises and its batch can be retried by the worker when nothing else in it landed, while a
-  publish outliving the budget is abandoned and counted, never retried (`docs/invariants.md`,
-  invariant 2's recorded exception). The same header closes both.
+  is treated two ways depending on how the wait ended: an ack wait that expires (every one the
+  budget caps does, inside the sink's own wait) raises and its batch can be retried by the
+  worker when nothing else in it landed, while a publish the driver never returns from is
+  abandoned and counted, never retried (`docs/invariants.md`, invariant 2's recorded
+  exception). The same header closes both.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were

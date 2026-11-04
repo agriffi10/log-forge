@@ -536,6 +536,7 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
         if cell.call == "close":
             assert elapsed <= D + LOOP_JOIN_TIMEOUT + 0.5, f"{cell_id}: close {elapsed:.2f}s"
             assert "close" in fake.calls
+            assert not sink._thread.is_alive(), f"{cell_id}: the loop thread outlived close()"
         else:
             assert cancelled == 0, f"{cell_id}: the sink cancelled a PONG wait"
         if cell.queued_refused:

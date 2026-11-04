@@ -221,6 +221,19 @@ backstop adds to a bound a coroutine already enforces on itself, which only has 
 scheduling; `LOOP_JOIN_TIMEOUT = 1.0`, enough for cancellation callbacks to run and no more,
 because a join that waits longer defeats FR-004's bound. `DEFAULT_CLOSE_TIMEOUT` is FR-004's.
 
+**One timing rule governs every wait (diff review frame 3).** Where the sink waits on a driver call
+that carries a timeout whose expiry the driver reports by raising -- a JetStream ack wait -- the
+driver's timeout ends strictly inside the sink's wait, by `DRIVER_DEADLINE_MARGIN = 0.05` through
+one helper, `_driver_timeout`: two timers due at the same instant are decided by arming order,
+and the sink arms its `asyncio.wait` first, so a timeout equal to the sink's remaining budget let
+every capped ack wait read as an abandoned publish instead of a raised one (against a real server
+at `publish_timeout=1.0`, 0 of 4 ack-starved emits raised; at `fda134a` all did). Below twice the
+margin the margin halves with what remains, so the timeout stays positive and inside the wait at
+every value; a fixed floor cannot. The probe's `PROBE_FLUSH_TIMEOUT` is the rule's mirror, a driver
+timeout that deliberately outlives every sink wait. Every latch ages from when the silence began,
+not from when the sink noticed it. A test holds the rule on the source: every `timeout=` the sink
+hands the driver is `_driver_timeout(...)` or `PROBE_FLUSH_TIMEOUT`, from a pinned roster.
+
 #### Acceptance Criteria:
 
 - [ ] AC-1: After constructing a sink from a fake `nats` module, exactly one live thread named
@@ -334,7 +347,11 @@ probe task finishes for any reason, because the next call then sends a fresh PIN
 that. When FR-003's drained wait fails, `emit` and `flush` leave a probe outstanding without
 waiting for it, so the latch has a PING to age even when the stall shows as a buffer that is not
 moving rather than as an unanswered PING (diff review frame 2, finding 2: before, the confirmation
-short-circuited before any PING, so the next caller paid a whole budget sending its own).
+short-circuited before any PING, so the next caller paid a whole budget sending its own). That
+probe is aged from when the drained wait **began**, when the buffer stopped moving, so the latch
+already holds when the call returns and the next caller is **refused at once** (diff review frame
+3, finding 2: dated when the wait failed, the next caller waited a whole budget more, 1.002 s at
+`publish_timeout=1.0` on the real driver, and callers queued behind it twice that).
 
 `PENDING_POLL = 0.005` is the step of the timed yield the FR-003 drained wait polls on.
 `PROBE_FLUSH_TIMEOUT = 600.0` is the driver's own `wait_for` bound inside the probe and must
@@ -432,8 +449,9 @@ zero confirms**: a probe still outstanding at that moment (one FR-002's latch wa
 an undrained buffer) is waited out first as a liveness answer, and the confirming PING is sent
 fresh once it has finished, so at most one probe is outstanding and none sent before the drain
 ever confirms. When the counter does not reach zero, a probe is left outstanding unawaited for
-FR-002's latch (`close()` excepted, since nothing follows it), and that PING may overtake the
-buffer, which is why the rule above exists. No answer, including when the deadline is already
+FR-002's latch (`close()` excepted, since nothing follows it), aged from when the drained wait
+began so the next caller is refused at once, and that PING may overtake the buffer, which is why
+the rule above exists. No answer, including when the deadline is already
 spent or the client has become disconnected (the probe is still sent where it can be, so the next
 call can reuse it), means every
 event that was published and not otherwise counted is added to `failed` and announced once through
@@ -516,6 +534,16 @@ retry can count it again.
       outstanding over an undrained buffer and answered during a later `flush()`, after the
       buffer drained, does not confirm it: that flush sends a fresh PING after the drain (the
       PINGs read 0, 0 and 1 written publishes).
+- [ ] AC-17 (frame 3, finding 2): in the same stall, the call made **at once** after the
+      unconfirmed batch -- with no sleep -- is refused by the latch in under 0.05 s and sends no
+      PING; made while another thread holds the lock, it is refused in under 0.1 s, so before
+      the lock; and callers queued on the lock behind the batch are refused within one and a half
+      budgets of their start.
+- [ ] AC-18 (frame 3, finding 1): a JetStream client whose ack never arrives, owned or injected,
+      with `publish_timeout=0.4` and a batch of one, makes `emit` raise `SinkDeliveryError` with
+      `failed` 1 announced as "NATSSink publish, TimeoutError", not return with the publish
+      counted as abandoned; with the ack ceiling at 0.05 and a batch of three, all three raise and
+      `emit` raises with `failed` 3.
 - [ ] AC-12: Serves invariants 2, 4, 6 and 7; invariant 2 because the unconfirmed events are
       counted and announced, invariant 4 because FR-005 records the two-round-trip cost on the
       orphan path, invariant 6 because core and JetStream are twins and differ only here, and
@@ -539,8 +567,10 @@ the closure §12 named for the item: drive the steps itself rather than the driv
 else `DEFAULT_CLOSE_TIMEOUT = 1.0`:
 
 1. For a sink-connected client, one probe round trip through the FR-002 mechanism (skipped when a
-   probe is latched as unanswered, when the client reports itself disconnected, and when the
-   client has no `flush`), sent once the driver's `pending_data_size` reads zero (FR-003's wait,
+   probe is latched as unanswered, when a publish abandoned at an earlier deadline is still
+   pending (diff review frame 3, finding 3: the drained wait otherwise spent `D` behind the
+   blocked flush and `close()` raised about a PING it never sent), when the client reports itself
+   disconnected, and when the client has no `flush`), sent once the driver's `pending_data_size` reads zero (FR-003's wait,
    so the PING confirms the outbound buffer rather than overtaking it), to push and confirm that
    buffer. The wait and the round trip together take at most `D`.
 2. `client.close()`, as a task under what remains of `D`, waited with `asyncio.wait` and
@@ -635,6 +665,9 @@ close and reported as `SinkDeliveryError`, and the sink stays usable.
       `D` and step 3 cancels again; the close task has ended by the time the close coroutine
       returns (a step 2 that drops its cancel, or cancels without yielding, leaves it parked
       until the loop's stop), and after `close()` no task is pending on the loop.
+- [ ] AC-16 (frame 3, finding 3): `close()` after an emit whose publish was abandoned and is still
+      blocked, owned or injected, core or JetStream, sends no PING, calls the client's `close`,
+      returns without raising within `D + LOOP_JOIN_TIMEOUT` plus a margin, and stops the loop.
 - [ ] AC-11: Serves invariants 3, 5, 6 and 7; invariant 5 because a close in flight is waited for
       under the lock and the connection is released exactly once, and invariant 6 because `emit`
       and `flush` share the probe.
@@ -719,6 +752,19 @@ are not touched; the tag is the orchestrator's.
 - [ ] AC-7: `docs/release-notes/v1.1.0.md` carries the `## Fixed` entry above, between the OTLP
       section and *What did not change*, and neither of the two sentences the change falsifies
       still reads as it did; `CHANGELOG.md` and `RELEASES.md` are unchanged.
+- [ ] AC-9 (diff review frame 3): `tests/test_sinks_nats_matrix.py` is the wait-and-latch matrix
+      as a parametrized corpus -- owned and injected, core and JetStream, `emit` of one and of
+      three, `flush` and `close`, against expiry at the probe, at the first publish, mid-batch,
+      at the confirmation, over an undrained buffer, with the deadline already spent and in a
+      JetStream ack wait, plus the degenerate rows (`publish_timeout` that bounds nothing and at
+      its floor; `drain_timeout` of 0, -1, `inf` and `nan`; a client with no `flush`, `close`
+      or `pending_data_size`, or whose `pending_data_size` raises; the backstop's race; a client
+      `close` that swallows a cancel; a liveness PING that must not confirm). Each cell asserts
+      the outcome and its words, the exact `losses()`, every announcement line in order, and for
+      a stall the next caller's latency with the lock held and a queued caller's latency. It is
+      gated by mutation: every guard in `nats.py`'s wait and latch sites turns at least one cell
+      red on its stated reason, and a docstring-only edit and an equivalent reordering leave it
+      green.
 - [ ] AC-8: Serves invariants 2, 4, 7 and 12 (AC-5) and records the evidence for invariants 3 and 5.
 
 ---
@@ -731,6 +777,7 @@ DEFAULT_CLOSE_TIMEOUT: float = 1.0     # + LOOP_JOIN_TIMEOUT == _lifecycle.DEFAU
 PROBE_FLUSH_TIMEOUT: float = 600.0     # > ping_interval * (max_outstanding_pings + 1) = 360
 CALL_SLACK: float = 1.0                # backstop margin on a bound the coroutine enforces itself
 PENDING_POLL: float = 0.005            # poll step while waiting for pending_data_size to read zero
+DRIVER_DEADLINE_MARGIN: float = 0.05   # a driver timeout ends this far inside the sink's own wait
 LOOP_JOIN_TIMEOUT: float = 1.0         # join bound for the loop thread at close
 
 # NATSSink private state added
@@ -782,6 +829,7 @@ No new configuration. `drain_timeout` additionally sets the sink's own `close()`
 src/log_foundry/sinks/nats.py                       # the loop thread, the probe, close and flush
 tests/test_sinks_nats.py                            # existing tests updated for the thread and close
 tests/test_sinks_nats_liveness.py                   # new: fakes for FR-001 to FR-004, the fork child
+tests/test_sinks_nats_matrix.py                     # new: the wait-and-latch matrix corpus (FR-005)
 tests/test_sink_concurrency.py                      # the NATS re-entry test rewritten
 tests/integration/test_nats.py                      # the integration tests
 docs/decisions/sink-lifecycle/<slug>.md             # the new decision (index regenerated)

@@ -72,11 +72,14 @@ So is a `NATSSink` publish the driver never returned from within the budget, on 
 no confirmation will judge it — JetStream, and an injected client of either mode — counted as
 unconfirmed where it is abandoned, with every later call refused while it is still pending
 (SPEC-061 FR-001). That leaves a JetStream asymmetry, recorded rather than removed: an ack wait
-that expires *inside* the budget raises in the driver, is counted as a raised publish, and a batch
-in which nothing else landed goes back to the worker, which retries it (SPEC-047's behaviour); one
-that outlives the budget is abandoned, counted as unconfirmed, and never retried. Both mean the
-same thing — no ack, and the event may have been persisted — so the first can duplicate while the
-second can lose. The closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
+that expires raises in the driver, is counted as a raised publish, and a batch in which nothing
+else landed goes back to the worker, which retries it (SPEC-047's behaviour) — and every ack wait
+the budget caps does expire, because the sink hands the driver a timeout that ends inside its own
+wait (`DRIVER_DEADLINE_MARGIN`; before that margin the two tied and every such wait read as
+abandoned, SPEC-061's diff review frame 3); a publish the driver never returns from — a force-flush
+into a peer that stopped reading, or a driver ignoring its own timeout — is abandoned, counted as
+unconfirmed, and never retried. Both mean the same thing — no ack, and the event may have been
+persisted — so the first can duplicate while the second can lose. The closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
 makes a retry safe.
 At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
 that returned; one that raised counts none of them, and whoever caught it — the worker, the
@@ -107,7 +110,8 @@ what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
 `tests/test_sink_retry.py`, `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
-backstop and the latch, SPEC-061) and `tests/test_worker_exit_budget.py` (the exit drain's
+backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
+as a mutation-gated corpus, including the next and the queued caller's latency) and `tests/test_worker_exit_budget.py` (the exit drain's
 retries fit the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight) and
 `tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,

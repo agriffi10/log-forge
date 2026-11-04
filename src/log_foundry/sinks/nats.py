@@ -58,8 +58,10 @@ DEFAULT_ACK_TIMEOUT = 5.0
 A constant of this module's own rather than a value read from the driver: the sink builds its
 context with a bare ``self._client.jetstream()``, so ``JetStreamContext``'s ``timeout`` is its
 constructor default and is not readable back off the object. It mirrors that default, and every
-publish is given ``min(DEFAULT_ACK_TIMEOUT, remaining budget)`` -- so a divergence can only ever
-make the per-publish timeout smaller than the driver would have used, never larger.
+publish is given ~~``min(DEFAULT_ACK_TIMEOUT, remaining budget)``~~ the lesser of this and the
+remaining budget less :data:`DRIVER_DEADLINE_MARGIN` (:func:`_driver_timeout`, diff review frame
+3) -- so a divergence can only ever make the per-publish timeout smaller than the driver would
+have used, never larger.
 """
 
 DEFAULT_CLOSE_TIMEOUT = 1.0
@@ -264,11 +266,13 @@ class NATSSink:
     once while it is still pending, since each would only queue behind the same blocked
     force-flush.
 
-    **A JetStream event with no ack is retried or not depending on when the ack wait ended**, and
-    the asymmetry is recorded rather than removed (``docs/invariants.md``, invariant 2). An ack
-    wait that expires inside the budget raises in the driver, so the event is counted as a raised
+    **A JetStream event with no ack is retried or not depending on how the wait ended**, and the
+    asymmetry is recorded rather than removed (``docs/invariants.md``, invariant 2). An ack wait
+    that expires -- and every ack wait the budget caps does, inside the sink's own wait, by
+    :data:`DRIVER_DEADLINE_MARGIN` -- raises in the driver, so the event is counted as a raised
     publish and a batch in which nothing landed goes back to the worker, which retries it
-    (SPEC-047's behaviour); a publish that outlives the budget is abandoned, counted as
+    (SPEC-047's behaviour); a publish the driver never returns from (a force-flush into a peer
+    that stopped reading, or a driver ignoring its own timeout) is abandoned, counted as
     unconfirmed and never retried. Both mean the same thing -- no ack, and the event may have been
     persisted -- so the first can duplicate and the second can lose. What closes it is the
     ``Nats-Msg-Id`` deduplication item in ``architecture.md`` section 12, which makes a retry safe.
@@ -719,9 +723,9 @@ class NATSSink:
         awaited its ack, and an injected client has none either. The second round trip is sent
         only while the client still reports itself connected, because the driver's ``flush``
         returns without a PONG otherwise and the next call would wait on nothing. When the buffer
-        does not drain, a probe is left outstanding (:meth:`_confirm`), so the latch has a PING
-        to age and the callers after this one are refused at once rather than each spending a
-        budget.
+        does not drain, a probe is left outstanding (:meth:`_confirm`), aged from when the drained
+        wait began, so the latch already holds when this call returns and the callers after it
+        are refused at once rather than each spending a budget.
 
         Args:
           batch: The events to publish.
@@ -881,7 +885,9 @@ class NATSSink:
 
         Returns:
           True while the outstanding probe has gone unanswered for at least ``publish_timeout``
-          and the driver has not reconnected since it was sent.
+          since the silence it measures began (when it was sent, or for a probe
+          :meth:`_confirm` left behind, when the drained wait began) and the driver has not
+          reconnected since.
 
         Raises:
           None.
@@ -889,10 +895,10 @@ class NATSSink:
         probe = self._probe
         if probe is None:
             return False
-        task, sent_at, reconnects = probe
+        task, silent_since, reconnects = probe
         return (
             not task.done()
-            and time.monotonic() - sent_at >= self.publish_timeout
+            and time.monotonic() - silent_since >= self.publish_timeout
             and self._reconnects() == reconnects
         )
 
@@ -931,9 +937,9 @@ class NATSSink:
         probe = self._outstanding_probe()
         if probe is None:
             probe = self._send_probe()
-        task, sent_at, reconnects = probe
+        task, silent_since, reconnects = probe
         now = time.monotonic()
-        wait = min(deadline - now, self.publish_timeout - (now - sent_at))
+        wait = min(deadline - now, self.publish_timeout - (now - silent_since))
         await asyncio.wait({task}, timeout=max(0.0, wait))
         if not task.done() or task.cancelled() or task.exception() is not None:
             return False
@@ -951,7 +957,7 @@ class NATSSink:
           None.
 
         Returns:
-          The pending probe's ``(task, sent_at, reconnects)``, or None when there is none.
+          The pending probe's ``(task, silent_since, reconnects)``, or None when there is none.
 
         Raises:
           None.
@@ -1094,9 +1100,11 @@ class NATSSink:
         a round trip through the FR-002 probe, sent once the driver's pending buffer has drained
         (:meth:`_drained`) so it confirms the outbound buffer rather than overtaking it, then
         ``client.close()`` as a task cancelled on expiry, then stops the loop. The round trip is
-        skipped when the client is injected, has no ``flush``, reports itself disconnected, or has
-        a probe latched as unanswered, and a skipped round trip raises nothing: emits were refused
-        throughout, so nothing uncounted rides on it. One that **ran** and went unanswered raises
+        skipped when the client is injected, has no ``flush``, reports itself disconnected, has a
+        probe latched as unanswered, or has a publish abandoned and still pending (diff review
+        frame 3: the drained wait then spent the whole deadline behind the blocked flush and the
+        close raised about a PING it never sent), and a skipped round trip raises nothing: emits
+        were refused throughout, so nothing uncounted rides on it. One that **ran** and went unanswered raises
         ``TimeoutError`` after the loop is stopped, keeping the contract that the loop is closed
         regardless of what the flush raised; the probe's own exception is re-raised the same way.
         A failure of ``client.close()``, including the ``TypeError`` M8 measured while
@@ -1231,9 +1239,11 @@ class NATSSink:
         ``n x timeout``, and ``Worker._final_drain`` hands the exit backlog over as one batch.
 
         The two paths take the bound differently because the driver offers different handles. A
-        JetStream publish accepts a ``timeout`` and is given ``min(DEFAULT_ACK_TIMEOUT,
-        remaining)`` — never the bare remainder, which would hand the first event of a fresh
-        budget a longer ack wait than the driver's own default. ~~A core publish accepts none and
+        JetStream publish accepts a ``timeout`` and is given ~~``min(DEFAULT_ACK_TIMEOUT,
+        remaining)``~~ :func:`_driver_timeout` of the remainder (diff review frame 3: the bare
+        remainder tied with this sink's own wait, which won, so every ack wait the budget capped
+        read as abandoned instead of raised) — never the bare remainder, which would also hand
+        the first event of a fresh budget a longer ack wait than the driver's own default. ~~A core publish accepts none and
         writes into the client's outbound buffer without waiting, so the deadline is checked
         between events, which is all there is to check.~~ **Corrected by SPEC-061 FR-001:** a
         publish can block without limit, because the driver force-flushes once its pending buffer
