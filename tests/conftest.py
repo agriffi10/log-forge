@@ -4,8 +4,10 @@ Imports here are plain: a `log_foundry` module that will not import is an error,
 skipped file. See `tests/README.md` for the two things that may still legitimately skip.
 """
 
+import contextlib
 import sys
 import threading
+from typing import ClassVar
 
 import pytest
 
@@ -286,3 +288,158 @@ def lf(fake_sink: FakeSink, monkeypatch):
     return log_foundry
 
 
+# -- hostile inbound values (SPEC-067) ------------------------------------------------------------
+#
+# Shared by `test_diag.py`, `test_ids.py` and `test_inbound_totality.py`, so "a spy on every
+# method" has one definition rather than three that drift. Every hook records its name and, when
+# asked to, raises — but only while `armed()` is open. Outside it each hook behaves as the base
+# type's own method, because pytest itself reads these values when it reports a failure: its
+# `saferepr` reads `cls.__name__`, and an always-raising metaclass turns any failing test into an
+# INTERNALERROR (the reason `_NamelessMeta` in `test_baggage_header.py` is armed the same way).
+
+
+class Hostility:
+    """The switch and the record every probe shares: armed or not, and which hooks ran."""
+
+    armed: ClassVar[bool] = False
+    calls: ClassVar[list[str]] = []
+
+
+@contextlib.contextmanager
+def armed():
+    """Arms every probe for the body, and always disarms it before any assertion runs."""
+    Hostility.calls.clear()
+    Hostility.armed = True
+    try:
+        yield Hostility.calls
+    finally:
+        Hostility.armed = False
+
+
+def _hook(name: str, raises: bool, fallback):
+    """One recording hook: records ``name`` and maybe raises while armed, else defers."""
+
+    def hook(self, *args, **kwargs):
+        if Hostility.armed:
+            Hostility.calls.append(name)
+            if raises:
+                raise RuntimeError(f"{name}-secret")
+        return fallback(self, *args, **kwargs)
+
+    hook.__name__ = name
+    return hook
+
+
+_NOT_HOOKED = frozenset(
+    {
+        "__class__",
+        "__delattr__",
+        "__dir__",
+        "__doc__",
+        "__getnewargs__",
+        "__getstate__",
+        "__init__",
+        "__init_subclass__",
+        "__new__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__setattr__",
+        "__sizeof__",
+        "__subclasshook__",
+    }
+)
+
+
+def str_probe(text: str, raising=frozenset(), name: str = "_S") -> str:
+    """A ``str`` subclass instance holding ``text``, with a spy on every method ``str`` has.
+
+    Every callable in ``dir(str)`` but the construction and pickling hooks is overridden,
+    ``__getattribute__`` included, so an attribute read is recorded as well as a call; those
+    named in ``raising`` also raise while armed, and ``raising="all"`` makes every one raise.
+    ``__hash__`` is overridden beside ``__eq__``, so the instance stays hashable.
+    """
+    hooked = [a for a in dir(str) if a not in _NOT_HOOKED and callable(getattr(str, a))]
+    if raising == "all":
+        raising = frozenset(hooked)
+    namespace = {attr: _hook(attr, attr in raising, getattr(str, attr)) for attr in hooked}
+    unknown = set(raising) - set(namespace)
+    assert not unknown, f"not a hookable str method: {unknown}"
+    return type(name, (str,), namespace)(text)
+
+
+def _absent(self, *args, **kwargs):
+    """What an object without the protocol does when it is asked for it."""
+    raise TypeError("not supported")
+
+
+_OBJECT_HOOKS = {
+    "__repr__": object.__repr__,
+    "__str__": object.__str__,
+    "__format__": object.__format__,
+    "__eq__": object.__eq__,
+    "__ne__": object.__ne__,
+    "__hash__": object.__hash__,
+    "__getattribute__": object.__getattribute__,
+    "__bool__": lambda self: True,
+    "__len__": _absent,
+    "__iter__": _absent,
+    "__getitem__": _absent,
+    "__index__": _absent,
+    "__contains__": _absent,
+}
+
+
+def object_probe(name: str, raising=frozenset(), class_property=None, meta: bool = False):
+    """An instance of a fresh class named ``name`` whose every protocol hook is a spy.
+
+    ``class_property="raise"`` adds a ``__class__`` property that raises while armed, and
+    ``"str"`` one that answers ``str`` while armed: the two shapes that make
+    ``isinstance(v, str)`` raise, or lie (Probe F). ``meta=True`` gives the class a metaclass
+    whose ``__getattribute__``, ``__name__`` property, ``__repr__``, ``__instancecheck__`` and
+    ``__subclasscheck__`` record and raise while armed, and otherwise answer as ``type`` does.
+    """
+    namespace = {
+        attr: _hook(attr, attr in raising, fallback) for attr, fallback in _OBJECT_HOOKS.items()
+    }
+    if class_property is not None:
+
+        def spoof(self):
+            if Hostility.armed:
+                Hostility.calls.append("__class__")
+                if class_property == "raise":
+                    raise RuntimeError("__class__-secret")
+                return str
+            return type(self)
+
+        namespace["__class__"] = property(spoof)
+    unknown = set(raising) - set(namespace)
+    assert not unknown, f"not a hookable object method: {unknown}"
+    if not meta:
+        return type(name, (), namespace)()
+
+    def meta_name(cls):
+        if Hostility.armed:
+            Hostility.calls.append("meta.__name__")
+            raise RuntimeError("meta-name-secret")
+        return type.__dict__["__name__"].__get__(cls)
+
+    metaclass = type(
+        "_SpyMeta",
+        (type,),
+        {
+            "__getattribute__": _hook("meta.__getattribute__", True, type.__getattribute__),
+            "__repr__": _hook("meta.__repr__", True, type.__repr__),
+            "__instancecheck__": _hook("meta.__instancecheck__", True, type.__instancecheck__),
+            "__subclasscheck__": _hook("meta.__subclasscheck__", True, type.__subclasscheck__),
+            "__name__": property(meta_name),
+        },
+    )
+    return metaclass(name, (), namespace)()
+
+
+def fan_out() -> object:
+    """`y = 0`, then `y = [y] * 16` seven times: 16^7 paths to one leaf (SPEC-064 case (a))."""
+    shape: object = 0
+    for _ in range(7):
+        shape = [shape] * 16
+    return shape

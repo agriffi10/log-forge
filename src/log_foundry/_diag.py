@@ -1,6 +1,6 @@
 """The library's own diagnostic channel — one line on stderr, for what it lost or absorbed.
 
-Three rules, all load-bearing (SPEC-029 FR-004):
+Four rules, all load-bearing (SPEC-029 FR-004, SPEC-067 FR-001):
 
 * The exception's type, never its message. A message can carry a value from the event that
   provoked it, and arch §6 keeps user data out of anything the library emits about itself.
@@ -11,6 +11,10 @@ Three rules, all load-bearing (SPEC-029 FR-004):
   in this library: a ``KeyboardInterrupt`` mid-write is the operator's intent.
 * Record first, announce second. A counter moves before its line is attempted, at every call
   site, because the write is best-effort and the counter ``health()`` reports is not.
+* An inbound value runs no code of its own. ``rejected`` echoes a ``str`` by its first 64
+  characters, read through ``str``'s own slot and quoted by ``str.__repr__``, and anything else
+  as ``<TypeName>``, read through ``type``'s own descriptor; never a ``repr`` of the value. If
+  even that cannot be computed, the line is still written with ``<?>``.
 
 Stderr stays the channel: routing through the ``logging`` module would make the library's own
 failure reports depend on machinery that may be the thing failing. This module must import
@@ -21,6 +25,7 @@ partially initialised, and resolves only because it is a leaf.
 from __future__ import annotations
 
 import sys
+from typing import cast
 
 __all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "rejected"]
 
@@ -118,36 +123,93 @@ def lost(what: str, count: int, detail: str = "") -> None:
 
 
 def rejected(reason: str, value: object) -> None:
-    """Reports an inbound trace context the library refused to adopt (SPEC-014).
+    """Reports an inbound trace context the library refused to adopt (SPEC-014, SPEC-067).
 
-    The offending value is echoed as a bounded ``repr`` — the one place in the library where a
-    ``repr`` is correct, because the input is an inbound header rather than an exception and
-    its exact shape is what makes a rejection diagnosable. The ``repr`` is escaped afterwards
-    even though ``repr`` of a ``str`` is already printable, because ``repr`` runs
-    ``__repr__``, which is user code free to return a raw newline; escaping the result is the
-    difference between "the built-ins happen to escape" and "this cannot forge a line".
+    The offending value is echoed because its exact shape is what makes a rejection
+    diagnosable, and it is echoed without running any code of the value, its type or its
+    metaclass (:func:`_echo`). A ``str``, exact or a subclass, is shown as its first
+    ``_MAX_REJECTED_ECHO`` characters, quoted, escaped and cut; anything else is shown as
+    ``<TypeName>``. The value is only ``str`` by annotation, which a caller not running mypy is
+    free to ignore, so the old echo, a ``repr`` of the whole value taken before it was cut,
+    could hang the caller's thread on a shared-sublist list or raise from a ``__repr__``. That
+    raise was swallowed with the write, so ``continue_trace`` reported a rejection as announced
+    while nothing was written.
+
+    The echo is computed inside the guard, and an ``Exception`` from computing it writes the
+    line with ``<?>`` instead, so the line is written on every input bar a fault of the stream
+    itself. ``"rejected"`` from ``continue_trace`` means this function ran, which is why the
+    line must not depend on the value.
 
     Args:
       reason: Why it was refused, such as ``"unparseable traceparent"``. A literal, never a
-        runtime value: unlike the echo, it is not bounded.
-      value: The refused value, echoed as a ``repr`` bounded to ``_MAX_REJECTED_ECHO``,
-        because unbounded it would be a log-injection surface.
+        runtime value: unlike the echo, it is escaped but not cut.
+      value: The refused value, of any type, echoed in at most ``_MAX_REJECTED_ECHO + 3``
+        characters, because unbounded it would be a log-injection surface.
 
     Returns:
       None.
 
     Raises:
-      None on a stream fault; a ``BaseException`` from the write still propagates.
+      None on a stream fault; a ``BaseException`` from computing the echo or from the write
+        still propagates.
     """
     try:
-        shown = _escape(repr(value))
-        if len(shown) > _MAX_REJECTED_ECHO:
-            shown = shown[:_MAX_REJECTED_ECHO] + "…"
+        try:
+            shown = _echo(value)
+        except Exception:
+            shown = "<?>"
         sys.stderr.write(
             f"log-foundry: ignoring inbound trace context ({_escape(reason)}): {shown}\n"
         )
     except Exception:
         pass
+
+
+def _echo(value: object) -> str:
+    """Renders a refused inbound value for :func:`rejected` without running any of its code.
+
+    The value's real type decides the route, through ``issubclass(type(value), str)``: an MRO
+    check on ``str``'s side, where ``isinstance`` would read the value's own ``__class__`` and a
+    property there runs. A ``str``, exact or a subclass, keeps its first ``_MAX_REJECTED_ECHO``
+    characters, read with ``str.__getitem__`` so a subclass's ``__getitem__`` and ``__len__`` are
+    never consulted and the slice is an exact ``str``. That slice is quoted with
+    ``str.__repr__``, so the work is the same whatever the value's length: a ``repr`` of the
+    whole value walked all of it before the old echo cut it, and a shared-sublist list never
+    returned at all.
+
+    Anything else is named by its type, as ``<TypeName>``, read through ``type``'s own
+    ``__name__`` descriptor (:data:`_STORED_NAME`), which a metaclass ``__name__`` property or ``__getattribute__``
+    cannot divert. The name goes through the same escape and cut, because a class's
+    ``__name__`` may be any length, may contain a newline and may be a ``str`` subclass
+    instance. It is sliced one character past the bound, so a printable name longer than the
+    bound still escapes to something longer than it and is cut with a ``…``; a slice of exactly
+    the bound would escape to exactly the bound and be cut silently. The ``str`` route needs no
+    such margin, since its quotes always carry a full slice past the bound.
+
+    Escaping precedes the cut, as in :func:`_suffix`, so the bound applies to what is written.
+    The result is at most ``_MAX_REJECTED_ECHO + 3`` characters.
+
+    Args:
+      value: The refused value, of any type.
+
+    Returns:
+      The bounded, escaped echo: a quoted ``str`` or ``<TypeName>``.
+
+    Raises:
+      Exception: Whatever computing the echo raises, such as a ``MemoryError``. :func:`rejected`
+        catches it and writes ``<?>`` in its place, so the line is still written.
+    """
+    if issubclass(type(value), str):
+        text = str.__repr__(str.__getitem__(cast("str", value), slice(None, _MAX_REJECTED_ECHO)))
+        opening, closing = "", ""
+    else:
+        name: str = _STORED_NAME(type(value))
+        text = str.__getitem__(name, slice(None, _MAX_REJECTED_ECHO + 1))
+        opening, closing = "<", ">"
+    shown = _escape(text)
+    if len(shown) > _MAX_REJECTED_ECHO:
+        shown = shown[:_MAX_REJECTED_ECHO] + "…"
+    return f"{opening}{shown}{closing}"
 
 
 def errno_of(exc: BaseException) -> str:

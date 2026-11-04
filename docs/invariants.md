@@ -39,7 +39,9 @@ moment of construction.
 *Guarded:* `tests/test_api.py`, `tests/test_decorator_sync.py`, `tests/test_sanitize.py`,
 `tests/test_assembly_budget.py` (a hostile argument returns on both delivery paths before a
 deadline), `tests/test_baggage_header.py` (a hostile baggage value, on either intake route, leaves
-`current_baggage_header()` returning before a deadline, SPEC-064);
+`current_baggage_header()` returning before a deadline, SPEC-064), `tests/test_inbound_totality.py`
+(every hostile probe, in each of `continue_trace`'s arguments, returns before a deadline and runs
+none of its own code, SPEC-067);
 `tests/test_invariants_model.py` asserts it over random interleavings.
 
 ## 2. Every accepted event is delivered, or counted and announced — exactly once
@@ -280,6 +282,8 @@ statement finds nothing; every count a line carries reproduces from the ledger.
 *Guarded:* `tests/test_diag.py` (a roster over every site) for the first half; the second is
 asserted line by line in the tests of the site that writes it, and the throttle by
 `tests/test_worker.py` and `tests/test_console_echo.py` (SPEC-055).
+`tests/test_inbound_totality.py` holds `continue_trace`'s `"rejected"` to a written line on every
+hostile probe (SPEC-067).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
