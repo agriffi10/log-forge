@@ -989,7 +989,7 @@ class NATSSink:
             done, _ = await asyncio.wait({task}, timeout=max(0.0, end - time.monotonic()))
             if not done:
                 task.cancel()
-                await asyncio.sleep(0)
+                await self._pause(0)
             elif not task.cancelled():
                 close_failure = task.exception()
                 if close_failure is not None:
