@@ -43,7 +43,11 @@ publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker declines 
 end after the ``shutdown()`` deadline, so the exit drain's worst case is bounded by the
 ``shutdown()`` budget plus up to two ``publish_timeout``s -- the emit in flight when the budget
 runs out, and the first attempt of a tail batch, which is never declined -- and at these defaults
-the third attempt is declined at 20 s and ``close()`` runs. Ten is chosen on
+the third attempt is declined at 20 s and ``close()`` runs. That rests on one emit costing at most
+``publish_timeout``, which SPEC-061 keeps: its liveness and confirmation round trips and each
+publish are waited under the emit's one deadline. The only overrun is :data:`CALL_SLACK`, the
+backstop for a loop a driver has wedged, and it fires once: the sink then closes itself, so every
+later attempt is refused at once. Ten is chosen on
 the size of the improvement: the same path was *unbounded* before this bound, 8.3 hours for a
 5,980-event backlog at 5 s an event.
 """
@@ -178,8 +182,8 @@ class NATSSink:
     > server, and ``Worker._final_drain`` hands the exit backlog over as one batch. One
     > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
 
-    The worst case is therefore ``publish_timeout`` per emit, plus one in-flight ack — and across
-    the exit drain the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in
+    The worst case is therefore ``publish_timeout`` per emit — SPEC-061's two round trips and every
+    publish, a JetStream ack wait included, spend that one deadline — and across the exit drain the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in
     flight when the budget runs out and the first attempt of a tail batch — since
     ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and a
     batch's first attempt is always made. Before that it was ``(max_retries + 1) x publish_timeout``,
