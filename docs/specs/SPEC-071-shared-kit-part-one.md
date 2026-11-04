@@ -38,7 +38,7 @@ observable broken. FR-002 resolves the class through `import_extra` at construct
 configuration is refused where it is written.
 
 **What changes for a caller:** a missing extra's message names the extra; the five existing
-refusals share one message tail; eight options that were ignored beside an injected client are now
+refusals share one message tail; nine options that were ignored beside an injected client are now
 refused; and an injected-producer `AzureEventHubsSink` with no extra installed is refused at the
 constructor. Each is a release-notes line. Nothing else changes in what a sink delivers, counts or
 retries. Tests that already exist and are **not edited**, plus characterisation tests written first
@@ -94,7 +94,7 @@ re-raises, so that site still propagates.
   | `KafkaSink` | `producer` | `producer_config` | `bootstrap_servers` |
   | `MongoDBSink` | `client` | `socket_timeout`, `server_selection_timeout` | `uri` |
   | `NATSSink` | `client` | the four connect options, `servers` | none |
-  | `PostgresSink` | `connection` | none | `dsn`; `connect_timeout` (default `5`) |
+  | `PostgresSink` | `connection` | none | `dsn`, `connect_timeout` (default `5`) |
   | `RabbitMQSink` | `connection` | the three bounds | `url` |
   | `RedisStreamsSink`, `RedisListSink` | `client` | none | `url` |
   | `SQLiteSink` | `connection` | none | `database` (required, positional) |
@@ -148,11 +148,11 @@ re-raises, so that site still propagates.
 - **`HTTPSink._take` and `AzureEventHubsSink`'s batching.** Neither has limits that fit
   `chunk_items`' fixed count and byte bound (Overview), so converting either would change
   behaviour.
-- **Build options with a non-`None` default or no default**: `PostgresSink.connect_timeout` (default
-  `5`) and `SQLiteSink.database` (required and positional). Neither can be told apart from an
-  omitted argument without changing a frozen signature or default (invariant 10). Every existing
-  injected-connection `SQLiteSink` caller must pass a `database`, so refusing it would break them
-  all. FR-003's guard pins these two by name, so a third is noticed.
+- **Refusing `SQLiteSink.database` beside an injected connection.** It is required and positional,
+  and its docstring documents it as ignored when a connection is injected, so every 1.x caller that
+  injects a connection must pass it; refusing it would break all of them, which is not additive.
+  It is accepted by design, recorded as invariant 13's exception (FR-003), and pinned by name in
+  FR-003's guard, so a second such argument is noticed.
 - **`LogstashSink`'s two backend refusals**, a different rule (Overview).
 - **Making the error type public.** It is private (FR-002). Promoting it later only adds to the
   surface, while the reverse would be a break.
@@ -345,14 +345,33 @@ client from that has a `None` default:
 - `KafkaSink`: `bootstrap_servers` and `producer_config`.
 - `MongoDBSink`: `uri` and its two bounds.
 - `NATSSink`: its four options and `servers`.
-- `PostgresSink`: `dsn`.
+- `PostgresSink`: `dsn` and `connect_timeout`.
 - `RabbitMQSink`: `url` and its three bounds.
 - The Redis pair: `url`, refused in `_RedisSink.__init__`.
 
 The five existing refusals keep the prefix the existing tests match, so those tests pass unedited.
 Their tail is the one text that changes: today two say "already built", three "already connected",
-and `KafkaSink` has no "drop" clause. The eight newly refused options are a behaviour change, and
-the release note lists them. `NATSSink`'s `options` dict literal stays in its `__init__`, because
+and `KafkaSink` has no "drop" clause. The nine newly refused options are a behaviour change, and
+the release note lists them: a 1.x caller passing one beside an injected object now gets a
+`ValueError` at construction.
+
+**`PostgresSink.connect_timeout` gets a "not given" default.** Its signature becomes
+`connect_timeout: int | None = None`, `None` meaning `DEFAULT_CONNECT_TIMEOUT`, so the refusal can
+tell an argument the caller gave from one left at its default. `None` is resolved to the default
+before the floor runs, and the floor is unchanged (`max(..., 2)`, through SPEC-066's
+`floor_count` once that lands, which refuses a non-`int` and so must never see `None`). The
+attribute `PostgresSink.connect_timeout` still reads the floored effective value, `5` by default.
+This is additive under invariant 10: the parameter's type only widens, so a typed consumer passing
+an `int`, or nothing, still type-checks and behaves as before; the one caller it breaks is the one
+passing it beside `connection=`, exactly as for the other eight. The refusal runs after SPEC-066's
+type judgement, so `PostgresSink(connection=c, connect_timeout=2.5)` still raises SPEC-066's
+`TypeError` and its tests pass unedited.
+
+**`SQLiteSink.database` is the one build option accepted beside an injected connection.** It is
+required and positional and documented as ignored in that case (*Out of Scope*). The build records
+it in `docs/invariants.md` §13, which has no *Recorded exceptions* line yet, by adding one sentence:
+a required argument that a constructor documents as ignored beside an injected connection is
+accepted, because refusing it would break every such caller. `NATSSink`'s `options` dict literal stays in its `__init__`, because
 `tests/test_sinks_nats.py` derives the forwarded names from it.
 
 **The guard catches a sink that ignores an option, not only a copy of the message.**
@@ -366,7 +385,7 @@ comprehensions over them. Defaults are read from each concrete class's `inspect.
 - Every build option whose default is `None` appears as a key of that `__init__`'s
   `refuse_with_injected` `supplied` mapping, or it is reported as `<file>:<Class>.<param>`.
 - Build options with any other default, or none, form a second derived set compared exactly with
-  the two named in *Out of Scope*.
+  `SQLiteSink.database`, the recorded exception.
 - The derived population of classes is compared exactly with the table's fifteen plus `SentrySink`
   (whose client is built from no option), re-derived on the build's base commit.
 
@@ -381,7 +400,8 @@ is about bounding waits.
       begins `S cannot apply b, c to an injected client` and names `drop client=`.
 - [ ] `RedisListSink(client=c, url="redis://x")`, `RedisStreamsSink(...)` likewise,
       `AzureEventHubsSink(producer=p, connection_str="x")`, `AzureEventHubsSink(producer=p,
-      eventhub="h")`, `PostgresSink("t", connection=c, dsn="x")`, `ClickHouseSink("t", client=c,
+      eventhub="h")`, `PostgresSink("t", connection=c, dsn="x")`, `PostgresSink("t", connection=c,
+      connect_timeout=30)`, `ClickHouseSink("t", client=c,
       dsn="x")`, `KafkaSink("t", producer=p, bootstrap_servers="b")`, `MongoDBSink(client=c,
       uri="mongodb://x", database="d", collection="c")` and `RabbitMQSink(..., connection=c,
       url="amqp://x")` each raise `ValueError` naming the argument. At `fda134a` each constructed.
@@ -399,15 +419,26 @@ is about bounding waits.
       build (`MongoDBSink`'s `database`).
 - [ ] Its mutation sweep drops each name from each `supplied` mapping in memory, and the scan
       reports it.
-- [ ] Its second set is exactly `PostgresSink.connect_timeout` and `SQLiteSink.database`, and its
-      class population is exactly the table's fifteen plus
-      `SentrySink`.
+- [ ] `PostgresSink("t", dsn="x", connect_timeout=30)` constructs and connects with `30`; with
+      `connect_timeout` omitted, and with `connect_timeout=None` given explicitly, it connects with
+      `DEFAULT_CONNECT_TIMEOUT` (`5`) and `sink.connect_timeout == 5`; `connect_timeout=0` still
+      floors to `2`. `PostgresSink("t", connection=c)` constructs, and the existing
+      `test_the_documented_default_connect_timeout_is_the_one_used` and
+      `test_the_connect_timeout_is_passed_and_floored` pass unedited.
+- [ ] `inspect.signature(PostgresSink).parameters["connect_timeout"]` has default `None` and
+      annotation `int | None`, and `tests/typed_consumer/` and `tests/test_public_surface.py` pass
+      unedited.
+- [ ] `SQLiteSink(":memory:", connection=c)` still constructs and writes through `c`, and
+      `docs/invariants.md` §13 carries a *Recorded exceptions* line naming a required argument
+      documented as ignored beside an injected connection.
+- [ ] Its second set is exactly `SQLiteSink.database`, and its class population is exactly the
+      table's fifteen plus `SentrySink`.
 - [ ] No `ValueError` raised in `sinks/*.py` outside `_args.py` carries `to an injected`.
       `LogstashSink`'s two backend refusals are unchanged, and `git diff` shows no change to
       `sinks/_retry.py`.
 - [ ] Serves invariant 13, whose observable "no argument is silently ignored because another was
-      given" this closes at every constructor the sweep finds, and invariant 10. No signature or
-      default changes, which is why the two options in the second set stay accepted.
+      given" this closes at every constructor the sweep finds except its recorded exception, and
+      invariant 10: the one signature change only widens a parameter's type.
 
 ### FR-004: `SQSSink` uses `chunk_items`, and the two other local chunkers stay
 
@@ -482,6 +513,11 @@ refuse_with_injected(owner: str, kind: str, injected: object | None,
     // injected is None, or every value is None -> returns
     // else -> ValueError(f"{owner} cannot apply {', '.join(sorted(names))} to an injected {kind}; ... drop {kind}=")
 
+// src/log_foundry/sinks/postgres.py
+PostgresSink.__init__(..., connect_timeout: int | None = None)   // was int = DEFAULT_CONNECT_TIMEOUT
+    // None -> DEFAULT_CONNECT_TIMEOUT, then the unchanged floor at 2; refused beside connection=
+    // self.connect_timeout: int, the floored effective value (5 by default)
+
 // src/log_foundry/sinks/sqs.py
 class _Prepared(NamedTuple): body: str; group_id: str | None; dedup_id: str | None; size: int
 ```
@@ -507,7 +543,9 @@ src/log_foundry/sinks/{clickhouse,eventhubs,firehose,kafka,kinesis,mongodb,nats,
                        pubsub,rabbitmq,redis,sentry,sns,sqs}.py   # the lazy-import sites
 src/log_foundry/sinks/{clickhouse,eventhubs,kafka,mongodb,nats,postgres,rabbitmq,redis}.py
                                                                   # the refusals
+src/log_foundry/sinks/postgres.py       # connect_timeout: int | None = None
 src/log_foundry/sinks/sqs.py            # _chunks on chunk_items, _Prepared.size
+docs/invariants.md                      # §13 gains its Recorded exceptions line
 pyproject.toml                          # google.cloud.* override removed
 CLAUDE.md, .github/workflows/integration.yml   # the extras paragraph and header comment
 tests/test_extras_sites.py              # Phase 1 characterisation of the sites     (new)
@@ -562,3 +600,7 @@ docs/release-notes/v1.2.0.md
   dropped, because SPEC-070 floors that roster. The Azure emit-time import defect and the silently
   ignored build options were folded in rather than deferred. FR-003 and FR-004 no longer cite
   invariant 6, because five constructors or four chunkers are not twin paths in its sense.
+- **Revised on Andrew's decision (2026-11-04).** `PostgresSink.connect_timeout` beside an injected
+  connection is refused like the other eight options, through a `None` "not given" default, which
+  only widens the parameter's type. `SQLiteSink.database` stays accepted, as invariant 13's recorded
+  exception rather than as something left open.

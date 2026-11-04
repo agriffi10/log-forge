@@ -269,16 +269,29 @@ leg of CI runs the installed versions (the class-existence criterion below).
 | Redis (both sinks) | `redis.exceptions.ConnectionError` except its `AuthenticationError`, `AuthorizationError` and `ExternalAuthProviderError` subclasses (present in 8.1.0; skipped by `driver_classes` in a version that lacks it); `TimeoutError`; `TryAgainError`; `ClusterDownError` | `ResponseError` and the rest of its subclasses, `DataError`, the three credential subclasses | `redis/retry.py` (the default `supported_errors` are `ConnectionError`, `TimeoutError`, `socket.timeout`); `redis/cluster.py` retries `TryAgainError` and `ClusterDownError`; the three credential subclasses are narrowed out because a resend cannot fix a credential |
 | RabbitMQ | `pika.exceptions.AMQPConnectionError` except `AuthenticationError`, `ProbableAuthenticationError`, `ProbableAccessDeniedError`, `IncompatibleProtocolError`, `ConnectionClosedByClient` and `ConnectionOpenAborted`; `ChannelWrongStateError` | `ChannelClosedByBroker`, `ProtocolSyntaxError` and its subclasses. (`NackError` and `UnroutableError` are not classified: `RabbitMQSink` enables neither `confirm_delivery` nor `mandatory`, so pika cannot raise them here, and a broker nack is a retryable outcome in RabbitMQ's publisher-confirms guide, not a permanent one.) | `pika/exceptions.py`; `ChannelWrongStateError` is what a publish on the channel a dropped connection left behind raises, and the loop's `_reset` then reconnects |
 | Azure Event Hubs | `azure.eventhub.exceptions.ConnectionLostError`, `ConnectError` except `AuthenticationError`, `OperationTimeoutError` | `EventDataError`, `EventDataSendError`, `ClientClosedError`, a bare `EventHubError` | `azure/eventhub/exceptions.py` (`ConnectionLostError`: "in most cases the client will automatically retry"); `_transport/_pyamqp_transport.py` `_create_eventhub_exception` maps AMQP link and connection errors to those classes and everything unrecognised to a bare `EventHubError`, which `_handle_exception` raises for an AMQP message rejection as `EventDataSendError` |
-| PostgreSQL | a `psycopg.errors.OperationalError` whose `sqlstate` is `None` (psycopg's own client-side failures: a failed connect, `ConnectionTimeout`, "the connection is closed") or whose SQLSTATE class is `08` (connection exception), `40` (transaction rollback), `53` (insufficient resources) or `57` (operator intervention), plus `55P03` `LockNotAvailable` and `55006` `ObjectInUse` | every other `OperationalError` — class `28` (`InvalidPassword`, `InvalidAuthorizationSpecification`), `54` (`ProgramLimitExceeded`), `27`, `2F`, `38`, `39`, `3B`, the rest of `55`, `58`, `F0`, `HV` — and `DataError` (`StringDataRightTruncation` included), `IntegrityError`, `ProgrammingError`, `InternalError`, `InterfaceError`, `NotSupportedError` | `psycopg/errors.py`. psycopg files every one of those classes under `OperationalError` (a walk of its subclasses by SQLSTATE class at 3.3.8), so the class alone does not separate a transient failure from a permanent one; the SQLSTATE classes retried are the ones PostgreSQL's *Appendix A* defines as connection, rollback, resource and operator conditions |
+| PostgreSQL | a `psycopg.errors.OperationalError` whose `sqlstate` is `None` (psycopg's own client-side failures: a failed connect, `ConnectionTimeout`, "the connection is closed"), **except** a connect failure whose message carries one of the three refusals below, or whose SQLSTATE class is `08` (connection exception), `40` (transaction rollback), `53` (insufficient resources) or `57` (operator intervention), plus `55P03` `LockNotAvailable` and `55006` `ObjectInUse` | a connect-time refusal (below); every other `OperationalError` — class `28` (`InvalidPassword`, `InvalidAuthorizationSpecification`), `54` (`ProgramLimitExceeded`), `27`, `2F`, `38`, `39`, `3B`, the rest of `55`, `58`, `F0`, `HV` — and `DataError` (`StringDataRightTruncation` included), `IntegrityError`, `ProgrammingError`, `InternalError`, `InterfaceError`, `NotSupportedError` | `psycopg/errors.py`. psycopg files every one of those classes under `OperationalError` (a walk of its subclasses by SQLSTATE class at 3.3.8), so the class alone does not separate a transient failure from a permanent one; the SQLSTATE classes retried are the ones PostgreSQL's *Appendix A* defines as connection, rollback, resource and operator conditions |
 
-**A connect-time authentication failure cannot be told apart, and is retried.** psycopg raises a
-failed connection as a plain `OperationalError("connection failed: …")` with no SQLSTATE
-(`psycopg/generators.py`, the `POLL_FAILED` branch), and `PostgresSink._insert_batch` reconnects
-inside its loop, so a wrong password at reconnect is the same class, with the same `sqlstate`, as a
-refused port. Class `28` is narrowed out only where the server reports it with a code; the
-connect-time case is retried `max_retries + 1` times as today. Reading the message text to tell
-them apart is rejected: libpq's text is localised by the server's `lc_messages`, so a retry
-decision would depend on a translation.
+**A connect-time refusal is recognised by its text, because nothing structured carries it.**
+`PostgresSink._insert_batch` reconnects inside its loop (`_reconnect_if_broken`), and psycopg
+raises every failed connect as a plain `OperationalError("connection failed: …")`
+(`psycopg/generators.py`, the `POLL_FAILED` branch). Measured at `fda134a` (psycopg 3.3.8 binary,
+a throwaway container of the repo's postgres image, PostgreSQL 17.11): a wrong password, an
+unknown user, an unknown database and a refused port each raised that class with `sqlstate=None`
+and `diag.sqlstate=None`, and only the message differed — `FATAL:  password authentication failed`
+for the first two, `FATAL:  database "nope" does not exist` for the third, `could not receive data
+from server` for the refused port. So a connect-time `OperationalError` with `sqlstate is None`
+whose message contains libpq's `FATAL:  password authentication failed`, `FATAL:  role "` followed
+later by `" does not exist`, or `FATAL:  database "` followed later by `" does not exist` **fails at
+once**: the server answered and refused, and a resend asks the same question of the same
+configuration. Every other connect failure stays retryable, as today.
+
+The limits are stated rather than hidden. The text follows the server's `lc_messages`, so a server
+reporting in another language is not matched and falls back to today's retry: a false negative
+costs only today's behaviour, never a lost event that a retry would have saved. A transient `FATAL`
+— `the database system is starting up`, `sorry, too many clients already` — is deliberately not
+matched. The match reads the message inside the predicate only; no diagnostic prints it, and the
+stderr line still names `OperationalError` and the attempt count (invariant 11). A wrong password
+at **construction** is not this path: `__init__` connects and raises to the caller, as today.
 
 A non-retryable exception ends the loop at once, exactly as FR-001 says. The MongoDB loop keeps its
 `writeErrors` adjudication ahead of the predicate, so a `BulkWriteError` that names failed documents
@@ -292,8 +305,18 @@ is still counted from `details`.
       once. A class named as an exception to a retried class (`AuthenticationError`,
       `ExternalAuthProviderError`, `ConnectionClosedByClient`, and for PostgreSQL an
       `OperationalError` with `sqlstate="28P01"` or `"54000"`) is attempted once although its parent
-      is retried; a PostgreSQL `OperationalError` with `sqlstate=None` (the connect-time case) and
+      is retried; a PostgreSQL `OperationalError` with `sqlstate=None` whose text is none of the three refusals and
       one with `"40001"` are attempted `max_retries + 1` times.
+- [ ] A `PostgresSink` whose held connection is broken, so that `emit` reconnects, over a stand-in
+      `_connect` raising `OperationalError` (`sqlstate=None`) with each of the three measured texts
+      — `… FATAL:  password authentication failed for user "postgres"`, `… FATAL:  role "nobody"
+      does not exist`, `… FATAL:  database "nope" does not exist` — makes one connect, counts
+      `failed` once for the batch, and writes one line naming `OperationalError` and `1 attempt`
+      that contains none of the message text.
+- [ ] The same stand-in with the refused-port text (`… could not receive data from server: …`),
+      with `… FATAL:  the database system is starting up`, and with a German rendering of the
+      password message (`… FATAL:  Passwort-Authentifizierung für Benutzer »postgres«
+      fehlgeschlagen`) makes `max_retries + 1` connects.
 - [ ] Each predicate resolves its classes per call: a predicate first called while the stand-in
       driver module is absent, then called again after it is installed in `sys.modules`, retries the
       driver's transient class on the second call.
@@ -713,3 +736,7 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   `VARCHAR(5)` column (`StringDataRightTruncation`), measured at `fda134a`, because SPEC-069 repairs
   every U+0000 before encoding, so the NUL never reaches the server once it lands.
 - Cross-arc review: the SNS sender fault is "a further case" in the silent-cases list, with no ordinal, since SPEC-061 and SPEC-069 extend the same list.
+- Andrew asked on 2026-11-04 that the PostgreSQL connect-time authentication case be folded in. It
+  was stated as indistinguishable and retried; it now fails at once on libpq's three refusal texts,
+  on the orchestrator's measurement at `fda134a`, with the localisation limit stated and the
+  transient `FATAL`s left retryable.
