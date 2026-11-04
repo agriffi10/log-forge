@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-068
 title: "Shutdown-Expiry Bookkeeping: One Announcement per Queued Item, an Expiry That Is Final, a Shutdown From the Drain Thread, a Fork That Resets the Stop Gate"
 description: "Stops an expired shutdown() calling queued items lost, records that an expired shutdown is final, makes a shutdown() on the drain thread return without raising or waiting on itself, and gives a resumed forked child its own stop gate and stop event."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-062]
 ---
 

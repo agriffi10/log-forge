@@ -782,6 +782,11 @@ def test_the_owed_join_is_taken_over_once_by_concurrent_callers(capsys) -> None:
     After a drain-thread win and a wedge, two `shutdown(0.3)` calls start together. Exactly one
     takes the owed join over, joins and announces; the other loses. The recorded deadline is one
     of the two callers', bracketed by its own call and return.
+
+    This route cannot see a handover decided on a read of `_join_owed` taken outside
+    `Worker._lock`: `_shutdown_worker` claims under the owner's lock, which already serializes
+    the two claims, so that mutant passes here (planted and run). The test below, whose claims
+    meet at `Worker._lock` itself, is the one that kills it.
     """
     sink = _ReentrantSink((5.0,), wedge=True)
     spans: list[tuple[float, float]] = []

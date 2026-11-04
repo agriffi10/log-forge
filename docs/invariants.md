@@ -151,8 +151,11 @@ close already running waits for it rather than returning through it (SPEC-050).
 *Observable:* after `shutdown()`, every sink that received an event has `close()` called on it,
 and no sink is closed by a process that did not open it.
 *Recorded exceptions:* a swap whose drain cannot be confirmed leaves the old sink open until a
-later `shutdown()` finds the drain thread ended (SPEC-050); a sink written to after its close is
-owed a second close, which is correct rather than a double (SPEC-045).
+later `shutdown()` finds the drain thread ended (SPEC-050); an expired `shutdown()` leaves the sink
+open, and only a later call that finds the drain thread ended closes it — so in an `atexit` exit
+after an expired call, a sink still inside an emit is not closed at all (SPEC-027 FR-004, decided
+final by SPEC-068); a sink written to after its close is owed a second close, which is correct
+rather than a double (SPEC-045).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
 `tests/test_sink_ownership.py`; `tests/test_invariants_model.py` asserts the first observable;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
