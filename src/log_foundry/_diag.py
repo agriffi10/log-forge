@@ -178,7 +178,7 @@ def _echo(value: object) -> str:
     returned at all.
 
     Anything else is named by its type, as ``<TypeName>``, read through ``type``'s own
-    ``__name__`` descriptor, which a metaclass ``__name__`` property or ``__getattribute__``
+    ``__name__`` descriptor (:data:`_STORED_NAME`), which a metaclass ``__name__`` property or ``__getattribute__``
     cannot divert. The name goes through the same escape and cut, because a class's
     ``__name__`` may be any length, may contain a newline and may be a ``str`` subclass
     instance. It is sliced one character past the bound, so a printable name longer than the
@@ -203,7 +203,7 @@ def _echo(value: object) -> str:
         text = str.__repr__(str.__getitem__(cast("str", value), slice(None, _MAX_REJECTED_ECHO)))
         opening, closing = "", ""
     else:
-        name: str = type.__dict__["__name__"].__get__(type(value))
+        name: str = _STORED_NAME(type(value))
         text = str.__getitem__(name, slice(None, _MAX_REJECTED_ECHO + 1))
         opening, closing = "<", ">"
     shown = _escape(text)
