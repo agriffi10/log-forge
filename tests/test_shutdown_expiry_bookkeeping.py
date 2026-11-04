@@ -432,9 +432,9 @@ def test_a_caller_parked_after_a_lost_claim_returns_at_once_after_the_expiry(
     loser = threading.Thread(target=lose, name="loser")
     try:
         winner.start()
-        deadline = time.monotonic() + 5.0
-        while not worker._stopped and time.monotonic() < deadline:
-            threading.Event().wait(0.001)
+        # `_shutdown_worker` sets the worker's own stop event only after the winning claim, in
+        # the same critical section, so an idle wait on it orders the two claims.
+        assert worker._stop.wait(5.0), "the winner claimed the gate"
         loser.start()
         assert parked.wait(5.0), "the loser lost its claim and is parked before `draining`"
         winner.finish(0.3 + _SLACK + 1.0)
@@ -494,9 +494,9 @@ class _ReentrantSink:
     The calls are made with the timeouts in `inner`, in order, each measured where it runs —
     wall time, CPU time, what it raised, and how many closes the sink had seen when it
     returned — and kept for the test thread to assert. Before the first call the emit waits for
-    `go`, so a test can queue spans behind it; with `after_claim` it also waits until that
-    worker's gate has been claimed by another caller, which orders the two claims without a
-    sleep. With `wedge` the first emit then blocks on `release` until the test lets it go.
+    `go`, so a test can queue spans behind it; with `after_claim` it also waits on that worker's
+    stop event, which `_shutdown_worker` sets only after the other caller's claim, so the two
+    claims are ordered by an idle wait rather than a poll inside the caller's CPU window. With `wedge` the first emit then blocks on `release` until the test lets it go.
     """
 
     def __init__(
@@ -530,9 +530,7 @@ class _ReentrantSink:
             self.in_emit.set()
             assert self.go.wait(5.0)
             if self.after_claim is not None:
-                until = time.monotonic() + 5.0
-                while not self.after_claim._stopped and time.monotonic() < until:
-                    threading.Event().wait(0.001)
+                assert self.after_claim._stop.wait(5.0), "the other caller claimed the gate"
             for timeout in self.inner:
                 self.results.append(self._measured_shutdown(timeout))
             self.inner_done.set()
@@ -642,12 +640,23 @@ def test_a_shutdown_inside_emit_never_closes_the_sink_it_is_inside(order: str) -
         assert raised is None
         assert closes_at_return == 0, "the inner call closed the sink it was inside"
         if order == "before_thread_ends":
-            main = _MeasuredThread(lambda: _lifecycle._shutdown_worker(3.0), name="main")
-            main.start()
-            until = time.monotonic() + 5.0
-            while worker._join_owed and time.monotonic() < until:
-                threading.Event().wait(0.001)
-            assert not worker._join_owed, "the main call took the owed join over"
+            taken = threading.Event()
+            real_claim = Worker.claim_stop
+
+            def noting_claim(self: Worker, deadline: float | None) -> bool:
+                won = real_claim(self, deadline)
+                if won and threading.current_thread().name == "main":
+                    taken.set()
+                return won
+
+            Worker.claim_stop = noting_claim  # type: ignore[method-assign]
+            try:
+                main = _MeasuredThread(lambda: _lifecycle._shutdown_worker(3.0), name="main")
+                main.start()
+                assert taken.wait(5.0), "the main call took the owed join over"
+            finally:
+                Worker.claim_stop = real_claim  # type: ignore[method-assign]
+            assert not worker._join_owed
             sink.release.set()
             main.finish(3.0 + _SLACK)
         else:
