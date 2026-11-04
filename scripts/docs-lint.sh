@@ -1006,7 +1006,7 @@ if [ -d "$PROCESS_DIR" ]; then
     fi
 
     # 13 — agents: the roles the roles table names, each declaring `model: inherit`.
-    # 13d runs whenever the TABLE exists, whether or not any agent file does: with the
+    # 13d runs whenever a well-formed TABLE exists, whether or not any agent file does: with the
     # roles directory gone entirely, a table naming four ghosts must still fail.
     ROSTER="${TMPDIR:-/tmp}/docs-lint-roster.$$"
     : > "$ROSTER"
@@ -1015,22 +1015,31 @@ if [ -d "$PROCESS_DIR" ]; then
     # whose remedy (add a router row) is the opposite of the right one.
     [ ! -e "$OLD_ROUTING" ] || note "$OLD_ROUTING is the per-job model routing that $ROLES replaced. Delete it:
       every role now declares \`model: inherit\` and runs on the model that started the task."
-    # 13j — the one setting that moves every subagent off the parent's model at once. The env
-    # var itself is out of this script's reach; the fence in $ROLES covers it.
-    if [ -f "$SETTINGS" ] && grep -q 'CLAUDE_CODE_SUBAGENT_MODEL' "$SETTINGS"; then
+    # 13j — the one setting that moves every subagent off the parent's model at once. Matched
+    # as a JSON KEY, so a settings file may still name the variable elsewhere — a deny rule
+    # against exporting it, say. The env var itself is out of this script's reach; the fence in
+    # $ROLES covers it.
+    if [ -f "$SETTINGS" ] && grep -qE '"CLAUDE_CODE_SUBAGENT_MODEL(_FORCE)?"[[:space:]]*:' "$SETTINGS"; then
       note "$SETTINGS sets CLAUDE_CODE_SUBAGENT_MODEL. Remove it: it puts subagents on the model it names
       instead of the one that started the task, and with _FORCE it overrides \`model: inherit\` too."
     fi
     if [ -f "$ROLES" ]; then
       # 13h — the roster is read by column position, so the header is held to the exact shape. A
       # third column (the old Model column) would shift the Agent column and empty the roster,
-      # and 13f would then report a missing table that is plainly there.
+      # and 13f would then report a missing table that is plainly there. Every other row in the
+      # section is held to the same two cells, so a model cannot come back as an extra cell or as
+      # a second table under a well-formed first one.
       header=$(tr -d '\r' < "$ROLES" | awk 'index($0, "## The table") == 1 { t = 1; next } t && /^## / { exit } t && /^\|/ { print; exit }')
+      odd=$(tr -d '\r' < "$ROLES" | awk -F'|' 'index($0, "## The table") == 1 { t = 1; next } t && /^## / { exit } t && /^\|/ && NF != 4 { print; exit }')
       if [ -n "$header" ] && [ "$(printf '%s' "$header" | tr -d ' \t')" != "|Job|Agent|" ]; then
         have_roles_table=0
         note "$ROLES has a table headed \"$header\". It must be exactly | Job | Agent |: the Agent
       column is read by position, and a Model column is gone because every role runs on the
       model that started the task."
+      elif [ -n "$odd" ]; then
+        have_roles_table=0
+        note "$ROLES has a table row \"$odd\" that is not two cells. Every row under ## The table
+      is | Job | Agent |: the Agent column is read by position, and a model has no column."
       fi
       awk -F'|' '
         index($0, "## The table") == 1 { t = 1; next }
@@ -1076,7 +1085,7 @@ if [ -d "$PROCESS_DIR" ]; then
             note "$a has no frontmatter at byte 0, so it declares no name and no model — the
       roles table cannot bind to it."; continue
           fi
-          name=$(tr -d '\r' < "$a" | awk 'NR == 1 { next } /^---$/ { exit } /^name:/ { sub(/^name:[ \t]*/, ""); print }')
+          name=$(tr -d '\r' < "$a" | awk 'NR == 1 { next } /^---$/ { exit } /^name:/ { sub(/^name:[ \t]*/, ""); sub(/[ \t]+#.*$/, ""); sub(/[ \t]+$/, ""); if ($0 ~ /^".*"$/ || $0 ~ /^\047.*\047$/) $0 = substr($0, 2, length($0) - 2); print }')
           model=$(tr -d '\r' < "$a" | awk 'NR == 1 { next } /^---$/ { exit } /^model:/ { sub(/^model:[ \t]*/, ""); sub(/[ \t]+#.*$/, ""); sub(/[ \t]+$/, ""); if ($0 ~ /^".*"$/ || $0 ~ /^\047.*\047$/) $0 = substr($0, 2, length($0) - 2); print }')
           [ "$name" = "$stem" ] || note "$a declares name \"$name\" but is named $stem.md. The roles table names
       agents by file stem; a mismatch binds to nothing."

@@ -45,6 +45,6 @@ another by its brief, its tools and its isolation, never by its model.
   asked for it.** `inherit` reaches only subagents.
 - `scripts/docs-lint.sh` holds the agent files to their shape: frontmatter at byte 0, `name` equal
   to the file stem, `model: inherit` and nothing else, and every agent this table names exists as a
-  file and every file is named here. It also holds this table to exactly `| Job | Agent |`, fails a
-  leftover `model-routing.md`, and fails a `.claude/settings.json` that sets
-  `CLAUDE_CODE_SUBAGENT_MODEL`.
+  file and every file is named here. It also holds every row of this table to two cells under a
+  `| Job | Agent |` header, fails a leftover `model-routing.md`, and fails a `.claude/settings.json`
+  that sets `CLAUDE_CODE_SUBAGENT_MODEL` or its `_FORCE` twin as a key.
