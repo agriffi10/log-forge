@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-080
 title: "@trace Intake by Real Type — a Lying Argument Is Refused or Traced at Decoration, Never Absorbed on Every Call"
 description: "Makes @trace route its name= argument, the span-name fallback and its refusal messages on each value's real type, keeping exact str, so no argument decorates cleanly and then fails every call."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-055, SPEC-063, SPEC-067]
 ---
 
