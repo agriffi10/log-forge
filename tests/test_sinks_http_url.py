@@ -1196,7 +1196,7 @@ def test_an_appended_base_with_a_stray_at_after_a_delimiter_is_refused_unquoted(
 def test_the_wrapper_and_the_dataset_refuse_a_stray_at_under_their_own_names() -> None:
     with pytest.raises(ValueError, match=rf"^LogstashSink url {_STRAY_AT_MESSAGE}"):
         LogstashSink(url="http://elastic:12#ss@es:9200/x")
-    with pytest.raises(ValueError, match=rf"^HoneycombSink dataset {_STRAY_AT_MESSAGE}"):
+    with pytest.raises(ValueError, match=r"^HoneycombSink dataset must not hold an '@'; "):
         HoneycombSink("k", "a@b")
     with pytest.raises(ValueError, match=r"^DatadogSink site must be a Datadog site's") as e:
         DatadogSink("k", site="a#USERX@b")

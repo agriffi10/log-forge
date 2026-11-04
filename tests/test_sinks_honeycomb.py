@@ -12,6 +12,7 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.honeycomb import HoneycombSink
 from log_foundry.worker import Worker
 from test_sinks_http import FakeOpener, FakeResponse
+from test_sinks_http_url import _assert_chains_nothing, _assert_never_echoes, _assert_printable
 
 _SERVER_TEXT = "Event has too many columns."
 """An ``error`` Honeycomb writes beside a rejected event; it must never reach stderr."""
@@ -287,15 +288,64 @@ def test_a_dataset_that_delivered_before_still_goes_where_it_went(dataset: str, 
     assert opener.calls[0]["url"] == url
 
 
-def test_a_dataset_holding_an_at_sign_is_refused_naming_dataset() -> None:
+@pytest.mark.parametrize("dataset", ["d@x", "SECRET@d", "d@SECRET x"])
+def test_a_dataset_holding_an_at_sign_is_refused_with_the_dataset_remedy(dataset: str) -> None:
+    """Not the shared URL reason, which is about a password ending a host: a dataset has none."""
     with pytest.raises(
-        ValueError, match=r"^HoneycombSink dataset must not hold an '@' outside its host: "
+        ValueError,
+        match=r"^HoneycombSink dataset must not hold an '@'; write an '@' in a dataset as '%40'$",
     ) as caught:
-        HoneycombSink(_KEY, "d@x")
+        HoneycombSink(_KEY, dataset)
 
-    assert str(caught.value).endswith("write an '@' that belongs in a path or query as '%40'")
-    assert "d@x" not in str(caught.value)
-    assert _KEY not in str(caught.value)
+    _assert_never_echoes(caught.value, "SECRET", _KEY, "localhost", "host")
+    _assert_chains_nothing(caught.value)
+
+
+_UNCARRIED = [
+    ("d x", "InvalidURL"),
+    ("d\x00x", "InvalidURL"),
+    ("d\ud800", "UnicodeEncodeError"),
+    ("d\u20ac", "UnicodeEncodeError"),
+    ("\u4f8b", "UnicodeEncodeError"),
+]
+"""Datasets ``http.client`` cannot carry in a request path, and the error it raises for each."""
+
+
+@pytest.mark.parametrize(("dataset", "kind"), _UNCARRIED)
+def test_a_dataset_a_request_path_cannot_carry_is_refused_quoting_the_dataset(
+    dataset: str, kind: str
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"^HoneycombSink dataset cannot be carried in a request path \({kind}\): ",
+    ) as caught:
+        HoneycombSink(_KEY, dataset)
+
+    assert str(caught.value).endswith(f": {dataset!r}")
+    assert "localhost" not in str(caught.value)
+    _assert_chains_nothing(caught.value)
+    _assert_printable(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "kind"),
+    [("a%40SECRET x", "InvalidURL"), ("a\uff20SECRET", "UnicodeEncodeError")],
+)
+def test_an_uncarried_dataset_holding_an_encoded_at_sign_is_not_quoted(
+    dataset: str, kind: str
+) -> None:
+    """``%40`` and a fullwidth ``@`` are ``@`` to :func:`_holds_at`, so what precedes is hidden."""
+    with pytest.raises(
+        ValueError,
+        match=rf"^HoneycombSink dataset cannot be carried in a request path \({kind}\); ",
+    ) as caught:
+        HoneycombSink(_KEY, dataset)
+
+    assert str(caught.value).endswith(
+        "; the dataset is not quoted, since it holds an '@', '/', '?' or '#'"
+    )
+    _assert_never_echoes(caught.value, "SECRET", _KEY, "localhost")
+    _assert_chains_nothing(caught.value)
 
 
 @pytest.mark.parametrize("dataset", ["d?api_key=SECRET", "d#SECRET", "SECRET/d", "a@SECRET/d"])
