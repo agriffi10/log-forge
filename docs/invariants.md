@@ -356,7 +356,9 @@ having delivered nothing; no argument is silently ignored because another was gi
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
-`@trace` refuses (SPEC-055); the wider population is SPEC-049's — `tests/test_socket_transport.py`,
+`@trace` refuses (SPEC-055), and for a value lying about its type being refused where it is
+written or traced, never absorbed on every call (SPEC-080); the wider population is SPEC-049's —
+`tests/test_socket_transport.py`,
 the per-sink refusal tests it added, and the floor-side pins in `tests/test_sink_retry.py`, which
 also holds SPEC-065's spoofed-subclass pins for the three validators, and
 `tests/test_sinks_pubsub.py` — whose spec Overview was the
