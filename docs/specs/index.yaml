@@ -447,6 +447,12 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-014", "SPEC-029", "SPEC-064"]
     path: "docs/specs/SPEC-067-total-inbound-trace-context.md"
+  - id: "SPEC-068"
+    title: "Shutdown-Expiry Bookkeeping: One Announcement per Queued Item, a Second Caller That Waits for the Thread, a Fork That Resets the Stop Gate"
+    description: "Stops an expired shutdown() calling queued items lost, makes a later shutdown() wait on the drain thread so it can close the sink, and gives a resumed forked child a stop gate and stop event of its own."
+    spec_status: "Draft"
+    depends_on: ["SPEC-062"]
+    path: "docs/specs/SPEC-068-shutdown-expiry-bookkeeping.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
