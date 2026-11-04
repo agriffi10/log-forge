@@ -180,6 +180,21 @@ branch's fallback is ``str(value)``, the builtin ``repr`` for a real container (
 ``Enum`` fallback would render a real ``int`` subclass by ``str()`` whatever its digit count.
 """
 
+_ENUM_TEXT_BUILTINS: tuple[type, ...] = (tuple, list, dict, set, frozenset, bytes, bytearray)
+"""The builtins whose ``Enum`` member's text the library computes rather than ``str()`` (SPEC-063).
+
+An ``Enum`` member whose real type subclasses one of these, as a value that reaches the ``Enum``
+fallback or as a key, is written as :func:`_enum_text`, never through ``str()``. ``str()`` of such
+a member is the builtin container's or bytes' ``repr`` whenever the member's ``__str__`` is not
+``Enum.__str__``: a ``ReprEnum`` mixin restores the builtin's own ``__str__``, and a metaclass
+``mro()`` can put ``Enum`` into a real ``tuple`` subclass's MRO without inheriting from it.
+Measured at ``fda134a``: an mro-forged ``tuple`` around an object whose ``__repr__`` named a secret
+wrote it, value and key, and one around the shared ``frozenset`` DAG did not return on any route;
+a ``(tuple, ReprEnum)`` member holding the DAG did not return either, and a 16 MiB
+``(bytes, ReprEnum)`` member peaked at 64 MiB. ``str``, ``int`` and ``float`` mixins are not here:
+their members keep their routes.
+"""
+
 _BYTES_LEN = bytes.__len__
 """The unbound lengths that price a bytes-like key before it is rendered (SPEC-063 FR-001).
 
@@ -575,6 +590,8 @@ class _Coercer:
                 return member
             if isinstance(member, str):
                 return self.text(member)
+            if issubclass(kind, _ENUM_TEXT_BUILTINS):
+                return self.produced(_enum_text(value))
             return self.produced(str(value))
         if isinstance(value, int):
             return self.integer(_INT_INT(value))
@@ -895,6 +912,8 @@ class _Coercer:
         kind = type(key)
         if issubclass(kind, _CONTAINER_KEYS) and not issubclass(kind, Enum):
             return self._container_key(key, kind, depth)
+        if issubclass(kind, Enum) and issubclass(kind, _ENUM_TEXT_BUILTINS):
+            return self.produced(_enum_text(key))
         if isinstance(key, str):
             return self.text(key)
         if isinstance(key, int) and type(key) is not bool:
@@ -1209,6 +1228,31 @@ class _Coercer:
           None. A pathological metaclass is still not this module's problem.
         """
         return self.produced(f"<unserializable: {_type_name(value)}>")
+
+
+def _enum_text(member: object) -> str:
+    """Returns ``Enum.__str__``'s default text for a member, computed without calling ``str()``.
+
+    The stored type name, through :func:`_type_name`, then ``.``, then the member's ``_name_``
+    through :data:`_STR_STR`, which returns an exact ``str`` for a ``str`` subclass and raises
+    ``TypeError`` for anything else. For an ordinary ``(tuple, Enum)`` member that is the text
+    ``str()`` gave, ``TE.A``; for a ``ReprEnum`` or an mro-forged member, whose ``str()`` is the
+    builtin's ``repr``, it is the same text where the ``repr`` wrote its members and recursed
+    through a shared one once per path (:data:`_ENUM_TEXT_BUILTINS`). The ``_name_`` read is the
+    caller's attribute, which may raise; the coercer's guard then writes the type-name placeholder,
+    as for any value or key whose rendering raised.
+
+    Args:
+      member: The ``Enum`` member, whose real type subclasses a builtin container or bytes.
+
+    Returns:
+      The member's ``Type.NAME`` text.
+
+    Raises:
+      TypeError: When the member's ``_name_`` is not a ``str``; the coercer is the guard.
+      Exception: Whatever reading ``_name_`` raises; the coercer is the guard.
+    """
+    return f"{_type_name(member)}.{_STR_STR(cast('Enum', member)._name_)}"
 
 
 def _type_name(value: object) -> str:

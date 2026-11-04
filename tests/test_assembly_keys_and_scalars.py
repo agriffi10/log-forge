@@ -23,7 +23,7 @@ import time
 import tracemalloc
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
-from enum import Enum, StrEnum
+from enum import Enum, ReprEnum, StrEnum
 from typing import NamedTuple
 from uuid import UUID
 
@@ -1063,3 +1063,118 @@ def test_enum_members_of_builtin_mixins_keep_the_enum_route() -> None:
     assert fields == {"te": "_TupleEnum.A", "se": "a", "ie": 1, "fe": 1.5}
     assert [type(fields[k]) for k in ("te", "se", "ie", "fe")] == [str, str, int, float]
     assert flag is False
+
+
+# -- the Enum text of a real builtin container or bytes is computed, never str() -----------------
+
+
+class _InjectEnumMeta(type):
+    """A metaclass whose ``mro()`` puts ``Enum`` into a class without the class inheriting it."""
+
+    def mro(cls) -> list[type]:
+        order = type.mro(cls)
+        order.remove(object)
+        return [*order, Enum, object]
+
+
+class _ForgedEnumTuple(tuple, metaclass=_InjectEnumMeta):  # type: ignore[type-arg]
+    """A real ``tuple`` subclass that ``issubclass(..., Enum)`` believes, its ``str()`` the repr."""
+
+    _name_ = "X"
+    _value_ = object()
+    __str__ = object.__str__
+    __hash__ = tuple.__hash__
+
+
+class _TupleReprEnum(tuple, ReprEnum):  # type: ignore[misc]
+    """A ``ReprEnum`` with a tuple mixin, whose ``str()`` is the tuple's ``repr``."""
+
+    A = (_DAG_40,)
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_an_mro_forged_enum_tuple_is_written_as_its_enum_text(route: str) -> None:
+    """FR-002: the library computes ``Type.NAME`` for the forged member, value and key alike.
+
+    Measured at ``fda134a``, its ``str()`` reached ``tuple.__repr__``: it wrote a member's ``repr``
+    and did not return around the shared DAG.
+    """
+    sink = _configure()
+    secret = _emit(
+        route, {"v": _ForgedEnumTuple((_Secret(),)), "k": {_ForgedEnumTuple((_Secret(),)): 1}}, sink
+    )
+    assert secret["fields"] == {"v": "_ForgedEnumTuple.X", "k": {"_ForgedEnumTuple.X": 1}}
+    assert "SECRET" not in json.dumps(secret)
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_an_mro_forged_enum_tuple_around_a_dag_returns(route: str) -> None:
+    """FR-002: the forged member's text is computed, so the shared DAG inside it is never walked."""
+    sink = _configure()
+    started = time.process_time()
+    event = _emit(
+        route,
+        {"v": _ForgedEnumTuple((_DAG_40,)), "k": {_ForgedEnumTuple((_DAG_40,)): 1}},
+        sink,
+        deadline=5,
+    )
+    cpu = time.process_time() - started
+    assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
+    assert event["fields"] == {"v": "_ForgedEnumTuple.X", "k": {"_ForgedEnumTuple.X": 1}}
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+def test_a_tuple_repr_enum_member_is_written_as_its_enum_text(route: str) -> None:
+    """FR-002: a ``(tuple, ReprEnum)`` member holding the DAG is its enum text, value and key.
+
+    Its ``str()`` is the tuple's ``repr``, which recursed through the shared DAG and never
+    returned at ``fda134a``.
+    """
+    sink = _configure()
+    started = time.process_time()
+    event = _emit(route, {"v": _TupleReprEnum.A, "k": {_TupleReprEnum.A: 1}}, sink, deadline=5)
+    cpu = time.process_time() - started
+    assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
+    assert event["fields"] == {"v": "_TupleReprEnum.A", "k": {"_TupleReprEnum.A": 1}}
+
+
+def test_a_large_bytes_repr_enum_member_is_never_rendered_by_repr() -> None:
+    """FR-002: a 16 MiB ``(bytes, ReprEnum)`` member is its enum text; its ``repr`` was 64 MiB."""
+
+    class _BytesReprEnum(bytes, ReprEnum):
+        A = b"\\x00" * (16 << 20)
+
+    member = _BytesReprEnum.A
+    tracemalloc.start()
+    started = time.process_time()
+    try:
+        fields, flag = sanitize_fields({"v": member, "k": {member: 1}}, cfg=Config())
+        cpu = time.process_time() - started
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert fields == {"v": "_BytesReprEnum.A", "k": {"_BytesReprEnum.A": 1}}
+    assert flag is False
+    assert cpu < 2, f"{cpu:.2f} s of CPU"
+    assert peak < 8 << 20, f"peak {peak >> 20} MiB"
+
+
+class _NonTextName(tuple, Enum):  # type: ignore[misc]
+    """A ``(tuple, Enum)`` member whose ``_name_`` cannot be read as text."""
+
+    A = (1,)
+
+
+def test_an_enum_text_whose_name_is_not_text_is_the_type_placeholder() -> None:
+    """The ``_name_`` read is the caller's: a non-``str`` one is the placeholder, sibling kept."""
+    member = _NonTextName.A
+    object.__setattr__(member, "_name_", 7)
+    try:
+        fields, flag = sanitize_fields({"v": member, "k": {member: 1, "sib": 2}}, cfg=Config())
+    finally:
+        object.__setattr__(member, "_name_", "A")
+    assert fields == {
+        "v": "<unserializable: _NonTextName>",
+        "k": {"<unserializable key: _NonTextName>": 1, "sib": 2},
+    }
+    assert flag is True
