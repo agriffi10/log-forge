@@ -176,8 +176,8 @@ the list is empty after the call. A hook that raises is armed only around the `r
       escaped and then cut to 64 characters, `…` and `>`, written out as a literal. The spy on the
       subclass is empty. *Fails at base, which echoes the default object `repr` and not the name.*
 - [ ] A class named by 64 printable characters is echoed `<` and that name and `>`, and one named by
-      65 printable characters is echoed `<`, its first 64 characters, `…` and `>`. *The second fails
-      at base, which echoes the default object `repr`.*
+      65 printable characters is echoed `<`, its first 64 characters, `…` and `>`. *Both fail at
+      base, which echoes the default object `repr` of the instance, not its type's name.*
 - [ ] `b"00-bad"` is echoed `<bytes>`, an `int` `<int>` and a `list` `<list>`. *Fails at base for
       all three (`b'00-bad'`, `123` and the `repr` of the list).*
 - [ ] A `str` subclass with `__repr__`, `__getitem__`, `__len__`, `__str__`, `__iter__` and `__eq__`

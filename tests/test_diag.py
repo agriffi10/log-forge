@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import armed, object_probe, str_probe
 from log_foundry import _diag
 
 if TYPE_CHECKING:
@@ -192,7 +193,7 @@ def test_the_bound_applies_to_the_escaped_text(err: _Stderr) -> None:
     assert len(err.getvalue()) == len(prefix) + _diag._MAX_DETAIL + len("…\n")
 
 
-# -- FR-002: rejected keeps SPEC-014's bounded repr exactly ---------------------------------
+# -- SPEC-067 FR-001: rejected echoes a str's first 64 characters, anything else its type ---
 
 
 def test_rejected_bounds_the_echoed_value(err: _Stderr) -> None:
@@ -221,20 +222,215 @@ def test_rejected_echoes_a_short_value_verbatim(err: _Stderr) -> None:
 
 
 def test_rejected_escapes_a_repr_that_lies(err: _Stderr) -> None:
-    """``repr`` escaping line breaks is a property of the built-ins, not of ``repr``.
+    """A ``__repr__`` free to return a raw newline is never called at all (SPEC-067 FR-001).
 
-    ``__repr__`` is user code and may *return* a raw newline. The call sites pass an inbound
-    header, so this is the untrusted path by construction (SPEC-014) — and the values are only
-    ``str`` by annotation, which a caller not running mypy is free to ignore.
+    ``__repr__`` is user code, and the call sites pass an inbound header that is only ``str`` by
+    annotation, which a caller not running mypy is free to ignore. SPEC-029 escaped what it
+    returned; SPEC-067 stops calling it, so a non-``str`` is echoed by its type's name.
     """
+    called: list[str] = []
 
     class _Liar:
         def __repr__(self) -> str:
+            called.append("__repr__")
             return "00-bad\nlog-foundry: everything is fine"
 
     _diag.rejected("unparseable traceparent", _Liar())
 
-    assert len(err.getvalue().splitlines()) == 1
+    out = err.getvalue()
+    assert len(out.splitlines()) == 1
+    assert out.endswith(": <_Liar>\n")
+    assert called == [], "the value's own __repr__ ran"
+
+
+def test_a_metaclass_and_a_class_property_cannot_divert_the_type_name(err: _Stderr) -> None:
+    """The name is read through ``type``'s own descriptor, the route through ``str``'s MRO.
+
+    ``__subclasscheck__`` is not a hook here: ``issubclass(type(v), str)`` consults ``str``'s
+    metaclass, never the value's. The probe is armed only around the call, so a failure here is
+    reported by pytest rather than ending the run in INTERNALERROR.
+    """
+    value = object_probe("C", class_property="raise", meta=True)
+
+    with armed() as calls:
+        _diag.rejected("invalid trace_id", value)
+
+    assert err.getvalue() == "log-foundry: ignoring inbound trace context (invalid trace_id): <C>\n"
+    assert calls == []
+
+
+def test_a_type_name_that_is_a_hostile_str_is_escaped_and_bounded(err: _Stderr) -> None:
+    """A class's ``__name__`` may be any ``str`` subclass instance, of any length, with a newline."""
+    name = str_probe("a\nlog-foundry: forged" + "z" * 479, raising="all")
+
+    class D:
+        pass
+
+    D.__name__ = name
+
+    with armed() as calls:
+        _diag.rejected("invalid trace_id", D())
+
+    out = err.getvalue()
+    assert out.count("\n") == 1
+    assert out == (
+        "log-foundry: ignoring inbound trace context (invalid trace_id): "
+        "<a\\nlog-foundry: forgedzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz…>\n"
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("length", "echo"),
+    [
+        (64, "<NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN>"),
+        (65, "<NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN…>"),
+    ],
+    ids=["64-whole", "65-cut-and-marked"],
+)
+def test_a_type_name_is_cut_and_marked_past_64(err: _Stderr, length: int, echo: str) -> None:
+    """A printable name one past the bound is cut **and** marked, never cut silently.
+
+    The name route slices 65 characters, not 64: a 65-character printable name sliced at 64
+    escapes to exactly 64 and the cut would carry no ``…``.
+    """
+    _diag.rejected("invalid trace_id", type("N" * length, (), {})())
+
+    assert (
+        err.getvalue()
+        == f"log-foundry: ignoring inbound trace context (invalid trace_id): {echo}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "echo"),
+    [(b"00-bad", "<bytes>"), (123, "<int>"), ([1, 2], "<list>")],
+    ids=["bytes", "int", "list"],
+)
+def test_a_non_str_is_echoed_by_type_name(err: _Stderr, value: object, echo: str) -> None:
+    """``<bytes>`` names the caller's actual mistake, where ``b'00-bad'`` looked like a header."""
+    _diag.rejected("unparseable traceparent", value)
+
+    assert err.getvalue() == (
+        f"log-foundry: ignoring inbound trace context (unparseable traceparent): {echo}\n"
+    )
+
+
+def test_a_hostile_str_subclass_is_echoed_as_the_str_it_holds(err: _Stderr) -> None:
+    """Quoted, escaped and bounded, by ``str``'s own slots, with none of the subclass's code."""
+    value = str_probe(
+        "a\nb" + "0" * 500,
+        raising={"__repr__", "__getitem__", "__len__", "__str__", "__iter__", "__eq__"},
+    )
+
+    with armed() as calls:
+        _diag.rejected("unparseable traceparent", value)
+
+    assert err.getvalue() == (
+        "log-foundry: ignoring inbound trace context (unparseable traceparent): "
+        "'a\\nb00000000000000000000000000000000000000000000000000000000000…\n"
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("value", "echo"),
+    [
+        ("nope", "'nope'"),
+        ("", "''"),
+        ("it's", '"it\'s"'),
+        ('say "hi"', "'say \"hi\"'"),
+        ("a'b\"c", "'a\\'b\"c'"),
+        ("a\nb", "'a\\nb'"),
+        ("a\tb", "'a\\tb'"),
+        ("\x85", "'\\x85'"),
+        ("\u2028", "'\\u2028'"),
+        ("0" * 64, "'000000000000000000000000000000000000000000000000000000000000000…"),
+    ],
+    ids=[
+        "plain",
+        "empty",
+        "apostrophe",
+        "double-quotes",
+        "both-quotes",
+        "newline",
+        "tab",
+        "nel",
+        "line-separator",
+        "sixty-four",
+    ],
+)
+def test_a_short_exact_str_echoes_as_before(err: _Stderr, value: str, echo: str) -> None:
+    """The unchanged half: at most 64 characters, the line is byte-identical to SPEC-029's."""
+    _diag.rejected("invalid trace_id", value)
+
+    assert (
+        err.getvalue()
+        == f"log-foundry: ignoring inbound trace context (invalid trace_id): {echo}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "echo"),
+    [
+        ("0" * 500, "'000000000000000000000000000000000000000000000000000000000000000…"),
+        ("x" * 100 + "'", "'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"),
+        (
+            "it's" + "x" * 100 + '"',
+            "\"it'sxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…",
+        ),
+    ],
+    ids=["zeros", "apostrophe-past-the-cut", "both-quotes-past-the-cut"],
+)
+def test_a_long_str_is_cut_before_its_repr(err: _Stderr, value: str, echo: str) -> None:
+    """The quote is chosen from the first 64 characters, so text past the cut cannot change it."""
+    _diag.rejected("invalid trace_id", value)
+
+    assert (
+        err.getvalue()
+        == f"log-foundry: ignoring inbound trace context (invalid trace_id): {echo}\n"
+    )
+
+
+def test_the_reason_is_escaped_and_never_cut(err: _Stderr) -> None:
+    """``reason`` is a library literal: escaped like everything written, but not bounded."""
+    reason = "r" * 150 + "\n" + "s" * 149
+
+    _diag.rejected(reason, "x")
+
+    out = err.getvalue()
+    assert out.count("\n") == 1
+    assert out == f"log-foundry: ignoring inbound trace context ({'r' * 150}\\n{'s' * 149}): 'x'\n"
+
+
+def test_an_echo_that_cannot_be_computed_still_writes_the_line(
+    err: _Stderr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``"rejected"`` means the line was announced, so the echo failing must not lose it."""
+
+    def _no_memory(value: object) -> str:
+        raise MemoryError
+
+    monkeypatch.setattr(_diag, "_echo", _no_memory)
+
+    _diag.rejected("invalid trace_id", "x")
+
+    assert err.getvalue() == "log-foundry: ignoring inbound trace context (invalid trace_id): <?>\n"
+
+
+def test_a_baseexception_from_the_echo_propagates(
+    err: _Stderr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard catches ``Exception`` only; an interrupt mid-echo is the operator's intent."""
+
+    def _interrupted(value: object) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_diag, "_echo", _interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        _diag.rejected("invalid trace_id", "x")
+    assert err.getvalue() == ""
 
 
 def test_the_documented_bounds_are_the_spec_s(err: _Stderr) -> None:
@@ -360,7 +556,12 @@ def test_an_unrenderable_detail_still_leaves_the_count(err: _Stderr) -> None:
 
 
 def test_a_hostile_value_cannot_break_rejected(err: _Stderr) -> None:
-    """``repr`` runs user code; ``rejected`` is called from the caller's thread."""
+    """A raising ``__repr__`` is never called, so the line is written (SPEC-067 FR-001).
+
+    Before SPEC-067 the echo was ``repr(value)``, inside the guard that covers the write, so the
+    raise was swallowed with the line and ``continue_trace`` reported ``"rejected"`` — announced —
+    with nothing on stderr.
+    """
 
     class _Hostile:
         def __repr__(self) -> str:
@@ -368,7 +569,9 @@ def test_a_hostile_value_cannot_break_rejected(err: _Stderr) -> None:
 
     _diag.rejected("unusable baggage header", _Hostile())
 
-    assert err.getvalue() == "", "nothing written, nothing raised"
+    assert err.getvalue() == (
+        "log-foundry: ignoring inbound trace context (unusable baggage header): <_Hostile>\n"
+    )
 
 
 # -- FR-004: the rules are documented where the next writer will look -----------------------
