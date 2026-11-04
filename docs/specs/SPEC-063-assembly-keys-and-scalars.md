@@ -139,11 +139,12 @@ Stated here rather than left to be found.
   sacrifices the entries after it in walk order, exactly as a huge value does (SPEC-057).
 - **A container key that is not a builtin subclass** — a custom hashable `Sequence` — keeps `str()`,
   which is the caller's code (*Out of Scope*).
-- **A `ReprEnum` with a container mixin hangs on the DAG.** A `(tuple, ReprEnum)` member holding the
-  frozenset DAG hangs on both delivery paths at `71e42dd`, as a value and as a key, through the Enum
-  fallback `str()`, which for a `ReprEnum` is the mixin's repr. It stays: the caller chose that
-  enum's `__str__` chain, and the `Enum` exclusion keeps it, like every other Enum key, out of the
-  container-key rule.
+- ~~**A `ReprEnum` with a container mixin hangs on the DAG.**~~ **Closed in this spec (FR-002):**
+  an `Enum` member whose real type subclasses `tuple`, `list`, `dict`, `set`, `frozenset`, `bytes`
+  or `bytearray` is written as `Type.NAME`, computed by the library, as a value reaching the Enum
+  fallback and as a key, so a `(tuple, ReprEnum)` member holding the frozenset DAG, which hung on
+  both paths at `71e42dd`, is `TE.A`, and a 16 MiB `(bytes, ReprEnum)` member no longer peaks at
+  64 MiB.
 - **The rebuilt merge changes key order.** On the marked slow path, entered only when the unpack
   raised, the merged mapping is in highest-source-first order (per-call fields, baggage, span
   defaults, config defaults) rather than the unpack's first-insertion order, and each source's keys
@@ -233,9 +234,11 @@ key still rendered a 64 MiB repr before becoming `<size limit>` (measured, 64 Mi
 consequence is stated: a bytes key longer than about a quarter of the remaining budget becomes
 `<size limit>` unrendered, even a printable one whose repr would have fitted.
 
-**An `Enum` member is not a container key.** A key whose real type subclasses `Enum` keeps `str()`,
-like `Color(int, Enum)`: a `(tuple, Enum)` mixin member `TE.A` stays `"TE.A"`, as the value route
-sends an `Enum` to its own branch ahead of the sequence branch.
+**An `Enum` member is not a container key.** A key whose real type subclasses `Enum` keeps its
+enum text, like `Color(int, Enum)`: a `(tuple, Enum)` mixin member `TE.A` stays `"TE.A"`, as the
+value route sends an `Enum` to its own branch ahead of the sequence branch. When the member's real
+type is a builtin container or bytes that text is computed, `Type.NAME`, never `str(key)` (FR-002),
+which for an ordinary member is the same text.
 
 **What does not change.** Keys of any other type keep today's rendering, an object that only claims
 through `__class__` to be a tuple is not a container key, and the per-key order SPEC-057 fixed —
@@ -372,6 +375,19 @@ is the node. The `str` claim is existing behaviour. A genuine
 `Color.RED`; a genuine `float` subclass key renders as its exact float, except a `(float, Enum)`
 member, which keeps `str()` (`FE.A`) as a `(int, Enum)` member does.
 
+**An Enum member whose real type is a builtin container or bytes is written as `Type.NAME`.** The
+Enum fallback `str(value)` and an Enum key's `str(key)` reach the builtin's `repr` whenever the
+member's `__str__` is not `Enum.__str__`: a `ReprEnum` mixin restores it, and a metaclass `mro()`
+can put `Enum` into a real `tuple` subclass's MRO without inheriting from it, so `issubclass(kind,
+Enum)` holds. Measured at `fda134a` (and pre-existing): such a forged tuple wrote a member's
+`repr` and hung on the frozenset DAG applied 40 times on every route, and a 16 MiB
+`(bytes, ReprEnum)` member peaked at 64 MiB. So for a member whose real type subclasses `tuple`,
+`list`, `dict`, `set`, `frozenset`, `bytes` or `bytearray`, the library computes the text: the
+stored type name, `.`, and `str.__str__` of the member's `_name_`; a `_name_` that is not a `str`,
+or that raises, gives the type-name placeholder through the existing guard. That is the text an
+ordinary `(tuple, Enum)` member has always had, `TE.A`. Enum members with a `str`, `int` or
+`float` mixin, and plain Enums, keep their routes.
+
 **The Enum branch is entered only by a real `Enum`, or by an object whose real type is no builtin
 text, bytes, container or number.** Its fallback is `str(value)`, so a real builtin that claims
 `Enum` through `__class__` and answers `.value` with an object reached the builtin `repr`, found by
@@ -462,6 +478,14 @@ this spec extends): on both delivery paths every leaf of the assembled event is 
       to its ceiling with a `tracemalloc` peak under 8 MiB. At `71e42dd` they write `'(SECRET,)'`
       and `"{'a': SECRET}"`, the DAG does not return, and the peak is 64 MiB. A real `tuple` key
       claiming `str`, `int` or `float` is the key `"[1, 2]"`, where it was the key placeholder.
+- [ ] A real `tuple` subclass whose metaclass `mro()` puts `Enum` in its MRO, holding an object whose
+      `repr` names a secret, is written `T.X` as a value and as a key on both delivery paths, the
+      secret nowhere; around the frozenset DAG applied 40 times it returns in under 2 s of
+      `process_time()`, alarm-guarded. A `(tuple, ReprEnum)` member holding the DAG is `TE.A` as a
+      value and a key on both paths under the same bound, and a 16 MiB `(bytes, ReprEnum)` member is
+      `BE.A` with a `tracemalloc` peak under 8 MiB. Each fails at `fda134a` (the repr, the alarm,
+      a 64 MiB peak). An ordinary `(tuple, Enum)` member stays `TE.A` (silence), and one whose
+      `_name_` is not a `str` is the type-name placeholder.
 - [ ] A class whose metaclass defines `__name__` as a property that raises, or returns `42`, or
       returns `"renamed"`, gives `<unserializable: Stored>` as a value and
       `<unserializable key: Stored>` as a key, `Stored` being its stored name; each fails at

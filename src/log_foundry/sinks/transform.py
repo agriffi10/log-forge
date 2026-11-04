@@ -20,7 +20,11 @@ __all__ = ["TransformSink"]
 
 
 def _check(result: object) -> None:
-    """Raises unless ``result`` meets invariant 8's observable, in one expression (SPEC-058 FR-001).
+    """Raises unless ``result`` passes invariant 8's JSON check, in one expression (SPEC-058).
+
+    The JSON half of the observable, not its exact-type clause (SPEC-063): a result that passes is
+    delivered as returned, so what a transform adds may hold a builtin subclass, as
+    ``docs/invariants.md`` §8 records.
 
     ``allow_nan=False`` and the UTF-8 encode are what make it the stricter of the two readings:
     a NaN and a lone surrogate both pass a bare ``json.dumps``, and the second is what the SQL
@@ -41,7 +45,7 @@ def _check(result: object) -> None:
 
 
 def _passes(result: object) -> bool:
-    """Reports whether ``result`` meets invariant 8's observable, as a verdict rather than a raise.
+    """Reports whether ``result`` passes invariant 8's JSON check, as a verdict rather than a raise.
 
     The catch is broad on purpose: SPEC-058 FR-001 makes *any* ``Exception`` from the check a
     failure, a ``RecursionError`` and a ``dict`` subclass's own ``items()`` failure included, and
@@ -107,7 +111,7 @@ class TransformSink:
     **What the function returns is checked, and coerced when it fails** (SPEC-058 FR-001). The
     function runs after assembly, so it can put a value into an event that assembly would have
     coerced — ``bytes``, a ``datetime``, a NaN — and invariant 8 promised every sink an event it
-    could serialize bare. Each result is checked with that promise's observable; one that passes
+    could serialize bare. Each result is checked with that promise's JSON check; one that passes
     is forwarded as the same object, and one that fails is replaced by a new mapping coerced for
     type only, under no configured ceiling and one fixed depth bound. A coercion is not loss:
     nothing is counted and nothing is announced.

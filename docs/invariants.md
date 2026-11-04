@@ -199,8 +199,8 @@ cannot convert; a container
 mapping key is coerced as a value and written as the JSON of the result, not as its `repr`
 (SPEC-063). The premise holds at assembly **and at a
 transform's coercion**: a `TransformSink` runs its function after assembly, so it checks each
-result with the observable below and replaces one that fails with a coercion by assembly's
-per-type rules (SPEC-058).
+result with the observable's JSON check — `json.dumps(result, allow_nan=False)` and a strict UTF-8
+encode — and replaces one that fails with a coercion by assembly's per-type rules (SPEC-058).
 
 *Observable:* for any value, the call returns, every string in the event encodes as UTF-8 and
 `json.dumps(event, allow_nan=False)` succeeds, every leaf of the event is of type exactly `str`,
@@ -223,7 +223,16 @@ event takes two passes, `build_event`'s and `backfill_baggage`'s, so `span.start
 can each hold up to twice each budget (SPEC-057). A key that is an arbitrary object, or any
 `Enum` member, keeps its own `str()`, which for a default object is its `repr`: the no-`repr` rule
 holds for a value and inside a container key, not for such a key, whose `__str__` is the caller's
-code (SPEC-063). The
+code (SPEC-063). An `Enum` member whose real type is a builtin container or bytes is the exception
+to that exception: its text, as a value and as a key, is computed as `Type.NAME`, never by
+`str()`, which for a `ReprEnum` or an mro-forged member is the builtin's `repr` (SPEC-063). An
+object that is not a builtin and claims `UUID`, `Decimal`, `datetime` or `Enum` through `__class__`
+renders through that claim, by its own `str()`, `isoformat()` or `.value`: that is the transparent
+proxy route, kept on purpose, so the no-`repr` rule does not cover it, and such an object's
+`__str__` can write what its `repr` would (SPEC-063). A transform's result that passes the JSON
+check is delivered as the transform returned it, so what a transform adds may hold a builtin
+subclass: the exact-type clause of the observable holds at assembly and for a transform's
+coercion, not for a passing transform result (SPEC-058, SPEC-063). The
 ceilings bound the values of an assembled event and do not bound what a transform adds: a
 transform's coercion is for type only, under no configured ceiling, outside the two pass budgets,
 and with one fixed depth bound of 100, marked as assembly marks a depth cut, because what a transform adds is the caller's code

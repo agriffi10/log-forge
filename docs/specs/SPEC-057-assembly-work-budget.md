@@ -291,7 +291,9 @@ bound the bytes and cut a 256 × 256 structure, and would diverge from SPEC-056.
       that string `<size limit>` and marks the event; a sibling `"z"` after it in the list, and a
       second field `b`, are absent.
 - [ ] The same exactness holds for a structure that also holds, ahead of the special string in walk
-      order, an integer key, a one-element tuple key whose `str()` is 10,000 characters (charged
+      order, an integer key, ~~a one-element tuple key whose `str()` is 10,000 characters~~
+      (**superseded by SPEC-063 FR-001:** a tuple key is now the JSON of its coerced members, so the
+      test uses a `Decimal` key whose `str()` is 10,000 characters) (charged
       10,000 though written at 8,192), a float, a bool, a `None`, an over-long integer and a
       `<depth limit>` value (the last five charge nothing), the special string's length chosen so the
       total is exact. It is written whole with no `<size limit>`, and the over-by-one variant, which

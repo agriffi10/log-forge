@@ -15,7 +15,9 @@ config key and no public name was added; `sanitize.__all__` and `log_foundry.__a
   the number rules, builtin `str`, `bytes`, `dict` and container subclasses routed by
   `issubclass(type(value), …)`, the `Enum` branch entered only by a real `Enum` or a non-builtin
   (`_REAL_ROUTED`), `_key`'s container test ahead of its claim-based scalar tests and its
-  `type(key) is not bool`, a `(float, Enum)` key kept on `str()`, and `_type_name` reading the stored
+  `type(key) is not bool`, a `(float, Enum)` key kept on `str()`, an `Enum` member whose real type
+  is a builtin container or bytes written as `Type.NAME` by `_enum_text` (closing the
+  `(tuple, ReprEnum)` limit), and `_type_name` reading the stored
   name through `str.__str__`. `isinstance` stays only on the render-through routes, for proxies.
 - **Truthiness inside the guard** (FR-003): `_merge`'s `fields=` test and `_log`'s `echo` test.
 - **Hostile class and colliding key** (FR-004): `model._stored_module`, `sanitize._type_name` reused

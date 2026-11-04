@@ -1004,9 +1004,10 @@ close it.
   would hand a real tuple that claims `UUID` through `__class__` to the builtin `repr`. A `bytes` or
   `bytearray` key is priced at `4 * len + 3` before it is rendered (a 64 MiB `b"\x00"` key peaked
   at 256 MiB). The remaining cost is stated, not open: an object that is itself the key keeps
-  `str()`, a `(tuple, ReprEnum)` member holding the DAG still hangs through the enum fallback
-  `str()` (the caller chose that `__str__` chain), and `_coerce_unbounded` extends its accepted
-  DAG cost to a DAG key. Decision:
+  `str()`, and `_coerce_unbounded` extends its accepted DAG cost to a DAG key. An `Enum` member
+  whose real type is a builtin container or bytes is written as `Type.NAME`, computed, never
+  `str()`, so a `(tuple, ReprEnum)` member holding the DAG, or a real tuple an `mro()` forges into
+  `Enum`, no longer hangs or writes a member's `repr`. Decision:
   `docs/decisions/event-assembly/a-route-that-trusts-the-callers-object-admits-it-by-exact-type-or-an-unbound-accessor.md`.
 
 - ~~**An object that only claims a scalar type is routed as that type and reaches the event as
