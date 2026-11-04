@@ -522,8 +522,14 @@ def parse_baggage_header(header: object) -> dict[str, object] | None:
     the process. W3C allows per-member properties after a ``;`` and nothing here consumes
     them, so they are dropped rather than treated as part of the value.
 
+    Only an exact ``str`` is parsed (SPEC-067 FR-003), tested as ``type(header) is str``:
+    ``isinstance`` would read the value's own ``__class__``, and a subclass's ``strip``,
+    ``encode`` and ``split`` are its author's code. :func:`~log_foundry.continue_trace` turns a
+    subclass into the exact ``str`` it holds before calling this.
+
     Args:
-      header: An inbound header value of any type.
+      header: An inbound header value of any type. Anything but an exact ``str``, a ``str``
+        subclass included, is refused without running any of its code.
 
     Returns:
       The parsed mapping, or ``None`` for a non-string, an empty header, one over
@@ -533,7 +539,7 @@ def parse_baggage_header(header: object) -> dict[str, object] | None:
     Raises:
       None.
     """
-    if not isinstance(header, str) or not header.strip():
+    if type(header) is not str or not header.strip():
         return None
     if len(header.encode("utf-8", "replace")) > BAGGAGE_MAX_BYTES:
         return None

@@ -115,6 +115,16 @@ def continue_trace(
     The validation is about output integrity, never emitting a malformed id into the event
     stream, not authorization; this is not a trust boundary.
 
+    Each argument is normalised once, on entry, by :func:`_exact` (SPEC-067 FR-004): a ``str``
+    subclass becomes the exact ``str`` it holds, through ``str.__str__``, and anything else is
+    passed on as it is, to be refused and announced by type name. No code of an inbound value
+    runs anywhere in this call, so a valid header in a ``str`` subclass is still adopted, and
+    what is stored, put on events and formatted later by :func:`current_traceparent` is the exact
+    ``str`` — a subclass kept as it was would raise its own exception from that formatting. The
+    four parameters are reassigned through ``cast`` rather than rebound to new names, so no later
+    line can read an argument the normalisation skipped; the ``cast`` states the same thing the
+    annotation already does, which a caller not running mypy is free to ignore.
+
     Args:
       traceparent: A W3C ``traceparent`` string, which wins if ids are also supplied.
       trace_id: The trace to join, as an alternative to a ``traceparent``.
@@ -146,9 +156,18 @@ def continue_trace(
       baggage header *while writing the rejection line for it* — the discrimination FR-007 AC-3
       exists to provide, stated backwards.
 
+      ``"rejected"`` follows the announcement, not its delivery. The stderr write is best-effort,
+      so a stream that faults still yields ``"rejected"``: the refusal was announced, and the
+      line was lost to the stream rather than to the library.
+
     Raises:
-      None.
+      None. A ``BaseException`` raised by the stderr write, such as a ``KeyboardInterrupt``, still
+        propagates (SPEC-029).
     """
+    traceparent = cast("str | None", _exact(traceparent))
+    trace_id = cast("str | None", _exact(trace_id))
+    parent_span_id = cast("str | None", _exact(parent_span_id))
+    baggage = cast("str | None", _exact(baggage))
     adopted: tuple[str, str | None] | None = None
     announced = False
     if traceparent is not None:
@@ -196,6 +215,30 @@ def continue_trace(
     if adopted is not None:
         return ContinueResult(ok=True)
     return ContinueResult(ok=False, reason="rejected" if announced else "nothing-supplied")
+
+
+def _exact(value: object) -> object:
+    """Returns an inbound ``str`` subclass as the exact ``str`` it holds, anything else as is.
+
+    The test is ``issubclass(type(value), str)``, a check over the real type's MRO that consults
+    ``str``'s metaclass and never the value's; ``isinstance`` would read the value's own
+    ``__class__``, a property free to raise. The copy is ``str.__str__(value)``, which is
+    C-level: on a subclass it returns the stored characters without calling the subclass's
+    ``__str__``, ``__len__`` or anything else. A value of any other type is not touched at all,
+    so the parsers refuse it and ``_diag.rejected`` names it by type.
+
+    Args:
+      value: One of :func:`continue_trace`'s inbound arguments, of any type.
+
+    Returns:
+      An exact ``str`` for a ``str`` or ``str`` subclass, otherwise ``value`` itself.
+
+    Raises:
+      None.
+    """
+    if issubclass(type(value), str):
+        return str.__str__(cast("str", value))
+    return value
 
 
 def _current_span_was_swept() -> bool:

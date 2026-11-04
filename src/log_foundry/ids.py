@@ -97,8 +97,15 @@ def is_valid_trace_id(value: object) -> bool:
     A valid trace id is exactly 32 lowercase hex characters and not all zero, the
     all-zero form being the W3C "unset" sentinel rather than an id.
 
+    The value must be an exact ``str``, tested as ``type(value) is str`` (SPEC-067 FR-003).
+    ``isinstance`` would read the value's own ``__class__``, a property free to raise or to
+    answer ``str``, and would then admit a subclass whose ``__len__``, ``__iter__`` and
+    ``__ne__`` are its author's code. :func:`~log_foundry.continue_trace` turns a subclass into
+    the exact ``str`` it holds before calling this, so a valid one is still adopted there.
+
     Args:
-      value: The candidate trace id, of any type.
+      value: The candidate trace id, of any type. Anything but an exact ``str``, a ``str``
+        subclass included, is refused without running any of its code.
 
     Returns:
       True when the value is a valid trace id.
@@ -106,7 +113,7 @@ def is_valid_trace_id(value: object) -> bool:
     Raises:
       None.
     """
-    return isinstance(value, str) and _is_hex(value, 32) and value != "0" * 32
+    return type(value) is str and _is_hex(value, 32) and value != "0" * 32
 
 
 def is_valid_span_id(value: object) -> bool:
@@ -115,8 +122,11 @@ def is_valid_span_id(value: object) -> bool:
     A valid span id is exactly 16 lowercase hex characters and not all zero, the
     all-zero form being the W3C "unset" sentinel rather than an id.
 
+    The value must be an exact ``str``, for the reason :func:`is_valid_trace_id` gives.
+
     Args:
-      value: The candidate span id, of any type.
+      value: The candidate span id, of any type. Anything but an exact ``str``, a ``str``
+        subclass included, is refused without running any of its code.
 
     Returns:
       True when the value is a valid span id.
@@ -124,7 +134,7 @@ def is_valid_span_id(value: object) -> bool:
     Raises:
       None.
     """
-    return isinstance(value, str) and _is_hex(value, 16) and value != "0" * 16
+    return type(value) is str and _is_hex(value, 16) and value != "0" * 16
 
 
 def parse_traceparent(value: object) -> tuple[str, str] | None:
@@ -136,10 +146,15 @@ def parse_traceparent(value: object) -> tuple[str, str] | None:
     rule. The returned span id is the caller's span — the adopting span's parent, never
     its own identity.
 
+    Only an exact ``str`` is parsed, for the reason :func:`is_valid_trace_id` gives: a subclass's
+    ``strip`` and ``split`` are its author's code, and ``isinstance`` reads ``__class__``.
+    :func:`~log_foundry.continue_trace` turns a subclass into the exact ``str`` it holds first.
+
     Args:
-      value: An inbound header value of any type, from outside the process. Surrounding
-        whitespace is stripped before parsing, since a header value arrives trimmed from some
-        transports and not others; whitespace anywhere else is a malformed field.
+      value: An inbound header value of any type, from outside the process. Anything but an
+        exact ``str``, a ``str`` subclass included, is refused without running any of its code.
+        Surrounding whitespace is stripped before parsing, since a header value arrives trimmed
+        from some transports and not others; whitespace anywhere else is a malformed field.
 
     Returns:
       A ``(trace_id, span_id)`` tuple, or ``None`` if the value is unusable.
@@ -147,7 +162,7 @@ def parse_traceparent(value: object) -> tuple[str, str] | None:
     Raises:
       None. A logging call must never be the reason a caller's function fails.
     """
-    if not isinstance(value, str):
+    if type(value) is not str:
         return None
     parts = value.strip().split("-")
     if len(parts) < 4:
