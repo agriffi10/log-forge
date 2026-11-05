@@ -662,26 +662,40 @@ def test_a_forked_child_refuses_without_touching_the_lock_loop_or_client(monkeyp
 
 
 class AnnouncingLock:
-    """A lock that counts the threads waiting on it, so a test can see callers queued behind it."""
+    """A first-come lock that counts the threads waiting on it, so a test fixes who is served next.
+
+    ``threading.Lock`` is not FIFO, so a test that queues callers behind it cannot say which one
+    the release wakes. Serving tickets in arrival order makes that a fact of the test rather than
+    of the scheduler, and ``entered`` counts every caller that ever reached the lock.
+    """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.waiting = 0
         self._changed = threading.Condition()
+        self._held = False
+        self._next_ticket = 0
+        self._serving = 0
+        self.waiting = 0
+        self.entered = 0
 
     def __enter__(self) -> None:
         with self._changed:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self.entered += 1
             self.waiting += 1
             self._changed.notify_all()
-        self._lock.acquire()
-        with self._changed:
+            self._changed.wait_for(lambda: not self._held and self._serving == ticket)
+            self._held = True
+            self._serving += 1
             self.waiting -= 1
 
     def __exit__(self, *exc: object) -> None:
-        self._lock.release()
+        with self._changed:
+            self._held = False
+            self._changed.notify_all()
 
     def locked(self) -> bool:
-        return self._lock.locked()
+        return self._held
 
     def wait_for_waiters(self, count: int, timeout: float = 5.0) -> bool:
         with self._changed:
@@ -693,7 +707,12 @@ def test_a_closer_is_not_starved_by_queued_emits(monkeypatch) -> None:
 
     The three queued emits took the lock's queue before ``close()`` set its flag, so only the
     post-acquire read refuses them (mutant 5); a fourth emit started after the flag is set is
-    refused before it even queues, within about 50 ms, by the pre-lock read (mutant 4).
+    refused without ever reaching the lock, by the pre-lock read (mutant 4).
+
+    The lock is first-come, so the queued emits are served before the closer by construction. On
+    the sink's own lock the release may wake the closer first instead, and the queued emits then
+    find the sink closed rather than closing: refused just the same, but by the ``_closed`` read,
+    an ordering in which mutant 5 survives and the message names a closed sink.
     """
     sink, fake, _ = _build(monkeypatch, publish_timeout=20.0)
     lock = AnnouncingLock()
@@ -724,11 +743,17 @@ def test_a_closer_is_not_starved_by_queued_emits(monkeypatch) -> None:
     assert lock.wait_for_waiters(4), "close() never reached the lock"
     assert sink._closing
     publishes_when_close_began = fake.calls.count("publish")
+    entered_when_close_began = lock.entered
 
-    began = time.monotonic()
-    with pytest.raises(SinkDeliveryError, match="closing"):
-        sink.emit([{"n": "fourth"}])
-    assert time.monotonic() - began < 0.05, "the pre-lock read must refuse without queueing"
+    fourth = threading.Thread(target=emit, args=("fourth",))
+    fourth.start()
+    fourth.join(5.0)
+    assert not fourth.is_alive(), "the fourth emit queued on the lock instead of being refused"
+    assert isinstance(errors["fourth"], SinkDeliveryError), errors
+    assert "closing" in str(errors["fourth"])
+    assert lock.entered == entered_when_close_began, (
+        "the pre-lock read must refuse without queueing"
+    )
 
     released_at = time.monotonic()
     _open(sink, gate)
