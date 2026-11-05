@@ -188,24 +188,42 @@ class SlowJetStream:
     async def publish(self, subject, payload, *, timeout=None) -> None:  # noqa: ASYNC109
         self._owner.timeouts.append(timeout)
         self._owner.calls += 1
-        await asyncio.sleep(self._owner.per_event)
+        await self._owner.spend()
         if self._owner.fail:
             raise RuntimeError("no responders")
         self._owner.published.append((subject, payload))
 
 
 class SlowNATS:
-    def __init__(self, per_event: float = 0.05, fail: bool = False) -> None:
+    """A client double whose publishes cost ``per_event`` seconds each.
+
+    ``hold_at`` names one publish (1-based) that first parks on ``held``, which no test sets: the
+    publish is in flight at the deadline by construction rather than by a ratio of sleeps to
+    budget -- a ratio a slow runner lands on the wrong side of -- and ``close`` cancels it.
+    """
+
+    def __init__(
+        self, per_event: float = 0.05, fail: bool = False, hold_at: int | None = None
+    ) -> None:
+        if hold_at is not None and hold_at < 1:
+            raise ValueError(f"hold_at counts publishes from 1, got {hold_at}")
         self.per_event = per_event
         self.fail = fail
+        self.hold_at = hold_at
+        self.held = asyncio.Event()
         self.calls = 0
         self.published: list[tuple] = []
         self.timeouts: list[float | None] = []
         self.is_connected = True
 
+    async def spend(self) -> None:
+        if self.calls == self.hold_at:
+            await self.held.wait()
+        await asyncio.sleep(self.per_event)
+
     async def publish(self, subject, payload) -> None:
         self.calls += 1
-        await asyncio.sleep(self.per_event)
+        await self.spend()
         if self.fail:
             raise RuntimeError("no responders")
         self.published.append((subject, payload))
@@ -359,9 +377,9 @@ def test_an_expired_budget_with_nothing_published_books_only_what_it_attempted()
     # Since SPEC-061 the publish in flight when the deadline passes is abandoned rather than
     # awaited (it may yet land, so it is counted as published and as unconfirmed, and the batch is
     # not sent back for a retry that could duplicate it). A fake whose publishes cost time
-    # therefore always straddles the deadline, and the raising path needs one whose failures are
+    # therefore usually straddles the deadline, and the raising path needs one whose failures are
     # instant: every attempt raises, nothing is in flight, and `emit` raises having booked only
-    # the attempts. The straddling shape has its own test below.
+    # the attempts. The straddling shape has its own test below, held open by construction.
     client = SlowNATS(per_event=0.0, fail=True)
     sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
     with pytest.raises(SinkDeliveryError):
@@ -378,29 +396,38 @@ def test_a_failing_publish_in_flight_at_the_deadline_is_abandoned_and_each_loss_
     # SPEC-061's reading of the same batch: the slow failing publish the deadline interrupts is
     # abandoned, so `emit` returns, and the three populations -- the attempts that raised, the one
     # abandoned, the remainder never attempted -- add up to the batch exactly once.
-    client = SlowNATS(per_event=0.08, fail=True)
-    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
+    #
+    # The 4th publish is held open until `close` cancels it, so it is in flight at the deadline
+    # whatever the runner's speed. It used to rely on 3 x 0.08 s landing inside a 0.25 s budget, a
+    # 10 ms margin a slow CI runner missed: the deadline fell between publishes, nothing was in
+    # flight to abandon, and `emit` raised instead. The only timing left is three free publishes
+    # against the whole budget.
+    client = SlowNATS(per_event=0.0, fail=True, hold_at=4)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.5)
     sink.emit([{"n": i} for i in range(30)])
     calls_at_return = client.calls
     sink.close()
 
-    assert 0 < calls_at_return < 30, "the deadline must have stopped the loop short"
+    assert calls_at_return == 4, "three raised, the fourth was in flight, the rest unattempted"
     assert sink.failed == 30, "raised once, abandoned once, unattempted once: never twice"
 
 
 def test_an_expired_budget_with_something_published_books_the_remainder() -> None:
     # FR-001 AC-7, returning path. The worker will not retry a batch that returned, so the
     # unattempted remainder is a real loss and is counted.
-    client = SlowNATS(per_event=0.08)
-    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.25)
+    #
+    # Held open as in the test above, so exactly three publish before the deadline and the 4th is
+    # abandoned whatever the runner's speed, rather than however many 0.08 s sleeps fit in 0.25 s.
+    client = SlowNATS(per_event=0.0, hold_at=4)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=0.5)
     sink.emit([{"n": i} for i in range(30)])
     # Read at the moment emit returned: since SPEC-061 the publish in flight at the deadline is
-    # abandoned rather than awaited, so it lands in the fake AFTER this and is counted as
-    # unconfirmed, an upper bound a late landing does not reduce.
+    # abandoned rather than awaited, so against a real server it could land after this; it is
+    # counted as unconfirmed, an upper bound a late landing does not reduce. Here it never lands.
     published = len(client.published)
     sink.close()
 
-    assert 0 < published < 30
+    assert published == 3
     assert sink.failed == 30 - published, "every event not delivered when emit returned is counted"
 
 
