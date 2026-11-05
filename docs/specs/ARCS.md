@@ -400,9 +400,9 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   schedule, rather than the plan's sink-only budget. A fourth, also his, fixes when `sink_factory=`
   runs: lazily on first use in every process.
 
-  Three peer specs fix code this arc then restructures, and none is in any `depends_on`, because
-  spec-lint refuses a dependency on a spec not yet in the directory. They are SPEC-061 (NATS
-  liveness and bounded close), SPEC-066 (numeric doors) and SPEC-068 (shutdown expiry). Each arc
-  spec that builds on one says so in its Overview, and the dependency joins `depends_on` once the
-  peer's file lands.
+  Four peer specs fixed code this arc then restructures, and they landed in 1.1.0: SPEC-061 (NATS
+  liveness and bounded close), SPEC-066 (numeric doors), SPEC-068 (shutdown expiry) and SPEC-080
+  (trace intake by real type). While the arc was written their files were not yet in the directory,
+  which spec-lint refuses as a dependency, so each arc spec named them in its Overview only. Once
+  the branch was rebased onto 1.1.0, each arc spec that builds on one gained it in `depends_on`.
 

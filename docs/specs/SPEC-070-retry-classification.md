@@ -559,7 +559,7 @@ why, the decision that records it and a derivation or a named test that proves t
 
 | Rule | Departing classes | Departure | Recorded in | Derived by |
 |---|---|---|---|---|
-| A timeout that is already broken is refused, one that works is floored | `KafkaSink` (`flush_timeout`), `NATSSink` (`publish_timeout`) and `GooglePubSubSink` (`overflow_timeout`) floor it through `usable_timeout`; `PostgresSink` floors `connect_timeout` at 2 (`max(connect_timeout, _MIN_CONNECT_TIMEOUT)` at `fda134a`, `floor_count` since SPEC-066 landed in 1.1.0); every other timeout is refused through `require_timeout` | floor, not refuse, for 1.x | *A bad argument is floored if it works and refused if it is already broken; a new one is refused* | per sink class, each `__init__` parameter whose name ends in `timeout`, classed by the call that judges it (below) |
+| A timeout that is already broken is refused, one that works is floored | `KafkaSink` (`flush_timeout`), `NATSSink` (`publish_timeout`, and `drain_timeout` when one is passed, since SPEC-061) and `GooglePubSubSink` (`overflow_timeout`) floor it through `usable_timeout`; `PostgresSink` floors `connect_timeout` at 2 (`max(connect_timeout, _MIN_CONNECT_TIMEOUT)` at `fda134a`, `floor_count` since SPEC-066 landed in 1.1.0); every other timeout is refused through `require_timeout` | floor, not refuse, for 1.x | *A bad argument is floored if it works and refused if it is already broken; a new one is refused* | per sink class, each `__init__` parameter whose name ends in `timeout`, classed by the call that judges it (below) |
 | A status is retried if it is `429` or `5xx` | `OTLPSink` retries `429`, `502`, `503`, `504` | a `500` is abandoned on the first request | *A protocol's retry set is a private predicate hook, not a second loop* | the classes defining `_retryable_status`; the existing roster in `tests/test_sinks_otlp.py` |
 | A sink that released its transport refuses; a close mid-batch raises nothing by itself | `GooglePubSubSink` absorbs a close that lands mid-batch | the rest of the batch is counted unconfirmed, not raised | *A sink that released its transport refuses; one that released nothing keeps accepting* | `test_a_close_landing_mid_batch_counts_the_rest_unconfirmed_and_does_not_raise` in `tests/test_sinks_pubsub.py`, which the roster requires to exist |
 | A body that cannot carry the verdict is counted | `OTLPSink` reads an **empty** `2xx` body as success; the `_bulk` sinks and `HoneycombSink` count it | an OTLP success needs no `partialSuccess` | *A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited* | `_handle_response` of each of the four readers on `b""` |
@@ -571,7 +571,7 @@ call to `usable_timeout`, `max` or `floor_count` puts the class in the row. A ca
 body for the same three names, which is how `KafkaSink`'s `flush_timeout` reaches `usable_timeout`
 through `kafka._usable_timeout`. Anything else — `require_timeout`, a keyword forwarded to another
 constructor (`SyslogSink`, `LogstashSink`), a value handed to the driver unjudged (`NATSSink`'s
-`connect_timeout` and `drain_timeout`), a dict comprehension (`RabbitMQSink`) — keeps the class out
+`connect_timeout`), a dict comprehension (`RabbitMQSink`) — keeps the class out
 of the row. Measured with that scan at `fda134a`, the row is exactly the four classes named. The
 stated bound: a floor reached through two helpers, or through a keyword, is not seen; the floor of
 four in the AC below is what makes that bound fail loudly if a refactor moves one of the four out
@@ -602,8 +602,10 @@ by the row they break, and the shipped tree is reported clean.
       checks is mutation-tested once (the derived population emptied, the decision file renamed, the
       Pub/Sub test deleted) and reddens on its own reason.
 - [ ] `tests/test_sink_retry.py::test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side`
-      still passes; its name says two where the scan finds three `usable_timeout` callers, and the
-      build renames it to say three.
+      still passes; its name says two where `grep -nE '(^|[^_])usable_timeout\(' src/log_foundry/sinks/*.py`,
+      less its `def` line, finds four calls (`NATSSink`'s `publish_timeout` and `drain_timeout`,
+      `kafka._usable_timeout` and `GooglePubSubSink`'s `overflow_timeout`), and the build renames
+      it to say four.
 - [ ] No behaviour changes: the full suite's tests of the three plan-named departures pass unmodified.
 - [ ] Serves no invariant: it records and pins departures that FR-001 to FR-004's invariants already
       hold, and changes no behaviour a probe could observe.
@@ -741,3 +743,4 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   on the orchestrator's measurement at `fda134a`, with the localisation limit stated and the
   transient `FATAL`s left retryable.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-05, drift review: row 1 adds `NATSSink`'s `drain_timeout`, which SPEC-061 floors through `usable_timeout`, and drops it from the unjudged examples; the `usable_timeout` call count is re-measured as four on `93113e1b`.

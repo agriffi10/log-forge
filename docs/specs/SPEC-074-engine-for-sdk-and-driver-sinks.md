@@ -57,8 +57,7 @@ often as before.
 - Only the events that failed are resent: under 1.x a raising batch was resent whole, chunks that
   had landed included.
 - An exception the sink does not declare retryable (SPEC-070) costs one attempt in total, where the
-  worker used to resend it. This includes a `NATSSink` batch whose every publish raised, and an SQS
-  FIFO batch whose every id callable raised: the caller's own exception is still re-raised from
+  worker used to resend it. This includes an SQS FIFO batch whose every id callable raised: the caller's own exception is still re-raised from
   `emit` by identity and still counted by no sink counter, but the worker no longer re-runs the
   callables (FR-002).
 - A `Failed` item, `writeErrors` entry or positional result the sink cannot read is counted in
@@ -150,8 +149,9 @@ often as before.
   decision). Nothing in `kafka.py`, `pubsub.py` or `multi.py` changes; FR-006 pins that.
 - **The local sinks** (`StdoutSink`, `StderrSink`, `FileSink`, `RotatingFileSink`, `SQLiteSink`):
   they keep `emit`, for the reason under *In Scope*.
-- **A predicate for `NATSSink`.** SPEC-070 declared none; a publish that raises is `REJECTED` here
-  (FR-004), and naming NATS's transient exceptions is a later change.
+- **A predicate for `NATSSink`.** SPEC-070 declared none; a publish that raises is `REJECTED` beside
+  a publish that landed and `RETRYABLE` when nothing in its round landed, as 1.x (FR-004), and naming
+  NATS's transient exceptions is a later change.
 - **Declaring any shipped sink idempotent.** FR-006 records why none qualifies.
 - **The closed-guard helper** is SPEC-076's. This spec keeps each sink's own closed flag and lock,
   and a closed sink's `deliver` keeps today's observable through the refusal marker: the
@@ -334,8 +334,8 @@ from step 1:
    events are all `DROPPED`, the run settles with `dropped_events == 2`, nothing is resent, and there
    is no `refuse`, because not every event failed in caller code. `NATSSink` does not take this step.
    SPEC-069 leaves it off the encode step, counting an unencodable event in `failed` as a publish
-   that raised, and FR-004 keeps that: the event is `REJECTED` with SPEC-061's publish line, so
-   `.failed` moves and `losses().dropped` does not.
+   that raised, and FR-004 keeps that: the event takes FR-004's outcome for a publish that raised,
+   with SPEC-061's publish line, so `.failed` moves and `losses().dropped` does not.
 2. Chunk with the sink's existing chunker (`chunk_items`, kept from SPEC-071) and send **every
    remaining chunk once per round**, in order, through `_send`, now one attempt with no loop, which
    keeps SPEC-048's guard inside it. A chunk's failure does not hold back the chunks after it, so
@@ -543,27 +543,46 @@ the close alone.
 - **NATS, as SPEC-061 leaves it.** `deliver` runs SPEC-061's coroutine for one round, under
   `self._lock` and its bounds, and maps what it learns. Each refusal SPEC-061 makes before the first
   publish is a refusal round (FR-001) carrying SPEC-061's own `SinkDeliveryError`: `RETRYABLE` for a
-  disconnected client, the latch and an unanswered pre-publish probe, which a later round can pass;
-  `REJECTED` for a forked child, a closed or a closing sink. A publish that raises is `REJECTED` with
-  SPEC-061's line (NATS declares no predicate), and so is an event `json.dumps` cannot encode, which
-  stays inside the publish path, off FR-002's step 1. An event the deadline left unattempted is
-  `RETRYABLE`, its `LAST` line SPEC-061's `publish_timeout` line. A core batch whose confirmation went
+  disconnected client, the probe's latch, an unanswered pre-publish probe and the abandoned-publish
+  latch (`_refuse_while_stuck`, read for every client, an injected one included, before the lock and
+  again under it), each of which a later round can pass, so the worker retries a batch refused by
+  any of them exactly as it retries the raise in 1.x; `REJECTED` for a forked child, a closed or a
+  closing sink. A publish that raises, and an event the deadline left unattempted, take the
+  outcome the rule below gives (NATS declares no predicate). A core batch whose confirmation went
   unanswered makes its published events `UNKNOWN` with SPEC-061's `unconfirmed` line, never resent.
+  A publish abandoned at the deadline on JetStream or an injected client, which SPEC-061 FR-001
+  counts as unconfirmed where it is abandoned, is `UNKNOWN` with SPEC-061's `unconfirmed, ...
+  abandoned` line, never resent, since `NATSSink` declares no idempotence (SPEC-072 FR-004); on the
+  sink's own core client the confirming round trip judges it, as the row before says.
   The wedged-loop backstop raises SPEC-061's `SinkDeliveryError` unchanged, which SPEC-072 counts as
   an escaped exception, as 1.x's worker counted its raise. JetStream and an injected client keep
-  SPEC-061's behaviour; a JetStream publish that raised is `REJECTED`.
+  SPEC-061's behaviour, and a JetStream publish that raised takes the rule below.
+
+  After the first publish, the round's outcome follows the one fact 1.x's `emit` acts on: whether
+  anything in the round was published. An abandoned publish counts as published, as
+  `_emit_on_loop` counts it.
+  - **Nothing published.** 1.x's `emit` raises and the worker resends the whole batch, so every
+    event of the round is `RETRYABLE`, announced `LAST`: each publish that raised, an ack wait that
+    expired in the driver included, with SPEC-061's publish line, and each event the deadline left
+    unattempted, with its `publish_timeout` line. An event `json.dumps` cannot encode is a publish
+    that raised, since it stays inside the publish path, off FR-002's step 1.
+  - **Something published.** 1.x's `emit` returns, counting the rest in `failed`, and the worker
+    resends nothing, so a publish that raised (an unencodable event included) and an event the
+    deadline left unattempted are `REJECTED`, announced `ALWAYS` with the same two lines.
 
 **NATS's budget.** `NATSSink` takes no `max_retries` and gains none, so SPEC-072 gives it the
 worker's `max_retries` further rounds on the drain thread and none on the orphan path or through
 `emit` (the adapter uses the sink's own `max_retries`, or 0). So SPEC-061's `emit` against a stalled
 server still takes one `publish_timeout` and raises with `losses()` unchanged, and the worker still
-retries a refused batch as its 1.x loop did.
+retries a refused batch, or one in which nothing was published, as its 1.x loop did: `w + 1`
+`deliver` calls for 1.x's `w + 1` `emit` calls, each carrying the whole batch, then
+`failed_batches` once with 1.x's `batch abandoned after {w + 1} emit attempts` line (SPEC-072
+FR-005).
 
-**This squares with SPEC-061's bounded delivery.** SPEC-061 bounds one `emit` by `publish_timeout`.
-A resend of a batch whose every publish raised, with no class declared transient, would spend
-another such bound on the drain thread for a failure nothing says will pass, so it now fails once,
-counted, as every converted sink fails an exception it does not declare retryable (SPEC-070). What
-SPEC-061 shows can pass, a refusal before the first publish, is `RETRYABLE` and still retried.
+**Why a batch with nothing published is still resent:** the 1.2.0 release is additive, so `emit`'s
+contract and every documented counter stay true for 1.x callers and no count is reclassified, and
+1.x resends that batch (`docs/invariants.md` 2's JetStream asymmetry, which therefore stays true as
+written and is not rewritten).
 
 #### Acceptance Criteria:
 
@@ -587,8 +606,16 @@ SPEC-061 shows can pass, a refusal before the first publish, is `RETRYABLE` and 
       unanswered probe is three `deliver` calls with no publish, a PONG on the second delivers the
       batch once, and refused throughout gives `failed_batches == 1` with `losses()` unchanged.
 - [ ] NATS: one publish raising beside two unconfirmed is `.failed == 3` and `emit` returns; every
-      publish raising is `.failed == n`, `emit` raises, and a `Worker` makes one `deliver` call;
+      publish raising, a JetStream ack-wait expiry among them, is `.failed == n` and `emit` raises;
       SPEC-061's blocked-publish case still returns with `.failed` equal to the batch size.
+- [ ] NATS, every publish raising through `Worker(max_retries=2)`: three `deliver` calls, each with
+      the whole batch, the same count of publish attempts 1.x's three `emit` calls make;
+      `failed_batches == 1` with the line `batch abandoned after 3 emit attempts`; and a batch whose
+      second round publishes is delivered with no third call.
+- [ ] NATS, one publish landing and the deadline leaving the other `n - 1` unattempted, through
+      `Worker(max_retries=2)`: one `deliver` call, `losses().failed == n - 1`, `failed_batches`
+      unmoved, `flush()` true, `health()` equal field for field to the same case on `93113e1b`, and
+      the only stderr line SPEC-061's `publish_timeout` line.
 - [ ] NATS keeps SPEC-069's ledger: one unencodable event among several is `.failed == 1` and
       `losses().dropped == 0`, and `emit` returns; a batch of nothing but unencodable events raises
       `SinkDeliveryError` with `.failed` equal to the batch size. SPEC-069 FR-001's and FR-002's NATS
@@ -980,3 +1007,5 @@ other site still stating the old claim:
   a criterion kills the per-round mutant, and FR-006's idempotency reasoning no longer rests on
   per-round ids.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-05, drift review: the NATS mapping gives a publish abandoned at the deadline (JetStream or an injected client) `UNKNOWN`, never resent, and names the abandoned-publish latch `_refuse_while_stuck` as a `RETRYABLE` refusal round, which keeps 1.x's worker retry of the refused batch.
+- 2026-11-05, the additive rule restored on SPEC-061's code: a NATS round in which nothing was published is `RETRYABLE` throughout, so the worker resends it `w + 1` times as 1.x does and `docs/invariants.md` 2's JetStream asymmetry stays true unrewritten; a publish that raised or an event left unattempted beside a publish that landed is `REJECTED`, counted in `failed` and never resent, as 1.x. The reason that argued for one attempt is replaced by the additive rule, and the Overview's release-notes line no longer names NATS.

@@ -4,7 +4,7 @@ id: SPEC-069
 title: "Encoding and Driver Errors — One Bad Event Costs Only Itself in Every Sink"
 description: "Gives every record-building sink one encode step before its bulk call, so an event it cannot encode costs only itself and one its destination refuses is repaired and delivered, and counts, announces and types the driver errors the SQLite and file sinks let escape."
 spec_status: Draft
-depends_on: [SPEC-026, SPEC-058, SPEC-059]
+depends_on: [SPEC-026, SPEC-058, SPEC-059, SPEC-061, SPEC-066]
 arc: stability-redesign
 arc_order: 1
 ---
@@ -113,8 +113,8 @@ This spec is a caller-visible behaviour change in a minor release, so it carries
 entry. Three changes are visible to a caller: a sink stops raising on an event it cannot encode,
 two refusals are repaired instead of losing the batch, and three sinks raise a new subclass. The
 only overlap with SPEC-061 is that SPEC-061 rewrites `NATSSink.emit`. This spec does not touch
-`NATSSink`, so SPEC-061 leaves nothing to rebase. SPEC-061 has landed, in 1.1.0, and is not in
-`depends_on` because this spec does not build on it.
+`NATSSink`, so SPEC-061 leaves nothing to rebase. SPEC-061 has landed, in 1.1.0, and is in
+`depends_on`, because FR-001's and FR-002's `NATSSink` criteria pin the sink as SPEC-061 left it.
 
 ## Scope
 
@@ -390,9 +390,14 @@ Two destinations meet that bar.
   - a NUL in a key becomes U+FFFD.
 
   The walk then runs `bson.encode` again.
-  - *Placeholder text.* The expression is factored into one private function in `sanitize.py`,
-    which the sink calls and a test holds equal to `_Coercer`'s inline copy, so the text cannot
-    drift.
+  - *Placeholder text.* The expression is factored out of `sanitize._int_text` (SPEC-066), which
+    already renders `<int: ~N digits>` for a refusal message, into one private function in
+    `sanitize.py`, `int_placeholder`. `_int_text`'s placeholder branch and the sink both call it,
+    so `_int_text`'s output is unchanged. The other copies keep their inline expression:
+    `_Coercer`'s two (`_bounded_int` and `integer`, inlined because they run once per integer) and
+    `_otel._int_digits` (a leaf that imports nothing from the package). A test holds all three
+    sites equal to `int_placeholder` on positive and negative integers either side of each digit
+    boundary it crosses, so the text cannot drift.
   - *Values left alone.* A NUL in a *value* is not touched, because BSON accepts it.
   - *Importing `bson`.* It is imported lazily on the first `emit` that reaches the check, never at
     construction, and read by name. A `bson` that is missing, or has no `encode`, disables the
@@ -649,7 +654,7 @@ repair_nul(event) -> dict[str, object] | None        # a marked copy, or None wh
 repair_bson(event) -> dict[str, object] | None       # ints outside int64 and NUL keys, marked
 
 // src/log_foundry/sanitize.py   (private)
-int_placeholder(value: int) -> str                   # "<int: ~N digits>", shared with _Coercer
+int_placeholder(value: int) -> str                   # "<int: ~N digits>", called by _int_text; _Coercer and _otel held equal
 
 // src/log_foundry/sinks/_driver_error.py   (private; in no __all__)
 delivery_error(err: Exception) -> Exception | None
@@ -664,7 +669,7 @@ None. No new argument, `configure()` key or environment variable.
 
 ```
 src/log_foundry/
-├── sanitize.py             # edited: int_placeholder factored out
+├── sanitize.py             # edited: int_placeholder factored out of _int_text
 └── sinks/
     ├── _encode.py          # new: encode_events, repair_nul, repair_bson
     ├── _driver_error.py    # new: delivery_error
@@ -732,4 +737,5 @@ tests/
   - FR-005 now serves no invariant.
   - The Postgres loss is now described as the whole batch (one commit across all chunks).
   - FR-005's octet-count criterion was dropped, because it already passes today.
-- 2026-11-05: rebased onto main after v1.1.0; SPEC-061 has landed and stays out of depends_on, since this spec does not build on it.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-05, drift review: SPEC-061 (its `NATSSink` criteria pin SPEC-061's sink) and SPEC-066 joined `depends_on`; `int_placeholder` is factored out of SPEC-066's `sanitize._int_text`, and its equality test covers `_Coercer`'s two inline copies and `_otel._int_digits`.

@@ -28,8 +28,8 @@ Two specs have landed, in 1.1.0, and this one builds on both: SPEC-066 (the `flu
 timeout verdicts, which put a door at the public calls and leave `_shutdown_worker`, `claim_stop`
 and `Worker.stop` alone) and SPEC-068 (shutdown expiry: `architecture.md` §12's double announce of
 an expired exit drain, a second `shutdown()` after an expired one, and a fork-resumed worker not
-resetting `Worker._stopped`). Both are in `depends_on`. This spec does not re-specify any of those fixes and writes nothing that depends on how they
-come out, which is why `Worker._stopped` stays on `Worker` (FR-001).
+resetting `Worker._stopped`). Both are in `depends_on`. This spec does not re-specify any of those
+fixes and writes nothing that depends on how they come out, which is why `Worker._stopped` stays on `Worker` (FR-001).
 
 **What "today's state" is, measured at `fda134a`.** The plan this arc follows counted eleven lock
 and event sites across `_lifecycle.py` and `worker.py`; that reproduces, with
@@ -524,19 +524,20 @@ The last column is FR-003's child value: `walk` (replaced by `_fork._reinit_prim
 | `_lock` | `_lifecycle.py:157` | itself | `Runtime` | walk |
 | `_worker`, `_late_worker`, `_owed`, `retirements`, `_atexit_registered` | `_lifecycle.py:156-163` | `_lock` (reads of `_worker` and `retirements` are unlocked, single loads) | `Runtime`, unchanged | inherited |
 | `_shutdown_running` | `_lifecycle.py:162` | `_lock` | `Runtime`, unchanged | inherited — the known defect under Out of Scope |
-| `_stop` | `_lifecycle.py:160`, replaced at `:272` | `_lock` | `Runtime`, unchanged | walk |
+| `_stop` | `_lifecycle.py:160`, replaced at `:272` | `_lock` | `Runtime`, unchanged | walk; in a resumed child then reset: `_rebuild_worker_after_fork`, whose `Worker._reinit_after_fork` calls `refresh_stop_signal` (`worker.py:581` at `93113e1b`), replacing it if set; a retired child keeps the walked event |
 | `_closers` | `_lifecycle.py:356` | `_closers_lock` | moves to `Runtime` | inherited (its threads read dead and are pruned) |
 | `_closers_lock`, `_closing_now_lock`, `_owned_lock` | `_lifecycle.py:357`, `:430`, `:624` | themselves | move to `Runtime` | walk |
 | `_closing_now` | `_lifecycle.py:393` | `_closing_now_lock` | moves to `Runtime` | reset: `_clear_after_fork` |
 | `_owned`, `_marking_failed` | `_lifecycle.py:606`, `:598` | `_owned_lock`; `_marking_failed` none, written by the child's one thread | move to `Runtime` | reset: `_mark_inherited` |
 | `_swaps_running`, `_stops_running` | new | none: added under `_lock`, discarded atomically | `Runtime` | reset: `_clear_after_fork` |
 | `_Closing.event` | `_lifecycle.py:390` | the registry lock | stays, a per-close event owned by the entry | walk |
-| `Worker._stopped` | `worker.py:415` | `Worker._lock` | stays: the once-only stop gate **of one worker**, and there can be two (`_worker` and `_late_worker`), so a field on `Runtime` would need keying by worker; SPEC-068 changed how it resets, in 1.1.0 | inherited at `fda134a` |
-| `Worker._exit_deadline`, `_in_flight` | `worker.py:416-417` | `_exit_deadline` under `Worker._lock` by `claim_stop`; `_in_flight` by the drain thread | stay: the drain's own bookkeeping (SPEC-062) | reset: `_rebuild_worker_after_fork` |
+| `Worker._stopped` | `worker.py:415` | `Worker._lock` | stays: the once-only stop gate **of one worker**, and there can be two (`_worker` and `_late_worker`), so a field on `Runtime` would need keying by worker; SPEC-068 changed how it resets, in 1.1.0 | reset: `_rebuild_worker_after_fork`, to `False` when the child resumes (`worker.py:578` at `93113e1b`, SPEC-068); inherited by a retired child |
+| `Worker._exit_deadline`, `_in_flight` | `worker.py:416-417` | `_exit_deadline` under `Worker._lock` by `claim_stop`; `_in_flight` by the drain thread | stay: the drain's own bookkeeping (SPEC-062) | reset: `_rebuild_worker_after_fork` — `_in_flight` in every child, `_exit_deadline` only when the child resumes, so a retired child inherits it |
+| `Worker._join_owed`, `_join_taken_over` | `worker.py:431-432` at `93113e1b` | `Worker._lock` by `claim_stop` | stay: the join a stop claimed on the drain thread owes, and whether a later caller took it over (SPEC-068 FR-006); per worker, like `_stopped` | reset: `_rebuild_worker_after_fork`, to `False` when the child resumes (`worker.py:579-580`); inherited by a retired child |
 | `Worker._drain_finished`, `_drain_settled` | `worker.py:413-414` | events | stay: the drain loop's own events, ordered against each other (`_run`'s docstring), read by `draining` and `flush` | walk, then reset: `_rebuild_worker_after_fork` |
 | `Worker._held`, `_taken_markers` | `worker.py:419`, `:418` | `Worker._lock` | stay: what the worker's own thread may still be inside, and the `flush()` callers it owes; both in `Worker._FORK_SKIP` | reset: `_rebuild_worker_after_fork` |
 | `Worker._epoch` | `worker.py:412` | none | stays: the retirement count copied at that worker's build, which makes `live_worker` a comparison | inherited |
-| `Worker._stop` | `worker.py:411` | none | stays: a reference to `Runtime._stop` taken at the build, or a fresher event for a late worker; not a second signal | walk |
+| `Worker._stop` | `worker.py:411` | none | stays: a reference to `Runtime._stop` taken at the build, or a fresher event for a late worker; not a second signal | walk; in a resumed child then reset: `_rebuild_worker_after_fork`, to `refresh_stop_signal()`'s event (`worker.py:581` at `93113e1b`); a retired child keeps the walked event |
 | `Worker._lock` | `worker.py:420` | itself | stays: guards the worker's counters, markers and `_stopped` | walk |
 | `Worker.sink` | `worker.py:400` | `Worker._lock` in `retarget` | stays; no `Runtime.sink` is added (Out of Scope) | inherited |
 | `Worker.batch_size`, `flush_interval`, `max_retries`, `_max_queue` | `worker.py:401-403`, `:409` | none, set once | stay: tunables | inherited |
@@ -630,3 +631,4 @@ updated for the rename and for the three loose names that moved.
   base commit, as SPEC-071's pins are, since SPEC-072 rewrites `Worker._emit` and adds
   `_retry_declined` before this spec builds.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-05, drift review: the inventory adds `Worker._join_owed` and `_join_taken_over` (SPEC-068 FR-006), and its child column now has `Worker._stopped`, `Worker._stop` and `Runtime._stop` reset on resume through `refresh_stop_signal`, `_exit_deadline` reset only on resume, and each retired child's case.

@@ -437,6 +437,11 @@ SPEC-058, SPEC-061 (1.1.0), SPEC-069 and SPEC-070 leave it:
 | a wrapper's per-event failure beside delivered siblings | `SKIPPED`, counted in the wrapper's own `_dropped` (SPEC-075) |
 | an event a sink cannot encode, which SPEC-069 widens from an unrenderable HTTP event | `DROPPED` |
 | a NATS core batch whose confirmation went unanswered (SPEC-061) | `UNKNOWN` |
+| a NATS publish abandoned at the deadline, on JetStream or an injected client, counted unconfirmed (SPEC-061 FR-001) | `UNKNOWN` |
+
+Both NATS rows stay never retried: FR-004 resends an `UNKNOWN` outcome only for a sink that declares
+itself idempotent, and `NATSSink` declares nothing (no shipped sink does, SPEC-074), so the engine
+counts each once, as 1.x does.
 
 **The engine announces** a settled run's loss in one `_diag.lost` line naming counts by term and the
 number of rounds, never a value (invariant 11), unless the sink registered an announcement of its
@@ -577,7 +582,8 @@ batch, so a swap to an engine sink and back takes effect on the next batch.
 
 **Worker.** The engine's stop event is the worker's `_stop`; the decline predicate is
 `Worker._retry_declined`; `_in_flight` is set before the run and reset in the same `finally`, so the
-expiry line of SPEC-062 FR-005 counts the events inside a `deliver`. A failed run increments
+expiry line counts the events inside a `deliver`: SPEC-062 FR-005's count, written since SPEC-068
+FR-001 as a `_diag.pending` line rather than a loss. A failed run increments
 `failed_batches` once and writes one line, through `_diag.lost("event", len(batch), ...)` exactly as
 1.x does: when the run declined, SPEC-062's `retry declined after {k} emit attempt(s); the next was
 predicted to end after the shutdown() deadline` with `k` the `deliver` calls made; otherwise 1.x's
@@ -938,3 +944,4 @@ tests/
 - 2026-11-05, the fold-in's review: the `Verdict` refusal routes its container and elements on their
   real type, and a criterion covers an element whose `__class__` claims `Outcome`.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-05, drift review: FR-003's never-retried table gains invariant 2's abandoned NATS publish (JetStream or an injected client) as `UNKNOWN`, never resent because `NATSSink` declares no idempotence; FR-005's expiry line is credited to SPEC-068 FR-001's `_diag.pending` line.
