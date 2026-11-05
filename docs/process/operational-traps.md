@@ -41,5 +41,15 @@ list project-specific; seed it the first time a trap bites and never again.
   Completed specs, delivery docs, audits, release notes — keep the paths they were written with:
   `docs/decisions/<area>.md` now reads `docs/decisions/<area>/`, and `docs/specs/INDEX.md` reads
   `docs/specs/index.yaml` or `docs/specs/ARCS.md`.
+- **A CodeQL default-setup run on `main` can go red on its upload alone, and only a new commit
+  clears the red.** Run `42062242018` on `7dbe5254` failed "Analyze (actions)" at "Perform CodeQL
+  Analysis": the SARIF exported, then "Uploading results" stalled and the step failed with no error
+  line, so no analysis for that commit appears under `code-scanning/analyses`. `gh run rerun`
+  refused that run ("cannot be retried"; its event is `dynamic`), and the weekly scheduled re-scan
+  does not help, because `queue.sh` reads a sha as red while any run on it failed. The job log is
+  what decides: one ending at "Uploading results" is an upload stall that any new commit clears,
+  while an extraction or query failure is an ordinary red needing a real fix. A missing
+  `/language:<lang>` row for the failed job's language only confirms nothing was uploaded, which
+  is true of both. Either way it is an `IS RED`, handled as `scripts/pr-queue/PROTOCOL.md` says.
 - _(add your own as they bite — one line each, with the fix.)_
 
