@@ -26,9 +26,9 @@ freeze: `from log_foundry.sinks.otlp import OTLPSink` is the one new public impo
 each batch as OTLP/HTTP JSON to a Collector or any backend that ingests OTLP, and the core still
 has no runtime dependency. `log_foundry.__all__` is unchanged and so is every shipped sink's
 constructor signature. The fixes, though, can break a caller that worked on `1.0.2`: several sink
-arguments, `configure()` ceilings and `flush()`/`shutdown()` timeouts that were accepted and then
-misbehaved are now refused, some sink URLs and DSNs are refused or post elsewhere, and some field
-keys, header values, stderr lines and counters read differently. The notes open with the list of
+arguments, `configure()` ceilings and `flush()`/`shutdown()` timeouts that were accepted, some of
+them working and some misbehaving later, are now refused; some sink URLs and DSNs are refused or
+post elsewhere; and some field keys, header values, stderr lines and counters read differently. The notes open with the list of
 what can break you, each item linked to its entry; read it before you bump a `>=1,<2` pin.
 [**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.1.0/docs/release-notes/v1.1.0.md).
 
