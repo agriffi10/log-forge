@@ -33,8 +33,8 @@ copy — so nothing forced the row into the tag commit; the release was prepared
 one the tag is cut from, so there was no later commit to add it in. Convenience, not mechanism.
 **`v1.0.2`'s row is pre-written for the same weaker reason**: its notes link `CHANGELOG.md` and the
 three delivery docs tag-absolutely, but not this table. **So is `v1.1.0`'s**: its notes link
-nothing outside themselves, since the lead's links are anchors within the file, and nothing else
-in its tree links this table at `blob/v1.1.0`.
+only themselves tag-absolutely, since the lead's links must reach the entries from the release page,
+which renders no heading anchors, and nothing in its tree links this table at `blob/v1.1.0`.
 
 **Which makes any pre-written row a hostage to the tag actually being cut, so re-read it before
 you cut.** Three ways it goes wrong. **A spec completes first:** on `v1.0.0`'s row the exposure
