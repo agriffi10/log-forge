@@ -2,9 +2,9 @@
 type: Spec
 id: SPEC-071
 title: "Shared Kit, Part One: import_extra, One Injected-Client Refusal and the Chunker Rule"
-description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, and pins first the rosters those moves can reach."
+description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, routes configure()'s and the sinks' type doors on the real type, and pins first the rosters those moves can reach."
 spec_status: Draft
-depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059]
+depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059, SPEC-065]
 arc: stability-redesign
 arc_order: 3
 ---
@@ -37,18 +37,34 @@ the `EventData` class per batch (probe-confirmed at `fda134a`). That too is inva
 observable broken. FR-002 resolves the class through `import_extra` at construction, so the
 configuration is refused where it is written.
 
+**And the type doors stop asking the value what it is.** `configure()`'s stamps and payload
+ceilings, `sinks/_retry.py`'s four type validators and `OTLPSink`'s endpoint test their argument with
+`isinstance`, which falls back to the value's own `__class__`, and name it with
+`type(value).__name__`, which a metaclass `__name__` property answers. Probed at `4fbfd60`, a value
+whose `__class__` property returns `str` gives `configure(service=x)` the message `descriptor
+'__str__' requires a 'str' object but received a 'Claims'`, which does not name `service`; a raising
+`__class__` raises its own exception out of every one of the seven doors; and a metaclass `__name__`
+property returning `"str"` gives `service must be a str, got str`. `docs/architecture.md` §12 on
+`main` records this as open (recorded by SPEC-080, which closed the same defect for `@trace`).
+FR-005 closes it with SPEC-080's own helpers, at Andrew's direction, deferred from 1.1.0.
+
 **What changes for a caller:** a missing extra's message names the extra; the five existing
 refusals share one message tail; nine options that were ignored beside an injected client are now
-refused; and an injected-producer `AzureEventHubsSink` with no extra installed is refused at the
-constructor. Each is a release-notes line. Nothing else changes in what a sink delivers, counts or
+refused; an injected-producer `AzureEventHubsSink` with no extra installed is refused at the
+constructor; and a value lying about its type is refused with a `TypeError` naming the argument and
+its real type. Each is a release-notes line. Nothing else changes in what a sink delivers, counts or
 retries. Tests that already exist and are **not edited**, plus characterisation tests written first
 against the unmodified code, are what show that.
 
-This spec builds on SPEC-066, which lands first in 1.1.0 and is not in `depends_on` because it is not
-yet in `docs/specs/`. SPEC-066 adds `exact_int` and `floor_count` to `sinks/_retry.py` and routes
-every `max_retries` floor through them. **That is why the plan's "`max_retries` floor" row is absent
-here:** its validator already exists by the time this spec builds. This spec adds no function to
-`sinks/_retry.py` and edits no line of it. `_BACKOFF_BASE` and the retry loop belong to SPEC-072.
+This spec builds on SPEC-065 (in `depends_on`: its four payload ceilings are among FR-005's doors)
+and on SPEC-066 and SPEC-080, which have landed on `main` (`4fbfd60`) and are not in `depends_on`
+because they are not in this branch's `docs/specs/`. SPEC-066 added `exact_int`
+and `floor_count` to `sinks/_retry.py` and routed every `max_retries` floor through them. **That is
+why the plan's "`max_retries` floor" row is absent here:** its validator already exists. This spec
+adds no function to `sinks/_retry.py`; FR-005 changes how its four type validators and
+`_exact_number` ask a value's type, and nothing else in it. SPEC-080 shipped `_diag._STORED_NAME`,
+`_diag._STR_STR` and `decorator._stored_name`, which FR-005 reuses. `_BACKOFF_BASE` and the retry
+loop belong to SPEC-072.
 
 **Built after SPEC-069 and SPEC-070, so every pinned set is derived on the commit the build starts
 from**, and written out by name there; the figures below are anchored to `fda134a`, the tree this
@@ -128,6 +144,51 @@ re-raises, so that site still propagates.
     the exact line `from google.cloud import pubsub_v1  # type: ignore[import-not-found,
     unused-ignore]` and the `google.cloud.*` mypy override in `pyproject.toml`.
 
+**What was measured at `4fbfd60`, for FR-005** (current `main`; the branch rebases onto it).
+
+- **Seven type doors.** An AST scan of `src/log_foundry/**/*.py` for a `raise TypeError(...)` whose
+  message formats `type(x).__name__` for an `x` other than `self` or `cls` finds nine raises. Seven
+  are argument doors that also test `x` with `isinstance`:
+
+  | Site (`file:line` of the `isinstance`) | Function | Reached from |
+  |---|---|---|
+  | `config.py:112` | `_require_positive` | `configure()`'s four payload ceilings |
+  | `config.py:144` | `_require_text` | `configure()`'s `service`, `version`, `env` |
+  | `sinks/_retry.py:220` | `exact_seconds` | `require_timeout`'s callers, `HTTPSink.max_retry_after` |
+  | `sinks/_retry.py:254` | `require_positive` | the sinks' chunk sizes, intervals and counts |
+  | `sinks/_retry.py:289` | `exact_int` | `floor_count`: every `max_retries`, the worker's included |
+  | `sinks/_retry.py:355` | `wait_budget` | `flush(timeout=)` and `shutdown(timeout=)` |
+  | `sinks/otlp.py:115` | `OTLPSink.__init__` | `OTLPSink(endpoint)` |
+
+  The other two, `sanitize._coerce_unbounded` (`sanitize.py:1458`) and `TransformSink._apply`
+  (`transform.py:243`), test a transform's *result*, a local, once per event.
+- **One helper behind the doors.** `_retry._exact_number` (`_retry.py:113`, `:115`) is reached
+  after `exact_seconds` and `wait_budget` pass and from `usable_timeout`. It picks `int.__index__`
+  or `float.__float__` with `isinstance`, so a real `float` subclass whose `__class__` property
+  returns `int` passes the door and is refused with `descriptor '__index__' requires a 'int' object`
+  (probed through both doors).
+- **Every other `isinstance` on a parameter.** A second scan, every `isinstance(p, ...)` whose `p`
+  is a parameter of its function, finds 61 calls. Outside the rows above they are per-event
+  encoding (`_otel`, `sanitize`, `sinks/_time.py`), fork and lifecycle walks, a response parse
+  (`otlp.py:339`), `decorator._refuse_unusable`'s kept proxy test (SPEC-080), and two constructor
+  branches that refuse nothing by type: `SQSSink`'s `message_group_id` (`sqs.py:148`) and the HTTP
+  sinks' `auth` (`http.py:813`). The two scripts are in the build's PR body; the guard in FR-005
+  re-derives the population on the build's base commit.
+- **Callable arguments that nothing tests.** An AST scan of every `__init__` in
+  `src/log_foundry/sinks/*.py`, for a parameter whose annotation names `Callable` (module-level
+  aliases resolved), finds seven, and none is tested for being callable. A probe passing `5` and
+  `"x"` to each shows every one constructs and then fails later:
+  - `SQSSink`'s `message_group_id` (`str | Callable | None`, only a `str` is tested for blankness)
+    and `message_deduplication_id` (`Callable | None`). On a FIFO queue every `emit` raises
+    `TypeError: 'int' object is not callable` and sends nothing. On a standard queue, which never
+    reads either, the batch is delivered. `message_deduplication_id="x"`, a constant where a
+    callable is wanted, fails the same way.
+  - `FilteringSink`'s `predicate` and `HTTPSink`'s `opener` (`Callable | None`): every `emit`
+    raises the same `TypeError`, and the filter's inner sink receives nothing.
+  - `CallbackSink`'s `on_close` (`Callable | None`): `emit` delivers, and `close()` raises.
+  - `CallbackSink`'s `fn` and `TransformSink`'s `fn`, annotated bare `Callable` with no default,
+    fail every `emit` the same way, `None` included.
+
 ## Scope
 
 ### In Scope
@@ -138,6 +199,11 @@ re-raises, so that site still propagates.
 - One refusal for every build option passed beside an injected client, at every constructor a
   derived sweep finds, with a guard that catches a sink that *ignores* the option (FR-003).
 - `SQSSink._chunks` on `chunk_items` (FR-004).
+- The seven type doors and `_retry._exact_number` routed on the real type and naming the type's
+  stored name, with a derived guard, the §12 entry resolved and a sibling decision (FR-005).
+- A refusal at the constructor for all seven callable arguments: SQS's two id sources,
+  `FilteringSink.predicate`, `HTTPSink.opener`, `CallbackSink.on_close`, and the two `fn`s of
+  `CallbackSink` and `TransformSink` (FR-005).
 - The v1.2.0 release-notes lines, and running the Integration workflow, which the build's edits to
   `src/log_foundry/sinks/**` trigger.
 
@@ -159,8 +225,24 @@ re-raises, so that site still propagates.
 - **Which exceptions a sink retries** (SPEC-070) and **how it encodes an event** (SPEC-069). FR-004
   changes only the boundary arithmetic of `_chunks`, as it stands on the build's base commit.
 - **Peer branches.** SPEC-061 rewrites the `import nats` site and SPEC-066 moves the constructors'
-  floors above their builds; both land first in 1.1.0, and the build rebases onto them, keeping
+  floors above their builds; both have landed on `main`, and the build rebases onto them, keeping
   both edits.
+- **The type-tested sites that are not FR-005's doors** (Overview, measured at `4fbfd60`):
+  - `decorator._refuse_unusable`'s `isinstance(fn, (classmethod, staticmethod))`, which SPEC-080
+    keeps on purpose, last and reached only by a callable, and which already names through
+    `_stored_name`.
+  - `sanitize._coerce_unbounded` and `TransformSink._apply`, which judge a transform's result once
+    per event, where invariants 2 and 8 govern and invariant 13 does not.
+  - `OTLPSink`'s response parse (`otlp.py:253`, `:258`, `:339`), which reads a server's reply,
+    not an argument.
+  - The HTTP sinks' `auth`, which branches on `isinstance(auth, str)`, and a non-`str` that is
+    not a pair is already refused with a `ValueError` naming `auth`.
+  - `_retry.usable_timeout`'s comparison on a non-number, floor-side by the decision
+    `docs/decisions/sink-delivery/a-bad-argument-is-floored-if-it-works-and-refused-if-it-is-already-broken-a-new-one-is-refused.md`.
+  - The `type(self).__name__` owner in every sink's messages, which names the caller's own class,
+    not the argument's type.
+- **What a real `str` subclass endpoint does after `OTLPSink`'s door.** It passes the door, as an
+  honest value of the declared type, and reaches `_valid_url` and `HTTPSink` unchanged.
 
 ---
 
@@ -185,7 +267,7 @@ build branches from and then written out by name, because SPEC-069 and SPEC-070 
   at `fda134a`). The runtime specs later in the arc move that population, and this way they start
   from a floor with no slack. It is a floor, so an added site needs no edit; only a removed one does.
 - **The text-pin sweep.** The build re-runs the Overview's text grep on its base commit, extended
-  with every source line Phases 2 to 4 rewrite. Each hit is either kept true or named in the PR body
+  with every source line Phases 2 to 5 rewrite. Each hit is either kept true or named in the PR body
   as edited, with the reason. At `fda134a` the hits are the integration marker (FR-002 re-aims it)
   and `test_the_mypy_accommodation_is_in_place` (FR-002 deletes it).
 
@@ -395,8 +477,8 @@ comprehensions over them. Defaults are read from each concrete class's `inspect.
 - The derived population of classes is compared exactly with the table's fifteen plus `SentrySink`
   (whose client is built from no option), re-derived on the build's base commit.
 
-`_args.py` is a new module rather than a function in `_retry.py`, because that file is SPEC-066's and
-is about bounding waits.
+`_args.py` is a new module rather than a function in `_retry.py`, because `_retry.py` bounds waits
+and judges numbers, and this refusal does neither.
 
 #### Acceptance Criteria:
 
@@ -443,7 +525,7 @@ is about bounding waits.
 - [ ] Its second set is exactly `SQLiteSink.database`, and its class population is exactly the
       table's fifteen plus `SentrySink`.
 - [ ] No `ValueError` raised in `sinks/*.py` outside `_args.py` carries `to an injected`.
-      `LogstashSink`'s two backend refusals are unchanged, and `git diff` shows no change to
+      `LogstashSink`'s two backend refusals are unchanged, and Phase 3's commits change no line of
       `sinks/_retry.py`.
 - [ ] Serves invariant 13, whose observable "no argument is silently ignored because another was
       given" this closes at every constructor the sweep finds except its recorded exception, and
@@ -502,6 +584,150 @@ own batching (*Out of Scope*).
 - [ ] Serves invariants 2 and 7. A dropped event is counted once, on return, and an all-oversize
       batch still settles counted without raising.
 
+### FR-005: The type doors ask the type, never the value, name the argument and its type's stored name, and refuse a non-callable
+
+#### Description:
+
+Each of the seven doors in the Overview's table changes two expressions and nothing else.
+- **The test.** `isinstance(value, T)` becomes `issubclass(type(value), T)`, with `T` unchanged
+  (`str`, `int`, or `int | float`). `type()` reads the real type, and `issubclass` walks its MRO
+  through `T`'s own metaclass, so neither runs the value's `__class__`.
+- **The name.** `type(value).__name__` becomes `_diag._STR_STR(_diag._STORED_NAME(type(value)))`,
+  the expression `decorator._stored_name` returns. `type`'s own `__name__` descriptor ignores a
+  metaclass property, and `str.__str__` copies a `str`-subclass name without running its methods.
+  `decorator._stored_name` is not imported, because `decorator` imports `model`, which imports
+  `config`. `config.py` and `sinks/_retry.py` gain `from log_foundry import _diag`, a leaf, and
+  `otlp.py` already imports it.
+
+`_retry._exact_number` routes the same way: `issubclass(type(value), int)` before `int.__index__`,
+and `issubclass(type(value), float)` before `float.__float__`. A real `float` subclass whose
+`__class__` claims `int` is then read as the float it holds, as SPEC-065 meant for every member of
+the declared type. A non-number is still returned unchanged, so `usable_timeout` keeps its
+floor-side comparison `TypeError` (*Out of Scope*), now for a lying value too.
+
+**What a caller sees.** A value that is not of the declared type is refused at the call, as at
+`4fbfd60`, now always with the door's own `TypeError` naming the argument and the real type's stored
+name. An honest value's message is byte-identical, because for a type with no metaclass `__name__`
+property the stored name *is* `type(value).__name__`. So the existing message tests
+(`tests/test_config.py`, `tests/test_numeric_doors.py`, `tests/test_sink_retry.py`,
+`tests/test_sinks_otlp.py`, `tests/test_decorator_sync.py`) pass unedited, and so does
+`tests/test_numeric_door_roster.py`, whose judges keep their names.
+
+**The twin paths (invariant 6).**
+- `flush()` and `shutdown()`, invariant 6's two answerers of a flush marker, both judge `timeout`
+  through `wait_budget`, so each lying shape gets the same refusal from both.
+- `config._require_positive` and `_retry.require_positive` are twins by their own docstrings: one
+  verdict on one value. Every sink constructor reaches the `_retry` doors through the same helper,
+  so one fix holds for all of them.
+- `@trace`, invariant 13's third entry point, was routed this way by SPEC-080. The guard below
+  holds its doors too, so the three entry points cannot drift apart again.
+
+**The callable doors.** `sinks/_args.py` (FR-003) also gains `require_callable(value, name, owner,
+*, text=False, optional=True)`. It returns for `None` when `optional` is set, for a callable (`callable(value)` reads the type's call slot
+and runs nothing of the value), and, when `text` is set, for a value whose real type is a `str`
+subclass. Otherwise it raises `TypeError` naming the owner, the argument and the type's stored name:
+`<owner> <name> must be callable or None, not <type>`, `must be callable, not <type>` without
+`optional`, or `must be a str, a callable or None` with `text`. It is called first in each
+constructor, beside the `_retry` doors and before any client is built or anything is stored, for
+these seven arguments:
+- `SQSSink`: `message_group_id` with `text=True`, and `message_deduplication_id`.
+- `FilteringSink`: `predicate`.
+- `HTTPSink`: `opener`, which also covers every HTTP platform sink and `SentrySink`'s HTTP delegate.
+- `CallbackSink`: `on_close`, and `fn` with `optional=False`.
+- `TransformSink`: `fn` with `optional=False`.
+
+`owner` is `type(self).__name__`, as `HTTPSink` and `OTLPSink` already name themselves.
+`SQSSink`'s blank-group test becomes `issubclass(type(message_group_id), str)` and runs on
+`_diag._STR_STR(message_group_id)`, so a `str` subclass's own `strip` is not run. **SQS refuses on a
+standard queue too**, where both ids are never read and the batch is delivered today. That follows
+the recorded rule (the bad-argument decision, refined by SPEC-065 and SPEC-066): a value outside the
+declared type is refused even where it happened to work, because it is already a `mypy` error, so no
+type-checked caller breaks. `SentrySink(backend="sdk", opener=...)` keeps its existing `ValueError`,
+because it builds no delegate.
+
+**The behaviour table.** `tests/test_type_doors.py` drives each door, through its public entry
+(the `Reached from` column) and directly, with the three lying shapes of the Overview and a
+metaclass whose `__name__` property raises. Each shape's getters count their calls.
+
+**The guard.** `tests/test_type_door_roster.py` derives from the AST of `src/log_foundry/**/*.py`
+and checks three things:
+- It reports `file:line` for any `raise TypeError(...)` whose message formats `type(x).__name__` or
+  `x.__class__.__name__` for an `x` other than `self` or `cls`, outside an exemption set compared
+  exactly with `{sanitize._coerce_unbounded, TransformSink._apply}`.
+- It reports any `isinstance(p, ...)` on a parameter `p` of a door, or of a same-module function a
+  door passes `p` to (one level, as `tests/test_numeric_door_roster.py` follows). The only
+  exemption is `decorator._refuse_unusable`, named.
+- A *door* is a function raising a `TypeError` that names the type of a parameter other than
+  `self` or `cls` through `_diag._STORED_NAME` or `_stored_name`. The derived set of doors equals, exactly, a set written
+  out by name from the build's base commit: its stored-name doors (at `4fbfd60`, decorator's
+  `trace` and `_refuse_unusable`) plus the seven this FR converts and `_args.require_callable`, ten
+  in all. An exact set, not a
+  count, so a door that is removed, renamed or inlined back reddens by name, and a new door is a
+  visible edit.
+
+It has its own fixture corpus. Its mutation sweep rewrites each door's `issubclass(type(p), T)` to
+`isinstance(p, T)`, and each stored-name read to `type(p).__name__`, in memory, and requires the
+scan to report every one.
+
+**The records.** The build moves §12's entry "`configure()`'s stamps, its numeric ceilings, the
+`_retry` doors and `OTLPSink`'s endpoint test their arguments with `isinstance`…" from *Open* to
+*Resolved* in `docs/architecture.md`, struck through and marked closed by SPEC-071. It writes a
+**sibling decision** rather than rewriting SPEC-080's, because that one's title and area
+(`trace-model`) are about `@trace`. The sibling goes in `docs/decisions/sink-delivery/`, beside the
+bad-argument decision that already holds these doors' floor-or-refuse rule. It states that an
+argument door asks `type`, never the value, names the stored name, and keeps no `isinstance` outside
+the guard's named exemption, and it points to SPEC-080's decision as the `@trace` half. Its fence
+is written with its entry and dated History, and `sh scripts/gen-index.sh` regenerates the index.
+Invariant 13's *Guarded* line gains the two new test files.
+
+#### Acceptance Criteria:
+
+- [ ] For each of the seven doors, a value whose `__class__` property returns the door's `T` raises
+      `TypeError` whose message names the argument and the value's real class name. At `4fbfd60`,
+      `configure(service=x)` raised `descriptor '__str__' requires a 'str' object…`, and
+      `OTLPSink(x)` a `ValueError` about the scheme.
+- [ ] For each door, a value whose `__class__` property raises gives that same `TypeError`, and
+      the property's exception is never raised. At `4fbfd60` each door raised the property's own
+      exception.
+- [ ] For each door, an instance of a class whose metaclass `__name__` property returns `T`'s name
+      gives a message carrying the class's stored name, never `got str` or `not int`. A metaclass
+      whose `__name__` property raises gives the same message.
+- [ ] Each of the three shapes counts, in a probe, zero calls of its `__class__` getter and its
+      metaclass `__name__` getter, at every door.
+- [ ] `flush(x)` and `shutdown(x)` give the same message for each shape, naming `timeout`, and
+      `configure(max_keys=x)` and `_retry.require_positive(x, …)` give the same verdict for each.
+- [ ] `_retry.exact_seconds` and `wait_budget`, given a real `float` subclass whose `__class__`
+      returns `int`, return the exact `float` it holds. At `4fbfd60` both raised the `__index__`
+      descriptor error.
+- [ ] `SQSSink(url, client=c, message_group_id=5)` and `message_deduplication_id="x"`, on a FIFO
+      and on a standard queue, raise `TypeError` naming the argument and `int` or `str`, and no
+      client is built. `FilteringSink(m, predicate=5)`, `HTTPSink(url, opener="x")`,
+      `CallbackSink(f, on_close=5)`, `CallbackSink(5)`, `CallbackSink(None)`, `TransformSink(m, "x")`
+      and `TransformSink(m, None)` raise likewise. At `4fbfd60` each constructed.
+- [ ] Each of those seven arguments still accepts a callable (a lambda, a class with `__call__`),
+      the five optional ones accept `None`, and `message_group_id` accepts a non-blank `str` and a `str` subclass and refuses a
+      blank one with its existing `ValueError`. A value whose `__class__` claims `str` or a callable
+      type is refused with the `TypeError`, its getter never called.
+- [ ] `tests/test_sinks_sqs*.py`, `tests/test_sinks_http*.py`, `tests/test_sinks_compose.py`,
+      `tests/test_wrapper_failures.py`, `tests/test_sentry_backend.py` and every other test that
+      constructs `CallbackSink` or `TransformSink` pass unedited.
+- [ ] For honest values, `None`, an exact value, a `bool` and a real subclass are accepted and
+      normalised as at `4fbfd60`, and a wrong type gets byte-identical text. The five message test
+      files and `tests/test_numeric_door_roster.py` pass unedited.
+- [ ] `tests/test_type_door_roster.py`'s corpus reports a door written with `isinstance`, one naming
+      through `type(v).__name__`, one naming through `v.__class__.__name__`, and a door whose
+      same-module helper tests `p` with `isinstance`.
+- [ ] It is silent on `issubclass(type(v), T)` with `_STORED_NAME`, on `type(self).__name__` as an
+      owner, and on `isinstance` in a function that raises no `TypeError`.
+- [ ] On the real tree, its door set equals the ten written out by name and its exemptions are
+      exactly the three named. Its mutation sweep reports every site it plants.
+- [ ] `docs/architecture.md` §12 carries the entry under *Resolved*, closed by SPEC-071, and
+      `docs/decisions/sink-delivery/` carries the sibling decision, fence and dated History
+      together, in the regenerated index.
+- [ ] Serves invariants 13 and 6. Every type door refuses where it is written with the argument
+      named, no callable argument is accepted and then fails every `emit`, and `flush()`/`shutdown()`
+      and the two `require_positive` twins give one verdict.
+
 ---
 
 ## Data Model
@@ -529,6 +755,24 @@ PostgresSink.__init__(..., connect_timeout: int | None = None)   // was int = DE
 
 // src/log_foundry/sinks/sqs.py
 class _Prepared(NamedTuple): body: str; group_id: str | None; dedup_id: str | None; size: int
+
+// src/log_foundry/config.py (_require_positive, _require_text),
+// src/log_foundry/sinks/_retry.py (exact_seconds, require_positive, exact_int, wait_budget),
+// src/log_foundry/sinks/otlp.py (OTLPSink.__init__): the door, T unchanged
+if not issubclass(type(value), T):                       // was: not isinstance(value, T)
+    raise TypeError(f"... {_diag._STR_STR(_diag._STORED_NAME(type(value)))}")
+                                                         // was: {type(value).__name__}
+// src/log_foundry/sinks/_args.py
+require_callable(value: object, name: str, owner: str, *, text: bool = False,
+                 optional: bool = True) -> None
+    // (optional and None), callable(value), or (text and issubclass(type(value), str)) -> returns
+    // else -> TypeError(f"{owner} {name} must be callable or None, not {stored name}")
+    //         ("must be callable" without optional; "must be a str, a callable or None" with text)
+
+// src/log_foundry/sinks/_retry.py
+_exact_number(value): issubclass(type(value), int) -> int.__index__(value)
+                      issubclass(type(value), float) -> float.__float__(value)
+                      else -> value                      // unchanged
 ```
 
 ## API / Interface Contract
@@ -541,6 +785,14 @@ except ImportError: ...         # still matches; so does ModuleNotFoundError, an
 RedisListSink("k", client=c, url="redis://x")
                                 # ValueError: RedisListSink cannot apply url to an injected client; ... drop client=
 AzureEventHubsSink(producer=p)  # azure-eventhub absent: MissingExtraError at construction
+
+configure(service=claims_str)   # TypeError: service must be a str, got Claims
+                                #   (was: descriptor '__str__' requires a 'str' object ...)
+flush(meta_named_int)           # TypeError: timeout must be an int or float number of seconds,
+                                #   or None, not Meta   (was: ... not int)
+SQSSink("https://q.fifo", message_group_id=5)
+                                # TypeError: SQSSink message_group_id must be a str, a callable
+                                #   or None, not int   (was: accepted; every emit raised)
 ```
 
 ## File & Folder Structure
@@ -554,7 +806,7 @@ src/log_foundry/sinks/{clickhouse,eventhubs,kafka,mongodb,nats,postgres,rabbitmq
                                                                   # the refusals
 src/log_foundry/sinks/postgres.py       # connect_timeout: int | None = None
 src/log_foundry/sinks/sqs.py            # _chunks on chunk_items, _Prepared.size
-docs/invariants.md                      # §13 gains its Recorded exceptions line
+docs/invariants.md                      # §13: Recorded exceptions line; Guarded line
 pyproject.toml                          # google.cloud.* override removed
 CLAUDE.md, .github/workflows/integration.yml   # the extras paragraph and header comment
 tests/test_extras_sites.py              # Phase 1 characterisation of the sites     (new)
@@ -562,6 +814,12 @@ tests/test_extras_roster.py             # FR-002 guard and its corpus           
 tests/test_injected_client_roster.py    # FR-003 guard and its corpus               (new)
 tests/test_sinks_args.py                # FR-003 helper table                       (new)
 tests/test_sinks_sqs_chunks.py          # FR-004 boundary corpus                    (new)
+src/log_foundry/config.py, src/log_foundry/sinks/{_retry,otlp}.py   # FR-005's doors
+src/log_foundry/sinks/{_args,sqs,filtering,http,callback,transform}.py   # FR-005's callable doors
+tests/test_type_doors.py                # FR-005 lying-shape table                  (new)
+tests/test_type_door_roster.py          # FR-005 guard and its corpus               (new)
+docs/architecture.md                    # §12 entry moved to Resolved
+docs/decisions/sink-delivery/<slug>.md  # FR-005 sibling decision (new), index regenerated
 tests/test_sink_integration_roster.py   # FR-001 pin; FR-002 re-aims the derivation (edited)
 tests/test_worker_predicate_roster.py   # _SITE_FLOOR raised                        (edited)
 tests/test_otel_envelope.py             # the mypy-accommodation test deleted       (edited)
@@ -589,10 +847,19 @@ docs/release-notes/v1.2.0.md
 
 - `_args.py`, its table test, the eight constructors, and `tests/test_injected_client_roster.py`.
 
-### Phase 4: The SQS chunker, and the landing
+### Phase 4: The type doors on the real type
+
+- The seven doors and `_exact_number`, `require_callable` and its seven call sites,
+  `tests/test_type_doors.py`, and
+  `tests/test_type_door_roster.py` with its corpus and mutation sweep (FR-005).
+- The door set and exemptions written out by name on the base commit.
+
+### Phase 5: The SQS chunker, and the landing
 
 - `_Prepared.size`, `_chunks` on `chunk_items`, and the derived module-set check.
 - The release-notes entries, and the component-inventory rows for `_extras` and `_args`.
+- The §12 entry moved to *Resolved*, the sibling decision with its fence and History, and the
+  index regenerated (FR-005).
 - The edits to `src/log_foundry/sinks/**` trigger the Integration workflow on the PR. Its run is owed
   before the merge and is named in the PR body as owed, since it cannot settle before the push.
 
@@ -616,3 +883,17 @@ docs/release-notes/v1.2.0.md
 - **Revised after the arc's build-order re-read.** The `connect_timeout` resolution now keeps the
   parameter as the floor call's positional argument, with a criterion that SPEC-070's row-1
   population is unchanged, and the SQS corpus's unencodable case is unconditional.
+- **2026-11-05: fold-in of the SPEC-080 deferred item, at Andrew's direction.** FR-005 added, taking
+  the spec from four FRs to five: `architecture.md` §12's open entry on `configure()`'s stamps and
+  ceilings, the `_retry` doors and `OTLPSink`'s endpoint, deferred from 1.1.0. Its population was
+  swept by AST at `4fbfd60`, with the sites it does not take scoped out by name. The Overview's
+  SPEC-066 paragraph and FR-003's `_args.py` sentence were corrected, since SPEC-066 has landed,
+  and SPEC-065 joined `depends_on`, being in this branch's `docs/specs/`.
+- **2026-11-05: the callable doors, at Andrew's direction.** `SQSSink(message_group_id=5)`, found
+  while sweeping for FR-005, is folded into FR-005 with no new spec. A sweep of callable-typed
+  constructor arguments at `4fbfd60` found seven never tested, and the five typed as a union are
+  refused through `_args.require_callable`, which joins the guard's door set (now ten).
+- **2026-11-05: the two bare-`Callable` arguments, at Andrew's direction.** `CallbackSink.fn` and
+  `TransformSink.fn` have the same defect as the five union-typed arguments and take the same fix,
+  so FR-005 refuses all seven, the two required ones refusing `None` too (`optional=False`). The
+  guard's door set stays at ten, because `require_callable` is one door.

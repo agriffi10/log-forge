@@ -172,6 +172,12 @@ construction, for example because its counters were replaced. In that case the w
 `TypeError` naming the inner sink's type, which fails the run (SPEC-072). The wrapper never calls
 `run_delivery` or `emit` on its inner sink from `deliver`, so the engine's rounds are not nested.
 
+**How a type is named.** Every `TypeError` this spec adds names a type, whether the wrapper's, the
+inner sink's or `LogstashSink`'s, through `_diag._STR_STR(_diag._STORED_NAME(type(x)))`, never
+`type(x).__name__`. A metaclass `__name__` property cannot rename it, and SPEC-071 FR-005's guard
+holds. Each names `self` or an attribute, not a parameter, so none joins that guard's pinned door
+set.
+
 **The retry budget is copied at construction.** The engine runs its rounds on the wrapper. So when
 the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink as
 plain instance attributes, with an ordinary attribute read (SPEC-074 makes some of them read-only
@@ -216,7 +222,8 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       wrapper.
 - [ ] A direct `deliver` on a non-offering wrapper raises `TypeError` naming the wrapper's class. An
       inner sink whose counters are replaced after construction makes the next round raise
-      `TypeError` naming its type, and the run fails.
+      `TypeError` naming its type, and the run fails. For an inner sink class whose metaclass
+      `__name__` property returns another name, the message carries the stored name.
 - [ ] A forked child that finds the shared counters' lock held by a parent thread completes a run
       through the wrapper within 5 s.
 - [ ] SPEC-074's engine-sink roster still finds exactly thirteen classes, and SPEC-070's restated
@@ -375,7 +382,8 @@ not `None` at construction:
 - it copies `max_retries` and `max_retry_after` from the backend, as FR-001 describes, and declares
   no idempotence.
 
-Otherwise `log_foundry_counters` is `None`, and a direct `deliver` raises `TypeError`. Each count a
+Otherwise `log_foundry_counters` is `None`, and a direct `deliver` raises `TypeError`, naming the
+class as FR-001's *How a type is named* says. Each count a
 backend makes through the run context names the backend as its owner (SPEC-073), and the engine's
 totals land on the backend's counters. So the unchanged `losses()` and `failed`, which already read
 the backend, report a run through `LogstashSink` exactly as a run through the bare backend.
@@ -572,3 +580,6 @@ tests/
 - Build-order re-read: SPEC-074 now records only the SQS half of the caller-code decision's History,
   since the wrappers' `deliver` does not exist until this spec, so this spec writes the wrappers'
   History line itself.
+- 2026-11-05, the SPEC-080 follow-ups folded into the arc, at Andrew's direction: every `TypeError`
+  this spec adds names its type through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard holds. None
+  is one of that guard's doors, since each names `self` or an attribute.

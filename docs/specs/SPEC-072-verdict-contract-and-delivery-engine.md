@@ -169,7 +169,10 @@ A `Verdict` addresses events by index in the list `deliver` was given: `outcomes
 `batch[i]`. A sink that re-chunks, filters or transforms maps its inner verdicts back to its own
 indices before returning. `retry_after` is the server's hint in seconds, advisory only (FR-002).
 `outcomes` is typed `tuple[Outcome, ...]`; at run time a `list` is also accepted and stored as a
-`tuple`, for an untyped caller, and any other container type is refused.
+`tuple`, for an untyped caller, and any other container type is refused. The refusal's `TypeError`
+names a type through `_diag._STR_STR(_diag._STORED_NAME(type(x)))`, never `type(x).__name__`, so a
+metaclass `__name__` property cannot rename it and SPEC-071 FR-005's guard holds. It names an
+element or an attribute, not a parameter, so it is not one of that guard's doors.
 
 **`deliver` is optional and probed, never declared on the `Sink` Protocol**, which stays structural
 for the reason `losses()` is not declared on it. `read_deliver(sink)` decides whether a sink
@@ -208,6 +211,9 @@ dataclass does. `configure()`, `Config` and every existing signature are unchang
 - [ ] An `outcomes` element that is not an `Outcome`, or an `outcomes` that is a `str`, a generator
       or a `set`, raises `TypeError` naming the position or the type, never a value;
       `Verdict.uniform` with a negative count raises `ValueError`.
+- [ ] An `outcomes` element, or an `outcomes` container, whose class has a metaclass `__name__`
+      property returning `"Outcome"` or `"tuple"` is refused with a message naming the class's
+      stored name, and the property is never called.
 - [ ] `list(Outcome)` is exactly the six members above, in that order.
 - [ ] `read_deliver` returns the bound method for a sink whose class defines `deliver` and whose
       `log_foundry_counters` is a `SinkCounters`, and `None` for each of: no `deliver`, a
@@ -226,8 +232,9 @@ dataclass does. `configure()`, `Config` and every existing signature are unchang
 - [ ] `tests/typed_consumer/accepts.py` type-checks under `mypy --strict` with a sink whose
       `deliver` returns a `Verdict` built by keyword from a tuple, and `rejects.py` holds a
       positional `Verdict(...)` that `mypy` refuses.
-- [ ] Serves invariants 7 and 10: `deliver` returning a `Verdict` is invariant 7's second form, and
-      every public name added only grows the surface.
+- [ ] Serves invariants 7, 10 and 13: `deliver` returning a `Verdict` is invariant 7's second form,
+      every public name added only grows the surface, and a malformed `Verdict` is refused where it
+      is built, its type named.
 
 ### FR-002: One engine resends only the retryable events, in bounded, idle rounds
 
@@ -641,7 +648,10 @@ decline predicate, and then keeps the 1.x contract: it returns `None` when the r
 returns without calling `deliver`. A sink that reaches the adapter with no usable `deliver` or no
 `SinkCounters`, such as one that misspelt `log_foundry_counters`, raises `TypeError` naming its type
 and the missing member, from every non-empty `emit`, so the batch is a counted failure rather than
-events that vanish while `flush()` reports success.
+events that vanish while `flush()` reports success. The type is named through
+`_diag._STR_STR(_diag._STORED_NAME(type(sink)))`, so SPEC-071 FR-005's guard holds. Because `sink`
+is a parameter, `emit_via_deliver` has that guard's door shape, so the build adds it to the guard's
+pinned door set in `tests/test_type_door_roster.py`. It tests `sink` with no `isinstance`.
 
 So a third-party wrapper that calls `inner.emit(batch)`, or a subclass that overrides `emit` and calls
 `super().emit(batch)`, sees what 1.x showed it: a normal return on a partial outcome, an unreadable
@@ -674,6 +684,9 @@ exception costs its chunk* records. The worker never calls the adapter for a sin
       each event exactly once through a real `Worker`, and every delivered event carries the
       subclass's stamp (the override ran).
 - [ ] A shutdown cuts an engine sink's `emit` backoff short through `log_foundry_stop_signal`.
+- [ ] That `TypeError`, for a sink class whose metaclass `__name__` property returns another name,
+      names the class's stored name, and `tests/test_type_door_roster.py`'s pinned door set gains
+      exactly `_engine.emit_via_deliver`.
 - [ ] Serves invariants 6, 7 and 2: `emit` and `deliver` of one sink are a twin pair with one ledger,
       total failure raises and partial loss reports, and no `dropped` count is made twice across a
       catcher's retry.
@@ -913,3 +926,7 @@ tests/
   predicate, and a criterion proves `HTTPSink`'s inherited predicate answers `True` through the
   engine; FR-003 states that a run whose sink registered its own announcement gets no engine
   settled line, the refinement SPEC-073 relies on.
+- 2026-11-05, the SPEC-080 follow-ups folded into the arc, at Andrew's direction: every `TypeError`
+  this spec adds that names a type names it through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard
+  holds. `emit_via_deliver` joins that guard's pinned door set, and the `Verdict` refusal does not,
+  because it names an element rather than a parameter.
