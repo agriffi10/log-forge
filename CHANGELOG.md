@@ -29,8 +29,8 @@ constructor signature. The fixes, though, can break a caller that worked on `1.0
 arguments, `configure()` ceilings and `flush()`/`shutdown()` timeouts that were accepted, some of
 them working and some misbehaving later, are now refused; some sink URLs and DSNs are refused or
 post elsewhere; some field keys, header values, stderr lines and counters read differently;
-`flush(math.inf)` now waits rather than returning at once; and `NATSSink` waits on its server and
-raises `TimeoutError` from `close()`. The notes open with the list of what can break you, the
+`flush(math.inf)` now waits rather than returning at once; and `NATSSink` waits on its server
+before it publishes and raises `TimeoutError` from a `close()` against a stalled server. The notes open with the list of what can break you, the
 silent changes first and each item linked to its entry; read it before you bump a `>=1,<2` pin.
 [**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.1.0/docs/release-notes/v1.1.0.md).
 
