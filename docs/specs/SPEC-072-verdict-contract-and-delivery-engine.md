@@ -172,7 +172,9 @@ indices before returning. `retry_after` is the server's hint in seconds, advisor
 `tuple`, for an untyped caller, and any other container type is refused. The refusal's `TypeError`
 names a type through `_diag._STR_STR(_diag._STORED_NAME(type(x)))`, never `type(x).__name__`, so a
 metaclass `__name__` property cannot rename it and SPEC-071 FR-005's guard holds. It names an
-element or an attribute, not a parameter, so it is not one of that guard's doors.
+element or an attribute, not a parameter, so it is not one of that guard's doors. The container and
+each element are routed on their real type (`issubclass(type(x), …)`), never `isinstance`, so an
+element whose `__class__` claims `Outcome` is refused and its `__class__` is never read.
 
 **`deliver` is optional and probed, never declared on the `Sink` Protocol**, which stays structural
 for the reason `losses()` is not declared on it. `read_deliver(sink)` decides whether a sink
@@ -214,6 +216,9 @@ dataclass does. `configure()`, `Config` and every existing signature are unchang
 - [ ] An `outcomes` element, or an `outcomes` container, whose class has a metaclass `__name__`
       property returning `"Outcome"` or `"tuple"` is refused with a message naming the class's
       stored name, and the property is never called.
+- [ ] An `outcomes` element whose `__class__` property returns `Outcome`, and one whose `__class__`
+      raises, are each refused with `TypeError` naming the position and the real class's stored
+      name, and neither getter is called.
 - [ ] `list(Outcome)` is exactly the six members above, in that order.
 - [ ] `read_deliver` returns the bound method for a sink whose class defines `deliver` and whose
       `log_foundry_counters` is a `SinkCounters`, and `None` for each of: no `deliver`, a
@@ -930,3 +935,5 @@ tests/
   this spec adds that names a type names it through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard
   holds. `emit_via_deliver` joins that guard's pinned door set, and the `Verdict` refusal does not,
   because it names an element rather than a parameter.
+- 2026-11-05, the fold-in's review: the `Verdict` refusal routes its container and elements on their
+  real type, and a criterion covers an element whose `__class__` claims `Outcome`.

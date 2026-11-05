@@ -172,7 +172,10 @@ re-raises, so that site still propagates.
   encoding (`_otel`, `sanitize`, `sinks/_time.py`), fork and lifecycle walks, a response parse
   (`otlp.py:339`), `decorator._refuse_unusable`'s kept proxy test (SPEC-080), and two constructor
   branches that refuse nothing by type: `SQSSink`'s `message_group_id` (`sqs.py:148`) and the HTTP
-  sinks' `auth` (`http.py:813`). The two scripts are in the build's PR body; the guard in FR-005
+  sinks' `auth` (`http.py:813`, and `:860` where the header is built). Probed at `4fbfd60`,
+  `HTTPSink("http://h/x", auth=x)` with `x`'s `__class__` property returning `str` raises
+  `TypeError: argument of type 'Liar' is not iterable`, which does not name `auth`, and a raising
+  `__class__` raises its own `RuntimeError`. The two scripts are in the build's PR body; the guard in FR-005
   re-derives the population on the build's base commit.
 - **Callable arguments that nothing tests.** An AST scan of every `__init__` in
   `src/log_foundry/sinks/*.py`, for a parameter whose annotation names `Callable` (module-level
@@ -200,7 +203,8 @@ re-raises, so that site still propagates.
   derived sweep finds, with a guard that catches a sink that *ignores* the option (FR-003).
 - `SQSSink._chunks` on `chunk_items` (FR-004).
 - The seven type doors and `_retry._exact_number` routed on the real type and naming the type's
-  stored name, with a derived guard, the §12 entry resolved and a sibling decision (FR-005).
+  stored name, and the HTTP sinks' `auth` routed on its real type, with a derived guard, the §12
+  entry resolved and a sibling decision (FR-005).
 - A refusal at the constructor for all seven callable arguments: SQS's two id sources,
   `FilteringSink.predicate`, `HTTPSink.opener`, `CallbackSink.on_close`, and the two `fn`s of
   `CallbackSink` and `TransformSink` (FR-005).
@@ -235,8 +239,6 @@ re-raises, so that site still propagates.
     per event, where invariants 2 and 8 govern and invariant 13 does not.
   - `OTLPSink`'s response parse (`otlp.py:253`, `:258`, `:339`), which reads a server's reply,
     not an argument.
-  - The HTTP sinks' `auth`, which branches on `isinstance(auth, str)`, and a non-`str` that is
-    not a pair is already refused with a `ValueError` naming `auth`.
   - `_retry.usable_timeout`'s comparison on a non-number, floor-side by the decision
     `docs/decisions/sink-delivery/a-bad-argument-is-floored-if-it-works-and-refused-if-it-is-already-broken-a-new-one-is-refused.md`.
   - The `type(self).__name__` owner in every sink's messages, which names the caller's own class,
@@ -639,11 +641,24 @@ these seven arguments:
 `owner` is `type(self).__name__`, as `HTTPSink` and `OTLPSink` already name themselves.
 `SQSSink`'s blank-group test becomes `issubclass(type(message_group_id), str)` and runs on
 `_diag._STR_STR(message_group_id)`, so a `str` subclass's own `strip` is not run. **SQS refuses on a
-standard queue too**, where both ids are never read and the batch is delivered today. That follows
-the recorded rule (the bad-argument decision, refined by SPEC-065 and SPEC-066): a value outside the
-declared type is refused even where it happened to work, because it is already a `mypy` error, so no
-type-checked caller breaks. `SentrySink(backend="sdk", opener=...)` keeps its existing `ValueError`,
+standard queue too**, where both ids are never read and the batch is delivered today. The recorded
+rule is `docs/decisions/sink-delivery/a-bad-argument-is-floored-if-it-works-and-refused-if-it-is-already-broken-a-new-one-is-refused.md`. Its "reach of a type refusal" (SPEC-066) covers only an `int` the constructor floors
+or range-checks, and its fence says "do NOT validate a value the selected backend never reads". So
+this refusal rests on a refinement the build records there (*The records*): the reach extends to
+every callable argument a constructor stores. The fence's clause is about validating a *value* the
+backend never reads, not about a type the signature already rules out. A value outside the declared
+type is already a `mypy` error, so no type-checked caller breaks, which is the reasoning SPEC-065
+recorded for the ceilings. `SentrySink(backend="sdk", opener=...)` keeps its existing `ValueError`,
 because it builds no delegate.
+
+**The HTTP sinks' `auth`.** `http._valid_auth` (`http.py:813`) and `http._authorization`
+(`:860`) test `isinstance(auth, str)`, so a value whose `__class__` claims `str` takes the token
+route and runs its own `__contains__`. Both become `issubclass(type(auth), str)`. A value that is
+not really a `str` then takes the pair route, which today already turns a value that cannot be
+unpacked into `ValueError("<owner> auth cannot be sent over HTTP (TypeError)")`, naming `auth`. A
+real `str` and a real pair are judged exactly as at `4fbfd60`, so every message an honest value
+gets is unchanged. These are `ValueError` refusals, not `TypeError` doors, so the guard's door set
+does not hold them; the behaviour table does.
 
 **The behaviour table.** `tests/test_type_doors.py` drives each door, through its public entry
 (the `Reached from` column) and directly, with the three lying shapes of the Overview and a
@@ -665,9 +680,17 @@ and checks three things:
   count, so a door that is removed, renamed or inlined back reddens by name, and a new door is a
   visible edit.
 
-It has its own fixture corpus. Its mutation sweep rewrites each door's `issubclass(type(p), T)` to
-`isinstance(p, T)`, and each stored-name read to `type(p).__name__`, in memory, and requires the
-scan to report every one.
+It has its own fixture corpus. Its scope is recorded by what the corpus asserts it does *not*
+see:
+- a type named by a helper, such as `_otel.py:337`'s `raise TypeError(_type_name(value))` over
+  `_otel.py:163`;
+- a message built in a local and raised later;
+- a `ValueError` door, such as `auth`'s;
+- a `TypeError` that names no type.
+
+Each is a deliberate edge, not a miss. Its mutation sweep rewrites each door's
+`issubclass(type(p), T)` to `isinstance(p, T)`, and each stored-name read to `type(p).__name__`,
+in memory, `_args.require_callable` included, and requires the scan to report every one.
 
 **The records.** The build moves §12's entry "`configure()`'s stamps, its numeric ceilings, the
 `_retry` doors and `OTLPSink`'s endpoint test their arguments with `isinstance`…" from *Open* to
@@ -678,7 +701,11 @@ bad-argument decision that already holds these doors' floor-or-refuse rule. It s
 argument door asks `type`, never the value, names the stored name, and keeps no `isinstance` outside
 the guard's named exemption, and it points to SPEC-080's decision as the `@trace` half. Its fence
 is written with its entry and dated History, and `sh scripts/gen-index.sh` regenerates the index.
-Invariant 13's *Guarded* line gains the two new test files.
+Invariant 13's *Guarded* line gains the two new test files. The build also refines
+`docs/decisions/sink-delivery/a-bad-argument-is-floored-if-it-works-and-refused-if-it-is-already-broken-a-new-one-is-refused.md` in place, with a dated History entry and its fence updated to match. The reach of a type
+refusal extends from the floored or range-checked `int`s to every callable argument a constructor
+stores, whether or not the selected branch reads it. The reason is the one SPEC-065 gave: the value
+is outside the declared type, so no type-checked caller breaks.
 
 #### Acceptance Criteria:
 
@@ -718,12 +745,19 @@ Invariant 13's *Guarded* line gains the two new test files.
       through `type(v).__name__`, one naming through `v.__class__.__name__`, and a door whose
       same-module helper tests `p` with `isinstance`.
 - [ ] It is silent on `issubclass(type(v), T)` with `_STORED_NAME`, on `type(self).__name__` as an
-      owner, and on `isinstance` in a function that raises no `TypeError`.
+      owner, on `isinstance` in a function that raises no `TypeError`, and on the four recorded
+      edges: a helper-built name, a message held in a local, a `ValueError` door, and a `TypeError`
+      naming no type.
+- [ ] `HTTPSink("http://h/x", auth=x)`, for an `x` whose `__class__` claims `str` and for one whose
+      `__class__` raises, raises `ValueError` naming `auth`, and neither getter is called. At
+      `4fbfd60` these raised `argument of type 'Liar' is not iterable` and the `RuntimeError`. A
+      `str` token and a `(user, password)` pair behave as at `4fbfd60`.
 - [ ] On the real tree, its door set equals the ten written out by name and its exemptions are
       exactly the three named. Its mutation sweep reports every site it plants.
 - [ ] `docs/architecture.md` §12 carries the entry under *Resolved*, closed by SPEC-071, and
       `docs/decisions/sink-delivery/` carries the sibling decision, fence and dated History
-      together, in the regenerated index.
+      together, in the regenerated index. The bad-argument decision carries a dated History entry
+      extending a type refusal's reach to callable arguments, and its fence says so.
 - [ ] Serves invariants 13 and 6. Every type door refuses where it is written with the argument
       named, no callable argument is accepted and then fails every `emit`, and `flush()`/`shutdown()`
       and the two `require_positive` twins give one verdict.
@@ -788,8 +822,9 @@ AzureEventHubsSink(producer=p)  # azure-eventhub absent: MissingExtraError at co
 
 configure(service=claims_str)   # TypeError: service must be a str, got Claims
                                 #   (was: descriptor '__str__' requires a 'str' object ...)
-flush(meta_named_int)           # TypeError: timeout must be an int or float number of seconds,
-                                #   or None, not Meta   (was: ... not int)
+flush(Timeout())                # class Timeout's metaclass has a __name__ property returning "int":
+                                # TypeError: timeout must be an int or float number of seconds,
+                                #   or None, not Timeout   (was: ... not int)
 SQSSink("https://q.fifo", message_group_id=5)
                                 # TypeError: SQSSink message_group_id must be a str, a callable
                                 #   or None, not int   (was: accepted; every emit raised)
@@ -897,3 +932,10 @@ docs/release-notes/v1.2.0.md
   `TransformSink.fn` have the same defect as the five union-typed arguments and take the same fix,
   so FR-005 refuses all seven, the two required ones refusing `None` too (`optional=False`). The
   guard's door set stays at ten, because `require_callable` is one door.
+- **2026-11-05: answered the fold-in's fresh-context review.**
+  - The HTTP sinks' `auth` (`http.py:813`, `:860`) joins FR-005; its Out of Scope reason was false.
+  - SQS's standard-queue refusal now rests on a recorded refinement of the bad-argument decision's
+    reach, not on a reading of it that its fence contradicts.
+  - The guard's corpus asserts silence on its four deliberate edges, and its mutation sweep plants
+    at `require_callable`.
+  - The API example names the instance's class, not its metaclass.

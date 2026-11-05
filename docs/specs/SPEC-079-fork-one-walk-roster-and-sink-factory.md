@@ -93,7 +93,8 @@ not yet in this directory.** SPEC-068 resets `Worker._stopped` when a fork resum
   `_late_worker` in the child, the defect SPEC-077 left here (FR-004).
 - `configure(sink_factory=…)` and `Config.sink_factory`, with their refusals (FR-005), and the
   lazy, per-process build behind a private wrapper sink, `_FactorySink` (FR-006).
-- Refusing at `configure()` a `sink=` that provably has no callable `emit`, which closes
+- Refusing at `configure()`, and in `FilteringSink`, `TransformSink` and `MultiSink`, a sink that
+  is one of the unpatchable builtin values, through one helper, which closes
   `architecture.md` §12's open item "`configure(sink=object())` is accepted, and every batch is then
   lost on the drain thread" (FR-005).
 - The FR count is six, within the aim of 3 to 6.
@@ -121,10 +122,10 @@ not yet in this directory.** SPEC-068 resets `Worker._stopped` when a fork resum
 - **`architecture.md` §12's first open item** (a sink released while live inside the graph that
   replaced it), and the third-party buffers of Kafka and Pub/Sub (§13).
 - **Splitting `_lifecycle.py`.**
-- **Refusing a `sink=` with no `close`, or one whose `emit` is not provably absent** (FR-005, by
-  Andrew's decisions of 2026-11-05). An emit-only sink delivers every event today. A `__getattr__`
-  proxy lacking `emit`, a descriptor that would fail when read, and an unset `__slots__` member
-  stay accepted, and their batches are lost counted, as at `4fbfd60`.
+- **Refusing a `sink=` with no `close`, or any sink that could still gain an `emit`** (FR-005, by
+  Andrew's decisions of 2026-11-05). That includes a user-defined class with no `emit` and an
+  unpatchable C type outside the closed list, whose batches are lost counted and announced, as at
+  `4fbfd60`. It is recorded in §13 as a constraint.
 
 ---
 
@@ -562,43 +563,68 @@ at `configure()`. One whose signature cannot be read, because `inspect.signature
 assigned, so a refused call leaves the config and the ownership record as it found them. What a
 factory returns can only be known by calling it, so FR-006 gives that case its defined answer.
 
-**`sink=` is refused when it provably has no callable `emit`.** This closes `architecture.md` §12's
-open item on `main` (`4fbfd60`): "`configure(sink=object())` is accepted, and every batch is then
-lost on the drain thread". Probed at `4fbfd60`, `configure(sink=object())` then one traced call
-leaves `flush()` falsy with nothing delivered. `sink=` is the twin argument of `sink_factory=`, so
-its refusal lives here and not in SPEC-072, which fences `configure()` as unchanged. Andrew made two
-decisions on 2026-11-05:
-- **Only a missing callable `emit` is refused, never a missing `close`.** An emit-only sink
-  delivers every event on `main` today; `flush()` returns ok, with one "absorbed a failure while
-  closing the sink" line. When the build resolves the §12 item it rewrites that item's closing
-  sentence ("no callable `emit` and `close`") to this rule.
-- **Only a provable absence is refused.** The test reads, and runs none of the sink's code.
+**`sink=` is refused when it is a value that can never be a sink.** This closes, for what
+`configure()` can decide, `architecture.md` §12's open item on `main` (`4fbfd60`):
+"`configure(sink=object())` is accepted, and every batch is then lost on the drain thread". Probed
+at `4fbfd60`, `configure(sink=object())` then one traced call leaves `flush()` falsy with nothing
+delivered. `sink=` is the twin argument of `sink_factory=`, so its refusal lives here and not in
+SPEC-072, which fences `configure()` as unchanged. Andrew decided on 2026-11-05, through the
+question tool:
+- **A missing `close` is never refused.** An emit-only sink delivers every event on `main` today;
+  `flush()` returns ok, with one "absorbed a failure while closing the sink" line.
+- **Only an unpatchable sink is refused.** A sink is refused when it has no callable `emit` *and* can
+  never gain one. A sink may get its `emit` after `configure()`: a class with `emit = None` whose
+  `start()` sets `self.emit`, or a `SimpleNamespace` given `emit` later. Both deliver at `4fbfd60`,
+  and both are accepted.
 
-The test, `config._require_sink(sink)`, runs only when `sink` is not `None`. It reads class
-namespaces through `type`'s own `__mro__` and `__dict__` descriptors, and `emit` with
-`inspect.getattr_static` on the instance. In order:
-1. **Accept without looking** when a class in the MRO other than `object` defines
-   `__getattribute__`, or defines `__dict__` as anything but the interpreter's own descriptor. A
-   shadowed `__dict__` hides instance attributes from `getattr_static`. Probed at `4fbfd60`, a sink
-   with a `__dict__` property and `self.emit` set in `__init__` delivers, and `getattr_static` does
-   not find its `emit`.
-2. **No `emit` found:** refuse, unless a class in the MRO defines `__getattr__`. That proxy is
-   accepted, and a batch it cannot deliver is counted as today.
-3. **A callable found** (`callable()` reads the type's call slot): accept. That covers a function, a
-   bound method, a callable object and a `staticmethod`.
-4. **A descriptor found**, whose type has `__get__` (read statically): accept, without calling
-   `__get__`. That covers a `property`, a `classmethod` and a `__slots__` member. A descriptor
-   delivers in 1.x when its getter returns a callable, which only calling it can show, and
-   *nothing that delivers in 1.x may be refused*.
-5. **Anything else found**, a plain non-callable such as `emit = 3`, `None` or a `str`: refuse.
+**The predicate is a closed list, not the heap-type flag.** "Not a heap type, and no instance
+`__dict__`" (`type.__dict__["__flags__"]` without `Py_TPFLAGS_HEAPTYPE`, `1 << 9`, and
+`type.__dict__["__dictoffset__"]` of `0`) was probed at `4fbfd60` and over-refuses. It holds for
+`weakref.proxy(sink)` and for `super(Sub, inst)`, and both deliver, because a C type's own
+`tp_getattro` can forward attribute lookup, and Python cannot tell a forwarding `tp_getattro` from
+the generic one. So the refused set is `_sink_arg._UNPATCHABLE`, the exact builtin types `object`,
+`str`, `bytes`, `bytearray`, `int`, `float`, `complex`, `bool`, `list`, `tuple`, `dict`, `set`,
+`frozenset` and `range`. Each was probed at `4fbfd60`:
+- it is not a heap type and has a `__dictoffset__` of `0`;
+- `setattr(x, "emit", f)` raises;
+- no class in its MRO has an `emit`;
+- configured as `sink=`, it loses every batch.
 
-A refusal raises `TypeError("sink has no callable emit, got <stored type name>")`, with the type
-named through `_diag._STR_STR(_diag._STORED_NAME(type(sink)))`. It is raised with the ceilings and
-stamps, before `stamp` and before anything is assigned, so the config and the ownership record are
-left unchanged. `config._require_sink` and the function that refuses `sink_factory` each have the
-guard shape of SPEC-071 FR-005: a `TypeError` naming a parameter's stored type name. The build adds
-both to that guard's pinned door set in `tests/test_type_door_roster.py`. Neither tests its argument
-with `isinstance`.
+The test is `any(type(value) is t for t in _UNPATCHABLE)`. `type()` reads the object's type
+pointer, and `is` compares identities, so neither a metaclass `__eq__` nor anything of the value
+runs. A list and not a rule is a deliberate trade: another unpatchable C type (`memoryview`, an
+extension type) is accepted and loses its batches counted, as today.
+
+**The accepted limit.** A user-defined class with no `emit` is a heap type, which can always gain
+one, so it is accepted. Its batches are lost counted and announced, as at `4fbfd60`:
+`failed_batches` on the worker path, `orphan_lost` on the no-worker path. When the build resolves
+the §12 item, its closing text says the item closes for what `configure()` can decide. The
+user-class case moves to `architecture.md` §13 *Known constraints* as a stated constraint: a sink
+`configure()` cannot prove unpatchable is accepted, and if it never gains an `emit` its batches are
+lost counted and announced.
+
+**One helper, for `configure()` and the wrappers.** `FilteringSink(object())`,
+`TransformSink(object(), f)` and `MultiSink(object())` construct on `main` and then fail every
+`emit` (probed at `4fbfd60`). They take the same refusal for their inner-sink arguments, naming
+the argument: `inner`, `inner`, and `sinks[i]` for each child of `MultiSink`. The helper is
+`require_sink(value, name)` in a new module, `src/log_foundry/_sink_arg.py`. It imports only
+`_diag`, a leaf, so the import edges are `config` → `_sink_arg` → `_diag`, plus `sinks/filtering.py`,
+`sinks/transform.py` and `sinks/multi.py` → `_sink_arg`. `config` imports nothing from `sinks/`,
+and `_sink_arg` imports nothing else from the package, so no cycle is possible. It raises
+`TypeError(f"{name} must be a sink with an emit method, got {stored}")`, with `stored` read through
+`_diag._STR_STR(_diag._STORED_NAME(type(value)))` and `name` being `sink`, `FilteringSink inner`,
+`TransformSink inner` or `MultiSink sinks[1]`.
+- **In `configure()`** it runs only when `sink` is not `None`, with the ceilings and stamps, before
+  `stamp` and before anything is assigned. The config and the ownership record are left unchanged.
+- **In each wrapper** it runs first in `__init__`, before anything is stored.
+
+The wrapper edits are this spec's, after SPEC-075 rewrote the same constructors; the build rebases
+onto it.
+
+**The guard.** The `sink_factory` refusal is `config._require_factory(value)`. `_sink_arg.require_sink`
+and `config._require_factory` each have the door shape of SPEC-071 FR-005: a `TypeError` naming a
+parameter's stored type name. The build adds exactly those two to that guard's pinned door set in
+`tests/test_type_door_roster.py`. Neither tests its argument with `isinstance`.
 
 **Test changes, named because this is public surface (invariant 10):**
 
@@ -615,9 +641,10 @@ with `isinstance`.
 **Twin paths (invariant 6).** A factory swapped in after logging has started takes `_swap_sink`'s
 worker branch and its no-worker branch, as `sink=` does. Both branches are tested. `sink=` and
 `sink_factory=` are twin arguments of one call: a refusal of either leaves `get_config()` and the
-ownership record unchanged. A `sink=` that is accepted but cannot deliver is lost counted on both
-delivery paths, `failed_batches` on the worker path and `orphan_lost` on the no-worker path, as at
-`4fbfd60`.
+ownership record unchanged. `configure(sink=)` and the three wrappers' inner-sink arguments are
+refused by one helper, so they cannot drift apart. A sink that is accepted but never gains an
+`emit` is lost counted on both delivery paths, `failed_batches` on the worker path and
+`orphan_lost` on the no-worker path, as at `4fbfd60`.
 
 #### Acceptance Criteria:
 
@@ -630,23 +657,32 @@ delivery paths, `failed_batches` on the worker path and `orphan_lost` on the no-
   `X`. `configure(sink=X)` then `configure(sink_factory=f)` leaves `sink_factory is f`, and `X` is
   closed once, on both delivery paths.
 - [ ] A second `configure(sink_factory=f)` with the same `f` performs no drain and no close.
-- [ ] `configure(sink=object())`, and `sink=` an instance whose class sets `emit = 3`, each raise
-  `TypeError` naming `sink` and the stored type name, both with and without a running worker.
-  `get_config()` and the ownership record are unchanged, and nothing is stamped. At `4fbfd60` each
-  was accepted, and a traced call left `flush()` falsy.
-- [ ] These are accepted and deliver every event, as at `4fbfd60`: an emit-only sink with no
-  `close`, an `emit` that is a `property` returning a function, a `staticmethod` `emit`, an `emit`
-  set on a `SimpleNamespace`, a set `__slots__` member, a `__getattr__` proxy over a full sink, a
-  `__getattribute__` proxy over one, and a sink whose `__dict__` is a property and whose `emit` is
-  set in `__init__`.
-- [ ] A `__getattr__` proxy with no `emit`, and an unset `__slots__` `emit`, are accepted, and their
-  batches are counted in `failed_batches` on the worker path and in `orphan_lost` on the no-worker
-  path, as at `4fbfd60`.
-- [ ] No `__getattr__`, `__getattribute__`, `property` getter or metaclass `__name__` of the sink runs
-  during `configure()`, each counted by a probe. A metaclass `__name__` property returning `"Sink"`
-  leaves the stored name in the message.
-- [ ] `tests/test_type_door_roster.py`'s pinned door set gains exactly `config._require_sink` and the
-  function refusing `sink_factory`.
+- [ ] `configure(sink=x)` raises `TypeError` naming `sink` and the type, both with and without a
+  running worker, for `x` each of `object()`, `"s"`, `5`, `[]` and `{}`. `get_config()` and the
+  ownership record are unchanged, and nothing is stamped. At `4fbfd60` each was accepted, and a
+  traced call left `flush()` falsy.
+- [ ] `FilteringSink(object())`, `TransformSink(object(), f)` and `MultiSink(MemorySink(), object())`
+  raise `TypeError` naming `FilteringSink inner`, `TransformSink inner` and `MultiSink sinks[1]`.
+  At `4fbfd60` each constructed and failed every `emit`.
+- [ ] Each of these is accepted, and delivers every event as at `4fbfd60`:
+  - an emit-only sink with no `close`;
+  - a class with `emit = None` whose `start()`, called after `configure()`, sets `self.emit`;
+  - a `SimpleNamespace`, a slotted user class, a function and a module, each given `emit` after
+    `configure()`;
+  - a `__getattr__` proxy over a full sink;
+  - `weakref.proxy(sink)`;
+  - `super(Sub, inst)` over a sink.
+- [ ] A user-defined class with no `emit` is accepted, and its batches are counted in
+  `failed_batches` on the worker path and in `orphan_lost` on the no-worker path and announced, as
+  at `4fbfd60`. That is the recorded limit.
+- [ ] A test checks every member of `_sink_arg._UNPATCHABLE`: its heap-type flag is clear, its
+  `__dictoffset__` is `0`, `setattr(x, "emit", f)` raises, and no class in its MRO has an `emit`.
+  `weakref.ProxyType` and `super` are not members.
+- [ ] During `configure()` and the three wrapper constructors, no `__getattr__`, `__getattribute__`,
+  `__class__` getter, metaclass `__name__` or metaclass `__eq__` of the value runs, each counted by
+  a probe.
+- [ ] `tests/test_type_door_roster.py`'s pinned door set gains exactly `_sink_arg.require_sink` and
+  `config._require_factory`.
 - [ ] `tests/test_public_surface.py` and `tests/typed_consumer/` pass with the additions above, and
   every pin that existed at the build's base passes unedited.
 - [ ] Invariants 10, 13 and 6: the surface only grows, every refusal above is raised at the
@@ -880,7 +916,7 @@ configure(*, service=None, version=None, env=None, sink=None, defaults=None,
           sink_factory: Callable[[], Sink] | None = None) -> None
     # ValueError if sink and sink_factory are both given; TypeError if sink_factory is not
     # callable or cannot bind zero arguments, or if sink provably has no callable emit
-    # (config._require_sink, read statically). Never calls sink_factory.
+    # (_sink_arg.require_sink: an unpatchable builtin value). Never calls sink_factory.
 
 Config.sink_factory: Callable[[], Sink] | None = None
 
@@ -916,7 +952,9 @@ src/log_foundry/_fork.py              # roster, _Repair, register_walk; module-w
 src/log_foundry/_lifecycle.py         # _walk_after_fork, _reclaim_after_fork, _adopt_factory_after_fork;
                                       # _mark_inherited and _inheritance_roots deleted; _clear_after_fork resets
 src/log_foundry/worker.py             # Worker._FORK_SKIP
-src/log_foundry/config.py             # sink_factory on configure() and Config; _require_sink
+src/log_foundry/config.py             # sink_factory on configure() and Config; _require_factory
+src/log_foundry/_sink_arg.py          # require_sink, _UNPATCHABLE (new; imports only _diag)
+src/log_foundry/sinks/{filtering,transform,multi}.py   # require_sink on the inner sinks
 src/log_foundry/sinks/_factory.py     # _FactorySink (new)
 tests/test_fork_roster.py             # FR-001 (new)
 tests/test_sink_factory.py            # FR-005 and FR-006 (new)
@@ -951,7 +989,8 @@ docs/decisions/pipeline/, docs/decisions/sink-lifecycle/
 
 ### Phase 3: `sink_factory=` (FR-005, FR-006)
 
-- Add the keyword, the field and the refusals, `config._require_sink` and its two door-set entries,
+- Add the keyword, the field and the refusals, `_sink_arg.require_sink` at `configure()` and in the
+  three wrappers, `config._require_factory`, and the two door-set entries,
   and `_FactorySink` with its first-build lock, its
   same-thread guard and its throttled line.
 - Add `_adopt_factory_after_fork` and its registration.
@@ -981,11 +1020,14 @@ live sink behind a third-party holder is now stranded too.
 2026-11-04.
 
 `architecture.md` §12's item "`configure(sink=object())` is accepted, and every batch is then lost
-on the drain thread" moves to *Resolved*, closed by SPEC-079. Its closing sentence is rewritten from
-"no callable `emit` and `close`" to the rule FR-005 states. One new decision in
+on the drain thread" moves to *Resolved*, closed by SPEC-079 for what `configure()` can decide. Its
+closing sentence ("no callable `emit` and `close`") is rewritten to the rule FR-005 states. §13
+*Known constraints* gains the user-class case: a sink `configure()` cannot prove unpatchable is
+accepted, and if it never gains an `emit` its batches are lost counted and announced.
+`docs/component-inventory.md` gains a row for `_sink_arg`. One new decision in
 `docs/decisions/sink-lifecycle/` records `sink_factory=`, citing Andrew's
-decision of 2026-11-04 and its two costs, and the `sink=` refusal with Andrew's two decisions of
-2026-11-05. It is lazy in every process, never called in the at-fork
+decision of 2026-11-04 and its two costs, and the `sink=` refusal with Andrew's decisions of
+2026-11-05 (no `close` requirement; only an unpatchable sink is refused). It is lazy in every process, never called in the at-fork
 handler, refused at `configure()` for what can be checked there, and a failed build is a counted
 delivery failure that the next emit retries.
 
@@ -1040,3 +1082,10 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   statically). The descriptor rule (a found descriptor is accepted uncalled) and the shadowed-`__dict__`
   case were settled by probe at `4fbfd60`. The `sink_factory` refusal names its type's stored name,
   and both doors join SPEC-071 FR-005's guard.
+- 2026-11-05, the fold-in's review: FR-005's static-lookup rule refused sinks that deliver, one
+  whose `emit` is bound after `configure()`, so it is replaced on Andrew's decision of that day:
+  only an unpatchable sink is refused. The heap-type predicate the review proposed was probed and
+  also refuses `weakref.proxy` and `super` objects, which deliver, so the refused set is a closed
+  list of builtin types. The same helper, `_sink_arg.require_sink`, now refuses the wrappers' inner
+  sinks. The `sink_factory` refusal is named `config._require_factory`, and the user-class case
+  moves to §13.
